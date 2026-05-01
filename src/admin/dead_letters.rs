@@ -10,7 +10,7 @@ use super::permissions::Permission;
 use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339, parse_dt};
 use crate::error::AppError;
-use crate::lua::{resolve_record_event, run_record_event_once};
+use crate::lua::{RecordEventPayload, resolve_record_event, run_record_event_once};
 use crate::record_handler::RecordEvent;
 
 // ---------------------------------------------------------------------------
@@ -513,12 +513,14 @@ async fn retry_single(state: &AppState, id: &str) -> Result<(), AppError> {
     match run_record_event_once(
         state,
         &resolved,
-        &dl.action,
-        &dl.uri,
-        &dl.did,
-        &dl.collection,
-        &dl.rkey,
-        record.as_ref(),
+        RecordEventPayload {
+            nsid: &dl.collection,
+            action: &dl.action,
+            uri: &dl.uri,
+            did: &dl.did,
+            rkey: &dl.rkey,
+            record: record.as_ref(),
+        },
     )
     .await
     {

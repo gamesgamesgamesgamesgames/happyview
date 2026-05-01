@@ -278,37 +278,45 @@ pub async fn resolve_record_event(
 // Record-event runner (fail-open, retry + dead-letter)
 // ---------------------------------------------------------------------------
 
+/// All the contextual fields a record-event script needs at execution
+/// time. Bundled into a struct so the runner doesn't take 6+ `&str`
+/// positional arguments — easy to swap `did` and `uri` and have the
+/// type checker shrug.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordEventPayload<'a> {
+    pub nsid: &'a str,
+    pub action: &'a str,
+    pub uri: &'a str,
+    pub did: &'a str,
+    pub rkey: &'a str,
+    pub record: Option<&'a Value>,
+}
+
 /// Run the record-event script (if any) for a given event. Returns the
 /// record body the indexer should store: `Some(record)` to proceed,
 /// `None` to skip indexing.
 ///
 /// Failure mode is fail-open: a script that exhausts its retry budget is
 /// dead-lettered and the indexer proceeds with the original record.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_record_event_script(
     state: &AppState,
-    nsid: &str,
-    action: &str,
-    uri: &str,
-    did: &str,
-    rkey: &str,
-    record: Option<&Value>,
+    payload: RecordEventPayload<'_>,
 ) -> Option<Value> {
-    let resolved = match resolve_record_event(state, nsid, action).await {
+    let resolved = match resolve_record_event(state, payload.nsid, payload.action).await {
         Some(s) => s,
         // No script for this trigger → indexer keeps the original record.
-        None => return record.cloned(),
+        None => return payload.record.cloned(),
     };
 
-    let host_id = format!("{nsid}:{action}");
-    let payload = serde_json::json!({
+    let host_id = format!("{}:{}", payload.nsid, payload.action);
+    let event_payload = serde_json::json!({
         "trigger": resolved.id,
-        "action": action,
-        "uri": uri,
-        "did": did,
-        "collection": nsid,
-        "rkey": rkey,
-        "record": record,
+        "action": payload.action,
+        "uri": payload.uri,
+        "did": payload.did,
+        "collection": payload.nsid,
+        "rkey": payload.rkey,
+        "record": payload.record,
     });
 
     let mut last_error = String::new();
@@ -317,7 +325,7 @@ pub async fn run_record_event_script(
             let delay = std::time::Duration::from_secs(1 << (attempt - 1));
             tokio::time::sleep(delay).await;
         }
-        match run_record_event_once(state, &resolved, action, uri, did, nsid, rkey, record).await {
+        match run_record_event_once(state, &resolved, payload).await {
             Ok(outcome) => {
                 log_event(
                     &state.db,
@@ -325,7 +333,7 @@ pub async fn run_record_event_script(
                         event_type: "script.executed".to_string(),
                         severity: Severity::Info,
                         actor_did: None,
-                        subject: Some(uri.to_string()),
+                        subject: Some(payload.uri.to_string()),
                         detail: serde_json::json!({
                             "host_kind": "record",
                             "host_id": host_id,
@@ -341,7 +349,7 @@ pub async fn run_record_event_script(
             Err(e) => {
                 last_error = e;
                 tracing::warn!(
-                    %uri,
+                    uri = %payload.uri,
                     trigger = %resolved.id,
                     attempt = attempt + 1,
                     "record script attempt failed: {last_error}"
@@ -355,7 +363,7 @@ pub async fn run_record_event_script(
         &resolved,
         "record",
         &host_id,
-        &payload,
+        &event_payload,
         &last_error,
         MAX_ATTEMPTS,
     )
@@ -366,7 +374,7 @@ pub async fn run_record_event_script(
             event_type: "script.dead_lettered".to_string(),
             severity: Severity::Error,
             actor_did: None,
-            subject: Some(uri.to_string()),
+            subject: Some(payload.uri.to_string()),
             detail: serde_json::json!({
                 "host_kind": "record",
                 "host_id": host_id,
@@ -379,7 +387,7 @@ pub async fn run_record_event_script(
     .await;
 
     // Fail-open: indexer proceeds with the original record.
-    record.cloned()
+    payload.record.cloned()
 }
 
 /// Single attempt at the record-event Lua script. Used internally by the
@@ -388,16 +396,10 @@ pub async fn run_record_event_script(
 /// Returns `Ok(Some(value))` to continue indexing with `value`,
 /// `Ok(None)` when the script returned `nil` (skip), or `Err(msg)` on
 /// any execution failure.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_record_event_once(
     state: &AppState,
     script: &ResolvedScript,
-    action: &str,
-    uri: &str,
-    did: &str,
-    collection: &str,
-    rkey: &str,
-    record: Option<&Value>,
+    payload: RecordEventPayload<'_>,
 ) -> Result<Option<Value>, String> {
     if script.language != ScriptLanguage::Lua {
         return Err(format!(
@@ -407,25 +409,33 @@ pub async fn run_record_event_once(
     }
     let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
     let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, &script.id, Some(did))?;
+    register_default_apis(&lua, &state_arc, &script.id, Some(payload.did))?;
 
     // Legacy globals (action, uri, did, collection, rkey, record) for
     // back-compat with scripts written against the old `index_hook`
     // surface.
-    context::set_hook_context(&lua, action, uri, did, collection, rkey, record)
-        .map_err(|e| format!("set hook context: {e}"))?;
+    context::set_hook_context(
+        &lua,
+        payload.action,
+        payload.uri,
+        payload.did,
+        payload.nsid,
+        payload.rkey,
+        payload.record,
+    )
+    .map_err(|e| format!("set hook context: {e}"))?;
 
     // Also expose an `event` table — same fields, different idiom. New
     // scripts can read `event.action` / `event.record.title` instead of
     // the bare globals; both styles work.
     use mlua::LuaSerdeExt;
     let event_value = serde_json::json!({
-        "action": action,
-        "uri": uri,
-        "did": did,
-        "collection": collection,
-        "rkey": rkey,
-        "record": record,
+        "action": payload.action,
+        "uri": payload.uri,
+        "did": payload.did,
+        "collection": payload.nsid,
+        "rkey": payload.rkey,
+        "record": payload.record,
     });
     lua.globals()
         .set(
@@ -459,7 +469,7 @@ pub async fn run_record_event_once(
             Ok(Some(v))
         }
         // Non-nil, non-table return — pass-through: keep the original record.
-        _ => Ok(record.cloned()),
+        _ => Ok(payload.record.cloned()),
     }
 }
 

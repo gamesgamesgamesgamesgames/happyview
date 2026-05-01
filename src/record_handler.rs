@@ -64,12 +64,14 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
             // `record.index:<nsid>`; failures are dead-lettered fail-open.
             let hook_result = crate::lua::run_record_event_script(
                 state,
-                &record.collection,
-                &record.action,
-                &uri,
-                &record.did,
-                &record.rkey,
-                Some(rec),
+                crate::lua::RecordEventPayload {
+                    nsid: &record.collection,
+                    action: &record.action,
+                    uri: &uri,
+                    did: &record.did,
+                    rkey: &record.rkey,
+                    record: Some(rec),
+                },
             )
             .await;
             let rec_to_store = match hook_result {
@@ -180,12 +182,14 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
             // return aborts the delete; any other return continues.
             let hook_result = crate::lua::run_record_event_script(
                 state,
-                &record.collection,
-                "delete",
-                &uri,
-                &record.did,
-                &record.rkey,
-                None,
+                crate::lua::RecordEventPayload {
+                    nsid: &record.collection,
+                    action: "delete",
+                    uri: &uri,
+                    did: &record.did,
+                    rkey: &record.rkey,
+                    record: None,
+                },
             )
             .await;
             if hook_result.is_none() {
