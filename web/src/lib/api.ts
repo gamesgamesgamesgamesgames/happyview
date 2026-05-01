@@ -7,6 +7,7 @@ import type { UserSummary } from "@/types/users"
 import type { AdminListRecordsResponse } from "@/types/records"
 import type { EventsListResponse } from "@/types/events"
 import type { ScriptVariableSummary } from "@/types/script-variables"
+import type { Script, UpsertScriptBody, PatchScriptBody } from "@/types/scripts"
 import type { LabelerSummary } from "@/types/labelers"
 import type { ApiClientSummary, CreateApiClientResponse } from "@/types/api-clients"
 import type { SettingEntry } from "@/types/settings"
@@ -34,6 +35,21 @@ export type { UserSummary } from "@/types/users"
 export type { AdminRecord, AdminListRecordsResponse } from "@/types/records"
 export type { EventLogEntry, EventsListResponse } from "@/types/events"
 export type { ScriptVariableSummary } from "@/types/script-variables"
+export type {
+  Script,
+  ScriptLanguage,
+  TriggerKind,
+  TriggerFamily,
+  UpsertScriptBody,
+  PatchScriptBody,
+} from "@/types/scripts"
+export {
+  TRIGGER_KIND_LABELS,
+  TRIGGER_FAMILY_LABELS,
+  familyOf,
+  parseTriggerId,
+  DEFAULT_SCRIPT_BODY,
+} from "@/types/scripts"
 export type { LabelerSummary } from "@/types/labelers"
 export type { RecordLabel } from "@/types/records"
 export type { ApiClientSummary, CreateApiClientResponse } from "@/types/api-clients"
@@ -679,5 +695,34 @@ export function bulkReindexDeadLetters(body: {
   return apiFetch<BulkActionResponse>("/admin/dead-letters/bulk/reindex", {
     method: "POST",
     body: JSON.stringify(body),
+  })
+}
+
+// Scripts (trigger-keyed)
+export function getScripts() {
+  return apiFetch<Script[]>("/admin/scripts")
+}
+
+export function getScript(id: string) {
+  return apiFetch<Script>(`/admin/scripts/${encodeURIComponent(id)}`)
+}
+
+export function upsertScript(body: UpsertScriptBody) {
+  return apiFetch<Script>("/admin/scripts", {
+    method: "POST",
+    body: JSON.stringify(body),
+  })
+}
+
+export function patchScript(id: string, body: PatchScriptBody) {
+  return apiFetch<Script>(`/admin/scripts/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  })
+}
+
+export function deleteScript(id: string) {
+  return apiFetch(`/admin/scripts/${encodeURIComponent(id)}`, {
+    method: "DELETE",
   })
 }

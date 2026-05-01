@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { IconPlus } from "@tabler/icons-react";
+import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
@@ -9,26 +11,22 @@ import {
   deleteLexicon,
   deleteNetworkLexicon,
   getLexicon,
+  getScripts,
   uploadLexicon,
 } from "@/lib/api";
 import type { LexiconDetail } from "@/types/lexicons";
-import {
-  indexHookScript,
-  procedureScript,
-  queryScript,
-} from "@/lib/lua-templates";
-import { useLuaCompletions } from "@/hooks/use-lua-completions";
+import type { Script, TriggerKind } from "@/types/scripts";
 import { SiteHeader } from "@/components/site-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 
 export default function LexiconDetailPage() {
   const pathname = usePathname();
@@ -38,51 +36,39 @@ export default function LexiconDetailPage() {
   const { hasPermission } = useCurrentUser();
   const router = useRouter();
   const [lexicon, setLexicon] = useState<LexiconDetail | null>(null);
+  // All scripts in the system — we filter to those targeting this
+  // lexicon's id below. Best-effort: render an empty panel if the
+  // scripts call fails so the rest of the page still works.
+  const [scripts, setScripts] = useState<Script[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // Editable text state
+  // Editable text state. The lexicon page used to edit `script` and
+  // `index_hook` columns inline via lua editors; those columns are
+  // now managed via the Scripts subsystem (see "Scripts targeting
+  // this lexicon" panel below). We pass the existing values through
+  // unchanged on save so legacy data isn't accidentally NULLed.
   const [jsonText, setJsonText] = useState("");
-  const [luaText, setLuaText] = useState("");
   const [originalJson, setOriginalJson] = useState("");
-  const [originalLua, setOriginalLua] = useState("");
-  const [hookText, setHookText] = useState("");
-  const [originalHook, setOriginalHook] = useState("");
-  const [showHookEditor, setShowHookEditor] = useState(false);
   const [tokenCost, setTokenCost] = useState("");
   const [originalTokenCost, setOriginalTokenCost] = useState("");
-  const { luaCompletions, collections } = useLuaCompletions(jsonText);
 
   const load = useCallback(() => {
+    // Fire both requests in parallel; the scripts list is best-effort.
+    getScripts()
+      .then(setScripts)
+      .catch(() => setScripts([]));
     getLexicon(id)
       .then((lex) => {
         setLexicon(lex);
         const json = JSON.stringify(lex.lexicon_json, null, 2);
         setJsonText(json);
         setOriginalJson(json);
-
-        // If lexicon has no script but is a query/procedure, auto-generate one
-        if (
-          !lex.script &&
-          (lex.lexicon_type === "query" || lex.lexicon_type === "procedure")
-        ) {
-          const generated =
-            lex.lexicon_type === "procedure"
-              ? procedureScript(lex.target_collection ?? "")
-              : queryScript(lex.target_collection ?? "");
-          setLuaText(generated);
-          // Set originalLua to "" so isDirty becomes true, prompting user to save
-          setOriginalLua("");
-        } else {
-          setLuaText(lex.script ?? "");
-          setOriginalLua(lex.script ?? "");
-        }
-        setHookText(lex.index_hook ?? "");
-        setOriginalHook(lex.index_hook ?? "");
-        setShowHookEditor(!!lex.index_hook);
         setTokenCost(lex.token_cost != null ? String(lex.token_cost) : "");
-        setOriginalTokenCost(lex.token_cost != null ? String(lex.token_cost) : "");
+        setOriginalTokenCost(
+          lex.token_cost != null ? String(lex.token_cost) : "",
+        );
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
   }, [id]);
@@ -92,10 +78,7 @@ export default function LexiconDetailPage() {
   }, [load]);
 
   const isDirty =
-    jsonText !== originalJson ||
-    luaText !== originalLua ||
-    hookText !== originalHook ||
-    tokenCost !== originalTokenCost;
+    jsonText !== originalJson || tokenCost !== originalTokenCost;
 
   async function handleSave() {
     if (!lexicon) return;
@@ -106,8 +89,11 @@ export default function LexiconDetailPage() {
       await uploadLexicon({
         lexicon_json: lexiconJson,
         backfill: lexicon.backfill,
-        script: luaText || undefined,
-        index_hook: hookText || undefined,
+        // Preserve any legacy script / index_hook values verbatim — we
+        // no longer edit them here, but leaving them out of the body
+        // would NULL the columns on upsert and lose data.
+        script: lexicon.script ?? undefined,
+        index_hook: lexicon.index_hook ?? undefined,
         token_cost: tokenCost ? Number(tokenCost) : null,
       });
       load();
@@ -157,12 +143,28 @@ export default function LexiconDetailPage() {
   }
 
   const isNetwork = lexicon.source === "network";
-  const showLua =
-    lexicon.has_script ||
-    lexicon.lexicon_type === "query" ||
-    lexicon.lexicon_type === "procedure";
   const isRecord = lexicon.lexicon_type === "record";
-  const showHook = isRecord && (showHookEditor || !!lexicon.index_hook);
+
+  // Triggers that target this lexicon's id, given its type.
+  //
+  // Record-type lexicons get the four `record.*` slots (the cascade
+  // wildcard `record.index` listed first as the most common starting
+  // point, then the three action-specific slots), plus `labeler.apply`
+  // for "react to labels arriving on records of this type."
+  // XRPC lexicons get the matching `xrpc.{query,procedure}` slot only.
+  const targetingTriggers: { kind: TriggerKind; label: string }[] = isRecord
+    ? [
+        { kind: "record.index", label: "Default handler (any action)" },
+        { kind: "record.create", label: "On create" },
+        { kind: "record.update", label: "On update" },
+        { kind: "record.delete", label: "On delete" },
+        { kind: "labeler.apply", label: "On label applied" },
+      ]
+    : lexicon.lexicon_type === "query"
+      ? [{ kind: "xrpc.query", label: "Query handler" }]
+      : lexicon.lexicon_type === "procedure"
+        ? [{ kind: "xrpc.procedure", label: "Procedure handler" }]
+        : [];
 
   return (
     <div className="flex flex-col h-full max-h-screen md:max-h-[calc(100vh-((var(--spacing)*2)*2))] overflow-hidden">
@@ -244,20 +246,30 @@ export default function LexiconDetailPage() {
               </div>
             )}
           </div>
+
+          {/* Trigger-keyed scripts that target this lexicon. Each row
+              either links to the existing script or to the New Script
+              page pre-filled with the trigger id. */}
+          {targetingTriggers.length > 0 && (
+            <ScriptsTargetingPanel
+              lexiconId={lexicon.id}
+              scripts={scripts}
+              entries={targetingTriggers}
+              canManage={hasPermission("scripts:manage")}
+            />
+          )}
         </div>
 
-        {/* Code Panels */}
+        {/* JSON editor only — scripts (record-event handlers, XRPC
+            handlers, label-arrival handlers) are managed via the
+            "Scripts targeting this lexicon" panel above. The legacy
+            `script` / `index_hook` columns on the lexicons table are
+            preserved as-is on save but no longer edited here. */}
         <CodePanels
           className="flex-1 min-h-0 px-4 md:px-6"
           jsonValue={jsonText}
           onJsonChange={isNetwork ? undefined : setJsonText}
           jsonReadOnly={isNetwork}
-          luaValue={showHook ? hookText : showLua ? luaText : undefined}
-          onLuaChange={
-            showHook ? setHookText : showLua ? setLuaText : undefined
-          }
-          luaCompletions={showLua ? luaCompletions : undefined}
-          collections={showLua ? collections : undefined}
         />
 
         {/* Actions */}
@@ -273,40 +285,6 @@ export default function LexiconDetailPage() {
           )}
 
           <div className="flex gap-2">
-            {hasPermission("lexicons:create") && isRecord && !showHook && (
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="outline"
-                      onClick={() => {
-                        setHookText(indexHookScript());
-                        setShowHookEditor(true);
-                      }}
-                    >
-                      Add Index Hook
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent className="max-w-xs">
-                    {
-                      "An Index Hook is a Lua script that runs automatically whenever a record in this collection is created, updated, or deleted on the network."
-                    }
-                  </TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-            )}
-            {hasPermission("lexicons:create") && isRecord && showHook && (
-              <Button
-                variant="outline"
-                onClick={() => {
-                  setHookText("");
-                  setShowHookEditor(false);
-                }}
-              >
-                Remove Index Hook
-              </Button>
-            )}
-
             {hasPermission("lexicons:create") && (
               <Button onClick={handleSave} disabled={!isDirty || saving}>
                 {saving ? "Saving..." : "Save"}
@@ -315,6 +293,117 @@ export default function LexiconDetailPage() {
           </div>
         </footer>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Lists scripts targeting this lexicon and offers a "+ New" dropdown
+ * for the slots that don't yet have a script.
+ *
+ * Existing scripts (those whose trigger id matches one of `entries`)
+ * appear as rows linking to the Scripts detail page. Missing slots
+ * are surfaced via a single "+ New script" dropdown so the operator
+ * picks the kind of handler they want without seeing four "Create"
+ * buttons stacked. The dropdown hides when every slot is taken.
+ */
+function ScriptsTargetingPanel({
+  lexiconId,
+  scripts,
+  entries,
+  canManage,
+}: {
+  lexiconId: string;
+  scripts: Script[];
+  entries: { kind: TriggerKind; label: string }[];
+  canManage: boolean;
+}) {
+  const byId = new Map(scripts.map((s) => [s.id, s]));
+  const existing = entries
+    .map((e) => ({ ...e, triggerId: `${e.kind}:${lexiconId}` }))
+    .filter((e) => byId.has(e.triggerId));
+  const available = entries
+    .map((e) => ({ ...e, triggerId: `${e.kind}:${lexiconId}` }))
+    .filter((e) => !byId.has(e.triggerId));
+
+  return (
+    <div className="mt-6 rounded-md border p-4">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <div>
+          <h3 className="text-sm font-semibold">
+            Scripts targeting this lexicon
+          </h3>
+          <p className="text-muted-foreground text-xs">
+            Each row is a{" "}
+            <Link
+              href="/dashboard/settings/scripts"
+              className="underline hover:no-underline"
+            >
+              trigger
+            </Link>{" "}
+            the dispatcher resolves at firing time.
+          </p>
+        </div>
+        {canManage && available.length > 0 && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" size="sm">
+                <IconPlus className="size-4" />
+                New script
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              {available.map(({ kind, label, triggerId }) => (
+                <DropdownMenuItem key={kind} asChild>
+                  <Link
+                    href={`/dashboard/settings/scripts/new?id=${encodeURIComponent(triggerId)}`}
+                    className="flex flex-col items-start gap-0.5"
+                  >
+                    <span className="text-sm">{label}</span>
+                    <span className="text-muted-foreground font-mono text-[11px]">
+                      {triggerId}
+                    </span>
+                  </Link>
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+      </div>
+      {existing.length === 0 ? (
+        <p className="text-muted-foreground text-sm py-2">
+          No scripts yet.
+          {canManage && available.length > 0 && (
+            <> Use the &ldquo;New script&rdquo; menu to add one.</>
+          )}
+        </p>
+      ) : (
+        <ul className="flex flex-col divide-y">
+          {existing.map(({ kind, label, triggerId }) => (
+            <li
+              key={kind}
+              className="flex items-center justify-between gap-2 py-2"
+            >
+              <Link
+                href={`/dashboard/settings/scripts/${encodeURIComponent(triggerId)}`}
+                className="flex flex-col gap-0.5 hover:underline"
+              >
+                <span className="text-sm">{label}</span>
+                <span className="text-muted-foreground font-mono text-xs">
+                  {triggerId}
+                </span>
+              </Link>
+              <Button asChild variant="ghost" size="sm">
+                <Link
+                  href={`/dashboard/settings/scripts/${encodeURIComponent(triggerId)}`}
+                >
+                  Edit
+                </Link>
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

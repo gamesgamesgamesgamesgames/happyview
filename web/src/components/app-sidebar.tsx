@@ -18,6 +18,7 @@ import {
   IconApps,
   IconArrowUpCircle,
   IconArrowsShuffle,
+  IconCode,
   IconSkull,
 } from "@tabler/icons-react";
 import Image from "next/image";
@@ -95,6 +96,12 @@ const integrationItems: NavItem[] = [
     url: "/dashboard/settings/labelers",
     icon: IconTag,
     requiredPermissions: ["labelers:read"],
+  },
+  {
+    title: "Scripts",
+    url: "/dashboard/settings/scripts",
+    icon: IconCode,
+    requiredPermissions: ["scripts:read"],
   },
 ];
 
