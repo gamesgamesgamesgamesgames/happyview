@@ -18,7 +18,15 @@ pub(crate) async fn handle_procedure(
     params: &std::collections::HashMap<String, Value>,
     lexicon: &crate::lexicon::ParsedLexicon,
 ) -> Result<Response, AppError> {
-    if let Some(ref script) = lexicon.script {
+    // Trigger-keyed dispatch: a script bound at `xrpc.procedure:<id>`
+    // overrides the default PDS-write flow. The legacy `lexicon.script`
+    // column is no longer read.
+    let trigger = format!("xrpc.procedure:{}", lexicon.id);
+    if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
+        // Delegation guard preserved from origin/dev: scripts that run
+        // under a `delegateDid` must come from a caller who is an
+        // active write-capable delegate of that account, scoped to the
+        // calling api_client.
         let delegate_did = input
             .get("delegateDid")
             .and_then(|v| v.as_str())
@@ -71,7 +79,7 @@ pub(crate) async fn handle_procedure(
             &script_input,
             params,
             lexicon,
-            script,
+            &resolved.body,
             None,
             delegate_did.as_deref(),
         )

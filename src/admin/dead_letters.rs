@@ -10,7 +10,7 @@ use super::permissions::Permission;
 use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339, parse_dt};
 use crate::error::AppError;
-use crate::lua::{HookEvent, run_hook_once};
+use crate::lua::{resolve_record_event, run_record_event_once};
 use crate::record_handler::RecordEvent;
 
 // ---------------------------------------------------------------------------
@@ -487,29 +487,22 @@ async fn resolve_bulk_ids(state: &AppState, body: &BulkRequest) -> Result<Vec<St
     }
 }
 
-/// Fetch the index_hook script directly from the lexicons table, bypassing the in-memory registry.
-async fn get_index_hook_from_db(
-    state: &AppState,
-    lexicon_id: &str,
-) -> Result<Option<String>, AppError> {
-    let backend = state.db_backend;
-    let sql = adapt_sql("SELECT index_hook FROM lexicons WHERE id = ?", backend);
-    let row: Option<(Option<String>,)> = sqlx::query_as(&sql)
-        .bind(lexicon_id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to fetch index hook: {e}")))?;
-    Ok(row.and_then(|r| r.0))
-}
-
-/// Retry a single dead letter by re-running its hook script.
+/// Retry a single dead letter by re-running its trigger-keyed script.
+///
+/// Resolves the script via the new dispatcher's cascade
+/// (`record.<action>:<nsid>` → `record.index:<nsid>`). If no script is
+/// bound for the cascade now, returns 404 — the operator either deleted
+/// the script or never re-bound it under the new naming.
 async fn retry_single(state: &AppState, id: &str) -> Result<(), AppError> {
     let dl = fetch_dead_letter_for_action(state, id).await?;
 
-    let script = get_index_hook_from_db(state, &dl.lexicon_id)
-        .await?
+    let resolved = resolve_record_event(state, &dl.collection, &dl.action)
+        .await
         .ok_or_else(|| {
-            AppError::NotFound(format!("no index hook found for lexicon {}", dl.lexicon_id))
+            AppError::NotFound(format!(
+                "no script bound for record.{}:{} (or record.index:{})",
+                dl.action, dl.collection, dl.collection
+            ))
         })?;
 
     let record: Option<Value> = dl
@@ -517,19 +510,18 @@ async fn retry_single(state: &AppState, id: &str) -> Result<(), AppError> {
         .as_deref()
         .and_then(|r| serde_json::from_str(r).ok());
 
-    let event = HookEvent {
+    match run_record_event_once(
         state,
-        lexicon_id: &dl.lexicon_id,
-        script: &script,
-        action: &dl.action,
-        uri: &dl.uri,
-        did: &dl.did,
-        collection: &dl.collection,
-        rkey: &dl.rkey,
-        record: record.as_ref(),
-    };
-
-    match run_hook_once(&event).await {
+        &resolved,
+        &dl.action,
+        &dl.uri,
+        &dl.did,
+        &dl.collection,
+        &dl.rkey,
+        record.as_ref(),
+    )
+    .await
+    {
         Ok(_) => {
             mark_resolved(state, id).await?;
             Ok(())

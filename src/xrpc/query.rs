@@ -15,9 +15,19 @@ pub(crate) async fn handle_query(
     lexicon: &crate::lexicon::ParsedLexicon,
     claims: Option<&Claims>,
 ) -> Result<Response, AppError> {
-    if let Some(ref script) = lexicon.script {
+    // Trigger-keyed dispatch: a script bound at `xrpc.query:<id>`
+    // overrides the default list / get-record flow. The legacy
+    // `lexicon.script` column is no longer read.
+    let trigger = format!("xrpc.query:{}", lexicon.id);
+    if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
         return crate::lua::execute_query_script(
-            state, method, params, lexicon, script, claims, None,
+            state,
+            method,
+            params,
+            lexicon,
+            &resolved.body,
+            claims,
+            None,
         )
         .await;
     }

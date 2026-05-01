@@ -56,51 +56,45 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
             };
             let cid = record.cid.as_deref().unwrap_or_default();
 
-            // Run index hook before storing, if configured. The hook's return
-            // value determines what (if anything) gets written to the DB.
-            let rec_to_store =
-                if let Some(script) = state.lexicons.get_index_hook(&record.collection).await {
-                    let hook_result = crate::lua::execute_hook_script(&crate::lua::HookEvent {
-                        state,
-                        lexicon_id: &record.collection,
-                        script: &script,
-                        action: &record.action,
-                        uri: &uri,
-                        did: &record.did,
-                        collection: &record.collection,
-                        rkey: &record.rkey,
-                        record: Some(rec),
-                    })
+            // Run record-event script (if any) before storing. The script's
+            // return value determines what gets written:
+            //   None → skip indexing entirely
+            //   Some(record) → upsert with that record body
+            // The dispatcher cascades `record.<action>:<nsid>` →
+            // `record.index:<nsid>`; failures are dead-lettered fail-open.
+            let hook_result = crate::lua::run_record_event_script(
+                state,
+                &record.collection,
+                &record.action,
+                &uri,
+                &record.did,
+                &record.rkey,
+                Some(rec),
+            )
+            .await;
+            let rec_to_store = match hook_result {
+                None => {
+                    log_event(
+                        db,
+                        EventLog {
+                            event_type: "record.skipped".to_string(),
+                            severity: Severity::Info,
+                            actor_did: None,
+                            subject: Some(uri.clone()),
+                            detail: serde_json::json!({
+                                "collection": record.collection,
+                                "did": record.did,
+                                "rkey": record.rkey,
+                                "reason": "script returned nil",
+                            }),
+                        },
+                        state.db_backend,
+                    )
                     .await;
-
-                    match hook_result {
-                        None => {
-                            // Hook returned nil — skip indexing this record.
-                            log_event(
-                                db,
-                                EventLog {
-                                    event_type: "record.skipped".to_string(),
-                                    severity: Severity::Info,
-                                    actor_did: None,
-                                    subject: Some(uri.clone()),
-                                    detail: serde_json::json!({
-                                        "collection": record.collection,
-                                        "did": record.did,
-                                        "rkey": record.rkey,
-                                        "reason": "hook returned nil",
-                                    }),
-                                },
-                                state.db_backend,
-                            )
-                            .await;
-                            return;
-                        }
-                        Some(v) => v,
-                    }
-                } else {
-                    // No hook — store the original record as-is.
-                    rec.clone()
-                };
+                    return;
+                }
+                Some(v) => v,
+            };
 
             let now = now_rfc3339();
             let backend = state.db_backend;
@@ -182,42 +176,37 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
         "delete" => {
             let backend = state.db_backend;
 
-            // Run index hook before deleting, if configured.
-            if let Some(script) = state.lexicons.get_index_hook(&record.collection).await {
-                let hook_result = crate::lua::execute_hook_script(&crate::lua::HookEvent {
-                    state,
-                    lexicon_id: &record.collection,
-                    script: &script,
-                    action: "delete",
-                    uri: &uri,
-                    did: &record.did,
-                    collection: &record.collection,
-                    rkey: &record.rkey,
-                    record: None,
-                })
+            // Run record-event script (if any) before deleting. A nil
+            // return aborts the delete; any other return continues.
+            let hook_result = crate::lua::run_record_event_script(
+                state,
+                &record.collection,
+                "delete",
+                &uri,
+                &record.did,
+                &record.rkey,
+                None,
+            )
+            .await;
+            if hook_result.is_none() {
+                log_event(
+                    db,
+                    EventLog {
+                        event_type: "record.skipped".to_string(),
+                        severity: Severity::Info,
+                        actor_did: None,
+                        subject: Some(uri.clone()),
+                        detail: serde_json::json!({
+                            "collection": record.collection,
+                            "did": record.did,
+                            "rkey": record.rkey,
+                            "reason": "script returned nil",
+                        }),
+                    },
+                    backend,
+                )
                 .await;
-
-                if hook_result.is_none() {
-                    // Hook returned nil — skip the delete.
-                    log_event(
-                        db,
-                        EventLog {
-                            event_type: "record.skipped".to_string(),
-                            severity: Severity::Info,
-                            actor_did: None,
-                            subject: Some(uri.clone()),
-                            detail: serde_json::json!({
-                                "collection": record.collection,
-                                "did": record.did,
-                                "rkey": record.rkey,
-                                "reason": "hook returned nil",
-                            }),
-                        },
-                        backend,
-                    )
-                    .await;
-                    return;
-                }
+                return;
             }
 
             let delete_sql = adapt_sql("DELETE FROM records WHERE uri = ?", backend);

@@ -214,7 +214,13 @@ mod tests {
         let (tx, _) = watch::channel(vec![]);
         let (labeler_tx, _) = watch::channel(());
         sqlx::any::install_default_drivers();
-        let test_db = sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap();
+        // Single-connection pool so the in-memory DB is shared across the
+        // pool's queries (separate connections to `sqlite::memory:` get
+        // independent DBs otherwise).
+        let test_db = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect_lazy("sqlite::memory:")
+            .unwrap();
         let atrium_http = std::sync::Arc::new(atrium_oauth::DefaultHttpClient::default());
         let did_resolver = atrium_identity::did::CommonDidResolver::new(
             atrium_identity::did::CommonDidResolverConfig {
@@ -292,6 +298,38 @@ mod tests {
                 crate::proxy_config::ProxyConfig::default(),
             ))),
         }
+    }
+
+    /// Create the `scripts` table on the in-memory test DB and insert one
+    /// row keyed by trigger id. The trigger-keyed dispatcher reads from
+    /// here at firing time; `make_*_lexicon`'s `script` field is now
+    /// inert (kept on the struct for forward-compat with row loaders but
+    /// not consulted by dispatch).
+    async fn seed_script(state: &AppState, trigger: &str, body: &str) {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS scripts (
+                id          TEXT PRIMARY KEY,
+                body        TEXT NOT NULL,
+                description TEXT,
+                script_type TEXT NOT NULL DEFAULT 'lua',
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO scripts (id, body, script_type, created_at, updated_at)
+             VALUES (?, ?, 'lua', datetime('now'), datetime('now'))",
+        )
+        .bind(trigger)
+        .bind(body)
+        .execute(&state.db)
+        .await
+        .unwrap();
     }
 
     fn make_query_lexicon(id: &str, script: Option<&str>) -> ParsedLexicon {
@@ -421,11 +459,14 @@ mod tests {
         let state = test_state();
 
         // Register a scripted query that returns a static response
-        let lexicon = make_query_lexicon(
-            "test.echo",
-            Some(r#"function handle() return { greeting = "hello" } end"#),
-        );
+        let lexicon = make_query_lexicon("test.echo", None);
         state.lexicons.upsert(lexicon).await;
+        seed_script(
+            &state,
+            "xrpc.query:test.echo",
+            r#"function handle() return { greeting = "hello" } end"#,
+        )
+        .await;
 
         let mut params = HashMap::new();
         let result = execute_local_query(&state, "test.echo", &mut params, None).await;
@@ -443,11 +484,14 @@ mod tests {
     async fn query_local_script_receives_params() {
         let state = test_state();
 
-        let lexicon = make_query_lexicon(
-            "test.greet",
-            Some(r#"function handle() return { greeting = "hello " .. params.name } end"#),
-        );
+        let lexicon = make_query_lexicon("test.greet", None);
         state.lexicons.upsert(lexicon).await;
+        seed_script(
+            &state,
+            "xrpc.query:test.greet",
+            r#"function handle() return { greeting = "hello " .. params.name } end"#,
+        )
+        .await;
 
         let mut params = HashMap::new();
         params.insert("name".into(), Value::String("world".into()));
@@ -469,15 +513,16 @@ mod tests {
     async fn query_local_script_receives_caller_did() {
         let state = test_state();
 
-        let lexicon = make_query_lexicon(
-            "test.whoami",
-            Some(
-                r#"function handle()
-                    return { did = caller_did or "anonymous" }
-                end"#,
-            ),
-        );
+        let lexicon = make_query_lexicon("test.whoami", None);
         state.lexicons.upsert(lexicon).await;
+        seed_script(
+            &state,
+            "xrpc.query:test.whoami",
+            r#"function handle()
+                return { did = caller_did or "anonymous" }
+            end"#,
+        )
+        .await;
 
         // With caller_did
         let claims = Claims::internal("did:plc:testuser".into());
@@ -548,11 +593,14 @@ mod tests {
         let state = test_state();
 
         // Register a simple query that the outer script will call
-        let inner_lexicon = make_query_lexicon(
-            "test.inner",
-            Some(r#"function handle() return { value = 42 } end"#),
-        );
+        let inner_lexicon = make_query_lexicon("test.inner", None);
         state.lexicons.upsert(inner_lexicon).await;
+        seed_script(
+            &state,
+            "xrpc.query:test.inner",
+            r#"function handle() return { value = 42 } end"#,
+        )
+        .await;
 
         let state_arc = Arc::new(state);
         let lua = sandbox::create_sandbox().unwrap();

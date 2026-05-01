@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-/// All 37 permissions in the system.
+/// All permissions in the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Permission {
     #[serde(rename = "lexicons:create")]
@@ -100,6 +100,11 @@ pub enum Permission {
     SpacesManageRecords,
     #[serde(rename = "spaces:manage-credentials")]
     SpacesManageCredentials,
+
+    #[serde(rename = "scripts:read")]
+    ScriptsRead,
+    #[serde(rename = "scripts:manage")]
+    ScriptsManage,
 }
 
 impl Permission {
@@ -147,6 +152,8 @@ impl Permission {
             Self::SpacesManageInvites => "spaces:manage-invites",
             Self::SpacesManageRecords => "spaces:manage-records",
             Self::SpacesManageCredentials => "spaces:manage-credentials",
+            Self::ScriptsRead => "scripts:read",
+            Self::ScriptsManage => "scripts:manage",
         }
     }
 
@@ -194,6 +201,8 @@ impl Permission {
             Self::SpacesManageInvites,
             Self::SpacesManageRecords,
             Self::SpacesManageCredentials,
+            Self::ScriptsRead,
+            Self::ScriptsManage,
         ])
     }
 }
@@ -215,6 +224,7 @@ impl Template {
                 Permission::LexiconsRead,
                 Permission::RecordsRead,
                 Permission::ScriptVariablesRead,
+                Permission::ScriptsRead,
                 Permission::UsersRead,
                 Permission::ApiKeysRead,
                 Permission::BackfillRead,
@@ -236,6 +246,7 @@ impl Template {
                 perms.insert(Permission::LexiconsDelete);
                 perms.insert(Permission::ScriptVariablesCreate);
                 perms.insert(Permission::ScriptVariablesDelete);
+                perms.insert(Permission::ScriptsManage);
                 perms.insert(Permission::RecordsDelete);
                 perms.insert(Permission::LabelersCreate);
                 perms.insert(Permission::LabelersRead);

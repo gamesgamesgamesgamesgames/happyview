@@ -21,16 +21,44 @@ const INTERNAL_FIELDS: &[&str] = &[
     "_repo_override",
 ];
 
-/// Register the `Record` global constructor and static methods.
-/// Only registered for procedure scripts (not queries).
+/// Error message returned when a script calls a PDS-touching method
+/// (`:save()` / `:delete()` / `Record.save_all`) from a context without
+/// caller credentials — e.g. label scripts, record-event scripts, or
+/// query handlers.
+const NO_PDS_AUTH_MSG: &str = "no PDS auth in this script context — \
+    use :save_local() / :delete_local() / Record.delete_local(uri) for local-only mutation";
+
+/// Register the `Record` global with only the local-only surface
+/// (`Record.load`, `:save_local`, `:delete_local`, `Record.delete_local`).
+/// PDS-touching methods (`:save`, `:delete`, `Record.save_all`) are still
+/// exposed but error with [`NO_PDS_AUTH_MSG`] when called.
 ///
-/// When `delegate_did` is `Some`, record writes default to the delegate's repo
-/// instead of the caller's DID. Scripts can still override via `record:set_repo()`.
-pub fn register_record_api(
+/// This is the entry point for label scripts, record-event scripts, and
+/// query handlers — contexts that have no caller credentials to round-trip
+/// records through a PDS.
+pub fn register_record_api_no_auth(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
+    register_record_api(lua, state, None, None, None)
+}
+
+/// Register the `Record` global constructor and static methods.
+///
+/// `claims` / `pds_auth` are optional: when both are `Some`, the full
+/// surface (`:save()`, `:delete()`, `Record.save_all`) round-trips through
+/// the PDS. When either is `None` (label scripts, record-event scripts,
+/// query handlers), only the local-only methods are usable
+/// (`:save_local()`, `:delete_local()`, `Record.delete_local(uri)`); the
+/// PDS-touching methods error with [`NO_PDS_AUTH_MSG`]. Most callers want
+/// [`register_record_api_no_auth`] instead — this lower-level entry point
+/// exposes the internal `PdsAuth` type and is only public to the crate.
+///
+/// When `delegate_did` is `Some`, record writes default to the delegate's
+/// repo instead of the caller's DID. Scripts can still override via
+/// `record:set_repo()`.
+pub(crate) fn register_record_api(
     lua: &Lua,
     state: Arc<AppState>,
-    claims: Arc<Claims>,
-    pds_auth: Arc<PdsAuth>,
+    claims: Option<Arc<Claims>>,
+    pds_auth: Option<Arc<PdsAuth>>,
     delegate_did: Option<String>,
 ) -> LuaResult<()> {
     // -- methods table (shared by all Record instances) --
@@ -48,6 +76,8 @@ pub fn register_record_api(
             let pds_auth = pds_auth.clone();
             let delegate_did = delegate_did.clone();
             async move {
+                let claims = claims.ok_or_else(|| mlua::Error::runtime(NO_PDS_AUTH_MSG))?;
+                let pds_auth = pds_auth.ok_or_else(|| mlua::Error::runtime(NO_PDS_AUTH_MSG))?;
                 let backend = state.db_backend;
                 let collection: String = this.raw_get("_collection")?;
                 let schema: mlua::Value = this.raw_get("_schema")?;
@@ -223,6 +253,8 @@ pub fn register_record_api(
             let pds_auth = pds_auth.clone();
             let delegate_did = delegate_did.clone();
             async move {
+                let claims = claims.ok_or_else(|| mlua::Error::runtime(NO_PDS_AUTH_MSG))?;
+                let pds_auth = pds_auth.ok_or_else(|| mlua::Error::runtime(NO_PDS_AUTH_MSG))?;
                 let backend = state.db_backend;
                 let uri: String = this.raw_get::<Option<String>>("_uri")?.ok_or_else(|| {
                     mlua::Error::runtime("cannot delete a Record that has no _uri")
@@ -246,24 +278,39 @@ pub fn register_record_api(
                     "rkey": rkey,
                 });
 
-                let resp = pds_auth
+                // Try the PDS delete. We log-and-continue on failure so the
+                // operator's intent ("remove this record") is still
+                // reflected in the local DB even when the PDS is down or
+                // refuses the call. The local row is the source of truth
+                // for the index.
+                match pds_auth
                     .post_json(&state, repo, "com.atproto.repo.deleteRecord", &pds_body)
                     .await
-                    .map_err(|e| mlua::Error::runtime(format!("PDS deleteRecord failed: {e}")))?;
-
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(mlua::Error::runtime(format!(
-                        "PDS deleteRecord returned {status}: {body}"
-                    )));
+                {
+                    Ok(resp) if resp.status().is_success() => {}
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        tracing::warn!(
+                            uri = %uri,
+                            "PDS deleteRecord returned {status}: {body} \
+                             — proceeding with local delete anyway"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            uri = %uri,
+                            "PDS deleteRecord failed: {e} \
+                             — proceeding with local delete anyway"
+                        );
+                    }
                 }
 
-                // Delete from local DB
+                // Always delete locally — operator's logical action is
+                // "remove this record from view" regardless of PDS outcome.
                 let delete_sql = adapt_sql("DELETE FROM records WHERE uri = ?", backend);
                 let _ = sqlx::query(&delete_sql).bind(&uri).execute(&state.db).await;
 
-                // Clear _uri and _cid
                 this.raw_set("_uri", mlua::Value::Nil)?;
                 this.raw_set("_cid", mlua::Value::Nil)?;
 
@@ -271,6 +318,156 @@ pub fn register_record_api(
             }
         })?;
         methods.set("delete", delete_fn)?;
+    }
+
+    // :save_local() — upsert into local DB only, never touches a PDS.
+    // Works in any script context (no auth required).
+    //
+    // For records loaded via `Record.load(uri)` or saved via `:save()`
+    // (i.e. those with an `_uri`), the repo+rkey are parsed back out of
+    // the URI. For brand-new records (no `_uri`), we fall back to
+    // `_repo_override` / `claims.did()` for the repo, and generate an
+    // rkey via `_key_type` if `_rkey` isn't set. Errors clearly when no
+    // DID can be determined.
+    {
+        let state = state.clone();
+        let claims = claims.clone();
+        let save_local_fn = lua.create_async_function(move |lua, this: mlua::Table| {
+            let state = state.clone();
+            let claims = claims.clone();
+            async move {
+                let backend = state.db_backend;
+                let collection: String = this.raw_get("_collection")?;
+                let schema: mlua::Value = this.raw_get("_schema")?;
+
+                if let mlua::Value::Table(ref schema_table) = schema {
+                    validate_required_fields(&this, schema_table)?;
+                }
+
+                let data = extract_record_data(&lua, &this, &collection)?;
+                let data_str = serde_json::to_string(&data).unwrap_or_default();
+                let now = now_rfc3339();
+
+                let existing_uri: Option<String> = this.raw_get("_uri")?;
+                let (uri, repo, rkey) = if let Some(uri) = existing_uri {
+                    // Parse repo (DID) and rkey out of the URI:
+                    // at://<did>/<collection>/<rkey>
+                    let trimmed = uri
+                        .strip_prefix("at://")
+                        .ok_or_else(|| mlua::Error::runtime(format!("invalid AT URI: {uri}")))?;
+                    let mut parts = trimmed.splitn(3, '/');
+                    let repo = parts
+                        .next()
+                        .ok_or_else(|| mlua::Error::runtime(format!("invalid AT URI: {uri}")))?
+                        .to_string();
+                    let _col = parts.next();
+                    let rkey = parts
+                        .next()
+                        .ok_or_else(|| mlua::Error::runtime(format!("invalid AT URI: {uri}")))?
+                        .to_string();
+                    (uri, repo, rkey)
+                } else {
+                    // CREATE path — no URI yet. Compute repo + rkey, build URI.
+                    let repo_override: Option<String> = this.raw_get("_repo_override")?;
+                    let repo = repo_override
+                        .or_else(|| claims.as_ref().map(|c| c.did().to_string()))
+                        .ok_or_else(|| {
+                            mlua::Error::runtime(
+                                "save_local() needs a DID — call :set_repo(\"did:plc:...\") \
+                                 or load the record first",
+                            )
+                        })?;
+
+                    let rkey: Option<String> = this.raw_get("_rkey")?;
+                    let rkey = if let Some(rk) = rkey {
+                        rk
+                    } else {
+                        let key_type: Option<String> = this.raw_get("_key_type")?;
+                        match key_type.as_deref() {
+                            Some("tid") | Some("any") | None => generate_tid(),
+                            Some(s) if s.starts_with("literal:") => {
+                                s["literal:".len()..].to_string()
+                            }
+                            Some("nsid") => {
+                                return Err(mlua::Error::runtime(
+                                    "cannot auto-generate rkey for nsid key type — \
+                                     call set_rkey() first",
+                                ));
+                            }
+                            Some(other) => {
+                                return Err(mlua::Error::runtime(format!(
+                                    "unknown key type '{other}'"
+                                )));
+                            }
+                        }
+                    };
+                    let uri = format!("at://{repo}/{collection}/{rkey}");
+                    (uri, repo, rkey)
+                };
+
+                // Upsert. Sentinel CID `""` — no PDS round-trip means we
+                // have no real CID to record; consumers reading the row
+                // should treat empty CID as "local-only write".
+                let upsert_sql = adapt_sql(
+                    r#"INSERT INTO records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (uri) DO UPDATE
+                           SET record = EXCLUDED.record,
+                               cid = EXCLUDED.cid,
+                               indexed_at = ?"#,
+                    backend,
+                );
+                sqlx::query(&upsert_sql)
+                    .bind(&uri)
+                    .bind(&repo)
+                    .bind(&collection)
+                    .bind(&rkey)
+                    .bind(&data_str)
+                    .bind("")
+                    .bind(&now)
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(&state.db)
+                    .await
+                    .map_err(|e| mlua::Error::runtime(format!("save_local upsert failed: {e}")))?;
+
+                let _ = sync_refs(&state.db, &uri, &collection, &data, backend).await;
+
+                this.raw_set("_uri", uri.as_str())?;
+                this.raw_set("_cid", "")?;
+
+                Ok(this)
+            }
+        })?;
+        methods.set("save_local", save_local_fn)?;
+    }
+
+    // :delete_local() — local DB delete only, never touches a PDS.
+    // Idempotent: succeeds whether or not a row existed at the URI.
+    {
+        let state = state.clone();
+        let delete_local_fn = lua.create_async_function(move |_lua, this: mlua::Table| {
+            let state = state.clone();
+            async move {
+                let backend = state.db_backend;
+                let uri: String = this.raw_get::<Option<String>>("_uri")?.ok_or_else(|| {
+                    mlua::Error::runtime("cannot delete_local a Record that has no _uri")
+                })?;
+
+                let delete_sql = adapt_sql("DELETE FROM records WHERE uri = ?", backend);
+                sqlx::query(&delete_sql)
+                    .bind(&uri)
+                    .execute(&state.db)
+                    .await
+                    .map_err(|e| mlua::Error::runtime(format!("delete_local failed: {e}")))?;
+
+                this.raw_set("_uri", mlua::Value::Nil)?;
+                this.raw_set("_cid", mlua::Value::Nil)?;
+
+                Ok(this)
+            }
+        })?;
+        methods.set("delete_local", delete_local_fn)?;
     }
 
     // :set_key_type(type)
@@ -461,6 +658,8 @@ pub fn register_record_api(
                 let pds_auth = pds_auth.clone();
                 let delegate_did = delegate_did.clone();
                 async move {
+                    let claims = claims.ok_or_else(|| mlua::Error::runtime(NO_PDS_AUTH_MSG))?;
+                    let pds_auth = pds_auth.ok_or_else(|| mlua::Error::runtime(NO_PDS_AUTH_MSG))?;
                     let backend = state.db_backend;
                     // Extract save data from each record (sync)
                     type SaveItem = (mlua::Table, String, Option<String>, Option<String>, Option<String>, Value);
@@ -722,8 +921,8 @@ pub fn register_record_api(
 
     // Record.load_all(uris)
     {
-        let state = state;
-        let metatable_c = metatable;
+        let state = state.clone();
+        let metatable_c = metatable.clone();
         let load_all_fn = lua.create_async_function(move |lua, uris_table: mlua::Table| {
             let state = state.clone();
             let metatable = metatable_c.clone();
@@ -802,6 +1001,31 @@ pub fn register_record_api(
             }
         })?;
         record_table.set("load_all", load_all_fn)?;
+    }
+
+    // Record.delete_local(uri) — fire-and-forget local-only delete by URI.
+    // The common one-liner for label-script reactions like:
+    //   if event.val == "spam" then Record.delete_local(event.uri) end
+    // Returns true if a row was deleted, false if no row matched.
+    // Always succeeds (no error) regardless of whether the row existed.
+    {
+        let state = state;
+        let delete_local_static_fn = lua.create_async_function(move |_lua, uri: String| {
+            let state = state.clone();
+            async move {
+                let backend = state.db_backend;
+                let delete_sql = adapt_sql("DELETE FROM records WHERE uri = ?", backend);
+                let res = sqlx::query(&delete_sql)
+                    .bind(&uri)
+                    .execute(&state.db)
+                    .await
+                    .map_err(|e| {
+                        mlua::Error::runtime(format!("Record.delete_local failed: {e}"))
+                    })?;
+                Ok(res.rows_affected() > 0)
+            }
+        })?;
+        record_table.set("delete_local", delete_local_static_fn)?;
     }
 
     // -- Make Record callable via __call metamethod --

@@ -253,7 +253,7 @@ async fn run_subscription_once(
         last_seq = message.seq;
 
         for label in &message.labels {
-            apply_label(&state.db, label, state.db_backend).await;
+            apply_label(state, label).await;
         }
 
         events_since_cursor_save += 1;
@@ -323,22 +323,53 @@ fn http_to_ws(url: &str) -> String {
     }
 }
 
-async fn apply_label(db: &sqlx::AnyPool, label: &Label, backend: DatabaseBackend) {
-    if label.neg {
+/// Persist a label received from a subscribed upstream labeler.
+///
+/// Before touching the DB we run the trigger-keyed script chain (computed
+/// from `label.uri` — `labeler.apply:<nsid>` for at-uri subjects,
+/// `labeler.apply:_actor` for bare DIDs). The script can rewrite any field
+/// of the label (including `val` or `neg`) or return nil to skip
+/// persistence. Failure is fail-open: a dead-lettered script proceeds with
+/// the original label, so a buggy script can't permanently break the
+/// firehose.
+async fn apply_label(state: &AppState, label: &Label) {
+    let event = crate::lua::LabelAppliedEvent {
+        src: label.src.clone(),
+        uri: label.uri.clone(),
+        val: label.val.clone(),
+        neg: label.neg,
+        cts: label.cts.clone(),
+        exp: label.exp.clone(),
+    };
+    let final_label = match crate::lua::run_label_applied_script(state, event).await {
+        crate::lua::LabelHookOutcome::Continue(next) => next,
+        crate::lua::LabelHookOutcome::Skip => {
+            tracing::debug!(
+                src = %label.src, uri = %label.uri, val = %label.val,
+                "label.applied script skipped persistence"
+            );
+            return;
+        }
+    };
+
+    let db = &state.db;
+    let backend = state.db_backend;
+
+    if final_label.neg {
         // Negation label — remove it.
         let delete_sql = adapt_sql(
             "DELETE FROM labels WHERE src = ? AND uri = ? AND val = ?",
             backend,
         );
         if let Err(e) = sqlx::query(&delete_sql)
-            .bind(&label.src)
-            .bind(&label.uri)
-            .bind(&label.val)
+            .bind(&final_label.src)
+            .bind(&final_label.uri)
+            .bind(&final_label.val)
             .execute(db)
             .await
         {
             tracing::warn!(
-                src = %label.src, uri = %label.uri, val = %label.val,
+                src = %final_label.src, uri = %final_label.uri, val = %final_label.val,
                 "failed to delete negated label: {e}"
             );
         }
@@ -356,16 +387,16 @@ async fn apply_label(db: &sqlx::AnyPool, label: &Label, backend: DatabaseBackend
         );
 
         if let Err(e) = sqlx::query(&insert_sql)
-            .bind(&label.src)
-            .bind(&label.uri)
-            .bind(&label.val)
-            .bind(&label.cts)
-            .bind(&label.exp)
+            .bind(&final_label.src)
+            .bind(&final_label.uri)
+            .bind(&final_label.val)
+            .bind(&final_label.cts)
+            .bind(&final_label.exp)
             .execute(db)
             .await
         {
             tracing::warn!(
-                src = %label.src, uri = %label.uri, val = %label.val,
+                src = %final_label.src, uri = %final_label.uri, val = %final_label.val,
                 "failed to upsert label: {e}"
             );
         }
@@ -452,7 +483,7 @@ async fn backfill_from_labeler(
     let response: QueryLabelsResponse = resp.json().await?;
 
     for label in &response.labels {
-        apply_label(&state.db, label, state.db_backend).await;
+        apply_label(state, label).await;
     }
 
     Ok(())

@@ -14,6 +14,7 @@ mod plugins;
 mod proxy_config;
 mod records;
 mod script_variables;
+mod scripts;
 pub mod settings;
 mod stats;
 pub(crate) mod types;
@@ -68,6 +69,13 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             post(script_variables::upsert).get(script_variables::list),
         )
         .route("/script-variables/{key}", delete(script_variables::delete))
+        .route("/scripts", get(scripts::list).post(scripts::upsert))
+        .route(
+            "/scripts/{id}",
+            get(scripts::get)
+                .patch(scripts::patch)
+                .delete(scripts::delete),
+        )
         .route("/labelers", post(labelers::add).get(labelers::list))
         .route(
             "/labelers/{did}",
