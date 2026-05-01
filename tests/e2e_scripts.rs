@@ -556,6 +556,57 @@ async fn record_create_returning_nil_skips_indexing() {
 }
 
 // ---------------------------------------------------------------------------
+// log() in scripts → event_logs
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+#[ignore]
+async fn record_event_script_log_writes_event_log_row() {
+    let app = TestApp::new().await;
+    seed_lexicon(&app, fixtures::game_record_lexicon()).await;
+
+    create_script(
+        &app,
+        "record.create:games.gamesgamesgamesgames.game",
+        "function handle() log('hello from script'); return event.record end",
+    )
+    .await;
+
+    handle_record_event(
+        &app.state,
+        &RecordEvent {
+            did: "did:plc:test".into(),
+            collection: "games.gamesgamesgamesgames.game".into(),
+            rkey: "rk1".into(),
+            action: "create".into(),
+            record: Some(json!({"title": "anything"})),
+            cid: Some("bafy".into()),
+        },
+    )
+    .await;
+
+    // The script's log("hello from script") should land in event_logs
+    // as a `script.log` row whose subject is the trigger id.
+    let row: (String, String) = sqlx::query_as(&adapt_sql(
+        "SELECT subject, detail FROM event_logs
+         WHERE event_type = 'script.log'
+         ORDER BY id DESC LIMIT 1",
+        app.state.db_backend,
+    ))
+    .fetch_one(&app.state.db)
+    .await
+    .expect("expected a script.log row");
+    assert_eq!(row.0, "record.create:games.gamesgamesgamesgames.game");
+    let detail: Value = serde_json::from_str(&row.1).unwrap();
+    assert_eq!(detail["message"], "hello from script");
+    assert_eq!(
+        detail["trigger"],
+        "record.create:games.gamesgamesgamesgames.game"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Label scripts via URI routing
 // ---------------------------------------------------------------------------
 

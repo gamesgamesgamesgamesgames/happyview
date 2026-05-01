@@ -284,6 +284,37 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
+    // Override the sandbox's tracing-only `log()` with a version that
+    // also writes a `script.log` row to `event_logs` so operators can
+    // see script output from the dashboard. The xrpc trigger id is
+    // computed from the lexicon's id + procedure type.
+    let trigger_id = format!("xrpc.procedure:{}", lexicon.id);
+    if let Err(e) =
+        super::scripts::register_log_event_api(&lua, &state_arc, &trigger_id, Some(claims.did()))
+    {
+        let error_message = format!("failed to register log API: {e}");
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "script.error".to_string(),
+                severity: Severity::Error,
+                actor_did: Some(claims.did().to_string()),
+                subject: Some(method.to_string()),
+                detail: serde_json::json!({
+                    "error": error_message,
+                    "script_source": script_source,
+                    "input": input_json,
+                    "caller_did": claims.did(),
+                    "method": method,
+                    "duration_ms": start.elapsed().as_millis() as u64,
+                }),
+            },
+            backend,
+        )
+        .await;
+        return Err(AppError::Internal(error_message));
+    }
+
     if let Err(e) = context::set_procedure_context(
         &lua,
         method,
@@ -655,8 +686,38 @@ pub async fn execute_query_script(
     // auth context — the local-only methods (Record.load, :save_local,
     // :delete_local, Record.delete_local) work; PDS-touching variants
     // error with the no-PDS-auth message.
-    if let Err(e) = record::register_record_api_no_auth(&lua, state_arc) {
+    if let Err(e) = record::register_record_api_no_auth(&lua, state_arc.clone()) {
         let error_message = format!("failed to register Record API: {e}");
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "script.error".to_string(),
+                severity: Severity::Error,
+                actor_did: None,
+                subject: Some(method.to_string()),
+                detail: serde_json::json!({
+                    "error": error_message,
+                    "script_source": script_source,
+                    "method": method,
+                    "duration_ms": start.elapsed().as_millis() as u64,
+                }),
+            },
+            backend,
+        )
+        .await;
+        return Err(AppError::Internal(error_message));
+    }
+
+    // Override the sandbox's tracing-only `log()` with a version that
+    // also writes a `script.log` row to `event_logs`.
+    let trigger_id = format!("xrpc.query:{}", lexicon.id);
+    if let Err(e) = super::scripts::register_log_event_api(
+        &lua,
+        &state_arc,
+        &trigger_id,
+        claims.map(|c| c.did()),
+    ) {
+        let error_message = format!("failed to register log API: {e}");
         log_event(
             &state.db,
             EventLog {

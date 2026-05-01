@@ -407,7 +407,7 @@ pub async fn run_record_event_once(
     }
     let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
     let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, Some(did))?;
+    register_default_apis(&lua, &state_arc, &script.id, Some(did))?;
 
     // Legacy globals (action, uri, did, collection, rkey, record) for
     // back-compat with scripts written against the old `index_hook`
@@ -565,7 +565,7 @@ async fn run_label_lua_once(
     }
     let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
     let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, None)?;
+    register_default_apis(&lua, &state_arc, &script.id, None)?;
 
     use mlua::LuaSerdeExt;
     let globals = lua.globals();
@@ -660,6 +660,7 @@ fn extract_bool(v: &Value, key: &str) -> Option<bool> {
 fn register_default_apis(
     lua: &mlua::Lua,
     state: &Arc<AppState>,
+    trigger_id: &str,
     caller_did: Option<&str>,
 ) -> Result<(), String> {
     db_api::register_db_api(lua, state.clone()).map_err(|e| format!("db api: {e}"))?;
@@ -670,6 +671,62 @@ fn register_default_apis(
         .map_err(|e| format!("atproto api: {e}"))?;
     record::register_record_api_no_auth(lua, state.clone())
         .map_err(|e| format!("record api: {e}"))?;
+    register_log_event_api(lua, state, trigger_id, caller_did)?;
+    Ok(())
+}
+
+/// Register `log(msg)` as a Lua global that writes a `script.log` row to
+/// `event_logs` (so operators can inspect script output from
+/// `/dashboard/events` without tailing stderr) AND emits a
+/// `tracing::debug!` for ops who do tail.
+///
+/// `trigger_id` is recorded as the row's `subject` so events for a
+/// specific script can be filtered by trigger. `caller_did` is recorded
+/// as `actor_did` when the runner has one (XRPC handlers); record /
+/// label runners pass `None`.
+///
+/// This intentionally **overrides** the basic `log()` helper that
+/// `sandbox::create_sandbox()` registers (which only writes to
+/// `tracing::debug!`). All script runners call this helper so every
+/// trigger family lands its `log()` calls in the event log.
+pub(crate) fn register_log_event_api(
+    lua: &mlua::Lua,
+    state: &Arc<AppState>,
+    trigger_id: &str,
+    caller_did: Option<&str>,
+) -> Result<(), String> {
+    let state = state.clone();
+    let trigger_id = trigger_id.to_string();
+    let caller_did = caller_did.map(String::from);
+    let log_fn = lua
+        .create_async_function(move |_, msg: String| {
+            let state = state.clone();
+            let trigger_id = trigger_id.clone();
+            let caller_did = caller_did.clone();
+            async move {
+                tracing::debug!(lua_log = %msg, trigger = %trigger_id, "lua script log");
+                log_event(
+                    &state.db,
+                    EventLog {
+                        event_type: "script.log".to_string(),
+                        severity: Severity::Info,
+                        actor_did: caller_did,
+                        subject: Some(trigger_id.clone()),
+                        detail: serde_json::json!({
+                            "trigger": trigger_id,
+                            "message": msg,
+                        }),
+                    },
+                    state.db_backend,
+                )
+                .await;
+                Ok(())
+            }
+        })
+        .map_err(|e| format!("log api: {e}"))?;
+    lua.globals()
+        .set("log", log_fn)
+        .map_err(|e| format!("set log global: {e}"))?;
     Ok(())
 }
 

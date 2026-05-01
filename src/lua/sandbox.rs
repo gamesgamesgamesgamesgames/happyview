@@ -52,11 +52,15 @@ pub fn create_sandbox() -> LuaResult<Lua> {
     let now_fn = lua.create_function(|_, ()| Ok(chrono::Utc::now().to_rfc3339()))?;
     globals.set("now", now_fn)?;
 
-    // Utility: log(message) logs via tracing::debug
-    let log_fn = lua.create_function(|_, msg: String| {
-        tracing::debug!(lua_log = %msg, "lua script log");
-        Ok(())
-    })?;
+    // `log(message)` no-op stub. The real implementation lives in
+    // `super::scripts::register_log_event_api` and is registered by
+    // every runner so the trigger context can be threaded into each
+    // `event_logs` row. The stub here exists only so paths that exec
+    // a script body OUTSIDE a runner — namely `validate_script`
+    // (admin write-time linting) and the in-process xrpc_api tests —
+    // don't break on top-level `log("...")` calls in user scripts.
+    // The runner-level registration always overrides this stub.
+    let log_fn = lua.create_function(|_, _msg: String| Ok(()))?;
     globals.set("log", log_fn)?;
 
     // Utility: TID() returns a fresh AT Protocol TID string
