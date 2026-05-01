@@ -10,3 +10,4 @@ build/
 .vercel
 .env*.local
 .worktrees/
+bun.lock
