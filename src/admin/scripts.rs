@@ -86,23 +86,38 @@ where
 // Routes
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Deserialize)]
+pub(super) struct ListQuery {
+    pub suffix: Option<String>,
+}
+
 /// `GET /admin/scripts` — list all rows. Clients group by trigger family
-/// in the UI.
+/// in the UI. Optional `?suffix=<nsid>` filters to scripts whose id
+/// ends with `:<suffix>`.
 pub(super) async fn list(
     State(state): State<AppState>,
     auth: UserAuth,
+    axum::extract::Query(query): axum::extract::Query<ListQuery>,
 ) -> Result<Json<Vec<ScriptResponse>>, AppError> {
     auth.require(Permission::ScriptsRead).await?;
 
     let backend = state.db_backend;
-    let sql = adapt_sql(
+    let mut sql = String::from(
         "SELECT id, script_type, body, description, created_at, updated_at
-         FROM scripts
-         ORDER BY id",
-        backend,
+         FROM scripts",
     );
+    if query.suffix.is_some() {
+        sql.push_str(" WHERE id LIKE ?");
+    }
+    sql.push_str(" ORDER BY id");
+
+    let sql = adapt_sql(&sql, backend);
     #[allow(clippy::type_complexity)]
-    let rows: Vec<(String, String, String, Option<String>, String, String)> = sqlx::query_as(&sql)
+    let mut q = sqlx::query_as::<_, (String, String, String, Option<String>, String, String)>(&sql);
+    if let Some(ref suffix) = query.suffix {
+        q = q.bind(format!("%:{suffix}"));
+    }
+    let rows = q
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list scripts: {e}")))?;

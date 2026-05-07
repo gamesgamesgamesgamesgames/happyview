@@ -51,7 +51,7 @@ export default function LexiconDetailPage() {
 
   const load = useCallback(() => {
     // Fire both requests in parallel; the scripts list is best-effort.
-    getScripts()
+    getScripts({ suffix: id })
       .then(setScripts)
       .catch(() => setScripts([]));
     getLexicon(id)

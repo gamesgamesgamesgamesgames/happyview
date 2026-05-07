@@ -697,8 +697,11 @@ export function bulkReindexDeadLetters(body: {
 }
 
 // Scripts (trigger-keyed)
-export function getScripts() {
-  return apiFetch<Script[]>("/admin/scripts")
+export function getScripts(opts?: { suffix?: string }) {
+  const params = new URLSearchParams();
+  if (opts?.suffix) params.set("suffix", opts.suffix);
+  const qs = params.toString();
+  return apiFetch<Script[]>(`/admin/scripts${qs ? `?${qs}` : ""}`)
 }
 
 export function getScript(id: string) {
