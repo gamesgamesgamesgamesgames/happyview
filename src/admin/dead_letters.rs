@@ -791,9 +791,13 @@ async fn mark_resolved(
         DeadLetterSource::Scripts => q.bind(id.parse::<i64>().unwrap_or(0)),
         DeadLetterSource::LegacyHooks => q.bind(id),
     };
-    q.execute(&state.db)
+    let result = q
+        .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to mark dead letter resolved: {e}")))?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!("dead letter '{id}' not found")));
+    }
     Ok(())
 }
 
