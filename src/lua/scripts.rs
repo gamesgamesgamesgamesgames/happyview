@@ -360,13 +360,15 @@ pub async fn run_record_event_script(
 
     write_dead_letter(
         state,
-        &resolved,
-        "record",
-        &host_id,
-        &event_payload,
-        &last_error,
-        MAX_ATTEMPTS,
-        Some(payload.nsid),
+        &DeadLetterEntry {
+            script: &resolved,
+            host_kind: "record",
+            host_id: &host_id,
+            payload: &event_payload,
+            error: &last_error,
+            attempts: MAX_ATTEMPTS,
+            collection: Some(payload.nsid),
+        },
     )
     .await;
     log_event(
@@ -557,13 +559,15 @@ pub async fn run_label_applied_script(
         .filter(|s| *s != "_actor");
     write_dead_letter(
         state,
-        &resolved,
-        "label",
-        &host_id,
-        &payload,
-        &last_error,
-        MAX_ATTEMPTS,
-        collection,
+        &DeadLetterEntry {
+            script: &resolved,
+            host_kind: "label",
+            host_id: &host_id,
+            payload: &payload,
+            error: &last_error,
+            attempts: MAX_ATTEMPTS,
+            collection,
+        },
     )
     .await;
     LabelHookOutcome::Continue(original)
@@ -761,18 +765,18 @@ async fn load_env_vars(
         .collect()
 }
 
-/// Persist a permanently-failed run for later admin triage.
-async fn write_dead_letter(
-    state: &AppState,
-    script: &ResolvedScript,
-    host_kind: &str,
-    host_id: &str,
-    payload: &Value,
-    error: &str,
+struct DeadLetterEntry<'a> {
+    script: &'a ResolvedScript,
+    host_kind: &'a str,
+    host_id: &'a str,
+    payload: &'a Value,
+    error: &'a str,
     attempts: u32,
-    collection: Option<&str>,
-) {
-    let payload_str = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
+    collection: Option<&'a str>,
+}
+
+async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
+    let payload_str = serde_json::to_string(entry.payload).unwrap_or_else(|_| "{}".to_string());
     let sql = adapt_sql(
         "INSERT INTO dead_letter_scripts
             (script_ref, host_kind, host_id, payload, error, attempts, created_at, collection)
@@ -780,21 +784,21 @@ async fn write_dead_letter(
         state.db_backend,
     );
     if let Err(e) = sqlx::query(&sql)
-        .bind(script.id.as_str())
-        .bind(host_kind)
-        .bind(host_id)
+        .bind(entry.script.id.as_str())
+        .bind(entry.host_kind)
+        .bind(entry.host_id)
         .bind(&payload_str)
-        .bind(error)
-        .bind(attempts as i64)
+        .bind(entry.error)
+        .bind(entry.attempts as i64)
         .bind(now_rfc3339())
-        .bind(collection)
+        .bind(entry.collection)
         .execute(&state.db)
         .await
     {
         tracing::error!(
-            host_kind,
-            host_id,
-            trigger = %script.id,
+            host_kind = entry.host_kind,
+            host_id = entry.host_id,
+            trigger = %entry.script.id,
             "failed to write dead_letter_scripts: {e}"
         );
     }
