@@ -478,17 +478,17 @@ async fn list_scripts(
     let summaries: Vec<DeadLetterSummary> = rows
         .into_iter()
         .map(|row| {
-            summary_from_scripts_row(
-                &row.0.to_string(),
-                &row.1,
-                &row.2,
-                &row.3,
-                &row.4,
-                &row.5,
-                row.6,
-                &row.7,
-                row.8.as_deref(),
-            )
+            summary_from_scripts_row(&ScriptsDeadLetterRow {
+                id: row.0.to_string(),
+                script_ref: row.1,
+                host_kind: row.2,
+                host_id: row.3,
+                payload: row.4,
+                error: row.5,
+                attempts: row.6,
+                created_at: row.7,
+                resolved_at: row.8,
+            })
         })
         .collect();
 
@@ -505,18 +505,30 @@ async fn list_scripts(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn summary_from_scripts_row(
-    id: &str,
-    script_ref: &str,
-    host_kind: &str,
-    host_id: &str,
-    payload: &str,
-    error: &str,
+struct ScriptsDeadLetterRow {
+    id: String,
+    script_ref: String,
+    host_kind: String,
+    host_id: String,
+    payload: String,
+    error: String,
     attempts: i64,
-    created_at: &str,
-    resolved_at: Option<&str>,
-) -> DeadLetterSummary {
+    created_at: String,
+    resolved_at: Option<String>,
+}
+
+fn summary_from_scripts_row(row: &ScriptsDeadLetterRow) -> DeadLetterSummary {
+    let ScriptsDeadLetterRow {
+        id,
+        script_ref,
+        host_kind,
+        host_id,
+        payload,
+        error,
+        attempts,
+        created_at,
+        resolved_at,
+    } = row;
     let payload_v: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
     let s = |key: &str| {
         payload_v
@@ -526,21 +538,16 @@ fn summary_from_scripts_row(
             .to_string()
     };
 
-    // Map the trigger-keyed payload onto the legacy DeadLetterSummary
-    // shape. Record-event dead letters fit cleanly. Label-arrival dead
-    // letters reuse the slots: did = labeler DID (host_id), action =
-    // "label", rkey = label.val, collection extracted from the trigger
-    // suffix when possible.
-    let (lexicon_id, collection, did, rkey, action) = match host_kind {
+    let (lexicon_id, collection, did, rkey, action) = match host_kind.as_str() {
         "label" => {
             let collection_from_trigger = script_ref
                 .split_once(':')
                 .map(|(_, suf)| suf.to_string())
                 .unwrap_or_default();
             (
-                script_ref.to_string(),
+                script_ref.clone(),
                 collection_from_trigger,
-                host_id.to_string(),
+                host_id.clone(),
                 s("val"),
                 "label".to_string(),
             )
@@ -555,17 +562,17 @@ fn summary_from_scripts_row(
     };
 
     DeadLetterSummary {
-        id: id.to_string(),
+        id: id.clone(),
         lexicon_id,
         uri: s("uri"),
         did,
         collection,
         rkey,
         action,
-        error: error.to_string(),
-        attempts,
+        error: error.clone(),
+        attempts: *attempts,
         created_at: parse_dt(created_at),
-        resolved_at: resolved_at.map(parse_dt),
+        resolved_at: resolved_at.as_deref().map(parse_dt),
     }
 }
 
@@ -645,26 +652,26 @@ async fn detail_scripts(state: &AppState, id: &str) -> Result<DeadLetterDetail, 
         .map_err(|e| AppError::Internal(format!("failed to fetch dead letter: {e}")))?
         .ok_or_else(|| AppError::NotFound(format!("dead letter {id} not found")))?;
 
-    let summary = summary_from_scripts_row(
-        &row.0.to_string(),
-        &row.1,
-        &row.2,
-        &row.3,
-        &row.4,
-        &row.5,
-        row.6,
-        &row.7,
-        row.8.as_deref(),
-    );
+    let scripts_row = ScriptsDeadLetterRow {
+        id: row.0.to_string(),
+        script_ref: row.1,
+        host_kind: row.2,
+        host_id: row.3,
+        payload: row.4,
+        error: row.5,
+        attempts: row.6,
+        created_at: row.7,
+        resolved_at: row.8,
+    };
 
-    let payload_v: Value = serde_json::from_str(&row.4).unwrap_or(Value::Null);
-    // For record events the original record body lives at `payload.record`.
-    // For label events the entire payload is the event; surface it whole.
-    let record = if row.2 == "label" {
+    let payload_v: Value = serde_json::from_str(&scripts_row.payload).unwrap_or(Value::Null);
+    let record = if scripts_row.host_kind == "label" {
         Some(payload_v.clone())
     } else {
         payload_v.get("record").cloned()
     };
+
+    let summary = summary_from_scripts_row(&scripts_row);
 
     Ok(DeadLetterDetail { summary, record })
 }
