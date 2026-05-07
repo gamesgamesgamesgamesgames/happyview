@@ -366,6 +366,7 @@ pub async fn run_record_event_script(
         &event_payload,
         &last_error,
         MAX_ATTEMPTS,
+        Some(payload.nsid),
     )
     .await;
     log_event(
@@ -549,6 +550,11 @@ pub async fn run_label_applied_script(
             }
         }
     }
+    let collection = resolved
+        .id
+        .split_once(':')
+        .map(|(_, suf)| suf)
+        .filter(|s| *s != "_actor");
     write_dead_letter(
         state,
         &resolved,
@@ -557,6 +563,7 @@ pub async fn run_label_applied_script(
         &payload,
         &last_error,
         MAX_ATTEMPTS,
+        collection,
     )
     .await;
     LabelHookOutcome::Continue(original)
@@ -763,12 +770,13 @@ async fn write_dead_letter(
     payload: &Value,
     error: &str,
     attempts: u32,
+    collection: Option<&str>,
 ) {
     let payload_str = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
     let sql = adapt_sql(
         "INSERT INTO dead_letter_scripts
-            (script_ref, host_kind, host_id, payload, error, attempts, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (script_ref, host_kind, host_id, payload, error, attempts, created_at, collection)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         state.db_backend,
     );
     if let Err(e) = sqlx::query(&sql)
@@ -779,6 +787,7 @@ async fn write_dead_letter(
         .bind(error)
         .bind(attempts as i64)
         .bind(now_rfc3339())
+        .bind(collection)
         .execute(&state.db)
         .await
     {

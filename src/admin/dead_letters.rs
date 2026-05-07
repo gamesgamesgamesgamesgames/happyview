@@ -77,6 +77,7 @@ pub struct ListQuery {
 
 #[derive(Deserialize)]
 pub struct CountQuery {
+    pub collection: Option<String>,
     pub resolved: Option<String>,
 }
 
@@ -208,16 +209,26 @@ pub(super) async fn count(
         _ => "",
     };
 
+    let collection_clause = if query.collection.is_some() {
+        " AND collection = ?"
+    } else {
+        ""
+    };
+
     let mut total: i64 = 0;
     for table in [
         DeadLetterSource::LegacyHooks.table(),
         DeadLetterSource::Scripts.table(),
     ] {
         let sql = adapt_sql(
-            &format!("SELECT COUNT(*) FROM {table} WHERE 1=1{resolved_clause}"),
+            &format!("SELECT COUNT(*) FROM {table} WHERE 1=1{resolved_clause}{collection_clause}"),
             backend,
         );
-        let (n,): (i64,) = sqlx::query_as(&sql)
+        let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+        if let Some(ref c) = query.collection {
+            q = q.bind(c);
+        }
+        let (n,) = q
             .fetch_one(&state.db)
             .await
             .map_err(|e| AppError::Internal(format!("failed to count dead letters: {e}")))?;
@@ -285,23 +296,15 @@ pub(super) async fn bulk_dismiss(
     let now = now_rfc3339();
 
     if body.all == Some(true) {
-        // Operate against both tables. Collection filter only applies
-        // to legacy rows (the new `dead_letter_scripts` doesn't have a
-        // collection column — to filter by collection there we'd need
-        // to JSON-parse `payload`, which is portable-SQL pain. Good
-        // enough: legacy table is the one with bulk-by-collection
-        // history anyway.).
         for source in [DeadLetterSource::LegacyHooks, DeadLetterSource::Scripts] {
             let table = source.table();
             let mut sql = format!("UPDATE {table} SET resolved_at = ? WHERE resolved_at IS NULL");
-            let collection_filter =
-                source == DeadLetterSource::LegacyHooks && body.collection.is_some();
-            if collection_filter {
+            if body.collection.is_some() {
                 sql.push_str(" AND collection = ?");
             }
             let sql = adapt_sql(&sql, backend);
             let mut q = sqlx::query(&sql).bind(&now);
-            if collection_filter && let Some(ref c) = body.collection {
+            if let Some(ref c) = body.collection {
                 q = q.bind(c);
             }
             q.execute(&state.db)
@@ -444,6 +447,9 @@ async fn list_scripts(
         "true" => sql.push_str(" AND resolved_at IS NOT NULL"),
         _ => {}
     }
+    if collection.is_some() {
+        sql.push_str(" AND collection = ?");
+    }
     if cursor.is_some() {
         sql.push_str(" AND created_at < ?");
     }
@@ -465,6 +471,9 @@ async fn list_scripts(
             Option<String>,
         ),
     >(&sql);
+    if let Some(c) = collection {
+        q = q.bind(c);
+    }
     if let Some(cur) = cursor {
         q = q.bind(cur);
     }
@@ -475,7 +484,7 @@ async fn list_scripts(
         .await
         .map_err(|e| AppError::Internal(format!("failed to query scripts dead letters: {e}")))?;
 
-    let summaries: Vec<DeadLetterSummary> = rows
+    Ok(rows
         .into_iter()
         .map(|row| {
             summary_from_scripts_row(&ScriptsDeadLetterRow {
@@ -490,19 +499,7 @@ async fn list_scripts(
                 resolved_at: row.8,
             })
         })
-        .collect();
-
-    // Filter by collection in Rust since the column lives inside
-    // `payload`. Negligible cost — already client-side after the
-    // unfiltered DB fetch.
-    Ok(if let Some(want) = collection {
-        summaries
-            .into_iter()
-            .filter(|s| s.collection == want)
-            .collect()
-    } else {
-        summaries
-    })
+        .collect())
 }
 
 struct ScriptsDeadLetterRow {
@@ -845,18 +842,18 @@ async fn resolve_bulk_ids(state: &AppState, body: &BulkRequest) -> Result<Vec<St
             .map_err(|e| AppError::Internal(format!("failed to resolve bulk ids: {e}")))?;
         ids.extend(rows.into_iter().map(|r| r.0));
 
-        // New table — collection isn't a column; if a filter was
-        // requested, only include rows whose payload.collection matches.
-        // Simpler to just include all unresolved when no collection
-        // filter is set, and skip the new table entirely when one is
-        // (the legacy table is the one historically pinned to a
-        // collection anyway).
-        if body.collection.is_none() {
-            let sql = adapt_sql(
-                "SELECT id FROM dead_letter_scripts WHERE resolved_at IS NULL",
-                backend,
-            );
-            let rows = sqlx::query_as::<_, (i64,)>(&sql)
+        {
+            let mut sql =
+                String::from("SELECT id FROM dead_letter_scripts WHERE resolved_at IS NULL");
+            if body.collection.is_some() {
+                sql.push_str(" AND collection = ?");
+            }
+            let sql = adapt_sql(&sql, backend);
+            let mut q = sqlx::query_as::<_, (i64,)>(&sql);
+            if let Some(ref c) = body.collection {
+                q = q.bind(c);
+            }
+            let rows = q
                 .fetch_all(&state.db)
                 .await
                 .map_err(|e| AppError::Internal(format!("failed to resolve bulk ids: {e}")))?;
