@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 
 import { MonacoEditor } from "@/components/monaco-editor";
 import { Badge } from "@/components/ui/badge";
@@ -206,18 +206,16 @@ function TriggerComposer({
     [state.suffix, lexicons],
   );
 
-  // If the current kind doesn't match the actions valid for the current
-  // suffix (e.g. user just switched lexicon, the old kind is invalid),
-  // snap to the first available action.
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
   useEffect(() => {
     if (actions.length === 0) return;
-    if (!actions.some((a) => a.kind === state.kind)) {
-      onChange({ ...state, kind: actions[0].kind });
+    const current = stateRef.current;
+    if (!actions.some((a) => a.kind === current.kind)) {
+      onChange({ ...current, kind: actions[0].kind });
     }
-    // We deliberately omit `state` from deps to avoid re-running when
-    // the user edits other fields (description / body).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [actions, state.suffix]);
+  }, [actions, onChange]);
 
   function handleSuffixChange(next: string) {
     // Pre-snap kind so the resolved trigger id badge updates immediately
