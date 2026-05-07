@@ -540,7 +540,26 @@ pub async fn run_label_applied_script(
             tokio::time::sleep(delay).await;
         }
         match run_label_lua_once(state, &resolved, &event).await {
-            Ok(outcome) => return outcome,
+            Ok(outcome) => {
+                log_event(
+                    &state.db,
+                    EventLog {
+                        event_type: "script.executed".to_string(),
+                        severity: Severity::Info,
+                        actor_did: None,
+                        subject: Some(event.uri.clone()),
+                        detail: serde_json::json!({
+                            "host_kind": "label",
+                            "host_id": host_id,
+                            "trigger": resolved.id,
+                            "attempts": attempt + 1,
+                        }),
+                    },
+                    state.db_backend,
+                )
+                .await;
+                return outcome;
+            }
             Err(e) => {
                 last_error = e;
                 tracing::warn!(
@@ -568,6 +587,23 @@ pub async fn run_label_applied_script(
             attempts: MAX_ATTEMPTS,
             collection,
         },
+    )
+    .await;
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "script.dead_lettered".to_string(),
+            severity: Severity::Error,
+            actor_did: None,
+            subject: Some(event.uri.clone()),
+            detail: serde_json::json!({
+                "host_kind": "label",
+                "host_id": host_id,
+                "trigger": resolved.id,
+                "error": last_error,
+            }),
+        },
+        state.db_backend,
     )
     .await;
     LabelHookOutcome::Continue(original)
