@@ -298,8 +298,6 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
                 target_collection.clone(),
                 ProcedureAction::Upsert,
                 None,
-                None,
-                None,
             ) {
                 Ok(p) => p,
                 Err(e) => {

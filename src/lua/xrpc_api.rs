@@ -332,7 +332,7 @@ mod tests {
         .unwrap();
     }
 
-    fn make_query_lexicon(id: &str, script: Option<&str>) -> ParsedLexicon {
+    fn make_query_lexicon(id: &str) -> ParsedLexicon {
         ParsedLexicon {
             id: id.to_string(),
             lexicon_type: LexiconType::Query,
@@ -345,14 +345,12 @@ mod tests {
             revision: 1,
             target_collection: None,
             action: ProcedureAction::Create,
-            script: script.map(|s| s.to_string()),
-            index_hook: None,
             token_cost: None,
             space_type: None,
         }
     }
 
-    fn make_procedure_lexicon(id: &str, script: Option<&str>) -> ParsedLexicon {
+    fn make_procedure_lexicon(id: &str) -> ParsedLexicon {
         ParsedLexicon {
             id: id.to_string(),
             lexicon_type: LexiconType::Procedure,
@@ -365,8 +363,6 @@ mod tests {
             revision: 1,
             target_collection: None,
             action: ProcedureAction::Create,
-            script: script.map(|s| s.to_string()),
-            index_hook: None,
             token_cost: None,
             space_type: None,
         }
@@ -459,7 +455,7 @@ mod tests {
         let state = test_state();
 
         // Register a scripted query that returns a static response
-        let lexicon = make_query_lexicon("test.echo", None);
+        let lexicon = make_query_lexicon("test.echo");
         state.lexicons.upsert(lexicon).await;
         seed_script(
             &state,
@@ -484,7 +480,7 @@ mod tests {
     async fn query_local_script_receives_params() {
         let state = test_state();
 
-        let lexicon = make_query_lexicon("test.greet", None);
+        let lexicon = make_query_lexicon("test.greet");
         state.lexicons.upsert(lexicon).await;
         seed_script(
             &state,
@@ -513,7 +509,7 @@ mod tests {
     async fn query_local_script_receives_caller_did() {
         let state = test_state();
 
-        let lexicon = make_query_lexicon("test.whoami", None);
+        let lexicon = make_query_lexicon("test.whoami");
         state.lexicons.upsert(lexicon).await;
         seed_script(
             &state,
@@ -558,7 +554,7 @@ mod tests {
     async fn query_rejects_procedure_lexicon() {
         let state = test_state();
 
-        let lexicon = make_procedure_lexicon("test.create", None);
+        let lexicon = make_procedure_lexicon("test.create");
         state.lexicons.upsert(lexicon).await;
 
         let mut params = HashMap::new();
@@ -572,7 +568,7 @@ mod tests {
     async fn procedure_rejects_query_lexicon() {
         let state = test_state();
 
-        let lexicon = make_query_lexicon("test.echo", Some("function handle() end"));
+        let lexicon = make_query_lexicon("test.echo");
         state.lexicons.upsert(lexicon).await;
 
         let claims = Claims::internal("did:plc:test".into());
@@ -593,7 +589,7 @@ mod tests {
         let state = test_state();
 
         // Register a simple query that the outer script will call
-        let inner_lexicon = make_query_lexicon("test.inner", None);
+        let inner_lexicon = make_query_lexicon("test.inner");
         state.lexicons.upsert(inner_lexicon).await;
         seed_script(
             &state,

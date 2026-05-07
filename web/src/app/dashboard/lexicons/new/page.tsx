@@ -9,8 +9,7 @@ import {
   uploadLexicon,
 } from "@/lib/api";
 import { resolveNsid } from "@/lib/nsid";
-import { LEXICON_TEMPLATE, procedureScript, queryScript } from "@/lib/lua-templates";
-import { useLuaCompletions } from "@/hooks/use-lua-completions";
+import { LEXICON_TEMPLATE } from "@/lib/lua-templates";
 import { CodePanels } from "@/components/code-panels";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
@@ -35,12 +34,7 @@ export default function AddLexiconPage() {
   // Local state
   const [json, setJson] = useState(LEXICON_TEMPLATE);
   const [localTargetCollection, setLocalTargetCollection] = useState("");
-  const [script, setScript] = useState("");
   const [backfill, setBackfill] = useState(true);
-  const scriptManuallyEdited = useRef(false);
-
-  // Collections for Record() completions and record schemas
-  const { luaCompletions, collections } = useLuaCompletions(json);
 
   // Network state
   const [nsid, setNsid] = useState("");
@@ -64,28 +58,9 @@ export default function AddLexiconPage() {
 
   const showLocalTargetCollection =
     localMainType === "query" || localMainType === "procedure";
-  const showScript = localMainType === "query" || localMainType === "procedure";
-
-  // Auto-generate script when type or target collection changes
-  useEffect(() => {
-    if (scriptManuallyEdited.current) return;
-    if (localMainType === "procedure") {
-      setScript(procedureScript(localTargetCollection));
-    } else if (localMainType === "query") {
-      setScript(queryScript(localTargetCollection));
-    }
-  }, [localMainType, localTargetCollection]);
-
-  function handleScriptChange(value: string) {
-    scriptManuallyEdited.current = true;
-    setScript(value);
-  }
-
-  // Reset manual-edit flag when type changes
   const prevType = useRef(localMainType);
   useEffect(() => {
     if (prevType.current !== localMainType) {
-      scriptManuallyEdited.current = false;
       prevType.current = localMainType;
     }
   }, [localMainType]);
@@ -133,7 +108,6 @@ export default function AddLexiconPage() {
       await uploadLexicon({
         lexicon_json: lexiconJson,
         backfill: localMainType === "record" && backfill,
-        script: showScript && script ? script : undefined,
       });
       router.push("/dashboard/lexicons");
     } catch (e: unknown) {
@@ -205,10 +179,6 @@ export default function AddLexiconPage() {
                 className="flex-1 min-h-0"
                 jsonValue={json}
                 onJsonChange={setJson}
-                luaValue={showScript ? script : undefined}
-                onLuaChange={showScript ? handleScriptChange : undefined}
-                luaCompletions={showScript ? luaCompletions : undefined}
-                collections={showScript ? collections : undefined}
               />
             </div>
 

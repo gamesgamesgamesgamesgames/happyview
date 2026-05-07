@@ -375,8 +375,6 @@ mod tests {
             None,
             crate::lexicon::ProcedureAction::Upsert,
             None,
-            None,
-            None,
         )
         .unwrap();
         reg.upsert(parsed).await;
@@ -435,8 +433,6 @@ mod tests {
             None,
             crate::lexicon::ProcedureAction::Upsert,
             None,
-            None,
-            None,
         )
         .unwrap();
         reg.upsert(parsed).await;
@@ -486,8 +482,6 @@ mod tests {
             1,
             None,
             crate::lexicon::ProcedureAction::Upsert,
-            None,
-            None,
             None,
         )
         .unwrap();

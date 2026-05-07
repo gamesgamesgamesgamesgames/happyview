@@ -60,39 +60,24 @@ pub(super) async fn upload_lexicon(
         1,
         body.target_collection.clone(),
         action.clone(),
-        body.script.clone(),
-        body.index_hook.clone(),
         body.token_cost.map(|c| c as u32),
     )
     .map_err(|e| AppError::BadRequest(format!("failed to parse lexicon: {e}")))?;
 
-    // Validate script if provided
-    if let Some(ref script) = body.script {
-        crate::lua::validate_script(script).map_err(AppError::BadRequest)?;
-    }
-
-    // Validate index_hook if provided
-    if let Some(ref script) = body.index_hook {
-        crate::lua::validate_script(script).map_err(AppError::BadRequest)?;
-    }
-
     let action_str = action.to_optional_str();
-    let has_script = body.script.is_some();
     let lexicon_json_str = serde_json::to_string(&body.lexicon_json).unwrap_or_default();
     let now = now_rfc3339();
 
     // Upsert into database
     let sql = adapt_sql(
         r#"
-        INSERT INTO lexicons (id, lexicon_json, backfill, target_collection, action, script, index_hook, token_cost, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)
+        INSERT INTO lexicons (id, lexicon_json, backfill, target_collection, action, token_cost, source, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'manual', ?)
         ON CONFLICT (id) DO UPDATE SET
             lexicon_json = EXCLUDED.lexicon_json,
             backfill = EXCLUDED.backfill,
             target_collection = EXCLUDED.target_collection,
             action = EXCLUDED.action,
-            script = EXCLUDED.script,
-            index_hook = EXCLUDED.index_hook,
             token_cost = EXCLUDED.token_cost,
             source = 'manual',
             revision = lexicons.revision + 1,
@@ -107,8 +92,6 @@ pub(super) async fn upload_lexicon(
         .bind(if body.backfill { 1_i32 } else { 0_i32 })
         .bind(&body.target_collection)
         .bind(action_str)
-        .bind(&body.script)
-        .bind(&body.index_hook)
         .bind(body.token_cost)
         .bind(&now)
         .bind(&now)
@@ -124,8 +107,6 @@ pub(super) async fn upload_lexicon(
         revision,
         body.target_collection,
         action,
-        body.script,
-        body.index_hook.clone(),
         body.token_cost.map(|c| c as u32),
     )
     .map_err(|e| AppError::Internal(format!("failed to re-parse lexicon: {e}")))?;
@@ -156,8 +137,6 @@ pub(super) async fn upload_lexicon(
             subject: Some(id.clone()),
             detail: serde_json::json!({
                 "revision": revision,
-                "has_script": has_script,
-                "has_index_hook": body.index_hook.is_some(),
                 "source": "manual",
             }),
         },
@@ -182,7 +161,7 @@ pub(super) async fn list_lexicons(
     auth.require(Permission::LexiconsRead).await?;
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT id, revision, lexicon_json, backfill, action, target_collection, script, index_hook, source, authority_did, last_fetched_at, created_at, updated_at, token_cost FROM lexicons ORDER BY id",
+        "SELECT id, revision, lexicon_json, backfill, action, target_collection, source, authority_did, last_fetched_at, created_at, updated_at, token_cost FROM lexicons ORDER BY id",
         backend,
     );
     #[allow(clippy::type_complexity)]
@@ -191,8 +170,6 @@ pub(super) async fn list_lexicons(
         i32,
         String,
         i32,
-        Option<String>,
-        Option<String>,
         Option<String>,
         Option<String>,
         String,
@@ -216,8 +193,6 @@ pub(super) async fn list_lexicons(
                 backfill,
                 action,
                 target_collection,
-                script,
-                index_hook,
                 source,
                 authority_did,
                 last_fetched_at,
@@ -226,15 +201,8 @@ pub(super) async fn list_lexicons(
                 token_cost,
             )| {
                 let json: Value = serde_json::from_str(&json_str).unwrap_or_default();
-                let parsed = ParsedLexicon::parse(
-                    json,
-                    revision,
-                    None,
-                    ProcedureAction::Upsert,
-                    None,
-                    None,
-                    None,
-                );
+                let parsed =
+                    ParsedLexicon::parse(json, revision, None, ProcedureAction::Upsert, None);
                 let lexicon_type = parsed
                     .as_ref()
                     .map(|p| format!("{:?}", p.lexicon_type).to_lowercase())
@@ -251,8 +219,6 @@ pub(super) async fn list_lexicons(
                     backfill: backfill != 0,
                     action,
                     target_collection,
-                    has_script: script.is_some(),
-                    has_index_hook: index_hook.is_some(),
                     source,
                     authority_did,
                     last_fetched_at,
@@ -277,7 +243,7 @@ pub(super) async fn get_lexicon(
     auth.require(Permission::LexiconsRead).await?;
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT id, revision, lexicon_json, backfill, action, target_collection, script, index_hook, source, authority_did, last_fetched_at, created_at, updated_at, token_cost FROM lexicons WHERE id = ?",
+        "SELECT id, revision, lexicon_json, backfill, action, target_collection, source, authority_did, last_fetched_at, created_at, updated_at, token_cost FROM lexicons WHERE id = ?",
         backend,
     );
     #[allow(clippy::type_complexity)]
@@ -286,8 +252,6 @@ pub(super) async fn get_lexicon(
         i32,
         String,
         i32,
-        Option<String>,
-        Option<String>,
         Option<String>,
         Option<String>,
         String,
@@ -309,8 +273,6 @@ pub(super) async fn get_lexicon(
         backfill,
         action,
         target_collection,
-        script,
-        index_hook,
         source,
         authority_did,
         last_fetched_at,
@@ -327,13 +289,9 @@ pub(super) async fn get_lexicon(
         None,
         ProcedureAction::Upsert,
         None,
-        None,
-        None,
     )
     .map(|p| format!("{:?}", p.lexicon_type).to_lowercase())
     .unwrap_or_else(|_| "unknown".into());
-
-    let has_script = script.is_some();
 
     Ok(Json(serde_json::json!({
         "id": id,
@@ -343,10 +301,6 @@ pub(super) async fn get_lexicon(
         "backfill": backfill != 0,
         "action": action,
         "target_collection": target_collection,
-        "has_script": has_script,
-        "script": script,
-        "has_index_hook": index_hook.is_some(),
-        "index_hook": index_hook,
         "source": source,
         "authority_did": authority_did,
         "last_fetched_at": last_fetched_at,

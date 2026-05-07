@@ -150,20 +150,6 @@ export default function LexiconsPage() {
         enableSorting: true,
       },
       {
-        id: "has_script",
-        accessorKey: "has_script",
-        header: ({ column }) => (
-          <DataTableColumnHeader column={column} label="Script" />
-        ),
-        cell: ({ row }) =>
-          row.original.has_script ? (
-            <Badge variant="secondary">Lua</Badge>
-          ) : (
-            "--"
-          ),
-        enableSorting: true,
-      },
-      {
         id: "backfill",
         accessorKey: "backfill",
         header: ({ column }) => (

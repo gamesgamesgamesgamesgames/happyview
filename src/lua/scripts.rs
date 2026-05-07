@@ -415,8 +415,7 @@ pub async fn run_record_event_once(
     register_default_apis(&lua, &state_arc, &script.id, Some(payload.did))?;
 
     // Legacy globals (action, uri, did, collection, rkey, record) for
-    // back-compat with scripts written against the old `index_hook`
-    // surface.
+    // convenience / backwards compatibility.
     context::set_hook_context(
         &lua,
         payload.action,

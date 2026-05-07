@@ -79,10 +79,6 @@ pub struct ParsedLexicon {
     pub target_collection: Option<String>,
     /// For procedures: the action this procedure performs (create, update, delete, upsert).
     pub action: ProcedureAction,
-    /// Optional Lua script that replaces the built-in handler.
-    pub script: Option<String>,
-    /// Optional Lua script that runs when a record in this collection is indexed.
-    pub index_hook: Option<String>,
     /// Optional per-NSID token cost for rate limiting.
     pub token_cost: Option<u32>,
     /// Optional space type NSID indicating this lexicon is designed for use within spaces of that type.
@@ -96,8 +92,6 @@ impl ParsedLexicon {
         revision: i32,
         target_collection: Option<String>,
         action: ProcedureAction,
-        script: Option<String>,
-        index_hook: Option<String>,
         token_cost: Option<u32>,
     ) -> Result<Self, String> {
         let id = raw
@@ -146,8 +140,6 @@ impl ParsedLexicon {
             revision,
             target_collection,
             action,
-            script,
-            index_hook,
             token_cost,
             space_type,
         })
@@ -182,11 +174,9 @@ impl LexiconRegistry {
             i32,
             Option<String>,
             Option<String>,
-            Option<String>,
-            Option<String>,
             Option<i32>,
         )> = sqlx::query_as(
-            "SELECT id, lexicon_json, revision, target_collection, action, script, index_hook, token_cost FROM lexicons",
+            "SELECT id, lexicon_json, revision, target_collection, action, token_cost FROM lexicons",
         )
         .fetch_all(db)
         .await
@@ -196,17 +186,7 @@ impl LexiconRegistry {
         inner.clear();
 
         let mut loaded = 0u32;
-        for (
-            id,
-            json_str,
-            revision,
-            target_collection,
-            action_str,
-            script,
-            index_hook,
-            token_cost,
-        ) in rows
-        {
+        for (id, json_str, revision, target_collection, action_str, token_cost) in rows {
             let json: Value = match serde_json::from_str(&json_str) {
                 Ok(v) => v,
                 Err(e) => {
@@ -226,8 +206,6 @@ impl LexiconRegistry {
                 revision,
                 target_collection,
                 action,
-                script,
-                index_hook,
                 token_cost.map(|c| c as u32),
             ) {
                 Ok(parsed) => {
@@ -290,12 +268,6 @@ impl LexiconRegistry {
             .filter(|lex| lex.lexicon_type == LexiconType::Procedure)
             .map(|lex| lex.id.clone())
             .collect()
-    }
-
-    /// Get the index_hook for a record-type lexicon by its collection NSID.
-    pub async fn get_index_hook(&self, collection: &str) -> Option<String> {
-        let inner = self.inner.read().await;
-        inner.get(collection).and_then(|lex| lex.index_hook.clone())
     }
 
     /// Return the total count of registered lexicons.
@@ -393,8 +365,6 @@ mod tests {
             None,
             ProcedureAction::Upsert,
             None,
-            None,
-            None,
         )
         .unwrap();
         assert_eq!(parsed.id, "games.gamesgamesgamesgames.game");
@@ -412,8 +382,6 @@ mod tests {
             2,
             Some("games.gamesgamesgamesgames.game".into()),
             ProcedureAction::Upsert,
-            None,
-            None,
             None,
         )
         .unwrap();
@@ -435,8 +403,6 @@ mod tests {
             None,
             ProcedureAction::Upsert,
             None,
-            None,
-            None,
         )
         .unwrap();
         assert_eq!(parsed.lexicon_type, LexiconType::Procedure);
@@ -452,8 +418,6 @@ mod tests {
             None,
             ProcedureAction::Delete,
             None,
-            None,
-            None,
         )
         .unwrap();
         assert_eq!(parsed.action, ProcedureAction::Delete);
@@ -467,8 +431,6 @@ mod tests {
             None,
             ProcedureAction::Upsert,
             None,
-            None,
-            None,
         )
         .unwrap();
         assert_eq!(parsed.lexicon_type, LexiconType::Definitions);
@@ -477,7 +439,7 @@ mod tests {
     #[test]
     fn parse_missing_id_returns_error() {
         let raw = json!({"lexicon": 1, "defs": {}});
-        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None, None, None);
+        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("id"));
     }
@@ -485,16 +447,8 @@ mod tests {
     #[test]
     fn parse_preserves_raw_json() {
         let raw = record_lexicon_json();
-        let parsed = ParsedLexicon::parse(
-            raw.clone(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let parsed =
+            ParsedLexicon::parse(raw.clone(), 1, None, ProcedureAction::Upsert, None).unwrap();
         assert_eq!(parsed.raw, raw);
     }
 
@@ -505,8 +459,6 @@ mod tests {
             1,
             Some("custom.collection".into()),
             ProcedureAction::Upsert,
-            None,
-            None,
             None,
         )
         .unwrap();
@@ -532,8 +484,6 @@ mod tests {
             None,
             ProcedureAction::Upsert,
             None,
-            None,
-            None,
         )
         .unwrap();
         reg.upsert(parsed).await;
@@ -552,8 +502,6 @@ mod tests {
             None,
             ProcedureAction::Upsert,
             None,
-            None,
-            None,
         )
         .unwrap();
         reg.upsert(v1).await;
@@ -563,8 +511,6 @@ mod tests {
             5,
             None,
             ProcedureAction::Upsert,
-            None,
-            None,
             None,
         )
         .unwrap();
@@ -588,8 +534,6 @@ mod tests {
             1,
             None,
             ProcedureAction::Upsert,
-            None,
-            None,
             None,
         )
         .unwrap();
@@ -621,27 +565,16 @@ mod tests {
             None,
             ProcedureAction::Upsert,
             None,
-            None,
-            None,
         )
         .unwrap();
-        let query = ParsedLexicon::parse(
-            query_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let query =
+            ParsedLexicon::parse(query_lexicon_json(), 1, None, ProcedureAction::Upsert, None)
+                .unwrap();
         let procedure = ParsedLexicon::parse(
             procedure_lexicon_json(),
             1,
             None,
             ProcedureAction::Upsert,
-            None,
-            None,
             None,
         )
         .unwrap();
@@ -650,8 +583,6 @@ mod tests {
             1,
             None,
             ProcedureAction::Upsert,
-            None,
-            None,
             None,
         )
         .unwrap();
@@ -723,85 +654,6 @@ mod tests {
         assert_eq!(ProcedureAction::Upsert.to_optional_str(), None);
     }
 
-    // -----------------------------------------------------------------------
-    // index_hook
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_preserves_index_hook() {
-        let parsed = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-            Some("function handle() end".into()),
-            None,
-        )
-        .unwrap();
-        assert_eq!(parsed.index_hook, Some("function handle() end".into()));
-    }
-
-    #[test]
-    fn parse_index_hook_none_by_default() {
-        let parsed = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(parsed.index_hook.is_none());
-    }
-
-    #[tokio::test]
-    async fn registry_get_index_hook_returns_script() {
-        let reg = LexiconRegistry::new();
-        let parsed = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-            Some("function handle() log('hook') end".into()),
-            None,
-        )
-        .unwrap();
-        reg.upsert(parsed).await;
-
-        let script = reg.get_index_hook("games.gamesgamesgamesgames.game").await;
-        assert_eq!(script, Some("function handle() log('hook') end".into()));
-    }
-
-    #[tokio::test]
-    async fn registry_get_index_hook_returns_none_when_absent() {
-        let reg = LexiconRegistry::new();
-        let parsed = ParsedLexicon::parse(
-            record_lexicon_json(),
-            1,
-            None,
-            ProcedureAction::Upsert,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        reg.upsert(parsed).await;
-
-        let script = reg.get_index_hook("games.gamesgamesgamesgames.game").await;
-        assert!(script.is_none());
-    }
-
-    #[tokio::test]
-    async fn registry_get_index_hook_returns_none_for_unknown() {
-        let reg = LexiconRegistry::new();
-        let script = reg.get_index_hook("nonexistent").await;
-        assert!(script.is_none());
-    }
-
     #[test]
     fn parse_space_type_from_lexicon() {
         let raw = json!({
@@ -821,8 +673,7 @@ mod tests {
                 }
             }
         });
-        let parsed =
-            ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None, None, None).unwrap();
+        let parsed = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None).unwrap();
         assert_eq!(parsed.space_type.as_deref(), Some("com.example.forum"));
     }
 
@@ -833,8 +684,6 @@ mod tests {
             1,
             None,
             ProcedureAction::Upsert,
-            None,
-            None,
             None,
         )
         .unwrap();

@@ -44,11 +44,6 @@ export default function LexiconDetailPage() {
   const [deleting, setDeleting] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // Editable text state. The lexicon page used to edit `script` and
-  // `index_hook` columns inline via lua editors; those columns are
-  // now managed via the Scripts subsystem (see "Scripts targeting
-  // this lexicon" panel below). We pass the existing values through
-  // unchanged on save so legacy data isn't accidentally NULLed.
   const [jsonText, setJsonText] = useState("");
   const [originalJson, setOriginalJson] = useState("");
   const [tokenCost, setTokenCost] = useState("");
@@ -89,11 +84,6 @@ export default function LexiconDetailPage() {
       await uploadLexicon({
         lexicon_json: lexiconJson,
         backfill: lexicon.backfill,
-        // Preserve any legacy script / index_hook values verbatim — we
-        // no longer edit them here, but leaving them out of the body
-        // would NULL the columns on upsert and lose data.
-        script: lexicon.script ?? undefined,
-        index_hook: lexicon.index_hook ?? undefined,
         token_cost: tokenCost ? Number(tokenCost) : null,
       });
       load();
@@ -262,9 +252,7 @@ export default function LexiconDetailPage() {
 
         {/* JSON editor only — scripts (record-event handlers, XRPC
             handlers, label-arrival handlers) are managed via the
-            "Scripts targeting this lexicon" panel above. The legacy
-            `script` / `index_hook` columns on the lexicons table are
-            preserved as-is on save but no longer edited here. */}
+            "Scripts targeting this lexicon" panel above. */}
         <CodePanels
           className="flex-1 min-h-0 px-4 md:px-6"
           jsonValue={jsonText}

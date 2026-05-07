@@ -134,8 +134,6 @@ async fn main() {
                             target_collection.clone(),
                             ProcedureAction::Upsert,
                             None,
-                            None,
-                            None,
                         ) {
                             Ok(parsed) => {
                                 let now = db::now_rfc3339();

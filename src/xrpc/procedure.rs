@@ -19,8 +19,7 @@ pub(crate) async fn handle_procedure(
     lexicon: &crate::lexicon::ParsedLexicon,
 ) -> Result<Response, AppError> {
     // Trigger-keyed dispatch: a script bound at `xrpc.procedure:<id>`
-    // overrides the default PDS-write flow. The legacy `lexicon.script`
-    // column is no longer read.
+    // overrides the default PDS-write flow.
     let trigger = format!("xrpc.procedure:{}", lexicon.id);
     if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
         // Delegation guard preserved from origin/dev: scripts that run
