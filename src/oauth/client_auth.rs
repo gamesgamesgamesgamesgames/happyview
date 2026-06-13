@@ -212,6 +212,16 @@ pub async fn validate_scopes(
             }
         }
 
+        // The PDS also grants bare `repo:COLLECTION` scopes (without
+        // `?action=`).  Match if the expanded client set has any
+        // `repo:COLLECTION?action=...` entry for that collection.
+        if let Some(collection) = scope.strip_prefix("repo:") {
+            let prefix = format!("repo:{}?", collection);
+            if client_set.iter().any(|cs| cs.starts_with(&prefix)) {
+                continue;
+            }
+        }
+
         return Err(AppError::BadRequest(format!(
             "scope '{}' is not allowed for this client",
             scope
@@ -493,6 +503,51 @@ mod tests {
             &reg,
         )
         .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn validate_scopes_bare_repo_collection_allowed_with_expanded_permissions() {
+        let reg = empty_registry();
+        let raw = serde_json::json!({
+            "lexicon": 1,
+            "id": "com.example.authBasic",
+            "defs": {
+                "main": {
+                    "type": "permission-set",
+                    "permissions": [
+                        {
+                            "type": "permission",
+                            "resource": "repo",
+                            "collection": ["com.example.profile", "com.example.post"]
+                        }
+                    ]
+                }
+            }
+        });
+        let parsed = crate::lexicon::ParsedLexicon::parse(
+            raw,
+            1,
+            None,
+            crate::lexicon::ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        reg.upsert(parsed).await;
+
+        let result = validate_scopes(
+            "atproto repo:com.example.profile",
+            "atproto include:com.example.authBasic",
+            &reg,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_scopes_bare_repo_collection_rejected_without_permission() {
+        let reg = empty_registry();
+        let result = validate_scopes("atproto repo:com.example.secret", "atproto", &reg).await;
         assert!(result.is_err());
     }
 

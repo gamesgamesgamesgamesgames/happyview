@@ -99,7 +99,7 @@ export class HappyViewOAuthClient {
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
       throw new ApiError(
-        `Failed to provision DPoP key: ${resp.status} ${(body as any).message ?? resp.statusText}`,
+        `Failed to provision DPoP key: ${resp.status} ${(body as any).error ?? (body as any).message ?? resp.statusText}`,
         resp.status,
         body,
       );
@@ -149,7 +149,7 @@ export class HappyViewOAuthClient {
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
       throw new ApiError(
-        `Failed to register session: ${resp.status} ${(body as any).message ?? resp.statusText}`,
+        `Failed to register session: ${resp.status} ${(body as any).error ?? (body as any).message ?? resp.statusText}`,
         resp.status,
         body,
       );
@@ -203,7 +203,7 @@ export class HappyViewOAuthClient {
       if (!resp.ok && resp.status !== 404) {
         const body = await resp.json().catch(() => ({}));
         throw new ApiError(
-          `Failed to delete session: ${resp.status} ${(body as any).message ?? resp.statusText}`,
+          `Failed to delete session: ${resp.status} ${(body as any).error ?? (body as any).message ?? resp.statusText}`,
           resp.status,
           body,
         );
@@ -254,7 +254,7 @@ export class HappyViewOAuthClient {
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
       throw new ApiError(
-        `Failed to get session: ${resp.status} ${(body as any).message ?? resp.statusText}`,
+        `Failed to get session: ${resp.status} ${(body as any).error ?? (body as any).message ?? resp.statusText}`,
         resp.status,
         body,
       );
