@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: happyview
+      POSTGRES_PASSWORD: happyview
+      POSTGRES_DB: happyview_test
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./scripts/init-e2e-dbs.sql:/docker-entrypoint-initdb.d/init-e2e-dbs.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U happyview -d happyview_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  plc:
+    build:
+      context: https://github.com/did-method-plc/did-method-plc.git
+      dockerfile: packages/server/Dockerfile
+    environment:
+      DB_CREDS_JSON: '{"username":"happyview","password":"happyview","host":"postgres","port":"5432","database":"plc"}'
+      ENABLE_MIGRATIONS: "true"
+      DB_MIGRATE_CREDS_JSON: '{"username":"happyview","password":"happyview","host":"postgres","port":"5432","database":"plc"}'
+      PORT: "2582"
+    ports:
+      - "2582:2582"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  pds:
+    image: atcr.io/tranquil.farm/tranquil-pds:latest
+    environment:
+      DATABASE_URL: postgres://happyview:happyview@postgres:5432/pds
+      PLC_DIRECTORY_URL: http://plc:2582
+      TRANQUIL_PDS_ALLOW_INSECURE_SECRETS: "1"
+    volumes:
+      - ./scripts/e2e-config.toml:/etc/tranquil-pds/config.toml:ro
+    ports:
+      - "3100:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      plc:
+        condition: service_started
+
+  happyview:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgres://happyview:happyview@postgres:5432/happyview_test
+      PUBLIC_URL: http://localhost:3200
+      HOST: 0.0.0.0
+      PORT: "3000"
+      PLC_URL: http://plc:2582
+      RELAY_URL: http://plc:2582
+      SESSION_SECRET: e2e-test-secret-that-is-at-least-32-bytes
+      TOKEN_ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000042
+      JETSTREAM_URL: wss://jetstream1.us-east.bsky.network
+    ports:
+      - "3200:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      plc:
+        condition: service_started

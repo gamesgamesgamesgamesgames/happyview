@@ -21,6 +21,7 @@ import {
   IconCode,
   IconSkull,
   IconFlask,
+  IconFingerprint,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -113,6 +114,12 @@ const systemItems: NavItem[] = [
     title: "General",
     url: "/dashboard/settings/general",
     icon: IconSettings,
+    requiredPermissions: ["settings:manage"],
+  },
+  {
+    title: "Service Identity",
+    url: "/dashboard/settings/service-identity",
+    icon: IconFingerprint,
     requiredPermissions: ["settings:manage"],
   },
   {

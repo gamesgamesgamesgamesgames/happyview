@@ -171,9 +171,16 @@ async fn resolve_signing_key(did: &str, state: &AppState) -> Result<Vec<u8>, App
     let url = if did.starts_with("did:plc:") {
         format!("{}/{did}", state.config.plc_url.trim_end_matches('/'))
     } else if did.starts_with("did:web:") {
-        let domain = did.strip_prefix("did:web:").unwrap();
-        let domain = domain.replace(':', "/");
-        format!("https://{domain}/.well-known/did.json")
+        let identifier = did.strip_prefix("did:web:").unwrap();
+        let mut segments = identifier.split(':');
+        let host = segments.next().unwrap();
+        let host = urlencoding::decode(host).unwrap_or_else(|_| host.into());
+        let path_segments: Vec<&str> = segments.collect();
+        if path_segments.is_empty() {
+            format!("https://{host}/.well-known/did.json")
+        } else {
+            format!("https://{host}/{}/did.json", path_segments.join("/"))
+        }
     } else {
         return Err(AppError::BadRequest(format!(
             "unsupported DID method: {did}"
@@ -258,6 +265,30 @@ fn verify_es256(msg: &[u8], sig_bytes: &[u8], key_bytes: &[u8]) -> bool {
     false
 }
 
+/// Minimal JWT payload for extracting fields after signature verification.
+#[derive(Debug, serde::Deserialize)]
+pub struct PublicJwtPayload {
+    pub iss: String,
+    pub aud: Option<String>,
+    pub exp: u64,
+}
+
+/// Decode the JWT payload without verification.
+///
+/// Call this *after* `ServiceAuth::from_bearer` has already validated the
+/// signature. This is used to extract the `aud` field for service auth
+/// fragment matching.
+pub fn decode_jwt_payload(token: &str) -> Result<PublicJwtPayload, AppError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AppError::Auth("invalid JWT format".into()));
+    }
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| AppError::Auth("invalid JWT payload encoding".into()))?;
+    serde_json::from_slice(&payload_bytes).map_err(|_| AppError::Auth("invalid JWT payload".into()))
+}
+
 fn verify_es256k(msg: &[u8], sig_bytes: &[u8], key_bytes: &[u8]) -> bool {
     use k256::ecdsa::{Signature as K256Signature, VerifyingKey as K256Key, signature::Verifier};
 
@@ -280,4 +311,42 @@ fn verify_es256k(msg: &[u8], sig_bytes: &[u8], key_bytes: &[u8]) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_jwt(payload_json: &str) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"ES256","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json);
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fake_sig");
+        format!("{}.{}.{}", header, payload, signature)
+    }
+
+    #[test]
+    fn decode_valid_payload() {
+        let jwt = make_test_jwt(
+            r#"{"iss":"did:plc:abc","aud":"did:web:example.com#svc","exp":9999999999}"#,
+        );
+        let payload = decode_jwt_payload(&jwt).unwrap();
+        assert_eq!(payload.iss, "did:plc:abc");
+        assert_eq!(payload.aud.unwrap(), "did:web:example.com#svc");
+        assert_eq!(payload.exp, 9999999999);
+    }
+
+    #[test]
+    fn decode_payload_without_aud() {
+        let jwt = make_test_jwt(r#"{"iss":"did:plc:abc","exp":9999999999}"#);
+        let payload = decode_jwt_payload(&jwt).unwrap();
+        assert!(payload.aud.is_none());
+    }
+
+    #[test]
+    fn decode_rejects_invalid_format() {
+        assert!(decode_jwt_payload("not.a.valid.jwt.with.too.many.parts").is_err());
+        assert!(decode_jwt_payload("onlyonepart").is_err());
+        assert!(decode_jwt_payload("two.parts").is_err());
+    }
 }

@@ -7,6 +7,7 @@ import { usePathname, useRouter } from "next/navigation";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { CodePanels } from "@/components/code-panels";
+import { LexiconServicesSheet } from "@/components/lexicon-services-sheet";
 import {
   deleteLexicon,
   deleteNetworkLexicon,
@@ -37,6 +38,7 @@ export default function LexiconDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [servicesSheetOpen, setServicesSheetOpen] = useState(false);
 
   const [jsonText, setJsonText] = useState("");
   const [originalJson, setOriginalJson] = useState("");
@@ -251,6 +253,12 @@ export default function LexiconDetailPage() {
           )}
         </div>
 
+        <LexiconServicesSheet
+          lexiconId={id}
+          open={servicesSheetOpen}
+          onOpenChange={setServicesSheetOpen}
+        />
+
         {/* Actions */}
         <footer className="bg-sidebar-accent flex justify-between gap-2 ps-4 py-2 md:px-6 md:py-4 rounded-b-md">
           {hasPermission("lexicons:delete") && (
@@ -264,6 +272,16 @@ export default function LexiconDetailPage() {
           )}
 
           <div className="flex gap-2">
+            {(lexicon.lexicon_type === "query" ||
+              lexicon.lexicon_type === "procedure") && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setServicesSheetOpen(true)}
+              >
+                Services
+              </Button>
+            )}
             {hasPermission("lexicons:create") && (
               <Button onClick={handleSave} disabled={!isDirty || saving}>
                 {saving ? "Saving..." : "Save"}

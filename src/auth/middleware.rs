@@ -55,6 +55,15 @@ impl Claims {
     pub fn new_for_test(did: String) -> Self {
         Self::internal(did)
     }
+
+    #[cfg(test)]
+    pub fn with_client_key(did: String, client_key: String) -> Self {
+        Self {
+            did,
+            client_key: Some(client_key),
+            dpop_key_id: None,
+        }
+    }
 }
 
 impl FromRequestParts<AppState> for Claims {
@@ -229,13 +238,21 @@ pub async fn resolve_dpop_claims(
 
 /// XRPC-specific claims extractor.
 ///
-/// Accepts DPoP auth (`Authorization: DPoP <token>`) or Bearer space credential
-/// JWTs (`Authorization: Bearer <space_credential>`). Cookie auth, Bearer API keys,
-/// and service JWTs are rejected on XRPC routes.
+/// Accepts DPoP auth (`Authorization: DPoP <token>`), Bearer space credential
+/// JWTs (`Authorization: Bearer <space_credential>`), or Bearer service auth
+/// JWTs (`Authorization: Bearer <service_jwt>`). Cookie auth and Bearer API keys
+/// are rejected on XRPC routes.
 #[derive(Debug, Clone)]
 pub struct XrpcClaims {
     pub identity: Option<Claims>,
     pub space_credential: Option<String>,
+    pub service_auth: Option<ServiceAuthClaims>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceAuthClaims {
+    pub did: String,
+    pub aud_fragment: String,
 }
 
 impl FromRequestParts<AppState> for XrpcClaims {
@@ -257,17 +274,30 @@ impl FromRequestParts<AppState> for XrpcClaims {
                 Ok(XrpcClaims {
                     identity: Some(claims),
                     space_credential: None,
+                    service_auth: None,
                 })
             }
             Some(h) if h.starts_with("Bearer ") => {
                 let token = &h[7..];
                 let path = parts.uri.path();
                 let is_space_route = path.contains("/dev.happyview.space.");
+
+                // Try service auth first
+                if let Ok(service_claims) = try_parse_service_auth(token, state).await {
+                    return Ok(XrpcClaims {
+                        identity: None,
+                        space_credential: None,
+                        service_auth: Some(service_claims),
+                    });
+                }
+
+                // Existing space credential logic
                 match crate::spaces::credential::peek_jwt_typ(token) {
                     Some(typ) if typ == "space_credential" && is_space_route => {
                         Ok(XrpcClaims {
                             identity: None,
                             space_credential: Some(token.to_string()),
+                            service_auth: None,
                         })
                     }
                     Some(typ) if typ == "space_credential" => Err(AppError::Auth(
@@ -284,8 +314,61 @@ impl FromRequestParts<AppState> for XrpcClaims {
                 Ok(XrpcClaims {
                     identity: None,
                     space_credential: None,
+                    service_auth: None,
                 })
             }
         }
     }
+}
+
+async fn try_parse_service_auth(
+    token: &str,
+    state: &AppState,
+) -> Result<ServiceAuthClaims, AppError> {
+    // 1. Check if service identity is configured and not "not_exposed"
+    let identity = crate::service_identity::get_identity(&state.db, state.db_backend).await?;
+    let identity =
+        identity.ok_or_else(|| AppError::Auth("no service identity configured".into()))?;
+
+    if identity.mode == crate::service_identity::IdentityMode::NotExposed {
+        return Err(AppError::Auth("service auth disabled".into()));
+    }
+
+    let instance_did = identity
+        .did
+        .as_ref()
+        .ok_or_else(|| AppError::Auth("no DID configured".into()))?;
+
+    // 2. Verify the JWT (this resolves the issuer's DID doc and checks signature)
+    let service_auth = crate::auth::service_auth::ServiceAuth::from_bearer(token, state)
+        .await
+        .map_err(|_| AppError::Auth("invalid service auth token".into()))?;
+
+    // 3. Decode payload to extract aud
+    let payload = crate::auth::service_auth::decode_jwt_payload(token)
+        .map_err(|_| AppError::Auth("failed to decode JWT".into()))?;
+
+    let aud = payload
+        .aud
+        .ok_or_else(|| AppError::Auth("JWT missing aud field".into()))?;
+
+    // 4. Verify aud starts with instance DID and extract fragment
+    if !aud.starts_with(instance_did) {
+        return Err(AppError::Auth(format!(
+            "JWT aud '{}' does not match instance DID '{}'",
+            aud, instance_did
+        )));
+    }
+
+    let fragment = aud.strip_prefix(instance_did).unwrap_or("").to_string();
+    if fragment.is_empty() || !fragment.starts_with('#') {
+        return Err(AppError::Auth(
+            "JWT aud must include a service fragment".into(),
+        ));
+    }
+
+    Ok(ServiceAuthClaims {
+        did: service_auth.did,
+        aud_fragment: fragment,
+    })
 }

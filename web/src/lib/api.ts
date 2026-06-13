@@ -829,3 +829,171 @@ export function deleteScript(id: string) {
     method: "DELETE",
   })
 }
+
+// Setup
+export interface SetupStatus {
+  identity_mode: "did_web" | "did_plc" | "attach_account" | "not_exposed" | null;
+  identity_configured: boolean;
+  plc_verified: boolean;
+  setup_complete: boolean;
+}
+
+export interface ServiceIdentityResponse {
+  mode: string;
+  did: string | null;
+  setup_complete: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ServiceEntry {
+  id: number;
+  fragment_id: string;
+  service_type: string;
+  access_mode: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export function getSetupStatus() {
+  return apiFetch<SetupStatus>("/api/setup/status");
+}
+
+export function setSetupIdentity(body: {
+  mode: string;
+  did?: string;
+  attached_account_did?: string;
+}) {
+  return apiFetch("/api/setup/identity", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function completeSetup() {
+  return apiFetch("/api/setup/complete", { method: "POST" });
+}
+
+export interface ResolveResult {
+  did: string
+  handle: string | null
+  display_name: string | null
+  avatar: string | null
+}
+
+export function resolveIdentity(q: string) {
+  return apiFetch<ResolveResult[]>(`/api/setup/resolve?q=${encodeURIComponent(q)}`)
+}
+
+export function confirmAttachAuth(body: { original_did: string }) {
+  return apiFetch("/api/setup/attach-auth/confirm", {
+    method: "POST",
+    body: JSON.stringify(body),
+  })
+}
+
+export function plcRequest() {
+  return apiFetch("/api/setup/plc/request", { method: "POST" })
+}
+
+export function plcSubmit(token: string) {
+  return apiFetch("/api/setup/plc/submit", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  })
+}
+
+export function plcRegister() {
+  return apiFetch<{ did: string }>("/api/setup/plc/register", { method: "POST" })
+}
+
+// Service Identity
+export function getServiceIdentity() {
+  return apiFetch<ServiceIdentityResponse | null>("/admin/service-identity");
+}
+
+export function updateServiceIdentity(body: {
+  mode: string;
+  did?: string;
+  signing_key_enc?: string;
+  rotation_key_enc?: string;
+  attached_account_did?: string;
+}) {
+  return apiFetch("/admin/service-identity", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+// Service Entries
+export function getServiceEntries() {
+  return apiFetch<ServiceEntry[]>("/admin/service-entries");
+}
+
+export function createServiceEntry(body: {
+  fragment_id: string;
+  service_type: string;
+}) {
+  return apiFetch<ServiceEntry>("/admin/service-entries", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function updateServiceEntry(
+  id: number,
+  body: {
+    fragment_id?: string;
+    service_type?: string;
+    access_mode?: string;
+  },
+) {
+  return apiFetch(`/admin/service-entries/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+export function deleteServiceEntry(id: number) {
+  return apiFetch(`/admin/service-entries/${id}`, { method: "DELETE" });
+}
+
+export function getServiceEntryXrpcs(id: number) {
+  return apiFetch<string[]>(`/admin/service-entries/${id}/xrpcs`);
+}
+
+export function addServiceEntryXrpcs(id: number, lexicon_ids: string[]) {
+  return apiFetch(`/admin/service-entries/${id}/xrpcs`, {
+    method: "POST",
+    body: JSON.stringify({ lexicon_ids }),
+  });
+}
+
+export function removeServiceEntryXrpcs(id: number, lexicon_ids: string[]) {
+  return apiFetch(`/admin/service-entries/${id}/xrpcs`, {
+    method: "DELETE",
+    body: JSON.stringify({ lexicon_ids }),
+  });
+}
+
+export function getLexiconServices(lexiconId: string) {
+  return apiFetch<ServiceEntry[]>(
+    `/admin/lexicons/${encodeURIComponent(lexiconId)}/services`,
+  );
+}
+
+// Service Entry PLC Sync
+export function syncPlc() {
+  return apiFetch("/admin/service-entries/sync-plc", { method: "POST" });
+}
+
+export function syncPlcRequest() {
+  return apiFetch("/admin/service-entries/sync-plc/request", { method: "POST" });
+}
+
+export function syncPlcSubmit(token: string) {
+  return apiFetch("/admin/service-entries/sync-plc/submit", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
+}

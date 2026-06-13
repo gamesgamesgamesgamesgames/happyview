@@ -468,8 +468,9 @@ jobs:
       && needs.unit-tests.result == 'success'
       && needs.e2e-tests.result == 'success'
       && needs.frontend.result == 'success'
+      && needs.playwright.result == 'success'
       && needs.lint.result == 'success'
-    needs: [changes, unit-tests, e2e-tests, frontend, lint]
+    needs: [changes, unit-tests, e2e-tests, frontend, playwright, lint]
     runs-on: depot-ubuntu-24.04
     outputs:
       version: ${{ steps.semantic.outputs.version }}

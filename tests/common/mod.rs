@@ -6,6 +6,10 @@ pub mod auth;
 pub mod db;
 #[allow(dead_code, unused_imports)]
 pub mod fixtures;
+#[allow(dead_code, unused_imports)]
+pub mod plc;
+#[allow(dead_code, unused_imports)]
+pub mod tls;
 
 #[allow(unused_macros)]
 macro_rules! require_db {

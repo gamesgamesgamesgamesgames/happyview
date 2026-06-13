@@ -15,6 +15,8 @@ mod proxy_config;
 mod records;
 mod script_variables;
 mod scripts;
+mod service_entries;
+mod service_identity;
 pub mod settings;
 mod stats;
 pub(crate) mod types;
@@ -30,6 +32,10 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route(
             "/lexicons",
             post(lexicons::upload_lexicon).get(lexicons::list_lexicons),
+        )
+        .route(
+            "/lexicons/{id}/services",
+            get(service_entries::lexicon_services),
         )
         .route(
             "/lexicons/{id}",
@@ -157,4 +163,31 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route("/dead-letters/{id}/retry", post(dead_letters::retry))
         .route("/dead-letters/{id}/reindex", post(dead_letters::reindex))
         .route("/permissions", get(users::list_permissions))
+        .route(
+            "/service-identity",
+            get(service_identity::get).put(service_identity::update),
+        )
+        .route(
+            "/service-entries",
+            get(service_entries::list).post(service_entries::create),
+        )
+        .route("/service-entries/sync-plc", post(service_entries::sync_plc))
+        .route(
+            "/service-entries/sync-plc/request",
+            post(service_entries::sync_plc_request),
+        )
+        .route(
+            "/service-entries/sync-plc/submit",
+            post(service_entries::sync_plc_submit),
+        )
+        .route(
+            "/service-entries/{id}",
+            put(service_entries::update).delete(service_entries::delete),
+        )
+        .route(
+            "/service-entries/{id}/xrpcs",
+            get(service_entries::list_xrpcs)
+                .post(service_entries::add_xrpcs)
+                .delete(service_entries::remove_xrpcs),
+        )
 }

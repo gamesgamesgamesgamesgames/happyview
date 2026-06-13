@@ -1,8 +1,9 @@
 "use client"
 
-import { useEffect } from "react"
+import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
 
+import { getSetupStatus } from "@/lib/api"
 import { useAuth } from "@/lib/auth-context"
 import { useConfig } from "@/lib/config-context"
 import { AppSidebar } from "@/components/app-sidebar"
@@ -19,6 +20,7 @@ export default function DashboardLayout({
   const { did } = useAuth()
   const { app_name } = useConfig()
   const router = useRouter()
+  const [setupChecked, setSetupChecked] = useState(false)
 
   useEffect(() => {
     if (!did) {
@@ -27,10 +29,27 @@ export default function DashboardLayout({
   }, [did, router])
 
   useEffect(() => {
+    if (did) {
+      getSetupStatus()
+        .then((status) => {
+          if (!status.setup_complete) {
+            router.replace("/setup")
+          } else {
+            setSetupChecked(true)
+          }
+        })
+        .catch(() => {
+          // If status endpoint fails (e.g. no table yet), allow through
+          setSetupChecked(true)
+        })
+    }
+  }, [did, router])
+
+  useEffect(() => {
     document.title = app_name ? `${app_name} Admin` : "HappyView Admin"
   }, [app_name])
 
-  if (!did) return null
+  if (!did || !setupChecked) return null
 
   return (
     <PluginUpdateProvider>

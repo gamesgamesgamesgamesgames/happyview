@@ -5,6 +5,7 @@ use atrium_oauth::{
     OAuthResolverConfig, Scope,
 };
 use axum::Router;
+use base64::Engine as _;
 use happyview::config::Config;
 use happyview::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use happyview::lexicon::LexiconRegistry;
@@ -20,6 +21,7 @@ pub struct TestApp {
     pub mock_server: MockServer,
     pub admin_did: String,
     pub admin_token: String,
+    _db_lock: Option<sqlx::AnyPool>,
 }
 
 impl TestApp {
@@ -33,6 +35,7 @@ impl TestApp {
     pub async fn new_with_registry_config(
         registry_config: happyview::plugin::official_registry::RegistryConfig,
     ) -> Self {
+        let _db_lock = db::acquire_test_lock().await;
         let pool = db::test_pool().await;
         let backend = db::test_backend();
         db::truncate_all(&pool).await;
@@ -172,7 +175,20 @@ impl TestApp {
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
-        let router = server::router(state.clone()).layer(axum::middleware::from_fn(
+        let router = Self::build_router(&state);
+
+        Self {
+            router,
+            state,
+            mock_server,
+            admin_did,
+            _db_lock,
+            admin_token,
+        }
+    }
+
+    fn build_router(state: &AppState) -> axum::Router {
+        server::router(state.clone()).layer(axum::middleware::from_fn(
             |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
                 if !req.headers().contains_key("host") {
                     req.headers_mut()
@@ -180,28 +196,24 @@ impl TestApp {
                 }
                 next.run(req).await
             },
-        ));
+        ))
+    }
 
-        Self {
-            router,
-            state,
-            mock_server,
-            admin_did,
-            admin_token,
-        }
+    pub fn rebuild_router(&mut self) {
+        self.router = Self::build_router(&self.state);
     }
 
     pub async fn new_with_base_path(base_path: &str) -> Self {
         let mut app = Self::new().await;
         app.state.config.base_path = Some(base_path.to_string());
-        app.router = server::router(app.state.clone());
+        app.rebuild_router();
         app
     }
 
     pub async fn new_with_encryption() -> Self {
         let mut app = Self::new().await;
         app.state.config.token_encryption_key = Some([0x42u8; 32]);
-        app.router = server::router(app.state.clone());
+        app.rebuild_router();
         app
     }
 
@@ -260,6 +272,305 @@ impl TestApp {
     /// Build a Cookie header that authenticates as the admin user.
     pub fn admin_cookie(&self) -> (axum::http::HeaderName, axum::http::HeaderValue) {
         crate::common::auth::admin_cookie_header(&self.admin_did, &self.state.cookie_key)
+    }
+
+    pub async fn setup_did_web(&mut self) -> String {
+        use p256::ecdsa::SigningKey;
+        use rand::RngCore;
+
+        let encryption_key = [0x42u8; 32];
+        self.state.config.token_encryption_key = Some(encryption_key);
+
+        let mut key_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut key_bytes);
+        let signing_key = SigningKey::from_bytes((&key_bytes[..]).into()).unwrap();
+        let private_bytes = signing_key.to_bytes();
+        let encrypted = happyview::plugin::encryption::encrypt(&encryption_key, &private_bytes)
+            .expect("encryption failed");
+        let enc_b64 = base64::engine::general_purpose::STANDARD.encode(encrypted);
+
+        let url = &self.state.config.public_url;
+        let host = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+        let did = format!("did:web:{}", host.replace(':', "%3A"));
+
+        happyview::service_identity::upsert_identity(
+            &self.state.db,
+            self.state.db_backend,
+            &happyview::service_identity::IdentityMode::DidWeb,
+            Some(&did),
+            Some(&enc_b64),
+            None,
+            None,
+        )
+        .await
+        .expect("failed to upsert service identity");
+
+        happyview::service_identity::mark_setup_complete(&self.state.db, self.state.db_backend)
+            .await
+            .expect("failed to mark setup complete");
+
+        self.rebuild_router();
+
+        did
+    }
+
+    pub async fn create_service_entry(
+        &self,
+        fragment_id: &str,
+        service_type: &str,
+        access_mode: &str,
+    ) -> i64 {
+        let entry = happyview::service_entries::create_entry(
+            &self.state.db,
+            self.state.db_backend,
+            &happyview::service_entries::CreateServiceEntry {
+                fragment_id: fragment_id.to_string(),
+                service_type: service_type.to_string(),
+            },
+        )
+        .await
+        .expect("failed to create service entry");
+
+        if access_mode != "all" {
+            happyview::service_entries::update_entry(
+                &self.state.db,
+                self.state.db_backend,
+                entry.id,
+                &happyview::service_entries::UpdateServiceEntry {
+                    fragment_id: None,
+                    service_type: None,
+                    access_mode: Some(access_mode.to_string()),
+                },
+            )
+            .await
+            .expect("failed to update service entry access mode");
+        }
+
+        entry.id
+    }
+
+    pub async fn add_entry_xrpcs(&self, entry_id: i64, xrpcs: &[&str]) {
+        let xrpc_strings: Vec<String> = xrpcs.iter().map(|s| s.to_string()).collect();
+        happyview::service_entries::add_entry_xrpcs(
+            &self.state.db,
+            self.state.db_backend,
+            entry_id,
+            &xrpc_strings,
+        )
+        .await
+        .expect("failed to add entry xrpcs");
+    }
+
+    pub async fn service_auth_jwt(
+        &self,
+        plc_store: &crate::common::plc::PlcStore,
+        issuer_did: &str,
+        instance_did: &str,
+        aud_fragment: &str,
+    ) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use p256::ecdsa::{SigningKey, signature::Signer};
+        use rand::RngCore;
+
+        let mut key_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut key_bytes);
+        let signing_key = SigningKey::from_bytes((&key_bytes[..]).into()).unwrap();
+        let public_key = signing_key.verifying_key();
+        let compressed = public_key.to_encoded_point(true);
+
+        let did_doc = crate::common::plc::test_did_document(issuer_did, compressed.as_bytes());
+        plc_store
+            .write()
+            .await
+            .insert(issuer_did.to_string(), did_doc);
+
+        let header = serde_json::json!({"alg": "ES256"});
+        let payload = serde_json::json!({
+            "iss": issuer_did,
+            "aud": format!("{}{}", instance_did, aud_fragment),
+            "exp": chrono::Utc::now().timestamp() as u64 + 60,
+        });
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let message = format!("{}.{}", header_b64, payload_b64);
+
+        let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+        format!("Bearer {}.{}.{}", header_b64, payload_b64, sig_b64)
+    }
+
+    pub async fn setup_not_exposed(&mut self) {
+        happyview::service_identity::upsert_identity(
+            &self.state.db,
+            self.state.db_backend,
+            &happyview::service_identity::IdentityMode::NotExposed,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("failed to upsert not_exposed identity");
+
+        happyview::service_identity::mark_setup_complete(&self.state.db, self.state.db_backend)
+            .await
+            .expect("failed to mark setup complete");
+
+        self.rebuild_router();
+    }
+
+    pub async fn setup_did_plc(&mut self) -> String {
+        use p256::ecdsa::SigningKey;
+        use rand::RngCore;
+
+        let encryption_key = [0x42u8; 32];
+        self.state.config.token_encryption_key = Some(encryption_key);
+
+        let mut key_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut key_bytes);
+        let signing_key = SigningKey::from_bytes((&key_bytes[..]).into()).unwrap();
+        let private_bytes = signing_key.to_bytes();
+        let encrypted = happyview::plugin::encryption::encrypt(&encryption_key, &private_bytes)
+            .expect("encryption failed");
+        let enc_b64 = base64::engine::general_purpose::STANDARD.encode(encrypted);
+
+        let did = "did:plc:testinstance".to_string();
+
+        happyview::service_identity::upsert_identity(
+            &self.state.db,
+            self.state.db_backend,
+            &happyview::service_identity::IdentityMode::DidPlc,
+            Some(&did),
+            Some(&enc_b64),
+            None,
+            None,
+        )
+        .await
+        .expect("failed to upsert did:plc identity");
+
+        happyview::service_identity::mark_setup_complete(&self.state.db, self.state.db_backend)
+            .await
+            .expect("failed to mark setup complete");
+
+        self.rebuild_router();
+
+        did
+    }
+
+    pub async fn raw_service_auth_jwt(
+        &self,
+        plc_store: &crate::common::plc::PlcStore,
+        issuer_did: &str,
+        aud: &str,
+        exp: u64,
+    ) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use p256::ecdsa::{SigningKey, signature::Signer};
+        use rand::RngCore;
+
+        let mut key_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut key_bytes);
+        let signing_key = SigningKey::from_bytes((&key_bytes[..]).into()).unwrap();
+        let public_key = signing_key.verifying_key();
+        let compressed = public_key.to_encoded_point(true);
+
+        let did_doc = crate::common::plc::test_did_document(issuer_did, compressed.as_bytes());
+        plc_store
+            .write()
+            .await
+            .insert(issuer_did.to_string(), did_doc);
+
+        let header = serde_json::json!({"alg": "ES256"});
+        let payload = serde_json::json!({
+            "iss": issuer_did,
+            "aud": aud,
+            "exp": exp,
+        });
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let message = format!("{}.{}", header_b64, payload_b64);
+
+        let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+        format!("Bearer {}.{}.{}", header_b64, payload_b64, sig_b64)
+    }
+
+    pub async fn custom_service_auth_jwt(
+        &self,
+        plc_store: &crate::common::plc::PlcStore,
+        issuer_did: &str,
+        header: serde_json::Value,
+        payload: serde_json::Value,
+    ) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use p256::ecdsa::{SigningKey, signature::Signer};
+        use rand::RngCore;
+
+        let mut key_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut key_bytes);
+        let signing_key = SigningKey::from_bytes((&key_bytes[..]).into()).unwrap();
+        let public_key = signing_key.verifying_key();
+        let compressed = public_key.to_encoded_point(true);
+
+        let did_doc = crate::common::plc::test_did_document(issuer_did, compressed.as_bytes());
+        plc_store
+            .write()
+            .await
+            .insert(issuer_did.to_string(), did_doc);
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let message = format!("{}.{}", header_b64, payload_b64);
+
+        let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+        format!("Bearer {}.{}.{}", header_b64, payload_b64, sig_b64)
+    }
+
+    pub fn use_permissive_http_client(&mut self) {
+        self.state.http = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("failed to build permissive http client");
+        self.rebuild_router();
+    }
+
+    pub fn did_web_service_auth_jwt(
+        &self,
+        signing_key: &p256::ecdsa::SigningKey,
+        issuer_did: &str,
+        instance_did: &str,
+        aud_fragment: &str,
+    ) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use p256::ecdsa::signature::Signer;
+
+        let header = serde_json::json!({"alg": "ES256"});
+        let payload = serde_json::json!({
+            "iss": issuer_did,
+            "aud": format!("{}{}", instance_did, aud_fragment),
+            "exp": chrono::Utc::now().timestamp() as u64 + 60,
+        });
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        let message = format!("{}.{}", header_b64, payload_b64);
+
+        let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+        format!("Bearer {}.{}.{}", header_b64, payload_b64, sig_b64)
     }
 
     /// Install a fake plugin directly into the registry at the given version.

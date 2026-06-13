@@ -3,6 +3,7 @@ use axum::http::{Method, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use bytes::Bytes;
 use http_body_util::Full;
 use std::convert::Infallible;
@@ -73,6 +74,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/oauth", crate::oauth::routes::routes())
         // https://atproto.com/specs/oauth#types-of-clients
         .route("/oauth-client-metadata.json", get(client_metadata))
+        .route("/.well-known/did.json", get(well_known_did_json))
+        .nest("/api/setup", crate::setup::routes())
         .route("/xrpc/app.bsky.actor.getProfile", get(get_profile))
         .route(
             "/xrpc/com.atproto.repo.uploadBlob",
@@ -304,6 +307,74 @@ async fn client_metadata(
     }
 
     Json(metadata)
+}
+
+fn extract_public_key_multibase(
+    identity: &crate::service_identity::ServiceIdentity,
+    state: &AppState,
+) -> Result<String, AppError> {
+    let enc_b64 = identity
+        .signing_key_enc
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("no signing key configured".into()))?;
+
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(enc_b64)
+        .map_err(|e| AppError::Internal(format!("invalid signing key encoding: {e}")))?;
+
+    let encryption_key = state
+        .config
+        .token_encryption_key
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
+
+    let private_bytes = crate::plugin::encryption::decrypt(encryption_key, &encrypted)
+        .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
+
+    let signing_key = p256::ecdsa::SigningKey::from_bytes(private_bytes.as_slice().into())
+        .map_err(|e| AppError::Internal(format!("invalid signing key: {e}")))?;
+    let public_key = signing_key.verifying_key();
+    let compressed = public_key.to_encoded_point(true);
+
+    // Multikey format: multicodec varint prefix for P-256 (0x1200) then base58btc with 'z' prefix
+    let mut multikey_bytes = vec![0x80, 0x24];
+    multikey_bytes.extend_from_slice(compressed.as_bytes());
+    let encoded = multibase::encode(multibase::Base::Base58Btc, &multikey_bytes);
+    Ok(encoded)
+}
+
+async fn well_known_did_json(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let identity = crate::service_identity::get_identity(&state.db, state.db_backend).await?;
+    let identity =
+        identity.ok_or_else(|| AppError::NotFound("no service identity configured".into()))?;
+
+    if identity.mode != crate::service_identity::IdentityMode::DidWeb {
+        return Err(AppError::NotFound(
+            "DID document only served in did:web mode".into(),
+        ));
+    }
+
+    let entries = crate::service_entries::list_entries(&state.db, state.db_backend).await?;
+    let entry_pairs: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| (e.fragment_id.clone(), e.service_type.clone()))
+        .collect();
+
+    let service_endpoint = &state.config.public_url;
+
+    let signing_key_multibase = extract_public_key_multibase(&identity, &state)?;
+
+    let doc = crate::service_identity::generate_did_document(
+        &identity,
+        &signing_key_multibase,
+        &entry_pairs,
+        service_endpoint,
+    )
+    .ok_or_else(|| AppError::NotFound("DID document not available".into()))?;
+
+    Ok(Json(doc))
 }
 
 async fn get_profile(
