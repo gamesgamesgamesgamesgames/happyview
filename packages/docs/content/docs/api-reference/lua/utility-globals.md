@@ -20,7 +20,7 @@ log("processing record: " .. uri)
 log("count: " .. tostring(n))
 ```
 
-Writes a message to the server logs at debug level. Useful for debugging scripts during development. Log output appears in HappyView's stdout — check your platform's log viewer (Railway logs, `docker logs`, terminal output) to see it.
+Writes a message to the server logs at debug level and records a `script.log` event in the [event logs](../../api-reference/admin/events.md). Useful for debugging scripts during development. Log output appears in HappyView's stdout and is also accessible via `GET /admin/events`.
 
 ## TID
 

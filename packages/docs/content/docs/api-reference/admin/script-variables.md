@@ -2,7 +2,7 @@
 title: "Script Variables"
 ---
 
-Script variables are encrypted key/value pairs available to Lua scripts via the `vars` global. Use them for secrets like API tokens.
+Script variables are encrypted key/value pairs available to Lua scripts via the `env` global. Use them for secrets like API tokens.
 
 ```ts tab="TypeScript" tab-group="language"
 const TOKEN = "hv_..."; // your API key

@@ -171,7 +171,7 @@ Parameters are passed as an array and bound to `$1`, `$2`, etc. Supported parame
 
 ### SQL dialect
 
-Write SQL in **SQLite syntax** — HappyView translates it to Postgres at runtime if you're using Postgres. See [Database Setup](../../guides/database/database-setup.md) for details on what gets translated. If you need database-specific SQL that can't be translated, check `db.backend()` at runtime.
+Unlike the structured API methods (`db.query`, `db.get`, etc.), `db.raw` does **not** translate SQL between backends. Write native SQL for the database you're running against — `$1`/`$2` placeholders for Postgres, `?` for SQLite. Use `db.backend()` to branch when you need to support both.
 
 ### Column type mapping
 

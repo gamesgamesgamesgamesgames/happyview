@@ -65,11 +65,9 @@ Filters support comparison operators (`=`, `!=`, `>`, `<`, `>=`, `<=`), `AND`/`O
 local result = db.query({
   collection = "com.example.post",
   filter = {
-    op = "AND",
-    conditions = {
-      { field = "status", value = "published" },
-      { field = "views", op = ">", value = 100 },
-    },
+    combine = "AND",
+    { field = "status", value = "published" },
+    { field = "views", op = ">", value = 100 },
   },
 })
 ```

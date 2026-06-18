@@ -2,7 +2,7 @@
 title: "Record API"
 ---
 
-The `Record` API is only available in **procedure** scripts. It handles creating, updating, loading, and deleting atproto records. Writes are proxied to the caller's PDS and indexed locally.
+The `Record` API is available in **procedure**, **query**, and **record/label** scripts. In procedure scripts the full API is available — writes are proxied to the caller's PDS and indexed locally. In query and record/label scripts it runs in **no-auth mode**: `Record.load`, `r:save_local()`, `r:delete_local()`, and `Record.delete_local()` work, but PDS-touching methods (`r:save()`, `r:delete()`) raise an error.
 
 ## Constructor
 
@@ -25,6 +25,10 @@ local r = Record.load("at://did:plc:abc/xyz.statusphere.status/abc123")
 -- Load multiple records in parallel
 local records = Record.load_all({ uri1, uri2 })
 -- Returns nil entries for URIs not found
+
+-- Delete a record from the local database only (no PDS call)
+local ok = Record.delete_local("at://did:plc:abc/xyz.statusphere.status/abc123")
+-- Returns true if deleted, false if not found
 ```
 
 ## Instance methods
@@ -35,6 +39,15 @@ r:save()
 
 -- Delete from PDS and local database
 r:delete()
+
+-- Save directly to the local database (no PDS call)
+r:save_local()
+
+-- Delete from the local database only (no PDS call)
+r:delete_local()
+
+-- Set the repo DID (for no-auth contexts like record/label scripts)
+r:set_repo("did:plc:abc")
 
 -- Set the record key type (tid, any, nsid, or literal:*)
 r:set_key_type("tid")
@@ -65,8 +78,9 @@ These fields are set automatically and are read-only (writes raise an error):
 | `_cid`        | string? | Content hash — set after `save()`, cleared after `delete()` |
 | `_key_type`   | string? | Record key type from the lexicon definition                 |
 | `_rkey`       | string? | Record key — set via `set_rkey()` or `generate_rkey()`      |
-| `_collection` | string  | Collection NSID (always set)                                |
-| `_schema`     | table?  | Schema definition from the lexicon (used for validation)    |
+| `_collection`     | string  | Collection NSID (always set)                                        |
+| `_schema`         | table?  | Schema definition from the lexicon (used for validation)            |
+| `_repo_override`  | string? | DID set by `set_repo()`, used in no-auth contexts to target a repo  |
 
 ## Schema validation
 

@@ -23,6 +23,15 @@ Every script is identified by a **trigger string** -- the script's `id` in the `
 
 **Cascade rule:** When a record event occurs, the dispatcher tries the action-specific trigger first (e.g. `record.create:<nsid>`), then falls back to `record.index:<nsid>` if no action-specific script exists. This means you can use `record.index` as a catch-all and override individual actions when needed.
 
+### XRPC triggers
+
+| Trigger                    | Fires when                                    |
+| -------------------------- | --------------------------------------------- |
+| `xrpc.query:<nsid>`        | An XRPC query endpoint is called              |
+| `xrpc.procedure:<nsid>`    | An XRPC procedure endpoint is called          |
+
+XRPC scripts handle the request and return the response. Without a script, HappyView uses [default query/procedure behavior](../api-reference/xrpc-api.md). See [Lua Scripting](./lua-scripting.md) for the full query/procedure scripting reference.
+
 ### Label event triggers
 
 | Trigger                    | Fires when                                         |
@@ -30,7 +39,7 @@ Every script is identified by a **trigger string** -- the script's `id` in the `
 | `labeler.apply:<nsid>`     | A label arrives whose subject is `at://<did>/<nsid>/<rkey>` |
 | `labeler.apply:_actor`     | A label arrives whose subject is a bare DID (actor-level label) |
 
-There is no cascade for label triggers -- each trigger string must match exactly.
+There is no cascade for label or XRPC triggers -- each trigger string must match exactly.
 
 ## Creating scripts
 
@@ -111,12 +120,13 @@ These globals are set before `handle()` is called for label events:
 | `exp`   | string? | Expiration timestamp (nil if the label does not expire) |
 | `event` | table   | The full label event as a table (same fields)    |
 
-Record and label scripts do **not** have access to `caller_did`, `input`, `params`, `method`, or the `Record` API. They run from the event stream, not from a user request.
+Record and label scripts do **not** have access to `caller_did`, `input`, `params`, or `method`. They run from the event stream, not from a user request.
 
 ## Available APIs
 
 Record and label scripts have access to:
 
+- **[Record API](../api-reference/lua/record-api.md)** (no-auth mode) -- `Record.load`, `r:save_local()`, `r:delete_local()`, `Record.delete_local()`. PDS-touching methods (`r:save()`, `r:delete()`) raise an error.
 - **[Database API](../api-reference/lua/database-api.md)** -- `db.query`, `db.get`, `db.search`, `db.backlinks`, `db.count`, `db.raw`
 - **[HTTP API](../api-reference/lua/http-api.md)** -- `http.get`, `http.post`, `http.put`, `http.patch`, `http.delete`, `http.head`
 - **[XRPC Lua API](../api-reference/lua/xrpc-lua-api.md)** -- `xrpc.query`, `xrpc.procedure`
@@ -143,17 +153,18 @@ Because scripts run synchronously before indexing, they block the Jetstream cons
 
 The `dead_letter_scripts` table stores events that failed all retry attempts:
 
-| Column       | Type        | Description                                           |
-| ------------ | ----------- | ----------------------------------------------------- |
-| `id`         | BIGSERIAL   | Primary key                                           |
-| `script_ref` | text       | The trigger id of the script that failed              |
-| `host_kind`  | text       | `'record'` or `'label'`                               |
-| `host_id`    | text       | Identifies the specific event source                  |
-| `payload`    | jsonb       | The full event payload                                |
-| `error`      | text        | The error message from the last attempt               |
-| `attempts`   | int         | Total number of attempts made                         |
-| `created_at` | timestamptz | When the failure was recorded                         |
-| `resolved_at`| timestamptz | When the failure was resolved (null until resolved)   |
+| Column       | Type      | Description                                           |
+| ------------ | --------- | ----------------------------------------------------- |
+| `id`         | BIGSERIAL | Primary key                                           |
+| `script_ref` | text      | The trigger id of the script that failed              |
+| `host_kind`  | text      | `'record'` or `'label'`                               |
+| `host_id`    | text      | Identifies the specific event source                  |
+| `collection` | text      | The collection NSID of the failed event               |
+| `payload`    | jsonb     | The full event payload                                |
+| `error`      | text      | The error message from the last attempt               |
+| `attempts`   | int       | Total number of attempts made                         |
+| `created_at` | text      | When the failure was recorded (ISO 8601)              |
+| `resolved_at`| text      | When the failure was resolved (null until resolved)   |
 
 ## Examples
 
