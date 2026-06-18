@@ -6,6 +6,6 @@ CREATE TABLE IF NOT EXISTS service_identity (
     rotation_key_enc     TEXT,
     attached_account_did TEXT,
     setup_complete       BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at           TEXT NOT NULL DEFAULT NOW(),
-    updated_at           TEXT NOT NULL DEFAULT NOW()
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL
 );

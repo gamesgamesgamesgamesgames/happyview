@@ -3,8 +3,8 @@ CREATE TABLE IF NOT EXISTS service_entries (
     fragment_id  TEXT UNIQUE NOT NULL,
     service_type TEXT NOT NULL,
     access_mode  TEXT NOT NULL DEFAULT 'all',
-    created_at   TEXT NOT NULL DEFAULT NOW(),
-    updated_at   TEXT NOT NULL DEFAULT NOW()
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS service_entry_xrpcs (
