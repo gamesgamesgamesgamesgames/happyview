@@ -1,9 +1,26 @@
+use axum::body::Bytes;
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
 use std::sync::Arc;
 
 use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::profile;
+
+/// Opaque handle to blob bytes stored on the Rust side.
+/// Lua scripts receive this from `atproto.blob_download()` and pass it
+/// to `atproto.blob_upload()` — the binary data never enters the Lua VM.
+#[derive(Clone)]
+pub(crate) struct BlobHandle {
+    pub data: Bytes,
+    pub mime_type: String,
+}
+
+impl mlua::UserData for BlobHandle {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("size", |_, this, ()| Ok(this.data.len()));
+        methods.add_method("mime_type", |_, this, ()| Ok(this.mime_type.clone()));
+    }
+}
 
 /// Register the `atproto` table with AT Protocol utility functions.
 ///
@@ -31,6 +48,68 @@ pub fn register_atproto_api(
     })?;
 
     atproto_table.set("resolve_service_endpoint", resolve_fn)?;
+
+    // atproto.blob_download(did, cid) -> { handle = BlobHandle, mimeType = string, size = number }
+    {
+        let state_clone = state.clone();
+        let blob_download_fn =
+            lua.create_async_function(move |lua, (did, cid): (String, String)| {
+                let state = state_clone.clone();
+                async move {
+                    let pds_endpoint =
+                        profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, &did)
+                            .await
+                            .map_err(|e| {
+                                mlua::Error::runtime(format!(
+                                    "blob_download: failed to resolve PDS for {did}: {e}"
+                                ))
+                            })?;
+
+                    let url = format!(
+                        "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
+                        pds_endpoint,
+                        urlencoding::encode(&did),
+                        urlencoding::encode(&cid),
+                    );
+
+                    let response = state.http.get(&url).send().await.map_err(|e| {
+                        mlua::Error::runtime(format!("blob_download: request failed: {e}"))
+                    })?;
+
+                    let status = response.status();
+                    if !status.is_success() {
+                        return Err(mlua::Error::runtime(format!(
+                            "blob_download: PDS returned {status} for did={did} cid={cid}"
+                        )));
+                    }
+
+                    let mime_type = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("application/octet-stream")
+                        .to_string();
+
+                    let bytes = response.bytes().await.map_err(|e| {
+                        mlua::Error::runtime(format!("blob_download: failed to read body: {e}"))
+                    })?;
+
+                    let size = bytes.len();
+                    let handle = BlobHandle {
+                        data: bytes,
+                        mime_type: mime_type.clone(),
+                    };
+
+                    let result = lua.create_table()?;
+                    result.set("handle", lua.create_userdata(handle)?)?;
+                    result.set("mimeType", mime_type)?;
+                    result.set("size", size)?;
+
+                    Ok(mlua::Value::Table(result))
+                }
+            })?;
+        atproto_table.set("blob_download", blob_download_fn)?;
+    }
 
     // get_labels(uri) -> array of { src, uri, val, cts }
     let state_clone = state.clone();
@@ -472,6 +551,123 @@ pub fn register_atproto_api(
     Ok(())
 }
 
+/// Register blob upload capability on the existing `atproto` table.
+///
+/// Called only in procedure execution contexts where PDS auth is
+/// available. `blob_download` is registered in `register_atproto_api`
+/// (available everywhere); `blob_upload` needs caller credentials to
+/// write to the caller's PDS.
+pub(crate) fn register_atproto_blob_api(
+    lua: &Lua,
+    state: Arc<AppState>,
+    claims: Arc<crate::auth::Claims>,
+    pds_auth: Arc<crate::repo::PdsAuth>,
+) -> LuaResult<()> {
+    let atproto_table: mlua::Table = lua.globals().get("atproto")?;
+
+    let upload_fn = lua.create_async_function(
+        move |lua, (handle, content_type): (mlua::AnyUserData, String)| {
+            let state = state.clone();
+            let claims = claims.clone();
+            let pds_auth = pds_auth.clone();
+            async move {
+                let blob_handle = handle.borrow::<BlobHandle>().map_err(|_| {
+                    mlua::Error::runtime(
+                        "blob_upload: first argument must be a BlobHandle from blob_download()",
+                    )
+                })?;
+                let blob_bytes = blob_handle.data.clone();
+                drop(blob_handle);
+
+                let result =
+                    upload_blob_to_pds(&state, claims.did(), &pds_auth, &content_type, blob_bytes)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(format!("blob_upload: {e}")))?;
+
+                lua.to_value(&result)
+            }
+        },
+    )?;
+    atproto_table.set("blob_upload", upload_fn)?;
+
+    Ok(())
+}
+
+async fn upload_blob_to_pds(
+    state: &AppState,
+    caller_did: &str,
+    pds_auth: &crate::repo::PdsAuth,
+    content_type: &str,
+    blob_bytes: Bytes,
+) -> Result<serde_json::Value, crate::error::AppError> {
+    use crate::error::AppError;
+    use crate::repo::PdsAuth;
+
+    match pds_auth {
+        PdsAuth::OAuth(session) => {
+            use atrium_xrpc::{
+                InputDataOrBytes, OutputDataOrBytes, XrpcClient, XrpcRequest, http::Method,
+            };
+
+            let request = XrpcRequest {
+                method: Method::POST,
+                nsid: "com.atproto.repo.uploadBlob".to_string(),
+                parameters: None::<()>,
+                input: Some(InputDataOrBytes::<()>::Bytes(blob_bytes.to_vec())),
+                encoding: Some(content_type.to_string()),
+            };
+
+            let result: Result<
+                OutputDataOrBytes<serde_json::Value>,
+                atrium_xrpc::Error<serde_json::Value>,
+            > = session.send_xrpc(&request).await;
+
+            match result {
+                Ok(OutputDataOrBytes::Data(data)) => Ok(data),
+                Ok(OutputDataOrBytes::Bytes(bytes)) => serde_json::from_slice(&bytes)
+                    .map_err(|e| AppError::Internal(format!("invalid uploadBlob response: {e}"))),
+                Err(e) => Err(AppError::Internal(format!("PDS uploadBlob failed: {e}"))),
+            }
+        }
+        PdsAuth::Dpop {
+            api_client_id,
+            dpop_key_id,
+            encryption_key,
+        } => {
+            let resp = crate::oauth::pds_write::dpop_pds_post_blob(
+                &state.http,
+                &state.db,
+                state.db_backend,
+                encryption_key,
+                &state.oauth,
+                &state.config.plc_url,
+                api_client_id,
+                caller_did,
+                dpop_key_id,
+                content_type,
+                blob_bytes,
+            )
+            .await?;
+
+            let status = resp.status();
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to read upload response: {e}")))?;
+
+            if !status.is_success() {
+                let body_str = String::from_utf8_lossy(&body);
+                return Err(AppError::Internal(format!(
+                    "PDS uploadBlob returned {status}: {body_str}"
+                )));
+            }
+
+            serde_json::from_slice(&body)
+                .map_err(|e| AppError::Internal(format!("invalid uploadBlob response: {e}")))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,5 +944,231 @@ mod tests {
         "#;
         let result: bool = lua.load(chunk).eval_async().await.unwrap();
         assert!(result);
+    }
+
+    #[tokio::test]
+    async fn blob_handle_exposes_size_and_mime() {
+        let state = test_state_with_plc("");
+        let lua = mlua::Lua::new();
+        register_atproto_api(&lua, Arc::new(state), None).unwrap();
+
+        let handle = BlobHandle {
+            data: axum::body::Bytes::from_static(b"hello world"),
+            mime_type: "text/plain".to_string(),
+        };
+        lua.globals()
+            .set("test_handle", lua.create_userdata(handle).unwrap())
+            .unwrap();
+
+        let size: usize = lua
+            .load("return test_handle:size()")
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(size, 11);
+
+        let mime: String = lua
+            .load("return test_handle:mime_type()")
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(mime, "text/plain");
+    }
+
+    #[tokio::test]
+    async fn blob_download_returns_handle_and_metadata() {
+        let mock = wiremock::MockServer::start().await;
+
+        let did_doc = serde_json::json!({
+            "id": "did:plc:blobsource",
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": mock.uri()
+            }]
+        });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/did:plc:blobsource"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&did_doc))
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/xrpc/com.atproto.sync.getBlob"))
+            .and(wiremock::matchers::query_param("did", "did:plc:blobsource"))
+            .and(wiremock::matchers::query_param("cid", "bafytest123"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(vec![0x89, 0x50, 0x4E, 0x47]),
+            )
+            .mount(&mock)
+            .await;
+
+        let state = test_state_with_plc(&mock.uri());
+        let lua = mlua::Lua::new();
+        register_atproto_api(&lua, Arc::new(state), None).unwrap();
+
+        let chunk = r#"
+            local result = atproto.blob_download("did:plc:blobsource", "bafytest123")
+            return {
+                size = result.handle:size(),
+                mimeType = result.mimeType,
+            }
+        "#;
+        let result: mlua::Table = lua.load(chunk).eval_async().await.unwrap();
+        assert_eq!(result.get::<usize>("size").unwrap(), 4);
+        assert_eq!(result.get::<String>("mimeType").unwrap(), "image/png");
+    }
+
+    #[tokio::test]
+    async fn blob_download_throws_on_404() {
+        let mock = wiremock::MockServer::start().await;
+
+        let did_doc = serde_json::json!({
+            "id": "did:plc:blobsource",
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": mock.uri()
+            }]
+        });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/did:plc:blobsource"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&did_doc))
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/xrpc/com.atproto.sync.getBlob"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let state = test_state_with_plc(&mock.uri());
+        let lua = mlua::Lua::new();
+        register_atproto_api(&lua, Arc::new(state), None).unwrap();
+
+        let result: Result<mlua::Value, _> = lua
+            .load(r#"return atproto.blob_download("did:plc:blobsource", "bafymissing")"#)
+            .eval_async()
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn blob_download_defaults_mime_to_octet_stream() {
+        let mock = wiremock::MockServer::start().await;
+
+        let did_doc = serde_json::json!({
+            "id": "did:plc:blobsource",
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": mock.uri()
+            }]
+        });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/did:plc:blobsource"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&did_doc))
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/xrpc/com.atproto.sync.getBlob"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0xFF, 0xD8]))
+            .mount(&mock)
+            .await;
+
+        let state = test_state_with_plc(&mock.uri());
+        let lua = mlua::Lua::new();
+        register_atproto_api(&lua, Arc::new(state), None).unwrap();
+
+        let chunk = r#"
+            local result = atproto.blob_download("did:plc:blobsource", "bafynoheader")
+            return result.mimeType
+        "#;
+        let result: String = lua.load(chunk).eval_async().await.unwrap();
+        assert_eq!(result, "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn blob_download_throws_on_429() {
+        let mock = wiremock::MockServer::start().await;
+
+        let did_doc = serde_json::json!({
+            "id": "did:plc:blobsource",
+            "service": [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": mock.uri()
+            }]
+        });
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/did:plc:blobsource"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&did_doc))
+            .mount(&mock)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/xrpc/com.atproto.sync.getBlob"))
+            .respond_with(wiremock::ResponseTemplate::new(429))
+            .mount(&mock)
+            .await;
+
+        let state = test_state_with_plc(&mock.uri());
+        let lua = mlua::Lua::new();
+        register_atproto_api(&lua, Arc::new(state), None).unwrap();
+
+        let result: Result<mlua::Value, _> = lua
+            .load(r#"return atproto.blob_download("did:plc:blobsource", "bafyratelimit")"#)
+            .eval_async()
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("429"),
+            "error should mention 429 status: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_download_throws_on_did_resolution_failure() {
+        let mock = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/did:plc:nonexistent"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&mock)
+            .await;
+
+        let state = test_state_with_plc(&mock.uri());
+        let lua = mlua::Lua::new();
+        register_atproto_api(&lua, Arc::new(state), None).unwrap();
+
+        let result: Result<mlua::Value, _> = lua
+            .load(r#"return atproto.blob_download("did:plc:nonexistent", "bafytest")"#)
+            .eval_async()
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("resolve PDS"),
+            "error should mention PDS resolution failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_upload_throws_without_auth() {
+        let state = test_state_with_plc("");
+        let lua = mlua::Lua::new();
+        register_atproto_api(&lua, Arc::new(state), None).unwrap();
+
+        let has_upload: bool = lua
+            .load("return atproto.blob_upload ~= nil")
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(!has_upload);
     }
 }

@@ -108,6 +108,104 @@ for _, uri in ipairs(uris) do
 end
 ```
 
+## atproto.blob_download
+
+```lua
+local result = atproto.blob_download(did, cid)
+```
+
+Downloads a blob from any DID's PDS via the public `com.atproto.sync.getBlob` endpoint. No authentication is required. The blob bytes are held on the Rust side as an opaque `BlobHandle` — binary data never enters the Lua VM.
+
+| Parameter | Type   | Description                        |
+| --------- | ------ | ---------------------------------- |
+| `did`     | string | DID of the repo that owns the blob |
+| `cid`     | string | CID of the blob to download        |
+
+**Returns:** A table with:
+
+| Field      | Type       | Description                                              |
+| ---------- | ---------- | -------------------------------------------------------- |
+| `handle`   | BlobHandle | Opaque handle to the blob bytes (pass to `blob_upload`)  |
+| `mimeType` | string     | Content type from the PDS response (e.g. `"image/png"`)  |
+| `size`     | number     | Size of the blob in bytes                                |
+
+If the content-type header is missing from the PDS response, `mimeType` defaults to `"application/octet-stream"`.
+
+**Throws** on any non-2xx response from the PDS, including 404 (blob not found) and 429 (rate limited). Retry logic is the script's responsibility.
+
+**Availability:** All script contexts (queries, procedures, record scripts).
+
+### BlobHandle methods
+
+The `BlobHandle` userdata exposes two methods:
+
+| Method        | Returns | Description                       |
+| ------------- | ------- | --------------------------------- |
+| `:size()`     | number  | Size of the blob in bytes         |
+| `:mime_type()` | string  | MIME type of the blob             |
+
+### Examples
+
+```lua
+-- Download a blob and inspect it
+local result = atproto.blob_download("did:plc:abc123", "bafyreie...")
+log("downloaded " .. result.size .. " bytes, type: " .. result.mimeType)
+
+-- The handle can also be queried directly
+log("handle size: " .. result.handle:size())
+log("handle mime: " .. result.handle:mime_type())
+```
+
+## atproto.blob_upload
+
+```lua
+local response = atproto.blob_upload(handle, content_type)
+```
+
+Uploads blob bytes to the caller's PDS via authenticated `com.atproto.repo.uploadBlob`. The `handle` must be a `BlobHandle` from `blob_download`.
+
+| Parameter      | Type       | Description                                  |
+| -------------- | ---------- | -------------------------------------------- |
+| `handle`       | BlobHandle | Opaque blob handle from `blob_download`      |
+| `content_type` | string     | MIME type for the upload (e.g. `"image/png"`) |
+
+**Returns:** The PDS `uploadBlob` response, which contains a `blob` field with the new blob reference:
+
+```lua
+{
+  blob = {
+    ["$type"] = "blob",
+    ref = { ["$link"] = "<new-cid>" },
+    mimeType = "image/png",
+    size = 12345
+  }
+}
+```
+
+**Throws** on any error, including 429 (rate limited) and authentication failures. Retry logic is the script's responsibility.
+
+**Availability:** Procedure scripts only. Returns `nil` in query and record script contexts (no PDS auth available).
+
+### Examples
+
+```lua
+-- Copy a blob from one repo to another
+local downloaded = atproto.blob_download(source_did, old_cid)
+local uploaded = atproto.blob_upload(downloaded.handle, downloaded.mimeType)
+
+-- Use the new blob ref in a record
+local new_cid = uploaded.blob.ref["$link"]
+
+-- Migrate all blobs in a media array
+for _, item in ipairs(record.media) do
+  if item.blob and item.blob.ref then
+    local dl = atproto.blob_download(source_did, item.blob.ref["$link"])
+    local ul = atproto.blob_upload(dl.handle, dl.mimeType)
+    item.blob = ul.blob
+  end
+end
+```
+
 ## atproto.sign
 
 ```lua
