@@ -53,7 +53,7 @@ services:
       dockerfile: Dockerfile
     environment:
       DATABASE_URL: postgres://happyview:happyview@postgres:5432/happyview_test
-      PUBLIC_URL: http://localhost:3200
+      PUBLIC_URL: http://127.0.0.1:3200
       HOST: 0.0.0.0
       PORT: "3000"
       PLC_URL: http://plc:2582
