@@ -16,7 +16,7 @@ async function globalSetup() {
   const baseURL = process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:3200"
 
   await waitForService(`${baseURL}/health`, "HappyView")
-  await waitForService("http://localhost:2582/health", "PLC Directory")
+  await waitForService("http://localhost:2582/_health", "PLC Directory")
   await waitForService("http://localhost:3100/health", "Tranquil PDS")
 }
 
