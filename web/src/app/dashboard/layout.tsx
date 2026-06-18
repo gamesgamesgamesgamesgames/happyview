@@ -23,26 +23,23 @@ export default function DashboardLayout({
   const [setupChecked, setSetupChecked] = useState(false)
 
   useEffect(() => {
-    if (!did) {
-      router.replace("/login")
-    }
-  }, [did, router])
-
-  useEffect(() => {
-    if (did) {
-      getSetupStatus()
-        .then((status) => {
-          if (!status.setup_complete) {
-            router.replace("/setup")
-          } else {
-            setSetupChecked(true)
-          }
-        })
-        .catch(() => {
-          // If status endpoint fails (e.g. no table yet), allow through
+    getSetupStatus()
+      .then((status) => {
+        if (!status.setup_complete) {
+          router.replace("/setup")
+        } else if (!did) {
+          router.replace("/login")
+        } else {
           setSetupChecked(true)
-        })
-    }
+        }
+      })
+      .catch(() => {
+        if (!did) {
+          router.replace("/login")
+        } else {
+          setSetupChecked(true)
+        }
+      })
   }, [did, router])
 
   useEffect(() => {
