@@ -1,21 +1,29 @@
 "use client"
 
-import { useAuth } from "@/lib/auth-context"
 import { useRouter } from "next/navigation"
-import { useEffect } from "react"
+import { useEffect, useState } from "react"
+import { getSetupStatus } from "@/lib/api"
 import { SetupWizard } from "@/components/setup/setup-wizard"
 
 export default function SetupPage() {
-  const { did } = useAuth()
   const router = useRouter()
+  const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    if (!did) {
-      router.replace("/login")
-    }
-  }, [did, router])
+    getSetupStatus()
+      .then((status) => {
+        if (status.setup_complete) {
+          router.replace("/dashboard")
+        } else {
+          setReady(true)
+        }
+      })
+      .catch(() => {
+        setReady(true)
+      })
+  }, [router])
 
-  if (!did) return null
+  if (!ready) return null
 
   return (
     <div className="bg-background flex min-h-svh flex-col items-center justify-center p-6 md:p-10">

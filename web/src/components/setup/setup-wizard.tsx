@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
-import { getSetupStatus } from "@/lib/api"
+import { getSetupStatus, setSetupIdentity } from "@/lib/api"
 import { SetupIdentityMode } from "./setup-identity-mode"
 import { SetupConfigure } from "./setup-configure"
 import { SetupAttachAuth } from "./setup-attach-auth"
@@ -29,6 +29,7 @@ export function SetupWizard() {
         } else if (status.plc_verified || (status.identity_mode === "not_exposed")) {
           setCurrentStep("complete")
         } else if (status.identity_configured) {
+          setIdentityMode(status.identity_mode)
           setCurrentStep("verify")
         } else if (status.identity_mode) {
           setIdentityMode(status.identity_mode)
@@ -38,9 +39,10 @@ export function SetupWizard() {
       .finally(() => setLoading(false))
   }, [])
 
-  const handleModeSelected = useCallback((mode: string) => {
+  const handleModeSelected = useCallback(async (mode: string) => {
     setIdentityMode(mode)
     if (mode === "not_exposed") {
+      await setSetupIdentity({ mode: "not_exposed" })
       setCurrentStep("complete")
     } else {
       setCurrentStep("configure")

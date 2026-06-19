@@ -1,10 +1,11 @@
 import { test, expect } from "@playwright/test"
+import { loginAsTestAdmin, resetServiceIdentity } from "./auth-helper"
 
 const PDS_URL = "http://localhost:3100"
 
 async function createPdsAccount(): Promise<{ did: string; handle: string }> {
   const suffix = Date.now().toString(36)
-  const handle = `testuser-${suffix}.localhost`
+  const handle = `testuser-${suffix}.test`
 
   const resp = await fetch(`${PDS_URL}/xrpc/com.atproto.server.createAccount`, {
     method: "POST",
@@ -12,7 +13,7 @@ async function createPdsAccount(): Promise<{ did: string; handle: string }> {
     body: JSON.stringify({
       email: `testuser-${suffix}@example.com`,
       handle,
-      password: "test-password-e2e-123",
+      password: "Test-password-e2e-123",
     }),
   })
 
@@ -30,24 +31,10 @@ test.describe("Setup - Attach Account", () => {
 
   test.beforeAll(async () => {
     account = await createPdsAccount()
+    await resetServiceIdentity()
   })
 
   test("attach_account flow reaches authenticate step", async ({ page }) => {
-    // Reset identity by calling the admin API to trigger fresh setup
-    await page.goto("/dashboard/settings/service-identity")
-
-    const changeModeButton = page.getByRole("button", {
-      name: /change mode/i,
-    })
-    if (await changeModeButton.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await changeModeButton.click()
-      const confirmButton = page.getByRole("button", {
-        name: /confirm|yes|continue/i,
-      })
-      await expect(confirmButton).toBeVisible()
-      await confirmButton.click()
-    }
-
     await page.goto("/setup")
     await expect(
       page.getByText(/how should this appview be identified/i),
@@ -62,9 +49,10 @@ test.describe("Setup - Attach Account", () => {
     await expect(identifierInput).toBeVisible({ timeout: 5000 })
     await identifierInput.fill(account.did)
 
-    // Wait for identity resolution (debounced typeahead)
-    // The dropdown might or might not appear depending on PLC state
-    await page.waitForTimeout(500)
+    // Wait for the typeahead dropdown and select the suggestion
+    const suggestion = page.locator(".bg-popover button").first()
+    await expect(suggestion).toBeVisible({ timeout: 5000 })
+    await suggestion.click()
 
     // Click continue to submit the identity
     const continueButton = page.getByRole("button", { name: /continue/i })
@@ -76,12 +64,9 @@ test.describe("Setup - Attach Account", () => {
       page.getByText(/authenticate attached account/i),
     ).toBeVisible({ timeout: 10000 })
 
-    // Verify the correct account info is displayed
-    await expect(page.getByText(account.did)).toBeVisible()
-
-    // The "Authenticate as ..." button should be visible
+    // Verify the authenticate button contains the account handle
     await expect(
-      page.getByRole("button", { name: /authenticate as/i }),
+      page.getByRole("button", { name: new RegExp(`authenticate as.*${account.handle}`, "i") }),
     ).toBeVisible()
   })
 
@@ -95,8 +80,9 @@ test.describe("Setup - Attach Account", () => {
         await notExposedCard.isVisible({ timeout: 3000 }).catch(() => false)
       ) {
         await notExposedCard.click()
+        await page.getByRole("button", { name: /continue/i }).click()
         await expect(
-          page.getByText(/complete|success|done/i),
+          page.getByText("Setup Complete"),
         ).toBeVisible({ timeout: 5000 })
       }
     } finally {

@@ -1,19 +1,9 @@
 import { test, expect } from "@playwright/test"
+import { loginAsTestAdmin } from "./auth-helper"
 
 test.describe("Lexicon Services", () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto("/setup")
-    const didWebCard = page.getByText("did:web")
-    if (await didWebCard.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await didWebCard.click()
-      const continueButton = page.getByRole("button", { name: /continue|next|save/i })
-      if (await continueButton.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await continueButton.click()
-      }
-      const completeButton = page.getByRole("button", { name: /looks good|complete|continue/i })
-      await expect(completeButton).toBeVisible({ timeout: 10000 })
-      await completeButton.click()
-    }
+    await loginAsTestAdmin(page)
   })
 
   test("service entry appears in lexicon services sheet", async ({ page }) => {

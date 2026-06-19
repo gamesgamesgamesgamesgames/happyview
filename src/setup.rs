@@ -11,11 +11,18 @@ use axum_extra::extract::cookie::{Cookie, Key, SignedCookieJar};
 use rand::RngCore;
 use serde::Deserialize;
 
-use crate::admin::auth::UserAuth;
 use crate::auth::COOKIE_NAME;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::service_identity::{self, IdentityMode};
 use crate::{AppState, error::AppError};
+
+async fn require_setup_incomplete(state: &AppState) -> Result<(), AppError> {
+    let status = service_identity::get_setup_status(&state.db, state.db_backend).await?;
+    if status.setup_complete {
+        return Err(AppError::Forbidden("setup is already complete".into()));
+    }
+    Ok(())
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -50,9 +57,9 @@ struct PlcSubmitBody {
 
 async fn set_identity(
     State(state): State<AppState>,
-    _auth: UserAuth,
     Json(body): Json<SetIdentityRequest>,
 ) -> Result<StatusCode, AppError> {
+    require_setup_incomplete(&state).await?;
     let mode = IdentityMode::parse(&body.mode)
         .ok_or_else(|| AppError::BadRequest(format!("invalid identity mode: {}", body.mode)))?;
 
@@ -142,8 +149,8 @@ struct PlcRegisterResponse {
 /// 7. Updates the service_identity row with the new DID
 async fn plc_register(
     State(state): State<AppState>,
-    _auth: UserAuth,
 ) -> Result<Json<PlcRegisterResponse>, AppError> {
+    require_setup_incomplete(&state).await?;
     let identity = service_identity::get_identity(&state.db, state.db_backend).await?;
     let identity = identity.ok_or_else(|| AppError::BadRequest("no identity configured".into()))?;
 
@@ -233,10 +240,8 @@ async fn plc_register(
     Ok(Json(PlcRegisterResponse { did }))
 }
 
-async fn plc_request(
-    State(state): State<AppState>,
-    _auth: UserAuth,
-) -> Result<StatusCode, AppError> {
+async fn plc_request(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+    require_setup_incomplete(&state).await?;
     let identity = service_identity::get_identity(&state.db, state.db_backend).await?;
     let identity = identity.ok_or_else(|| AppError::BadRequest("no identity configured".into()))?;
 
@@ -279,9 +284,9 @@ async fn plc_request(
 
 async fn plc_submit(
     State(state): State<AppState>,
-    _auth: UserAuth,
     Json(body): Json<PlcSubmitBody>,
 ) -> Result<StatusCode, AppError> {
+    require_setup_incomplete(&state).await?;
     let identity = service_identity::get_identity(&state.db, state.db_backend).await?;
     let identity = identity.ok_or_else(|| AppError::BadRequest("no identity configured".into()))?;
 
@@ -494,10 +499,8 @@ async fn attach_auth_confirm(
     Ok((jar, StatusCode::NO_CONTENT))
 }
 
-async fn export_rotation_key(
-    State(state): State<AppState>,
-    _auth: UserAuth,
-) -> Result<impl IntoResponse, AppError> {
+async fn export_rotation_key(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    require_setup_incomplete(&state).await?;
     use base64::Engine;
 
     let identity = service_identity::get_identity(&state.db, state.db_backend).await?;
@@ -547,7 +550,8 @@ async fn export_rotation_key(
     ))
 }
 
-async fn complete(State(state): State<AppState>, auth: UserAuth) -> Result<StatusCode, AppError> {
+async fn complete(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+    require_setup_incomplete(&state).await?;
     service_identity::mark_setup_complete(&state.db, state.db_backend).await?;
 
     log_event(
@@ -555,7 +559,7 @@ async fn complete(State(state): State<AppState>, auth: UserAuth) -> Result<Statu
         EventLog {
             event_type: "setup.completed".to_string(),
             severity: Severity::Info,
-            actor_did: Some(auth.did.clone()),
+            actor_did: None,
             subject: None,
             detail: serde_json::json!({}),
         },

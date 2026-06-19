@@ -59,7 +59,7 @@ services:
       PLC_URL: http://plc:2582
       RELAY_URL: http://plc:2582
       SESSION_SECRET: e2e-test-secret-that-is-at-least-32-bytes
-      TOKEN_ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000042
+      TOKEN_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
       JETSTREAM_URL: wss://jetstream1.us-east.bsky.network
     ports:
       - "3200:3000"
