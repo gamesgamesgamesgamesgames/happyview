@@ -28,6 +28,7 @@ export default defineConfig({
       testMatch: [
         "service-identity-settings.spec.ts",
         "lexicon-services.spec.ts",
+        "proxy-config.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },
@@ -36,6 +37,12 @@ export default defineConfig({
       name: "attach-account",
       testMatch: "setup-attach-account.spec.ts",
       dependencies: ["post-setup"],
+      use: { browserName: "chromium", ignoreHTTPSErrors: true },
+    },
+    {
+      name: "didplc-setup",
+      testMatch: "setup-didplc.spec.ts",
+      dependencies: ["attach-account"],
       use: { browserName: "chromium" },
     },
   ],

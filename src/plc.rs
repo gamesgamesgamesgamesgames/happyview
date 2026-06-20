@@ -308,4 +308,54 @@ mod tests {
         let did_key = private_key_to_did_key(&key_bytes).unwrap();
         assert!(did_key.starts_with("did:key:z"));
     }
+
+    #[test]
+    fn decrypt_key_invalid_base64() {
+        let encryption_key = [0x42u8; 32];
+        let result = decrypt_key("not valid base64!!!", &encryption_key);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("decode"),
+            "error should mention decoding: {msg}"
+        );
+    }
+
+    #[test]
+    fn decrypt_key_wrong_encryption_key() {
+        let correct_key = [0x42u8; 32];
+        let wrong_key = [0x99u8; 32];
+
+        let plaintext = [0xAAu8; 32];
+        let encrypted = crate::plugin::encryption::encrypt(&correct_key, &plaintext).unwrap();
+        let enc_b64 = base64::engine::general_purpose::STANDARD.encode(&encrypted);
+
+        let result = decrypt_key(&enc_b64, &wrong_key);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("decrypt"),
+            "error should mention decryption: {msg}"
+        );
+    }
+
+    #[test]
+    fn private_key_to_did_key_rejects_invalid_bytes() {
+        let result = private_key_to_did_key(&[0x00; 32]);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("invalid signing key"),
+            "error should mention invalid: {msg}"
+        );
+    }
+
+    #[test]
+    fn extract_prev_cid_missing_field() {
+        let op = serde_json::json!({"type": "plc_operation"});
+        let result = extract_prev_cid(&op);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("CID"), "error should mention CID: {msg}");
+    }
 }

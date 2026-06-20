@@ -33,7 +33,21 @@ export function SetupWizard() {
           setCurrentStep("verify")
         } else if (status.identity_mode) {
           setIdentityMode(status.identity_mode)
-          setCurrentStep("configure")
+
+          // Returning from OAuth redirect — localStorage has the pending auth payload.
+          // Jump directly to attach-auth so SetupAttachAuth can process the callback.
+          const pendingAuth = localStorage.getItem("happyview_attach_auth")
+          if (status.identity_mode === "attach_account" && pendingAuth) {
+            try {
+              const payload = JSON.parse(pendingAuth) as { attachedDid: string }
+              setAttachedDid(payload.attachedDid)
+              setCurrentStep("attach-auth")
+            } catch {
+              setCurrentStep("configure")
+            }
+          } else {
+            setCurrentStep("configure")
+          }
         }
       })
       .finally(() => setLoading(false))

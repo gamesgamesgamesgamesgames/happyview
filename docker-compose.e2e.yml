@@ -47,10 +47,23 @@ services:
       plc:
         condition: service_started
 
+  caddy:
+    image: caddy:2-alpine
+    volumes:
+      - ./scripts/e2e-Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    ports:
+      - "443:443"
+    networks:
+      default:
+        aliases:
+          - pds.localhost
+
   happyview:
     build:
       context: .
       dockerfile: Dockerfile
+    entrypoint: ["/bin/sh", "/e2e-entrypoint.sh"]
     environment:
       DATABASE_URL: postgres://happyview:happyview@postgres:5432/happyview_test
       PUBLIC_URL: http://127.0.0.1:3200
@@ -63,8 +76,16 @@ services:
       JETSTREAM_URL: wss://jetstream1.us-east.bsky.network
     ports:
       - "3200:3000"
+    volumes:
+      - ./scripts/e2e-entrypoint.sh:/e2e-entrypoint.sh:ro
+      - caddy_data:/caddy-data:ro
     depends_on:
       postgres:
         condition: service_healthy
       plc:
         condition: service_started
+      caddy:
+        condition: service_started
+
+volumes:
+  caddy_data:

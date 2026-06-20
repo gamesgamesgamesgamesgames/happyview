@@ -70,7 +70,16 @@ export function SetupAttachAuth({ attachedDid, attachedHandle, onComplete }: Set
         localStorage.setItem(ATTACH_AUTH_STORAGE_KEY, JSON.stringify(payload))
 
         const handle = attachedHandle ?? attachedDid
-        window.location.href = `/auth/login?handle=${encodeURIComponent(handle)}`
+        return fetch(`/auth/login?handle=${encodeURIComponent(handle)}`, {
+          credentials: "same-origin",
+        })
+      })
+      .then((resp) => {
+        if (!resp.ok) throw new Error("Login request failed")
+        return resp.json() as Promise<{ url: string }>
+      })
+      .then(({ url }) => {
+        window.location.href = url
       })
       .catch((e) => {
         setError(e instanceof Error ? e.message : "Failed to start authentication")

@@ -159,6 +159,25 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_does_not_match_prefix_without_dot() {
+        let config = ProxyConfig {
+            mode: ProxyMode::Allowlist,
+            nsids: vec!["com.example.*".into()],
+        };
+        assert!(
+            !config.allows("com.example"),
+            "bare prefix should not match wildcard"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_characters() {
+        assert!(validate_nsid_pattern("com.ex@mple.foo").is_err());
+        assert!(validate_nsid_pattern("com.ex mple.foo").is_err());
+        assert!(validate_nsid_pattern("com.ex_mple.foo").is_err());
+    }
+
+    #[test]
     fn validate_valid_nsids() {
         assert!(validate_nsid_pattern("com.example.feed.getHot").is_ok());
         assert!(validate_nsid_pattern("com.example.*").is_ok());

@@ -1553,6 +1553,96 @@ async fn service_auth_works_with_did_plc_identity() {
 }
 
 // ---------------------------------------------------------------------------
+// Service auth — ES256K (secp256k1)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn service_auth_es256k_query_allowed() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    seed_query_lexicon(&app).await;
+
+    app.create_service_entry("#chess", "ChessAppView", "all")
+        .await;
+
+    // Generate a secp256k1 key pair
+    use k256::ecdsa::{SigningKey as K256SigningKey, signature::Signer as K256Signer};
+    use rand::RngCore;
+
+    let mut key_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut key_bytes);
+    let k256_signing_key = K256SigningKey::from_bytes((&key_bytes[..]).into()).unwrap();
+    let k256_verifying_key = k256_signing_key.verifying_key();
+    let compressed = k256_verifying_key.to_encoded_point(true);
+    let pub_bytes = compressed.as_bytes();
+
+    // Build a DID document with secp256k1 key using EcdsaSecp256k1VerificationKey2019
+    // This type uses raw SEC1 key bytes (no multicodec prefix)
+    let multibase_key = multibase::encode(multibase::Base::Base58Btc, pub_bytes);
+
+    let issuer_did = "did:plc:es256kcaller";
+    let did_doc = json!({
+        "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
+        "id": issuer_did,
+        "verificationMethod": [{
+            "id": format!("{issuer_did}#atproto"),
+            "type": "EcdsaSecp256k1VerificationKey2019",
+            "controller": issuer_did,
+            "publicKeyMultibase": multibase_key
+        }],
+        "service": []
+    });
+
+    plc_store
+        .write()
+        .await
+        .insert(issuer_did.to_string(), did_doc);
+
+    // Sign a JWT with ES256K
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let header = json!({"alg": "ES256K"});
+    let payload = json!({
+        "iss": issuer_did,
+        "aud": format!("{did}#chess"),
+        "exp": chrono::Utc::now().timestamp() as u64 + 60,
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let message = format!("{}.{}", header_b64, payload_b64);
+
+    let signature: k256::ecdsa::Signature = k256_signing_key.sign(message.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    let auth = format!("Bearer {}.{}.{}", header_b64, payload_b64, sig_b64);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/games.gamesgamesgamesgames.listGames")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "ES256K service auth should be accepted"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Anonymous POST to procedure is rejected
 // ---------------------------------------------------------------------------
 
@@ -1586,5 +1676,517 @@ async fn anonymous_procedure_rejected() {
         resp.status(),
         StatusCode::UNAUTHORIZED,
         "anonymous POST to procedure should be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Proxy config blocking — XRPC method blocked by proxy policy
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn proxy_config_disabled_rejects_unknown_method() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.setup_did_web().await;
+
+    // Set proxy config to disabled
+    app.state
+        .proxy_config
+        .store(std::sync::Arc::new(happyview::proxy_config::ProxyConfig {
+            mode: happyview::proxy_config::ProxyMode::Disabled,
+            nsids: vec![],
+        }));
+
+    app.rebuild_router();
+
+    // Query an unknown method (not in lexicon registry) — should be blocked
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/com.unknown.method")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "disabled proxy config should reject unknown methods"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn proxy_config_allowlist_rejects_unlisted_method() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.setup_did_web().await;
+
+    // Set proxy config to allowlist with a specific pattern
+    app.state
+        .proxy_config
+        .store(std::sync::Arc::new(happyview::proxy_config::ProxyConfig {
+            mode: happyview::proxy_config::ProxyMode::Allowlist,
+            nsids: vec!["com.allowed.*".to_string()],
+        }));
+
+    app.rebuild_router();
+
+    // Query an unlisted method — should be blocked
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/com.blocked.method")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "allowlist proxy config should reject unlisted methods"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Non-scripted procedure via service auth — falls through to OAuth path
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn service_auth_non_scripted_procedure_fails_gracefully() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    // Seed a procedure lexicon but do NOT seed a script for it
+    seed_procedure_lexicon(&app).await;
+
+    let entry_id = app
+        .create_service_entry("#chess", "ChessAppView", "specific")
+        .await;
+    app.add_entry_xrpcs(entry_id, &["games.gamesgamesgamesgames.createGame"])
+        .await;
+
+    let auth = app
+        .service_auth_jwt(&plc_store, "did:plc:noscript", &did, "#chess")
+        .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/games.gamesgamesgamesgames.createGame")
+                .header("authorization", &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"title": "test"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Without a script, service auth goes to the OAuth session path which will fail
+    // because there's no stored session for the service auth caller. This should
+    // return a server error, not panic.
+    assert!(
+        resp.status().is_client_error() || resp.status().is_server_error(),
+        "non-scripted procedure via service auth should fail gracefully, got {}",
+        resp.status()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// JWT unsupported algorithm rejected
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn unsupported_jwt_algorithm_rejected() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    seed_procedure_lexicon(&app).await;
+    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+
+    app.create_service_entry("#chess", "ChessAppView", "all")
+        .await;
+
+    // JWT with RS256 algorithm (unsupported)
+    let auth = app
+        .custom_service_auth_jwt(
+            &plc_store,
+            "did:plc:rs256test",
+            json!({"alg": "RS256"}),
+            json!({
+                "iss": "did:plc:rs256test",
+                "aud": format!("{}#chess", did),
+                "exp": chrono::Utc::now().timestamp() as u64 + 60,
+            }),
+        )
+        .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/games.gamesgamesgamesgames.createGame")
+                .header("authorization", &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"title": "test"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "unsupported JWT algorithm should be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unauthenticated access to admin service identity endpoints
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn unauthenticated_get_service_identity_rejected() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/service-identity")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        resp.status().is_client_error(),
+        "unauthenticated GET /admin/service-identity should be rejected, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn unauthenticated_put_service_identity_rejected() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/service-identity")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"mode": "not_exposed"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        resp.status().is_client_error(),
+        "unauthenticated PUT /admin/service-identity should be rejected, got {}",
+        resp.status()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lexicon type mismatch — GET to procedure, POST to query
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn get_to_procedure_endpoint_rejected() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.setup_did_web().await;
+
+    seed_procedure_lexicon(&app).await;
+    seed_procedure_script(&app, "function handle(input, params)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/games.gamesgamesgamesgames.createGame")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "GET to a procedure endpoint should return 400"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn post_to_query_endpoint_rejected() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    seed_query_lexicon(&app).await;
+    app.create_service_entry("#chess", "ChessAppView", "all")
+        .await;
+
+    let auth = app
+        .service_auth_jwt(&plc_store, "did:plc:postquery", &did, "#chess")
+        .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/games.gamesgamesgamesgames.listGames")
+                .header("authorization", &auth)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"test": true})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "POST to a query endpoint should return 400"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DID doc missing #atproto verification method
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn did_doc_missing_atproto_vm_rejected() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    seed_query_lexicon(&app).await;
+    app.create_service_entry("#chess", "ChessAppView", "all")
+        .await;
+
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use p256::ecdsa::{SigningKey, signature::Signer};
+    use rand::RngCore;
+
+    let mut key_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut key_bytes);
+    let signing_key = SigningKey::from_bytes((&key_bytes[..]).into()).unwrap();
+
+    let issuer_did = "did:plc:noatprotovm";
+    let did_doc = json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": issuer_did,
+        "verificationMethod": [{
+            "id": format!("{issuer_did}#wrongId"),
+            "type": "Multikey",
+            "controller": issuer_did,
+            "publicKeyMultibase": "zNotARealKey"
+        }],
+        "service": []
+    });
+    plc_store
+        .write()
+        .await
+        .insert(issuer_did.to_string(), did_doc);
+
+    let header = json!({"alg": "ES256"});
+    let payload = json!({
+        "iss": issuer_did,
+        "aud": format!("{}#chess", did),
+        "exp": chrono::Utc::now().timestamp() as u64 + 60,
+    });
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let message = format!("{}.{}", header_b64, payload_b64);
+    let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    let auth = format!("Bearer {}.{}.{}", header_b64, payload_b64, sig_b64);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/games.gamesgamesgamesgames.listGames")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "DID doc without #atproto VM should reject service auth"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn did_doc_missing_public_key_multibase_rejected() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    seed_query_lexicon(&app).await;
+    app.create_service_entry("#chess", "ChessAppView", "all")
+        .await;
+
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use p256::ecdsa::{SigningKey, signature::Signer};
+    use rand::RngCore;
+
+    let mut key_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut key_bytes);
+    let signing_key = SigningKey::from_bytes((&key_bytes[..]).into()).unwrap();
+
+    let issuer_did = "did:plc:nokeymultibase";
+    let did_doc = json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": issuer_did,
+        "verificationMethod": [{
+            "id": format!("{issuer_did}#atproto"),
+            "type": "Multikey",
+            "controller": issuer_did
+        }],
+        "service": []
+    });
+    plc_store
+        .write()
+        .await
+        .insert(issuer_did.to_string(), did_doc);
+
+    let header = json!({"alg": "ES256"});
+    let payload = json!({
+        "iss": issuer_did,
+        "aud": format!("{}#chess", did),
+        "exp": chrono::Utc::now().timestamp() as u64 + 60,
+    });
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let message = format!("{}.{}", header_b64, payload_b64);
+    let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    let auth = format!("Bearer {}.{}.{}", header_b64, payload_b64, sig_b64);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/games.gamesgamesgamesgames.listGames")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "DID doc without publicKeyMultibase should reject service auth"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// JWT allowed typ (e.g., "JWT") is accepted
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn jwt_with_allowed_typ_accepted() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    seed_query_lexicon(&app).await;
+
+    app.create_service_entry("#chess", "ChessAppView", "all")
+        .await;
+
+    let auth = app
+        .custom_service_auth_jwt(
+            &plc_store,
+            "did:plc:goodtyp",
+            json!({"alg": "ES256", "typ": "JWT"}),
+            json!({
+                "iss": "did:plc:goodtyp",
+                "aud": format!("{}#chess", did),
+                "exp": chrono::Utc::now().timestamp() as u64 + 60,
+            }),
+        )
+        .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/games.gamesgamesgamesgames.listGames")
+                .header("authorization", &auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "JWT with typ=JWT should be accepted"
     );
 }

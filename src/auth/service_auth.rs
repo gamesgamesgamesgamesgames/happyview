@@ -349,4 +349,90 @@ mod tests {
         assert!(decode_jwt_payload("onlyonepart").is_err());
         assert!(decode_jwt_payload("two.parts").is_err());
     }
+
+    #[test]
+    fn decode_jwt_payload_rejects_not_three_parts() {
+        assert!(decode_jwt_payload("notenoughparts").is_err());
+        assert!(decode_jwt_payload("two.parts").is_err());
+        assert!(decode_jwt_payload("a.b.c.d").is_err());
+    }
+
+    #[test]
+    fn decode_jwt_payload_rejects_invalid_base64() {
+        let jwt = "validheader.!!!invalid-base64!!!.sig";
+        let result = decode_jwt_payload(jwt);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_es256_rejects_invalid_key_bytes() {
+        assert!(!verify_es256(b"test message", &[0u8; 64], &[0xFF; 5]));
+    }
+
+    #[test]
+    fn verify_es256k_rejects_invalid_key_bytes() {
+        assert!(!verify_es256k(b"test message", &[0u8; 64], &[0xFF; 5]));
+    }
+
+    #[test]
+    fn decode_multibase_key_rejects_invalid_multibase() {
+        let result = decode_multibase_key("not-a-valid-multibase-string!!!", "Multikey");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("multibase"),
+            "error should mention multibase: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_multibase_key_secp256r1_returns_raw_bytes() {
+        let raw_bytes = vec![0x04, 0xAA, 0xBB, 0xCC, 0xDD];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &raw_bytes);
+        let result = decode_multibase_key(&encoded, "EcdsaSecp256r1VerificationKey2019").unwrap();
+        assert_eq!(result, raw_bytes);
+    }
+
+    #[test]
+    fn decode_multibase_key_secp256k1_returns_raw_bytes() {
+        let raw_bytes = vec![0x02, 0x11, 0x22, 0x33];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &raw_bytes);
+        let result = decode_multibase_key(&encoded, "EcdsaSecp256k1VerificationKey2019").unwrap();
+        assert_eq!(result, raw_bytes);
+    }
+
+    #[test]
+    fn decode_multibase_key_unknown_type_rejected() {
+        let raw_bytes = vec![0x80, 0x24, 0x01, 0x02, 0x03];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &raw_bytes);
+        let result = decode_multibase_key(&encoded, "UnknownKeyType2099");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("unsupported"),
+            "error should mention unsupported: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_multibase_key_multikey_too_short() {
+        let short_bytes = vec![0x80];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &short_bytes);
+        let result = decode_multibase_key(&encoded, "Multikey");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("too short"),
+            "error should mention too short: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_multibase_key_multikey_strips_prefix() {
+        let mut bytes = vec![0x80, 0x24];
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &bytes);
+        let result = decode_multibase_key(&encoded, "Multikey").unwrap();
+        assert_eq!(result, vec![0xAA, 0xBB, 0xCC]);
+    }
 }

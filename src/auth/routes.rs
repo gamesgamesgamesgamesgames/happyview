@@ -16,6 +16,10 @@ use serde::Deserialize;
 /// Detected and removed in the callback to clean up stale cookies.
 const LEGACY_REDIRECT_COOKIE: &str = "happyview_redirect";
 
+fn is_https(public_url: &str) -> bool {
+    public_url.starts_with("https://")
+}
+
 #[derive(Deserialize)]
 pub struct LoginQuery {
     handle: String,
@@ -212,6 +216,7 @@ async fn callback(
 
     // Check if the user is authorized to access the dashboard.
     // Allow login when no users exist yet (first user will be bootstrapped as admin).
+    // Also allow login for the configured attached account DID (setup attach-auth flow).
     // Otherwise, only allow users already in the users table.
     let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
         .fetch_one(&state.db)
@@ -229,13 +234,25 @@ async fn callback(
         .map_err(|e| AppError::Internal(format!("user lookup failed: {e}")))?;
 
         if user_exists.is_none() {
-            let login_url = state
-                .config
-                .base_path
-                .as_ref()
-                .map(|bp| format!("{}/login?error=not_authorized", bp))
-                .unwrap_or_else(|| "/login?error=not_authorized".into());
-            return Ok((jar, Redirect::to(&login_url)));
+            // Allow login if this DID is the configured attached account (setup flow)
+            let is_attached_account: Option<(i32,)> = sqlx::query_as(&adapt_sql(
+                "SELECT 1 FROM service_identity WHERE attached_account_did = ?",
+                state.db_backend,
+            ))
+            .bind(did.as_ref())
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
+
+            if is_attached_account.is_none() {
+                let login_url = state
+                    .config
+                    .base_path
+                    .as_ref()
+                    .map(|bp| format!("{}/login?error=not_authorized", bp))
+                    .unwrap_or_else(|| "/login?error=not_authorized".into());
+                return Ok((jar, Redirect::to(&login_url)));
+            }
         }
     }
 
@@ -274,18 +291,24 @@ async fn callback(
     } else {
         did_str.to_string()
     };
+    let secure = is_https(&state.config.public_url);
+    let same_site = if secure {
+        axum_extra::extract::cookie::SameSite::None
+    } else {
+        axum_extra::extract::cookie::SameSite::Lax
+    };
     let mut session_cookie = Cookie::new(COOKIE_NAME, cookie_value);
     session_cookie.set_path("/");
     session_cookie.set_http_only(true);
-    session_cookie.set_same_site(axum_extra::extract::cookie::SameSite::None);
-    session_cookie.set_secure(true); // Required when SameSite=None
+    session_cookie.set_same_site(same_site);
+    session_cookie.set_secure(secure);
 
     // Remove the legacy redirect cookie if present (old cookie-based approach)
     let jar = if jar.get(LEGACY_REDIRECT_COOKIE).is_some() {
         let mut removal = Cookie::from(LEGACY_REDIRECT_COOKIE);
         removal.set_path("/");
-        removal.set_same_site(axum_extra::extract::cookie::SameSite::None);
-        removal.set_secure(true);
+        removal.set_same_site(same_site);
+        removal.set_secure(secure);
         jar.add(session_cookie).remove(removal)
     } else {
         jar.add(session_cookie)
@@ -306,10 +329,16 @@ async fn logout(
         }
     }
 
+    let secure = is_https(&state.config.public_url);
+    let same_site = if secure {
+        axum_extra::extract::cookie::SameSite::None
+    } else {
+        axum_extra::extract::cookie::SameSite::Lax
+    };
     let mut removal = Cookie::from(COOKIE_NAME);
     removal.set_path("/");
-    removal.set_same_site(axum_extra::extract::cookie::SameSite::None);
-    removal.set_secure(true);
+    removal.set_same_site(same_site);
+    removal.set_secure(secure);
     let jar = jar.remove(removal);
     Ok(jar)
 }

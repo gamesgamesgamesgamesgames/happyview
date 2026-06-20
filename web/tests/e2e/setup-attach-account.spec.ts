@@ -70,6 +70,85 @@ test.describe("Setup - Attach Account", () => {
     ).toBeVisible()
   })
 
+  test("full OAuth flow completes through PDS authorization", async ({ page }) => {
+    await resetServiceIdentity()
+    await loginAsTestAdmin(page)
+    await page.goto("/setup")
+
+    // Select "Attach existing account"
+    await expect(
+      page.getByText(/how should this appview be identified/i),
+    ).toBeVisible({ timeout: 10000 })
+    await page.getByText(/attach existing account/i).click()
+    await page.getByRole("button", { name: /continue/i }).click()
+
+    // Enter the DID directly without selecting from the typeahead so
+    // attachedHandle stays null and the OAuth flow uses the DID.
+    // Handle resolution for .test domains won't work from inside Docker.
+    const identifierInput = page.getByLabel(/account identifier/i)
+    await expect(identifierInput).toBeVisible({ timeout: 5000 })
+    await identifierInput.fill(account.did)
+
+    // Dismiss any typeahead dropdown that appears
+    await page.keyboard.press("Escape")
+
+    const continueButton = page.getByRole("button", { name: /continue/i })
+    await expect(continueButton).toBeEnabled({ timeout: 5000 })
+    await continueButton.click()
+
+    // Reach the authenticate step
+    await expect(
+      page.getByText(/authenticate attached account/i),
+    ).toBeVisible({ timeout: 10000 })
+
+    // Click "Authenticate as @handle" — this triggers the OAuth flow:
+    // 1. Frontend fetches /auth/login?handle=<did> to get the authorization URL
+    // 2. HappyView's backend makes a PAR request to the PDS via Caddy (HTTPS)
+    // 3. Frontend redirects to the PDS OAuth login page
+    const authButton = page.getByRole("button", {
+      name: /authenticate as/i,
+    })
+    await authButton.click()
+
+    // Wait for redirect to PDS OAuth login page (served via Caddy at pds.localhost)
+    await page.waitForURL(/pds\.localhost/, { timeout: 30000 })
+
+    // Fill in credentials on the PDS OAuth login form
+    // The PDS login page has: username input (#username), password input (#password), submit button
+    const usernameInput = page.locator("#username")
+    await expect(usernameInput).toBeVisible({ timeout: 10000 })
+    await usernameInput.fill(account.handle)
+
+    const passwordInput = page.locator("#password")
+    await expect(passwordInput).toBeVisible({ timeout: 5000 })
+    await passwordInput.fill("Test-password-e2e-123")
+
+    // Submit the login form
+    await page.locator("button[type='submit']").click()
+
+    // After login, the PDS may show a consent screen or auto-redirect.
+    // Wait for either the consent page or the redirect back to HappyView.
+    const consentOrCallback = await Promise.race([
+      page.waitForURL(/127\.0\.0\.1:3200/, { timeout: 30000 }).then(() => "callback" as const),
+      page.locator("text=/authorize/i").waitFor({ timeout: 10000 }).then(() => "consent" as const).catch(() => null),
+    ])
+
+    if (consentOrCallback === "consent") {
+      // Click the authorize button on the consent page
+      const authorizeButton = page.locator("button", { hasText: /authorize/i }).last()
+      await authorizeButton.click()
+      await page.waitForURL(/127\.0\.0\.1:3200/, { timeout: 15000 })
+    }
+
+    // We're back on HappyView after the OAuth callback.
+    // The setup-attach-auth component detects the return via localStorage
+    // and calls confirmAttachAuth to restore the admin session.
+    // Then the wizard advances to the "verify" step.
+    await expect(
+      page.getByRole("tab", { name: "Verify", selected: true }),
+    ).toBeVisible({ timeout: 15000 })
+  })
+
   // Restore setup state for subsequent tests
   test.afterAll(async ({ browser }) => {
     const page = await browser.newPage()

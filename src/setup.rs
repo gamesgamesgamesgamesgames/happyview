@@ -488,11 +488,17 @@ async fn attach_auth_confirm(
         return Err(AppError::Auth("original_did is not a known user".into()));
     }
 
+    let secure = state.config.public_url.starts_with("https://");
+    let same_site = if secure {
+        axum_extra::extract::cookie::SameSite::None
+    } else {
+        axum_extra::extract::cookie::SameSite::Lax
+    };
     let mut session_cookie = Cookie::new(COOKIE_NAME, original_did);
     session_cookie.set_path("/");
     session_cookie.set_http_only(true);
-    session_cookie.set_same_site(axum_extra::extract::cookie::SameSite::None);
-    session_cookie.set_secure(true);
+    session_cookie.set_same_site(same_site);
+    session_cookie.set_secure(secure);
 
     let jar = jar.add(session_cookie);
 

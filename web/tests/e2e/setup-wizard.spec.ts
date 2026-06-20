@@ -1,6 +1,11 @@
 import { test, expect } from "@playwright/test"
+import { resetServiceIdentity } from "./auth-helper"
 
 test.describe("Setup Wizard", () => {
+  test.beforeAll(async () => {
+    await resetServiceIdentity()
+  })
+
   test("did:web flow completes successfully", async ({ page }) => {
     await page.goto("/setup")
 

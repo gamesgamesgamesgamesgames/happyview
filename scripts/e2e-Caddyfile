@@ -1,0 +1,4 @@
+pds.localhost {
+	tls internal
+	reverse_proxy pds:3000
+}
