@@ -18,13 +18,27 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 
+import { toast } from "sonner";
+
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { toastError } from "@/lib/format";
 import {
   deleteLexicon,
   deleteNetworkLexicon,
   getLexicons,
 } from "@/lib/api";
 import type { LexiconSummary } from "@/types/lexicons";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { DataTable } from "@/components/data-table/data-table";
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header";
 import { DataTableToolbar } from "@/components/data-table/data-table-toolbar";
@@ -37,12 +51,11 @@ export default function LexiconsPage() {
   const { hasPermission } = useCurrentUser();
   const router = useRouter();
   const [lexicons, setLexicons] = useState<LexiconSummary[]>([]);
-  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     getLexicons()
       .then(setLexicons)
-      .catch((e) => setError(e.message));
+      .catch((e) => toastError("Failed to load lexicons", e));
   }, []);
 
   useEffect(() => {
@@ -56,9 +69,10 @@ export default function LexiconsPage() {
       } else {
         await deleteLexicon(lex.id);
       }
+      toast.success("Lexicon deleted");
       load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to delete lexicon", e);
     }
   }
 
@@ -209,19 +223,32 @@ export default function LexiconsPage() {
             </Button>
 
             {hasPermission("lexicons:delete") && (
-              <Button
-                variant="destructive"
-                size="icon"
-                className="size-8 text-muted-foreground hover:text-destructive"
-                title="Delete lexicon"
-                aria-label="Delete lexicon"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleDelete(row.original);
-                }}
-              >
-                <Trash2 className="size-4" />
-              </Button>
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button
+                    variant="destructive"
+                    size="icon"
+                    className="size-8 text-muted-foreground hover:text-destructive"
+                    title="Delete lexicon"
+                    aria-label="Delete lexicon"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Delete lexicon?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      This will permanently remove the lexicon and its associated routes. This action cannot be undone.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                    <AlertDialogAction variant="destructive" onClick={() => handleDelete(row.original)}>Delete</AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
             )}
           </div>
         ),
@@ -273,8 +300,6 @@ export default function LexiconsPage() {
     <>
       <SiteHeader title="Lexicons" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
-
         <DataTable
           table={table}
           onRowClick={(lex) =>

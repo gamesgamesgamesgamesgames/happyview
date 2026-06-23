@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { toastError } from "@/lib/format";
 import {
   cancelBackfillJob,
   pauseBackfillJob,
@@ -377,13 +379,12 @@ function ProfileRow({ did, profile, suffix }: {
 export default function BackfillPage() {
   const { hasPermission } = useCurrentUser();
   const [jobs, setJobs] = useState<BackfillJob[]>([]);
-  const [error, setError] = useState<string | null>(null);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
 
   const load = useCallback(() => {
     getBackfillJobs()
       .then(setJobs)
-      .catch((e) => setError(e.message));
+      .catch((e) => toastError("Failed to load backfill jobs", e));
   }, []);
 
   useEffect(() => {
@@ -404,8 +405,6 @@ export default function BackfillPage() {
     <>
       <SiteHeader title="Backfill" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
-
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">Backfill Jobs</h2>
           <div className="flex items-center gap-2">
@@ -425,6 +424,7 @@ export default function BackfillPage() {
                     <AlertDialogCancel>Cancel</AlertDialogCancel>
                     <AlertDialogAction onClick={async () => {
                       await flushAllBackfillDetails();
+                      toast.success("All job details cleared");
                       setSelectedJobId(null);
                       load();
                     }}>Clear</AlertDialogAction>
@@ -456,7 +456,7 @@ export default function BackfillPage() {
                     colSpan={5}
                     className="text-muted-foreground text-center"
                   >
-                    No backfill jobs yet.
+                    No backfill jobs yet. Create a job to import historical records from the AT Protocol network.
                   </TableCell>
                 </TableRow>
               )}
@@ -608,6 +608,7 @@ function JobDetail({
     setCancelling(true);
     try {
       await onCancel();
+      toast.success("Backfill job cancelled");
     } finally {
       setCancelling(false);
     }
@@ -617,6 +618,7 @@ function JobDetail({
     setPausing(true);
     try {
       await onPause();
+      toast.success("Backfill job paused");
     } finally {
       setPausing(false);
     }
@@ -626,6 +628,7 @@ function JobDetail({
     setResuming(true);
     try {
       await onResume();
+      toast.success("Backfill job resumed");
     } finally {
       setResuming(false);
     }
@@ -923,6 +926,7 @@ function JobDetail({
                 <AlertDialogCancel>Cancel</AlertDialogCancel>
                 <AlertDialogAction onClick={async () => {
                   await flushBackfillDetails(job.id);
+                  toast.success("Job details cleared");
                   setDiscoveredRepos([]);
                   setDiscoveredCursor(null);
                   setDiscoveredLoaded(false);
@@ -1134,7 +1138,6 @@ function ProgressRow({
 function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
   const [collection, setCollection] = useState<string | null>(null);
   const [did, setDid] = useState("");
-  const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [recordLexicons, setRecordLexicons] = useState<string[]>([]);
 
@@ -1154,18 +1157,18 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
   }, [open]);
 
   async function handleCreate() {
-    setError(null);
     try {
       await createBackfillJob({
         collection: collection || undefined,
         did: did || undefined,
       });
+      toast.success("Backfill job created");
       setCollection(null);
       setDid("");
       setOpen(false);
       onSuccess();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to create backfill job", e);
     }
   }
 
@@ -1194,7 +1197,6 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
         <div className="flex flex-col gap-4">
-          {error && <p className="text-destructive text-sm">{error}</p>}
           <div className="flex flex-col gap-2">
             <Label>Collection (optional)</Label>
             <Combobox

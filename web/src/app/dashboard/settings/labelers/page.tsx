@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Trash2, Pause, Play } from "lucide-react";
+import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { toastError } from "@/lib/format";
 import {
   getLabelers,
   addLabeler,
@@ -12,6 +14,16 @@ import {
 } from "@/lib/api";
 import type { LabelerSummary } from "@/types/labelers";
 import { SiteHeader } from "@/components/site-header";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -39,14 +51,13 @@ export default function LabelersPage() {
   const { hasPermission } = useCurrentUser();
   const [labelers, setLabelers] = useState<LabelerSummary[]>([]);
   const [handles, setHandles] = useState<Record<string, string>>({});
-  const [error, setError] = useState<string | null>(null);
   const [deleteDid, setDeleteDid] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
 
   const load = useCallback(() => {
     getLabelers()
       .then(setLabelers)
-      .catch((e) => setError(e.message));
+      .catch((e) => toastError("Failed to load labelers", e));
   }, []);
 
   useEffect(() => {
@@ -77,9 +88,10 @@ export default function LabelersPage() {
     try {
       const newStatus = labeler.status === "active" ? "paused" : "active";
       await updateLabeler(labeler.did, { status: newStatus });
+      toast.success(labeler.status === "active" ? "Labeler paused" : "Labeler resumed");
       load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to update labeler status", e);
     }
   }
 
@@ -88,9 +100,10 @@ export default function LabelersPage() {
     try {
       await deleteLabeler(did);
       setDeleteDid(null);
+      toast.success("Labeler deleted");
       load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to delete labeler", e);
     } finally {
       setDeleting(false);
     }
@@ -100,8 +113,6 @@ export default function LabelersPage() {
     <>
       <SiteHeader title="Labelers" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
-
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-lg font-semibold">Labeler Subscriptions</h2>
@@ -133,7 +144,7 @@ export default function LabelersPage() {
                     colSpan={6}
                     className="text-muted-foreground text-center"
                   >
-                    No labeler subscriptions yet.
+                    No labeler subscriptions yet. Add a labeler to subscribe to external content labeling services.
                   </TableCell>
                 </TableRow>
               )}
@@ -208,43 +219,32 @@ export default function LabelersPage() {
         </div>
       </div>
 
-      <ResponsiveDialog
-        open={!!deleteDid}
-        onOpenChange={(open) => {
-          if (!open) setDeleteDid(null);
-        }}
-      >
-        <ResponsiveDialogContent>
-          <ResponsiveDialogHeader>
-            <ResponsiveDialogTitle>Delete labeler?</ResponsiveDialogTitle>
-            <ResponsiveDialogDescription>
+      <AlertDialog open={!!deleteDid} onOpenChange={(open) => { if (!open) setDeleteDid(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete labeler?</AlertDialogTitle>
+            <AlertDialogDescription>
               This will remove the labeler subscription and delete all labels it
               has emitted. This action cannot be undone.
-            </ResponsiveDialogDescription>
-          </ResponsiveDialogHeader>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
           {deleteDid && (
             <code className="text-muted-foreground block truncate text-xs">
               {deleteDid}
             </code>
           )}
-          <ResponsiveDialogFooter>
-            <ResponsiveDialogClose asChild>
-              <Button variant="outline" disabled={deleting}>
-                Cancel
-              </Button>
-            </ResponsiveDialogClose>
-            <Button
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
               variant="destructive"
               disabled={deleting}
-              onClick={() => {
-                if (deleteDid) handleDelete(deleteDid);
-              }}
+              onClick={() => { if (deleteDid) handleDelete(deleteDid); }}
             >
               {deleting ? "Deleting..." : "Delete"}
-            </Button>
-          </ResponsiveDialogFooter>
-        </ResponsiveDialogContent>
-      </ResponsiveDialog>
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </>
   );
 }
@@ -262,10 +262,12 @@ function AddLabelerDialog({
     setError(null);
     try {
       await addLabeler({ did });
+      toast.success("Labeler added");
       setDid("");
       setOpen(false);
       onSuccess();
     } catch (e: unknown) {
+      toastError("Failed to add labeler", e);
       setError(e instanceof Error ? e.message : String(e));
     }
   }

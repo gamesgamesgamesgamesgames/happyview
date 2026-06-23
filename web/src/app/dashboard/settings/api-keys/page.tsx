@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Copy, Check } from "lucide-react";
+import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { toastError } from "@/lib/format";
 import {
   getApiKeys,
   createApiKey,
@@ -11,6 +13,17 @@ import {
 } from "@/lib/api";
 import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import { SiteHeader } from "@/components/site-header";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   ResponsiveDialog,
@@ -55,12 +68,11 @@ const ALL_PERMISSIONS = Object.values(PERMISSION_CATEGORIES).flat();
 export default function ApiKeysPage() {
   const { hasPermission } = useCurrentUser();
   const [keys, setKeys] = useState<ApiKeySummary[]>([]);
-  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     getApiKeys()
       .then(setKeys)
-      .catch((e) => setError(e.message));
+      .catch((e) => toastError("Failed to load API keys", e));
   }, []);
 
   useEffect(() => {
@@ -70,9 +82,10 @@ export default function ApiKeysPage() {
   async function handleRevoke(id: string) {
     try {
       await revokeApiKey(id);
+      toast.success("API key revoked");
       load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to revoke API key", e);
     }
   }
 
@@ -80,8 +93,6 @@ export default function ApiKeysPage() {
     <>
       <SiteHeader title="API Keys" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
-
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">API Keys</h2>
           {hasPermission("api-keys:create") && (
@@ -108,7 +119,7 @@ export default function ApiKeysPage() {
                     colSpan={6}
                     className="text-muted-foreground text-center"
                   >
-                    No API keys yet.
+                    No API keys yet. Create an API key to allow external services to authenticate with this AppView.
                   </TableCell>
                 </TableRow>
               )}
@@ -140,38 +151,32 @@ export default function ApiKeysPage() {
                   </TableCell>
                   <TableCell className="w-10 sticky right-0 bg-inherit z-[1]">
                     {!key.revoked_at && hasPermission("api-keys:delete") && (
-                      <ResponsiveDialog>
-                        <ResponsiveDialogTrigger asChild>
+                      <AlertDialog>
+                        <AlertDialogTrigger asChild>
                           <Button variant="outline" size="sm">
                             Revoke
                           </Button>
-                        </ResponsiveDialogTrigger>
-                        <ResponsiveDialogContent>
-                          <ResponsiveDialogHeader>
-                            <ResponsiveDialogTitle>
-                              Revoke API Key
-                            </ResponsiveDialogTitle>
-                            <ResponsiveDialogDescription>
+                        </AlertDialogTrigger>
+                        <AlertDialogContent>
+                          <AlertDialogHeader>
+                            <AlertDialogTitle>Revoke API key?</AlertDialogTitle>
+                            <AlertDialogDescription>
                               This will permanently revoke the key &ldquo;
                               {key.name}&rdquo;. Any services using this key
                               will lose access.
-                            </ResponsiveDialogDescription>
-                          </ResponsiveDialogHeader>
-                          <ResponsiveDialogFooter>
-                            <ResponsiveDialogClose asChild>
-                              <Button variant="outline">Cancel</Button>
-                            </ResponsiveDialogClose>
-                            <ResponsiveDialogClose asChild>
-                              <Button
-                                variant="destructive"
-                                onClick={() => handleRevoke(key.id)}
-                              >
-                                Revoke
-                              </Button>
-                            </ResponsiveDialogClose>
-                          </ResponsiveDialogFooter>
-                        </ResponsiveDialogContent>
-                      </ResponsiveDialog>
+                            </AlertDialogDescription>
+                          </AlertDialogHeader>
+                          <AlertDialogFooter>
+                            <AlertDialogCancel>Cancel</AlertDialogCancel>
+                            <AlertDialogAction
+                              variant="destructive"
+                              onClick={() => handleRevoke(key.id)}
+                            >
+                              Revoke
+                            </AlertDialogAction>
+                          </AlertDialogFooter>
+                        </AlertDialogContent>
+                      </AlertDialog>
                     )}
                   </TableCell>
                 </TableRow>
@@ -192,7 +197,6 @@ function CreateApiKeyDialog({
   const [name, setName] = useState("");
   const [selectedPermissions, setSelectedPermissions] =
     useState<string[]>(ALL_PERMISSIONS);
-  const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [createdKey, setCreatedKey] = useState<CreateApiKeyResponse | null>(
     null
@@ -204,7 +208,6 @@ function CreateApiKeyDialog({
     if (!nextOpen) {
       setName("");
       setSelectedPermissions(ALL_PERMISSIONS);
-      setError(null);
       if (createdKey) {
         setCreatedKey(null);
         onSuccess();
@@ -231,7 +234,6 @@ function CreateApiKeyDialog({
   }
 
   async function handleCreate() {
-    setError(null);
     try {
       const result = await createApiKey({
         name,
@@ -240,7 +242,7 @@ function CreateApiKeyDialog({
       setCreatedKey(result);
       setCopied(false);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to create API key", e);
     }
   }
 
@@ -298,7 +300,6 @@ function CreateApiKeyDialog({
           </div>
         ) : (
           <div className="flex flex-col gap-4">
-            {error && <p className="text-destructive text-sm">{error}</p>}
             <div className="flex flex-col gap-2">
               <Label htmlFor="api-key-name">Name</Label>
               <Input

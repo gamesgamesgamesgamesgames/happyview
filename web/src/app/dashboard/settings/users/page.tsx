@@ -5,6 +5,7 @@ import { ChevronRight, Search, Shield, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/lib/auth-context";
+import { toastError } from "@/lib/format";
 import {
   getUsers,
   addUser,
@@ -15,6 +16,17 @@ import {
 } from "@/lib/api";
 import type { PermissionEntry, PermissionTemplate } from "@/lib/api";
 import type { UserSummary } from "@/types/users";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -77,7 +89,6 @@ export default function UsersPage() {
   const { did: currentDid } = useAuth();
   const [users, setUsers] = useState<UserSummary[]>([]);
   const [handles, setHandles] = useState<Record<string, string>>({});
-  const [error, setError] = useState<string | null>(null);
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [pendingPermissions, setPendingPermissions] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
@@ -124,7 +135,7 @@ export default function UsersPage() {
   const load = useCallback(() => {
     getUsers()
       .then(setUsers)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+      .catch((e) => toastError("Failed to load users", e));
   }, []);
 
   useEffect(() => {
@@ -134,7 +145,7 @@ export default function UsersPage() {
         setPermissionEntries(catalog.permissions);
         setTemplates(catalog.templates);
       })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+      .catch((e) => toastError("Failed to load permissions", e));
   }, [load]);
 
   // Resolve DIDs to handles via PLC directory
@@ -190,9 +201,10 @@ export default function UsersPage() {
   async function handleDelete(id: string) {
     try {
       await deleteUser(id);
+      toast.success("User deleted");
       load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to delete user", e);
     }
   }
 
@@ -253,7 +265,7 @@ export default function UsersPage() {
       toast.success("Permissions updated");
       load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to save permissions", e);
     } finally {
       setSaving(false);
     }
@@ -262,9 +274,10 @@ export default function UsersPage() {
   async function handleTransferSuper(targetUserId: string) {
     try {
       await transferSuper({ target_user_id: targetUserId });
+      toast.success("Ownership transferred");
       load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to transfer ownership", e);
     }
   }
 
@@ -272,8 +285,6 @@ export default function UsersPage() {
     <>
       <SiteHeader title="Users" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
-
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">Users</h2>
           {(isCurrentUserSuper ||
@@ -304,7 +315,7 @@ export default function UsersPage() {
                     colSpan={5}
                     className="text-muted-foreground text-center"
                   >
-                    No users yet.
+                    No users yet. The first authenticated user is automatically granted owner permissions.
                   </TableCell>
                 </TableRow>
               )}
@@ -550,25 +561,37 @@ export default function UsersPage() {
 
                           <SheetFooter className="border-t flex-row">
                             <div className="flex items-center gap-2">
-                              <Button
-                                variant="destructive"
-                                size="sm"
-                                disabled={
-                                  selectedUser.is_super ||
-                                  selectedUser.did === currentDid ||
-                                  (!isCurrentUserSuper &&
-                                    !currentUser?.permissions.includes(
-                                      "users:delete",
-                                    ))
-                                }
-                                onClick={() => {
-                                  handleDelete(selectedUser.id);
-                                  setSelectedUserId(null);
-                                }}
-                              >
-                                <Trash2 className="mr-1 size-3.5" />
-                                Delete User
-                              </Button>
+                              <AlertDialog>
+                                <AlertDialogTrigger asChild>
+                                  <Button
+                                    variant="destructive"
+                                    size="sm"
+                                    disabled={
+                                      selectedUser.is_super ||
+                                      selectedUser.did === currentDid ||
+                                      (!isCurrentUserSuper &&
+                                        !currentUser?.permissions.includes(
+                                          "users:delete",
+                                        ))
+                                    }
+                                  >
+                                    <Trash2 className="mr-1 size-3.5" />
+                                    Delete User
+                                  </Button>
+                                </AlertDialogTrigger>
+                                <AlertDialogContent>
+                                  <AlertDialogHeader>
+                                    <AlertDialogTitle>Delete user?</AlertDialogTitle>
+                                    <AlertDialogDescription>
+                                      This will permanently remove the user and revoke all their permissions. This action cannot be undone.
+                                    </AlertDialogDescription>
+                                  </AlertDialogHeader>
+                                  <AlertDialogFooter>
+                                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                                    <AlertDialogAction variant="destructive" onClick={() => { handleDelete(selectedUser.id); setSelectedUserId(null); }}>Delete</AlertDialogAction>
+                                  </AlertDialogFooter>
+                                </AlertDialogContent>
+                              </AlertDialog>
                               {isCurrentUserSuper && (
                                 <TransferOwnershipDialog
                                   user={selectedUser}
@@ -768,21 +791,20 @@ function AddUserDialog({
 }) {
   const [did, setDid] = useState("");
   const [template, setTemplate] = useState<string>("");
-  const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
 
   async function handleAdd() {
-    setError(null);
     try {
       const body: { did: string; template?: string } = { did };
       if (template) body.template = template;
       await addUser(body);
+      toast.success("User added");
       setDid("");
       setTemplate("");
       setOpen(false);
       onSuccess();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to add user", e);
     }
   }
 
@@ -800,7 +822,6 @@ function AddUserDialog({
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
         <div className="flex flex-col gap-4">
-          {error && <p className="text-destructive text-sm">{error}</p>}
           <div className="flex flex-col gap-2">
             <Label htmlFor="user-did">DID</Label>
             <Input
