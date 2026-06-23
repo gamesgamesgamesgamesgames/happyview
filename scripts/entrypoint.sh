@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+TUNNEL_URL_FILE="${TUNNEL_URL_FILE:-}"
+
+if [ -n "$TUNNEL_URL_FILE" ] && [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+  rm -f "$TUNNEL_URL_FILE"
+  echo "Waiting for quick tunnel URL..."
+  elapsed=0
+  while [ ! -f "$TUNNEL_URL_FILE" ] && [ "$elapsed" -lt 30 ]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  if [ -f "$TUNNEL_URL_FILE" ]; then
+    url=$(cat "$TUNNEL_URL_FILE")
+    export PUBLIC_URL="$url"
+    echo "Using tunnel URL as PUBLIC_URL: $url"
+  else
+    echo "Tunnel URL not found after 30s, using PUBLIC_URL from env: $PUBLIC_URL"
+  fi
+fi
+
+exec "$@"

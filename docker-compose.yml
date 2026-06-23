@@ -22,6 +22,7 @@ services:
   happyview:
     image: rust:1.93
     working_dir: /app
+    entrypoint: ["sh", "/scripts/entrypoint.sh"]
     command: cargo run
     ports:
       - "3000:3000"
@@ -30,16 +31,44 @@ services:
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - cargo-target:/app/target
+      - ./scripts/entrypoint.sh:/scripts/entrypoint.sh:ro
+      - tunnel-url:/shared
     environment:
       DATABASE_URL: ${DATABASE_URL}
       PUBLIC_URL: ${PUBLIC_URL}
       SESSION_SECRET: ${SESSION_SECRET}
       RELAY_URL: ${RELAY_URL}
       PORT: ${PORT}
+      TUNNEL_URL_FILE: /shared/tunnel-url
+      CLOUDFLARE_TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
     # depends_on:
     #   Uncomment if using Postgres:
     #   postgres:
     #     condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    volumes:
+      - ./scripts/dev-Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "3080:80"
+    depends_on:
+      - happyview
+      - web
+
+  tunnel:
+    image: alpine:latest
+    entrypoint: ["sh", "/scripts/tunnel.sh"]
+    volumes:
+      - ./scripts/tunnel.sh:/scripts/tunnel.sh:ro
+      - tunnel-url:/shared
+    environment:
+      CLOUDFLARE_TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+      TUNNEL_URL_FILE: /shared/tunnel-url
+      TUNNEL_UPSTREAM: http://caddy:80
+    depends_on:
+      - caddy
+    restart: unless-stopped
 
   web:
     image: node:24-alpine
@@ -61,3 +90,4 @@ volumes:
   cargo-git:
   cargo-target:
   web-node-modules:
+  tunnel-url:
