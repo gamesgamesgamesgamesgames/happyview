@@ -283,7 +283,11 @@ impl FromRequestParts<AppState> for XrpcClaims {
                 let is_space_route = path.contains("/dev.happyview.space.");
 
                 // Try service auth first
-                if let Ok(service_claims) = try_parse_service_auth(token, state).await {
+                let host = parts
+                    .headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|v| v.to_str().ok());
+                if let Ok(service_claims) = try_parse_service_auth(token, state, host).await {
                     return Ok(XrpcClaims {
                         identity: None,
                         space_credential: None,
@@ -324,6 +328,7 @@ impl FromRequestParts<AppState> for XrpcClaims {
 async fn try_parse_service_auth(
     token: &str,
     state: &AppState,
+    host: Option<&str>,
 ) -> Result<ServiceAuthClaims, AppError> {
     // 1. Check if service identity is configured and not "not_exposed"
     let identity = crate::service_identity::get_identity(&state.db, state.db_backend).await?;
@@ -334,10 +339,16 @@ async fn try_parse_service_auth(
         return Err(AppError::Auth("service auth disabled".into()));
     }
 
-    let instance_did = identity
-        .did
-        .as_ref()
-        .ok_or_else(|| AppError::Auth("no DID configured".into()))?;
+    let instance_did = match &identity.mode {
+        crate::service_identity::IdentityMode::DidWeb => {
+            let h = host.ok_or_else(|| AppError::Auth("missing Host header for did:web".into()))?;
+            format!("did:web:{h}")
+        }
+        _ => identity
+            .did
+            .clone()
+            .ok_or_else(|| AppError::Auth("no DID configured".into()))?,
+    };
 
     // 2. Verify the JWT (this resolves the issuer's DID doc and checks signature)
     let service_auth = crate::auth::service_auth::ServiceAuth::from_bearer(token, state)
@@ -353,14 +364,14 @@ async fn try_parse_service_auth(
         .ok_or_else(|| AppError::Auth("JWT missing aud field".into()))?;
 
     // 4. Verify aud starts with instance DID and extract fragment
-    if !aud.starts_with(instance_did) {
+    if !aud.starts_with(&*instance_did) {
         return Err(AppError::Auth(format!(
             "JWT aud '{}' does not match instance DID '{}'",
             aud, instance_did
         )));
     }
 
-    let fragment = aud.strip_prefix(instance_did).unwrap_or("").to_string();
+    let fragment = aud.strip_prefix(&*instance_did).unwrap_or("").to_string();
     if fragment.is_empty() || !fragment.starts_with('#') {
         return Err(AppError::Auth(
             "JWT aud must include a service fragment".into(),

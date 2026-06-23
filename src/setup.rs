@@ -11,6 +11,7 @@ use axum_extra::extract::cookie::{Cookie, Key, SignedCookieJar};
 use rand::RngCore;
 use serde::Deserialize;
 
+use crate::admin::auth::UserAuth;
 use crate::auth::COOKIE_NAME;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::service_identity::{self, IdentityMode};
@@ -38,6 +39,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn status(
+    _auth: UserAuth,
     State(state): State<AppState>,
 ) -> Result<Json<service_identity::SetupStatus>, AppError> {
     let status = service_identity::get_setup_status(&state.db, state.db_backend).await?;
@@ -56,6 +58,7 @@ struct PlcSubmitBody {
 }
 
 async fn set_identity(
+    _auth: UserAuth,
     State(state): State<AppState>,
     Json(body): Json<SetIdentityRequest>,
 ) -> Result<StatusCode, AppError> {
@@ -65,18 +68,9 @@ async fn set_identity(
 
     let (did, signing_key_enc, rotation_key_enc, attached_account_did) = match &mode {
         IdentityMode::DidWeb => {
-            // Derive domain from public_url: strip https:// prefix and trailing slash
-            let domain = state
-                .config
-                .public_url
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .trim_end_matches('/');
-            let did = format!("did:web:{domain}");
-
             let signing_key_enc = generate_encrypted_signing_key(&state)?;
 
-            (Some(did), Some(signing_key_enc), None, None)
+            (None::<String>, Some(signing_key_enc), None, None)
         }
 
         IdentityMode::DidPlc => {
@@ -148,6 +142,7 @@ struct PlcRegisterResponse {
 /// 6. Submits the signed operation to the PLC directory
 /// 7. Updates the service_identity row with the new DID
 async fn plc_register(
+    _auth: UserAuth,
     State(state): State<AppState>,
 ) -> Result<Json<PlcRegisterResponse>, AppError> {
     require_setup_incomplete(&state).await?;
@@ -240,7 +235,10 @@ async fn plc_register(
     Ok(Json(PlcRegisterResponse { did }))
 }
 
-async fn plc_request(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+async fn plc_request(
+    _auth: UserAuth,
+    State(state): State<AppState>,
+) -> Result<StatusCode, AppError> {
     require_setup_incomplete(&state).await?;
     let identity = service_identity::get_identity(&state.db, state.db_backend).await?;
     let identity = identity.ok_or_else(|| AppError::BadRequest("no identity configured".into()))?;
@@ -283,6 +281,7 @@ async fn plc_request(State(state): State<AppState>) -> Result<StatusCode, AppErr
 }
 
 async fn plc_submit(
+    _auth: UserAuth,
     State(state): State<AppState>,
     Json(body): Json<PlcSubmitBody>,
 ) -> Result<StatusCode, AppError> {
@@ -505,7 +504,10 @@ async fn attach_auth_confirm(
     Ok((jar, StatusCode::NO_CONTENT))
 }
 
-async fn export_rotation_key(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+async fn export_rotation_key(
+    _auth: UserAuth,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
     require_setup_incomplete(&state).await?;
     use base64::Engine;
 
@@ -556,7 +558,7 @@ async fn export_rotation_key(State(state): State<AppState>) -> Result<impl IntoR
     ))
 }
 
-async fn complete(State(state): State<AppState>) -> Result<StatusCode, AppError> {
+async fn complete(_auth: UserAuth, State(state): State<AppState>) -> Result<StatusCode, AppError> {
     require_setup_incomplete(&state).await?;
     service_identity::mark_setup_complete(&state.db, state.db_backend).await?;
 
@@ -590,6 +592,7 @@ struct ResolveResult {
 }
 
 async fn resolve_identity(
+    _auth: UserAuth,
     State(state): State<AppState>,
     Query(query): Query<ResolveQuery>,
 ) -> Result<Json<Vec<ResolveResult>>, AppError> {

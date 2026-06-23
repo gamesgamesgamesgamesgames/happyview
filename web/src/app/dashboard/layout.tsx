@@ -23,22 +23,21 @@ export default function DashboardLayout({
   const [setupChecked, setSetupChecked] = useState(false)
 
   useEffect(() => {
+    if (!did) {
+      router.replace("/login")
+      return
+    }
+
     getSetupStatus()
       .then((status) => {
         if (!status.setup_complete) {
           router.replace("/setup")
-        } else if (!did) {
-          router.replace("/login")
         } else {
           setSetupChecked(true)
         }
       })
       .catch(() => {
-        if (!did) {
-          router.replace("/login")
-        } else {
-          setSetupChecked(true)
-        }
+        setSetupChecked(true)
       })
   }, [did, router])
 

@@ -5,6 +5,7 @@ use atrium_oauth::{
     OAuthResolverConfig, Scope,
 };
 use axum::Router;
+use axum::http::Request;
 use base64::Engine as _;
 use happyview::config::Config;
 use happyview::db::{DatabaseBackend, adapt_sql, now_rfc3339};
@@ -274,6 +275,12 @@ impl TestApp {
         crate::common::auth::admin_cookie_header(&self.admin_did, &self.state.cookie_key)
     }
 
+    /// Return a `Request::builder()` pre-configured with the admin auth cookie.
+    pub fn authed_request(&self) -> axum::http::request::Builder {
+        let cookie = self.admin_cookie();
+        Request::builder().header(cookie.0, cookie.1)
+    }
+
     pub async fn setup_did_web(&mut self) -> String {
         use p256::ecdsa::SigningKey;
         use rand::RngCore;
@@ -300,7 +307,7 @@ impl TestApp {
             &self.state.db,
             self.state.db_backend,
             &happyview::service_identity::IdentityMode::DidWeb,
-            Some(&did),
+            None,
             Some(&enc_b64),
             None,
             None,

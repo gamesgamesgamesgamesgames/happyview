@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test"
-import { resetServiceIdentity } from "./auth-helper"
+import { loginAsTestAdmin, resetServiceIdentity } from "./auth-helper"
 
 test.describe("Setup - did:plc", () => {
   test.beforeAll(async () => {
@@ -7,34 +7,30 @@ test.describe("Setup - did:plc", () => {
   })
 
   test("did:plc flow completes successfully", async ({ page }) => {
+    await loginAsTestAdmin(page)
     await page.goto("/setup")
 
-    // Select "Create did:plc"
+    // Select "Create a new network identity"
     await expect(
-      page.getByText(/how should this appview be identified/i),
+      page.getByText(/set up your service identity/i),
     ).toBeVisible({ timeout: 10000 })
 
-    await page.getByText("Create did:plc").click()
+    await page.getByText("Create a new network identity").click()
     await page.getByRole("button", { name: /continue/i }).click()
 
-    // The configure step shows "Create did:plc" card with Continue button
-    await expect(page.getByText("Create did:plc").first()).toBeVisible({ timeout: 5000 })
-    await page.getByRole("button", { name: /continue/i }).click()
+    // Wait for either registration in progress or the result
+    const registeringText = page.getByText("Registering your identity")
+    const saveKeyText = page.getByText("Save your rotation key")
+    const registrationFailed = page.getByText("Registration failed")
 
-    // Wait for either "Registering DID..." or the result
-    const registeringText = page.getByText("Registering DID...")
-    const exportKeyText = page.getByText("Export Rotation Key")
-    const registrationFailed = page.getByText("Registration Failed")
-
-    // Wait for the registration to start or complete
     await expect(
-      registeringText.or(exportKeyText).or(registrationFailed),
+      registeringText.or(saveKeyText).or(registrationFailed),
     ).toBeVisible({ timeout: 10000 })
 
     // If registration is in progress, wait for it to finish
     if (await registeringText.isVisible().catch(() => false)) {
       await expect(
-        exportKeyText.or(registrationFailed),
+        saveKeyText.or(registrationFailed),
       ).toBeVisible({ timeout: 30000 })
     }
 
@@ -53,7 +49,7 @@ test.describe("Setup - did:plc", () => {
     await page.getByRole("button", { name: /continue/i }).click()
 
     // Verify setup completes
-    await expect(page.getByText("Setup Complete")).toBeVisible({ timeout: 5000 })
+    await expect(page.getByText("Your AppView is ready")).toBeVisible({ timeout: 5000 })
   })
 
   // Restore setup state for subsequent tests
@@ -61,17 +57,18 @@ test.describe("Setup - did:plc", () => {
     await resetServiceIdentity()
     const page = await browser.newPage()
     try {
+      await loginAsTestAdmin(page)
       await page.goto(
         (process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:3200") + "/setup",
       )
-      const notExposedCard = page.getByText(/not exposed/i)
+      const skipCard = page.getByText(/skip for now/i)
       if (
-        await notExposedCard.isVisible({ timeout: 5000 }).catch(() => false)
+        await skipCard.isVisible({ timeout: 5000 }).catch(() => false)
       ) {
-        await notExposedCard.click()
+        await skipCard.click()
         await page.getByRole("button", { name: /continue/i }).click()
         await expect(
-          page.getByText("Setup Complete"),
+          page.getByText("Your AppView is ready"),
         ).toBeVisible({ timeout: 5000 })
       }
     } finally {

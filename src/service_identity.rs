@@ -52,7 +52,8 @@ pub struct SetupStatus {
 }
 
 // Row type: (mode, did, signing_key_enc, setup_complete, created_at, updated_at)
-type ServiceIdentityRow = (String, Option<String>, Option<String>, bool, String, String);
+// setup_complete uses i32 because sqlx's Any driver can't decode SQLite BOOLEAN directly.
+type ServiceIdentityRow = (String, Option<String>, Option<String>, i32, String, String);
 
 fn parse_row(r: ServiceIdentityRow) -> Result<ServiceIdentity, AppError> {
     let mode = IdentityMode::parse(&r.0)
@@ -61,7 +62,7 @@ fn parse_row(r: ServiceIdentityRow) -> Result<ServiceIdentity, AppError> {
         mode,
         did: r.1,
         signing_key_enc: r.2,
-        setup_complete: r.3,
+        setup_complete: r.3 != 0,
         created_at: r.4,
         updated_at: r.5,
     })
@@ -73,7 +74,7 @@ pub async fn get_identity(
     backend: DatabaseBackend,
 ) -> Result<Option<ServiceIdentity>, AppError> {
     let sql = adapt_sql(
-        "SELECT mode, did, signing_key_enc, setup_complete, created_at, updated_at FROM service_identity WHERE id = 1",
+        "SELECT mode, did, signing_key_enc, CAST(setup_complete AS INTEGER), created_at, updated_at FROM service_identity WHERE id = 1",
         backend,
     );
 
@@ -101,7 +102,10 @@ pub async fn get_setup_status(
         }),
         Some(id) => {
             let plc_verified = matches!(id.mode, IdentityMode::DidPlc) && id.setup_complete;
-            let identity_configured = id.did.is_some();
+            let identity_configured = match id.mode {
+                IdentityMode::DidWeb => id.signing_key_enc.is_some(),
+                _ => id.did.is_some(),
+            };
             let setup_complete = id.setup_complete;
             let identity_mode = Some(id.mode);
             Ok(SetupStatus {
@@ -146,7 +150,7 @@ pub async fn upsert_identity(
         .bind(signing_key_enc)
         .bind(rotation_key_enc)
         .bind(attached_account_did)
-        .bind(false)
+        .bind(0i32)
         .bind(&now)
         .bind(&now)
         .execute(db)
@@ -165,7 +169,7 @@ pub async fn mark_setup_complete(db: &AnyPool, backend: DatabaseBackend) -> Resu
     );
 
     sqlx::query(&sql)
-        .bind(true)
+        .bind(1i32)
         .bind(&now)
         .execute(db)
         .await
@@ -175,9 +179,12 @@ pub async fn mark_setup_complete(db: &AnyPool, backend: DatabaseBackend) -> Resu
 }
 
 /// Generate a DID document for did:web identity mode.
-/// Returns None if the identity mode is not DidWeb or if required fields are missing.
+/// The DID is derived dynamically from the request host rather than stored,
+/// so the same signing key works across any domain pointing at this server.
+/// Returns None if the identity mode is not DidWeb.
 pub fn generate_did_document(
     identity: &ServiceIdentity,
+    host: &str,
     signing_key_multibase: &str,
     service_entries: &[(String, String)],
     service_endpoint: &str,
@@ -186,12 +193,12 @@ pub fn generate_did_document(
         return None;
     }
 
-    let did = identity.did.as_deref()?;
+    let did = format!("did:web:{host}");
 
     let verification_method = serde_json::json!([{
-        "id": format!("{}#atproto", did),
+        "id": format!("{did}#atproto"),
         "type": "Multikey",
-        "controller": did,
+        "controller": &did,
         "publicKeyMultibase": signing_key_multibase
     }]);
 
@@ -211,7 +218,7 @@ pub fn generate_did_document(
             "https://www.w3.org/ns/did/v1",
             "https://w3id.org/security/multikey/v1"
         ],
-        "id": did,
+        "id": &did,
         "verificationMethod": verification_method,
         "service": services
     }))
@@ -255,19 +262,37 @@ mod tests {
     #[test]
     fn generate_did_document_returns_none_for_non_web() {
         let identity = make_identity(IdentityMode::DidPlc, Some("did:plc:abc123"));
-        assert!(generate_did_document(&identity, "zKey", &[], "https://example.com").is_none());
+        assert!(
+            generate_did_document(&identity, "example.com", "zKey", &[], "https://example.com")
+                .is_none()
+        );
     }
 
     #[test]
-    fn generate_did_document_returns_none_without_did() {
+    fn generate_did_document_derives_did_from_host() {
         let identity = make_identity(IdentityMode::DidWeb, None);
-        assert!(generate_did_document(&identity, "zKey", &[], "https://example.com").is_none());
+        let doc = generate_did_document(
+            &identity,
+            "example.com",
+            "zKey123",
+            &[],
+            "https://example.com",
+        )
+        .unwrap();
+        assert_eq!(doc["id"], "did:web:example.com");
     }
 
     #[test]
     fn generate_did_document_with_no_entries() {
-        let identity = make_identity(IdentityMode::DidWeb, Some("did:web:example.com"));
-        let doc = generate_did_document(&identity, "zKey123", &[], "https://example.com").unwrap();
+        let identity = make_identity(IdentityMode::DidWeb, None);
+        let doc = generate_did_document(
+            &identity,
+            "example.com",
+            "zKey123",
+            &[],
+            "https://example.com",
+        )
+        .unwrap();
         assert_eq!(doc["id"], "did:web:example.com");
         assert_eq!(
             doc["verificationMethod"][0]["publicKeyMultibase"],
@@ -278,13 +303,19 @@ mod tests {
 
     #[test]
     fn generate_did_document_with_entries() {
-        let identity = make_identity(IdentityMode::DidWeb, Some("did:web:example.com"));
+        let identity = make_identity(IdentityMode::DidWeb, None);
         let entries = vec![
             ("#chess".to_string(), "ChessService".to_string()),
             ("#checkers".to_string(), "CheckersService".to_string()),
         ];
-        let doc =
-            generate_did_document(&identity, "zKey123", &entries, "https://example.com").unwrap();
+        let doc = generate_did_document(
+            &identity,
+            "example.com",
+            "zKey123",
+            &entries,
+            "https://example.com",
+        )
+        .unwrap();
         let services = doc["service"].as_array().unwrap();
         assert_eq!(services.len(), 2);
         assert_eq!(services[0]["id"], "#chess");
@@ -295,8 +326,10 @@ mod tests {
 
     #[test]
     fn generate_did_document_context_and_structure() {
-        let identity = make_identity(IdentityMode::DidWeb, Some("did:web:example.com"));
-        let doc = generate_did_document(&identity, "zKey", &[], "https://example.com").unwrap();
+        let identity = make_identity(IdentityMode::DidWeb, None);
+        let doc =
+            generate_did_document(&identity, "example.com", "zKey", &[], "https://example.com")
+                .unwrap();
         let context = doc["@context"].as_array().unwrap();
         assert_eq!(context.len(), 2);
         assert_eq!(context[0], "https://www.w3.org/ns/did/v1");

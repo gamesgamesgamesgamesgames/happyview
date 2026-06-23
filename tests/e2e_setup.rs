@@ -29,7 +29,7 @@ async fn setup_status_returns_defaults_when_no_identity() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/status")
                 .body(Body::empty())
                 .unwrap(),
@@ -59,7 +59,7 @@ async fn setup_identity_sets_mode() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
                 .header("content-type", "application/json")
@@ -77,7 +77,7 @@ async fn setup_identity_sets_mode() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/status")
                 .body(Body::empty())
                 .unwrap(),
@@ -106,7 +106,7 @@ async fn setup_identity_rejects_when_complete() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
                 .header("content-type", "application/json")
@@ -140,7 +140,7 @@ async fn setup_complete_marks_done() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
                 .header("content-type", "application/json")
@@ -159,7 +159,7 @@ async fn setup_complete_marks_done() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/complete")
                 .body(Body::empty())
@@ -175,7 +175,7 @@ async fn setup_complete_marks_done() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/status")
                 .body(Body::empty())
                 .unwrap(),
@@ -206,7 +206,7 @@ async fn rotation_key_export() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
                 .header("content-type", "application/json")
@@ -227,7 +227,7 @@ async fn rotation_key_export() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/rotation-key")
                 .body(Body::empty())
                 .unwrap(),
@@ -267,7 +267,7 @@ async fn rotation_key_export_rejects_non_plc() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
                 .header("content-type", "application/json")
@@ -286,7 +286,7 @@ async fn rotation_key_export_rejects_non_plc() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/rotation-key")
                 .body(Body::empty())
                 .unwrap(),
@@ -315,7 +315,7 @@ async fn resolve_identity_empty_query_returns_empty() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/resolve?q=")
                 .body(Body::empty())
                 .unwrap(),
@@ -340,7 +340,7 @@ async fn resolve_identity_with_did_returns_result() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/resolve?q=did%3Aplc%3Atestresolver")
                 .body(Body::empty())
                 .unwrap(),
@@ -374,7 +374,7 @@ async fn plc_register_creates_did() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
                 .header("content-type", "application/json")
@@ -393,7 +393,7 @@ async fn plc_register_creates_did() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/plc/register")
                 .body(Body::empty())
@@ -438,7 +438,7 @@ async fn plc_register_rejects_non_plc_mode() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
                 .header("content-type", "application/json")
@@ -456,7 +456,7 @@ async fn plc_register_rejects_non_plc_mode() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/plc/register")
                 .body(Body::empty())
@@ -486,7 +486,7 @@ async fn plc_register_rejects_duplicate() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
                 .header("content-type", "application/json")
@@ -505,7 +505,7 @@ async fn plc_register_rejects_duplicate() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/plc/register")
                 .body(Body::empty())
@@ -521,7 +521,7 @@ async fn plc_register_rejects_duplicate() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/plc/register")
                 .body(Body::empty())
@@ -715,7 +715,7 @@ async fn plc_request_rejects_non_attach_account_mode() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
                 .header("content-type", "application/json")
@@ -733,7 +733,7 @@ async fn plc_request_rejects_non_attach_account_mode() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/plc/request")
                 .body(Body::empty())
@@ -762,7 +762,7 @@ async fn plc_submit_rejects_non_attach_account_mode() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
                 .header("content-type", "application/json")
@@ -780,7 +780,7 @@ async fn plc_submit_rejects_non_attach_account_mode() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/plc/submit")
                 .header("content-type", "application/json")

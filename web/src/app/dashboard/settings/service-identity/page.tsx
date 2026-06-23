@@ -261,7 +261,7 @@ export default function ServiceIdentityPage() {
                   DID
                 </span>
                 <span className="text-sm font-mono">
-                  {identity.did ?? <em>not set</em>}
+                  {identity.did ?? (identity.mode === "did_web" ? `did:web:${window.location.host}` : <em>not set</em>)}
                 </span>
               </div>
               <div className="flex items-center gap-2">

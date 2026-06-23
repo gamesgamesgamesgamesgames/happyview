@@ -345,6 +345,7 @@ fn extract_public_key_multibase(
 
 async fn well_known_did_json(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let identity = crate::service_identity::get_identity(&state.db, state.db_backend).await?;
     let identity =
@@ -356,21 +357,27 @@ async fn well_known_did_json(
         ));
     }
 
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AppError::BadRequest("missing Host header".into()))?;
+
     let entries = crate::service_entries::list_entries(&state.db, state.db_backend).await?;
     let entry_pairs: Vec<(String, String)> = entries
         .iter()
         .map(|e| (e.fragment_id.clone(), e.service_type.clone()))
         .collect();
 
-    let service_endpoint = &state.config.public_url;
+    let service_endpoint = format!("https://{host}");
 
     let signing_key_multibase = extract_public_key_multibase(&identity, &state)?;
 
     let doc = crate::service_identity::generate_did_document(
         &identity,
+        host,
         &signing_key_multibase,
         &entry_pairs,
-        service_endpoint,
+        &service_endpoint,
     )
     .ok_or_else(|| AppError::NotFound("DID document not available".into()))?;
 

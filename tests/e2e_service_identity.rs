@@ -125,7 +125,7 @@ async fn setup_status_unconfigured() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/status")
                 .body(Body::empty())
                 .unwrap(),
@@ -150,7 +150,7 @@ async fn setup_status_after_did_web() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/status")
                 .body(Body::empty())
                 .unwrap(),
@@ -175,7 +175,7 @@ async fn setup_status_after_not_exposed() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/status")
                 .body(Body::empty())
                 .unwrap(),
@@ -226,6 +226,7 @@ async fn did_doc_empty_services() {
         .oneshot(
             Request::builder()
                 .uri("/.well-known/did.json")
+                .header("host", "127.0.0.1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -259,6 +260,7 @@ async fn did_doc_with_entries() {
         .oneshot(
             Request::builder()
                 .uri("/.well-known/did.json")
+                .header("host", "127.0.0.1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -282,6 +284,7 @@ async fn did_doc_with_entries() {
         .oneshot(
             Request::builder()
                 .uri("/.well-known/did.json")
+                .header("host", "127.0.0.1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1220,16 +1223,14 @@ async fn jwt_without_aud_field_rejected() {
 async fn set_identity_attach_account_mode() {
     common::require_db!();
     let app = TestApp::new().await;
-    let cookie = app.admin_cookie();
 
     let resp = app
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
-                .header(cookie.0.clone(), cookie.1.clone())
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
@@ -1250,7 +1251,7 @@ async fn set_identity_attach_account_mode() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/status")
                 .body(Body::empty())
                 .unwrap(),
@@ -1274,17 +1275,14 @@ async fn setup_http_flow_did_web_produces_valid_did_doc() {
     app.state.config.token_encryption_key = Some([0x42u8; 32]);
     app.rebuild_router();
 
-    let cookie = app.admin_cookie();
-
     // Step 1: POST /api/setup/identity with mode=did_web
     let resp = app
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/identity")
-                .header(cookie.0.clone(), cookie.1.clone())
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({"mode": "did_web"})).unwrap(),
@@ -1301,10 +1299,9 @@ async fn setup_http_flow_did_web_produces_valid_did_doc() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .method("POST")
                 .uri("/api/setup/complete")
-                .header(cookie.0.clone(), cookie.1.clone())
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1322,6 +1319,7 @@ async fn setup_http_flow_did_web_produces_valid_did_doc() {
         .oneshot(
             Request::builder()
                 .uri("/.well-known/did.json")
+                .header("host", "127.0.0.1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1330,7 +1328,7 @@ async fn setup_http_flow_did_web_produces_valid_did_doc() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let doc = json_body(resp).await;
-    assert!(doc["id"].as_str().unwrap().starts_with("did:web:"));
+    assert_eq!(doc["id"], "did:web:127.0.0.1");
     assert!(!doc["verificationMethod"].as_array().unwrap().is_empty());
 
     // Step 4: Verify status shows complete
@@ -1338,7 +1336,7 @@ async fn setup_http_flow_did_web_produces_valid_did_doc() {
         .router
         .clone()
         .oneshot(
-            Request::builder()
+            app.authed_request()
                 .uri("/api/setup/status")
                 .body(Body::empty())
                 .unwrap(),

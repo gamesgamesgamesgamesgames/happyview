@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -11,71 +11,21 @@ import { setSetupIdentity, resolveIdentity, type ResolveResult } from "@/lib/api
 interface SetupConfigureProps {
   mode: string
   onComplete: (opts?: { attachedDid?: string; attachedHandle?: string | null }) => void
+  onBack?: () => void
 }
 
-export function SetupConfigure({ mode, onComplete }: SetupConfigureProps) {
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [identifier, setIdentifier] = useState("")
-
-  const handleSubmit = async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      await setSetupIdentity({
-        mode,
-        ...(mode === "attach_account" ? { attached_account_did: identifier } : {}),
-      })
-      onComplete()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Setup failed")
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  if (mode === "did_web") {
-    return (
-      <Card>
-        <CardHeader><CardTitle>Configure did:web</CardTitle>
-          <CardDescription>HappyView will serve a DID document at <code className="bg-muted px-1.5 py-0.5 rounded text-sm">/.well-known/did.json</code> using your instance domain.</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div><Label>Signing Key</Label><p className="text-muted-foreground text-sm mt-1">A new P-256 keypair will be generated and encrypted at rest.</p></div>
-          <p className="text-muted-foreground text-sm">You can add service entries after setup from the Service Identity settings page.</p>
-          {error && <p className="text-destructive text-sm">{error}</p>}
-          <div className="flex justify-end"><Button onClick={handleSubmit} disabled={loading}>{loading ? "Configuring..." : "Continue"}</Button></div>
-        </CardContent>
-      </Card>
-    )
-  }
-
+export function SetupConfigure({ mode, onComplete, onBack }: SetupConfigureProps) {
   if (mode === "attach_account") {
-    return (
-      <AttachAccountForm onComplete={(opts) => onComplete(opts)} />
-    )
-  }
-
-  if (mode === "did_plc") {
-    return (
-      <Card>
-        <CardHeader><CardTitle>Create did:plc</CardTitle>
-          <CardDescription>A new DID will be registered in the PLC directory. HappyView will generate and manage the signing and rotation keypairs.</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div><Label>Signing Key</Label><p className="text-muted-foreground text-sm mt-1">A new P-256 keypair will be generated and encrypted at rest.</p></div>
-          <div><Label>Rotation Key</Label><p className="text-muted-foreground text-sm mt-1">A separate rotation key will be generated. You'll be able to export it in the next step.</p></div>
-          {error && <p className="text-destructive text-sm">{error}</p>}
-          <div className="flex justify-end"><Button onClick={handleSubmit} disabled={loading}>{loading ? "Configuring..." : "Continue"}</Button></div>
-        </CardContent>
-      </Card>
-    )
+    return <AttachAccountForm onComplete={(opts) => onComplete(opts)} onBack={onBack} />
   }
 
   return null
 }
 
-function AttachAccountForm({ onComplete }: { onComplete: (opts: { attachedDid: string; attachedHandle: string | null }) => void }) {
+function AttachAccountForm({ onComplete, onBack }: {
+  onComplete: (opts: { attachedDid: string; attachedHandle: string | null }) => void
+  onBack?: () => void
+}) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [inputValue, setInputValue] = useState("")
@@ -83,10 +33,11 @@ function AttachAccountForm({ onComplete }: { onComplete: (opts: { attachedDid: s
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [selectedProfile, setSelectedProfile] = useState<ResolveResult | null>(null)
   const [resolving, setResolving] = useState(false)
+  const [focusedIndex, setFocusedIndex] = useState(-1)
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const listboxId = useId()
 
-  // Close suggestions on outside click
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
@@ -109,10 +60,12 @@ function AttachAccountForm({ onComplete }: { onComplete: (opts: { attachedDid: s
     try {
       const results = await resolveIdentity(q)
       setSuggestions(results)
-      setShowSuggestions(results.length > 0)
+      setShowSuggestions(true)
+      setFocusedIndex(-1)
     } catch {
-      // Silently fail — typeahead is optional
       setSuggestions([])
+      setShowSuggestions(false)
+      setFocusedIndex(-1)
     } finally {
       setResolving(false)
     }
@@ -152,49 +105,87 @@ function AttachAccountForm({ onComplete }: { onComplete: (opts: { attachedDid: s
         attachedHandle: selectedProfile?.handle ?? null,
       })
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Setup failed")
+      setError(e instanceof Error ? e.message : "Failed to link account. Check the identifier and try again.")
     } finally {
       setLoading(false)
     }
   }
 
+  const trimmedInput = inputValue.trim()
+  const looksValid = selectedProfile != null || /^did:[a-z]+:.+/.test(trimmedInput) || trimmedInput.includes(".")
+  const showFormatHint = trimmedInput.length >= 2 && !looksValid && !resolving
+
   const displayName = selectedProfile?.display_name ?? selectedProfile?.handle ?? selectedProfile?.did
   const avatarFallback = displayName?.charAt(0).toUpperCase() ?? "?"
+  const hasSuggestions = showSuggestions && suggestions.length > 0
+  const showEmpty = showSuggestions && suggestions.length === 0 && !resolving && trimmedInput.length >= 2
 
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Attach Existing Account</CardTitle>
-        <CardDescription>Enter the handle or DID of the account to attach. You'll verify ownership in the next step.</CardDescription>
+        <CardTitle>Find your account</CardTitle>
+        <CardDescription>Search for the AT Protocol account you want to link to this AppView.</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div ref={containerRef}>
-          <Label htmlFor="identifier">Account identifier</Label>
+          <Label htmlFor="identifier">Handle or DID</Label>
           <div className="relative mt-1.5">
             <Input
               id="identifier"
-              placeholder="handle.bsky.social or did:plc:..."
+              placeholder="e.g. alice.bsky.social"
               value={inputValue}
               onChange={(e) => handleInputChange(e.target.value)}
               onFocus={() => { if (suggestions.length > 0) setShowSuggestions(true) }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  if (hasSuggestions && focusedIndex >= 0) {
+                    e.preventDefault()
+                    selectResult(suggestions[focusedIndex])
+                  } else if (!hasSuggestions && looksValid && trimmedInput && !loading) {
+                    e.preventDefault()
+                    handleSubmit()
+                  }
+                  return
+                }
+                if (!hasSuggestions) return
+                if (e.key === "ArrowDown") {
+                  e.preventDefault()
+                  setFocusedIndex((i) => (i + 1) % suggestions.length)
+                } else if (e.key === "ArrowUp") {
+                  e.preventDefault()
+                  setFocusedIndex((i) => (i <= 0 ? suggestions.length - 1 : i - 1))
+                } else if (e.key === "Escape") {
+                  setShowSuggestions(false)
+                  setFocusedIndex(-1)
+                }
+              }}
               autoComplete="off"
               disabled={loading}
+              aria-required="true"
+              role="combobox"
+              aria-expanded={hasSuggestions}
+              aria-controls={listboxId}
+              aria-autocomplete="list"
+              aria-activedescendant={focusedIndex >= 0 ? `${listboxId}-option-${focusedIndex}` : undefined}
             />
             {resolving && (
-              <span className="text-muted-foreground absolute right-3 top-1/2 -translate-y-1/2 text-xs">
-                Resolving...
+              <span className="text-muted-foreground absolute right-3 top-1/2 -translate-y-1/2 text-xs" aria-live="polite">
+                Resolving…
               </span>
             )}
-            {showSuggestions && suggestions.length > 0 && (
-              <div className="absolute z-50 mt-1 w-full rounded-md border bg-popover shadow-md">
+            {hasSuggestions && (
+              <div id={listboxId} role="listbox" aria-label="Search results" className="absolute z-50 mt-1 w-full rounded-md border bg-popover shadow-md">
                 {suggestions.map((result, index) => {
                   const name = result.display_name ?? result.handle ?? result.did
                   const fallback = name.charAt(0).toUpperCase()
                   return (
                     <button
                       key={result.did}
+                      id={`${listboxId}-option-${index}`}
                       type="button"
-                      className={`flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors hover:bg-accent ${index === 0 ? "rounded-t-md" : ""} ${index === suggestions.length - 1 ? "rounded-b-md" : ""}`}
+                      role="option"
+                      aria-selected={focusedIndex === index}
+                      className={`flex w-full items-center gap-3 px-3 py-2 text-left text-sm transition-colors hover:bg-accent ${focusedIndex === index ? "bg-accent" : ""} ${index === 0 ? "rounded-t-md" : ""} ${index === suggestions.length - 1 ? "rounded-b-md" : ""}`}
                       onMouseDown={(e) => {
                         e.preventDefault()
                         selectResult(result)
@@ -217,7 +208,15 @@ function AttachAccountForm({ onComplete }: { onComplete: (opts: { attachedDid: s
                 })}
               </div>
             )}
+            {showEmpty && (
+              <div className="absolute z-50 mt-1 w-full rounded-md border bg-popover p-3 shadow-md">
+                <p className="text-muted-foreground text-sm">No accounts found. Try a full handle (e.g. alice.bsky.social) or a DID.</p>
+              </div>
+            )}
           </div>
+          {showFormatHint && (
+            <p className="text-muted-foreground text-xs mt-1.5">Enter a handle (e.g. alice.bsky.social) or a DID (e.g. did:plc:...).</p>
+          )}
         </div>
 
         {selectedProfile && (
@@ -235,20 +234,24 @@ function AttachAccountForm({ onComplete }: { onComplete: (opts: { attachedDid: s
               </p>
               <p className="text-muted-foreground truncate text-xs font-mono">{selectedProfile.did}</p>
             </div>
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={clearSelection}
-              className="text-muted-foreground hover:text-foreground text-xs shrink-0"
+              aria-label="Clear selection and search again"
             >
               Change
-            </button>
+            </Button>
           </div>
         )}
 
-        {error && <p className="text-destructive text-sm">{error}</p>}
-        <div className="flex justify-end">
-          <Button onClick={handleSubmit} disabled={loading || !inputValue.trim()}>
-            {loading ? "Configuring..." : "Continue"}
+        {error && <p role="alert" className="text-destructive text-sm">{error}</p>}
+        <div className="flex justify-between">
+          {onBack ? (
+            <Button variant="ghost" onClick={onBack}>Back</Button>
+          ) : <div />}
+          <Button onClick={handleSubmit} disabled={loading || !trimmedInput || !looksValid}>
+            {loading ? "Configuring…" : "Continue"}
           </Button>
         </div>
       </CardContent>

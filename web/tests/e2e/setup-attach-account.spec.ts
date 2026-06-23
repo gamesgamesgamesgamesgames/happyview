@@ -35,22 +35,23 @@ test.describe("Setup - Attach Account", () => {
   })
 
   test("attach_account flow reaches authenticate step", async ({ page }) => {
+    await loginAsTestAdmin(page)
     await page.goto("/setup")
     await expect(
-      page.getByText(/how should this appview be identified/i),
+      page.getByText(/set up your service identity/i),
     ).toBeVisible({ timeout: 10000 })
 
-    // Select "Attach existing account"
-    await page.getByText(/attach existing account/i).click()
+    // Select "Use an existing AT Protocol account"
+    await page.getByText(/use an existing at protocol account/i).click()
     await page.getByRole("button", { name: /continue/i }).click()
 
     // Configure step: enter the PDS account DID
-    const identifierInput = page.getByLabel(/account identifier/i)
+    const identifierInput = page.getByLabel(/handle or did/i)
     await expect(identifierInput).toBeVisible({ timeout: 5000 })
     await identifierInput.fill(account.did)
 
     // Wait for the typeahead dropdown and select the suggestion
-    const suggestion = page.locator(".bg-popover button").first()
+    const suggestion = page.getByRole("option").first()
     await expect(suggestion).toBeVisible({ timeout: 5000 })
     await suggestion.click()
 
@@ -61,7 +62,7 @@ test.describe("Setup - Attach Account", () => {
 
     // Should reach the authenticate step
     await expect(
-      page.getByText(/authenticate attached account/i),
+      page.getByText(/sign in to verify ownership/i),
     ).toBeVisible({ timeout: 10000 })
 
     // Verify the authenticate button contains the account handle
@@ -75,17 +76,17 @@ test.describe("Setup - Attach Account", () => {
     await loginAsTestAdmin(page)
     await page.goto("/setup")
 
-    // Select "Attach existing account"
+    // Select "Use an existing AT Protocol account"
     await expect(
-      page.getByText(/how should this appview be identified/i),
+      page.getByText(/set up your service identity/i),
     ).toBeVisible({ timeout: 10000 })
-    await page.getByText(/attach existing account/i).click()
+    await page.getByText(/use an existing at protocol account/i).click()
     await page.getByRole("button", { name: /continue/i }).click()
 
     // Enter the DID directly without selecting from the typeahead so
     // attachedHandle stays null and the OAuth flow uses the DID.
     // Handle resolution for .test domains won't work from inside Docker.
-    const identifierInput = page.getByLabel(/account identifier/i)
+    const identifierInput = page.getByLabel(/handle or did/i)
     await expect(identifierInput).toBeVisible({ timeout: 5000 })
     await identifierInput.fill(account.did)
 
@@ -98,7 +99,7 @@ test.describe("Setup - Attach Account", () => {
 
     // Reach the authenticate step
     await expect(
-      page.getByText(/authenticate attached account/i),
+      page.getByText(/sign in to verify ownership/i),
     ).toBeVisible({ timeout: 10000 })
 
     // Click "Authenticate as @handle" — this triggers the OAuth flow:
@@ -153,15 +154,16 @@ test.describe("Setup - Attach Account", () => {
   test.afterAll(async ({ browser }) => {
     const page = await browser.newPage()
     try {
+      await loginAsTestAdmin(page)
       await page.goto("/setup")
-      const notExposedCard = page.getByText(/not exposed/i)
+      const skipCard = page.getByText(/skip for now/i)
       if (
-        await notExposedCard.isVisible({ timeout: 3000 }).catch(() => false)
+        await skipCard.isVisible({ timeout: 3000 }).catch(() => false)
       ) {
-        await notExposedCard.click()
+        await skipCard.click()
         await page.getByRole("button", { name: /continue/i }).click()
         await expect(
-          page.getByText("Setup Complete"),
+          page.getByText("Your AppView is ready"),
         ).toBeVisible({ timeout: 5000 })
       }
     } finally {

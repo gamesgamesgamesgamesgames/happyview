@@ -45,6 +45,12 @@ export default defineConfig({
       dependencies: ["attach-account"],
       use: { browserName: "chromium" },
     },
+    {
+      name: "setup-features",
+      testMatch: "setup-features.spec.ts",
+      dependencies: ["didplc-setup"],
+      use: { browserName: "chromium" },
+    },
   ],
   globalSetup: "./tests/e2e/global-setup.ts",
 })
