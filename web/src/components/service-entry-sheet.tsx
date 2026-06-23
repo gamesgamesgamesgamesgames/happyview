@@ -2,7 +2,9 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Trash2 } from "lucide-react";
+import { toast } from "sonner";
 
+import { toastError } from "@/lib/format";
 import {
   getServiceEntryXrpcs,
   updateServiceEntry,
@@ -11,6 +13,17 @@ import {
   deleteServiceEntry,
   type ServiceEntry,
 } from "@/lib/api";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -49,7 +62,6 @@ export function ServiceEntrySheet({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [newXrpc, setNewXrpc] = useState("");
   const [adding, setAdding] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
@@ -59,7 +71,7 @@ export function ServiceEntrySheet({
       const list = await getServiceEntryXrpcs(entry.id);
       setXrpcs(list);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to load XRPC list", e);
     }
   }, [entry.id, accessMode]);
 
@@ -67,7 +79,6 @@ export function ServiceEntrySheet({
     if (open) {
       setAccessMode(entry.access_mode);
       setSelected(new Set());
-      setError(null);
     }
   }, [open, entry]);
 
@@ -99,55 +110,55 @@ export function ServiceEntrySheet({
 
   async function handleRemoveSelected() {
     if (selected.size === 0) return;
-    setError(null);
     try {
       await removeServiceEntryXrpcs(entry.id, Array.from(selected));
+      toast.success(`Removed ${selected.size} XRPC${selected.size > 1 ? "s" : ""}`);
       setSelected(new Set());
       await loadXrpcs();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to remove XRPCs", e);
     }
   }
 
   async function handleAddXrpc() {
     const value = newXrpc.trim();
     if (!value) return;
-    setError(null);
     setAdding(true);
     try {
       await addServiceEntryXrpcs(entry.id, [value]);
+      toast.success(`Added ${value}`);
       setNewXrpc("");
       await loadXrpcs();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to add XRPC", e);
     } finally {
       setAdding(false);
     }
   }
 
   async function handleSave() {
-    setError(null);
     setSaving(true);
     try {
       await updateServiceEntry(entry.id, { access_mode: accessMode });
+      toast.success("Service entry updated");
       onSaved();
       onOpenChange(false);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to update service entry", e);
     } finally {
       setSaving(false);
     }
   }
 
   async function handleDelete() {
-    setError(null);
     setDeleting(true);
     try {
       await deleteServiceEntry(entry.id);
+      toast.success(`Deleted ${entry.fragment_id}`);
       onSaved();
       onOpenChange(false);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to delete service entry", e);
     } finally {
       setDeleting(false);
     }
@@ -165,8 +176,6 @@ export function ServiceEntrySheet({
         </SheetHeader>
 
         <div className="flex flex-col gap-6 flex-1 p-4">
-          {error && <p className="text-destructive text-sm">{error}</p>}
-
           <div className="flex flex-col gap-2">
             <p className="text-sm font-medium">XRPC Access</p>
             <div className="flex gap-2">
@@ -211,15 +220,7 @@ export function ServiceEntrySheet({
                     <TableRow>
                       <TableHead className="w-10">
                         <Checkbox
-                          checked={allSelected}
-                          ref={(el) => {
-                            if (el)
-                              (
-                                el as HTMLButtonElement & {
-                                  indeterminate: boolean;
-                                }
-                              ).indeterminate = someSelected;
-                          }}
+                          checked={allSelected || (someSelected && "indeterminate")}
                           onCheckedChange={toggleSelectAll}
                           aria-label="Select all"
                         />
@@ -234,8 +235,8 @@ export function ServiceEntrySheet({
                           colSpan={2}
                           className="text-muted-foreground text-center text-sm"
                         >
-                          No XRPCs configured. Add XRPCs that this service can
-                          access.
+                          No XRPCs configured. Add methods below that this
+                          service entry can access.
                         </TableCell>
                       </TableRow>
                     )}
@@ -273,7 +274,7 @@ export function ServiceEntrySheet({
                   onClick={handleAddXrpc}
                   disabled={adding || !newXrpc.trim()}
                 >
-                  {adding ? "Adding..." : "Add"}
+                  {adding ? "Adding…" : "Add"}
                 </Button>
               </div>
             </div>
@@ -281,17 +282,38 @@ export function ServiceEntrySheet({
         </div>
 
         <SheetFooter className="border-t pt-4 flex-row justify-between">
-          <Button
-            variant="destructive"
-            size="sm"
-            onClick={handleDelete}
-            disabled={deleting}
-          >
-            <Trash2 className="size-4 mr-2" />
-            {deleting ? "Deleting..." : "Delete Service"}
-          </Button>
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="destructive" size="sm">
+                <Trash2 className="size-4 mr-2" />
+                Delete Service
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>
+                  Delete {entry.fragment_id}?
+                </AlertDialogTitle>
+                <AlertDialogDescription>
+                  This will permanently remove the service entry and its XRPC
+                  configuration. The change will take effect in the DID document
+                  after your next PLC sync.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  variant="destructive"
+                  onClick={handleDelete}
+                  disabled={deleting}
+                >
+                  {deleting ? "Deleting…" : "Delete"}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
           <Button onClick={handleSave} disabled={saving} size="sm">
-            {saving ? "Saving..." : "Save"}
+            {saving ? "Saving…" : "Save"}
           </Button>
         </SheetFooter>
       </SheetContent>
