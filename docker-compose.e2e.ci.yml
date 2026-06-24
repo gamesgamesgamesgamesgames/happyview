@@ -1,0 +1,5 @@
+services:
+  happyview:
+    build:
+      additional_contexts:
+        builder: .builder-override

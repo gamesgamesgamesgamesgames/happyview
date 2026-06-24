@@ -4,4 +4,5 @@ tests/
 .github/
 .claude/
 .env
+.builder-override/
 docker-compose*.yml

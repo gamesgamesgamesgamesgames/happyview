@@ -28,6 +28,9 @@ export default defineConfig({
       testMatch: [
         "service-identity-settings.spec.ts",
         "lexicon-services.spec.ts",
+        "lexicon-delete.spec.ts",
+        "script-delete.spec.ts",
+        "record-delete.spec.ts",
         "proxy-config.spec.ts",
       ],
       dependencies: ["setup"],
