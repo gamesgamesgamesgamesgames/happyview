@@ -51,8 +51,6 @@ pub struct SetupStatus {
     pub setup_complete: bool,
 }
 
-// Row type: (mode, did, signing_key_enc, setup_complete, created_at, updated_at)
-// setup_complete uses i32 because sqlx's Any driver can't decode SQLite BOOLEAN directly.
 type ServiceIdentityRow = (String, Option<String>, Option<String>, i32, String, String);
 
 fn parse_row(r: ServiceIdentityRow) -> Result<ServiceIdentity, AppError> {
@@ -132,7 +130,7 @@ pub async fn upsert_identity(
     let now = chrono::Utc::now().to_rfc3339();
     let sql = adapt_sql(
         "INSERT INTO service_identity (id, mode, did, signing_key_enc, rotation_key_enc, attached_account_did, setup_complete, created_at, updated_at)
-         VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (1, ?, ?, ?, ?, ?, FALSE, ?, ?)
          ON CONFLICT (id) DO UPDATE SET
              mode = excluded.mode,
              did = excluded.did,
@@ -150,7 +148,6 @@ pub async fn upsert_identity(
         .bind(signing_key_enc)
         .bind(rotation_key_enc)
         .bind(attached_account_did)
-        .bind(0i32)
         .bind(&now)
         .bind(&now)
         .execute(db)
@@ -164,12 +161,11 @@ pub async fn upsert_identity(
 pub async fn mark_setup_complete(db: &AnyPool, backend: DatabaseBackend) -> Result<(), AppError> {
     let now = chrono::Utc::now().to_rfc3339();
     let sql = adapt_sql(
-        "UPDATE service_identity SET setup_complete = ?, updated_at = ? WHERE id = 1",
+        "UPDATE service_identity SET setup_complete = TRUE, updated_at = ? WHERE id = 1",
         backend,
     );
 
     sqlx::query(&sql)
-        .bind(1i32)
         .bind(&now)
         .execute(db)
         .await
