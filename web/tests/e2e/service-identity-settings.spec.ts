@@ -8,15 +8,22 @@ test.describe("Service Identity Settings", () => {
   })
 
   test("manage service entry access mode and xrpcs", async ({ page }) => {
+    // Open the add sheet
+    const addEntryButton = page.getByRole("button", { name: "Add Service Entry" }).first()
+    await expect(addEntryButton).toBeVisible({ timeout: 5000 })
+    await addEntryButton.click()
+
     // Create an entry to work with
-    const fragmentInput = page.getByLabel(/fragment/i)
-    const typeInput = page.getByLabel(/service type/i)
+    const addSheet = page.locator("[data-slot='sheet-content']")
+    await expect(addSheet).toBeVisible({ timeout: 3000 })
+    const fragmentInput = addSheet.getByRole("textbox", { name: /fragment/i })
+    const typeInput = addSheet.getByRole("textbox", { name: /service type/i })
     await expect(fragmentInput).toBeVisible({ timeout: 5000 })
 
     await fragmentInput.fill("#e2esheet")
     await typeInput.fill("TestView")
 
-    const mainAddButton = page.getByRole("button", { name: "Add" })
+    const mainAddButton = addSheet.getByRole("button", { name: "Add" })
     await expect(mainAddButton).toBeEnabled({ timeout: 3000 })
     await mainAddButton.click()
 
@@ -67,20 +74,31 @@ test.describe("Service Identity Settings", () => {
     const deleteButton = sheetAfterReload.getByRole("button", { name: /delete service/i })
     await deleteButton.click()
 
+    const deleteDialog = page.getByRole("alertdialog")
+    await expect(deleteDialog).toBeVisible({ timeout: 3000 })
+    await deleteDialog.getByRole("button", { name: "Delete" }).click()
+
     // Wait for sheet to close, then verify entry is removed from the table
     await expect(sheetAfterReload).not.toBeVisible({ timeout: 5000 })
     await expect(page.getByRole("button", { name: /delete #e2esheet/i })).not.toBeVisible({ timeout: 5000 })
   })
 
   test("add and remove a service entry", async ({ page }) => {
-    const fragmentInput = page.getByLabel(/fragment/i)
-    const typeInput = page.getByLabel(/service type/i)
+    // Open the add sheet
+    const addEntryButton = page.getByRole("button", { name: "Add Service Entry" }).first()
+    await expect(addEntryButton).toBeVisible({ timeout: 5000 })
+    await addEntryButton.click()
+
+    const addSheet = page.locator("[data-slot='sheet-content']")
+    await expect(addSheet).toBeVisible({ timeout: 3000 })
+    const fragmentInput = addSheet.getByRole("textbox", { name: /fragment/i })
+    const typeInput = addSheet.getByRole("textbox", { name: /service type/i })
     await expect(fragmentInput).toBeVisible({ timeout: 5000 })
 
     await fragmentInput.fill("#testentry")
     await typeInput.fill("TestAppView")
 
-    const addButton = page.getByRole("button", { name: "Add" })
+    const addButton = addSheet.getByRole("button", { name: "Add" })
     await expect(addButton).toBeEnabled({ timeout: 3000 })
     await addButton.click()
 
@@ -90,7 +108,11 @@ test.describe("Service Identity Settings", () => {
     await expect(deleteButton).toBeVisible({ timeout: 3000 })
     await deleteButton.click()
 
-    await expect(page.getByText("#testentry")).not.toBeVisible({ timeout: 5000 })
+    const dialog = page.getByRole("alertdialog")
+    await expect(dialog).toBeVisible({ timeout: 3000 })
+    await dialog.getByRole("button", { name: "Delete" }).click()
+
+    await expect(page.getByText("#testentry", { exact: true })).not.toBeVisible({ timeout: 5000 })
   })
 
   test("change mode redirects to setup", async ({ page }) => {

@@ -48,7 +48,7 @@ async fn get_identity_returns_null_when_not_configured() {
 async fn get_identity_returns_identity_after_setup() {
     common::require_db!();
     let mut app = TestApp::new().await;
-    let did = app.setup_did_web().await;
+    app.setup_did_web().await;
     let cookie = app.admin_cookie();
 
     let resp = app
@@ -67,7 +67,10 @@ async fn get_identity_returns_identity_after_setup() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
     assert_eq!(body["mode"], "did_web");
-    assert_eq!(body["did"], did);
+    assert!(
+        body["did"].is_null(),
+        "did:web derives DID from host, not stored"
+    );
     assert_eq!(body["setup_complete"], true);
 }
 

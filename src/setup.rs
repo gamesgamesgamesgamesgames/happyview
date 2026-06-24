@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::admin::auth::UserAuth;
 use crate::auth::COOKIE_NAME;
+use crate::auth::middleware::Claims;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::service_identity::{self, IdentityMode};
 use crate::{AppState, error::AppError};
@@ -39,7 +40,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn status(
-    _auth: UserAuth,
+    _auth: Claims,
     State(state): State<AppState>,
 ) -> Result<Json<service_identity::SetupStatus>, AppError> {
     let status = service_identity::get_setup_status(&state.db, state.db_backend).await?;

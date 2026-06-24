@@ -232,11 +232,12 @@ export default function LexiconsPage() {
                     title="Delete lexicon"
                     aria-label="Delete lexicon"
                     onClick={(e) => e.stopPropagation()}
+                    onPointerDown={(e) => e.stopPropagation()}
                   >
                     <Trash2 className="size-4" />
                   </Button>
                 </AlertDialogTrigger>
-                <AlertDialogContent>
+                <AlertDialogContent onClick={(e) => e.stopPropagation()}>
                   <AlertDialogHeader>
                     <AlertDialogTitle>Delete lexicon?</AlertDialogTitle>
                     <AlertDialogDescription>

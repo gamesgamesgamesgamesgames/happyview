@@ -40,16 +40,21 @@ test.describe("Setup - did:plc", () => {
       return
     }
 
-    // Verify "Download Rotation Key" button is visible
-    await expect(
-      page.getByRole("button", { name: /download rotation key/i }),
-    ).toBeVisible()
+    // Download the rotation key (required before Continue is enabled)
+    const downloadButton = page.getByRole("button", { name: /download rotation key/i })
+    await expect(downloadButton).toBeVisible()
+    const [_download] = await Promise.all([
+      page.waitForEvent("download"),
+      downloadButton.click(),
+    ])
 
     // Click Continue to complete setup
-    await page.getByRole("button", { name: /continue/i }).click()
+    const continueButton = page.getByRole("button", { name: /continue/i })
+    await expect(continueButton).toBeEnabled({ timeout: 5000 })
+    await continueButton.click()
 
     // Verify setup completes
-    await expect(page.getByText("Your AppView is ready")).toBeVisible({ timeout: 5000 })
+    await expect(page.getByText("Your AppView is ready", { exact: true })).toBeVisible({ timeout: 5000 })
   })
 
   // Restore setup state for subsequent tests
@@ -68,7 +73,7 @@ test.describe("Setup - did:plc", () => {
         await skipCard.click()
         await page.getByRole("button", { name: /continue/i }).click()
         await expect(
-          page.getByText("Your AppView is ready"),
+          page.getByText("Your AppView is ready", { exact: true }),
         ).toBeVisible({ timeout: 5000 })
       }
     } finally {

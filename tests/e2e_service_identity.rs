@@ -226,7 +226,7 @@ async fn did_doc_empty_services() {
         .oneshot(
             Request::builder()
                 .uri("/.well-known/did.json")
-                .header("host", "127.0.0.1")
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -260,7 +260,7 @@ async fn did_doc_with_entries() {
         .oneshot(
             Request::builder()
                 .uri("/.well-known/did.json")
-                .header("host", "127.0.0.1")
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -284,7 +284,7 @@ async fn did_doc_with_entries() {
         .oneshot(
             Request::builder()
                 .uri("/.well-known/did.json")
-                .header("host", "127.0.0.1")
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -325,6 +325,7 @@ async fn service_auth_query_allowed() {
             Request::builder()
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -358,6 +359,7 @@ async fn service_auth_query_denied() {
             Request::builder()
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -396,6 +398,7 @@ async fn service_auth_specific_xrpc_allowed() {
             Request::builder()
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -438,6 +441,7 @@ async fn service_auth_procedure_allowed() {
                 .method("POST")
                 .uri("/xrpc/games.gamesgamesgamesgames.createGame")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({"title": "test"})).unwrap(),
@@ -476,6 +480,7 @@ async fn service_auth_procedure_denied() {
                 .method("POST")
                 .uri("/xrpc/games.gamesgamesgamesgames.createGame")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({"title": "test"})).unwrap(),
@@ -523,6 +528,7 @@ async fn token_scope_enforcement() {
                 .method("POST")
                 .uri("/xrpc/games.gamesgamesgamesgames.createGame")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({"title": "test"})).unwrap(),
@@ -707,6 +713,7 @@ async fn nonexistent_fragment_denies_access() {
             Request::builder()
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -769,6 +776,7 @@ async fn multiple_entries_matched_by_fragment() {
             Request::builder()
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth_chess)
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -788,6 +796,7 @@ async fn multiple_entries_matched_by_fragment() {
             Request::builder()
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth_checkers)
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -826,6 +835,7 @@ async fn scope_check_applies_with_access_mode_all() {
                 .method("POST")
                 .uri("/xrpc/games.gamesgamesgamesgames.createGame")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({"title": "test"})).unwrap(),
@@ -1319,7 +1329,7 @@ async fn setup_http_flow_did_web_produces_valid_did_doc() {
         .oneshot(
             Request::builder()
                 .uri("/.well-known/did.json")
-                .header("host", "127.0.0.1")
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1328,7 +1338,7 @@ async fn setup_http_flow_did_web_produces_valid_did_doc() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let doc = json_body(resp).await;
-    assert_eq!(doc["id"], "did:web:127.0.0.1");
+    assert_eq!(doc["id"], "did:web:127.0.0.1%3A0");
     assert!(!doc["verificationMethod"].as_array().unwrap().is_empty());
 
     // Step 4: Verify status shows complete
@@ -1460,6 +1470,7 @@ async fn did_web_issuer_resolved_via_https() {
             Request::builder()
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1498,6 +1509,7 @@ async fn service_auth_rejected_when_no_entries_exist() {
             Request::builder()
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1627,6 +1639,7 @@ async fn service_auth_es256k_query_allowed() {
             Request::builder()
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1978,6 +1991,7 @@ async fn post_to_query_endpoint_rejected() {
                 .method("POST")
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({"test": true})).unwrap(),
@@ -2176,6 +2190,7 @@ async fn jwt_with_allowed_typ_accepted() {
             Request::builder()
                 .uri("/xrpc/games.gamesgamesgamesgames.listGames")
                 .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
                 .body(Body::empty())
                 .unwrap(),
         )

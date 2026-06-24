@@ -14,7 +14,7 @@ test.describe("Setup - Features", () => {
     await page.getByText(/skip for now/i).click()
     await page.getByRole("button", { name: /continue/i }).click()
 
-    await expect(page.getByText("Your AppView is ready")).toBeVisible({ timeout: 5000 })
+    await expect(page.getByText("Your AppView is ready", { exact: true })).toBeVisible({ timeout: 5000 })
     await expect(page.getByText(/skipped/i)).toBeVisible()
   })
 
@@ -29,7 +29,7 @@ test.describe("Setup - Features", () => {
     await expect(page.getByText("Review your domain identity")).toBeVisible({ timeout: 10000 })
 
     // Click the Identity stepper step to go back and reset
-    await page.getByText("Identity").click()
+    await page.getByRole("tab", { name: "Identity" }).click()
 
     // Should be back at mode selection with state reset
     await expect(page.getByText(/set up your service identity/i)).toBeVisible({ timeout: 5000 })
@@ -96,7 +96,7 @@ test.describe("Setup - Features", () => {
         await skipCard.click()
         await page.getByRole("button", { name: /continue/i }).click()
         await expect(
-          page.getByText("Your AppView is ready"),
+          page.getByText("Your AppView is ready", { exact: true }),
         ).toBeVisible({ timeout: 5000 })
       }
     } finally {

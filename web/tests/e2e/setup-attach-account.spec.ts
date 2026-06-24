@@ -163,7 +163,7 @@ test.describe("Setup - Attach Account", () => {
         await skipCard.click()
         await page.getByRole("button", { name: /continue/i }).click()
         await expect(
-          page.getByText("Your AppView is ready"),
+          page.getByText("Your AppView is ready", { exact: true }),
         ).toBeVisible({ timeout: 5000 })
       }
     } finally {

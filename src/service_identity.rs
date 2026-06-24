@@ -189,7 +189,7 @@ pub fn generate_did_document(
         return None;
     }
 
-    let did = format!("did:web:{host}");
+    let did = format!("did:web:{}", host.replace(':', "%3A"));
 
     let verification_method = serde_json::json!([{
         "id": format!("{did}#atproto"),

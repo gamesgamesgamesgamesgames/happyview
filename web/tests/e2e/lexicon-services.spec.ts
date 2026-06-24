@@ -78,14 +78,22 @@ test.describe("Lexicon Services", () => {
     // Create a service entry via the settings page
     await page.goto("/dashboard/settings/service-identity")
 
-    const fragmentInput = page.getByLabel(/fragment/i)
+    // Open the add sheet
+    const addEntryButton = page.getByRole("button", { name: "Add Service Entry" }).first()
+    await expect(addEntryButton).toBeVisible({ timeout: 5000 })
+    await addEntryButton.click()
+
+    const addSheet = page.locator("[data-slot='sheet-content']")
+    await expect(addSheet).toBeVisible({ timeout: 3000 })
+
+    const fragmentInput = addSheet.getByRole("textbox", { name: /fragment/i })
     await expect(fragmentInput).toBeVisible({ timeout: 5000 })
 
     await fragmentInput.fill("#lextest")
-    const typeInput = page.getByLabel(/service type/i)
+    const typeInput = addSheet.getByRole("textbox", { name: /service type/i })
     await typeInput.fill("TestView")
 
-    const addButton = page.getByRole("button", { name: "Add" })
+    const addButton = addSheet.getByRole("button", { name: "Add" })
     await expect(addButton).toBeEnabled({ timeout: 3000 })
     await addButton.click()
 
@@ -128,6 +136,9 @@ test.describe("Lexicon Services", () => {
     const deleteButton = page.getByRole("button", { name: /delete #lextest/i })
     if (await deleteButton.isVisible({ timeout: 3000 }).catch(() => false)) {
       await deleteButton.click()
+      const dialog = page.getByRole("alertdialog")
+      await expect(dialog).toBeVisible({ timeout: 3000 })
+      await dialog.getByRole("button", { name: "Delete" }).click()
       await expect(page.getByText("#lextest")).not.toBeVisible({ timeout: 5000 })
     }
   })

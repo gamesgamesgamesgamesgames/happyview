@@ -342,7 +342,7 @@ async fn try_parse_service_auth(
     let instance_did = match &identity.mode {
         crate::service_identity::IdentityMode::DidWeb => {
             let h = host.ok_or_else(|| AppError::Auth("missing Host header for did:web".into()))?;
-            format!("did:web:{h}")
+            format!("did:web:{}", h.replace(':', "%3A"))
         }
         _ => identity
             .did

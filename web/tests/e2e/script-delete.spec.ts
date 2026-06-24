@@ -19,7 +19,7 @@ const TEST_LEXICON = {
 }
 
 const TEST_SCRIPT_SUFFIX = "test.e2e.scriptdelete.item"
-const TEST_SCRIPT_ID = `before_create:${TEST_SCRIPT_SUFFIX}`
+const TEST_SCRIPT_ID = `record.create:${TEST_SCRIPT_SUFFIX}`
 
 async function seedScript(
   request: import("@playwright/test").APIRequestContext,
@@ -37,8 +37,7 @@ async function seedScript(
   const resp = await request.post("/admin/scripts", {
     data: {
       id: TEST_SCRIPT_ID,
-      code: 'return record',
-      language: "lua",
+      body: 'function handle(record)\n  return record\nend',
     },
   })
   if (!resp.ok()) {

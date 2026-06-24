@@ -23,7 +23,7 @@ test.describe("Setup Wizard", () => {
     await expect(completeButton).toBeVisible({ timeout: 5000 })
     await completeButton.click()
 
-    await expect(page.getByText("Your AppView is ready")).toBeVisible({ timeout: 5000 })
+    await expect(page.getByText("Your AppView is ready", { exact: true })).toBeVisible({ timeout: 5000 })
   })
 
   test("setup page redirects to dashboard after completion", async ({ page }) => {

@@ -42,8 +42,8 @@ async function seedRecords(
       const uri = `at://did:plc:e2e-test-admin/${COLLECTION}/record-${i}`
       const now = new Date().toISOString()
       await client.query(
-        `INSERT INTO records (uri, did, collection, rkey, record, cid, indexed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (uri) DO NOTHING`,
         [
           uri,
@@ -52,6 +52,7 @@ async function seedRecords(
           `record-${i}`,
           JSON.stringify({ title: `Test Record ${i}` }),
           `cid-e2e-${i}`,
+          now,
           now,
         ],
       )

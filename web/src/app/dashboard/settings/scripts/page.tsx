@@ -249,7 +249,7 @@ export default function ScriptsPage() {
                     <Trash2 className="size-4" />
                   </Button>
                 </AlertDialogTrigger>
-                <AlertDialogContent>
+                <AlertDialogContent onClick={(e) => e.stopPropagation()}>
                   <AlertDialogHeader>
                     <AlertDialogTitle>Delete script?</AlertDialogTitle>
                     <AlertDialogDescription>
