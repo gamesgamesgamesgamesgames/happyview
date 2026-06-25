@@ -165,8 +165,9 @@ export default function ServiceIdentityPage() {
 
   const needsSync = useMemo(() => {
     if (sessionDirty) return true;
+    if (entries.length === 0) return false;
     const lastSynced = getLastSyncedAt();
-    if (!lastSynced || entries.length === 0) return false;
+    if (!lastSynced) return true;
     return entries.some((e) => e.updated_at > lastSynced);
   }, [entries, sessionDirty]);
 
