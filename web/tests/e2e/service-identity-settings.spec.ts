@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test"
-import { loginAsTestAdmin } from "./auth-helper"
+import { loginAsTestAdmin, setServiceIdentityMode } from "./auth-helper"
 
 test.describe("Service Identity Settings", () => {
   test.beforeEach(async ({ page }) => {
@@ -113,6 +113,27 @@ test.describe("Service Identity Settings", () => {
     await dialog.getByRole("button", { name: "Delete" }).click()
 
     await expect(page.getByText("#testentry", { exact: true })).not.toBeVisible({ timeout: 5000 })
+  })
+
+  test("re-authenticate button visible in attach_account mode", async ({ page }) => {
+    await setServiceIdentityMode("attach_account", {
+      did: "did:plc:e2e-reauth-test",
+      attachedAccountDid: "did:plc:e2e-attached-account",
+    })
+
+    await page.reload()
+    await expect(
+      page.getByRole("button", { name: /re-authenticate/i }),
+    ).toBeVisible({ timeout: 5000 })
+
+    // Restore to did_web mode for subsequent tests
+    await setServiceIdentityMode("did_web", { did: "did:web:localhost" })
+  })
+
+  test("re-authenticate button hidden in did_web mode", async ({ page }) => {
+    await expect(
+      page.getByRole("button", { name: /re-authenticate/i }),
+    ).not.toBeVisible({ timeout: 3000 })
   })
 
   test("change mode redirects to setup", async ({ page }) => {

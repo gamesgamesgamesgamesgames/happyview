@@ -110,7 +110,12 @@ async function apiFetch<T = unknown>(
 
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
-    throw new ApiError(res.status, text);
+    let message = text;
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed.error === "string") message = parsed.error;
+    } catch { /* not JSON, use raw text */ }
+    throw new ApiError(res.status, message);
   }
   if (res.status === 204) return null as T;
   const text = await res.text();
@@ -344,7 +349,12 @@ export async function xrpcQuery<T = unknown>(
   );
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
-    throw new ApiError(res.status, text);
+    let message = text;
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed.error === "string") message = parsed.error;
+    } catch { /* not JSON, use raw text */ }
+    throw new ApiError(res.status, message);
   }
   return res.json();
 }
@@ -432,7 +442,12 @@ export async function uploadLogo(file: File) {
   });
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
-    throw new ApiError(res.status, text);
+    let message = text;
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed.error === "string") message = parsed.error;
+    } catch { /* not JSON, use raw text */ }
+    throw new ApiError(res.status, message);
   }
 }
 
@@ -841,6 +856,7 @@ export interface SetupStatus {
 export interface ServiceIdentityResponse {
   mode: string;
   did: string | null;
+  attached_account_did: string | null;
   setup_complete: boolean;
   created_at: string;
   updated_at: string;

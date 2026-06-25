@@ -38,6 +38,7 @@ pub struct ServiceIdentity {
     pub mode: IdentityMode,
     pub did: Option<String>,
     pub signing_key_enc: Option<String>,
+    pub attached_account_did: Option<String>,
     pub setup_complete: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -51,7 +52,15 @@ pub struct SetupStatus {
     pub setup_complete: bool,
 }
 
-type ServiceIdentityRow = (String, Option<String>, Option<String>, i32, String, String);
+type ServiceIdentityRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i32,
+    String,
+    String,
+);
 
 fn parse_row(r: ServiceIdentityRow) -> Result<ServiceIdentity, AppError> {
     let mode = IdentityMode::parse(&r.0)
@@ -60,9 +69,10 @@ fn parse_row(r: ServiceIdentityRow) -> Result<ServiceIdentity, AppError> {
         mode,
         did: r.1,
         signing_key_enc: r.2,
-        setup_complete: r.3 != 0,
-        created_at: r.4,
-        updated_at: r.5,
+        attached_account_did: r.3,
+        setup_complete: r.4 != 0,
+        created_at: r.5,
+        updated_at: r.6,
     })
 }
 
@@ -72,7 +82,7 @@ pub async fn get_identity(
     backend: DatabaseBackend,
 ) -> Result<Option<ServiceIdentity>, AppError> {
     let sql = adapt_sql(
-        "SELECT mode, did, signing_key_enc, CAST(setup_complete AS INTEGER), created_at, updated_at FROM service_identity WHERE id = 1",
+        "SELECT mode, did, signing_key_enc, attached_account_did, CAST(setup_complete AS INTEGER), created_at, updated_at FROM service_identity WHERE id = 1",
         backend,
     );
 
@@ -229,6 +239,7 @@ mod tests {
             mode,
             did: did.map(String::from),
             signing_key_enc: None,
+            attached_account_did: None,
             setup_complete: true,
             created_at: "2024-01-01".into(),
             updated_at: "2024-01-01".into(),

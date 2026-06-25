@@ -18,6 +18,19 @@ use crate::event_log::{EventLog, Severity, log_event};
 use crate::service_identity::{self, IdentityMode};
 use crate::{AppState, error::AppError};
 
+fn is_pds_session_expired(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    msg.contains("invalid_token") || msg.contains("expired") || msg.contains("revoked")
+}
+
+fn pds_reauth_error() -> AppError {
+    AppError::Auth(
+        "Your PDS session has expired or been revoked. \
+         Use the Re-authenticate button on the Service Identity page to sign in again."
+            .into(),
+    )
+}
+
 async fn require_setup_incomplete(state: &AppState) -> Result<(), AppError> {
     let status = service_identity::get_setup_status(&state.db, state.db_backend).await?;
     if status.setup_complete {
@@ -265,7 +278,14 @@ async fn plc_request(
     };
 
     // Restore OAuth session for the attached account
-    let session = crate::repo::session::get_oauth_session(&state, &account_did).await?;
+    let session = crate::repo::session::get_oauth_session(&state, &account_did)
+        .await
+        .map_err(|e| {
+            if is_pds_session_expired(&e) {
+                return pds_reauth_error();
+            }
+            e
+        })?;
     let agent = Agent::new(session);
 
     // Request PLC operation signature — sends confirmation code to account's email
@@ -276,7 +296,12 @@ async fn plc_request(
         .identity
         .request_plc_operation_signature()
         .await
-        .map_err(|e| AppError::Internal(format!("requestPlcOperationSignature failed: {e}")))?;
+        .map_err(|e| {
+            if is_pds_session_expired(&e) {
+                return pds_reauth_error();
+            }
+            AppError::Internal(format!("requestPlcOperationSignature failed: {e}"))
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -310,7 +335,14 @@ async fn plc_submit(
         }
     };
 
-    let session = crate::repo::session::get_oauth_session(&state, &account_did).await?;
+    let session = crate::repo::session::get_oauth_session(&state, &account_did)
+        .await
+        .map_err(|e| {
+            if is_pds_session_expired(&e) {
+                return pds_reauth_error();
+            }
+            e
+        })?;
     let agent = Agent::new(session);
 
     // Fetch current PLC operation state
@@ -387,7 +419,12 @@ async fn plc_submit(
             .into(),
         )
         .await
-        .map_err(|e| AppError::Internal(format!("signPlcOperation failed: {e}")))?;
+        .map_err(|e| {
+            if is_pds_session_expired(&e) {
+                return pds_reauth_error();
+            }
+            AppError::Internal(format!("signPlcOperation failed: {e}"))
+        })?;
 
     // Submit the signed operation
     use atrium_api::com::atproto::identity::submit_plc_operation;
@@ -403,7 +440,12 @@ async fn plc_submit(
             .into(),
         )
         .await
-        .map_err(|e| AppError::Internal(format!("submitPlcOperation failed: {e}")))?;
+        .map_err(|e| {
+            if is_pds_session_expired(&e) {
+                return pds_reauth_error();
+            }
+            AppError::Internal(format!("submitPlcOperation failed: {e}"))
+        })?;
 
     // Update service_identity with the account's DID
     service_identity::upsert_identity(

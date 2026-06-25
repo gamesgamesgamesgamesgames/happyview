@@ -17,6 +17,19 @@ use crate::service_identity::IdentityMode;
 use super::auth::UserAuth;
 use super::permissions::Permission;
 
+fn is_pds_session_expired(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string();
+    msg.contains("invalid_token") || msg.contains("expired") || msg.contains("revoked")
+}
+
+fn pds_reauth_error() -> AppError {
+    AppError::Auth(
+        "Your PDS session has expired or been revoked. \
+         Use the Re-authenticate button on the Service Identity page to sign in again."
+            .into(),
+    )
+}
+
 /// GET /admin/service-entries — list all service entries.
 pub(super) async fn list(
     State(state): State<AppState>,
@@ -307,7 +320,14 @@ pub(super) async fn sync_plc_request(
         }
     };
 
-    let session = crate::repo::session::get_oauth_session(&state, &account_did).await?;
+    let session = crate::repo::session::get_oauth_session(&state, &account_did)
+        .await
+        .map_err(|e| {
+            if is_pds_session_expired(&e) {
+                return pds_reauth_error();
+            }
+            e
+        })?;
     let agent = Agent::new(session);
 
     agent
@@ -317,7 +337,12 @@ pub(super) async fn sync_plc_request(
         .identity
         .request_plc_operation_signature()
         .await
-        .map_err(|e| AppError::Internal(format!("requestPlcOperationSignature failed: {e}")))?;
+        .map_err(|e| {
+            if is_pds_session_expired(&e) {
+                return pds_reauth_error();
+            }
+            AppError::Internal(format!("requestPlcOperationSignature failed: {e}"))
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -359,7 +384,14 @@ pub(super) async fn sync_plc_submit(
         }
     };
 
-    let session = crate::repo::session::get_oauth_session(&state, &account_did).await?;
+    let session = crate::repo::session::get_oauth_session(&state, &account_did)
+        .await
+        .map_err(|e| {
+            if is_pds_session_expired(&e) {
+                return pds_reauth_error();
+            }
+            e
+        })?;
     let agent = Agent::new(session);
 
     // Fetch current PLC operation state
@@ -442,7 +474,12 @@ pub(super) async fn sync_plc_submit(
             .into(),
         )
         .await
-        .map_err(|e| AppError::Internal(format!("signPlcOperation failed: {e}")))?;
+        .map_err(|e| {
+            if is_pds_session_expired(&e) {
+                return pds_reauth_error();
+            }
+            AppError::Internal(format!("signPlcOperation failed: {e}"))
+        })?;
 
     // Submit the signed operation
     use atrium_api::com::atproto::identity::submit_plc_operation;
@@ -458,7 +495,12 @@ pub(super) async fn sync_plc_submit(
             .into(),
         )
         .await
-        .map_err(|e| AppError::Internal(format!("submitPlcOperation failed: {e}")))?;
+        .map_err(|e| {
+            if is_pds_session_expired(&e) {
+                return pds_reauth_error();
+            }
+            AppError::Internal(format!("submitPlcOperation failed: {e}"))
+        })?;
 
     log_event(
         &state.db,

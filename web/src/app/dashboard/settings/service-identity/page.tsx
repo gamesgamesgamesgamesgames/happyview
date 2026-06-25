@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { AlertTriangle, HelpCircle, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
+import { AlertTriangle, HelpCircle, KeyRound, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
@@ -16,6 +16,7 @@ import {
   syncPlc,
   syncPlcRequest,
   syncPlcSubmit,
+  confirmAttachAuth,
   type ServiceIdentityResponse,
   type ServiceEntry,
 } from "@/lib/api";
@@ -67,6 +68,8 @@ import {
 } from "@/components/ui/tooltip";
 
 const SYNC_STORAGE_KEY = "happyview:service-identity:last-synced-at";
+const REAUTH_STORAGE_KEY = "happyview:service-identity:reauth";
+const REAUTH_MAX_AGE_MS = 10 * 60 * 1000;
 const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone/.test(navigator.userAgent);
 const MOD_KEY = IS_MAC ? "⌘" : "Ctrl+";
 const FRAGMENT_ID_RE = /^#?[a-zA-Z][a-zA-Z0-9_-]*$/;
@@ -142,6 +145,7 @@ export default function ServiceIdentityPage() {
   const [sessionDirty, setSessionDirty] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [reauthing, setReauthing] = useState(false);
 
   const fragmentIdRef = useRef<HTMLInputElement>(null);
 
@@ -209,6 +213,70 @@ export default function ServiceIdentityPage() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [canManage]);
+
+  useEffect(() => {
+    const stored = localStorage.getItem(REAUTH_STORAGE_KEY);
+    if (!stored) return;
+
+    let payload: { originalDid: string; timestamp?: number };
+    try {
+      payload = JSON.parse(stored);
+    } catch {
+      localStorage.removeItem(REAUTH_STORAGE_KEY);
+      return;
+    }
+
+    if (payload.timestamp && Date.now() - payload.timestamp > REAUTH_MAX_AGE_MS) {
+      localStorage.removeItem(REAUTH_STORAGE_KEY);
+      return;
+    }
+
+    localStorage.removeItem(REAUTH_STORAGE_KEY);
+    setReauthing(true);
+
+    confirmAttachAuth({ original_did: payload.originalDid })
+      .then(() => {
+        toast.success("PDS session refreshed");
+        load();
+      })
+      .catch((e) => {
+        toastError("Failed to restore admin session", e);
+      })
+      .finally(() => setReauthing(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function handleReauthenticate() {
+    if (!identity?.attached_account_did) return;
+    setReauthing(true);
+
+    fetch("/auth/me", { credentials: "same-origin" })
+      .then((res) => {
+        if (!res.ok) throw new Error("Failed to fetch current user");
+        return res.json() as Promise<{ did: string }>;
+      })
+      .then(({ did: originalDid }) => {
+        localStorage.setItem(
+          REAUTH_STORAGE_KEY,
+          JSON.stringify({ originalDid, timestamp: Date.now() }),
+        );
+        return fetch(
+          `/auth/login?handle=${encodeURIComponent(identity.attached_account_did!)}&scope=${encodeURIComponent("atproto identity:*")}&redirect_uri=${encodeURIComponent("/dashboard/settings/service-identity")}`,
+          { credentials: "same-origin" },
+        );
+      })
+      .then((resp) => {
+        if (!resp.ok) throw new Error("Login request failed");
+        return resp.json() as Promise<{ url: string }>;
+      })
+      .then(({ url }) => {
+        window.location.href = url;
+      })
+      .catch((e) => {
+        toastError("Failed to start re-authentication", e);
+        setReauthing(false);
+      });
+  }
 
   const showSyncButton = canManage && identity &&
     (identity.mode === "did_plc" || identity.mode === "attach_account");
@@ -506,6 +574,17 @@ export default function ServiceIdentityPage() {
                   </AlertDialogFooter>
                 </AlertDialogContent>
               </AlertDialog>
+            )}
+            {canManage && identity?.mode === "attach_account" && identity.attached_account_did && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleReauthenticate}
+                disabled={reauthing}
+              >
+                <KeyRound className="size-3.5" />
+                {reauthing ? "Redirecting…" : "Re-authenticate"}
+              </Button>
             )}
             {showSyncButton && (
               identity?.mode === "did_plc" ? (

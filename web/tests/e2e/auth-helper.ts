@@ -72,6 +72,30 @@ export async function resetServiceIdentity(): Promise<void> {
   }
 }
 
+export async function setServiceIdentityMode(
+  mode: string,
+  opts?: { did?: string; attachedAccountDid?: string },
+): Promise<void> {
+  const client = new pg.Client(DB_URL)
+  await client.connect()
+  try {
+    const now = new Date().toISOString()
+    await client.query(
+      `INSERT INTO service_identity (id, mode, did, attached_account_did, setup_complete, created_at, updated_at)
+       VALUES (1, $1, $2, $3, TRUE, $4, $4)
+       ON CONFLICT (id) DO UPDATE SET
+         mode = $1,
+         did = $2,
+         attached_account_did = $3,
+         setup_complete = TRUE,
+         updated_at = $4`,
+      [mode, opts?.did ?? null, opts?.attachedAccountDid ?? null, now],
+    )
+  } finally {
+    await client.end()
+  }
+}
+
 export async function loginAsTestAdmin(page: Page): Promise<void> {
   await ensureTestUser(TEST_DID)
 
