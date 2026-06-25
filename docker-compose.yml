@@ -64,6 +64,7 @@ services:
       - tunnel-url:/shared
     environment:
       CLOUDFLARE_TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+      TUNNEL_HOSTNAME: ${TUNNEL_HOSTNAME:-}
       TUNNEL_URL_FILE: /shared/tunnel-url
       TUNNEL_UPSTREAM: http://caddy:80
     depends_on:

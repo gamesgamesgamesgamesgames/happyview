@@ -20,8 +20,13 @@ UPSTREAM="${TUNNEL_UPSTREAM:-http://happyview:3000}"
 URL_FILE="${TUNNEL_URL_FILE:-/shared/tunnel-url}"
 
 if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+  if [ -n "$TUNNEL_HOSTNAME" ]; then
+    mkdir -p "$(dirname "$URL_FILE")"
+    echo "https://$TUNNEL_HOSTNAME" > "$URL_FILE"
+  fi
   echo "══════════════════════════════════════════════════════════════"
   echo "  Starting named Cloudflare tunnel"
+  echo "  Hostname: ${TUNNEL_HOSTNAME:-<configured in Cloudflare>}"
   echo "  Upstream: $UPSTREAM"
   echo "══════════════════════════════════════════════════════════════"
   exec cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN"

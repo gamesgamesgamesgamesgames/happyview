@@ -3,9 +3,10 @@ set -e
 
 TUNNEL_URL_FILE="${TUNNEL_URL_FILE:-}"
 
-if [ -n "$TUNNEL_URL_FILE" ] && [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+if [ -n "$TUNNEL_URL_FILE" ]; then
   rm -f "$TUNNEL_URL_FILE"
-  echo "Waiting for quick tunnel URL..."
+
+  echo "Waiting for tunnel URL..."
   elapsed=0
   while [ ! -f "$TUNNEL_URL_FILE" ] && [ "$elapsed" -lt 30 ]; do
     sleep 1
