@@ -187,6 +187,7 @@ export default function ServiceIdentityPage() {
   }, []);
 
   useEffect(() => {
+    if (localStorage.getItem(REAUTH_STORAGE_KEY)) return;
     load();
   }, [load]);
 
@@ -235,10 +236,22 @@ export default function ServiceIdentityPage() {
     localStorage.removeItem(REAUTH_STORAGE_KEY);
     setReauthing(true);
 
-    confirmAttachAuth({ original_did: payload.originalDid })
-      .then(() => {
-        toast.success("PDS session refreshed");
-        load();
+    fetch("/auth/me", { credentials: "same-origin" })
+      .then((res) => {
+        if (!res.ok) throw new Error("Failed to check session");
+        return res.json() as Promise<{ did: string }>;
+      })
+      .then(({ did }) => {
+        if (did === payload.originalDid) {
+          // Session is still the admin — user backed out of OAuth
+          return;
+        }
+        return confirmAttachAuth({ original_did: payload.originalDid }).then(
+          () => {
+            toast.success("PDS session refreshed");
+            load();
+          },
+        );
       })
       .catch((e) => {
         toastError("Failed to restore admin session", e);
@@ -249,20 +262,32 @@ export default function ServiceIdentityPage() {
 
   function handleReauthenticate() {
     if (!identity?.attached_account_did) return;
+    const did = identity.attached_account_did;
     setReauthing(true);
 
-    fetch("/auth/me", { credentials: "same-origin" })
-      .then((res) => {
+    Promise.all([
+      fetch("/auth/me", { credentials: "same-origin" }).then((res) => {
         if (!res.ok) throw new Error("Failed to fetch current user");
         return res.json() as Promise<{ did: string }>;
-      })
-      .then(({ did: originalDid }) => {
+      }),
+      did.startsWith("did:plc:")
+        ? fetch(`https://plc.directory/${did}`)
+            .then((r) => (r.ok ? (r.json() as Promise<{ alsoKnownAs?: string[] }>) : null))
+            .then((doc) => {
+              const aka = doc?.alsoKnownAs?.find((a: string) => a.startsWith("at://"));
+              return aka ? aka.replace("at://", "") : null;
+            })
+            .catch(() => null)
+        : Promise.resolve(null),
+    ])
+      .then(([{ did: originalDid }, handle]) => {
         localStorage.setItem(
           REAUTH_STORAGE_KEY,
           JSON.stringify({ originalDid, timestamp: Date.now() }),
         );
+        const identifier = handle ?? did;
         return fetch(
-          `/auth/login?handle=${encodeURIComponent(identity.attached_account_did!)}&scope=${encodeURIComponent("atproto identity:*")}&redirect_uri=${encodeURIComponent("/dashboard/settings/service-identity")}`,
+          `/auth/login?handle=${encodeURIComponent(identifier)}&scope=${encodeURIComponent("atproto identity:*")}&redirect_uri=${encodeURIComponent("/dashboard/settings/service-identity")}`,
           { credentials: "same-origin" },
         );
       })
