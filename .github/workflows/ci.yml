@@ -8,23 +8,23 @@ on:
   workflow_dispatch:
     inputs:
       server:
-        description: 'Build server (unit tests, e2e, frontend, lint, release)'
+        description: "Build server (unit tests, e2e, frontend, lint, release)"
         type: boolean
         default: true
       oauth-client:
-        description: 'Build oauth-client'
+        description: "Build oauth-client"
         type: boolean
         default: false
       oauth-client-browser:
-        description: 'Build oauth-client-browser'
+        description: "Build oauth-client-browser"
         type: boolean
         default: false
       oauth-client-node:
-        description: 'Build oauth-client-node'
+        description: "Build oauth-client-node"
         type: boolean
         default: false
       lex-agent:
-        description: 'Build lex-agent'
+        description: "Build lex-agent"
         type: boolean
         default: false
   delete:
@@ -83,6 +83,46 @@ jobs:
   # ---------------------------------------------------------------------------
   # Server — unit tests, e2e tests, frontend build, lint
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Build server binary — shared by playwright and pr-build (amd64)
+  # ---------------------------------------------------------------------------
+  build-server:
+    needs: changes
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-amd64-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-release-amd64-
+
+      - name: Build release binary
+        run: |
+          docker run --rm \
+            -v "$PWD:/app" \
+            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
+            -v "$HOME/.cargo/git:/usr/local/cargo/git" \
+            -w /app \
+            -e SQLX_OFFLINE=true \
+            rust:1.93-bookworm \
+            cargo build --release
+
+      - name: Upload server binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: happyview-server
+          path: target/release/happyview
+
   unit-tests:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
@@ -174,15 +214,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Cache cargo dependencies
+      - name: Cache cargo
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-deps-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+            target
+          key: cargo-lint-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-deps-${{ runner.os }}-
+            cargo-lint-${{ runner.os }}-
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -190,11 +231,71 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  playwright:
+    needs: [changes, frontend, build-server]
+    if: >-
+      always()
+      && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+      && needs.frontend.result == 'success'
+      && needs.build-server.result == 'success'
+    runs-on: depot-ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: web
+        run: npx playwright install chromium --with-deps
+
+      - name: Download server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: happyview-server
+          path: .builder-override/app/target/release
+
+      - name: Log in to ATCR
+        run: echo "${{ secrets.ATCR_PASSWORD }}" | docker login atcr.io -u "${{ secrets.ATCR_USERNAME }}" --password-stdin
+
+      - name: Start E2E services
+        run: docker compose -f docker-compose.e2e.yml -f docker-compose.e2e.ci.yml up -d --build --wait
+        timeout-minutes: 10
+
+      - name: Run Playwright tests
+        working-directory: web
+        run: npx playwright test
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:3200
+
+      - name: Dump container logs
+        if: failure()
+        run: docker compose -f docker-compose.e2e.yml -f docker-compose.e2e.ci.yml logs
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: web/playwright-report/
+          retention-days: 14
+
+      - name: Stop E2E services
+        if: always()
+        run: docker compose -f docker-compose.e2e.yml -f docker-compose.e2e.ci.yml down -v
+
   # ---------------------------------------------------------------------------
   # PR builds — compile + Docker on every PR push so reviewers can test
   # ---------------------------------------------------------------------------
   pr-build:
-    needs: changes
+    needs: [changes, build-server]
     if: >-
       github.event_name == 'pull_request'
       && github.head_ref != 'dev'
@@ -219,17 +320,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Cache cargo
+      - name: Download server binary (amd64)
+        if: matrix.arch == 'amd64'
+        uses: actions/download-artifact@v4
+        with:
+          name: happyview-server
+          path: target/release
+
+      - name: Cache cargo (arm64)
+        if: matrix.arch != 'amd64'
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: cargo-release-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-release-${{ matrix.arch }}-
 
-      - name: Build release binary
+      - name: Build release binary (arm64)
+        if: matrix.arch != 'amd64'
         run: |
           docker run --rm \
             -v "$PWD:/app" \
@@ -415,6 +526,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: cargo-release-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-release-${{ matrix.arch }}-
