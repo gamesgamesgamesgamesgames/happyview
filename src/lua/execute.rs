@@ -237,12 +237,14 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
-    if let Err(e) = atproto_api::register_atproto_blob_api(
-        &lua,
-        state_arc.clone(),
-        claims_arc.clone(),
-        pds_auth_arc.clone(),
-    ) {
+    if let Some(ref pds_auth) = pds_auth_arc
+        && let Err(e) = atproto_api::register_atproto_blob_api(
+            &lua,
+            state_arc.clone(),
+            claims_arc.clone(),
+            pds_auth.clone(),
+        )
+    {
         let error_message = format!("failed to register atproto blob API: {e}");
         log_event(
             &state.db,
