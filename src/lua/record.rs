@@ -148,7 +148,7 @@ pub(crate) fn register_record_api(
                     let now = now_rfc3339();
                     let data_str = serde_json::to_string(&data).unwrap_or_default();
                     let upsert_sql = adapt_sql(
-                        r#"INSERT INTO records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+                        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT (uri) DO UPDATE
                                SET record = EXCLUDED.record,
@@ -212,7 +212,7 @@ pub(crate) fn register_record_api(
                         let data_str = serde_json::to_string(&data).unwrap_or_default();
                         let now = now_rfc3339();
                         let upsert_sql = adapt_sql(
-                            r#"INSERT INTO records (uri, did, collection, rkey, record, cid, created_at)
+                            r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
                                VALUES (?, ?, ?, ?, ?, ?, ?)
                                ON CONFLICT (uri) DO UPDATE
                                    SET record = EXCLUDED.record,
@@ -317,7 +317,7 @@ pub(crate) fn register_record_api(
 
                 // Always delete locally — operator's logical action is
                 // "remove this record from view" regardless of PDS outcome.
-                let delete_sql = adapt_sql("DELETE FROM records WHERE uri = ?", backend);
+                let delete_sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
                 let _ = sqlx::query(&delete_sql).bind(&uri).execute(&state.db).await;
 
                 this.raw_set("_uri", mlua::Value::Nil)?;
@@ -417,7 +417,7 @@ pub(crate) fn register_record_api(
                 // NULL CID — no PDS round-trip means we have no real CID
                 // to record.
                 let upsert_sql = adapt_sql(
-                    r#"INSERT INTO records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+                    r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT (uri) DO UPDATE
                            SET record = EXCLUDED.record,
@@ -462,7 +462,7 @@ pub(crate) fn register_record_api(
                     mlua::Error::runtime("cannot delete_local a Record that has no _uri")
                 })?;
 
-                let delete_sql = adapt_sql("DELETE FROM records WHERE uri = ?", backend);
+                let delete_sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
                 sqlx::query(&delete_sql)
                     .bind(&uri)
                     .execute(&state.db)
@@ -749,7 +749,7 @@ pub(crate) fn register_record_api(
                                 let now = now_rfc3339();
                                 let data_str = serde_json::to_string(&data).unwrap_or_default();
                                 let upsert_sql = adapt_sql(
-                                    r#"INSERT INTO records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+                                    r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                        ON CONFLICT (uri) DO UPDATE
                                            SET record = EXCLUDED.record,
@@ -818,7 +818,7 @@ pub(crate) fn register_record_api(
                                     let data_str = serde_json::to_string(&data).unwrap_or_default();
                                     let now = now_rfc3339();
                                     let upsert_sql = adapt_sql(
-                                        r#"INSERT INTO records (uri, did, collection, rkey, record, cid, created_at)
+                                        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
                                            VALUES (?, ?, ?, ?, ?, ?, ?)
                                            ON CONFLICT (uri) DO UPDATE
                                                SET record = EXCLUDED.record,
@@ -874,7 +874,7 @@ pub(crate) fn register_record_api(
             async move {
                 let backend = state.db_backend;
                 let sql = adapt_sql(
-                    "SELECT collection, record, cid FROM records WHERE uri = ?",
+                    "SELECT collection, record, cid FROM happyview_records WHERE uri = ?",
                     backend,
                 );
                 let row: Option<(String, String, String)> = sqlx::query_as(&sql)
@@ -941,7 +941,7 @@ pub(crate) fn register_record_api(
                     let uri = uri.clone();
                     async move {
                         let sql = adapt_sql(
-                            "SELECT collection, record, cid FROM records WHERE uri = ?",
+                            "SELECT collection, record, cid FROM happyview_records WHERE uri = ?",
                             backend,
                         );
                         let row: Option<(String, String, String)> = sqlx::query_as(&sql)
@@ -1020,7 +1020,7 @@ pub(crate) fn register_record_api(
             let state = state.clone();
             async move {
                 let backend = state.db_backend;
-                let delete_sql = adapt_sql("DELETE FROM records WHERE uri = ?", backend);
+                let delete_sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
                 let res = sqlx::query(&delete_sql)
                     .bind(&uri)
                     .execute(&state.db)

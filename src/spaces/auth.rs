@@ -97,7 +97,7 @@ async fn get_or_create_signing_key(
     space: &Space,
 ) -> Result<serde_json::Value, AppError> {
     let sql = adapt_sql(
-        "SELECT signing_key_enc FROM space_dids WHERE space_id = ?",
+        "SELECT signing_key_enc FROM happyview_space_dids WHERE space_id = ?",
         backend,
     );
     let row: Option<(Vec<u8>,)> = sqlx::query_as(&sql)
@@ -129,7 +129,7 @@ async fn get_or_create_signing_key(
 
     let now = now_rfc3339();
     let insert_sql = adapt_sql(
-        "INSERT INTO space_dids (id, did, space_id, signing_key_enc, rotation_key_enc, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_dids (id, did, space_id, signing_key_enc, rotation_key_enc, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -198,7 +198,7 @@ async fn store_credential_record(
         .unwrap_or_default();
 
     let sql = adapt_sql(
-        "INSERT INTO space_credentials (id, space_id, issued_to, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         backend,
     );
 

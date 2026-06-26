@@ -66,7 +66,7 @@ fn get_with_host(uri: &str, host: &str) -> Request<Body> {
 async fn seed_domain(app: &TestApp, id: &str, url: &str, is_primary: bool) {
     let now = happyview::db::now_rfc3339();
     let sql = happyview::db::adapt_sql(
-        "INSERT INTO domains (id, url, is_primary, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_domains (id, url, is_primary, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
         app.state.db_backend,
     );
     sqlx::query(&sql)

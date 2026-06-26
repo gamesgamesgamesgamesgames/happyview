@@ -140,7 +140,7 @@ async fn seed_records(pool: &sqlx::AnyPool, backend: DatabaseBackend) {
 
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO records (uri, did, collection, rkey, record, cid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
     for (uri, did, collection, rkey, record, cid) in &records {
@@ -334,7 +334,7 @@ async fn db_raw_select_works() {
 
     let result: mlua::Table = lua
         .load(
-            r#"return db.raw("SELECT COUNT(*) as cnt FROM records WHERE collection = $1", {"test.collection"})"#,
+            r#"return db.raw("SELECT COUNT(*) as cnt FROM happyview_records WHERE collection = $1", {"test.collection"})"#,
         )
         .eval_async()
         .await

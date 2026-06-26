@@ -66,7 +66,7 @@ pub(crate) async fn handle_query(
 
     let rows: Vec<(String, String, String)> = if let Some(did) = did {
         let sql = adapt_sql(
-            "SELECT uri, did, record FROM records WHERE collection = ? AND did = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
+            "SELECT uri, did, record FROM happyview_records WHERE collection = ? AND did = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
             backend,
         );
         sqlx::query_as(&sql)
@@ -79,7 +79,7 @@ pub(crate) async fn handle_query(
             .map_err(|e| AppError::Internal(format!("DB query failed: {e}")))?
     } else {
         let sql = adapt_sql(
-            "SELECT uri, did, record FROM records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
+            "SELECT uri, did, record FROM happyview_records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
             backend,
         );
         sqlx::query_as(&sql)
@@ -118,7 +118,10 @@ pub(crate) async fn handle_query(
 
 pub(super) async fn handle_get_record(state: &AppState, uri: &str) -> Result<Response, AppError> {
     let backend = state.db_backend;
-    let sql = adapt_sql("SELECT record FROM records WHERE uri = ?", backend);
+    let sql = adapt_sql(
+        "SELECT record FROM happyview_records WHERE uri = ?",
+        backend,
+    );
     let row: Option<(String,)> = sqlx::query_as(&sql)
         .bind(uri)
         .fetch_optional(&state.db)

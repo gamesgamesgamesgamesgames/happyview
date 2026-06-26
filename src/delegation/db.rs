@@ -13,7 +13,7 @@ pub async fn create_delegated_account(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO delegated_accounts (account_did, linked_by, api_client_id, created_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO happyview_delegated_accounts (account_did, linked_by, api_client_id, created_at) VALUES (?, ?, ?, ?)",
         backend,
     );
     sqlx::query(&sql)
@@ -33,7 +33,7 @@ pub async fn delete_delegated_account(
     account_did: &str,
 ) -> Result<(), AppError> {
     let sql = adapt_sql(
-        "DELETE FROM delegated_accounts WHERE account_did = ?",
+        "DELETE FROM happyview_delegated_accounts WHERE account_did = ?",
         backend,
     );
     sqlx::query(&sql)
@@ -50,7 +50,7 @@ pub async fn get_delegated_account_owner(
     account_did: &str,
 ) -> Result<Option<String>, AppError> {
     let sql = adapt_sql(
-        "SELECT linked_by FROM delegated_accounts WHERE account_did = ?",
+        "SELECT linked_by FROM happyview_delegated_accounts WHERE account_did = ?",
         backend,
     );
     let row: Option<(String,)> = sqlx::query_as(&sql)
@@ -76,7 +76,7 @@ pub async fn get_api_client_id(
     account_did: &str,
 ) -> Result<Option<String>, AppError> {
     let sql = adapt_sql(
-        "SELECT api_client_id FROM delegated_accounts WHERE account_did = ?",
+        "SELECT api_client_id FROM happyview_delegated_accounts WHERE account_did = ?",
         backend,
     );
     let row: Option<(String,)> = sqlx::query_as(&sql)
@@ -97,7 +97,7 @@ pub async fn add_delegate(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO account_delegates (account_did, user_did, role, granted_by, created_at) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_account_delegates (account_did, user_did, role, granted_by, created_at) VALUES (?, ?, ?, ?, ?)",
         backend,
     );
     sqlx::query(&sql)
@@ -119,7 +119,7 @@ pub async fn remove_delegate(
     user_did: &str,
 ) -> Result<(), AppError> {
     let sql = adapt_sql(
-        "DELETE FROM account_delegates WHERE account_did = ? AND user_did = ?",
+        "DELETE FROM happyview_account_delegates WHERE account_did = ? AND user_did = ?",
         backend,
     );
     sqlx::query(&sql)
@@ -138,7 +138,7 @@ pub async fn get_delegate_role(
     user_did: &str,
 ) -> Result<Option<DelegateRole>, AppError> {
     let sql = adapt_sql(
-        "SELECT role FROM account_delegates WHERE account_did = ? AND user_did = ?",
+        "SELECT role FROM happyview_account_delegates WHERE account_did = ? AND user_did = ?",
         backend,
     );
     let row: Option<(String,)> = sqlx::query_as(&sql)
@@ -157,7 +157,7 @@ pub async fn list_accounts_for_user(
     api_client_id: &str,
 ) -> Result<Vec<DelegatedAccountView>, AppError> {
     let sql = adapt_sql(
-        "SELECT ad.account_did, ad.role, ad.created_at FROM account_delegates ad JOIN delegated_accounts da ON da.account_did = ad.account_did WHERE ad.user_did = ? AND da.api_client_id = ? ORDER BY ad.created_at DESC",
+        "SELECT ad.account_did, ad.role, ad.created_at FROM happyview_account_delegates ad JOIN happyview_delegated_accounts da ON da.account_did = ad.account_did WHERE ad.user_did = ? AND da.api_client_id = ? ORDER BY ad.created_at DESC",
         backend,
     );
     let rows: Vec<(String, String, String)> = sqlx::query_as(&sql)
@@ -184,7 +184,7 @@ pub async fn get_account_for_user(
     user_did: &str,
 ) -> Result<Option<(String, String, String)>, AppError> {
     let sql = adapt_sql(
-        "SELECT da.linked_by, ad.role, ad.created_at FROM delegated_accounts da JOIN account_delegates ad ON da.account_did = ad.account_did WHERE da.account_did = ? AND ad.user_did = ?",
+        "SELECT da.linked_by, ad.role, ad.created_at FROM happyview_delegated_accounts da JOIN happyview_account_delegates ad ON da.account_did = ad.account_did WHERE da.account_did = ? AND ad.user_did = ?",
         backend,
     );
     let row: Option<(String, String, String)> = sqlx::query_as(&sql)
@@ -202,7 +202,7 @@ pub async fn list_delegates(
     account_did: &str,
 ) -> Result<Vec<DelegateView>, AppError> {
     let sql = adapt_sql(
-        "SELECT user_did, role, granted_by, created_at FROM account_delegates WHERE account_did = ? ORDER BY created_at ASC",
+        "SELECT user_did, role, granted_by, created_at FROM happyview_account_delegates WHERE account_did = ? ORDER BY created_at ASC",
         backend,
     );
     let rows: Vec<(String, String, String, String)> = sqlx::query_as(&sql)

@@ -819,7 +819,7 @@ async fn sync_plc_updates_did_document() {
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &encrypted);
 
     let sql = happyview::db::adapt_sql(
-        "UPDATE service_identity SET rotation_key_enc = ? WHERE id = 1",
+        "UPDATE happyview_service_identity SET rotation_key_enc = ? WHERE id = 1",
         app.state.db_backend,
     );
     sqlx::query(&sql)

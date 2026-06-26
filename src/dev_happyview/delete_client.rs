@@ -48,7 +48,7 @@ pub async fn delete_api_client(
 
     // 3. Look up client_id_url and client_key before deleting (scoped to owner)
     let lookup_sql = adapt_sql(
-        "SELECT client_id_url, client_key FROM api_clients WHERE id = ? AND owner_did = ?",
+        "SELECT client_id_url, client_key FROM happyview_api_clients WHERE id = ? AND owner_did = ?",
         state.db_backend,
     );
     let client_info: Option<(String, String)> = sqlx::query_as(&lookup_sql)
@@ -60,7 +60,7 @@ pub async fn delete_api_client(
 
     // 4. Look up child clients before deleting (ON DELETE CASCADE will remove DB rows)
     let children_sql = adapt_sql(
-        "SELECT client_id_url, client_key FROM api_clients WHERE parent_client_id = ?",
+        "SELECT client_id_url, client_key FROM happyview_api_clients WHERE parent_client_id = ?",
         state.db_backend,
     );
     let children: Vec<(String, String)> = sqlx::query_as(&children_sql)
@@ -71,7 +71,7 @@ pub async fn delete_api_client(
 
     // 5. Delete from DB — scoped to owner_did so users cannot delete others' clients
     let delete_sql = adapt_sql(
-        "DELETE FROM api_clients WHERE id = ? AND owner_did = ?",
+        "DELETE FROM happyview_api_clients WHERE id = ? AND owner_did = ?",
         state.db_backend,
     );
     let result = sqlx::query(&delete_sql)

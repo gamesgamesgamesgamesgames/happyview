@@ -36,7 +36,10 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
 
 /// Resolve a setting value: check the DB first, then fall back to env var.
 pub async fn get_setting(pool: &AnyPool, key: &str, backend: DatabaseBackend) -> Option<String> {
-    let sql = adapt_sql("SELECT value FROM instance_settings WHERE key = ?", backend);
+    let sql = adapt_sql(
+        "SELECT value FROM happyview_instance_settings WHERE key = ?",
+        backend,
+    );
     let row: Option<(String,)> = sqlx::query_as(&sql)
         .bind(key)
         .fetch_optional(pool)
@@ -67,7 +70,7 @@ pub(super) async fn list(
 
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT key, value FROM instance_settings ORDER BY key",
+        "SELECT key, value FROM happyview_instance_settings ORDER BY key",
         backend,
     );
     let rows: Vec<(String, String)> = sqlx::query_as(&sql)
@@ -115,7 +118,7 @@ pub(super) async fn upsert(
     let now = now_rfc3339();
     let sql = adapt_sql(
         r#"
-        INSERT INTO instance_settings (key, value, updated_at)
+        INSERT INTO happyview_instance_settings (key, value, updated_at)
         VALUES (?, ?, ?)
         ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?
         "#,
@@ -156,7 +159,10 @@ pub(super) async fn delete(
     auth.require(Permission::SettingsManage).await?;
 
     let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM instance_settings WHERE key = ?", backend);
+    let sql = adapt_sql(
+        "DELETE FROM happyview_instance_settings WHERE key = ?",
+        backend,
+    );
     let result = sqlx::query(&sql)
         .bind(&key)
         .execute(&state.db)
@@ -277,7 +283,7 @@ pub(super) async fn upload_logo(
     let backend = state.db_backend;
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO instance_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?",
+        "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?",
         backend,
     );
     for (key, value) in [
@@ -319,7 +325,10 @@ pub(super) async fn delete_logo(
     auth.require(Permission::SettingsManage).await?;
 
     let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM instance_settings WHERE key IN (?, ?)", backend);
+    let sql = adapt_sql(
+        "DELETE FROM happyview_instance_settings WHERE key IN (?, ?)",
+        backend,
+    );
     sqlx::query(&sql)
         .bind("logo_data")
         .bind("logo_content_type")
@@ -349,7 +358,7 @@ pub(crate) async fn serve_logo(
 ) -> Result<axum::response::Response, AppError> {
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT key, value FROM instance_settings WHERE key IN (?, ?)",
+        "SELECT key, value FROM happyview_instance_settings WHERE key IN (?, ?)",
         backend,
     );
     let rows: Vec<(String, String)> = sqlx::query_as(&sql)

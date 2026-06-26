@@ -51,7 +51,7 @@ pub(super) async fn list_events(
 
     let mut sql = String::from(
         "SELECT id, event_type, severity, actor_did, subject, detail, created_at
-         FROM event_logs WHERE 1=1",
+         FROM happyview_event_logs WHERE 1=1",
     );
 
     if query.event_type.is_some() {

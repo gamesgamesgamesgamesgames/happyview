@@ -23,7 +23,7 @@ use super::sandbox;
 
 /// Load all script variables from the database as a key-value map.
 async fn load_env_vars(db: &sqlx::AnyPool, backend: DatabaseBackend) -> HashMap<String, String> {
-    let sql = adapt_sql("SELECT key, value FROM script_variables", backend);
+    let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
     sqlx::query_as::<_, (String, String)>(&sql)
         .fetch_all(db)
         .await

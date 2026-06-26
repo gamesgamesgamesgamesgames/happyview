@@ -48,7 +48,7 @@ async fn seed_network_lexicon(app: &TestApp, nsid: &str, authority_did: &str) {
     let backend = app.state.db_backend;
     let sql = adapt_sql(
         r#"
-        INSERT INTO lexicons (id, lexicon_json, backfill, source, authority_did, last_fetched_at, created_at)
+        INSERT INTO happyview_lexicons (id, lexicon_json, backfill, source, authority_did, last_fetched_at, created_at)
         VALUES (?, ?, 0, 'network', ?, ?, ?)
         ON CONFLICT (id) DO NOTHING
         "#,
@@ -136,7 +136,7 @@ async fn network_lexicon_delete_removes_tracking_and_lexicon() {
 
     // Verify lexicon is removed.
     let sql = adapt_sql(
-        "SELECT COUNT(*) FROM lexicons WHERE id = ? AND source = 'network'",
+        "SELECT COUNT(*) FROM happyview_lexicons WHERE id = ? AND source = 'network'",
         backend,
     );
     let count: (i64,) = sqlx::query_as(&sql)

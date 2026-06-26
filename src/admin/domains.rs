@@ -30,7 +30,7 @@ pub(super) async fn list(
     auth.require(Permission::SettingsManage).await?;
 
     let sql = adapt_sql(
-        "SELECT id, url, is_primary, created_at, updated_at FROM domains ORDER BY created_at",
+        "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains ORDER BY created_at",
         state.db_backend,
     );
     let rows: Vec<(String, String, i32, String, String)> = sqlx::query_as(&sql)
@@ -85,7 +85,7 @@ pub(super) async fn create(
 
     // Check for duplicates
     let existing: Option<(String,)> = sqlx::query_as(&adapt_sql(
-        "SELECT id FROM domains WHERE url = ?",
+        "SELECT id FROM happyview_domains WHERE url = ?",
         state.db_backend,
     ))
     .bind(&url)
@@ -103,7 +103,7 @@ pub(super) async fn create(
     let now = now_rfc3339();
 
     let sql = adapt_sql(
-        "INSERT INTO domains (id, url, is_primary, created_at, updated_at) VALUES (?, ?, 0, ?, ?)",
+        "INSERT INTO happyview_domains (id, url, is_primary, created_at, updated_at) VALUES (?, ?, 0, ?, ?)",
         state.db_backend,
     );
     sqlx::query(&sql)
@@ -195,7 +195,7 @@ pub(super) async fn delete(
     auth.require(Permission::SettingsManage).await?;
 
     let sql = adapt_sql(
-        "SELECT id, url, is_primary, created_at, updated_at FROM domains WHERE id = ?",
+        "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains WHERE id = ?",
         state.db_backend,
     );
     let row: Option<(String, String, i32, String, String)> = sqlx::query_as(&sql)
@@ -213,7 +213,10 @@ pub(super) async fn delete(
         ));
     }
 
-    let delete_sql = adapt_sql("DELETE FROM domains WHERE id = ?", state.db_backend);
+    let delete_sql = adapt_sql(
+        "DELETE FROM happyview_domains WHERE id = ?",
+        state.db_backend,
+    );
     sqlx::query(&delete_sql)
         .bind(&id)
         .execute(&state.db)
@@ -258,7 +261,7 @@ pub(super) async fn set_primary(
     auth.require(Permission::SettingsManage).await?;
 
     let sql = adapt_sql(
-        "SELECT id, url, is_primary, created_at, updated_at FROM domains WHERE id = ?",
+        "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains WHERE id = ?",
         state.db_backend,
     );
     let row: Option<(String, String, i32, String, String)> = sqlx::query_as(&sql)
@@ -272,7 +275,7 @@ pub(super) async fn set_primary(
     let now = now_rfc3339();
 
     let unset_sql = adapt_sql(
-        "UPDATE domains SET is_primary = 0, updated_at = ? WHERE is_primary = 1",
+        "UPDATE happyview_domains SET is_primary = 0, updated_at = ? WHERE is_primary = 1",
         state.db_backend,
     );
     sqlx::query(&unset_sql)
@@ -282,7 +285,7 @@ pub(super) async fn set_primary(
         .map_err(|e| AppError::Internal(format!("failed to unset primary: {e}")))?;
 
     let set_sql = adapt_sql(
-        "UPDATE domains SET is_primary = 1, updated_at = ? WHERE id = ?",
+        "UPDATE happyview_domains SET is_primary = 1, updated_at = ? WHERE id = ?",
         state.db_backend,
     );
     sqlx::query(&set_sql)

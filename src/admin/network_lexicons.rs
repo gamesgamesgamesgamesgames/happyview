@@ -82,7 +82,7 @@ pub(super) async fn add(
     // Upsert into lexicons table with network source.
     let sql = adapt_sql(
         r#"
-        INSERT INTO lexicons (id, lexicon_json, backfill, target_collection, source, authority_did, last_fetched_at, created_at)
+        INSERT INTO happyview_lexicons (id, lexicon_json, backfill, target_collection, source, authority_did, last_fetched_at, created_at)
         VALUES (?, ?, 0, ?, 'network', ?, ?, ?)
         ON CONFLICT (id) DO UPDATE SET
             lexicon_json = EXCLUDED.lexicon_json,
@@ -90,7 +90,7 @@ pub(super) async fn add(
             source = 'network',
             authority_did = EXCLUDED.authority_did,
             last_fetched_at = ?,
-            revision = lexicons.revision + 1,
+            revision = happyview_lexicons.revision + 1,
             updated_at = ?
         RETURNING revision
         "#,
@@ -146,7 +146,7 @@ pub(super) async fn list(
 
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT id, authority_did, target_collection, last_fetched_at, created_at FROM lexicons WHERE source = 'network' ORDER BY id",
+        "SELECT id, authority_did, target_collection, last_fetched_at, created_at FROM happyview_lexicons WHERE source = 'network' ORDER BY id",
         backend,
     );
     #[allow(clippy::type_complexity)]
@@ -189,7 +189,7 @@ pub(super) async fn remove(
 
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "DELETE FROM lexicons WHERE id = ? AND source = 'network'",
+        "DELETE FROM happyview_lexicons WHERE id = ? AND source = 'network'",
         backend,
     );
     let result = sqlx::query(&sql)

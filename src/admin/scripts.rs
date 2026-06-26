@@ -107,7 +107,7 @@ pub(super) async fn list(
     let backend = state.db_backend;
     let mut sql = String::from(
         "SELECT id, script_type, body, description, outbound_xrpcs, created_at, updated_at
-         FROM scripts",
+         FROM happyview_scripts",
     );
     if query.suffix.is_some() {
         sql.push_str(" WHERE id LIKE ?");
@@ -207,17 +207,19 @@ pub(super) async fn upsert(
     let description = body.description.as_deref().filter(|s| !s.is_empty());
 
     // Distinguish create vs update so we can return 201 vs 200.
-    let pre_exists: Option<(String,)> =
-        sqlx::query_as(&adapt_sql("SELECT id FROM scripts WHERE id = ?", backend))
-            .bind(&body.id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to check script existence: {e}")))?;
+    let pre_exists: Option<(String,)> = sqlx::query_as(&adapt_sql(
+        "SELECT id FROM happyview_scripts WHERE id = ?",
+        backend,
+    ))
+    .bind(&body.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to check script existence: {e}")))?;
     let was_new = pre_exists.is_none();
 
     let sql = adapt_sql(
         r#"
-        INSERT INTO scripts (id, script_type, body, description, outbound_xrpcs, created_at, updated_at)
+        INSERT INTO happyview_scripts (id, script_type, body, description, outbound_xrpcs, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (id) DO UPDATE SET
             script_type    = EXCLUDED.script_type,
@@ -331,7 +333,7 @@ pub(super) async fn patch(
 
     let sql = adapt_sql(
         r#"
-        UPDATE scripts
+        UPDATE happyview_scripts
            SET script_type    = ?,
                body           = ?,
                description    = ?,
@@ -381,7 +383,7 @@ pub(super) async fn delete(
     auth.require(Permission::ScriptsManage).await?;
 
     let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM scripts WHERE id = ?", backend);
+    let sql = adapt_sql("DELETE FROM happyview_scripts WHERE id = ?", backend);
     let result = sqlx::query(&sql)
         .bind(&id)
         .execute(&state.db)
@@ -415,7 +417,7 @@ async fn fetch_one(state: &AppState, id: &str) -> Result<ScriptResponse, AppErro
     let backend = state.db_backend;
     let sql = adapt_sql(
         "SELECT id, script_type, body, description, outbound_xrpcs, created_at, updated_at
-         FROM scripts WHERE id = ?",
+         FROM happyview_scripts WHERE id = ?",
         backend,
     );
     #[allow(clippy::type_complexity)]

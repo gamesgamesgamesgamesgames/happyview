@@ -59,7 +59,7 @@ pub async fn list_entries(
     backend: DatabaseBackend,
 ) -> Result<Vec<ServiceEntry>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, fragment_id, service_type, access_mode, created_at, updated_at FROM service_entries ORDER BY id",
+        "SELECT id, fragment_id, service_type, access_mode, created_at, updated_at FROM happyview_service_entries ORDER BY id",
         backend,
     );
 
@@ -80,7 +80,7 @@ pub async fn create_entry(
     let now = Utc::now().to_rfc3339();
 
     let insert_sql = adapt_sql(
-        "INSERT INTO service_entries (fragment_id, service_type, access_mode, created_at, updated_at) VALUES (?, ?, 'all', ?, ?) RETURNING id",
+        "INSERT INTO happyview_service_entries (fragment_id, service_type, access_mode, created_at, updated_at) VALUES (?, ?, 'all', ?, ?) RETURNING id",
         backend,
     );
 
@@ -96,7 +96,7 @@ pub async fn create_entry(
     let id = row.0;
 
     let fetch_sql = adapt_sql(
-        "SELECT id, fragment_id, service_type, access_mode, created_at, updated_at FROM service_entries WHERE id = ?",
+        "SELECT id, fragment_id, service_type, access_mode, created_at, updated_at FROM happyview_service_entries WHERE id = ?",
         backend,
     );
 
@@ -142,7 +142,7 @@ pub async fn update_entry(
     if set_clauses.len() == 1 {
         // Only updated_at — nothing meaningful to update; just fetch current state.
         let fetch_sql = adapt_sql(
-            "SELECT id, fragment_id, service_type, access_mode, created_at, updated_at FROM service_entries WHERE id = ?",
+            "SELECT id, fragment_id, service_type, access_mode, created_at, updated_at FROM happyview_service_entries WHERE id = ?",
             backend,
         );
         let row: Option<ServiceEntryRow> = sqlx::query_as(&fetch_sql)
@@ -156,7 +156,7 @@ pub async fn update_entry(
     }
 
     let raw = format!(
-        "UPDATE service_entries SET {} WHERE id = ?",
+        "UPDATE happyview_service_entries SET {} WHERE id = ?",
         set_clauses.join(", ")
     );
     let update_sql = adapt_sql(&raw, backend);
@@ -183,7 +183,7 @@ pub async fn update_entry(
     }
 
     let fetch_sql = adapt_sql(
-        "SELECT id, fragment_id, service_type, access_mode, created_at, updated_at FROM service_entries WHERE id = ?",
+        "SELECT id, fragment_id, service_type, access_mode, created_at, updated_at FROM happyview_service_entries WHERE id = ?",
         backend,
     );
     let row: ServiceEntryRow = sqlx::query_as(&fetch_sql)
@@ -201,7 +201,10 @@ pub async fn delete_entry(
     backend: DatabaseBackend,
     id: i64,
 ) -> Result<bool, AppError> {
-    let sql = adapt_sql("DELETE FROM service_entries WHERE id = ?", backend);
+    let sql = adapt_sql(
+        "DELETE FROM happyview_service_entries WHERE id = ?",
+        backend,
+    );
 
     let result = sqlx::query(&sql)
         .bind(id)
@@ -223,7 +226,7 @@ pub async fn list_entry_xrpcs(
     entry_id: i64,
 ) -> Result<Vec<String>, AppError> {
     let sql = adapt_sql(
-        "SELECT lexicon_id FROM service_entry_xrpcs WHERE service_entry_id = ? ORDER BY lexicon_id",
+        "SELECT lexicon_id FROM happyview_service_entry_xrpcs WHERE service_entry_id = ? ORDER BY lexicon_id",
         backend,
     );
 
@@ -244,7 +247,7 @@ pub async fn add_entry_xrpcs(
     lexicon_ids: &[String],
 ) -> Result<(), AppError> {
     let sql = adapt_sql(
-        "INSERT INTO service_entry_xrpcs (service_entry_id, lexicon_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+        "INSERT INTO happyview_service_entry_xrpcs (service_entry_id, lexicon_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
         backend,
     );
 
@@ -268,7 +271,7 @@ pub async fn remove_entry_xrpcs(
     lexicon_ids: &[String],
 ) -> Result<(), AppError> {
     let sql = adapt_sql(
-        "DELETE FROM service_entry_xrpcs WHERE service_entry_id = ? AND lexicon_id = ?",
+        "DELETE FROM happyview_service_entry_xrpcs WHERE service_entry_id = ? AND lexicon_id = ?",
         backend,
     );
 
@@ -299,7 +302,7 @@ pub async fn check_access(
     xrpc_method: &str,
 ) -> Result<bool, AppError> {
     let sql = adapt_sql(
-        "SELECT id, access_mode FROM service_entries WHERE fragment_id = ? LIMIT 1",
+        "SELECT id, access_mode FROM happyview_service_entries WHERE fragment_id = ? LIMIT 1",
         backend,
     );
 
@@ -320,7 +323,7 @@ pub async fn check_access(
 
     // access_mode = "specific" — check junction table
     let check_sql = adapt_sql(
-        "SELECT 1 FROM service_entry_xrpcs WHERE service_entry_id = ? AND lexicon_id = ? LIMIT 1",
+        "SELECT 1 FROM happyview_service_entry_xrpcs WHERE service_entry_id = ? AND lexicon_id = ? LIMIT 1",
         backend,
     );
 
@@ -343,7 +346,7 @@ pub async fn services_for_lexicon(
     lexicon_id: &str,
 ) -> Result<Vec<ServiceEntry>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, fragment_id, service_type, access_mode, created_at, updated_at FROM service_entries WHERE access_mode = 'all' OR EXISTS (SELECT 1 FROM service_entry_xrpcs WHERE service_entry_xrpcs.service_entry_id = service_entries.id AND service_entry_xrpcs.lexicon_id = ?) ORDER BY id",
+        "SELECT id, fragment_id, service_type, access_mode, created_at, updated_at FROM happyview_service_entries WHERE access_mode = 'all' OR EXISTS (SELECT 1 FROM happyview_service_entry_xrpcs WHERE happyview_service_entry_xrpcs.service_entry_id = happyview_service_entries.id AND happyview_service_entry_xrpcs.lexicon_id = ?) ORDER BY id",
         backend,
     );
 

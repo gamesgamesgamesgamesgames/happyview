@@ -61,7 +61,7 @@ pub async fn create_api_client(
     .map_err(|_| AppError::Auth("Invalid client".into()))?;
 
     let parent_check_sql = adapt_sql(
-        "SELECT parent_client_id, created_by FROM api_clients WHERE id = ?",
+        "SELECT parent_client_id, created_by FROM happyview_api_clients WHERE id = ?",
         state.db_backend,
     );
     let parent_row: Option<(Option<String>, String)> = sqlx::query_as(&parent_check_sql)
@@ -91,7 +91,7 @@ pub async fn create_api_client(
 
     // 5. Check for duplicate client_id_url
     let dup_check_sql = adapt_sql(
-        "SELECT id FROM api_clients WHERE client_id_url = ?",
+        "SELECT id FROM happyview_api_clients WHERE client_id_url = ?",
         state.db_backend,
     );
     let dup: Option<(String,)> = sqlx::query_as(&dup_check_sql)
@@ -132,7 +132,7 @@ pub async fn create_api_client(
         .map(|origins| serde_json::to_string(origins).unwrap_or_else(|_| "[]".to_string()));
 
     let insert_sql = adapt_sql(
-        "INSERT INTO api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, rate_limit_capacity, rate_limit_refill_rate, client_type, allowed_origins, is_active, created_by, created_at, updated_at, parent_client_id, owner_did) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 1, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, rate_limit_capacity, rate_limit_refill_rate, client_type, allowed_origins, is_active, created_by, created_at, updated_at, parent_client_id, owner_did) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 1, ?, ?, ?, ?, ?)",
         state.db_backend,
     );
     sqlx::query(&insert_sql)

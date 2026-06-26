@@ -59,11 +59,12 @@ pub fn spawn(state: AppState, mut subscriptions_rx: watch::Receiver<()>) {
 
         loop {
             // Read all active subscriptions from the database.
-            let active: Vec<(String,)> =
-                sqlx::query_as("SELECT did FROM labeler_subscriptions WHERE status = 'active'")
-                    .fetch_all(&state.db)
-                    .await
-                    .unwrap_or_default();
+            let active: Vec<(String,)> = sqlx::query_as(
+                "SELECT did FROM happyview_labeler_subscriptions WHERE status = 'active'",
+            )
+            .fetch_all(&state.db)
+            .await
+            .unwrap_or_default();
 
             let active_dids: Vec<String> = active.into_iter().map(|(did,)| did).collect();
 
@@ -149,7 +150,7 @@ async fn run_subscription_once(
 
     // Read cursor from database.
     let cursor_sql = adapt_sql(
-        "SELECT cursor FROM labeler_subscriptions WHERE did = ?",
+        "SELECT cursor FROM happyview_labeler_subscriptions WHERE did = ?",
         state.db_backend,
     );
     let cursor: Option<(Option<i64>,)> = sqlx::query_as(&cursor_sql)
@@ -358,7 +359,7 @@ async fn apply_label(state: &AppState, label: &Label) {
     if final_label.neg {
         // Negation label — remove it.
         let delete_sql = adapt_sql(
-            "DELETE FROM labels WHERE src = ? AND uri = ? AND val = ?",
+            "DELETE FROM happyview_labels WHERE src = ? AND uri = ? AND val = ?",
             backend,
         );
         if let Err(e) = sqlx::query(&delete_sql)
@@ -377,7 +378,7 @@ async fn apply_label(state: &AppState, label: &Label) {
         // Normal label — upsert. Store timestamps as RFC3339 strings for portability.
         let insert_sql = adapt_sql(
             r#"
-            INSERT INTO labels (src, uri, val, cts, exp)
+            INSERT INTO happyview_labels (src, uri, val, cts, exp)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT (src, uri, val) DO UPDATE
                 SET cts = EXCLUDED.cts,
@@ -406,7 +407,7 @@ async fn apply_label(state: &AppState, label: &Label) {
 async fn persist_cursor(db: &sqlx::AnyPool, did: &str, seq: i64, backend: DatabaseBackend) {
     let now = now_rfc3339();
     let update_sql = adapt_sql(
-        "UPDATE labeler_subscriptions SET cursor = ?, updated_at = ? WHERE did = ?",
+        "UPDATE happyview_labeler_subscriptions SET cursor = ?, updated_at = ? WHERE did = ?",
         backend,
     );
     if let Err(e) = sqlx::query(&update_sql)
@@ -439,7 +440,7 @@ async fn backfill_labels_for_uri_inner(
     uri: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let subscriptions: Vec<(String,)> =
-        sqlx::query_as("SELECT did FROM labeler_subscriptions WHERE status = 'active'")
+        sqlx::query_as("SELECT did FROM happyview_labeler_subscriptions WHERE status = 'active'")
             .fetch_all(&state.db)
             .await?;
 
@@ -502,10 +503,11 @@ pub async fn spawn_label_gc(db: sqlx::AnyPool, backend: DatabaseBackend) {
     // Build database-specific cleanup query for expired labels
     let expired_sql = match backend {
         DatabaseBackend::Sqlite => {
-            "DELETE FROM labels WHERE exp IS NOT NULL AND exp < datetime('now')".to_string()
+            "DELETE FROM happyview_labels WHERE exp IS NOT NULL AND exp < datetime('now')"
+                .to_string()
         }
         DatabaseBackend::Postgres => {
-            "DELETE FROM labels WHERE exp IS NOT NULL AND exp < NOW()".to_string()
+            "DELETE FROM happyview_labels WHERE exp IS NOT NULL AND exp < NOW()".to_string()
         }
     };
 
@@ -525,7 +527,7 @@ pub async fn spawn_label_gc(db: sqlx::AnyPool, backend: DatabaseBackend) {
 
         // Delete orphaned labels (no matching record).
         let orphaned = sqlx::query(
-            "DELETE FROM labels WHERE NOT EXISTS (SELECT 1 FROM records WHERE records.uri = labels.uri)",
+            "DELETE FROM happyview_labels WHERE NOT EXISTS (SELECT 1 FROM happyview_records WHERE happyview_records.uri = happyview_labels.uri)",
         )
         .execute(&db)
         .await;

@@ -66,7 +66,7 @@ pub(super) async fn create_api_client(
         .map(|origins| serde_json::to_string(origins).unwrap_or_else(|_| "[]".to_string()));
 
     let insert_sql = adapt_sql(
-        "INSERT INTO api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, rate_limit_capacity, rate_limit_refill_rate, client_type, allowed_origins, is_active, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, rate_limit_capacity, rate_limit_refill_rate, client_type, allowed_origins, is_active, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
         state.db_backend,
     );
 
@@ -173,7 +173,7 @@ pub(super) async fn list_api_clients(
     let (select_sql, parent_filter) = if let Some(ref parent_id) = query.parent_id {
         (
             adapt_sql(
-                "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active, created_by, created_at, updated_at, parent_client_id, owner_did FROM api_clients WHERE parent_client_id = ? ORDER BY created_at DESC",
+                "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active, created_by, created_at, updated_at, parent_client_id, owner_did FROM happyview_api_clients WHERE parent_client_id = ? ORDER BY created_at DESC",
                 state.db_backend,
             ),
             Some(parent_id.clone()),
@@ -181,7 +181,7 @@ pub(super) async fn list_api_clients(
     } else {
         (
             adapt_sql(
-                "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active, created_by, created_at, updated_at, parent_client_id, owner_did FROM api_clients ORDER BY created_at DESC",
+                "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active, created_by, created_at, updated_at, parent_client_id, owner_did FROM happyview_api_clients ORDER BY created_at DESC",
                 state.db_backend,
             ),
             None,
@@ -245,7 +245,7 @@ pub(super) async fn get_api_client(
     auth.require(Permission::ApiClientsView).await?;
 
     let select_sql = adapt_sql(
-        "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active, created_by, created_at, updated_at, parent_client_id, owner_did FROM api_clients WHERE id = ?",
+        "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active, created_by, created_at, updated_at, parent_client_id, owner_did FROM happyview_api_clients WHERE id = ?",
         state.db_backend,
     );
 
@@ -299,7 +299,7 @@ pub(super) async fn update_api_client(
 
     // Read current values
     let select_sql = adapt_sql(
-        "SELECT client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active FROM api_clients WHERE id = ?",
+        "SELECT client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, allowed_origins, rate_limit_capacity, rate_limit_refill_rate, is_active FROM happyview_api_clients WHERE id = ?",
         state.db_backend,
     );
 
@@ -362,7 +362,7 @@ pub(super) async fn update_api_client(
     let now = now_rfc3339();
 
     let update_sql = adapt_sql(
-        "UPDATE api_clients SET name = ?, client_uri = ?, redirect_uris = ?, scopes = ?, allowed_origins = ?, rate_limit_capacity = ?, rate_limit_refill_rate = ?, is_active = ?, updated_at = ? WHERE id = ?",
+        "UPDATE happyview_api_clients SET name = ?, client_uri = ?, redirect_uris = ?, scopes = ?, allowed_origins = ?, rate_limit_capacity = ?, rate_limit_refill_rate = ?, is_active = ?, updated_at = ? WHERE id = ?",
         state.db_backend,
     );
 
@@ -435,7 +435,7 @@ pub(super) async fn update_api_client(
 
         // Cascade deactivation to child clients.
         let deactivate_children_sql = adapt_sql(
-            "UPDATE api_clients SET is_active = 0, updated_at = ? WHERE parent_client_id = ? AND is_active = 1",
+            "UPDATE happyview_api_clients SET is_active = 0, updated_at = ? WHERE parent_client_id = ? AND is_active = 1",
             state.db_backend,
         );
         let _ = sqlx::query(&deactivate_children_sql)
@@ -445,7 +445,7 @@ pub(super) async fn update_api_client(
             .await;
 
         let children_sql = adapt_sql(
-            "SELECT client_id_url, client_key FROM api_clients WHERE parent_client_id = ?",
+            "SELECT client_id_url, client_key FROM happyview_api_clients WHERE parent_client_id = ?",
             state.db_backend,
         );
         if let Ok(children) = sqlx::query_as::<_, (String, String)>(&children_sql)
@@ -487,7 +487,7 @@ pub(super) async fn delete_api_client(
 
     // Look up client_id_url and client_key before deleting so we can remove from registries.
     let lookup_sql = adapt_sql(
-        "SELECT client_id_url, client_key FROM api_clients WHERE id = ?",
+        "SELECT client_id_url, client_key FROM happyview_api_clients WHERE id = ?",
         state.db_backend,
     );
     let client_info: Option<(String, String)> = sqlx::query_as(&lookup_sql)
@@ -498,7 +498,7 @@ pub(super) async fn delete_api_client(
 
     // Look up child clients before deleting (ON DELETE CASCADE will remove DB rows).
     let children_sql = adapt_sql(
-        "SELECT client_id_url, client_key FROM api_clients WHERE parent_client_id = ?",
+        "SELECT client_id_url, client_key FROM happyview_api_clients WHERE parent_client_id = ?",
         state.db_backend,
     );
     let children: Vec<(String, String)> = sqlx::query_as(&children_sql)
@@ -507,7 +507,10 @@ pub(super) async fn delete_api_client(
         .await
         .unwrap_or_default();
 
-    let delete_sql = adapt_sql("DELETE FROM api_clients WHERE id = ?", state.db_backend);
+    let delete_sql = adapt_sql(
+        "DELETE FROM happyview_api_clients WHERE id = ?",
+        state.db_backend,
+    );
 
     let result = sqlx::query(&delete_sql)
         .bind(&id)

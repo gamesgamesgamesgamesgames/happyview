@@ -81,7 +81,7 @@ impl PluginRegistry {
 
         let now = now_rfc3339();
         let sql = adapt_sql(
-            "INSERT INTO plugins (id, source, url, sha256, enabled, loaded_at, api_version, manifest)
+            "INSERT INTO happyview_plugins (id, source, url, sha256, enabled, loaded_at, api_version, manifest)
              VALUES (?, ?, ?, ?, 1, ?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET
                 source = excluded.source,
@@ -126,7 +126,7 @@ impl PluginRegistry {
         };
 
         let sql = adapt_sql(
-            "SELECT id, source, url, sha256 FROM plugins WHERE enabled = true",
+            "SELECT id, source, url, sha256 FROM happyview_plugins WHERE enabled = true",
             self.db_backend,
         );
 

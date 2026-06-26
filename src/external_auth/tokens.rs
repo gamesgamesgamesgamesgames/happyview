@@ -62,7 +62,7 @@ pub async fn store_tokens(
     let now = now_rfc3339();
 
     let sql = adapt_sql(
-        "INSERT INTO external_account_tokens (id, did, plugin_id, account_id, access_token, refresh_token, token_type, scope, expires_at, created_at, updated_at)
+        "INSERT INTO happyview_external_account_tokens (id, did, plugin_id, account_id, access_token, refresh_token, token_type, scope, expires_at, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (did, plugin_id)
          DO UPDATE SET account_id = excluded.account_id, access_token = excluded.access_token, refresh_token = excluded.refresh_token, token_type = excluded.token_type, scope = excluded.scope, expires_at = excluded.expires_at, updated_at = excluded.updated_at",
@@ -98,7 +98,7 @@ pub async fn get_tokens(
     let key = encryption_key.ok_or(TokenError::KeyNotConfigured)?;
 
     let sql = adapt_sql(
-        "SELECT account_id, access_token, refresh_token, token_type, scope, expires_at FROM external_account_tokens WHERE did = ? AND plugin_id = ?",
+        "SELECT account_id, access_token, refresh_token, token_type, scope, expires_at FROM happyview_external_account_tokens WHERE did = ? AND plugin_id = ?",
         backend,
     );
 
@@ -140,7 +140,7 @@ pub async fn delete_tokens(
     plugin_id: &str,
 ) -> Result<bool, TokenError> {
     let sql = adapt_sql(
-        "DELETE FROM external_account_tokens WHERE did = ? AND plugin_id = ?",
+        "DELETE FROM happyview_external_account_tokens WHERE did = ? AND plugin_id = ?",
         backend,
     );
 
@@ -161,7 +161,7 @@ pub async fn is_linked(
     plugin_id: &str,
 ) -> Result<bool, TokenError> {
     let sql = adapt_sql(
-        "SELECT 1 FROM external_account_tokens WHERE did = ? AND plugin_id = ?",
+        "SELECT 1 FROM happyview_external_account_tokens WHERE did = ? AND plugin_id = ?",
         backend,
     );
 
@@ -182,7 +182,7 @@ pub async fn get_account_id(
     plugin_id: &str,
 ) -> Result<Option<String>, TokenError> {
     let sql = adapt_sql(
-        "SELECT account_id FROM external_account_tokens WHERE did = ? AND plugin_id = ?",
+        "SELECT account_id FROM happyview_external_account_tokens WHERE did = ? AND plugin_id = ?",
         backend,
     );
 
@@ -211,7 +211,7 @@ pub async fn list_linked_accounts(
     did: &str,
 ) -> Result<Vec<LinkedAccountSummary>, TokenError> {
     let sql = adapt_sql(
-        "SELECT plugin_id, account_id, created_at, updated_at FROM external_account_tokens WHERE did = ? ORDER BY created_at DESC",
+        "SELECT plugin_id, account_id, created_at, updated_at FROM happyview_external_account_tokens WHERE did = ? ORDER BY created_at DESC",
         backend,
     );
 

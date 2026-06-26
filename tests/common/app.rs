@@ -70,7 +70,7 @@ impl TestApp {
         };
 
         let sql = adapt_sql(
-            "INSERT INTO users (id, did, is_super, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
             backend,
         );
         sqlx::query(&sql)
@@ -245,7 +245,7 @@ impl TestApp {
             .map(|o| serde_json::to_string(o).unwrap_or_else(|_| "[]".to_string()));
 
         let sql = adapt_sql(
-            "INSERT INTO api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
             self.state.db_backend,
         );
 

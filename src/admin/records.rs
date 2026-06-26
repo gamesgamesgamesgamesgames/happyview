@@ -77,7 +77,7 @@ pub(super) async fn list_records(
         .unwrap_or(0);
 
     let sql = adapt_sql(
-        "SELECT uri, did, collection, rkey, cid, indexed_at, record FROM records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
+        "SELECT uri, did, collection, rkey, cid, indexed_at, record FROM happyview_records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
         backend,
     );
     let rows: Vec<RecordRow> = sqlx::query_as(&sql)
@@ -103,7 +103,7 @@ pub(super) async fn list_records(
         let now = now_rfc3339();
         let ph_str = (0..uris.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
         let raw_sql = format!(
-            "SELECT uri, src, val, cts FROM labels WHERE uri IN ({ph_str}) AND (exp IS NULL OR exp > ?)"
+            "SELECT uri, src, val, cts FROM happyview_labels WHERE uri IN ({ph_str}) AND (exp IS NULL OR exp > ?)"
         );
         let sql = adapt_sql(&raw_sql, backend);
         let mut q = sqlx::query_as(&sql);
@@ -186,7 +186,10 @@ pub(super) async fn delete_collection_records(
     auth.require(Permission::RecordsDeleteCollection).await?;
     auth.require(Permission::RecordsDelete).await?;
     let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM records WHERE collection = ?", backend);
+    let sql = adapt_sql(
+        "DELETE FROM happyview_records WHERE collection = ?",
+        backend,
+    );
     let result = sqlx::query(&sql)
         .bind(&params.collection)
         .execute(&state.db)
@@ -206,7 +209,7 @@ pub(super) async fn delete_record(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::RecordsDelete).await?;
     let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM records WHERE uri = ?", backend);
+    let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
     let result = sqlx::query(&sql)
         .bind(&params.uri)
         .execute(&state.db)
@@ -228,7 +231,7 @@ pub(super) async fn list_collections(
     auth.require(Permission::RecordsRead).await?;
 
     let sql = adapt_sql(
-        "SELECT id FROM lexicons WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record' ORDER BY id",
+        "SELECT id FROM happyview_lexicons WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record' ORDER BY id",
         state.db_backend,
     );
     let rows: Vec<(String,)> = sqlx::query_as(&sql)

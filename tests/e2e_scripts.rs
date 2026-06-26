@@ -143,7 +143,7 @@ async fn seed_record_row(
     body: Value,
 ) {
     let sql = adapt_sql(
-        "INSERT INTO records (uri, did, collection, rkey, record, cid, created_at)
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
         app.state.db_backend,
     );
@@ -162,7 +162,7 @@ async fn seed_record_row(
 
 async fn count_records(app: &TestApp, uri: &str) -> i64 {
     let (count,): (i64,) = sqlx::query_as(&adapt_sql(
-        "SELECT COUNT(*) FROM records WHERE uri = ?",
+        "SELECT COUNT(*) FROM happyview_records WHERE uri = ?",
         app.state.db_backend,
     ))
     .bind(uri)
@@ -174,7 +174,7 @@ async fn count_records(app: &TestApp, uri: &str) -> i64 {
 
 async fn fetch_record_body(app: &TestApp, uri: &str) -> Option<Value> {
     let row: Option<(String,)> = sqlx::query_as(&adapt_sql(
-        "SELECT record FROM records WHERE uri = ?",
+        "SELECT record FROM happyview_records WHERE uri = ?",
         app.state.db_backend,
     ))
     .bind(uri)
@@ -589,7 +589,7 @@ async fn record_event_script_log_writes_event_log_row() {
     // The script's log("hello from script") should land in event_logs
     // as a `script.log` row whose subject is the trigger id.
     let row: (String, String) = sqlx::query_as(&adapt_sql(
-        "SELECT subject, detail FROM event_logs
+        "SELECT subject, detail FROM happyview_event_logs
          WHERE event_type = 'script.log'
          ORDER BY id DESC LIMIT 1",
         app.state.db_backend,
@@ -713,7 +713,7 @@ async fn label_script_uri_routes_actor_special_case() {
         // Sentinel: write a row into records-table-as-flag so we can
         // detect that the script ran.
         "function handle() \
-            db.raw('INSERT INTO records (uri, did, collection, rkey, record, cid, created_at) \
+            db.raw('INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) \
                     VALUES (?, ?, ?, ?, ?, ?, ?)', \
                    {'at://did:plc:flag/flag.col/k', 'did:plc:flag', 'flag.col', 'k', '{}', 'b', '2026-05-01'}) \
             return event \
@@ -794,7 +794,7 @@ async fn label_script_calling_record_save_dead_letters_with_clear_message() {
 
     // A dead-letter row exists with the NO_PDS_AUTH message.
     let dl: (String,) = sqlx::query_as(&adapt_sql(
-        "SELECT error FROM dead_letter_scripts WHERE host_kind = 'label' \
+        "SELECT error FROM happyview_dead_letter_scripts WHERE host_kind = 'label' \
          AND host_id = 'did:plc:labeler' ORDER BY id DESC LIMIT 1",
         app.state.db_backend,
     ))

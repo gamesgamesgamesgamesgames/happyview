@@ -53,14 +53,14 @@ async fn main() {
         let db_bg = db_pool.clone();
         let backend = db_backend;
         tokio::spawn(async move {
-            let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM record_refs")
+            let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM happyview_record_refs")
                 .fetch_one(&db_bg)
                 .await
                 .expect("failed to count record_refs");
 
             if count.0 == 0 {
                 info!("backfilling record_refs table in background...");
-                let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM records")
+                let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM happyview_records")
                     .fetch_one(&db_bg)
                     .await
                     .expect("failed to count records");
@@ -71,7 +71,7 @@ async fn main() {
                 let mut processed = 0usize;
 
                 let query = db::adapt_sql(
-                    "SELECT uri, collection, record FROM records ORDER BY uri LIMIT ? OFFSET ?",
+                    "SELECT uri, collection, record FROM happyview_records ORDER BY uri LIMIT ? OFFSET ?",
                     backend,
                 );
 
@@ -121,7 +121,7 @@ async fn main() {
     // Re-fetch all network lexicons from their respective PDSes.
     let http = reqwest::Client::new();
     let network_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, authority_did, target_collection FROM lexicons WHERE source = 'network'",
+        "SELECT id, authority_did, target_collection FROM happyview_lexicons WHERE source = 'network'",
     )
     .fetch_all(&db_pool)
     .await
@@ -142,7 +142,7 @@ async fn main() {
                             Ok(parsed) => {
                                 let now = db::now_rfc3339();
                                 let update_sql = db::adapt_sql(
-                                    "UPDATE lexicons SET lexicon_json = ?, last_fetched_at = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND source = 'network'",
+                                    "UPDATE happyview_lexicons SET lexicon_json = ?, last_fetched_at = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND source = 'network'",
                                     db_backend,
                                 );
                                 let lexicon_json_str =
@@ -283,7 +283,7 @@ async fn main() {
             Option<String>,
         );
         let client_rows: Vec<ClientRow> = sqlx::query_as(
-            "SELECT client_key, client_secret_hash, client_uri, rate_limit_capacity, rate_limit_refill_rate, parent_client_id FROM api_clients WHERE is_active = 1",
+            "SELECT client_key, client_secret_hash, client_uri, rate_limit_capacity, rate_limit_refill_rate, parent_client_id FROM happyview_api_clients WHERE is_active = 1",
         )
         .fetch_all(&db_pool)
         .await
@@ -326,7 +326,8 @@ async fn main() {
     // Seed and load domain cache
     let domain_cache = happyview::domain::DomainCache::new();
     {
-        let count_sql = happyview::db::adapt_sql("SELECT COUNT(*) FROM domains", db_backend);
+        let count_sql =
+            happyview::db::adapt_sql("SELECT COUNT(*) FROM happyview_domains", db_backend);
         let row = sqlx::query(&count_sql)
             .fetch_one(&db_pool)
             .await
@@ -337,7 +338,7 @@ async fn main() {
             let id = uuid::Uuid::new_v4().to_string();
             let now = happyview::db::now_rfc3339();
             let insert_sql = happyview::db::adapt_sql(
-                "INSERT INTO domains (id, url, is_primary, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
+                "INSERT INTO happyview_domains (id, url, is_primary, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
                 db_backend,
             );
             sqlx::query(&insert_sql)
@@ -352,7 +353,7 @@ async fn main() {
         } else {
             // Sync the primary domain URL with PUBLIC_URL if it changed
             let primary_sql = happyview::db::adapt_sql(
-                "SELECT id, url FROM domains WHERE is_primary = 1",
+                "SELECT id, url FROM happyview_domains WHERE is_primary = 1",
                 db_backend,
             );
             if let Some(row) = sqlx::query(&primary_sql)
@@ -365,7 +366,7 @@ async fn main() {
                     let primary_id: String = row.try_get("id").unwrap_or_default();
                     let now = happyview::db::now_rfc3339();
                     let update_sql = happyview::db::adapt_sql(
-                        "UPDATE domains SET url = ?, updated_at = ? WHERE id = ?",
+                        "UPDATE happyview_domains SET url = ?, updated_at = ? WHERE id = ?",
                         db_backend,
                     );
                     sqlx::query(&update_sql)
@@ -384,7 +385,7 @@ async fn main() {
         }
 
         let select_sql = happyview::db::adapt_sql(
-            "SELECT id, url, is_primary, created_at, updated_at FROM domains",
+            "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains",
             db_backend,
         );
         let rows = sqlx::query(&select_sql)
@@ -720,7 +721,7 @@ async fn seed_and_load_rate_limit_defaults(
         {
             let now = happyview::db::now_rfc3339();
             let sql = happyview::db::adapt_sql(
-                "INSERT INTO instance_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO NOTHING",
+                "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT (key) DO NOTHING",
                 backend,
             );
             if let Err(e) = sqlx::query(&sql)

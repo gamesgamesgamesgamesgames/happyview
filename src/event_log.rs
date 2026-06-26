@@ -44,11 +44,11 @@ pub async fn spawn_retention_cleanup(db: AnyPool, retention_days: u32, backend: 
     // Cannot use adapt_sql: Postgres uses make_interval(days => $1) which has no SQLite equivalent pattern.
     let cleanup_sql = match backend {
         DatabaseBackend::Sqlite => {
-            "DELETE FROM event_logs WHERE created_at < datetime('now', '-' || ? || ' days')"
+            "DELETE FROM happyview_event_logs WHERE created_at < datetime('now', '-' || ? || ' days')"
                 .to_string()
         }
         DatabaseBackend::Postgres => {
-            "DELETE FROM event_logs WHERE created_at < NOW() - make_interval(days => $1)"
+            "DELETE FROM happyview_event_logs WHERE created_at < NOW() - make_interval(days => $1)"
                 .to_string()
         }
     };
@@ -82,7 +82,7 @@ pub async fn log_event(db: &AnyPool, event: EventLog, backend: DatabaseBackend) 
     let created_at = now_rfc3339();
 
     let sql = adapt_sql(
-        "INSERT INTO event_logs (id, event_type, severity, actor_did, subject, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_event_logs (id, event_type, severity, actor_did, subject, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 

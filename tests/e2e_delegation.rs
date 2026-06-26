@@ -968,7 +968,7 @@ async fn seed_procedure_lexicon(app: &common::app::TestApp) {
 
 async fn update_session_pds_url(app: &common::app::TestApp, user_did: &str, pds_url: &str) {
     let sql = adapt_sql(
-        "UPDATE dpop_sessions SET pds_url = ? WHERE user_did = ?",
+        "UPDATE happyview_dpop_sessions SET pds_url = ? WHERE user_did = ?",
         app.state.db_backend,
     );
     sqlx::query(&sql)

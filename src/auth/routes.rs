@@ -129,7 +129,7 @@ async fn login(
             let now = now_rfc3339();
             let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
             let sql = adapt_sql(
-                "INSERT INTO auth_login_redirects (state, redirect_uri, client_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO happyview_auth_login_redirects (state, redirect_uri, client_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
                 state.db_backend,
             );
             let _ = sqlx::query(&sql)
@@ -158,7 +158,7 @@ async fn callback(
     // Look up the redirect URI and client_id from the database before the OAuth library consumes the state
     let (redirect_url, client_id) = if let Some(oauth_state) = &query.state {
         let sql = adapt_sql(
-            "SELECT redirect_uri, client_id FROM auth_login_redirects WHERE state = ? AND expires_at > ?",
+            "SELECT redirect_uri, client_id FROM happyview_auth_login_redirects WHERE state = ? AND expires_at > ?",
             state.db_backend,
         );
         let now = now_rfc3339();
@@ -172,7 +172,7 @@ async fn callback(
         // Clean up the row (one-time use)
         if row.is_some() {
             let delete_sql = adapt_sql(
-                "DELETE FROM auth_login_redirects WHERE state = ?",
+                "DELETE FROM happyview_auth_login_redirects WHERE state = ?",
                 state.db_backend,
             );
             let _ = sqlx::query(&delete_sql)
@@ -218,14 +218,14 @@ async fn callback(
     // Allow login when no users exist yet (first user will be bootstrapped as admin).
     // Also allow login for the configured attached account DID (setup attach-auth flow).
     // Otherwise, only allow users already in the users table.
-    let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+    let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM happyview_users")
         .fetch_one(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("user count query failed: {e}")))?;
 
     if user_count.0 > 0 {
         let user_exists: Option<(i32,)> = sqlx::query_as(&adapt_sql(
-            "SELECT 1 FROM users WHERE did = ?",
+            "SELECT 1 FROM happyview_users WHERE did = ?",
             state.db_backend,
         ))
         .bind(did.as_ref())
@@ -236,7 +236,7 @@ async fn callback(
         if user_exists.is_none() {
             // Allow login if this DID is the configured attached account (setup flow)
             let is_attached_account: Option<(i32,)> = sqlx::query_as(&adapt_sql(
-                "SELECT 1 FROM service_identity WHERE attached_account_did = ?",
+                "SELECT 1 FROM happyview_service_identity WHERE attached_account_did = ?",
                 state.db_backend,
             ))
             .bind(did.as_ref())
@@ -260,7 +260,7 @@ async fn callback(
     // for per-client rate limiting.
     let client_key = if let Some(ref cid) = client_id {
         let sql = adapt_sql(
-            "SELECT client_key FROM api_clients WHERE client_id_url = ? AND is_active = 1",
+            "SELECT client_key FROM happyview_api_clients WHERE client_id_url = ? AND is_active = 1",
             state.db_backend,
         );
         let row: Option<(String,)> = sqlx::query_as(&sql)
@@ -360,12 +360,14 @@ async fn me(
     let did = raw.split('\n').next().unwrap_or(&raw).to_string();
 
     let backend = state.db_backend;
-    let user: Option<(i32,)> =
-        sqlx::query_as(&adapt_sql("SELECT 1 FROM users WHERE did = ?", backend))
-            .bind(&did)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| AppError::Internal(format!("user lookup failed: {e}")))?;
+    let user: Option<(i32,)> = sqlx::query_as(&adapt_sql(
+        "SELECT 1 FROM happyview_users WHERE did = ?",
+        backend,
+    ))
+    .bind(&did)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(format!("user lookup failed: {e}")))?;
 
     Ok(Json(MeResponse {
         did,

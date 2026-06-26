@@ -149,7 +149,7 @@ async fn admin_auto_bootstrap_first_user() {
     let backend = app.state.db_backend;
 
     // Clear the seeded user so the table is empty.
-    sqlx::query("DELETE FROM users")
+    sqlx::query("DELETE FROM happyview_users")
         .execute(&app.state.db)
         .await
         .unwrap();
@@ -171,7 +171,10 @@ async fn admin_auto_bootstrap_first_user() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Verify the DID was inserted.
-    let sql = adapt_sql("SELECT COUNT(*) FROM users WHERE did = ?", backend);
+    let sql = adapt_sql(
+        "SELECT COUNT(*) FROM happyview_users WHERE did = ?",
+        backend,
+    );
     let count: (i64,) = sqlx::query_as(&sql)
         .bind(bootstrap_did)
         .fetch_one(&app.state.db)
@@ -447,7 +450,7 @@ async fn stats_with_seeded_records() {
     });
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO lexicons (id, lexicon_json, created_at) VALUES (?, ?, ?)",
+        "INSERT INTO happyview_lexicons (id, lexicon_json, created_at) VALUES (?, ?, ?)",
         backend,
     );
     sqlx::query(&sql)
@@ -461,7 +464,7 @@ async fn stats_with_seeded_records() {
     // Seed records directly
     let record_val = serde_json::json!({"title": "test"});
     let sql = adapt_sql(
-        "INSERT INTO records (uri, did, collection, rkey, record, cid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
     sqlx::query(&sql)
@@ -572,7 +575,7 @@ async fn backfill_cancel_running_job() {
     let job_id = uuid::Uuid::new_v4().to_string();
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO backfill_jobs (id, status, stage, started_at, created_at) VALUES (?, 'running', 'discovering_repos', ?, ?)",
+        "INSERT INTO happyview_backfill_jobs (id, status, stage, started_at, created_at) VALUES (?, 'running', 'discovering_repos', ?, ?)",
         backend,
     );
     sqlx::query(&sql)
@@ -610,7 +613,7 @@ async fn backfill_cancel_already_cancelling_is_idempotent() {
     let job_id = uuid::Uuid::new_v4().to_string();
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO backfill_jobs (id, status, stage, started_at, created_at) VALUES (?, 'cancelling', 'fetching_records', ?, ?)",
+        "INSERT INTO happyview_backfill_jobs (id, status, stage, started_at, created_at) VALUES (?, 'cancelling', 'fetching_records', ?, ?)",
         backend,
     );
     sqlx::query(&sql)
@@ -647,7 +650,7 @@ async fn backfill_cancel_completed_returns_400() {
     let job_id = uuid::Uuid::new_v4().to_string();
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO backfill_jobs (id, status, stage, completed_at, created_at) VALUES (?, 'completed', 'completed', ?, ?)",
+        "INSERT INTO happyview_backfill_jobs (id, status, stage, completed_at, created_at) VALUES (?, 'completed', 'completed', ?, ?)",
         backend,
     );
     sqlx::query(&sql)

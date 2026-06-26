@@ -47,7 +47,10 @@ struct IdentityEvent {
 // ---------------------------------------------------------------------------
 
 async fn load_cursor(db: &AnyPool, backend: DatabaseBackend) -> Option<i64> {
-    let sql = adapt_sql("SELECT value FROM instance_settings WHERE key = ?", backend);
+    let sql = adapt_sql(
+        "SELECT value FROM happyview_instance_settings WHERE key = ?",
+        backend,
+    );
     let row: Option<(String,)> = sqlx::query_as(&sql)
         .bind("jetstream_cursor")
         .fetch_optional(db)
@@ -60,7 +63,7 @@ async fn save_cursor(db: &AnyPool, backend: DatabaseBackend, cursor: i64) {
     let now = now_rfc3339();
     let sql = adapt_sql(
         r#"
-        INSERT INTO instance_settings (key, value, updated_at)
+        INSERT INTO happyview_instance_settings (key, value, updated_at)
         VALUES (?, ?, ?)
         ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?
         "#,

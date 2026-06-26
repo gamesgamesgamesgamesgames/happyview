@@ -47,7 +47,7 @@ async fn resolve_credentials(
     };
 
     let key_sql = crate::db::adapt_sql(
-        "SELECT private_key_enc FROM dpop_keys WHERE id = ?",
+        "SELECT private_key_enc FROM happyview_dpop_keys WHERE id = ?",
         backend,
     );
     let row: Option<(Vec<u8>,)> = sqlx::query_as(&key_sql)
@@ -593,7 +593,7 @@ async fn lookup_client_id_url(
     api_client_id: &str,
 ) -> Result<String, AppError> {
     let sql = crate::db::adapt_sql(
-        "SELECT client_id_url FROM api_clients WHERE id = ?",
+        "SELECT client_id_url FROM happyview_api_clients WHERE id = ?",
         backend,
     );
     let row: Option<(String,)> = sqlx::query_as(&sql)

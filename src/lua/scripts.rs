@@ -223,7 +223,7 @@ pub struct ResolvedScript {
 /// the row's `script_type` is unknown to this binary (logged at warn).
 pub async fn resolve(state: &AppState, trigger_id: &str) -> Option<ResolvedScript> {
     let sql = adapt_sql(
-        "SELECT id, body, script_type FROM scripts WHERE id = ?",
+        "SELECT id, body, script_type FROM happyview_scripts WHERE id = ?",
         state.db_backend,
     );
     let row: Option<(String, String, String)> = match sqlx::query_as(&sql)
@@ -791,7 +791,7 @@ async fn load_env_vars(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
 ) -> std::collections::HashMap<String, String> {
-    let sql = adapt_sql("SELECT key, value FROM script_variables", backend);
+    let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
     sqlx::query_as::<_, (String, String)>(&sql)
         .fetch_all(db)
         .await
@@ -813,7 +813,7 @@ struct DeadLetterEntry<'a> {
 async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
     let payload_str = serde_json::to_string(entry.payload).unwrap_or_else(|_| "{}".to_string());
     let sql = adapt_sql(
-        "INSERT INTO dead_letter_scripts
+        "INSERT INTO happyview_dead_letter_scripts
             (script_ref, host_kind, host_id, payload, error, attempts, created_at, collection)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         state.db_backend,

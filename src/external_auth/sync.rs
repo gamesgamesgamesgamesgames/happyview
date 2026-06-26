@@ -32,7 +32,7 @@ pub async fn process_sync_records(
         // For now, just track dedup key
         if let Some(dedup_key) = &record.dedup_key {
             let sql = adapt_sql(
-                "INSERT INTO plugin_dedup_keys (plugin_id, did, dedup_key, record_uri, updated_at)
+                "INSERT INTO happyview_plugin_dedup_keys (plugin_id, did, dedup_key, record_uri, updated_at)
                  VALUES (?, ?, ?, ?, datetime('now'))
                  ON CONFLICT (plugin_id, did, dedup_key)
                  DO UPDATE SET record_uri = excluded.record_uri, updated_at = excluded.updated_at",

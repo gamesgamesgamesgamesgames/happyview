@@ -461,7 +461,7 @@ async fn load_plugin_secrets(
     // Try to load from database first (if encryption key is available)
     if let Some(key) = encryption_key {
         let sql = crate::db::adapt_sql(
-            "SELECT config FROM plugin_configs WHERE plugin_id = ?",
+            "SELECT config FROM happyview_plugin_configs WHERE plugin_id = ?",
             db_backend,
         );
 

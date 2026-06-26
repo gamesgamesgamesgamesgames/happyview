@@ -63,7 +63,7 @@ impl Store<Did, Session> for DbSessionStore {
 
     async fn get(&self, key: &Did) -> Result<Option<Session>, Self::Error> {
         let row: Option<(String,)> = sqlx::query_as(&adapt_sql(
-            "SELECT session_data FROM oauth_sessions WHERE did = ?",
+            "SELECT session_data FROM happyview_oauth_sessions WHERE did = ?",
             self.backend,
         ))
         .bind(key.as_ref())
@@ -79,7 +79,7 @@ impl Store<Did, Session> for DbSessionStore {
     async fn set(&self, key: Did, value: Session) -> Result<(), Self::Error> {
         let json = serde_json::to_string(&value)?;
         sqlx::query(&adapt_sql(
-            "INSERT INTO oauth_sessions (did, session_data, updated_at) VALUES (?, ?, datetime('now'))
+            "INSERT INTO happyview_oauth_sessions (did, session_data, updated_at) VALUES (?, ?, datetime('now'))
              ON CONFLICT (did) DO UPDATE SET session_data = EXCLUDED.session_data, updated_at = datetime('now')",
             self.backend,
         ))
@@ -92,7 +92,7 @@ impl Store<Did, Session> for DbSessionStore {
 
     async fn del(&self, key: &Did) -> Result<(), Self::Error> {
         sqlx::query(&adapt_sql(
-            "DELETE FROM oauth_sessions WHERE did = ?",
+            "DELETE FROM happyview_oauth_sessions WHERE did = ?",
             self.backend,
         ))
         .bind(key.as_ref())
@@ -102,7 +102,7 @@ impl Store<Did, Session> for DbSessionStore {
     }
 
     async fn clear(&self) -> Result<(), Self::Error> {
-        sqlx::query("DELETE FROM oauth_sessions")
+        sqlx::query("DELETE FROM happyview_oauth_sessions")
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -146,7 +146,7 @@ impl Store<String, InternalStateData> for DbStateStore {
 
     async fn get(&self, key: &String) -> Result<Option<InternalStateData>, Self::Error> {
         let row: Option<(String,)> = sqlx::query_as(&adapt_sql(
-            "SELECT state_data FROM oauth_state WHERE state_key = ?",
+            "SELECT state_data FROM happyview_oauth_state WHERE state_key = ?",
             self.backend,
         ))
         .bind(key)
@@ -162,7 +162,7 @@ impl Store<String, InternalStateData> for DbStateStore {
     async fn set(&self, key: String, value: InternalStateData) -> Result<(), Self::Error> {
         let json = serde_json::to_string(&value)?;
         sqlx::query(&adapt_sql(
-            "INSERT INTO oauth_state (state_key, state_data) VALUES (?, ?)
+            "INSERT INTO happyview_oauth_state (state_key, state_data) VALUES (?, ?)
              ON CONFLICT (state_key) DO UPDATE SET state_data = EXCLUDED.state_data",
             self.backend,
         ))
@@ -176,7 +176,7 @@ impl Store<String, InternalStateData> for DbStateStore {
 
     async fn del(&self, key: &String) -> Result<(), Self::Error> {
         sqlx::query(&adapt_sql(
-            "DELETE FROM oauth_state WHERE state_key = ?",
+            "DELETE FROM happyview_oauth_state WHERE state_key = ?",
             self.backend,
         ))
         .bind(key)
@@ -186,7 +186,7 @@ impl Store<String, InternalStateData> for DbStateStore {
     }
 
     async fn clear(&self) -> Result<(), Self::Error> {
-        sqlx::query("DELETE FROM oauth_state")
+        sqlx::query("DELETE FROM happyview_oauth_state")
             .execute(&self.pool)
             .await?;
         Ok(())
