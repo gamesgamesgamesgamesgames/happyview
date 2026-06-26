@@ -154,29 +154,17 @@ pub(crate) async fn proxy_to_authority(
         .unwrap())
 }
 
-/// Extract the API client key from the request for rate limiting.
+/// Find the client key from claims, headers, or query params.
 ///
-/// Every request must carry a client key. Returns an error when none is
-/// found so the caller can reject the request with 401.
-///
-/// Resolution order:
-/// 1. Session cookie (`client_key` field in Claims)
-/// 2. `X-Client-Key` header
-/// 3. `client_key` query parameter
-///
-/// Security validation (Origin / secret) is logged as warnings but does
-/// not reject the request — the key is always used as the rate-limit
-/// bucket regardless.
-fn resolve_client_key(
-    state: &AppState,
+/// Authenticated requests (claims present) must provide one — returns Err
+/// if missing.  Anonymous requests fall back to `"anonymous"`.
+fn extract_client_key(
     claims: Option<&Claims>,
     parts: &Parts,
     query_params: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<String, AppError> {
-    // 1. Try session cookie
-    let client_key = claims
+    let found = claims
         .and_then(|c| c.client_key().map(|k| k.to_string()))
-        // 2. Try X-Client-Key header
         .or_else(|| {
             parts
                 .headers
@@ -184,18 +172,30 @@ fn resolve_client_key(
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string())
         })
-        // 3. Try client_key query param
         .or_else(|| {
             query_params
                 .get("client_key")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-        })
-        .ok_or_else(|| {
-            AppError::Auth(
-                "Missing client identification. Provide an X-Client-Key header or client_key query parameter.".into(),
-            )
-        })?;
+        });
+
+    match found {
+        Some(k) => Ok(k),
+        None if claims.is_some() => Err(AppError::Auth(
+            "Missing client identification. Provide an X-Client-Key header or client_key query parameter.".into(),
+        )),
+        None => Ok("anonymous".to_string()),
+    }
+}
+
+/// Resolve the client key and run origin/secret validation.
+fn resolve_client_key(
+    state: &AppState,
+    claims: Option<&Claims>,
+    parts: &Parts,
+    query_params: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<String, AppError> {
+    let client_key = extract_client_key(claims, parts, query_params)?;
 
     // Log validation warnings but always return the key for rate limiting.
     if !state.rate_limiter.is_valid_client_key(&client_key) {
@@ -258,9 +258,54 @@ pub async fn xrpc_get(
 ) -> Result<Response, AppError> {
     let raw_query = raw_query.unwrap_or_default();
     let mut params = parse_query_params(&raw_query);
-    let claims = xrpc_claims.identity;
+    let identity_claims = xrpc_claims.identity;
 
-    let rate_key = resolve_client_key(&state, claims.as_ref(), &parts, &params)?;
+    // For service auth, synthesise Claims from the caller's DID so the
+    // query handler has an identity to work with.
+    let service_auth_claims_owned;
+    let claims: Option<Claims> = if let Some(ref sa) = xrpc_claims.service_auth {
+        let has_access = crate::service_entries::check_access(
+            &state.db,
+            state.db_backend,
+            &sa.aud_fragment,
+            &method,
+        )
+        .await?;
+
+        if !has_access {
+            crate::event_log::log_event(
+                &state.db,
+                crate::event_log::EventLog {
+                    event_type: "service_auth.access_denied".to_string(),
+                    severity: crate::event_log::Severity::Error,
+                    actor_did: Some(sa.did.clone()),
+                    subject: Some(method.clone()),
+                    detail: serde_json::json!({
+                        "fragment": sa.aud_fragment,
+                        "reason": "service entry not authorized for this XRPC"
+                    }),
+                },
+                state.db_backend,
+            )
+            .await;
+
+            return Err(AppError::Auth(format!(
+                "service '{}' is not authorized for '{}'",
+                sa.aud_fragment, method
+            )));
+        }
+
+        service_auth_claims_owned = Claims::internal(sa.did.clone());
+        Some(service_auth_claims_owned)
+    } else {
+        identity_claims
+    };
+
+    let rate_key = if let Some(sa) = &xrpc_claims.service_auth {
+        format!("service:{}", sa.did)
+    } else {
+        resolve_client_key(&state, claims.as_ref(), &parts, &params)?
+    };
 
     let lexicon = state.lexicons.get(&method).await;
 
@@ -350,9 +395,16 @@ pub async fn xrpc_post(
     let mut params = parse_query_params(&raw_query);
     let claims = xrpc_claims.identity;
 
-    let rate_key = resolve_client_key(&state, claims.as_ref(), &parts, &params)?;
+    let rate_key = if let Some(sa) = &xrpc_claims.service_auth {
+        format!("service:{}", sa.did)
+    } else {
+        resolve_client_key(&state, claims.as_ref(), &parts, &params)?
+    };
 
-    if claims.is_none() && xrpc_claims.space_credential.is_none() {
+    if claims.is_none()
+        && xrpc_claims.space_credential.is_none()
+        && xrpc_claims.service_auth.is_none()
+    {
         return Err(AppError::Auth(
             "XRPC procedures require DPoP authentication".into(),
         ));
@@ -420,11 +472,23 @@ pub async fn xrpc_post(
         coerce_params(&mut params, param_schema);
     }
 
-    let claims = claims
-        .ok_or_else(|| AppError::Auth("XRPC procedures require DPoP authentication".into()))?;
+    // For service auth, synthesise Claims from the caller's DID so the
+    // procedure handler has an identity to work with.
+    let service_auth_claims_owned;
+    let (claims, sa_ref) = if let Some(ref sa) = xrpc_claims.service_auth {
+        service_auth_claims_owned = Claims::internal(sa.did.clone());
+        (&service_auth_claims_owned, Some(sa))
+    } else {
+        let c = claims
+            .ok_or_else(|| AppError::Auth("XRPC procedures require DPoP authentication".into()))?;
+        // Re-bind to a reference with matching lifetime
+        service_auth_claims_owned = c;
+        (&service_auth_claims_owned, None)
+    };
 
     let mut response =
-        procedure::handle_procedure(&state, &method, &claims, &body, &params, &lexicon).await?;
+        procedure::handle_procedure(&state, &method, claims, &body, &params, &lexicon, sa_ref)
+            .await?;
     if let CheckResult::Allowed {
         remaining,
         limit,
@@ -574,5 +638,80 @@ mod tests {
         let schema = json!({});
         coerce_params(&mut params, &schema);
         assert_eq!(params["limit"], json!("25"));
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_client_key
+    // -----------------------------------------------------------------------
+
+    fn empty_parts() -> axum::http::request::Parts {
+        let (parts, _) = axum::http::Request::builder()
+            .uri("/xrpc/test")
+            .body(())
+            .unwrap()
+            .into_parts();
+        parts
+    }
+
+    #[test]
+    fn anonymous_request_gets_anonymous_rate_key() {
+        let parts = empty_parts();
+        let params = HashMap::new();
+        let result = extract_client_key(None, &parts, &params);
+        assert_eq!(result.unwrap(), "anonymous");
+    }
+
+    #[test]
+    fn authenticated_request_without_client_key_is_rejected() {
+        let parts = empty_parts();
+        let params = HashMap::new();
+        let claims = crate::auth::Claims::new_for_test("did:plc:test".into());
+        let result = extract_client_key(Some(&claims), &parts, &params);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn authenticated_request_with_client_key_in_claims() {
+        let parts = empty_parts();
+        let params = HashMap::new();
+        let claims = crate::auth::Claims::with_client_key("did:plc:test".into(), "hvc_abc".into());
+        let result = extract_client_key(Some(&claims), &parts, &params);
+        assert_eq!(result.unwrap(), "hvc_abc");
+    }
+
+    #[test]
+    fn x_client_key_header_used_for_anonymous() {
+        let (parts, _) = axum::http::Request::builder()
+            .uri("/xrpc/test")
+            .header("x-client-key", "hvc_from_header")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let params = HashMap::new();
+        let result = extract_client_key(None, &parts, &params);
+        assert_eq!(result.unwrap(), "hvc_from_header");
+    }
+
+    #[test]
+    fn client_key_from_query_params() {
+        let parts = empty_parts();
+        let mut params = HashMap::new();
+        params.insert("client_key".into(), json!("hvc_from_query"));
+        let result = extract_client_key(None, &parts, &params);
+        assert_eq!(result.unwrap(), "hvc_from_query");
+    }
+
+    #[test]
+    fn authenticated_request_uses_header_when_claims_lack_key() {
+        let (parts, _) = axum::http::Request::builder()
+            .uri("/xrpc/test")
+            .header("x-client-key", "hvc_fallback")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let params = HashMap::new();
+        let claims = crate::auth::Claims::new_for_test("did:plc:test".into());
+        let result = extract_client_key(Some(&claims), &parts, &params);
+        assert_eq!(result.unwrap(), "hvc_fallback");
     }
 }

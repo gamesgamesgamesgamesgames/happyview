@@ -3,6 +3,7 @@
   "pages": [
     "quickstart",
     "configuration",
+    "service-identity",
     "dashboard",
     "authentication",
     "deployment"

@@ -170,7 +170,8 @@ async fn execute_local_procedure(
             if let Some(ref param_schema) = lex.parameters {
                 xrpc::coerce_params(params, param_schema);
             }
-            xrpc::procedure::handle_procedure(state, method, claims, input, params, &lex).await
+            xrpc::procedure::handle_procedure(state, method, claims, input, params, &lex, None)
+                .await
         }
         None => {
             let query_string = params_to_query_string(params);

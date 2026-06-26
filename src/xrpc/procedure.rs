@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::auth::Claims;
+use crate::auth::ServiceAuthClaims;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lexicon::ProcedureAction;
@@ -17,10 +18,71 @@ pub(crate) async fn handle_procedure(
     input: &Value,
     params: &std::collections::HashMap<String, Value>,
     lexicon: &crate::lexicon::ParsedLexicon,
+    service_auth: Option<&ServiceAuthClaims>,
 ) -> Result<Response, AppError> {
     // Trigger-keyed dispatch: a script bound at `xrpc.procedure:<id>`
     // overrides the default PDS-write flow.
     let trigger = format!("xrpc.procedure:{}", lexicon.id);
+
+    // Service auth access and scope checks
+    if let Some(sa) = &service_auth {
+        let has_access = crate::service_entries::check_access(
+            &state.db,
+            state.db_backend,
+            &sa.aud_fragment,
+            method,
+        )
+        .await?;
+
+        if !has_access {
+            crate::event_log::log_event(
+                &state.db,
+                crate::event_log::EventLog {
+                    event_type: "service_auth.access_denied".to_string(),
+                    severity: crate::event_log::Severity::Error,
+                    actor_did: Some(sa.did.clone()),
+                    subject: Some(method.to_string()),
+                    detail: serde_json::json!({
+                        "fragment": sa.aud_fragment,
+                        "reason": "service entry not authorized for this XRPC"
+                    }),
+                },
+                state.db_backend,
+            )
+            .await;
+
+            return Err(AppError::Auth(format!(
+                "service '{}' is not authorized for '{}'",
+                sa.aud_fragment, method
+            )));
+        }
+
+        // Check token scope against outbound XRPCs declared by the script
+        let outbound_sql = adapt_sql(
+            "SELECT outbound_xrpcs FROM scripts WHERE id = ?",
+            state.db_backend,
+        );
+        if let Ok(Some((Some(json_str),))) = sqlx::query_as::<_, (Option<String>,)>(&outbound_sql)
+            .bind(&trigger)
+            .fetch_optional(&state.db)
+            .await
+            && let Ok(outbound_list) = serde_json::from_str::<Vec<String>>(&json_str)
+        {
+            let token_scope: Vec<&str> = vec![&method];
+            let missing: Vec<&String> = outbound_list
+                .iter()
+                .filter(|x| !token_scope.contains(&x.as_str()))
+                .collect();
+
+            if !missing.is_empty() {
+                let missing_list: Vec<&str> = missing.iter().map(|s| s.as_str()).collect();
+                return Err(AppError::Auth(format!(
+                    "this procedure calls additional XRPCs not covered by the token scope: {}",
+                    missing_list.join(", ")
+                )));
+            }
+        }
+    }
     if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
         // Delegation guard preserved from origin/dev: scripts that run
         // under a `delegateDid` must come from a caller who is an

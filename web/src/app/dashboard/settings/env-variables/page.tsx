@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Trash2, Pencil } from "lucide-react";
+import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { toastError } from "@/lib/format";
 import {
   getScriptVariables,
   upsertScriptVariable,
@@ -11,6 +13,17 @@ import {
 } from "@/lib/api";
 import type { ScriptVariableSummary } from "@/types/script-variables";
 import { SiteHeader } from "@/components/site-header";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   ResponsiveDialog,
@@ -37,12 +50,11 @@ import {
 export default function EnvVariablesPage() {
   const { hasPermission } = useCurrentUser();
   const [vars, setVars] = useState<ScriptVariableSummary[]>([]);
-  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     getScriptVariables()
       .then(setVars)
-      .catch((e) => setError(e.message));
+      .catch((e) => toastError("Failed to load variables", e));
   }, []);
 
   useEffect(() => {
@@ -52,9 +64,10 @@ export default function EnvVariablesPage() {
   async function handleDeleteVar(key: string) {
     try {
       await deleteScriptVariable(key);
+      toast.success("Variable deleted");
       load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to delete variable", e);
     }
   }
 
@@ -62,8 +75,6 @@ export default function EnvVariablesPage() {
     <>
       <SiteHeader title="ENV Variables" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
-
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-lg font-semibold">Script Variables</h2>
@@ -94,7 +105,7 @@ export default function EnvVariablesPage() {
                     colSpan={4}
                     className="text-muted-foreground text-center"
                   >
-                    No script variables yet.
+                    No script variables yet. Variables defined here are accessible to Lua scripts via the env global table.
                   </TableCell>
                 </TableRow>
               )}
@@ -116,16 +127,37 @@ export default function EnvVariablesPage() {
                         editKey={v.key}
                       />
                       {hasPermission("script-variables:delete") && (
-                        <Button
-                          variant="destructive"
-                          size="icon"
-                          className="size-8 text-muted-foreground hover:text-destructive"
-                          title="Delete variable"
-                          aria-label="Delete variable"
-                          onClick={() => handleDeleteVar(v.key)}
-                        >
-                          <Trash2 className="size-4" />
-                        </Button>
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button
+                              variant="destructive"
+                              size="icon"
+                              className="size-8 text-muted-foreground hover:text-destructive"
+                              title="Delete variable"
+                              aria-label="Delete variable"
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>Delete variable?</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                This will permanently remove the variable. Scripts
+                                using this variable will fail on next execution.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancel</AlertDialogCancel>
+                              <AlertDialogAction
+                                variant="destructive"
+                                onClick={() => handleDeleteVar(v.key)}
+                              >
+                                Delete
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
                       )}
                     </div>
                   </TableCell>
@@ -160,6 +192,7 @@ function UpsertVariableDialog({
         key: isEdit ? editKey : key,
         value,
       });
+      toast.success(isEdit ? "Variable updated" : "Variable created");
       setKey(editKey ?? "");
       setValue("");
       setOpen(false);

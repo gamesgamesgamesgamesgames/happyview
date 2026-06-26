@@ -9,7 +9,9 @@ import {
   getCoreRowModel,
   useReactTable,
 } from "@tanstack/react-table";
+import { toast } from "sonner";
 
+import { toastError } from "@/lib/format";
 import {
   getDeadLetters,
   getDeadLetter,
@@ -27,6 +29,17 @@ import { DataTableToolbar } from "@/components/data-table/data-table-toolbar";
 import { CodeBlock } from "@/components/code-block";
 import { MonacoEditor } from "@/components/monaco-editor";
 import { SiteHeader } from "@/components/site-header";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -155,12 +168,12 @@ function DetailBody({ detail }: { detail: DeadLetterDetail }) {
 
 export default function DeadLettersPage() {
   const [items, setItems] = useState<DeadLetterSummary[]>([]);
-  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [viewDetail, setViewDetail] = useState<DeadLetterDetail | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
   const [resolvedFilter, setResolvedFilter] = useState("false");
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
+  const [dismissAllOpen, setDismissAllOpen] = useState(false);
 
   const [cursorStack, setCursorStack] = useState<string[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -191,7 +204,6 @@ export default function DeadLettersPage() {
   const fetchItems = useCallback(
     async (cursor?: string) => {
       setLoading(true);
-      setError(null);
       try {
         const data = await getDeadLetters({
           collection: collectionFilter,
@@ -203,7 +215,7 @@ export default function DeadLettersPage() {
         setNextCursor(data.cursor);
         setRowSelection({});
       } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : String(e));
+        toastError("Failed to load dead letters", e);
         setItems([]);
         setNextCursor(null);
       } finally {
@@ -217,6 +229,21 @@ export default function DeadLettersPage() {
     setCursorStack([]);
     fetchItems();
   }, [fetchItems]);
+
+  useEffect(() => {
+    if (Object.keys(rowSelection).length === 0) return;
+    const validIds = new Set(items.map((item) => item.id));
+    const pruned: RowSelectionState = {};
+    let changed = false;
+    for (const [id, selected] of Object.entries(rowSelection)) {
+      if (validIds.has(id)) {
+        pruned[id] = selected;
+      } else {
+        changed = true;
+      }
+    }
+    if (changed) setRowSelection(pruned);
+  }, [items]);
 
   function handleNext() {
     if (!nextCursor) return;
@@ -237,8 +264,8 @@ export default function DeadLettersPage() {
     try {
       const detail = await getDeadLetter(row.id);
       setViewDetail(detail);
-    } catch {
-      setError("Failed to load detail");
+    } catch (e: unknown) {
+      toastError("Failed to load dead letter detail", e);
     }
   }
 
@@ -249,10 +276,11 @@ export default function DeadLettersPage() {
       if (action === "retry") await retryDeadLetter(viewDetail.id);
       else if (action === "reindex") await reindexDeadLetter(viewDetail.id);
       else await dismissDeadLetter(viewDetail.id);
+      toast.success(action === "retry" ? "Dead letter retried" : action === "reindex" ? "Dead letter re-indexed" : "Dead letter dismissed");
       setViewDetail(null);
       fetchItems();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError(`Failed to ${action} dead letter`, e);
     } finally {
       setActionLoading(false);
     }
@@ -269,6 +297,7 @@ export default function DeadLettersPage() {
   ) {
     setLoading(true);
     try {
+      const count = selectedIds.length;
       const body =
         scope === "all"
           ? { all: true, collection: collectionFilter }
@@ -276,10 +305,14 @@ export default function DeadLettersPage() {
       if (action === "retry") await bulkRetryDeadLetters(body);
       else if (action === "reindex") await bulkReindexDeadLetters(body);
       else await bulkDismissDeadLetters(body);
+      const verb = action === "retry" ? "retried" : action === "reindex" ? "re-indexed" : "dismissed";
+      toast.success(scope === "all"
+        ? `All matching dead letters ${verb}`
+        : `${count} dead ${count === 1 ? "letter" : "letters"} ${verb}`);
       setRowSelection({});
       fetchItems();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError(`Failed to ${action} dead letters`, e);
     } finally {
       setLoading(false);
     }
@@ -442,8 +475,6 @@ export default function DeadLettersPage() {
     <>
       <SiteHeader title="Dead Letters" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
-
         <div className="flex items-center gap-2">
           <DataTableToolbar table={table} />
           <Select value={resolvedFilter} onValueChange={setResolvedFilter}>
@@ -481,15 +512,26 @@ export default function DeadLettersPage() {
               <RefreshCw className="mr-1 size-3.5" />
               Re-index
             </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              disabled={loading}
-              onClick={() => handleBulkAction("dismiss", "selected")}
-            >
-              <XCircle className="mr-1 size-3.5" />
-              Dismiss
-            </Button>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button size="sm" variant="ghost" disabled={loading}>
+                  <XCircle className="mr-1 size-3.5" />
+                  Dismiss
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Dismiss {selectedIds.length} dead {selectedIds.length === 1 ? "letter" : "letters"}?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    Dismissed dead letters will be marked as resolved and will not be retried.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction variant="destructive" onClick={() => handleBulkAction("dismiss", "selected")}>Dismiss</AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button size="sm" variant="ghost" disabled={loading}>
@@ -509,7 +551,7 @@ export default function DeadLettersPage() {
                   Re-index all matching
                 </DropdownMenuItem>
                 <DropdownMenuItem
-                  onClick={() => handleBulkAction("dismiss", "all")}
+                  onClick={() => setDismissAllOpen(true)}
                 >
                   Dismiss all matching
                 </DropdownMenuItem>
@@ -610,6 +652,21 @@ export default function DeadLettersPage() {
             )}
           </SheetContent>
         </Sheet>
+
+        <AlertDialog open={dismissAllOpen} onOpenChange={setDismissAllOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Dismiss all matching dead letters?</AlertDialogTitle>
+              <AlertDialogDescription>
+                All dead letters matching the current filters will be marked as resolved. This action cannot be undone.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction variant="destructive" onClick={() => handleBulkAction("dismiss", "all")}>Dismiss All</AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     </>
   );

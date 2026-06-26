@@ -171,9 +171,16 @@ async fn resolve_signing_key(did: &str, state: &AppState) -> Result<Vec<u8>, App
     let url = if did.starts_with("did:plc:") {
         format!("{}/{did}", state.config.plc_url.trim_end_matches('/'))
     } else if did.starts_with("did:web:") {
-        let domain = did.strip_prefix("did:web:").unwrap();
-        let domain = domain.replace(':', "/");
-        format!("https://{domain}/.well-known/did.json")
+        let identifier = did.strip_prefix("did:web:").unwrap();
+        let mut segments = identifier.split(':');
+        let host = segments.next().unwrap();
+        let host = urlencoding::decode(host).unwrap_or_else(|_| host.into());
+        let path_segments: Vec<&str> = segments.collect();
+        if path_segments.is_empty() {
+            format!("https://{host}/.well-known/did.json")
+        } else {
+            format!("https://{host}/{}/did.json", path_segments.join("/"))
+        }
     } else {
         return Err(AppError::BadRequest(format!(
             "unsupported DID method: {did}"
@@ -258,6 +265,30 @@ fn verify_es256(msg: &[u8], sig_bytes: &[u8], key_bytes: &[u8]) -> bool {
     false
 }
 
+/// Minimal JWT payload for extracting fields after signature verification.
+#[derive(Debug, serde::Deserialize)]
+pub struct PublicJwtPayload {
+    pub iss: String,
+    pub aud: Option<String>,
+    pub exp: u64,
+}
+
+/// Decode the JWT payload without verification.
+///
+/// Call this *after* `ServiceAuth::from_bearer` has already validated the
+/// signature. This is used to extract the `aud` field for service auth
+/// fragment matching.
+pub fn decode_jwt_payload(token: &str) -> Result<PublicJwtPayload, AppError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AppError::Auth("invalid JWT format".into()));
+    }
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| AppError::Auth("invalid JWT payload encoding".into()))?;
+    serde_json::from_slice(&payload_bytes).map_err(|_| AppError::Auth("invalid JWT payload".into()))
+}
+
 fn verify_es256k(msg: &[u8], sig_bytes: &[u8], key_bytes: &[u8]) -> bool {
     use k256::ecdsa::{Signature as K256Signature, VerifyingKey as K256Key, signature::Verifier};
 
@@ -280,4 +311,128 @@ fn verify_es256k(msg: &[u8], sig_bytes: &[u8], key_bytes: &[u8]) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_jwt(payload_json: &str) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"ES256","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json);
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fake_sig");
+        format!("{}.{}.{}", header, payload, signature)
+    }
+
+    #[test]
+    fn decode_valid_payload() {
+        let jwt = make_test_jwt(
+            r#"{"iss":"did:plc:abc","aud":"did:web:example.com#svc","exp":9999999999}"#,
+        );
+        let payload = decode_jwt_payload(&jwt).unwrap();
+        assert_eq!(payload.iss, "did:plc:abc");
+        assert_eq!(payload.aud.unwrap(), "did:web:example.com#svc");
+        assert_eq!(payload.exp, 9999999999);
+    }
+
+    #[test]
+    fn decode_payload_without_aud() {
+        let jwt = make_test_jwt(r#"{"iss":"did:plc:abc","exp":9999999999}"#);
+        let payload = decode_jwt_payload(&jwt).unwrap();
+        assert!(payload.aud.is_none());
+    }
+
+    #[test]
+    fn decode_rejects_invalid_format() {
+        assert!(decode_jwt_payload("not.a.valid.jwt.with.too.many.parts").is_err());
+        assert!(decode_jwt_payload("onlyonepart").is_err());
+        assert!(decode_jwt_payload("two.parts").is_err());
+    }
+
+    #[test]
+    fn decode_jwt_payload_rejects_not_three_parts() {
+        assert!(decode_jwt_payload("notenoughparts").is_err());
+        assert!(decode_jwt_payload("two.parts").is_err());
+        assert!(decode_jwt_payload("a.b.c.d").is_err());
+    }
+
+    #[test]
+    fn decode_jwt_payload_rejects_invalid_base64() {
+        let jwt = "validheader.!!!invalid-base64!!!.sig";
+        let result = decode_jwt_payload(jwt);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_es256_rejects_invalid_key_bytes() {
+        assert!(!verify_es256(b"test message", &[0u8; 64], &[0xFF; 5]));
+    }
+
+    #[test]
+    fn verify_es256k_rejects_invalid_key_bytes() {
+        assert!(!verify_es256k(b"test message", &[0u8; 64], &[0xFF; 5]));
+    }
+
+    #[test]
+    fn decode_multibase_key_rejects_invalid_multibase() {
+        let result = decode_multibase_key("not-a-valid-multibase-string!!!", "Multikey");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("multibase"),
+            "error should mention multibase: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_multibase_key_secp256r1_returns_raw_bytes() {
+        let raw_bytes = vec![0x04, 0xAA, 0xBB, 0xCC, 0xDD];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &raw_bytes);
+        let result = decode_multibase_key(&encoded, "EcdsaSecp256r1VerificationKey2019").unwrap();
+        assert_eq!(result, raw_bytes);
+    }
+
+    #[test]
+    fn decode_multibase_key_secp256k1_returns_raw_bytes() {
+        let raw_bytes = vec![0x02, 0x11, 0x22, 0x33];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &raw_bytes);
+        let result = decode_multibase_key(&encoded, "EcdsaSecp256k1VerificationKey2019").unwrap();
+        assert_eq!(result, raw_bytes);
+    }
+
+    #[test]
+    fn decode_multibase_key_unknown_type_rejected() {
+        let raw_bytes = vec![0x80, 0x24, 0x01, 0x02, 0x03];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &raw_bytes);
+        let result = decode_multibase_key(&encoded, "UnknownKeyType2099");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("unsupported"),
+            "error should mention unsupported: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_multibase_key_multikey_too_short() {
+        let short_bytes = vec![0x80];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &short_bytes);
+        let result = decode_multibase_key(&encoded, "Multikey");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("too short"),
+            "error should mention too short: {msg}"
+        );
+    }
+
+    #[test]
+    fn decode_multibase_key_multikey_strips_prefix() {
+        let mut bytes = vec![0x80, 0x24];
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &bytes);
+        let result = decode_multibase_key(&encoded, "Multikey").unwrap();
+        assert_eq!(result, vec![0xAA, 0xBB, 0xCC]);
+    }
 }

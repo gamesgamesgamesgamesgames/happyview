@@ -45,6 +45,7 @@ pub(super) struct ScriptResponse {
     pub script_type: String,
     pub body: String,
     pub description: Option<String>,
+    pub outbound_xrpcs: Option<Vec<String>>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -105,7 +106,7 @@ pub(super) async fn list(
 
     let backend = state.db_backend;
     let mut sql = String::from(
-        "SELECT id, script_type, body, description, created_at, updated_at
+        "SELECT id, script_type, body, description, outbound_xrpcs, created_at, updated_at
          FROM scripts",
     );
     if query.suffix.is_some() {
@@ -115,7 +116,18 @@ pub(super) async fn list(
 
     let sql = adapt_sql(&sql, backend);
     #[allow(clippy::type_complexity)]
-    let mut q = sqlx::query_as::<_, (String, String, String, Option<String>, String, String)>(&sql);
+    let mut q = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ),
+    >(&sql);
     if let Some(ref suffix) = query.suffix {
         q = q.bind(format!("%:{suffix}"));
     }
@@ -127,13 +139,18 @@ pub(super) async fn list(
     let scripts: Vec<ScriptResponse> = rows
         .into_iter()
         .map(
-            |(id, script_type, body, description, created_at, updated_at)| ScriptResponse {
-                id,
-                script_type,
-                body,
-                description,
-                created_at,
-                updated_at,
+            |(id, script_type, body, description, outbound_xrpcs_json, created_at, updated_at)| {
+                let outbound_xrpcs: Option<Vec<String>> =
+                    outbound_xrpcs_json.and_then(|j| serde_json::from_str(&j).ok());
+                ScriptResponse {
+                    id,
+                    script_type,
+                    body,
+                    description,
+                    outbound_xrpcs,
+                    created_at,
+                    updated_at,
+                }
             },
         )
         .collect();
@@ -175,6 +192,16 @@ pub(super) async fn upsert(
     let script_type = body.script_type.unwrap_or_default();
     validate_body_for_type(&body.body, script_type)?;
 
+    let outbound_xrpcs = crate::lua_analysis::extract_outbound_xrpcs(&body.body);
+    let outbound_json =
+        if outbound_xrpcs.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&outbound_xrpcs).map_err(|e| {
+                AppError::Internal(format!("failed to serialize outbound xrpcs: {e}"))
+            })?)
+        };
+
     let backend = state.db_backend;
     let now = now_rfc3339();
     let description = body.description.as_deref().filter(|s| !s.is_empty());
@@ -190,13 +217,14 @@ pub(super) async fn upsert(
 
     let sql = adapt_sql(
         r#"
-        INSERT INTO scripts (id, script_type, body, description, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO scripts (id, script_type, body, description, outbound_xrpcs, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (id) DO UPDATE SET
-            script_type = EXCLUDED.script_type,
-            body        = EXCLUDED.body,
-            description = EXCLUDED.description,
-            updated_at  = EXCLUDED.updated_at
+            script_type    = EXCLUDED.script_type,
+            body           = EXCLUDED.body,
+            description    = EXCLUDED.description,
+            outbound_xrpcs = EXCLUDED.outbound_xrpcs,
+            updated_at     = EXCLUDED.updated_at
         "#,
         backend,
     );
@@ -205,6 +233,7 @@ pub(super) async fn upsert(
         .bind(script_type.as_str())
         .bind(&body.body)
         .bind(description)
+        .bind(&outbound_json)
         .bind(&now)
         .bind(&now)
         .execute(&state.db)
@@ -290,13 +319,24 @@ pub(super) async fn patch(
         None => existing.description,
     };
 
+    let outbound_xrpcs = crate::lua_analysis::extract_outbound_xrpcs(&new_body);
+    let outbound_json: Option<String> =
+        if outbound_xrpcs.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&outbound_xrpcs).map_err(|e| {
+                AppError::Internal(format!("failed to serialize outbound xrpcs: {e}"))
+            })?)
+        };
+
     let sql = adapt_sql(
         r#"
         UPDATE scripts
-           SET script_type = ?,
-               body        = ?,
-               description = ?,
-               updated_at  = ?
+           SET script_type    = ?,
+               body           = ?,
+               description    = ?,
+               outbound_xrpcs = ?,
+               updated_at     = ?
          WHERE id = ?
         "#,
         backend,
@@ -305,6 +345,7 @@ pub(super) async fn patch(
         .bind(&new_script_type)
         .bind(&new_body)
         .bind(new_description.as_deref())
+        .bind(&outbound_json)
         .bind(&now)
         .bind(&id)
         .execute(&state.db)
@@ -373,24 +414,34 @@ pub(super) async fn delete(
 async fn fetch_one(state: &AppState, id: &str) -> Result<ScriptResponse, AppError> {
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT id, script_type, body, description, created_at, updated_at
+        "SELECT id, script_type, body, description, outbound_xrpcs, created_at, updated_at
          FROM scripts WHERE id = ?",
         backend,
     );
     #[allow(clippy::type_complexity)]
-    let row: Option<(String, String, String, Option<String>, String, String)> =
-        sqlx::query_as(&sql)
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to fetch script: {e}")))?;
-    let (id, script_type, body, description, created_at, updated_at) =
+    let row: Option<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+    )> = sqlx::query_as(&sql)
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to fetch script: {e}")))?;
+    let (id, script_type, body, description, outbound_xrpcs_json, created_at, updated_at) =
         row.ok_or_else(|| AppError::NotFound(format!("script '{id}' not found")))?;
+    let outbound_xrpcs: Option<Vec<String>> =
+        outbound_xrpcs_json.and_then(|j| serde_json::from_str(&j).ok());
     Ok(ScriptResponse {
         id,
         script_type,
         body,
         description,
+        outbound_xrpcs,
         created_at,
         updated_at,
     })

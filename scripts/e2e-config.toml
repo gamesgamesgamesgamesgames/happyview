@@ -1,0 +1,18 @@
+[server]
+hostname = "pds.localhost"
+allow_http_proxy = true
+invite_code_required = false
+disable_rate_limiting = true
+disable_account_verification_gate = true
+
+[database]
+url = "postgres://happyview:happyview@postgres:5432/pds"
+
+[storage]
+path = "/var/lib/tranquil-pds/blobs"
+
+[plc]
+directory_url = "http://plc:2582"
+
+[secrets]
+allow_insecure = true

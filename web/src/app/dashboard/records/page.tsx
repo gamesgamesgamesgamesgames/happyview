@@ -8,9 +8,11 @@ import {
   getCoreRowModel,
   useReactTable,
 } from "@tanstack/react-table";
+import { toast } from "sonner";
 
 import { useSearchParams } from "next/navigation";
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { toastError } from "@/lib/format";
 import {
   getCollections,
   getAdminRecords,
@@ -18,6 +20,16 @@ import {
   deleteCollectionRecords,
 } from "@/lib/api";
 import type { AdminRecord } from "@/types/records";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   ResponsiveDialog,
   ResponsiveDialogClose,
@@ -88,7 +100,6 @@ export default function RecordsPage() {
   const [cursorStack, setCursorStack] = useState<string[]>([]);
   const [nextCursor, setNextCursor] = useState<string | undefined>();
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [viewRecord, setViewRecord] = useState<AdminRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteUri, setDeleteUri] = useState<string | null>(null);
@@ -105,8 +116,23 @@ export default function RecordsPage() {
   useEffect(() => {
     getCollections()
       .then((data) => setCollections(data.collections))
-      .catch((e) => setError(e.message));
+      .catch((e) => toastError("Failed to load collections", e));
   }, []);
+
+  useEffect(() => {
+    if (Object.keys(rowSelection).length === 0) return;
+    const validUris = new Set(records.map((r) => r.uri));
+    const pruned: RowSelectionState = {};
+    let changed = false;
+    for (const [uri, selected] of Object.entries(rowSelection)) {
+      if (validUris.has(uri)) {
+        pruned[uri] = selected;
+      } else {
+        changed = true;
+      }
+    }
+    if (changed) setRowSelection(pruned);
+  }, [records]);
 
   // Auto-select collection from URL search param on initial load.
   useEffect(() => {
@@ -122,13 +148,12 @@ export default function RecordsPage() {
   const fetchRecords = useCallback(
     async (collection: string, cursor?: string) => {
       setLoading(true);
-      setError(null);
       try {
         const data = await getAdminRecords(collection, 20, cursor);
         setRecords(data.records);
         setNextCursor(data.cursor);
       } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : String(e));
+        toastError("Failed to load records", e);
         setRecords([]);
         setNextCursor(undefined);
       } finally {
@@ -145,6 +170,7 @@ export default function RecordsPage() {
         await deleteRecord(uri);
         setDeleteUri(null);
         setViewRecord(null);
+        toast.success("Record deleted");
         if (selectedCollection) {
           const currentCursor =
             cursorStack.length > 0
@@ -153,7 +179,7 @@ export default function RecordsPage() {
           fetchRecords(selectedCollection, currentCursor);
         }
       } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : String(e));
+        toastError("Failed to delete record", e);
       } finally {
         setDeleting(false);
       }
@@ -170,7 +196,7 @@ export default function RecordsPage() {
       setBulkDeleteMode("selected");
       setBulkDeleteConfirm("");
       setRowSelection({});
-      // Refresh collections and records
+      toast.success("All records deleted");
       const data = await getCollections();
       setCollections(data.collections);
       setCursorStack([]);
@@ -178,7 +204,7 @@ export default function RecordsPage() {
       setRecords([]);
       setSelectedCollection("");
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to delete collection", e);
     } finally {
       setDeletingAll(false);
     }
@@ -186,25 +212,31 @@ export default function RecordsPage() {
 
   const handleBulkDelete = useCallback(async () => {
     setDeleting(true);
-    try {
-      const selectedUris = Object.keys(rowSelection);
-      for (const uri of selectedUris) {
-        await deleteRecord(uri);
-      }
-      setRowSelection({});
-      setBulkDeleteOpen(false);
-      if (selectedCollection) {
-        const currentCursor =
-          cursorStack.length > 0
-            ? cursorStack[cursorStack.length - 1]
-            : undefined;
-        fetchRecords(selectedCollection, currentCursor);
-      }
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setDeleting(false);
+    const selectedUris = Object.keys(rowSelection);
+    const results = await Promise.allSettled(selectedUris.map((uri) => deleteRecord(uri)));
+    const succeeded = selectedUris.filter((_, i) => results[i].status === "fulfilled");
+    const failed = selectedUris.length - succeeded.length;
+
+    if (failed === 0) {
+      toast.success(`Deleted ${succeeded.length} ${succeeded.length === 1 ? "record" : "records"}`);
+    } else if (succeeded.length === 0) {
+      toast.error("Failed to delete records");
+    } else {
+      toast.warning(`Deleted ${succeeded.length} of ${selectedUris.length} records`, {
+        description: `${failed} ${failed === 1 ? "record" : "records"} failed to delete.`,
+      });
     }
+
+    setRowSelection({});
+    setBulkDeleteOpen(false);
+    if (selectedCollection) {
+      const currentCursor =
+        cursorStack.length > 0
+          ? cursorStack[cursorStack.length - 1]
+          : undefined;
+      fetchRecords(selectedCollection, currentCursor);
+    }
+    setDeleting(false);
   }, [rowSelection, selectedCollection, cursorStack, fetchRecords]);
 
   // Build columns dynamically from the union of all record keys
@@ -351,8 +383,6 @@ export default function RecordsPage() {
     <>
       <SiteHeader title="Records" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
-
         <DataTable
           table={table}
           showPagination={false}
@@ -517,30 +547,23 @@ export default function RecordsPage() {
           </SheetContent>
         </Sheet>
 
-        <ResponsiveDialog
-          open={!!deleteUri}
-          onOpenChange={(open) => {
-            if (!open) setDeleteUri(null);
-          }}
-        >
-          <ResponsiveDialogContent>
-            <ResponsiveDialogHeader>
-              <ResponsiveDialogTitle>Delete record?</ResponsiveDialogTitle>
-              <ResponsiveDialogDescription>
+        <AlertDialog open={!!deleteUri} onOpenChange={(open) => { if (!open) setDeleteUri(null); }}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Delete record?</AlertDialogTitle>
+              <AlertDialogDescription>
                 This will permanently delete the record. This action cannot be
                 undone.
-              </ResponsiveDialogDescription>
-            </ResponsiveDialogHeader>
+              </AlertDialogDescription>
+            </AlertDialogHeader>
             {deleteUri && (
               <code className="text-muted-foreground block truncate text-xs">
                 {deleteUri}
               </code>
             )}
-            <ResponsiveDialogFooter>
-              <ResponsiveDialogClose asChild>
-                <Button variant="outline" disabled={deleting}>Cancel</Button>
-              </ResponsiveDialogClose>
-              <Button
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+              <AlertDialogAction
                 variant="destructive"
                 disabled={deleting}
                 onClick={() => {
@@ -548,10 +571,10 @@ export default function RecordsPage() {
                 }}
               >
                 {deleting ? "Deleting..." : "Delete"}
-              </Button>
-            </ResponsiveDialogFooter>
-          </ResponsiveDialogContent>
-        </ResponsiveDialog>
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
 
         <ResponsiveDialog
           open={bulkDeleteOpen}

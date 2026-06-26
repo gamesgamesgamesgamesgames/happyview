@@ -18,8 +18,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ExternalLink, Eye, Trash2 } from "lucide-react";
+import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { toastError } from "@/lib/format";
 import { deleteScript, getScripts } from "@/lib/api";
 import type { Script } from "@/types/scripts";
 import {
@@ -34,6 +36,17 @@ import { DataTable } from "@/components/data-table/data-table";
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header";
 import { DataTableToolbar } from "@/components/data-table/data-table-toolbar";
 import { SiteHeader } from "@/components/site-header";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 
@@ -47,12 +60,11 @@ export default function ScriptsPage() {
   const { hasPermission } = useCurrentUser();
   const router = useRouter();
   const [scripts, setScripts] = useState<Script[]>([]);
-  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     getScripts()
       .then(setScripts)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+      .catch((e) => toastError("Failed to load scripts", e));
   }, []);
 
   useEffect(() => {
@@ -74,12 +86,12 @@ export default function ScriptsPage() {
   );
 
   async function handleDelete(id: string) {
-    if (!confirm(`Delete script '${id}'?`)) return;
     try {
       await deleteScript(id);
+      toast.success("Script deleted");
       load();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to delete script", e);
     }
   }
 
@@ -224,19 +236,32 @@ export default function ScriptsPage() {
               </Link>
             </Button>
             {hasPermission("scripts:manage") && (
-              <Button
-                variant="destructive"
-                size="icon"
-                className="size-8 text-muted-foreground hover:text-destructive"
-                title="Delete script"
-                aria-label="Delete script"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleDelete(row.original.id);
-                }}
-              >
-                <Trash2 className="size-4" />
-              </Button>
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button
+                    variant="destructive"
+                    size="icon"
+                    className="size-8 text-muted-foreground hover:text-destructive"
+                    title="Delete script"
+                    aria-label="Delete script"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent onClick={(e) => e.stopPropagation()}>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Delete script?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      This will permanently remove the script. This action cannot be undone.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                    <AlertDialogAction variant="destructive" onClick={() => handleDelete(row.original.id)}>Delete</AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
             )}
           </div>
         ),
@@ -288,8 +313,6 @@ export default function ScriptsPage() {
     <>
       <SiteHeader title="Scripts" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
-
         <DataTable
           table={table}
           onRowClick={(row) =>

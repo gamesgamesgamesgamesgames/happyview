@@ -1,0 +1,41 @@
+:80 {
+	# API, admin, auth, XRPC, and well-known routes → Rust backend
+	handle /api/* {
+		reverse_proxy happyview:3000
+	}
+	handle /admin/* {
+		reverse_proxy happyview:3000
+	}
+	handle /auth/* {
+		reverse_proxy happyview:3000
+	}
+	handle /xrpc/* {
+		reverse_proxy happyview:3000
+	}
+	handle /oauth/* {
+		reverse_proxy happyview:3000
+	}
+	handle /external-auth/* {
+		reverse_proxy happyview:3000
+	}
+	handle /.well-known/* {
+		reverse_proxy happyview:3000
+	}
+	handle /oauth-client-metadata.json {
+		reverse_proxy happyview:3000
+	}
+	handle /health {
+		reverse_proxy happyview:3000
+	}
+	handle /config {
+		reverse_proxy happyview:3000
+	}
+	handle /settings/* {
+		reverse_proxy happyview:3000
+	}
+
+	# Everything else → Next.js dev server
+	handle {
+		reverse_proxy web:3001
+	}
+}

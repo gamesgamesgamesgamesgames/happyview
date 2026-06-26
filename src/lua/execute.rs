@@ -60,7 +60,7 @@ pub async fn execute_procedure_script(
     let script_source = script.to_string();
     let input_json = input.clone();
 
-    let pds_auth = if let Some(client_key) = claims.client_key() {
+    let pds_auth: Option<repo::PdsAuth> = if let Some(client_key) = claims.client_key() {
         let encryption_key = state
             .config
             .token_encryption_key
@@ -96,38 +96,16 @@ pub async fn execute_procedure_script(
             .dpop_key_id()
             .ok_or_else(|| AppError::Internal("DPoP key ID not available in claims".into()))?
             .to_string();
-        repo::PdsAuth::Dpop {
+        Some(repo::PdsAuth::Dpop {
             api_client_id,
             dpop_key_id,
             encryption_key: *encryption_key,
-        }
+        })
     } else {
-        match repo::get_oauth_session(state, claims.did()).await {
-            Ok(s) => repo::PdsAuth::OAuth(Arc::new(s)),
-            Err(e) => {
-                let error_message = format!("{e}");
-                log_event(
-                    &state.db,
-                    EventLog {
-                        event_type: "script.error".to_string(),
-                        severity: Severity::Error,
-                        actor_did: Some(claims.did().to_string()),
-                        subject: Some(method.to_string()),
-                        detail: serde_json::json!({
-                            "error": error_message,
-                            "script_source": script_source,
-                            "input": input_json,
-                            "caller_did": claims.did(),
-                            "method": method,
-                            "duration_ms": start.elapsed().as_millis() as u64,
-                        }),
-                    },
-                    backend,
-                )
-                .await;
-                return Err(e);
-            }
-        }
+        repo::get_oauth_session(state, claims.did())
+            .await
+            .ok()
+            .map(|s| repo::PdsAuth::OAuth(Arc::new(s)))
     };
 
     let lua = match sandbox::create_sandbox() {
@@ -159,7 +137,7 @@ pub async fn execute_procedure_script(
 
     let state_arc = Arc::new(state.clone());
     let claims_arc = Arc::new(claims.clone());
-    let pds_auth_arc = Arc::new(pds_auth);
+    let pds_auth_arc = pds_auth.map(Arc::new);
 
     if let Err(e) = db_api::register_db_api(&lua, state_arc.clone()) {
         let error_message = format!("failed to register db API: {e}");
@@ -259,12 +237,14 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
-    if let Err(e) = atproto_api::register_atproto_blob_api(
-        &lua,
-        state_arc.clone(),
-        claims_arc.clone(),
-        pds_auth_arc.clone(),
-    ) {
+    if let Some(ref pds_auth) = pds_auth_arc
+        && let Err(e) = atproto_api::register_atproto_blob_api(
+            &lua,
+            state_arc.clone(),
+            claims_arc.clone(),
+            pds_auth.clone(),
+        )
+    {
         let error_message = format!("failed to register atproto blob API: {e}");
         log_event(
             &state.db,
@@ -292,7 +272,7 @@ pub async fn execute_procedure_script(
         &lua,
         state_arc.clone(),
         Some(claims_arc),
-        Some(pds_auth_arc),
+        pds_auth_arc,
         delegate_did.map(|s| s.to_string()),
     ) {
         let error_message = format!("failed to register Record API: {e}");

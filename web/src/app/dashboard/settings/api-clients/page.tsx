@@ -9,9 +9,11 @@ import {
   X,
   ExternalLink,
 } from "lucide-react";
+import { toast } from "sonner";
 
 import { useConfig } from "@/lib/config-context";
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { toastError } from "@/lib/format";
 import {
   getApiClients,
   createApiClient,
@@ -23,6 +25,17 @@ import type {
   CreateApiClientResponse,
 } from "@/types/api-clients";
 import { SiteHeader } from "@/components/site-header";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -130,12 +143,11 @@ function MultiInput({
 export default function ApiClientsPage() {
   const { hasPermission } = useCurrentUser();
   const [clients, setClients] = useState<ApiClientSummary[]>([]);
-  const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     getApiClients()
       .then(setClients)
-      .catch((e) => setError(e.message));
+      .catch((e) => toastError("Failed to load API clients", e));
   }, []);
 
   useEffect(() => {
@@ -146,8 +158,6 @@ export default function ApiClientsPage() {
     <>
       <SiteHeader title="API Clients" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
-        {error && <p className="text-destructive text-sm">{error}</p>}
-
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-lg font-semibold">API Clients</h2>
@@ -183,7 +193,7 @@ export default function ApiClientsPage() {
                     colSpan={10}
                     className="text-muted-foreground text-center"
                   >
-                    No API clients yet.
+                    No API clients yet. Register an application to enable OAuth authentication through this AppView.
                   </TableCell>
                 </TableRow>
               )}
@@ -347,7 +357,7 @@ function CreateApiClientDialog({ onSuccess }: { onSuccess: () => void }) {
       });
       setCreated(result);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to create API client", e);
     }
   }
 
@@ -779,10 +789,11 @@ function EditApiClientDialog({
           ? Number(rateLimitRefillRate)
           : null,
       });
+      toast.success("API client updated");
       setOpen(false);
       onSuccess();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      toastError("Failed to update API client", e);
     } finally {
       setSaving(false);
     }
@@ -966,16 +977,19 @@ function DeleteApiClientDialog({
     setDeleting(true);
     try {
       await deleteApiClient(client.id);
+      toast.success("API client deleted");
       setOpen(false);
       onSuccess();
+    } catch (e: unknown) {
+      toastError("Failed to delete API client", e);
     } finally {
       setDeleting(false);
     }
   }
 
   return (
-    <ResponsiveDialog open={open} onOpenChange={setOpen}>
-      <ResponsiveDialogTrigger asChild>
+    <AlertDialog open={open} onOpenChange={setOpen}>
+      <AlertDialogTrigger asChild>
         <Button
           variant="ghost"
           size="icon"
@@ -985,31 +999,27 @@ function DeleteApiClientDialog({
         >
           <Trash2 className="size-4" />
         </Button>
-      </ResponsiveDialogTrigger>
-      <ResponsiveDialogContent>
-        <ResponsiveDialogHeader>
-          <ResponsiveDialogTitle>Delete API Client</ResponsiveDialogTitle>
-          <ResponsiveDialogDescription>
+      </AlertDialogTrigger>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Delete API client?</AlertDialogTitle>
+          <AlertDialogDescription>
             This will permanently delete &ldquo;{client.name}&rdquo; and revoke
             its OAuth identity. Any applications using this client will lose the
             ability to authenticate.
-          </ResponsiveDialogDescription>
-        </ResponsiveDialogHeader>
-        <ResponsiveDialogFooter>
-          <ResponsiveDialogClose asChild>
-            <Button variant="outline" disabled={deleting}>
-              Cancel
-            </Button>
-          </ResponsiveDialogClose>
-          <Button
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+          <AlertDialogAction
             variant="destructive"
             disabled={deleting}
             onClick={handleConfirm}
           >
             {deleting ? "Deleting..." : "Delete"}
-          </Button>
-        </ResponsiveDialogFooter>
-      </ResponsiveDialogContent>
-    </ResponsiveDialog>
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
 }

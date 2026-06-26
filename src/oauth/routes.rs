@@ -245,7 +245,18 @@ async fn register_session(
     }
 
     // Validate scopes
-    client_auth::validate_scopes(&body.scopes, &client.scopes, &state.lexicons).await?;
+    if let Err(e) =
+        client_auth::validate_scopes(&body.scopes, &client.scopes, &state.lexicons).await
+    {
+        tracing::warn!(
+            client_key = %client_key,
+            did = %body.did,
+            token_scopes = %body.scopes,
+            client_scopes = %client.scopes,
+            "session registration scope validation failed"
+        );
+        return Err(e);
+    }
 
     // Store the session
     let session_id = Uuid::new_v4().to_string();

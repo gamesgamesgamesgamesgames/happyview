@@ -127,6 +127,7 @@ jobs:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -149,6 +150,7 @@ jobs:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16-alpine
@@ -468,8 +470,9 @@ jobs:
       && needs.unit-tests.result == 'success'
       && needs.e2e-tests.result == 'success'
       && needs.frontend.result == 'success'
+      && needs.playwright.result == 'success'
       && needs.lint.result == 'success'
-    needs: [changes, unit-tests, e2e-tests, frontend, lint]
+    needs: [changes, unit-tests, e2e-tests, frontend, playwright, lint]
     runs-on: depot-ubuntu-24.04
     outputs:
       version: ${{ steps.semantic.outputs.version }}

@@ -178,6 +178,41 @@ async fn invalid_nsid_rejected() {
 
 #[tokio::test]
 #[serial]
+async fn put_and_get_blocklist() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/settings/xrpc-proxy",
+            app.admin_cookie(),
+            &json!({
+                "mode": "blocklist",
+                "nsids": ["com.blocked.feed.*"]
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings/xrpc-proxy", app.admin_cookie()))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    assert_eq!(json["mode"], "blocklist");
+    assert_eq!(json["nsids"], json!(["com.blocked.feed.*"]));
+}
+
+#[tokio::test]
+#[serial]
 async fn requires_auth() {
     common::require_db!();
     let app = TestApp::new().await;

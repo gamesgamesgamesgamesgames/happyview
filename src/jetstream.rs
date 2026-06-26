@@ -291,7 +291,7 @@ async fn run(
                     }
                     "identity" => {
                         if let Some(identity) = event.identity {
-                            tracing::info!(
+                            tracing::debug!(
                                 did = %identity.did,
                                 handle = ?identity.handle,
                                 "received identity event from jetstream"
