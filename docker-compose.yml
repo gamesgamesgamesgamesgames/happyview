@@ -23,7 +23,7 @@ services:
     image: rust:1.93
     working_dir: /app
     entrypoint: ["sh", "/scripts/entrypoint.sh"]
-    command: cargo run
+    command: cargo watch -x run
     ports:
       - "3000:3000"
     volumes:
@@ -68,7 +68,9 @@ services:
       TUNNEL_URL_FILE: /shared/tunnel-url
       TUNNEL_UPSTREAM: http://caddy:80
     depends_on:
-      - caddy
+      caddy:
+        condition: service_started
+        restart: true
     restart: unless-stopped
 
   web:

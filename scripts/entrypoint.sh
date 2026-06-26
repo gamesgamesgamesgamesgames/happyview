@@ -22,4 +22,9 @@ if [ -n "$TUNNEL_URL_FILE" ]; then
   fi
 fi
 
+if ! command -v cargo-watch >/dev/null 2>&1; then
+  echo "Installing cargo-watch..."
+  cargo install cargo-watch
+fi
+
 exec "$@"
