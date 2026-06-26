@@ -176,7 +176,7 @@ impl LexiconRegistry {
             Option<String>,
             Option<i32>,
         )> = sqlx::query_as(
-            "SELECT id, lexicon_json, revision, target_collection, action, token_cost FROM lexicons",
+            "SELECT id, lexicon_json, revision, target_collection, action, token_cost FROM happyview_lexicons",
         )
         .fetch_all(db)
         .await

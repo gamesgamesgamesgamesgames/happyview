@@ -56,7 +56,7 @@ pub(super) async fn create_api_key(
         serde_json::to_string(&body.permissions).unwrap_or_else(|_| "[]".to_string());
 
     let insert_sql = adapt_sql(
-        "INSERT INTO api_keys (id, user_id, name, key_hash, key_prefix, permissions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_api_keys (id, user_id, name, key_hash, key_prefix, permissions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         state.db_backend,
     );
 
@@ -105,7 +105,7 @@ pub(super) async fn list_api_keys(
     auth.require(Permission::ApiKeysRead).await?;
 
     let select_sql = adapt_sql(
-        "SELECT k.id, k.name, k.key_prefix, k.permissions, k.created_at, k.last_used_at, k.revoked_at FROM api_keys k JOIN users u ON u.id = k.user_id WHERE u.did = ? ORDER BY k.created_at DESC",
+        "SELECT k.id, k.name, k.key_prefix, k.permissions, k.created_at, k.last_used_at, k.revoked_at FROM happyview_api_keys k JOIN happyview_users u ON u.id = k.user_id WHERE u.did = ? ORDER BY k.created_at DESC",
         state.db_backend,
     );
 
@@ -156,7 +156,7 @@ pub(super) async fn revoke_api_key(
 
     let now = now_rfc3339();
     let update_sql = adapt_sql(
-        "UPDATE api_keys SET revoked_at = ? WHERE id = ? AND user_id = (SELECT id FROM users WHERE did = ?) AND revoked_at IS NULL",
+        "UPDATE happyview_api_keys SET revoked_at = ? WHERE id = ? AND user_id = (SELECT id FROM happyview_users WHERE did = ?) AND revoked_at IS NULL",
         state.db_backend,
     );
 

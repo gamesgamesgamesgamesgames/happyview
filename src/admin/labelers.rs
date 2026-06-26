@@ -20,7 +20,7 @@ pub(super) async fn list(
 
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT did, status, cursor, created_at, updated_at FROM labeler_subscriptions ORDER BY created_at",
+        "SELECT did, status, cursor, created_at, updated_at FROM happyview_labeler_subscriptions ORDER BY created_at",
         backend,
     );
     let rows: Vec<(String, String, Option<i64>, String, String)> = sqlx::query_as(&sql)
@@ -56,7 +56,7 @@ pub(super) async fn add(
     let now = now_rfc3339();
     let sql = adapt_sql(
         r#"
-        INSERT INTO labeler_subscriptions (did, created_at)
+        INSERT INTO happyview_labeler_subscriptions (did, created_at)
         VALUES (?, ?)
         ON CONFLICT (did) DO UPDATE SET status = 'active', updated_at = ?
         "#,
@@ -101,7 +101,7 @@ pub(super) async fn update(
     let backend = state.db_backend;
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE labeler_subscriptions SET status = ?, updated_at = ? WHERE did = ?",
+        "UPDATE happyview_labeler_subscriptions SET status = ?, updated_at = ? WHERE did = ?",
         backend,
     );
     let result = sqlx::query(&sql)
@@ -145,7 +145,10 @@ pub(super) async fn delete(
     auth.require(Permission::LabelersDelete).await?;
 
     let backend = state.db_backend;
-    let delete_sql = adapt_sql("DELETE FROM labeler_subscriptions WHERE did = ?", backend);
+    let delete_sql = adapt_sql(
+        "DELETE FROM happyview_labeler_subscriptions WHERE did = ?",
+        backend,
+    );
     let result = sqlx::query(&delete_sql)
         .bind(&did)
         .execute(&state.db)
@@ -159,7 +162,7 @@ pub(super) async fn delete(
     }
 
     // Also remove all labels from this labeler.
-    let delete_labels_sql = adapt_sql("DELETE FROM labels WHERE src = ?", backend);
+    let delete_labels_sql = adapt_sql("DELETE FROM happyview_labels WHERE src = ?", backend);
     let _ = sqlx::query(&delete_labels_sql)
         .bind(&did)
         .execute(&state.db)

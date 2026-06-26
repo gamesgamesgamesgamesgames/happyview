@@ -15,7 +15,7 @@ pub(super) async fn stats(
     auth: UserAuth,
 ) -> Result<Json<StatsResponse>, AppError> {
     auth.require(Permission::StatsRead).await?;
-    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM records")
+    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM happyview_records")
         .fetch_one(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to count records: {e}")))?;
@@ -24,11 +24,11 @@ pub(super) async fn stats(
         r#"
         SELECT c.collection, COALESCE(r.cnt, 0) AS count
         FROM (
-            SELECT id AS collection FROM lexicons
+            SELECT id AS collection FROM happyview_lexicons
             WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record'
         ) c
         LEFT JOIN (
-            SELECT collection, COUNT(*) AS cnt FROM records GROUP BY collection
+            SELECT collection, COUNT(*) AS cnt FROM happyview_records GROUP BY collection
         ) r ON r.collection = c.collection
         ORDER BY c.collection
         "#,

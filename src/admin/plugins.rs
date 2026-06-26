@@ -90,7 +90,7 @@ pub(super) async fn list(
     // Query which plugins have secrets configured
     let configured_plugins: std::collections::HashSet<String> = {
         let sql = adapt_sql(
-            "SELECT plugin_id FROM plugin_configs WHERE config IS NOT NULL",
+            "SELECT plugin_id FROM happyview_plugin_configs WHERE config IS NOT NULL",
             state.db_backend,
         );
         sqlx::query_scalar::<_, String>(&sql)
@@ -308,7 +308,10 @@ pub(super) async fn remove(
     }
 
     // Remove from database
-    let sql = adapt_sql("DELETE FROM plugins WHERE id = ?", state.db_backend);
+    let sql = adapt_sql(
+        "DELETE FROM happyview_plugins WHERE id = ?",
+        state.db_backend,
+    );
     sqlx::query(&sql)
         .bind(&plugin_id)
         .execute(&state.db)
@@ -398,7 +401,7 @@ pub(super) async fn reload(
     // Check if reloaded plugin still has its config
     let secrets_configured = required_secrets.is_empty() || {
         let sql = adapt_sql(
-            "SELECT 1 FROM plugin_configs WHERE plugin_id = ?",
+            "SELECT 1 FROM happyview_plugin_configs WHERE plugin_id = ?",
             state.db_backend,
         );
         sqlx::query_scalar::<_, i32>(&sql)
@@ -429,7 +432,7 @@ pub(super) async fn reload(
 
     // Persist the (possibly new) URL so restarts pick it up
     let persist_sql = adapt_sql(
-        "UPDATE plugins SET url = ?, sha256 = NULL WHERE id = ?",
+        "UPDATE happyview_plugins SET url = ?, sha256 = NULL WHERE id = ?",
         state.db_backend,
     );
     sqlx::query(&persist_sql)
@@ -481,7 +484,7 @@ pub(super) async fn get_secrets(
 
     // Get secrets from plugin_configs table
     let sql = adapt_sql(
-        "SELECT config FROM plugin_configs WHERE plugin_id = ?",
+        "SELECT config FROM happyview_plugin_configs WHERE plugin_id = ?",
         state.db_backend,
     );
 
@@ -551,7 +554,7 @@ pub(super) async fn update_secrets(
 
     // Get existing config or create new one
     let sql = adapt_sql(
-        "SELECT config FROM plugin_configs WHERE plugin_id = ?",
+        "SELECT config FROM happyview_plugin_configs WHERE plugin_id = ?",
         state.db_backend,
     );
 
@@ -605,7 +608,7 @@ pub(super) async fn update_secrets(
 
     // Upsert into plugin_configs
     let sql = adapt_sql(
-        "INSERT INTO plugin_configs (plugin_id, config, updated_at) VALUES (?, ?, ?)
+        "INSERT INTO happyview_plugin_configs (plugin_id, config, updated_at) VALUES (?, ?, ?)
          ON CONFLICT (plugin_id) DO UPDATE SET config = EXCLUDED.config, updated_at = EXCLUDED.updated_at",
         state.db_backend,
     );

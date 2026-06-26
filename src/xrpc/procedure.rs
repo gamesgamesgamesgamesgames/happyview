@@ -59,7 +59,7 @@ pub(crate) async fn handle_procedure(
 
         // Check token scope against outbound XRPCs declared by the script
         let outbound_sql = adapt_sql(
-            "SELECT outbound_xrpcs FROM scripts WHERE id = ?",
+            "SELECT outbound_xrpcs FROM happyview_scripts WHERE id = ?",
             state.db_backend,
         );
         if let Ok(Some((Some(json_str),))) = sqlx::query_as::<_, (Option<String>,)>(&outbound_sql)
@@ -246,7 +246,7 @@ async fn handle_create_record(
             let record_str = serde_json::to_string(&record).unwrap_or_default();
             let sql = adapt_sql(
                 r#"
-                INSERT INTO records (uri, did, collection, rkey, record, cid, created_at)
+                INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (uri) DO UPDATE
                     SET record = EXCLUDED.record,
@@ -334,7 +334,7 @@ async fn handle_put_record(
         let now = now_rfc3339();
         let sql = adapt_sql(
             r#"
-            INSERT INTO records (uri, did, collection, rkey, record, cid, created_at)
+            INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (uri) DO UPDATE
                 SET record = EXCLUDED.record,
@@ -401,7 +401,7 @@ async fn handle_delete_record(
             .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
 
         let backend = state.db_backend;
-        let sql = adapt_sql("DELETE FROM records WHERE uri = ?", backend);
+        let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
         let _ = sqlx::query(&sql).bind(uri).execute(&state.db).await;
 
         Ok((

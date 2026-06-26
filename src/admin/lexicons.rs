@@ -71,7 +71,7 @@ pub(super) async fn upload_lexicon(
     // Upsert into database
     let sql = adapt_sql(
         r#"
-        INSERT INTO lexicons (id, lexicon_json, backfill, target_collection, action, token_cost, source, created_at)
+        INSERT INTO happyview_lexicons (id, lexicon_json, backfill, target_collection, action, token_cost, source, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 'manual', ?)
         ON CONFLICT (id) DO UPDATE SET
             lexicon_json = EXCLUDED.lexicon_json,
@@ -80,7 +80,7 @@ pub(super) async fn upload_lexicon(
             action = EXCLUDED.action,
             token_cost = EXCLUDED.token_cost,
             source = 'manual',
-            revision = lexicons.revision + 1,
+            revision = happyview_lexicons.revision + 1,
             updated_at = ?
         RETURNING revision
         "#,
@@ -161,7 +161,7 @@ pub(super) async fn list_lexicons(
     auth.require(Permission::LexiconsRead).await?;
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT id, revision, lexicon_json, backfill, action, target_collection, source, authority_did, last_fetched_at, created_at, updated_at, token_cost FROM lexicons ORDER BY id",
+        "SELECT id, revision, lexicon_json, backfill, action, target_collection, source, authority_did, last_fetched_at, created_at, updated_at, token_cost FROM happyview_lexicons ORDER BY id",
         backend,
     );
     #[allow(clippy::type_complexity)]
@@ -243,7 +243,7 @@ pub(super) async fn get_lexicon(
     auth.require(Permission::LexiconsRead).await?;
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT id, revision, lexicon_json, backfill, action, target_collection, source, authority_did, last_fetched_at, created_at, updated_at, token_cost FROM lexicons WHERE id = ?",
+        "SELECT id, revision, lexicon_json, backfill, action, target_collection, source, authority_did, last_fetched_at, created_at, updated_at, token_cost FROM happyview_lexicons WHERE id = ?",
         backend,
     );
     #[allow(clippy::type_complexity)]
@@ -318,7 +318,7 @@ pub(super) async fn delete_lexicon(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::LexiconsDelete).await?;
     let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM lexicons WHERE id = ?", backend);
+    let sql = adapt_sql("DELETE FROM happyview_lexicons WHERE id = ?", backend);
     let result = sqlx::query(&sql)
         .bind(&id)
         .execute(&state.db)

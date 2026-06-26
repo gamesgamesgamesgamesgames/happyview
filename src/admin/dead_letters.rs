@@ -57,8 +57,8 @@ impl DeadLetterSource {
 
     fn table(self) -> &'static str {
         match self {
-            Self::LegacyHooks => "dead_letter_hooks",
-            Self::Scripts => "dead_letter_scripts",
+            Self::LegacyHooks => "happyview_dead_letter_hooks",
+            Self::Scripts => "happyview_dead_letter_scripts",
         }
     }
 }
@@ -366,7 +366,7 @@ async fn list_legacy(
     let backend = state.db_backend;
     let mut sql = String::from(
         "SELECT id, lexicon_id, uri, did, collection, rkey, action, error, attempts, created_at, resolved_at
-         FROM dead_letter_hooks WHERE 1=1",
+         FROM happyview_dead_letter_hooks WHERE 1=1",
     );
     match resolved {
         "false" => sql.push_str(" AND resolved_at IS NULL"),
@@ -440,7 +440,7 @@ async fn list_scripts(
     let backend = state.db_backend;
     let mut sql = String::from(
         "SELECT id, script_ref, host_kind, host_id, payload, error, attempts, created_at, resolved_at
-         FROM dead_letter_scripts WHERE 1=1",
+         FROM happyview_dead_letter_scripts WHERE 1=1",
     );
     match resolved {
         "false" => sql.push_str(" AND resolved_at IS NULL"),
@@ -577,7 +577,7 @@ async fn detail_legacy(state: &AppState, id: &str) -> Result<DeadLetterDetail, A
     let backend = state.db_backend;
     let sql = adapt_sql(
         "SELECT id, lexicon_id, uri, did, collection, rkey, action, error, attempts, created_at, resolved_at, record
-         FROM dead_letter_hooks WHERE id = ?",
+         FROM happyview_dead_letter_hooks WHERE id = ?",
         backend,
     );
 
@@ -624,7 +624,7 @@ async fn detail_scripts(state: &AppState, id: &str) -> Result<DeadLetterDetail, 
     let backend = state.db_backend;
     let sql = adapt_sql(
         "SELECT id, script_ref, host_kind, host_id, payload, error, attempts, created_at, resolved_at
-         FROM dead_letter_scripts WHERE id = ?",
+         FROM happyview_dead_letter_scripts WHERE id = ?",
         backend,
     );
     let id_int: i64 = id
@@ -688,7 +688,7 @@ async fn fetch_dead_letter_for_action(
             let backend = state.db_backend;
             let sql = adapt_sql(
                 "SELECT id, lexicon_id, uri, did, collection, rkey, action, record, error, attempts
-                 FROM dead_letter_hooks WHERE id = ? AND resolved_at IS NULL",
+                 FROM happyview_dead_letter_hooks WHERE id = ? AND resolved_at IS NULL",
                 backend,
             );
             #[allow(clippy::type_complexity)]
@@ -727,7 +727,7 @@ async fn fetch_dead_letter_for_action(
             let backend = state.db_backend;
             let id_int: i64 = id.parse().unwrap_or_default();
             let sql = adapt_sql(
-                "SELECT id, host_kind, payload FROM dead_letter_scripts
+                "SELECT id, host_kind, payload FROM happyview_dead_letter_scripts
                  WHERE id = ? AND resolved_at IS NULL",
                 backend,
             );
@@ -827,7 +827,8 @@ async fn resolve_bulk_ids(state: &AppState, body: &BulkRequest) -> Result<Vec<St
         let mut ids: Vec<String> = Vec::new();
 
         // Legacy table — supports the optional collection filter.
-        let mut sql = String::from("SELECT id FROM dead_letter_hooks WHERE resolved_at IS NULL");
+        let mut sql =
+            String::from("SELECT id FROM happyview_dead_letter_hooks WHERE resolved_at IS NULL");
         if body.collection.is_some() {
             sql.push_str(" AND collection = ?");
         }
@@ -843,8 +844,9 @@ async fn resolve_bulk_ids(state: &AppState, body: &BulkRequest) -> Result<Vec<St
         ids.extend(rows.into_iter().map(|r| r.0));
 
         {
-            let mut sql =
-                String::from("SELECT id FROM dead_letter_scripts WHERE resolved_at IS NULL");
+            let mut sql = String::from(
+                "SELECT id FROM happyview_dead_letter_scripts WHERE resolved_at IS NULL",
+            );
             if body.collection.is_some() {
                 sql.push_str(" AND collection = ?");
             }

@@ -22,7 +22,7 @@ pub async fn authenticate_confidential(
     let secret_hash = hex::encode(Sha256::digest(client_secret.as_bytes()));
 
     let sql = adapt_sql(
-        "SELECT id, client_key, client_type, scopes, allowed_origins, client_secret_hash FROM api_clients WHERE client_key = ? AND is_active = 1",
+        "SELECT id, client_key, client_type, scopes, allowed_origins, client_secret_hash FROM happyview_api_clients WHERE client_key = ? AND is_active = 1",
         backend,
     );
 
@@ -67,7 +67,7 @@ pub async fn authenticate_public(
     origin: Option<&str>,
 ) -> Result<ResolvedClient, AppError> {
     let sql = adapt_sql(
-        "SELECT id, client_key, client_type, scopes, allowed_origins FROM api_clients WHERE client_key = ? AND is_active = 1",
+        "SELECT id, client_key, client_type, scopes, allowed_origins FROM happyview_api_clients WHERE client_key = ? AND is_active = 1",
         backend,
     );
 
@@ -126,7 +126,7 @@ pub async fn resolve_client_by_key(
     client_key: &str,
 ) -> Result<ResolvedClient, AppError> {
     let sql = adapt_sql(
-        "SELECT id, client_key, client_type, scopes, allowed_origins FROM api_clients WHERE client_key = ? AND is_active = 1",
+        "SELECT id, client_key, client_type, scopes, allowed_origins FROM happyview_api_clients WHERE client_key = ? AND is_active = 1",
         backend,
     );
 

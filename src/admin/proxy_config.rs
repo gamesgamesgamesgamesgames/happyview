@@ -49,7 +49,7 @@ pub(super) async fn put(
     let now = now_rfc3339();
     let sql = adapt_sql(
         r#"
-        INSERT INTO instance_settings (key, value, updated_at)
+        INSERT INTO happyview_instance_settings (key, value, updated_at)
         VALUES (?, ?, ?)
         ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?
         "#,

@@ -60,7 +60,7 @@ pub(super) async fn create_user(
     let backend = state.db_backend;
 
     let insert_sql = adapt_sql(
-        "INSERT INTO users (id, did, is_super, created_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, ?, ?)",
         backend,
     );
 
@@ -74,7 +74,7 @@ pub(super) async fn create_user(
         .map_err(|e| AppError::Internal(format!("failed to create user: {e}")))?;
 
     let perm_sql = adapt_sql(
-        "INSERT INTO user_permissions (user_id, permission, granted_by, granted_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        "INSERT INTO happyview_user_permissions (user_id, permission, granted_by, granted_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
         backend,
     );
 
@@ -129,7 +129,7 @@ pub(super) async fn list_users(
     let backend = state.db_backend;
 
     let select_sql = adapt_sql(
-        "SELECT id, did, is_super, created_at, last_used_at FROM users ORDER BY created_at",
+        "SELECT id, did, is_super, created_at, last_used_at FROM happyview_users ORDER BY created_at",
         backend,
     );
 
@@ -139,7 +139,7 @@ pub(super) async fn list_users(
         .map_err(|e| AppError::Internal(format!("failed to list users: {e}")))?;
 
     let perm_sql = adapt_sql(
-        "SELECT permission FROM user_permissions WHERE user_id = ? ORDER BY permission",
+        "SELECT permission FROM happyview_user_permissions WHERE user_id = ? ORDER BY permission",
         backend,
     );
 
@@ -175,7 +175,7 @@ pub(super) async fn get_user(
     let backend = state.db_backend;
 
     let select_sql = adapt_sql(
-        "SELECT id, did, is_super, created_at, last_used_at FROM users WHERE id = ?",
+        "SELECT id, did, is_super, created_at, last_used_at FROM happyview_users WHERE id = ?",
         backend,
     );
 
@@ -190,7 +190,7 @@ pub(super) async fn get_user(
     };
 
     let perm_sql = adapt_sql(
-        "SELECT permission FROM user_permissions WHERE user_id = ? ORDER BY permission",
+        "SELECT permission FROM happyview_user_permissions WHERE user_id = ? ORDER BY permission",
         backend,
     );
 
@@ -229,7 +229,7 @@ pub(super) async fn update_permissions(
     }
 
     // Cannot modify super user's permissions
-    let select_sql = adapt_sql("SELECT is_super FROM users WHERE id = ?", backend);
+    let select_sql = adapt_sql("SELECT is_super FROM happyview_users WHERE id = ?", backend);
     let target: Option<(i32,)> = sqlx::query_as(&select_sql)
         .bind(&id)
         .fetch_optional(&state.db)
@@ -276,7 +276,7 @@ pub(super) async fn update_permissions(
     let now = now_rfc3339();
 
     let grant_sql = adapt_sql(
-        "INSERT INTO user_permissions (user_id, permission, granted_by, granted_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        "INSERT INTO happyview_user_permissions (user_id, permission, granted_by, granted_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
         backend,
     );
 
@@ -292,7 +292,7 @@ pub(super) async fn update_permissions(
     }
 
     let revoke_sql = adapt_sql(
-        "DELETE FROM user_permissions WHERE user_id = ? AND permission = ?",
+        "DELETE FROM happyview_user_permissions WHERE user_id = ? AND permission = ?",
         backend,
     );
 
@@ -340,7 +340,7 @@ pub(super) async fn delete_user(
     }
 
     // Cannot delete super user
-    let select_sql = adapt_sql("SELECT is_super FROM users WHERE id = ?", backend);
+    let select_sql = adapt_sql("SELECT is_super FROM happyview_users WHERE id = ?", backend);
     let target: Option<(i32,)> = sqlx::query_as(&select_sql)
         .bind(&id)
         .fetch_optional(&state.db)
@@ -359,7 +359,7 @@ pub(super) async fn delete_user(
     let now = now_rfc3339();
 
     let revoke_keys_sql = adapt_sql(
-        "UPDATE api_keys SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+        "UPDATE happyview_api_keys SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
         backend,
     );
 
@@ -370,7 +370,7 @@ pub(super) async fn delete_user(
         .await
         .map_err(|e| AppError::Internal(format!("failed to revoke api keys: {e}")))?;
 
-    let delete_sql = adapt_sql("DELETE FROM users WHERE id = ?", backend);
+    let delete_sql = adapt_sql("DELETE FROM happyview_users WHERE id = ?", backend);
 
     let result = sqlx::query(&delete_sql)
         .bind(&id)
@@ -414,7 +414,10 @@ pub(super) async fn transfer_super(
     let now = now_rfc3339();
 
     // Remove super from current user
-    let update1_sql = adapt_sql("UPDATE users SET is_super = ? WHERE id = ?", backend);
+    let update1_sql = adapt_sql(
+        "UPDATE happyview_users SET is_super = ? WHERE id = ?",
+        backend,
+    );
     sqlx::query(&update1_sql)
         .bind(0_i32)
         .bind(&auth.user_id)
@@ -423,7 +426,10 @@ pub(super) async fn transfer_super(
         .map_err(|e| AppError::Internal(format!("failed to remove super: {e}")))?;
 
     // Set super on target user
-    let update2_sql = adapt_sql("UPDATE users SET is_super = ? WHERE id = ?", backend);
+    let update2_sql = adapt_sql(
+        "UPDATE happyview_users SET is_super = ? WHERE id = ?",
+        backend,
+    );
     let result = sqlx::query(&update2_sql)
         .bind(1_i32)
         .bind(&body.target_user_id)
@@ -433,7 +439,10 @@ pub(super) async fn transfer_super(
 
     if result.rows_affected() == 0 {
         // Restore super on current user
-        let restore_sql = adapt_sql("UPDATE users SET is_super = ? WHERE id = ?", backend);
+        let restore_sql = adapt_sql(
+            "UPDATE happyview_users SET is_super = ? WHERE id = ?",
+            backend,
+        );
         let _ = sqlx::query(&restore_sql)
             .bind(1_i32)
             .bind(&auth.user_id)
@@ -447,7 +456,7 @@ pub(super) async fn transfer_super(
 
     // Ensure target has all permissions
     let perm_sql = adapt_sql(
-        "INSERT INTO user_permissions (user_id, permission, granted_by, granted_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        "INSERT INTO happyview_user_permissions (user_id, permission, granted_by, granted_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
         backend,
     );
 

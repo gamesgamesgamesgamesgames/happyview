@@ -54,7 +54,7 @@ impl UserAuth {
         backend: DatabaseBackend,
     ) -> Result<HashSet<Permission>, AppError> {
         let sql = adapt_sql(
-            "SELECT permission FROM user_permissions WHERE user_id = ?",
+            "SELECT permission FROM happyview_user_permissions WHERE user_id = ?",
             backend,
         );
         let rows: Vec<(String,)> = sqlx::query_as(&sql)
@@ -110,7 +110,7 @@ impl FromRequestParts<AppState> for UserAuth {
         let did = claims.did().to_string();
         let backend = state.db_backend;
 
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM happyview_users")
             .fetch_one(&state.db)
             .await
             .map_err(|e| AppError::Internal(format!("user count query failed: {e}")))?;
@@ -121,7 +121,7 @@ impl FromRequestParts<AppState> for UserAuth {
             let now = now_rfc3339();
 
             let insert_sql = adapt_sql(
-                "INSERT INTO users (id, did, is_super, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, ?, ?)",
                 backend,
             );
 
@@ -135,7 +135,7 @@ impl FromRequestParts<AppState> for UserAuth {
 
             if result.is_ok() {
                 let perm_sql = adapt_sql(
-                    "INSERT INTO user_permissions (user_id, permission, granted_at) VALUES (?, ?, ?)",
+                    "INSERT INTO happyview_user_permissions (user_id, permission, granted_at) VALUES (?, ?, ?)",
                     backend,
                 );
                 for perm in Permission::all() {
@@ -164,7 +164,10 @@ impl FromRequestParts<AppState> for UserAuth {
             }
         }
 
-        let select_sql = adapt_sql("SELECT id, is_super FROM users WHERE did = ?", backend);
+        let select_sql = adapt_sql(
+            "SELECT id, is_super FROM happyview_users WHERE did = ?",
+            backend,
+        );
         let found: Option<(String, i32)> = sqlx::query_as(&select_sql)
             .bind(&did)
             .fetch_optional(&state.db)
@@ -185,7 +188,10 @@ impl FromRequestParts<AppState> for UserAuth {
         let db = state.db.clone();
         let uid = user_id.clone();
         let now = now_rfc3339();
-        let update_sql = adapt_sql("UPDATE users SET last_used_at = ? WHERE id = ?", backend);
+        let update_sql = adapt_sql(
+            "UPDATE happyview_users SET last_used_at = ? WHERE id = ?",
+            backend,
+        );
         tokio::spawn(async move {
             let _ = sqlx::query(&update_sql)
                 .bind(&now)
@@ -229,7 +235,7 @@ impl UserAuth {
         let backend = state.db_backend;
 
         let select_sql = adapt_sql(
-            "SELECT k.id, u.id, u.did, u.is_super, k.permissions FROM api_keys k JOIN users u ON u.id = k.user_id WHERE k.key_hash = ? AND k.revoked_at IS NULL",
+            "SELECT k.id, u.id, u.did, u.is_super, k.permissions FROM happyview_api_keys k JOIN happyview_users u ON u.id = k.user_id WHERE k.key_hash = ? AND k.revoked_at IS NULL",
             backend,
         );
 
@@ -256,7 +262,10 @@ impl UserAuth {
 
         let db = state.db.clone();
         let now = now_rfc3339();
-        let update_sql = adapt_sql("UPDATE api_keys SET last_used_at = ? WHERE id = ?", backend);
+        let update_sql = adapt_sql(
+            "UPDATE happyview_api_keys SET last_used_at = ? WHERE id = ?",
+            backend,
+        );
         tokio::spawn(async move {
             let _ = sqlx::query(&update_sql)
                 .bind(&now)

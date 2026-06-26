@@ -39,7 +39,7 @@ pub async fn store_state(
     let expires_str = expires_at.to_rfc3339();
 
     let sql = adapt_sql(
-        "INSERT INTO external_auth_state (state, did, plugin_id, redirect_uri, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_external_auth_state (state, did, plugin_id, redirect_uri, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -68,7 +68,7 @@ pub async fn consume_state(
 
     // Get state if not expired
     let sql = adapt_sql(
-        "SELECT did, plugin_id, redirect_uri FROM external_auth_state WHERE state = ? AND expires_at > ?",
+        "SELECT did, plugin_id, redirect_uri FROM happyview_external_auth_state WHERE state = ? AND expires_at > ?",
         backend,
     );
 
@@ -81,7 +81,10 @@ pub async fn consume_state(
     let (did, plugin_id, redirect_uri) = row.ok_or(StateError::NotFound)?;
 
     // Delete the state (one-time use)
-    let delete_sql = adapt_sql("DELETE FROM external_auth_state WHERE state = ?", backend);
+    let delete_sql = adapt_sql(
+        "DELETE FROM happyview_external_auth_state WHERE state = ?",
+        backend,
+    );
     sqlx::query(&delete_sql).bind(state).execute(db).await?;
 
     Ok(StoredState {
@@ -99,7 +102,7 @@ pub async fn cleanup_expired(
     let now = now_rfc3339();
 
     let sql = adapt_sql(
-        "DELETE FROM external_auth_state WHERE expires_at <= ?",
+        "DELETE FROM happyview_external_auth_state WHERE expires_at <= ?",
         backend,
     );
     let result = sqlx::query(&sql).bind(&now).execute(db).await?;

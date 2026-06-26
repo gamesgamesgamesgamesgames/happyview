@@ -42,7 +42,7 @@ async function seedRecords(
       const uri = `at://did:plc:e2e-test-admin/${COLLECTION}/record-${i}`
       const now = new Date().toISOString()
       await client.query(
-        `INSERT INTO records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+        `INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (uri) DO NOTHING`,
         [
@@ -68,7 +68,7 @@ async function cleanupRecords(
   const client = new pg.Client(DB_URL)
   await client.connect()
   try {
-    await client.query("DELETE FROM records WHERE collection = $1", [COLLECTION])
+    await client.query("DELETE FROM happyview_records WHERE collection = $1", [COLLECTION])
   } finally {
     await client.end()
   }

@@ -40,7 +40,7 @@ pub async fn lookup_record(
     let json_path = format!("$.{}", external_id_field);
 
     let sql = adapt_sql(
-        "SELECT uri, cid FROM records
+        "SELECT uri, cid FROM happyview_records
          WHERE collection = ?
          AND json_extract(record, ?) = ?
          LIMIT 1",

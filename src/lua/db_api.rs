@@ -210,7 +210,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
 
                 let did_clause = if did.is_some() { " AND did = ?" } else { "" };
                 let sql = adapt_sql(
-                    &format!("SELECT uri, did, record FROM records WHERE collection = ?{did_clause}{filter_clause} ORDER BY {order_expr} LIMIT ? OFFSET ?"),
+                    &format!("SELECT uri, did, record FROM happyview_records WHERE collection = ?{did_clause}{filter_clause} ORDER BY {order_expr} LIMIT ? OFFSET ?"),
                     backend,
                 );
                 let mut q = sqlx::query_as(&sql).bind(&collection);
@@ -262,7 +262,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                 };
                 let sql = adapt_sql(
                     &format!(
-                        "SELECT uri, did, record, created_at FROM records \
+                        "SELECT uri, did, record, created_at FROM happyview_records \
                          WHERE collection = ?{did_clause}{cursor_clause}{filter_clause} \
                          ORDER BY created_at DESC, uri DESC \
                          LIMIT ?"
@@ -321,7 +321,10 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
         let state = state_get.clone();
         async move {
             let backend = state.db_backend;
-            let sql = adapt_sql("SELECT record FROM records WHERE uri = ?", backend);
+            let sql = adapt_sql(
+                "SELECT record FROM happyview_records WHERE uri = ?",
+                backend,
+            );
             let row: Option<(String,)> = sqlx::query_as(&sql)
                 .bind(&uri)
                 .fetch_optional(&state.db)
@@ -366,7 +369,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
             let rows: Vec<(String, String, String)> = match backend {
                 DatabaseBackend::Sqlite => {
                     let sql = format!(
-                        "SELECT uri, did, record FROM records \
+                        "SELECT uri, did, record FROM happyview_records \
                          WHERE collection = ? \
                            AND json_extract(record, '$.{field}') LIKE ? COLLATE NOCASE \
                          ORDER BY \
@@ -390,7 +393,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                 }
                 DatabaseBackend::Postgres => {
                     let sql = format!(
-                        "SELECT uri, did, record FROM records \
+                        "SELECT uri, did, record FROM happyview_records \
                          WHERE collection = $1 \
                            AND record::jsonb->>'{field}' ILIKE $2 \
                          ORDER BY \
@@ -448,7 +451,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                 let backend = state.db_backend;
                 let count: (i64,) = if let Some(ref did) = did {
                     let sql = adapt_sql(
-                        "SELECT COUNT(*) FROM records WHERE collection = ? AND did = ?",
+                        "SELECT COUNT(*) FROM happyview_records WHERE collection = ? AND did = ?",
                         backend,
                     );
                     sqlx::query_as(&sql)
@@ -458,8 +461,10 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                         .await
                         .map_err(|e| mlua::Error::runtime(format!("DB count failed: {e}")))?
                 } else {
-                    let sql =
-                        adapt_sql("SELECT COUNT(*) FROM records WHERE collection = ?", backend);
+                    let sql = adapt_sql(
+                        "SELECT COUNT(*) FROM happyview_records WHERE collection = ?",
+                        backend,
+                    );
                     sqlx::query_as(&sql)
                         .bind(&collection)
                         .fetch_one(&state.db)
@@ -491,8 +496,8 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
             let rows_raw: Vec<RowType> = match (&did, &cursor_parts) {
                 (Some(did), Some((cursor_ts, cursor_uri))) => {
                     let sql = adapt_sql(
-                        "SELECT r.uri, r.did, r.record, r.created_at FROM records r \
-                         INNER JOIN record_refs ref ON ref.source_uri = r.uri \
+                        "SELECT r.uri, r.did, r.record, r.created_at FROM happyview_records r \
+                         INNER JOIN happyview_record_refs ref ON ref.source_uri = r.uri \
                          WHERE ref.target_uri = ? AND ref.collection = ? AND r.did = ? \
                          AND (r.created_at < ? OR (r.created_at = ? AND r.uri < ?)) \
                          ORDER BY r.created_at DESC, r.uri DESC \
@@ -513,8 +518,8 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                 }
                 (Some(did), None) => {
                     let sql = adapt_sql(
-                        "SELECT r.uri, r.did, r.record, r.created_at FROM records r \
-                         INNER JOIN record_refs ref ON ref.source_uri = r.uri \
+                        "SELECT r.uri, r.did, r.record, r.created_at FROM happyview_records r \
+                         INNER JOIN happyview_record_refs ref ON ref.source_uri = r.uri \
                          WHERE ref.target_uri = ? AND ref.collection = ? AND r.did = ? \
                          ORDER BY r.created_at DESC, r.uri DESC \
                          LIMIT ?",
@@ -531,8 +536,8 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                 }
                 (None, Some((cursor_ts, cursor_uri))) => {
                     let sql = adapt_sql(
-                        "SELECT r.uri, r.did, r.record, r.created_at FROM records r \
-                         INNER JOIN record_refs ref ON ref.source_uri = r.uri \
+                        "SELECT r.uri, r.did, r.record, r.created_at FROM happyview_records r \
+                         INNER JOIN happyview_record_refs ref ON ref.source_uri = r.uri \
                          WHERE ref.target_uri = ? AND ref.collection = ? \
                          AND (r.created_at < ? OR (r.created_at = ? AND r.uri < ?)) \
                          ORDER BY r.created_at DESC, r.uri DESC \
@@ -552,8 +557,8 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                 }
                 (None, None) => {
                     let sql = adapt_sql(
-                        "SELECT r.uri, r.did, r.record, r.created_at FROM records r \
-                         INNER JOIN record_refs ref ON ref.source_uri = r.uri \
+                        "SELECT r.uri, r.did, r.record, r.created_at FROM happyview_records r \
+                         INNER JOIN happyview_record_refs ref ON ref.source_uri = r.uri \
                          WHERE ref.target_uri = ? AND ref.collection = ? \
                          ORDER BY r.created_at DESC, r.uri DESC \
                          LIMIT ?",
@@ -808,7 +813,7 @@ mod tests {
         let state = test_state();
         let lua = setup(&state);
         let result: Result<mlua::Value, _> = lua
-            .load(r#"return db.raw("DELETE FROM records")"#)
+            .load(r#"return db.raw("DELETE FROM happyview_records")"#)
             .eval_async()
             .await;
         // Should fail with a DB connection error, NOT a validation error

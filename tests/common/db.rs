@@ -48,7 +48,7 @@ pub async fn truncate_all(pool: &AnyPool) {
     match backend {
         DatabaseBackend::Postgres => {
             sqlx::query(
-                "TRUNCATE records, lexicons, backfill_jobs, users, user_permissions, api_keys, event_logs, script_variables, scripts, dead_letter_scripts, dead_letter_hooks, record_refs, labeler_subscriptions, labels, instance_settings, domains, dpop_sessions, dpop_keys, api_clients, delegated_accounts, account_delegates, service_identity, service_entries, service_entry_xrpcs RESTART IDENTITY CASCADE",
+                "TRUNCATE happyview_records, happyview_lexicons, happyview_backfill_jobs, happyview_users, happyview_user_permissions, happyview_api_keys, happyview_event_logs, happyview_script_variables, happyview_scripts, happyview_dead_letter_scripts, happyview_dead_letter_hooks, happyview_record_refs, happyview_labeler_subscriptions, happyview_labels, happyview_instance_settings, happyview_domains, happyview_dpop_sessions, happyview_dpop_keys, happyview_api_clients, happyview_delegated_accounts, happyview_account_delegates, happyview_service_identity, happyview_service_entries, happyview_service_entry_xrpcs RESTART IDENTITY CASCADE",
             )
             .execute(pool)
             .await
@@ -56,30 +56,30 @@ pub async fn truncate_all(pool: &AnyPool) {
         }
         DatabaseBackend::Sqlite => {
             let tables = [
-                "service_entry_xrpcs",
-                "service_entries",
-                "service_identity",
-                "account_delegates",
-                "delegated_accounts",
-                "dpop_sessions",
-                "dpop_keys",
-                "api_clients",
-                "records",
-                "lexicons",
-                "backfill_jobs",
-                "users",
-                "user_permissions",
-                "api_keys",
-                "event_logs",
-                "script_variables",
-                "scripts",
-                "dead_letter_scripts",
-                "dead_letter_hooks",
-                "record_refs",
-                "labeler_subscriptions",
-                "labels",
-                "instance_settings",
-                "domains",
+                "happyview_service_entry_xrpcs",
+                "happyview_service_entries",
+                "happyview_service_identity",
+                "happyview_account_delegates",
+                "happyview_delegated_accounts",
+                "happyview_dpop_sessions",
+                "happyview_dpop_keys",
+                "happyview_api_clients",
+                "happyview_records",
+                "happyview_lexicons",
+                "happyview_backfill_jobs",
+                "happyview_users",
+                "happyview_user_permissions",
+                "happyview_api_keys",
+                "happyview_event_logs",
+                "happyview_script_variables",
+                "happyview_scripts",
+                "happyview_dead_letter_scripts",
+                "happyview_dead_letter_hooks",
+                "happyview_record_refs",
+                "happyview_labeler_subscriptions",
+                "happyview_labels",
+                "happyview_instance_settings",
+                "happyview_domains",
             ];
             for table in tables {
                 sqlx::query(&format!("DELETE FROM {table}"))

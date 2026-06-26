@@ -40,7 +40,10 @@ pub async fn sync_refs(
     let uris = extract_at_uris(record);
 
     // Delete existing refs for this source
-    let delete_sql = adapt_sql("DELETE FROM record_refs WHERE source_uri = ?", backend);
+    let delete_sql = adapt_sql(
+        "DELETE FROM happyview_record_refs WHERE source_uri = ?",
+        backend,
+    );
     sqlx::query(&delete_sql)
         .bind(source_uri)
         .execute(db)
@@ -48,7 +51,7 @@ pub async fn sync_refs(
 
     // Insert new refs
     let insert_sql = adapt_sql(
-        "INSERT INTO record_refs (source_uri, target_uri, collection) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+        "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
         backend,
     );
     for target_uri in &uris {

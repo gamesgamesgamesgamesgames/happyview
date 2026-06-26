@@ -24,7 +24,7 @@ pub async fn create_space(
         .map(|v| serde_json::to_string(v).unwrap_or_default());
 
     let sql = adapt_sql(
-        "INSERT INTO spaces (id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_spaces (id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -56,7 +56,7 @@ pub async fn get_space(
     id: &str,
 ) -> Result<Option<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, revision, created_at, updated_at FROM spaces WHERE id = ?",
+        "SELECT id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE id = ?",
         backend,
     );
 
@@ -77,7 +77,7 @@ pub async fn get_space_by_address(
     skey: &str,
 ) -> Result<Option<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, revision, created_at, updated_at FROM spaces WHERE did = ? AND type_nsid = ? AND skey = ?",
+        "SELECT id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE did = ? AND type_nsid = ? AND skey = ?",
         backend,
     );
 
@@ -98,7 +98,7 @@ pub async fn list_spaces_by_owner(
     owner_did: &str,
 ) -> Result<Vec<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, revision, created_at, updated_at FROM spaces WHERE owner_did = ? ORDER BY created_at DESC",
+        "SELECT id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE owner_did = ? ORDER BY created_at DESC",
         backend,
     );
 
@@ -128,12 +128,12 @@ pub async fn list_spaces_for_user(
 
     let sql = if decoded_cursor.is_some() {
         adapt_sql(
-            "SELECT s.did, s.owner_did, s.type_nsid, s.skey, sm.created_at FROM space_members sm JOIN spaces s ON s.id = sm.space_id WHERE sm.member_did = ? AND (sm.created_at > ? OR (sm.created_at = ? AND ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            "SELECT s.did, s.owner_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? AND (sm.created_at > ? OR (sm.created_at = ? AND ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
             backend,
         )
     } else {
         adapt_sql(
-            "SELECT s.did, s.owner_did, s.type_nsid, s.skey, sm.created_at FROM space_members sm JOIN spaces s ON s.id = sm.space_id WHERE sm.member_did = ? ORDER BY sm.created_at ASC, ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            "SELECT s.did, s.owner_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? ORDER BY sm.created_at ASC, ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
             backend,
         )
     };
@@ -187,7 +187,7 @@ pub async fn update_space(
         .map(|v| serde_json::to_string(v).unwrap_or_default());
 
     let sql = adapt_sql(
-        "UPDATE spaces SET display_name = ?, description = ?, access_mode = ?, app_allowlist = ?, app_denylist = ?, managing_app_did = ?, config = ?, updated_at = ? WHERE id = ?",
+        "UPDATE happyview_spaces SET display_name = ?, description = ?, access_mode = ?, app_allowlist = ?, app_denylist = ?, managing_app_did = ?, config = ?, updated_at = ? WHERE id = ?",
         backend,
     );
 
@@ -213,7 +213,7 @@ pub async fn delete_space(
     backend: DatabaseBackend,
     id: &str,
 ) -> Result<bool, AppError> {
-    let sql = adapt_sql("DELETE FROM spaces WHERE id = ?", backend);
+    let sql = adapt_sql("DELETE FROM happyview_spaces WHERE id = ?", backend);
 
     let result = sqlx::query(&sql)
         .bind(id)
@@ -288,7 +288,7 @@ pub async fn add_member(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO space_members (id, space_id, member_did, access, is_delegation, granted_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_members (id, space_id, member_did, access, is_delegation, granted_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -314,7 +314,7 @@ pub async fn remove_member(
     did: &str,
 ) -> Result<bool, AppError> {
     let sql = adapt_sql(
-        "DELETE FROM space_members WHERE space_id = ? AND member_did = ?",
+        "DELETE FROM happyview_space_members WHERE space_id = ? AND member_did = ?",
         backend,
     );
 
@@ -335,7 +335,7 @@ pub async fn get_member(
     did: &str,
 ) -> Result<Option<SpaceMember>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, member_did, access, is_delegation, granted_by, created_at FROM space_members WHERE space_id = ? AND member_did = ?",
+        "SELECT id, space_id, member_did, access, is_delegation, granted_by, created_at FROM happyview_space_members WHERE space_id = ? AND member_did = ?",
         backend,
     );
 
@@ -355,7 +355,7 @@ pub async fn list_direct_members(
     space_id: &str,
 ) -> Result<Vec<SpaceMember>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, member_did, access, is_delegation, granted_by, created_at FROM space_members WHERE space_id = ? ORDER BY created_at ASC",
+        "SELECT id, space_id, member_did, access, is_delegation, granted_by, created_at FROM happyview_space_members WHERE space_id = ? ORDER BY created_at ASC",
         backend,
     );
 
@@ -374,7 +374,7 @@ pub async fn list_spaces_for_member(
     did: &str,
 ) -> Result<Vec<SpaceMember>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, member_did, access, is_delegation, granted_by, created_at FROM space_members WHERE member_did = ? ORDER BY created_at ASC",
+        "SELECT id, space_id, member_did, access, is_delegation, granted_by, created_at FROM happyview_space_members WHERE member_did = ? ORDER BY created_at ASC",
         backend,
     );
 
@@ -419,10 +419,10 @@ pub async fn upsert_space_record(
 
     let sql = match backend {
         DatabaseBackend::Sqlite => {
-            "INSERT OR REPLACE INTO space_records (uri, space_id, author_did, collection, rkey, record, cid, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)".to_string()
+            "INSERT OR REPLACE INTO happyview_space_records (uri, space_id, author_did, collection, rkey, record, cid, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)".to_string()
         }
         DatabaseBackend::Postgres => adapt_sql(
-            "INSERT INTO space_records (uri, space_id, author_did, collection, rkey, record, cid, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at",
+            "INSERT INTO happyview_space_records (uri, space_id, author_did, collection, rkey, record, cid, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at",
             backend,
         ),
     };
@@ -449,7 +449,7 @@ pub async fn get_space_record(
     uri: &str,
 ) -> Result<Option<SpaceRecord>, AppError> {
     let sql = adapt_sql(
-        "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM space_records WHERE uri = ?",
+        "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE uri = ?",
         backend,
     );
 
@@ -470,7 +470,7 @@ pub async fn get_space_record_by_parts(
     rkey: &str,
 ) -> Result<Option<SpaceRecord>, AppError> {
     let sql = adapt_sql(
-        "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM space_records WHERE space_id = ? AND collection = ? AND rkey = ? LIMIT 1",
+        "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE space_id = ? AND collection = ? AND rkey = ? LIMIT 1",
         backend,
     );
 
@@ -514,7 +514,7 @@ pub async fn list_space_records(
 
     let where_clause = conditions.join(" AND ");
     let raw = format!(
-        "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM space_records WHERE {} ORDER BY indexed_at {}, uri {} LIMIT ?",
+        "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE {} ORDER BY indexed_at {}, uri {} LIMIT ?",
         where_clause, order, order
     );
     let sql = adapt_sql(&raw, backend);
@@ -560,7 +560,7 @@ pub async fn insert_space_record(
         .map_err(|e| AppError::Internal(format!("failed to serialize record: {e}")))?;
 
     let sql = adapt_sql(
-        "INSERT INTO space_records (uri, space_id, author_did, collection, rkey, record, cid, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_records (uri, space_id, author_did, collection, rkey, record, cid, indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -598,7 +598,7 @@ pub async fn upsert_space_record_with_swap(
         .map_err(|e| AppError::Internal(format!("failed to serialize record: {e}")))?;
 
     let sql = adapt_sql(
-        "UPDATE space_records SET record = ?, cid = ?, indexed_at = ? WHERE uri = ? AND cid = ?",
+        "UPDATE happyview_space_records SET record = ?, cid = ?, indexed_at = ? WHERE uri = ? AND cid = ?",
         backend,
     );
 
@@ -628,7 +628,7 @@ pub async fn delete_space_record(
     backend: DatabaseBackend,
     uri: &str,
 ) -> Result<bool, AppError> {
-    let sql = adapt_sql("DELETE FROM space_records WHERE uri = ?", backend);
+    let sql = adapt_sql("DELETE FROM happyview_space_records WHERE uri = ?", backend);
 
     let result = sqlx::query(&sql)
         .bind(uri)
@@ -646,7 +646,7 @@ pub async fn delete_space_record_with_swap(
     swap_cid: &str,
 ) -> Result<bool, AppError> {
     let sql = adapt_sql(
-        "DELETE FROM space_records WHERE uri = ? AND cid = ?",
+        "DELETE FROM happyview_space_records WHERE uri = ? AND cid = ?",
         backend,
     );
 
@@ -676,7 +676,7 @@ pub async fn update_space_revision(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE spaces SET revision = ?, updated_at = ? WHERE id = ?",
+        "UPDATE happyview_spaces SET revision = ?, updated_at = ? WHERE id = ?",
         backend,
     );
 
@@ -729,7 +729,7 @@ pub async fn create_invite(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO space_invites (id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_invites (id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -757,7 +757,7 @@ pub async fn get_invite_by_token_hash(
     token_hash: &str,
 ) -> Result<Option<SpaceInvite>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at FROM space_invites WHERE token_hash = ?",
+        "SELECT id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at FROM happyview_space_invites WHERE token_hash = ?",
         backend,
     );
 
@@ -776,7 +776,7 @@ pub async fn increment_invite_uses(
     invite_id: &str,
 ) -> Result<(), AppError> {
     let sql = adapt_sql(
-        "UPDATE space_invites SET uses = uses + 1 WHERE id = ?",
+        "UPDATE happyview_space_invites SET uses = uses + 1 WHERE id = ?",
         backend,
     );
 
@@ -794,7 +794,10 @@ pub async fn revoke_invite(
     backend: DatabaseBackend,
     invite_id: &str,
 ) -> Result<bool, AppError> {
-    let sql = adapt_sql("UPDATE space_invites SET revoked = 1 WHERE id = ?", backend);
+    let sql = adapt_sql(
+        "UPDATE happyview_space_invites SET revoked = 1 WHERE id = ?",
+        backend,
+    );
 
     let result = sqlx::query(&sql)
         .bind(invite_id)
@@ -811,7 +814,7 @@ pub async fn list_invites(
     space_id: &str,
 ) -> Result<Vec<SpaceInvite>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at FROM space_invites WHERE space_id = ? ORDER BY created_at DESC",
+        "SELECT id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at FROM happyview_space_invites WHERE space_id = ? ORDER BY created_at DESC",
         backend,
     );
 

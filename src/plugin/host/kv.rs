@@ -11,7 +11,7 @@ pub enum KvError {
 
 pub async fn kv_get(ctx: &HostContext, key: &str) -> Result<Option<Vec<u8>>, KvError> {
     let sql = adapt_sql(
-        "SELECT value FROM plugin_kv
+        "SELECT value FROM happyview_plugin_kv
          WHERE plugin_id = ? AND scope = ? AND key = ?
          AND (expires_at IS NULL OR expires_at > datetime('now'))",
         ctx.db_backend,
@@ -45,7 +45,7 @@ pub async fn kv_set(
 
     // Upsert
     let sql = adapt_sql(
-        "INSERT INTO plugin_kv (plugin_id, scope, key, value, expires_at, created_at)
+        "INSERT INTO happyview_plugin_kv (plugin_id, scope, key, value, expires_at, created_at)
          VALUES (?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT (plugin_id, scope, key)
          DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at",
@@ -66,7 +66,7 @@ pub async fn kv_set(
 
 pub async fn kv_delete(ctx: &HostContext, key: &str) -> Result<(), KvError> {
     let sql = adapt_sql(
-        "DELETE FROM plugin_kv WHERE plugin_id = ? AND scope = ? AND key = ?",
+        "DELETE FROM happyview_plugin_kv WHERE plugin_id = ? AND scope = ? AND key = ?",
         ctx.db_backend,
     );
 

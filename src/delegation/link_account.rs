@@ -47,7 +47,7 @@ pub async fn link_account(
     let api_client_id = crate::repo::get_dpop_client_id(&state, client_key).await?;
 
     let session_check_sql = crate::db::adapt_sql(
-        "SELECT id FROM dpop_sessions WHERE api_client_id = ? AND user_did = ?",
+        "SELECT id FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ?",
         state.db_backend,
     );
     let session_exists: Option<(String,)> = sqlx::query_as(&session_check_sql)

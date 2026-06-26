@@ -20,7 +20,7 @@ pub(super) async fn list(
 
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT key, value, created_at, updated_at FROM script_variables ORDER BY key",
+        "SELECT key, value, created_at, updated_at FROM happyview_script_variables ORDER BY key",
         backend,
     );
     let rows: Vec<(String, String, String, String)> = sqlx::query_as(&sql)
@@ -56,7 +56,7 @@ pub(super) async fn upsert(
     let now = now_rfc3339();
     let sql = adapt_sql(
         r#"
-        INSERT INTO script_variables (key, value, created_at)
+        INSERT INTO happyview_script_variables (key, value, created_at)
         VALUES (?, ?, ?)
         ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?
         "#,
@@ -97,7 +97,10 @@ pub(super) async fn delete(
     auth.require(Permission::ScriptVariablesDelete).await?;
 
     let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM script_variables WHERE key = ?", backend);
+    let sql = adapt_sql(
+        "DELETE FROM happyview_script_variables WHERE key = ?",
+        backend,
+    );
     let result = sqlx::query(&sql)
         .bind(&key)
         .execute(&state.db)

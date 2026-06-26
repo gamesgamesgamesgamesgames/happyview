@@ -12,7 +12,7 @@ pub(crate) async fn get_dpop_client_id(
     client_key: &str,
 ) -> Result<String, AppError> {
     let sql = adapt_sql(
-        "SELECT id FROM api_clients WHERE client_key = ? AND is_active = 1",
+        "SELECT id FROM happyview_api_clients WHERE client_key = ? AND is_active = 1",
         state.db_backend,
     );
 

@@ -139,7 +139,7 @@ async fn resolve_api_key_did(state: &AppState, token: &str) -> Result<String, Ap
 
     let hash = hex::encode(Sha256::digest(token.as_bytes()));
     let sql = adapt_sql(
-        "SELECT u.did FROM api_keys k JOIN users u ON k.user_id = u.id WHERE k.key_hash = ? AND k.revoked_at IS NULL",
+        "SELECT u.did FROM happyview_api_keys k JOIN happyview_users u ON k.user_id = u.id WHERE k.key_hash = ? AND k.revoked_at IS NULL",
         state.db_backend,
     );
     let row: Option<(String,)> = sqlx::query_as(&sql)

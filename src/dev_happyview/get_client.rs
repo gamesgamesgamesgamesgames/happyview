@@ -50,7 +50,7 @@ pub async fn get_api_client(
 
     let sql = adapt_sql(
         "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_at \
-         FROM api_clients \
+         FROM happyview_api_clients \
          WHERE id = $1 AND owner_did = $2",
         state.db_backend,
     );

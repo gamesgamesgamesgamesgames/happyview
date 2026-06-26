@@ -125,7 +125,7 @@ async fn seed_record(
     record: serde_json::Value,
 ) {
     let sql = adapt_sql(
-        "INSERT INTO records (uri, did, collection, rkey, record, cid, created_at)
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
@@ -143,7 +143,10 @@ async fn seed_record(
 }
 
 async fn count_records(pool: &sqlx::AnyPool, backend: DatabaseBackend, uri: &str) -> i64 {
-    let sql = adapt_sql("SELECT COUNT(*) FROM records WHERE uri = ?", backend);
+    let sql = adapt_sql(
+        "SELECT COUNT(*) FROM happyview_records WHERE uri = ?",
+        backend,
+    );
     let (count,): (i64,) = sqlx::query_as(&sql)
         .bind(uri)
         .fetch_one(pool)
@@ -157,7 +160,10 @@ async fn fetch_record_body(
     backend: DatabaseBackend,
     uri: &str,
 ) -> Option<serde_json::Value> {
-    let sql = adapt_sql("SELECT record FROM records WHERE uri = ?", backend);
+    let sql = adapt_sql(
+        "SELECT record FROM happyview_records WHERE uri = ?",
+        backend,
+    );
     let row: Option<(String,)> = sqlx::query_as(&sql)
         .bind(uri)
         .fetch_optional(pool)

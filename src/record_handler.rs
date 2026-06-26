@@ -103,7 +103,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
             let backend = state.db_backend;
             let insert_sql = adapt_sql(
                 r#"
-                INSERT INTO records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+                INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (uri) DO UPDATE
                     SET record = EXCLUDED.record,
@@ -216,7 +216,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                 return;
             }
 
-            let delete_sql = adapt_sql("DELETE FROM records WHERE uri = ?", backend);
+            let delete_sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
             match sqlx::query(&delete_sql).bind(&uri).execute(db).await {
                 Ok(_) => {
                     if state.verbose_event_logging.load(Ordering::Relaxed) {
@@ -275,7 +275,7 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
 
     // Check if this NSID is one we're tracking and the DID matches the authority.
     let select_sql = adapt_sql(
-        "SELECT target_collection FROM lexicons WHERE id = ? AND source = 'network' AND authority_did = ?",
+        "SELECT target_collection FROM happyview_lexicons WHERE id = ? AND source = 'network' AND authority_did = ?",
         backend,
     );
     let tracked: Option<(Option<String>,)> = sqlx::query_as(&select_sql)
@@ -317,13 +317,13 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
             let now = now_rfc3339();
             let upsert_sql = adapt_sql(
                 r#"
-                INSERT INTO lexicons (id, lexicon_json, backfill, target_collection, source, authority_did, last_fetched_at, created_at)
+                INSERT INTO happyview_lexicons (id, lexicon_json, backfill, target_collection, source, authority_did, last_fetched_at, created_at)
                 VALUES (?, ?, 0, ?, 'network', ?, ?, ?)
                 ON CONFLICT (id) DO UPDATE SET
                     lexicon_json = EXCLUDED.lexicon_json,
                     target_collection = EXCLUDED.target_collection,
                     last_fetched_at = ?,
-                    revision = lexicons.revision + 1,
+                    revision = happyview_lexicons.revision + 1,
                     updated_at = ?
                 "#,
                 backend,
@@ -354,7 +354,7 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
         }
         "delete" => {
             // Remove from lexicons table and registry.
-            let delete_sql = adapt_sql("DELETE FROM lexicons WHERE id = ?", backend);
+            let delete_sql = adapt_sql("DELETE FROM happyview_lexicons WHERE id = ?", backend);
             let _ = sqlx::query(&delete_sql).bind(nsid).execute(db).await;
 
             let was_present = lexicons.remove(nsid).await;

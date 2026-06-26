@@ -52,7 +52,7 @@ async function ensureTestUser(did: string): Promise<void> {
     const id = "e2e-test-user-id"
     const now = new Date().toISOString()
     await client.query(
-      `INSERT INTO users (id, did, is_super, created_at)
+      `INSERT INTO happyview_users (id, did, is_super, created_at)
        VALUES ($1, $2, 1, $3)
        ON CONFLICT (did) DO NOTHING`,
       [id, did, now],
@@ -66,7 +66,7 @@ export async function resetServiceIdentity(): Promise<void> {
   const client = new pg.Client(DB_URL)
   await client.connect()
   try {
-    await client.query("DELETE FROM service_identity")
+    await client.query("DELETE FROM happyview_service_identity")
   } finally {
     await client.end()
   }
@@ -81,7 +81,7 @@ export async function setServiceIdentityMode(
   try {
     const now = new Date().toISOString()
     await client.query(
-      `INSERT INTO service_identity (id, mode, did, attached_account_did, setup_complete, created_at, updated_at)
+      `INSERT INTO happyview_service_identity (id, mode, did, attached_account_did, setup_complete, created_at, updated_at)
        VALUES (1, $1, $2, $3, TRUE, $4, $4)
        ON CONFLICT (id) DO UPDATE SET
          mode = $1,

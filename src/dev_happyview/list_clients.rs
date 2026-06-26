@@ -44,7 +44,7 @@ pub async fn list_api_clients(
     // Reject requests from child clients
     if let Some(client_key) = claims.client_key() {
         let sql = adapt_sql(
-            "SELECT parent_client_id FROM api_clients WHERE client_key = $1",
+            "SELECT parent_client_id FROM happyview_api_clients WHERE client_key = $1",
             state.db_backend,
         );
         let parent_check: Option<Option<String>> = sqlx::query_scalar(&sql)
@@ -63,7 +63,7 @@ pub async fn list_api_clients(
     // Fetch all clients owned by the authenticated user
     let sql = adapt_sql(
         "SELECT id, client_key, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_at \
-         FROM api_clients \
+         FROM happyview_api_clients \
          WHERE owner_did = $1 \
          ORDER BY created_at DESC",
         state.db_backend,

@@ -115,7 +115,7 @@ async fn seed_record(
     record: serde_json::Value,
 ) {
     let sql = adapt_sql(
-        "INSERT INTO records (uri, did, collection, rkey, record, cid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
     sqlx::query(&sql)
@@ -141,7 +141,7 @@ async fn seed_label(
 ) {
     if let Some(exp) = exp {
         let sql = adapt_sql(
-            "INSERT INTO labels (src, uri, val, cts, exp) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO happyview_labels (src, uri, val, cts, exp) VALUES (?, ?, ?, ?, ?)",
             backend,
         );
         sqlx::query(&sql)
@@ -155,7 +155,7 @@ async fn seed_label(
             .expect("failed to seed label");
     } else {
         let sql = adapt_sql(
-            "INSERT INTO labels (src, uri, val, cts) VALUES (?, ?, ?, ?)",
+            "INSERT INTO happyview_labels (src, uri, val, cts) VALUES (?, ?, ?, ?)",
             backend,
         );
         sqlx::query(&sql)
@@ -205,7 +205,7 @@ async fn get_labels_returns_external_labels() {
 
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "SELECT src, uri, val FROM labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
+        "SELECT src, uri, val FROM happyview_labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
         backend,
     );
     let rows: Vec<(String, String, String)> = sqlx::query_as(&sql)
@@ -255,7 +255,7 @@ async fn get_labels_filters_expired() {
 
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "SELECT src, uri, val FROM labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
+        "SELECT src, uri, val FROM happyview_labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
         backend,
     );
     let rows: Vec<(String, String, String)> = sqlx::query_as(&sql)
@@ -289,7 +289,10 @@ async fn get_labels_includes_self_labels() {
     });
     seed_record(&pool, backend, uri, "did:plc:author", record.clone()).await;
 
-    let sql = adapt_sql("SELECT did, record FROM records WHERE uri = ?", backend);
+    let sql = adapt_sql(
+        "SELECT did, record FROM happyview_records WHERE uri = ?",
+        backend,
+    );
     let fetched: Option<(String, String)> = sqlx::query_as(&sql)
         .bind(uri)
         .fetch_optional(&pool)
@@ -332,7 +335,7 @@ async fn get_labels_empty_for_unlabeled_record() {
 
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "SELECT src, uri, val FROM labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
+        "SELECT src, uri, val FROM happyview_labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
         backend,
     );
     let rows: Vec<(String, String, String)> = sqlx::query_as(&sql)
@@ -370,7 +373,7 @@ async fn get_labels_batch_returns_labels_per_uri() {
     .await;
 
     let sql = adapt_sql(
-        "INSERT INTO records (uri, did, collection, rkey, record, cid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
     sqlx::query(&sql)
@@ -391,7 +394,7 @@ async fn get_labels_batch_returns_labels_per_uri() {
 
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "SELECT src, uri, val FROM labels WHERE uri IN (?, ?) AND (exp IS NULL OR exp > ?)",
+        "SELECT src, uri, val FROM happyview_labels WHERE uri IN (?, ?) AND (exp IS NULL OR exp > ?)",
         backend,
     );
     let rows: Vec<(String, String, String)> = sqlx::query_as(&sql)
@@ -424,7 +427,7 @@ async fn get_labels_batch_empty_for_no_labels() {
 
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "SELECT src, uri, val FROM labels WHERE uri IN (?, ?) AND (exp IS NULL OR exp > ?)",
+        "SELECT src, uri, val FROM happyview_labels WHERE uri IN (?, ?) AND (exp IS NULL OR exp > ?)",
         backend,
     );
     let rows: Vec<(String, String, String)> = sqlx::query_as(&sql)
@@ -457,7 +460,7 @@ async fn label_negation_removes_row() {
 
     // Verify it exists
     let sql = adapt_sql(
-        "SELECT COUNT(*) FROM labels WHERE src = ? AND uri = ? AND val = ?",
+        "SELECT COUNT(*) FROM happyview_labels WHERE src = ? AND uri = ? AND val = ?",
         backend,
     );
     let count: (i64,) = sqlx::query_as(&sql)
@@ -471,7 +474,7 @@ async fn label_negation_removes_row() {
 
     // Simulate negation (same logic as labeler.rs)
     let sql = adapt_sql(
-        "DELETE FROM labels WHERE src = ? AND uri = ? AND val = ?",
+        "DELETE FROM happyview_labels WHERE src = ? AND uri = ? AND val = ?",
         backend,
     );
     sqlx::query(&sql)
@@ -484,7 +487,7 @@ async fn label_negation_removes_row() {
 
     // Verify it's gone
     let sql = adapt_sql(
-        "SELECT COUNT(*) FROM labels WHERE src = ? AND uri = ? AND val = ?",
+        "SELECT COUNT(*) FROM happyview_labels WHERE src = ? AND uri = ? AND val = ?",
         backend,
     );
     let count: (i64,) = sqlx::query_as(&sql)
@@ -513,10 +516,10 @@ async fn label_upsert_is_idempotent() {
 
     let upsert_sql = match backend {
         DatabaseBackend::Postgres => {
-            "INSERT INTO labels (src, uri, val, cts) VALUES ($1, $2, $3, $4) ON CONFLICT (src, uri, val) DO UPDATE SET cts = EXCLUDED.cts".to_string()
+            "INSERT INTO happyview_labels (src, uri, val, cts) VALUES ($1, $2, $3, $4) ON CONFLICT (src, uri, val) DO UPDATE SET cts = EXCLUDED.cts".to_string()
         }
         DatabaseBackend::Sqlite => {
-            "INSERT INTO labels (src, uri, val, cts) VALUES (?, ?, ?, ?) ON CONFLICT (src, uri, val) DO UPDATE SET cts = excluded.cts".to_string()
+            "INSERT INTO happyview_labels (src, uri, val, cts) VALUES (?, ?, ?, ?) ON CONFLICT (src, uri, val) DO UPDATE SET cts = excluded.cts".to_string()
         }
     };
 
@@ -533,7 +536,7 @@ async fn label_upsert_is_idempotent() {
     }
 
     let sql = adapt_sql(
-        "SELECT COUNT(*) FROM labels WHERE src = ? AND uri = ? AND val = ?",
+        "SELECT COUNT(*) FROM happyview_labels WHERE src = ? AND uri = ? AND val = ?",
         backend,
     );
     let count: (i64,) = sqlx::query_as(&sql)

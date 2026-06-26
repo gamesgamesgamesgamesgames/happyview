@@ -300,7 +300,7 @@ async fn delete_api_client_success() {
     let client_id = uuid::Uuid::new_v4().to_string();
     let now = happyview::db::now_rfc3339();
     let sql = happyview::db::adapt_sql(
-        "INSERT INTO api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at, owner_did) \
+        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at, owner_did) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
         app.state.db_backend,
     );
@@ -413,7 +413,7 @@ async fn get_api_client_returns_client() {
     let client_id = uuid::Uuid::new_v4().to_string();
     let now = happyview::db::now_rfc3339();
     let sql = happyview::db::adapt_sql(
-        "INSERT INTO api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at, owner_did) \
+        "INSERT INTO happyview_api_clients (id, client_key, client_secret_hash, name, client_id_url, client_uri, redirect_uris, scopes, client_type, allowed_origins, is_active, created_by, created_at, updated_at, owner_did) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
         app.state.db_backend,
     );

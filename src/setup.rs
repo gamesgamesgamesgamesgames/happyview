@@ -191,7 +191,7 @@ async fn plc_register(
 
     // Decrypt rotation key
     let sql = crate::db::adapt_sql(
-        "SELECT rotation_key_enc FROM service_identity WHERE id = 1",
+        "SELECT rotation_key_enc FROM happyview_service_identity WHERE id = 1",
         state.db_backend,
     );
     let row: Option<(Option<String>,)> = sqlx::query_as(&sql)
@@ -260,7 +260,7 @@ async fn plc_request(
     let account_did = match identity.mode {
         IdentityMode::AttachAccount => {
             let sql = crate::db::adapt_sql(
-                "SELECT attached_account_did FROM service_identity WHERE id = 1",
+                "SELECT attached_account_did FROM happyview_service_identity WHERE id = 1",
                 state.db_backend,
             );
             let row: Option<(Option<String>,)> = sqlx::query_as(&sql)
@@ -318,7 +318,7 @@ async fn plc_submit(
     let account_did = match identity.mode {
         IdentityMode::AttachAccount => {
             let sql = crate::db::adapt_sql(
-                "SELECT attached_account_did FROM service_identity WHERE id = 1",
+                "SELECT attached_account_did FROM happyview_service_identity WHERE id = 1",
                 state.db_backend,
             );
             let row: Option<(Option<String>,)> = sqlx::query_as(&sql)
@@ -492,7 +492,7 @@ async fn attach_auth_confirm(
 
     // Verify the current DID matches the configured attached_account_did
     let sql = crate::db::adapt_sql(
-        "SELECT attached_account_did FROM service_identity WHERE id = 1",
+        "SELECT attached_account_did FROM happyview_service_identity WHERE id = 1",
         state.db_backend,
     );
     let row: Option<(Option<String>,)> = sqlx::query_as(&sql)
@@ -518,7 +518,7 @@ async fn attach_auth_confirm(
 
     // Verify the original DID is a known admin user
     let user_exists: Option<(i32,)> = sqlx::query_as(&crate::db::adapt_sql(
-        "SELECT 1 FROM users WHERE did = ?",
+        "SELECT 1 FROM happyview_users WHERE did = ?",
         state.db_backend,
     ))
     .bind(&original_did)
@@ -564,7 +564,7 @@ async fn export_rotation_key(
     }
 
     let sql = crate::db::adapt_sql(
-        "SELECT rotation_key_enc FROM service_identity WHERE id = 1",
+        "SELECT rotation_key_enc FROM happyview_service_identity WHERE id = 1",
         state.db_backend,
     );
     let row: Option<(Option<String>,)> = sqlx::query_as(&sql)

@@ -57,7 +57,7 @@ pub async fn store_dpop_session(
 
     let now = now_rfc3339();
     let sql = adapt_sql(
-        r#"INSERT INTO dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, created_at, updated_at)
+        r#"INSERT INTO happyview_dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (api_client_id, user_did, dpop_key_id) DO UPDATE SET
                access_token_enc = EXCLUDED.access_token_enc,
@@ -100,7 +100,7 @@ pub async fn get_dpop_session(
     dpop_key_id: &str,
 ) -> Result<DpopSession, AppError> {
     let sql = adapt_sql(
-        "SELECT id, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer FROM dpop_sessions WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+        "SELECT id, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
         backend,
     );
 
@@ -163,7 +163,7 @@ pub async fn get_dpop_session_by_key_id(
     dpop_key_id: &str,
 ) -> Result<DpopSession, AppError> {
     let sql = adapt_sql(
-        "SELECT id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer FROM dpop_sessions WHERE api_client_id = ? AND dpop_key_id = ?",
+        "SELECT id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer FROM happyview_dpop_sessions WHERE api_client_id = ? AND dpop_key_id = ?",
         backend,
     );
 
@@ -225,7 +225,7 @@ pub async fn delete_dpop_session(
     dpop_key_id: &str,
 ) -> Result<String, AppError> {
     let del_session_sql = adapt_sql(
-        "DELETE FROM dpop_sessions WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+        "DELETE FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
         backend,
     );
     sqlx::query(&del_session_sql)
@@ -236,7 +236,7 @@ pub async fn delete_dpop_session(
         .await
         .map_err(|e| AppError::Internal(format!("failed to delete DPoP session: {e}")))?;
 
-    let del_key_sql = adapt_sql("DELETE FROM dpop_keys WHERE id = ?", backend);
+    let del_key_sql = adapt_sql("DELETE FROM happyview_dpop_keys WHERE id = ?", backend);
     sqlx::query(&del_key_sql)
         .bind(dpop_key_id)
         .execute(pool)
@@ -254,7 +254,7 @@ pub async fn delete_all_dpop_sessions(
     user_did: &str,
 ) -> Result<(), AppError> {
     let key_ids_sql = adapt_sql(
-        "SELECT dpop_key_id FROM dpop_sessions WHERE api_client_id = ? AND user_did = ?",
+        "SELECT dpop_key_id FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ?",
         backend,
     );
     let key_ids: Vec<(String,)> = sqlx::query_as(&key_ids_sql)
@@ -265,7 +265,7 @@ pub async fn delete_all_dpop_sessions(
         .map_err(|e| AppError::Internal(format!("failed to list DPoP sessions: {e}")))?;
 
     let del_sessions_sql = adapt_sql(
-        "DELETE FROM dpop_sessions WHERE api_client_id = ? AND user_did = ?",
+        "DELETE FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ?",
         backend,
     );
     sqlx::query(&del_sessions_sql)
@@ -275,7 +275,7 @@ pub async fn delete_all_dpop_sessions(
         .await
         .map_err(|e| AppError::Internal(format!("failed to delete DPoP sessions: {e}")))?;
 
-    let del_key_sql = adapt_sql("DELETE FROM dpop_keys WHERE id = ?", backend);
+    let del_key_sql = adapt_sql("DELETE FROM happyview_dpop_keys WHERE id = ?", backend);
     for (key_id,) in key_ids {
         let _ = sqlx::query(&del_key_sql).bind(&key_id).execute(pool).await;
     }
@@ -291,7 +291,7 @@ pub async fn list_dpop_sessions(
     user_did: &str,
 ) -> Result<Vec<DpopSessionInfo>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, dpop_key_id, scopes, created_at, updated_at FROM dpop_sessions WHERE api_client_id = ? AND user_did = ?",
+        "SELECT id, dpop_key_id, scopes, created_at, updated_at FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ?",
         backend,
     );
 
@@ -327,7 +327,7 @@ pub async fn get_dpop_session_for_user(
     user_did: &str,
 ) -> Result<DpopSession, AppError> {
     let sql = adapt_sql(
-        "SELECT id, dpop_key_id, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer FROM dpop_sessions WHERE api_client_id = ? AND user_did = ? LIMIT 1",
+        "SELECT id, dpop_key_id, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? LIMIT 1",
         backend,
     );
 
@@ -389,7 +389,7 @@ pub async fn delete_dpop_session_by_id(
     user_did: &str,
 ) -> Result<String, AppError> {
     let lookup_sql = adapt_sql(
-        "SELECT dpop_key_id FROM dpop_sessions WHERE id = ? AND api_client_id = ? AND user_did = ?",
+        "SELECT dpop_key_id FROM happyview_dpop_sessions WHERE id = ? AND api_client_id = ? AND user_did = ?",
         backend,
     );
     let row: Option<(String,)> = sqlx::query_as(&lookup_sql)
@@ -402,14 +402,14 @@ pub async fn delete_dpop_session_by_id(
 
     let (dpop_key_id,) = row.ok_or_else(|| AppError::NotFound("DPoP session not found".into()))?;
 
-    let del_session_sql = adapt_sql("DELETE FROM dpop_sessions WHERE id = ?", backend);
+    let del_session_sql = adapt_sql("DELETE FROM happyview_dpop_sessions WHERE id = ?", backend);
     sqlx::query(&del_session_sql)
         .bind(session_id)
         .execute(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to delete DPoP session: {e}")))?;
 
-    let del_key_sql = adapt_sql("DELETE FROM dpop_keys WHERE id = ?", backend);
+    let del_key_sql = adapt_sql("DELETE FROM happyview_dpop_keys WHERE id = ?", backend);
     sqlx::query(&del_key_sql)
         .bind(&dpop_key_id)
         .execute(pool)

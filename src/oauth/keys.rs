@@ -117,7 +117,7 @@ pub async fn store_dpop_key(
 
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO dpop_keys (id, provision_id, api_client_id, private_key_enc, jwk_thumbprint, pkce_challenge, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_dpop_keys (id, provision_id, api_client_id, private_key_enc, jwk_thumbprint, pkce_challenge, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -145,7 +145,7 @@ pub async fn get_dpop_key(
 ) -> Result<(String, String, serde_json::Value, String, Option<String>), AppError> {
     // Returns: (id, api_client_id, private_jwk, thumbprint, pkce_challenge)
     let sql = adapt_sql(
-        "SELECT id, api_client_id, private_key_enc, jwk_thumbprint, pkce_challenge FROM dpop_keys WHERE provision_id = ?",
+        "SELECT id, api_client_id, private_key_enc, jwk_thumbprint, pkce_challenge FROM happyview_dpop_keys WHERE provision_id = ?",
         backend,
     );
 
@@ -174,7 +174,10 @@ pub async fn get_dpop_key_thumbprint(
     backend: DatabaseBackend,
     key_id: &str,
 ) -> Result<String, AppError> {
-    let sql = adapt_sql("SELECT jwk_thumbprint FROM dpop_keys WHERE id = ?", backend);
+    let sql = adapt_sql(
+        "SELECT jwk_thumbprint FROM happyview_dpop_keys WHERE id = ?",
+        backend,
+    );
 
     let row: Option<(String,)> = sqlx::query_as(&sql)
         .bind(key_id)
@@ -194,7 +197,7 @@ pub async fn get_dpop_key_id_by_thumbprint(
     thumbprint: &str,
 ) -> Result<String, AppError> {
     let sql = adapt_sql(
-        "SELECT id FROM dpop_keys WHERE api_client_id = ? AND jwk_thumbprint = ?",
+        "SELECT id FROM happyview_dpop_keys WHERE api_client_id = ? AND jwk_thumbprint = ?",
         backend,
     );
 
@@ -216,13 +219,16 @@ pub async fn delete_dpop_key(
     dpop_key_id: &str,
 ) -> Result<(), AppError> {
     // Session is deleted by CASCADE, but be explicit for clarity
-    let session_sql = adapt_sql("DELETE FROM dpop_sessions WHERE dpop_key_id = ?", backend);
+    let session_sql = adapt_sql(
+        "DELETE FROM happyview_dpop_sessions WHERE dpop_key_id = ?",
+        backend,
+    );
     let _ = sqlx::query(&session_sql)
         .bind(dpop_key_id)
         .execute(pool)
         .await;
 
-    let key_sql = adapt_sql("DELETE FROM dpop_keys WHERE id = ?", backend);
+    let key_sql = adapt_sql("DELETE FROM happyview_dpop_keys WHERE id = ?", backend);
     sqlx::query(&key_sql)
         .bind(dpop_key_id)
         .execute(pool)

@@ -242,7 +242,7 @@ impl OAuthClientRegistry {
         session_store_pool: sqlx::AnyPool,
     ) {
         let sql = adapt_sql(
-            "SELECT client_id_url, client_uri, redirect_uris, scopes FROM api_clients WHERE is_active = 1",
+            "SELECT client_id_url, client_uri, redirect_uris, scopes FROM happyview_api_clients WHERE is_active = 1",
             db_backend,
         );
 

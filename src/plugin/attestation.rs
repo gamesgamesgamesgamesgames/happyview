@@ -362,7 +362,10 @@ pub async fn load_or_generate(
     let default_sig_type = "games.gamesgamesgamesgames.attestation".to_string();
 
     // 2. Try loading from instance_settings
-    let sql = adapt_sql("SELECT value FROM instance_settings WHERE key = ?", backend);
+    let sql = adapt_sql(
+        "SELECT value FROM happyview_instance_settings WHERE key = ?",
+        backend,
+    );
     let existing: Option<(String,)> = sqlx::query_as(&sql)
         .bind("attestation_private_key")
         .fetch_optional(db)
@@ -404,7 +407,7 @@ pub async fn load_or_generate(
     };
 
     let upsert_sql = adapt_sql(
-        "INSERT INTO instance_settings (key, value, updated_at) VALUES (?, ?, ?) \
+        "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         backend,
     );
@@ -596,7 +599,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "CREATE TABLE instance_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE happyview_instance_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '')",
         )
         .execute(&pool)
         .await
@@ -635,7 +638,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "CREATE TABLE instance_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE happyview_instance_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '')",
         )
         .execute(&pool)
         .await

@@ -253,7 +253,7 @@ pub(super) async fn sync_plc(
 
     // Decrypt the rotation key for signing
     let rotation_key_enc_sql = crate::db::adapt_sql(
-        "SELECT rotation_key_enc FROM service_identity WHERE id = 1",
+        "SELECT rotation_key_enc FROM happyview_service_identity WHERE id = 1",
         state.db_backend,
     );
     let row: Option<(Option<String>,)> = sqlx::query_as(&rotation_key_enc_sql)
@@ -303,7 +303,7 @@ pub(super) async fn sync_plc_request(
     let account_did = match identity.mode {
         IdentityMode::AttachAccount => {
             let sql = crate::db::adapt_sql(
-                "SELECT attached_account_did FROM service_identity WHERE id = 1",
+                "SELECT attached_account_did FROM happyview_service_identity WHERE id = 1",
                 state.db_backend,
             );
             let row: Option<(Option<String>,)> = sqlx::query_as(&sql)
@@ -367,7 +367,7 @@ pub(super) async fn sync_plc_submit(
     let account_did = match identity.mode {
         IdentityMode::AttachAccount => {
             let sql = crate::db::adapt_sql(
-                "SELECT attached_account_did FROM service_identity WHERE id = 1",
+                "SELECT attached_account_did FROM happyview_service_identity WHERE id = 1",
                 state.db_backend,
             );
             let row: Option<(Option<String>,)> = sqlx::query_as(&sql)

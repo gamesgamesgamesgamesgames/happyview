@@ -225,7 +225,7 @@ async fn lookup_game_by_external_id(
 
     let sql = adapt_sql(
         &format!(
-            "SELECT uri, cid FROM records WHERE collection = 'games.gamesgamesgamesgames.game' AND {} = ? LIMIT 1",
+            "SELECT uri, cid FROM happyview_records WHERE collection = 'games.gamesgamesgamesgames.game' AND {} = ? LIMIT 1",
             json_path
         ),
         backend,

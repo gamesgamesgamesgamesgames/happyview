@@ -59,7 +59,7 @@ struct RecordEntry {
 
 async fn set_stage(state: &AppState, job_id: &str, stage: &str) {
     let sql = adapt_sql(
-        "UPDATE backfill_jobs SET stage = ? WHERE id = ?",
+        "UPDATE happyview_backfill_jobs SET stage = ? WHERE id = ?",
         state.db_backend,
     );
     let _ = sqlx::query(&sql)
@@ -78,10 +78,10 @@ async fn set_stage(state: &AppState, job_id: &str, stage: &str) {
 
 async fn update_job_counter(state: &AppState, job_id: &str, column: &str, value: i32) {
     let query = match column {
-        "total_repos" => "UPDATE backfill_jobs SET total_repos = ? WHERE id = ?",
-        "resolved_repos" => "UPDATE backfill_jobs SET resolved_repos = ? WHERE id = ?",
-        "processed_repos" => "UPDATE backfill_jobs SET processed_repos = ? WHERE id = ?",
-        "total_records" => "UPDATE backfill_jobs SET total_records = ? WHERE id = ?",
+        "total_repos" => "UPDATE happyview_backfill_jobs SET total_repos = ? WHERE id = ?",
+        "resolved_repos" => "UPDATE happyview_backfill_jobs SET resolved_repos = ? WHERE id = ?",
+        "processed_repos" => "UPDATE happyview_backfill_jobs SET processed_repos = ? WHERE id = ?",
+        "total_records" => "UPDATE happyview_backfill_jobs SET total_records = ? WHERE id = ?",
         other => {
             tracing::error!(
                 column = other,
@@ -100,7 +100,7 @@ async fn update_job_counter(state: &AppState, job_id: &str, column: &str, value:
 
 async fn count_repos(state: &AppState, job_id: &str) -> i32 {
     let sql = adapt_sql(
-        "SELECT COUNT(*) FROM backfill_repos WHERE job_id = ?",
+        "SELECT COUNT(*) FROM happyview_backfill_repos WHERE job_id = ?",
         state.db_backend,
     );
     sqlx::query_as::<_, (i32,)>(&sql)
@@ -160,7 +160,7 @@ async fn load_concurrency(state: &AppState) -> BackfillConcurrency {
 async fn fail_job(state: &AppState, job_id: &str, error: &str) {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE backfill_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
+        "UPDATE happyview_backfill_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
         state.db_backend,
     );
     let _ = sqlx::query(&sql)
@@ -181,7 +181,7 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) {
 
 async fn should_stop(state: &AppState, job_id: &str) -> Option<&'static str> {
     let sql = adapt_sql(
-        "SELECT status FROM backfill_jobs WHERE id = ?",
+        "SELECT status FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     );
     let status = sqlx::query_as::<_, (String,)>(&sql)
@@ -204,7 +204,7 @@ async fn should_stop_worker(state: &AppState, job_id: &str) -> bool {
 
 async fn request_cancel(state: &AppState, job_id: &str) {
     let sql = adapt_sql(
-        "UPDATE backfill_jobs SET status = 'cancelling' WHERE id = ? AND status IN ('running', 'paused')",
+        "UPDATE happyview_backfill_jobs SET status = 'cancelling' WHERE id = ? AND status IN ('running', 'paused')",
         state.db_backend,
     );
     let _ = sqlx::query(&sql)
@@ -216,7 +216,7 @@ async fn request_cancel(state: &AppState, job_id: &str) {
 async fn finalise_cancel(state: &AppState, job_id: &str) {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'cancelled by user' WHERE id = ?",
+        "UPDATE happyview_backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'cancelled by user' WHERE id = ?",
         state.db_backend,
     );
     let _ = sqlx::query(&sql)
@@ -236,7 +236,7 @@ async fn finalise_cancel(state: &AppState, job_id: &str) {
 
 async fn request_pause(state: &AppState, job_id: &str) {
     let sql = adapt_sql(
-        "UPDATE backfill_jobs SET status = 'pausing' WHERE id = ? AND status = 'running'",
+        "UPDATE happyview_backfill_jobs SET status = 'pausing' WHERE id = ? AND status = 'running'",
         state.db_backend,
     );
     let _ = sqlx::query(&sql)
@@ -247,7 +247,7 @@ async fn request_pause(state: &AppState, job_id: &str) {
 
 async fn finalise_pause(state: &AppState, job_id: &str) {
     let sql = adapt_sql(
-        "UPDATE backfill_jobs SET status = 'paused' WHERE id = ?",
+        "UPDATE happyview_backfill_jobs SET status = 'paused' WHERE id = ?",
         state.db_backend,
     );
     let _ = sqlx::query(&sql)
@@ -273,7 +273,7 @@ async fn complete_job(
 ) {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE backfill_jobs SET status = 'completed', stage = 'completed', completed_at = ?, processed_repos = ?, total_records = ?, error = ? WHERE id = ?",
+        "UPDATE happyview_backfill_jobs SET status = 'completed', stage = 'completed', completed_at = ?, processed_repos = ?, total_records = ?, error = ? WHERE id = ?",
         state.db_backend,
     );
     let _ = sqlx::query(&sql)
@@ -308,7 +308,7 @@ async fn run_discovery_phase(
 
     if let Some(did) = specific_did {
         let sql = adapt_sql(
-            "INSERT INTO backfill_repos (job_id, did) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            "INSERT INTO happyview_backfill_repos (job_id, did) VALUES (?, ?) ON CONFLICT DO NOTHING",
             state.db_backend,
         );
         let _ = sqlx::query(&sql)
@@ -405,7 +405,7 @@ async fn discover_repos_from_relay(
             };
 
             for chunk in body.repos.chunks(chunk_size) {
-                let base_sql = "INSERT INTO backfill_repos (job_id, did) VALUES ";
+                let base_sql = "INSERT INTO happyview_backfill_repos (job_id, did) VALUES ";
                 let placeholders: Vec<String> = chunk
                     .iter()
                     .enumerate()
@@ -472,7 +472,7 @@ async fn run_pipelined_resolve_and_fetch(
     // Count already-resolved and already-completed repos for accurate progress
     let already_resolved: i32 = {
         let sql = adapt_sql(
-            "SELECT COUNT(*) FROM backfill_repos WHERE job_id = ? AND pds_endpoint IS NOT NULL",
+            "SELECT COUNT(*) FROM happyview_backfill_repos WHERE job_id = ? AND pds_endpoint IS NOT NULL",
             state.db_backend,
         );
         sqlx::query_as::<_, (i32,)>(&sql)
@@ -485,7 +485,7 @@ async fn run_pipelined_resolve_and_fetch(
 
     let already_completed: i32 = {
         let sql = adapt_sql(
-            "SELECT COUNT(*) FROM backfill_repos WHERE job_id = ? AND status = 'completed'",
+            "SELECT COUNT(*) FROM happyview_backfill_repos WHERE job_id = ? AND status = 'completed'",
             state.db_backend,
         );
         sqlx::query_as::<_, (i32,)>(&sql)
@@ -501,7 +501,7 @@ async fn run_pipelined_resolve_and_fetch(
 
     let existing_records: i32 = {
         let sql = adapt_sql(
-            "SELECT total_records FROM backfill_jobs WHERE id = ?",
+            "SELECT total_records FROM happyview_backfill_jobs WHERE id = ?",
             state.db_backend,
         );
         sqlx::query_as::<_, (Option<i32>,)>(&sql)
@@ -531,7 +531,7 @@ async fn run_pipelined_resolve_and_fetch(
 
     let resolver_handle = tokio::spawn(async move {
         let sql = adapt_sql(
-            "SELECT did FROM backfill_repos WHERE job_id = ? AND pds_endpoint IS NULL",
+            "SELECT did FROM happyview_backfill_repos WHERE job_id = ? AND pds_endpoint IS NULL",
             resolver_state.db_backend,
         );
         let unresolved: Vec<(String,)> = sqlx::query_as(&sql)
@@ -570,7 +570,7 @@ async fn run_pipelined_resolve_and_fetch(
             match result {
                 Ok(pds) => {
                     let sql = adapt_sql(
-                        "UPDATE backfill_repos SET pds_endpoint = ? WHERE job_id = ? AND did = ?",
+                        "UPDATE happyview_backfill_repos SET pds_endpoint = ? WHERE job_id = ? AND did = ?",
                         resolver_state.db_backend,
                     );
                     let _ = sqlx::query(&sql)
@@ -644,7 +644,7 @@ async fn run_pipelined_resolve_and_fetch(
 
     // --- Also send already-resolved-but-unfetched DIDs to the fetcher ---
     let pending_sql = adapt_sql(
-        "SELECT did, pds_endpoint FROM backfill_repos WHERE job_id = ? AND status = 'pending' AND pds_endpoint IS NOT NULL",
+        "SELECT did, pds_endpoint FROM happyview_backfill_repos WHERE job_id = ? AND status = 'pending' AND pds_endpoint IS NOT NULL",
         state.db_backend,
     );
     let pending_rows: Vec<(String, String)> = sqlx::query_as(&pending_sql)
@@ -827,7 +827,7 @@ async fn run_pipelined_resolve_and_fetch(
 
     // Persist final counts
     let sql = adapt_sql(
-        "UPDATE backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
+        "UPDATE happyview_backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
         state.db_backend,
     );
     let _ = sqlx::query(&sql)
@@ -874,7 +874,7 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
 
                 // Mark DID as completed
                 let sql = adapt_sql(
-                    "UPDATE backfill_repos SET status = 'completed', records_fetched = ? WHERE job_id = ? AND did = ?",
+                    "UPDATE happyview_backfill_repos SET status = 'completed', records_fetched = ? WHERE job_id = ? AND did = ?",
                     state.db_backend,
                 );
                 let _ = sqlx::query(&sql)
@@ -895,7 +895,7 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
                 let records = total_records.load(Ordering::Relaxed);
                 if repos >= next_flush {
                     let sql = adapt_sql(
-                        "UPDATE backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
+                        "UPDATE happyview_backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
                         state.db_backend,
                     );
                     let _ = sqlx::query(&sql)
@@ -973,7 +973,7 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
         total_records.fetch_add(records, Ordering::Relaxed);
 
         let sql = adapt_sql(
-            "UPDATE backfill_repos SET status = 'completed', records_fetched = ? WHERE job_id = ? AND did = ?",
+            "UPDATE happyview_backfill_repos SET status = 'completed', records_fetched = ? WHERE job_id = ? AND did = ?",
             state.db_backend,
         );
         let _ = sqlx::query(&sql)
@@ -1011,7 +1011,7 @@ async fn run_fetching_phase(
 
     // Load pending repos grouped by PDS
     let sql = adapt_sql(
-        "SELECT did, pds_endpoint FROM backfill_repos WHERE job_id = ? AND status = 'pending' AND pds_endpoint IS NOT NULL",
+        "SELECT did, pds_endpoint FROM happyview_backfill_repos WHERE job_id = ? AND status = 'pending' AND pds_endpoint IS NOT NULL",
         state.db_backend,
     );
     let rows: Vec<(String, String)> = sqlx::query_as(&sql)
@@ -1027,7 +1027,7 @@ async fn run_fetching_phase(
 
     // Count already-completed repos for accurate progress
     let sql = adapt_sql(
-        "SELECT COUNT(*) FROM backfill_repos WHERE job_id = ? AND status = 'completed'",
+        "SELECT COUNT(*) FROM happyview_backfill_repos WHERE job_id = ? AND status = 'completed'",
         state.db_backend,
     );
     let already_completed: i32 = sqlx::query_as::<_, (i32,)>(&sql)
@@ -1043,7 +1043,7 @@ async fn run_fetching_phase(
     // Seed total_records from DB so a resumed job doesn't lose its prior count
     let existing_records: i32 = {
         let sql = adapt_sql(
-            "SELECT total_records FROM backfill_jobs WHERE id = ?",
+            "SELECT total_records FROM happyview_backfill_jobs WHERE id = ?",
             state.db_backend,
         );
         sqlx::query_as::<_, (Option<i32>,)>(&sql)
@@ -1127,7 +1127,7 @@ async fn run_fetching_phase(
 
                             // Mark DID as completed
                             let sql = adapt_sql(
-                                "UPDATE backfill_repos SET status = 'completed', records_fetched = ? WHERE job_id = ? AND did = ?",
+                                "UPDATE happyview_backfill_repos SET status = 'completed', records_fetched = ? WHERE job_id = ? AND did = ?",
                                 state.db_backend,
                             );
                             let _ = sqlx::query(&sql)
@@ -1146,7 +1146,7 @@ async fn run_fetching_phase(
                             {
                                 let backend = state.db_backend;
                                 let sql = adapt_sql(
-                                    "UPDATE backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
+                                    "UPDATE happyview_backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
                                     backend,
                                 );
                                 let _ = sqlx::query(&sql)
@@ -1180,7 +1180,7 @@ async fn run_fetching_phase(
 
     // Persist final counts so they're accurate regardless of batch size
     let sql = adapt_sql(
-        "UPDATE backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
+        "UPDATE happyview_backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
         state.db_backend,
     );
     let _ = sqlx::query(&sql)
@@ -1215,7 +1215,7 @@ async fn batch_upsert_records(state: &AppState, batch: &[PreparedRecord]) {
         .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?)".to_string())
         .collect();
     let raw_sql = format!(
-        "INSERT INTO records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES {} ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at",
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES {} ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at",
         placeholders.join(", ")
     );
     let sql = adapt_sql(&raw_sql, backend);
@@ -1241,7 +1241,7 @@ async fn batch_upsert_records(state: &AppState, batch: &[PreparedRecord]) {
     let uris: Vec<&str> = batch.iter().map(|r| r.uri.as_str()).collect();
     let delete_placeholders: Vec<&str> = (0..uris.len()).map(|_| "?").collect();
     let delete_raw = format!(
-        "DELETE FROM record_refs WHERE source_uri IN ({})",
+        "DELETE FROM happyview_record_refs WHERE source_uri IN ({})",
         delete_placeholders.join(", ")
     );
     let delete_sql = adapt_sql(&delete_raw, backend);
@@ -1265,7 +1265,7 @@ async fn batch_upsert_records(state: &AppState, batch: &[PreparedRecord]) {
     for chunk in all_refs.chunks(300) {
         let ref_placeholders: Vec<&str> = (0..chunk.len()).map(|_| "(?, ?, ?)").collect();
         let ref_raw = format!(
-            "INSERT INTO record_refs (source_uri, target_uri, collection) VALUES {} ON CONFLICT DO NOTHING",
+            "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES {} ON CONFLICT DO NOTHING",
             ref_placeholders.join(", ")
         );
         let ref_sql = adapt_sql(&ref_raw, backend);
@@ -1279,7 +1279,7 @@ async fn batch_upsert_records(state: &AppState, batch: &[PreparedRecord]) {
     // Queue label backfill only if there are active labeler subscriptions.
     // Check once per batch instead of spawning a task per record.
     let has_subscriptions: bool = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM labeler_subscriptions WHERE status = 'active'",
+        "SELECT COUNT(*) FROM happyview_labeler_subscriptions WHERE status = 'active'",
     )
     .fetch_one(&state.db)
     .await
@@ -1395,7 +1395,7 @@ async fn run_backfill_job(state: AppState, job_id: String) {
 
     // Load job metadata
     let sql = adapt_sql(
-        "SELECT collection, did, stage FROM backfill_jobs WHERE id = ?",
+        "SELECT collection, did, stage FROM happyview_backfill_jobs WHERE id = ?",
         backend,
     );
     let job: Option<(Option<String>, Option<String>, String)> = sqlx::query_as(&sql)
@@ -1425,7 +1425,7 @@ async fn run_backfill_job(state: AppState, job_id: String) {
         vec![col.clone()]
     } else {
         let sql = adapt_sql(
-            "SELECT id FROM lexicons WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record'",
+            "SELECT id FROM happyview_lexicons WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record'",
             backend,
         );
         let rows: Vec<(String,)> = match sqlx::query_as(&sql).fetch_all(&state.backfill_db).await {
@@ -1553,7 +1553,7 @@ pub(super) async fn create_backfill(
     let now = now_rfc3339();
     let job_id = Uuid::new_v4().to_string();
     let sql = adapt_sql(
-        "INSERT INTO backfill_jobs (id, collection, did, status, stage, started_at, created_at) VALUES (?, ?, ?, 'running', 'pending', ?, ?) RETURNING id",
+        "INSERT INTO happyview_backfill_jobs (id, collection, did, status, stage, started_at, created_at) VALUES (?, ?, ?, 'running', 'pending', ?, ?) RETURNING id",
         backend,
     );
     let row: (String,) = sqlx::query_as(&sql)
@@ -1607,7 +1607,7 @@ pub(super) async fn cancel_backfill(
     admin.require(Permission::BackfillCreate).await?;
 
     let sql = adapt_sql(
-        "SELECT status FROM backfill_jobs WHERE id = ?",
+        "SELECT status FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     );
     let row: Option<(String,)> = sqlx::query_as(&sql)
@@ -1672,7 +1672,7 @@ pub(super) async fn pause_backfill(
     admin.require(Permission::BackfillCreate).await?;
 
     let sql = adapt_sql(
-        "SELECT status FROM backfill_jobs WHERE id = ?",
+        "SELECT status FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     );
     let row: Option<(String,)> = sqlx::query_as(&sql)
@@ -1719,7 +1719,7 @@ pub(super) async fn resume_backfill(
     admin.require(Permission::BackfillCreate).await?;
 
     let sql = adapt_sql(
-        "SELECT status FROM backfill_jobs WHERE id = ?",
+        "SELECT status FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     );
     let row: Option<(String,)> = sqlx::query_as(&sql)
@@ -1735,7 +1735,7 @@ pub(super) async fn resume_backfill(
         ))),
         Some(_) => {
             let sql = adapt_sql(
-                "UPDATE backfill_jobs SET status = 'running' WHERE id = ?",
+                "UPDATE happyview_backfill_jobs SET status = 'running' WHERE id = ?",
                 state.db_backend,
             );
             let _ = sqlx::query(&sql)
@@ -1777,7 +1777,7 @@ pub(super) async fn backfill_status(
     let backend = state.db_backend;
 
     let sql = adapt_sql(
-        "SELECT id, collection, did, status, stage, total_repos, resolved_repos, processed_repos, total_records, error, started_at, completed_at, created_at FROM backfill_jobs ORDER BY created_at DESC",
+        "SELECT id, collection, did, status, stage, total_repos, resolved_repos, processed_repos, total_records, error, started_at, completed_at, created_at FROM happyview_backfill_jobs ORDER BY created_at DESC",
         backend,
     );
     #[allow(clippy::type_complexity)]
@@ -1921,7 +1921,7 @@ pub(super) async fn backfill_repos(
     };
 
     let sql_str = format!(
-        "SELECT did, pds_endpoint, status, records_fetched FROM backfill_repos WHERE job_id = ?{phase_filter}{cursor_filter} ORDER BY did ASC LIMIT ?",
+        "SELECT did, pds_endpoint, status, records_fetched FROM happyview_backfill_repos WHERE job_id = ?{phase_filter}{cursor_filter} ORDER BY did ASC LIMIT ?",
     );
     let sql = adapt_sql(&sql_str, state.db_backend);
 
@@ -1967,7 +1967,7 @@ pub(super) async fn backfill_pds_summary(
     auth.require(Permission::BackfillRead).await?;
 
     let sql = adapt_sql(
-        "SELECT pds_endpoint, COUNT(*) as total_repos, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_repos, SUM(records_fetched) as total_records FROM backfill_repos WHERE job_id = ? AND pds_endpoint IS NOT NULL GROUP BY pds_endpoint ORDER BY COUNT(*) DESC",
+        "SELECT pds_endpoint, COUNT(*) as total_repos, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_repos, SUM(records_fetched) as total_records FROM happyview_backfill_repos WHERE job_id = ? AND pds_endpoint IS NOT NULL GROUP BY pds_endpoint ORDER BY COUNT(*) DESC",
         state.db_backend,
     );
 
@@ -2006,7 +2006,7 @@ pub(super) async fn flush_backfill_details(
     auth.require(Permission::BackfillCreate).await?;
 
     let sql = adapt_sql(
-        "DELETE FROM backfill_repos WHERE job_id = ?",
+        "DELETE FROM happyview_backfill_repos WHERE job_id = ?",
         state.db_backend,
     );
     let _ = sqlx::query(&sql)
@@ -2024,7 +2024,7 @@ pub(super) async fn flush_all_backfill_details(
     auth.require(Permission::BackfillCreate).await?;
 
     let sql = adapt_sql(
-        "DELETE FROM backfill_repos WHERE job_id IN (SELECT id FROM backfill_jobs WHERE status IN ('completed', 'cancelled', 'failed'))",
+        "DELETE FROM happyview_backfill_repos WHERE job_id IN (SELECT id FROM happyview_backfill_jobs WHERE status IN ('completed', 'cancelled', 'failed'))",
         state.db_backend,
     );
     let _ = sqlx::query(&sql).execute(&state.backfill_db).await;
@@ -2061,7 +2061,7 @@ pub async fn run_backfill_retention_cleanup(state: &AppState) {
         let cutoff_str = cutoff.to_rfc3339();
 
         let sql = adapt_sql(
-            "DELETE FROM backfill_repos WHERE job_id IN (SELECT id FROM backfill_jobs WHERE completed_at IS NOT NULL AND completed_at < ?)",
+            "DELETE FROM happyview_backfill_repos WHERE job_id IN (SELECT id FROM happyview_backfill_jobs WHERE completed_at IS NOT NULL AND completed_at < ?)",
             state.db_backend,
         );
         match sqlx::query(&sql)
@@ -2094,7 +2094,7 @@ pub async fn run_backfill_retention_cleanup(state: &AppState) {
 /// Jobs stuck in `cancelling` are finalised immediately.
 pub async fn resume_backfill_jobs(state: &AppState) {
     let sql = adapt_sql(
-        "SELECT id, status FROM backfill_jobs WHERE status IN ('running', 'cancelling', 'pausing')",
+        "SELECT id, status FROM happyview_backfill_jobs WHERE status IN ('running', 'cancelling', 'pausing')",
         state.db_backend,
     );
     let rows: Vec<(String, String)> = sqlx::query_as(&sql)

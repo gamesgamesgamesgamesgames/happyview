@@ -119,7 +119,7 @@ pub fn register_atproto_api(
             let backend = state.db_backend;
             let now = now_rfc3339();
             let sql = adapt_sql(
-                "SELECT src, uri, val, cts FROM labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
+                "SELECT src, uri, val, cts FROM happyview_labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
                 backend,
             );
             let rows: Vec<(String, String, String, String)> = sqlx::query_as(&sql)
@@ -143,7 +143,7 @@ pub fn register_atproto_api(
             }
 
             // Check for self-labels in the record itself.
-            let record_sql = adapt_sql("SELECT did, record FROM records WHERE uri = ?", backend);
+            let record_sql = adapt_sql("SELECT did, record FROM happyview_records WHERE uri = ?", backend);
             let record: Option<(String, String)> = sqlx::query_as(&record_sql)
                 .bind(&uri)
                 .fetch_optional(&state.db)
@@ -191,7 +191,7 @@ pub fn register_atproto_api(
 
             // Query labels for all URIs (one query per URI since AnyPool doesn't support array binding).
             let label_sql = adapt_sql(
-                "SELECT src, uri, val, cts FROM labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
+                "SELECT src, uri, val, cts FROM happyview_labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
                 backend,
             );
             let mut rows: Vec<(String, String, String, String)> = Vec::new();
@@ -210,7 +210,7 @@ pub fn register_atproto_api(
 
             // Query records for self-labels.
             let record_sql = adapt_sql(
-                "SELECT uri, did, record FROM records WHERE uri = ?",
+                "SELECT uri, did, record FROM happyview_records WHERE uri = ?",
                 backend,
             );
             let mut records: Vec<(String, String, String)> = Vec::new();

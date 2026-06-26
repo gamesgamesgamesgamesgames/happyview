@@ -82,7 +82,7 @@ pub async fn get_identity(
     backend: DatabaseBackend,
 ) -> Result<Option<ServiceIdentity>, AppError> {
     let sql = adapt_sql(
-        "SELECT mode, did, signing_key_enc, attached_account_did, CAST(setup_complete AS INTEGER), created_at, updated_at FROM service_identity WHERE id = 1",
+        "SELECT mode, did, signing_key_enc, attached_account_did, CAST(setup_complete AS INTEGER), created_at, updated_at FROM happyview_service_identity WHERE id = 1",
         backend,
     );
 
@@ -139,7 +139,7 @@ pub async fn upsert_identity(
 ) -> Result<(), AppError> {
     let now = chrono::Utc::now().to_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO service_identity (id, mode, did, signing_key_enc, rotation_key_enc, attached_account_did, setup_complete, created_at, updated_at)
+        "INSERT INTO happyview_service_identity (id, mode, did, signing_key_enc, rotation_key_enc, attached_account_did, setup_complete, created_at, updated_at)
          VALUES (1, ?, ?, ?, ?, ?, FALSE, ?, ?)
          ON CONFLICT (id) DO UPDATE SET
              mode = excluded.mode,
@@ -171,7 +171,7 @@ pub async fn upsert_identity(
 pub async fn mark_setup_complete(db: &AnyPool, backend: DatabaseBackend) -> Result<(), AppError> {
     let now = chrono::Utc::now().to_rfc3339();
     let sql = adapt_sql(
-        "UPDATE service_identity SET setup_complete = TRUE, updated_at = ? WHERE id = 1",
+        "UPDATE happyview_service_identity SET setup_complete = TRUE, updated_at = ? WHERE id = 1",
         backend,
     );
 
