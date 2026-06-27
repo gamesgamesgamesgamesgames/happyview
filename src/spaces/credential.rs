@@ -1,13 +1,21 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer, signature::Verifier};
+use k256::ecdsa::{
+    Signature as K256Signature, SigningKey as K256SigningKey, VerifyingKey as K256VerifyingKey,
+    signature::Signer as K256Signer, signature::Verifier as K256Verifier,
+};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::profile;
 
-pub const DEFAULT_CREDENTIAL_TTL_SECS: u64 = 4 * 60 * 60; // 4 hours
-pub const GRANT_TTL_SECS: u64 = 5 * 60; // 5 minutes
+pub const DEFAULT_CREDENTIAL_TTL_SECS: u64 = 2 * 60 * 60; // 2 hours
+pub const DELEGATION_TOKEN_TTL_SECS: u64 = 60; // 60 seconds
+
+pub const DELEGATION_TOKEN_TYP: &str = "atproto-space-delegation+jwt";
+pub const SPACE_CREDENTIAL_TYP: &str = "atproto-space-credential+jwt";
 
 /// Peek at a JWT's header to check its `typ` field without verifying the signature.
 pub fn peek_jwt_typ(token: &str) -> Option<String> {
@@ -17,7 +25,7 @@ pub fn peek_jwt_typ(token: &str) -> Option<String> {
     header["typ"].as_str().map(|s| s.to_string())
 }
 
-/// Peek at a space credential JWT's payload to extract the `sub` (user DID) without verifying.
+/// Peek at a space credential JWT's payload to extract the `sub` (space URI) without verifying.
 pub fn peek_credential_sub(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -29,49 +37,111 @@ pub fn peek_credential_sub(token: &str) -> Option<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemberGrantClaims {
-    pub sub: String,
-    pub space: String,
-    pub scope: String,
+pub struct DelegationTokenClaims {
+    pub iss: String, // User DID
+    pub sub: String, // Space URI (ats://...)
+    pub aud: String, // Space host (did#atproto_space_host)
     pub iat: u64,
     pub exp: u64,
+    pub jti: String, // Random nonce
 }
 
-pub fn sign_grant(claims: &MemberGrantClaims, secret: &[u8; 32]) -> Result<String, AppError> {
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-    let key = jsonwebtoken::EncodingKey::from_secret(secret);
-    jsonwebtoken::encode(&header, claims, &key)
-        .map_err(|e| AppError::Internal(format!("failed to sign member grant: {e}")))
+pub fn sign_delegation_token(
+    claims: &DelegationTokenClaims,
+    signing_key: &K256SigningKey,
+) -> Result<String, AppError> {
+    let header = serde_json::json!({
+        "alg": "ES256K",
+        "typ": DELEGATION_TOKEN_TYP,
+        "kid": "#atproto",
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+
+    let message = format!("{}.{}", header_b64, payload_b64);
+    let signature: K256Signature = signing_key.sign(message.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    Ok(format!("{}.{}.{}", header_b64, payload_b64, sig_b64))
 }
 
-pub fn verify_grant(token: &str, secret: &[u8; 32]) -> Result<MemberGrantClaims, AppError> {
-    let key = jsonwebtoken::DecodingKey::from_secret(secret);
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-    validation.required_spec_claims.clear();
-    validation.validate_exp = false;
-    let data = jsonwebtoken::decode::<MemberGrantClaims>(token, &key, &validation)
-        .map_err(|e| AppError::Auth(format!("invalid member grant: {e}")))?;
+pub fn verify_delegation_token(
+    token: &str,
+    verifying_key: &K256VerifyingKey,
+) -> Result<DelegationTokenClaims, AppError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AppError::Auth("invalid delegation token format".into()));
+    }
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| AppError::Auth("invalid delegation token header encoding".into()))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|_| AppError::Auth("invalid delegation token header".into()))?;
+
+    if header["alg"].as_str() != Some("ES256K") {
+        return Err(AppError::Auth("delegation token alg must be ES256K".into()));
+    }
+
+    if header["typ"].as_str() != Some(DELEGATION_TOKEN_TYP) {
+        return Err(AppError::Auth(format!(
+            "delegation token typ must be {DELEGATION_TOKEN_TYP}"
+        )));
+    }
+
+    let message = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| AppError::Auth("invalid delegation token signature encoding".into()))?;
+
+    // Try direct verify, then with low-S normalization
+    let verified = if let Ok(sig) = K256Signature::from_bytes(sig_bytes.as_slice().into()) {
+        if verifying_key.verify(message.as_bytes(), &sig).is_ok() {
+            true
+        } else if let Some(normalized) = sig.normalize_s() {
+            verifying_key
+                .verify(message.as_bytes(), &normalized)
+                .is_ok()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if !verified {
+        return Err(AppError::Auth(
+            "delegation token signature verification failed".into(),
+        ));
+    }
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| AppError::Auth("invalid delegation token payload encoding".into()))?;
+    let claims: DelegationTokenClaims = serde_json::from_slice(&payload_bytes)
+        .map_err(|_| AppError::Auth("invalid delegation token payload".into()))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
-    if now >= data.claims.exp {
-        return Err(AppError::Auth("member grant has expired".into()));
+    if now >= claims.exp {
+        return Err(AppError::Auth("delegation token has expired".into()));
     }
 
-    Ok(data.claims)
+    Ok(claims)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpaceCredentialClaims {
-    pub iss: String,
-    pub sub: String,
-    pub space: String,
-    pub scope: String,
+    pub iss: String, // Space authority DID
+    pub sub: String, // Space URI (ats://...)
     pub iat: u64,
     pub exp: u64,
+    pub jti: String, // Random nonce
 }
 
 pub fn sign_credential(
@@ -91,7 +161,8 @@ pub fn sign_credential(
 
     let header = serde_json::json!({
         "alg": "ES256",
-        "typ": "space_credential",
+        "typ": SPACE_CREDENTIAL_TYP,
+        "kid": "#atproto_space",
     });
 
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
@@ -123,33 +194,13 @@ pub fn verify_credential(
         return Err(AppError::Auth("credential alg must be ES256".into()));
     }
 
-    if header["typ"].as_str() != Some("space_credential") {
-        return Err(AppError::Auth(
-            "credential typ must be space_credential".into(),
-        ));
+    if header["typ"].as_str() != Some(SPACE_CREDENTIAL_TYP) {
+        return Err(AppError::Auth(format!(
+            "credential typ must be {SPACE_CREDENTIAL_TYP}"
+        )));
     }
 
-    let x_b64 = public_jwk["x"]
-        .as_str()
-        .ok_or_else(|| AppError::Auth("public key missing x".into()))?;
-    let y_b64 = public_jwk["y"]
-        .as_str()
-        .ok_or_else(|| AppError::Auth("public key missing y".into()))?;
-
-    let x_bytes = URL_SAFE_NO_PAD
-        .decode(x_b64)
-        .map_err(|_| AppError::Auth("invalid public key x".into()))?;
-    let y_bytes = URL_SAFE_NO_PAD
-        .decode(y_b64)
-        .map_err(|_| AppError::Auth("invalid public key y".into()))?;
-
-    let mut sec1 = Vec::with_capacity(1 + 32 + 32);
-    sec1.push(0x04);
-    sec1.extend_from_slice(&x_bytes);
-    sec1.extend_from_slice(&y_bytes);
-
-    let verifying_key = VerifyingKey::from_sec1_bytes(&sec1)
-        .map_err(|_| AppError::Auth("invalid space credential public key".into()))?;
+    let verifying_key = p256_jwk_to_verifying_key(public_jwk)?;
 
     let message = format!("{}.{}", parts[0], parts[1]);
     let sig_bytes = URL_SAFE_NO_PAD
@@ -178,6 +229,31 @@ pub fn verify_credential(
     }
 
     Ok(claims)
+}
+
+/// Extract a P-256 verifying key from a JWK.
+pub fn p256_jwk_to_verifying_key(jwk: &serde_json::Value) -> Result<VerifyingKey, AppError> {
+    let x_b64 = jwk["x"]
+        .as_str()
+        .ok_or_else(|| AppError::Auth("JWK missing x".into()))?;
+    let y_b64 = jwk["y"]
+        .as_str()
+        .ok_or_else(|| AppError::Auth("JWK missing y".into()))?;
+
+    let x_bytes = URL_SAFE_NO_PAD
+        .decode(x_b64)
+        .map_err(|_| AppError::Auth("invalid JWK x".into()))?;
+    let y_bytes = URL_SAFE_NO_PAD
+        .decode(y_b64)
+        .map_err(|_| AppError::Auth("invalid JWK y".into()))?;
+
+    let mut sec1 = Vec::with_capacity(65);
+    sec1.push(0x04);
+    sec1.extend_from_slice(&x_bytes);
+    sec1.extend_from_slice(&y_bytes);
+
+    VerifyingKey::from_sec1_bytes(&sec1)
+        .map_err(|_| AppError::Auth("invalid P-256 public key".into()))
 }
 
 /// Convert a multibase-encoded P-256 public key (from a DID doc `publicKeyMultibase`)
@@ -215,14 +291,13 @@ pub fn multikey_to_p256_jwk(public_key_multibase: &str) -> Result<serde_json::Va
 
 /// Verify a space credential JWT issued by an external space host.
 ///
-/// Resolves the issuer's DID document, extracts the `#atproto` signing key,
+/// Resolves the issuer's DID document, extracts the `#atproto_space` signing key,
 /// and verifies the JWT signature and expiry.
 pub async fn verify_external_credential(
     token: &str,
     http: &reqwest::Client,
     plc_url: &str,
 ) -> Result<SpaceCredentialClaims, AppError> {
-    // Peek at the payload to extract the issuer DID without verifying yet
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(AppError::Auth("invalid credential format".into()));
@@ -239,8 +314,10 @@ pub async fn verify_external_credential(
     let vm = did_doc
         .verification_method
         .iter()
-        .find(|v| v.id.ends_with("#atproto"))
-        .ok_or_else(|| AppError::Auth("issuer DID has no #atproto verification method".into()))?;
+        .find(|v| v.id.ends_with("#atproto_space"))
+        .ok_or_else(|| {
+            AppError::Auth("issuer DID has no #atproto_space verification method".into())
+        })?;
 
     let multibase = vm
         .public_key_multibase
@@ -249,6 +326,10 @@ pub async fn verify_external_credential(
 
     let jwk = multikey_to_p256_jwk(multibase)?;
     verify_credential(token, &jwk)
+}
+
+pub fn make_jti() -> String {
+    Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]
@@ -263,11 +344,10 @@ mod tests {
             .as_secs();
         SpaceCredentialClaims {
             iss: "did:plc:spaceowner".into(),
-            sub: "did:plc:requester".into(),
-            space: "did:plc:spaceowner/com.example.forum/main".into(),
-            scope: "read".into(),
+            sub: "ats://did:plc:spaceowner/com.example.forum/main".into(),
             iat: now,
             exp: now + DEFAULT_CREDENTIAL_TTL_SECS,
+            jti: make_jti(),
         }
     }
 
@@ -281,10 +361,9 @@ mod tests {
 
         assert_eq!(verified.iss, claims.iss);
         assert_eq!(verified.sub, claims.sub);
-        assert_eq!(verified.space, claims.space);
-        assert_eq!(verified.scope, claims.scope);
         assert_eq!(verified.iat, claims.iat);
         assert_eq!(verified.exp, claims.exp);
+        assert_eq!(verified.jti, claims.jti);
     }
 
     #[test]
@@ -293,7 +372,6 @@ mod tests {
         let claims = make_claims();
         let token = sign_credential(&claims, &keypair.private_jwk).unwrap();
 
-        // Tamper with the payload
         let parts: Vec<&str> = token.split('.').collect();
         let mut payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
         payload_bytes[0] ^= 0xFF;
@@ -324,11 +402,10 @@ mod tests {
             .as_secs();
         let claims = SpaceCredentialClaims {
             iss: "did:plc:owner".into(),
-            sub: "did:plc:user".into(),
-            space: "did:plc:owner/test/main".into(),
-            scope: "read".into(),
+            sub: "ats://did:plc:owner/com.example.test/main".into(),
             iat: now - 7200,
-            exp: now - 3600, // expired 1 hour ago
+            exp: now - 3600,
+            jti: make_jti(),
         };
 
         let token = sign_credential(&claims, &keypair.private_jwk).unwrap();
@@ -344,73 +421,98 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn test_secret() -> [u8; 32] {
-        [0xAB; 32]
+    fn make_k256_signing_key() -> K256SigningKey {
+        let key_bytes = [0x42u8; 32];
+        K256SigningKey::from_bytes((&key_bytes[..]).into()).expect("valid key")
     }
 
-    #[test]
-    fn grant_sign_and_verify_roundtrip() {
-        let secret = test_secret();
+    fn make_delegation_claims() -> DelegationTokenClaims {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let claims = MemberGrantClaims {
-            sub: "did:plc:member".into(),
-            space: "ats://did:plc:space/com.example.forum/main".into(),
-            scope: "read".into(),
+        DelegationTokenClaims {
+            iss: "did:plc:member".into(),
+            sub: "ats://did:plc:space/com.example.forum/main".into(),
+            aud: "did:plc:space#atproto_space_host".into(),
             iat: now,
-            exp: now + GRANT_TTL_SECS,
-        };
+            exp: now + DELEGATION_TOKEN_TTL_SECS,
+            jti: make_jti(),
+        }
+    }
 
-        let token = sign_grant(&claims, &secret).unwrap();
-        let verified = verify_grant(&token, &secret).unwrap();
+    #[test]
+    fn delegation_sign_and_verify_roundtrip() {
+        let signing_key = make_k256_signing_key();
+        let verifying_key = K256VerifyingKey::from(&signing_key);
+        let claims = make_delegation_claims();
 
+        let token = sign_delegation_token(&claims, &signing_key).unwrap();
+        let verified = verify_delegation_token(&token, &verifying_key).unwrap();
+
+        assert_eq!(verified.iss, claims.iss);
         assert_eq!(verified.sub, claims.sub);
-        assert_eq!(verified.space, claims.space);
-        assert_eq!(verified.scope, claims.scope);
+        assert_eq!(verified.aud, claims.aud);
+        assert_eq!(verified.jti, claims.jti);
     }
 
     #[test]
-    fn grant_rejects_wrong_secret() {
-        let secret1 = [0xAB; 32];
-        let secret2 = [0xCD; 32];
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let claims = MemberGrantClaims {
-            sub: "did:plc:member".into(),
-            space: "ats://did:plc:space/com.example.forum/main".into(),
-            scope: "read".into(),
-            iat: now,
-            exp: now + GRANT_TTL_SECS,
-        };
+    fn delegation_rejects_wrong_key() {
+        let signing_key = make_k256_signing_key();
+        let other_key = K256SigningKey::from_bytes((&[0x99u8; 32][..]).into()).unwrap();
+        let verifying_key = K256VerifyingKey::from(&other_key);
+        let claims = make_delegation_claims();
 
-        let token = sign_grant(&claims, &secret1).unwrap();
-        let result = verify_grant(&token, &secret2);
+        let token = sign_delegation_token(&claims, &signing_key).unwrap();
+        let result = verify_delegation_token(&token, &verifying_key);
         assert!(result.is_err());
     }
 
     #[test]
-    fn grant_rejects_expired() {
-        let secret = test_secret();
+    fn delegation_rejects_expired() {
+        let signing_key = make_k256_signing_key();
+        let verifying_key = K256VerifyingKey::from(&signing_key);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let claims = MemberGrantClaims {
-            sub: "did:plc:member".into(),
-            space: "ats://did:plc:space/com.example.forum/main".into(),
-            scope: "read".into(),
-            iat: now - 600,
-            exp: now - 300,
+        let claims = DelegationTokenClaims {
+            iss: "did:plc:member".into(),
+            sub: "ats://did:plc:space/com.example.forum/main".into(),
+            aud: "did:plc:space#atproto_space_host".into(),
+            iat: now - 120,
+            exp: now - 60,
+            jti: make_jti(),
         };
 
-        let token = sign_grant(&claims, &secret).unwrap();
-        let result = verify_grant(&token, &secret);
+        let token = sign_delegation_token(&claims, &signing_key).unwrap();
+        let result = verify_delegation_token(&token, &verifying_key);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expired"));
+    }
+
+    #[test]
+    fn delegation_rejects_wrong_typ() {
+        let signing_key = make_k256_signing_key();
+        let verifying_key = K256VerifyingKey::from(&signing_key);
+        let claims = make_delegation_claims();
+
+        // Craft a token with wrong typ
+        let header = serde_json::json!({ "alg": "ES256K", "typ": "wrong-typ", "kid": "#atproto" });
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let message = format!("{}.{}", header_b64, payload_b64);
+        let sig: K256Signature = signing_key.sign(message.as_bytes());
+        let token = format!(
+            "{}.{}.{}",
+            header_b64,
+            payload_b64,
+            URL_SAFE_NO_PAD.encode(sig.to_bytes())
+        );
+
+        let result = verify_delegation_token(&token, &verifying_key);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("typ"));
     }
 
     #[test]
@@ -418,7 +520,15 @@ mod tests {
         let keypair = generate_dpop_keypair().unwrap();
         let claims = make_claims();
         let token = sign_credential(&claims, &keypair.private_jwk).unwrap();
-        assert_eq!(peek_jwt_typ(&token).as_deref(), Some("space_credential"));
+        assert_eq!(peek_jwt_typ(&token).as_deref(), Some(SPACE_CREDENTIAL_TYP));
+    }
+
+    #[test]
+    fn delegation_has_delegation_typ() {
+        let signing_key = make_k256_signing_key();
+        let claims = make_delegation_claims();
+        let token = sign_delegation_token(&claims, &signing_key).unwrap();
+        assert_eq!(peek_jwt_typ(&token).as_deref(), Some(DELEGATION_TOKEN_TYP));
     }
 
     #[test]
@@ -428,13 +538,13 @@ mod tests {
     }
 
     #[test]
-    fn peek_credential_sub_extracts_did() {
+    fn peek_credential_sub_extracts_space_uri() {
         let keypair = generate_dpop_keypair().unwrap();
         let claims = make_claims();
         let token = sign_credential(&claims, &keypair.private_jwk).unwrap();
         assert_eq!(
             peek_credential_sub(&token).as_deref(),
-            Some("did:plc:requester")
+            Some("ats://did:plc:spaceowner/com.example.forum/main")
         );
     }
 
@@ -468,5 +578,22 @@ mod tests {
         let result = verify_credential(&token, &keypair.public_jwk);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("typ"));
+    }
+
+    #[test]
+    fn multikey_to_p256_jwk_invalid_multibase() {
+        let result = multikey_to_p256_jwk("xabc123");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("multibase"));
+    }
+
+    #[test]
+    fn multikey_to_p256_jwk_wrong_codec() {
+        let mut bytes = vec![0x99u8, 0x99];
+        bytes.extend_from_slice(&[0u8; 33]);
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &bytes);
+        let result = multikey_to_p256_jwk(&encoded);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("P-256"));
     }
 }

@@ -188,12 +188,16 @@ pub async fn mark_setup_complete(db: &AnyPool, backend: DatabaseBackend) -> Resu
 /// The DID is derived dynamically from the request host rather than stored,
 /// so the same signing key works across any domain pointing at this server.
 /// Returns None if the identity mode is not DidWeb.
+///
+/// `extra_verification_methods` is a slice of (fragment_id, key_type, public_key_multibase)
+/// tuples for additional verification methods (e.g. `#atproto_space`).
 pub fn generate_did_document(
     identity: &ServiceIdentity,
     host: &str,
     signing_key_multibase: &str,
     service_entries: &[(String, String)],
     service_endpoint: &str,
+    extra_verification_methods: &[(String, String, String)],
 ) -> Option<serde_json::Value> {
     if identity.mode != IdentityMode::DidWeb {
         return None;
@@ -201,12 +205,21 @@ pub fn generate_did_document(
 
     let did = format!("did:web:{}", host.replace(':', "%3A"));
 
-    let verification_method = serde_json::json!([{
+    let mut verification_methods: Vec<serde_json::Value> = vec![serde_json::json!({
         "id": format!("{did}#atproto"),
         "type": "Multikey",
         "controller": &did,
         "publicKeyMultibase": signing_key_multibase
-    }]);
+    })];
+
+    for (fragment_id, key_type, public_key_multibase) in extra_verification_methods {
+        verification_methods.push(serde_json::json!({
+            "id": format!("{did}{fragment_id}"),
+            "type": key_type,
+            "controller": &did,
+            "publicKeyMultibase": public_key_multibase
+        }));
+    }
 
     let services: Vec<serde_json::Value> = service_entries
         .iter()
@@ -225,7 +238,7 @@ pub fn generate_did_document(
             "https://w3id.org/security/multikey/v1"
         ],
         "id": &did,
-        "verificationMethod": verification_method,
+        "verificationMethod": verification_methods,
         "service": services
     }))
 }
@@ -270,8 +283,15 @@ mod tests {
     fn generate_did_document_returns_none_for_non_web() {
         let identity = make_identity(IdentityMode::DidPlc, Some("did:plc:abc123"));
         assert!(
-            generate_did_document(&identity, "example.com", "zKey", &[], "https://example.com")
-                .is_none()
+            generate_did_document(
+                &identity,
+                "example.com",
+                "zKey",
+                &[],
+                "https://example.com",
+                &[]
+            )
+            .is_none()
         );
     }
 
@@ -284,6 +304,7 @@ mod tests {
             "zKey123",
             &[],
             "https://example.com",
+            &[],
         )
         .unwrap();
         assert_eq!(doc["id"], "did:web:example.com");
@@ -298,6 +319,7 @@ mod tests {
             "zKey123",
             &[],
             "https://example.com",
+            &[],
         )
         .unwrap();
         assert_eq!(doc["id"], "did:web:example.com");
@@ -321,6 +343,7 @@ mod tests {
             "zKey123",
             &entries,
             "https://example.com",
+            &[],
         )
         .unwrap();
         let services = doc["service"].as_array().unwrap();
@@ -334,9 +357,15 @@ mod tests {
     #[test]
     fn generate_did_document_context_and_structure() {
         let identity = make_identity(IdentityMode::DidWeb, None);
-        let doc =
-            generate_did_document(&identity, "example.com", "zKey", &[], "https://example.com")
-                .unwrap();
+        let doc = generate_did_document(
+            &identity,
+            "example.com",
+            "zKey",
+            &[],
+            "https://example.com",
+            &[],
+        )
+        .unwrap();
         let context = doc["@context"].as_array().unwrap();
         assert_eq!(context.len(), 2);
         assert_eq!(context[0], "https://www.w3.org/ns/did/v1");
@@ -346,5 +375,30 @@ mod tests {
         assert_eq!(vm["id"], "did:web:example.com#atproto");
         assert_eq!(vm["type"], "Multikey");
         assert_eq!(vm["controller"], "did:web:example.com");
+    }
+
+    #[test]
+    fn generate_did_document_includes_extra_verification_methods() {
+        let identity = make_identity(IdentityMode::DidWeb, None);
+        let extra = vec![(
+            "#atproto_space".to_string(),
+            "Multikey".to_string(),
+            "zExtraKey".to_string(),
+        )];
+        let doc = generate_did_document(
+            &identity,
+            "example.com",
+            "zKey123",
+            &[],
+            "https://example.com",
+            &extra,
+        )
+        .unwrap();
+        let vms = doc["verificationMethod"].as_array().unwrap();
+        assert_eq!(vms.len(), 2);
+        assert_eq!(vms[0]["id"], "did:web:example.com#atproto");
+        assert_eq!(vms[1]["id"], "did:web:example.com#atproto_space");
+        assert_eq!(vms[1]["publicKeyMultibase"], "zExtraKey");
+        assert_eq!(vms[1]["type"], "Multikey");
     }
 }

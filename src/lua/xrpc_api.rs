@@ -352,6 +352,8 @@ mod tests {
             action: ProcedureAction::Create,
             token_cost: None,
             space_type: None,
+            space_name: None,
+            space_collections: None,
         }
     }
 
@@ -370,6 +372,8 @@ mod tests {
             action: ProcedureAction::Create,
             token_cost: None,
             space_type: None,
+            space_name: None,
+            space_collections: None,
         }
     }
 

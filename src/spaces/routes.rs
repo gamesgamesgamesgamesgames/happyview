@@ -1,8 +1,10 @@
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
+use k256;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -12,8 +14,9 @@ use crate::auth::XrpcClaims;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lua::tid::generate_tid;
+use crate::spaces::scope::{SpaceReadAccess, check_delegation_token_access, check_read_access};
 use crate::spaces::types::*;
-use crate::spaces::{SpaceUri, db, members};
+use crate::spaces::{SpaceUri, db, members, notifications, oplog};
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -21,15 +24,48 @@ use crate::spaces::{SpaceUri, db, members};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateSpaceInput {
-    #[serde(rename = "type")]
-    type_nsid: String,
-    skey: String,
-    display_name: Option<String>,
-    description: Option<String>,
-    access_mode: Option<AccessMode>,
-    managing_app_did: Option<String>,
-    config: Option<SpaceConfig>,
+struct RepoStateQuery {
+    space: String,
+    did: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListRepoOpsQuery {
+    space: String,
+    did: String,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegisterNotifyInput {
+    space: String,
+    service_did: String,
+    endpoint: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotifyWriteInput {
+    space: String,
+    did: String,
+    collection: String,
+    rkey: String,
+    cid: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotifySpaceDeletedInput {
+    space: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetDelegationTokenQuery {
+    space: String,
 }
 
 #[derive(Deserialize)]
@@ -44,25 +80,6 @@ struct ListSpacesQuery {
     did: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DeleteSpaceInput {
-    space: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateSpaceInput {
-    space: String,
-    display_name: Option<Option<String>>,
-    description: Option<Option<String>>,
-    access_mode: Option<AccessMode>,
-    app_allowlist: Option<Option<Vec<String>>>,
-    app_denylist: Option<Option<Vec<String>>>,
-    managing_app_did: Option<Option<String>>,
-    config: Option<SpaceConfig>,
 }
 
 #[derive(Deserialize)]
@@ -105,22 +122,6 @@ struct ListRecordsQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AddMemberInput {
-    space: String,
-    did: String,
-    access: Option<SpaceAccess>,
-    is_delegation: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RemoveMemberInput {
-    space: String,
-    did: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CreateInviteInput {
     space: String,
     access: Option<SpaceAccess>,
@@ -143,12 +144,6 @@ struct RevokeInviteInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GetMemberGrantInput {
-    space: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct GetSpaceCredentialInput {
     grant: String,
 }
@@ -159,6 +154,13 @@ struct CreateRecordInput {
     space: String,
     collection: String,
     record: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetSpaceBlobQuery {
+    space: String,
+    cid: String,
 }
 
 #[derive(Deserialize)]
@@ -196,78 +198,136 @@ enum WriteOp {
 // Route registration
 // ---------------------------------------------------------------------------
 
-const NS: &str = "dev.happyview";
+const PROTO_NS: &str = "com.atproto";
+const LEGACY_NS: &str = "dev.happyview";
 
 pub fn space_routes() -> Router<AppState> {
     Router::new()
-        // Space CRUD
-        .route(&format!("/xrpc/{NS}.space.createSpace"), post(create_space))
-        .route(&format!("/xrpc/{NS}.space.getSpace"), get(get_space))
-        .route(&format!("/xrpc/{NS}.space.listSpaces"), get(list_spaces))
-        .route(&format!("/xrpc/{NS}.space.deleteSpace"), post(delete_space))
-        .route(&format!("/xrpc/{NS}.space.updateSpace"), post(update_space))
-        // Records
+        // Protocol-level routes (com.atproto.space.*)
+        .route(&format!("/xrpc/{PROTO_NS}.space.getSpace"), get(get_space))
         .route(
-            &format!("/xrpc/{NS}.space.createRecord"),
-            post(create_record),
-        )
-        .route(&format!("/xrpc/{NS}.space.putRecord"), post(put_record))
-        .route(
-            &format!("/xrpc/{NS}.space.deleteRecord"),
-            post(delete_record),
-        )
-        .route(&format!("/xrpc/{NS}.space.applyWrites"), post(apply_writes))
-        .route(&format!("/xrpc/{NS}.space.getRecord"), get(get_record))
-        .route(&format!("/xrpc/{NS}.space.listRecords"), get(list_records))
-        // Members
-        .route(&format!("/xrpc/{NS}.space.listMembers"), get(list_members))
-        .route(&format!("/xrpc/{NS}.space.addMember"), post(add_member))
-        .route(
-            &format!("/xrpc/{NS}.space.removeMember"),
-            post(remove_member),
-        )
-        // Invites
-        .route(
-            &format!("/xrpc/{NS}.space.createInvite"),
-            post(create_invite),
+            &format!("/xrpc/{PROTO_NS}.space.listSpaces"),
+            get(list_spaces),
         )
         .route(
-            &format!("/xrpc/{NS}.space.redeemInvite"),
-            post(redeem_invite),
+            &format!("/xrpc/{PROTO_NS}.space.getRecord"),
+            get(get_record),
         )
         .route(
-            &format!("/xrpc/{NS}.space.revokeInvite"),
-            post(revoke_invite),
-        )
-        .route(&format!("/xrpc/{NS}.space.listInvites"), get(list_invites))
-        // Credentials
-        .route(
-            &format!("/xrpc/{NS}.space.getMemberGrant"),
-            post(get_member_grant),
+            &format!("/xrpc/{PROTO_NS}.space.listRecords"),
+            get(list_records),
         )
         .route(
-            &format!("/xrpc/{NS}.space.getSpaceCredential"),
+            &format!("/xrpc/{PROTO_NS}.space.getRepoState"),
+            get(get_repo_state),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.listRepoOps"),
+            get(list_repo_ops),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.listRepos"),
+            get(list_repos),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.getDelegationToken"),
+            get(get_delegation_token),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.getSpaceCredential"),
             post(get_space_credential),
         )
-        // Legacy aliases (will be removed in a future release)
-        .route(&format!("/xrpc/{NS}.space.create"), post(create_space))
-        .route(&format!("/xrpc/{NS}.space.get"), get(get_space))
-        .route(&format!("/xrpc/{NS}.space.list"), get(list_spaces))
-        .route(&format!("/xrpc/{NS}.space.delete"), post(delete_space))
-        .route(&format!("/xrpc/{NS}.space.update"), post(update_space))
         .route(
-            &format!("/xrpc/{NS}.space.invite.create"),
+            &format!("/xrpc/{PROTO_NS}.space.createRecord"),
+            post(create_record),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.putRecord"),
+            post(put_record),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.deleteRecord"),
+            post(delete_record),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.applyWrites"),
+            post(apply_writes),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.registerNotify"),
+            post(register_notify),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.notifyWrite"),
+            post(notify_write),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.notifySpaceDeleted"),
+            post(notify_space_deleted),
+        )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.getBlob"),
+            get(get_space_blob),
+        )
+        // Invites (HappyView extension, no com.atproto equivalent)
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.createInvite"),
             post(create_invite),
         )
         .route(
-            &format!("/xrpc/{NS}.space.invite.redeem"),
-            post(redeem_invite),
+            &format!("/xrpc/{LEGACY_NS}.space.acceptInvite"),
+            post(accept_invite),
         )
         .route(
-            &format!("/xrpc/{NS}.space.invite.revoke"),
+            &format!("/xrpc/{LEGACY_NS}.space.revokeInvite"),
             post(revoke_invite),
         )
-        .route(&format!("/xrpc/{NS}.space.invite.list"), get(list_invites))
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.listInvites"),
+            get(list_invites),
+        )
+        // Backward-compatible aliases (dev.happyview.space.*) — kept until v3
+        .route(&format!("/xrpc/{LEGACY_NS}.space.getSpace"), get(get_space))
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.listSpaces"),
+            get(list_spaces),
+        )
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.getRecord"),
+            get(get_record),
+        )
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.listRecords"),
+            get(list_records),
+        )
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.getMemberGrant"),
+            get(get_delegation_token),
+        )
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.getSpaceCredential"),
+            post(get_space_credential),
+        )
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.createRecord"),
+            post(create_record),
+        )
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.putRecord"),
+            post(put_record),
+        )
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.deleteRecord"),
+            post(delete_record),
+        )
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.applyWrites"),
+            post(apply_writes),
+        )
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.getBlob"),
+            get(get_space_blob),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +381,7 @@ async fn resolve_space(state: &AppState, space_uri: &str) -> Result<Space, AppEr
 }
 
 async fn require_space_admin(state: &AppState, space: &Space, did: &str) -> Result<(), AppError> {
-    if space.owner_did == did {
+    if space.authority_did == did {
         return Ok(());
     }
     let sql = adapt_sql(
@@ -357,17 +417,14 @@ async fn require_membership(
         )
         .await
         {
-            Ok(claims) if claims.space == space_uri => {
-                let access = match claims.scope.as_str() {
-                    "write" => SpaceAccess::Write,
-                    _ => SpaceAccess::Read,
-                };
-                if require_write && !access.can_write() {
+            Ok(claims) if claims.sub == space_uri => {
+                // External credential grants read access; write is not supported via space credential
+                if require_write {
                     return Err(AppError::Forbidden(
                         "Write access is required for this action".into(),
                     ));
                 }
-                return Ok(access);
+                return Ok(SpaceAccess::Read);
             }
             Ok(_) => {
                 // Credential is valid but for a different space — fall through
@@ -396,76 +453,8 @@ fn content_cid(record: &serde_json::Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Space CRUD handlers
+// Space read handlers
 // ---------------------------------------------------------------------------
-
-async fn create_space(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Json(input): Json<CreateSpaceInput>,
-) -> Result<Response, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
-    let did = claims.did().to_string();
-
-    if input.type_nsid.is_empty() || input.skey.is_empty() {
-        return Err(AppError::BadRequest("type and skey are required".into()));
-    }
-
-    let existing = db::get_space_by_address(
-        &state.db,
-        state.db_backend,
-        &did,
-        &input.type_nsid,
-        &input.skey,
-    )
-    .await?;
-    if existing.is_some() {
-        return Err(AppError::Conflict(
-            "A space with this address already exists".into(),
-        ));
-    }
-
-    let space = Space {
-        id: Uuid::new_v4().to_string(),
-        did: did.clone(),
-        owner_did: did.clone(),
-        type_nsid: input.type_nsid,
-        skey: input.skey,
-        display_name: input.display_name,
-        description: input.description,
-        access_mode: input.access_mode.unwrap_or(AccessMode::DefaultAllow),
-        app_allowlist: None,
-        app_denylist: None,
-        managing_app_did: input.managing_app_did,
-        config: input.config.unwrap_or_default(),
-        revision: None,
-        created_at: now_rfc3339(),
-        updated_at: now_rfc3339(),
-    };
-
-    db::create_space(&state.db, state.db_backend, &space).await?;
-
-    // Auto-add the creator as a write member
-    let member = SpaceMember {
-        id: Uuid::new_v4().to_string(),
-        space_id: space.id.clone(),
-        did: did.clone(),
-        access: SpaceAccess::Write,
-        is_delegation: false,
-        granted_by: Some(did),
-        created_at: now_rfc3339(),
-    };
-    db::add_member(&state.db, state.db_backend, &member).await?;
-
-    let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
-    let body = serde_json::json!({
-        "uri": space_uri,
-    });
-
-    let mut response = Json(body).into_response();
-    *response.status_mut() = StatusCode::CREATED;
-    Ok(response)
-}
 
 async fn get_space(
     State(state): State<AppState>,
@@ -478,7 +467,7 @@ async fn get_space(
     if !space.config.membership_public {
         let claims = require_auth(&xrpc_claims)?;
         let did = claims.did();
-        if space.owner_did != did {
+        if space.authority_did != did {
             members::is_member(&state.db, state.db_backend, &space.id, did)
                 .await?
                 .ok_or_else(|| AppError::NotFound("Space not found".into()))?;
@@ -486,9 +475,16 @@ async fn get_space(
     }
 
     let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
+    let simplespace_config = serde_json::json!({
+        "$type": "com.atproto.simplespace.defs#spaceConfig",
+        "mintPolicy": space.mint_policy,
+        "appAccess": space.app_access,
+        "managingApp": space.managing_app_did,
+    });
     Ok(Json(serde_json::json!({
         "uri": space_uri,
         "space": space,
+        "config": simplespace_config,
     })))
 }
 
@@ -523,60 +519,6 @@ async fn list_spaces(
     Ok(Json(serde_json::json!({
         "spaces": spaces_json,
         "cursor": cursor,
-    })))
-}
-
-async fn delete_space(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Json(input): Json<DeleteSpaceInput>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    db::delete_space(&state.db, state.db_backend, &space.id).await?;
-
-    Ok(Json(serde_json::json!({ "success": true })))
-}
-
-async fn update_space(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Json(input): Json<UpdateSpaceInput>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
-    let mut space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    if let Some(name) = input.display_name {
-        space.display_name = name;
-    }
-    if let Some(desc) = input.description {
-        space.description = desc;
-    }
-    if let Some(mode) = input.access_mode {
-        space.access_mode = mode;
-    }
-    if let Some(list) = input.app_allowlist {
-        space.app_allowlist = list;
-    }
-    if let Some(list) = input.app_denylist {
-        space.app_denylist = list;
-    }
-    if let Some(did) = input.managing_app_did {
-        space.managing_app_did = did;
-    }
-    if let Some(config) = input.config {
-        space.config = config;
-    }
-
-    db::update_space(&state.db, state.db_backend, &space).await?;
-
-    let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
-    Ok(Json(serde_json::json!({
-        "uri": space_uri,
-        "space": space,
     })))
 }
 
@@ -860,7 +802,8 @@ async fn get_record(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
     let space = resolve_space(&state, &query.space).await?;
-    require_membership(
+    let has_credential = xrpc_claims.space_credential.is_some();
+    let membership = require_membership(
         &state,
         &space,
         &did,
@@ -879,6 +822,9 @@ async fn get_record(
     .await?
     .ok_or_else(|| AppError::NotFound("Record not found".into()))?;
 
+    let read_access = SpaceReadAccess::from_space_access(membership);
+    check_read_access(&did, &record.author_did, read_access, has_credential)?;
+
     Ok(Json(serde_json::json!({
         "uri": record.uri,
         "cid": record.cid,
@@ -893,7 +839,8 @@ async fn list_records(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
     let space = resolve_space(&state, &query.space).await?;
-    require_membership(
+    let has_credential = xrpc_claims.space_credential.is_some();
+    let membership = require_membership(
         &state,
         &space,
         &did,
@@ -902,13 +849,18 @@ async fn list_records(
     )
     .await?;
 
-    let repo = query.repo.as_deref().or_else(|| {
-        if xrpc_claims.space_credential.is_some() {
+    let read_access = SpaceReadAccess::from_space_access(membership);
+
+    // read_self members may only list their own records regardless of what the caller requests
+    let repo = if !has_credential && read_access == SpaceReadAccess::ReadSelf {
+        Some(did.as_str())
+    } else {
+        query.repo.as_deref().or(if has_credential {
             None
         } else {
             Some(did.as_str())
-        }
-    });
+        })
+    };
 
     let limit = query.limit.unwrap_or(50).min(100);
     let reverse = query.reverse.unwrap_or(false);
@@ -939,85 +891,6 @@ async fn list_records(
         "records": records_json,
         "cursor": cursor,
     })))
-}
-
-// ---------------------------------------------------------------------------
-// Member handlers
-// ---------------------------------------------------------------------------
-
-async fn list_members(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Query(query): Query<SpaceUriQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let space = resolve_space(&state, &query.space).await?;
-
-    if !space.config.membership_public {
-        let did = require_auth_or_credential(&state, &xrpc_claims).await?;
-        require_membership(
-            &state,
-            &space,
-            &did,
-            false,
-            xrpc_claims.space_credential.as_deref(),
-        )
-        .await?;
-    }
-
-    let resolved = members::resolve_members(&state.db, state.db_backend, &space.id).await?;
-
-    Ok(Json(serde_json::json!({ "members": resolved })))
-}
-
-async fn add_member(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Json(input): Json<AddMemberInput>,
-) -> Result<Response, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    let existing = db::get_member(&state.db, state.db_backend, &space.id, &input.did).await?;
-    if existing.is_some() {
-        return Err(AppError::Conflict(
-            "Member already exists in this space".into(),
-        ));
-    }
-
-    let member = SpaceMember {
-        id: Uuid::new_v4().to_string(),
-        space_id: space.id,
-        did: input.did,
-        access: input.access.unwrap_or(SpaceAccess::Read),
-        is_delegation: input.is_delegation.unwrap_or(false),
-        granted_by: Some(claims.did().to_string()),
-        created_at: now_rfc3339(),
-    };
-
-    db::add_member(&state.db, state.db_backend, &member).await?;
-
-    let mut response = Json(serde_json::json!({ "member": member })).into_response();
-    *response.status_mut() = StatusCode::CREATED;
-    Ok(response)
-}
-
-async fn remove_member(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Json(input): Json<RemoveMemberInput>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    let removed = db::remove_member(&state.db, state.db_backend, &space.id, &input.did).await?;
-
-    if !removed {
-        return Err(AppError::NotFound("Member not found in this space".into()));
-    }
-
-    Ok(Json(serde_json::json!({ "success": true })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,7 +938,7 @@ async fn create_invite(
     Ok(response)
 }
 
-async fn redeem_invite(
+async fn accept_invite(
     State(state): State<AppState>,
     xrpc_claims: XrpcClaims,
     Json(input): Json<RedeemInviteInput>,
@@ -1180,46 +1053,269 @@ async fn list_invites(
 // Credential handlers
 // ---------------------------------------------------------------------------
 
-async fn get_member_grant(
+async fn get_delegation_token(
     State(state): State<AppState>,
     xrpc_claims: XrpcClaims,
-    Json(input): Json<GetMemberGrantInput>,
+    Query(params): Query<GetDelegationTokenQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
     let did = claims.did().to_string();
-    let space = resolve_space(&state, &input.space).await?;
+    let space = resolve_space(&state, &params.space).await?;
 
-    require_membership(&state, &space, &did, false, None).await?;
+    let membership = require_membership(&state, &space, &did, false, None).await?;
+    let read_access = SpaceReadAccess::from_space_access(membership);
+    check_delegation_token_access(read_access, false)?;
 
     let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
+    let signing_key = k256::ecdsa::SigningKey::from_bytes(encryption_key.into())
+        .map_err(|e| AppError::Internal(format!("failed to derive delegation signing key: {e}")))?;
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let exp = now + crate::spaces::credential::GRANT_TTL_SECS;
+    let exp = now + crate::spaces::credential::DELEGATION_TOKEN_TTL_SECS;
 
     let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
-    let grant_claims = crate::spaces::credential::MemberGrantClaims {
-        sub: did,
-        space: space_uri,
-        scope: "read".into(),
+    let space_host = format!("{}#atproto_space_host", space.did);
+    let delegation_claims = crate::spaces::credential::DelegationTokenClaims {
+        iss: did,
+        sub: space_uri,
+        aud: space_host,
         iat: now,
         exp,
+        jti: crate::spaces::credential::make_jti(),
     };
 
-    let grant = crate::spaces::credential::sign_grant(&grant_claims, encryption_key)?;
+    let grant = crate::spaces::credential::sign_delegation_token(&delegation_claims, &signing_key)?;
 
     let expires_at = chrono::DateTime::from_timestamp(exp as i64, 0)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default();
 
     Ok(Json(serde_json::json!({
-        "grant": grant,
+        "delegationToken": grant,
         "expiresAt": expires_at,
     })))
+}
+
+// ---------------------------------------------------------------------------
+// Protocol endpoint implementations
+// ---------------------------------------------------------------------------
+
+async fn get_repo_state(
+    State(state): State<AppState>,
+    claims: XrpcClaims,
+    Query(params): Query<RepoStateQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let did = require_auth_or_credential(&state, &claims).await?;
+    let space = resolve_space(&state, &params.space).await?;
+    let has_credential = claims.space_credential.is_some();
+    let membership = require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
+
+    let read_access = SpaceReadAccess::from_space_access(membership);
+    check_read_access(&did, &params.did, read_access, has_credential)?;
+
+    let repo_state =
+        db::get_or_create_repo_state(&state.db, state.db_backend, &space.id, &params.did).await?;
+
+    Ok(Json(serde_json::json!({
+        "rev": repo_state.rev,
+        "commit": repo_state.hash.as_ref().map(|h| {
+            serde_json::json!({
+                "hash": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h),
+                "ikm": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(repo_state.ikm.as_deref().unwrap_or_default()),
+                "sig": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(repo_state.sig.as_deref().unwrap_or_default()),
+                "mac": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(repo_state.mac.as_deref().unwrap_or_default()),
+                "rev": repo_state.rev,
+            })
+        }),
+    })))
+}
+
+async fn list_repo_ops(
+    State(state): State<AppState>,
+    claims: XrpcClaims,
+    Query(params): Query<ListRepoOpsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let did = require_auth_or_credential(&state, &claims).await?;
+    let space = resolve_space(&state, &params.space).await?;
+    let has_credential = claims.space_credential.is_some();
+    let membership = require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
+
+    let read_access = SpaceReadAccess::from_space_access(membership);
+    check_read_access(&did, &params.did, read_access, has_credential)?;
+
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let ops = oplog::list_ops(
+        &state.db,
+        state.db_backend,
+        &space.id,
+        &params.did,
+        params.cursor.as_deref(),
+        limit,
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({ "ops": ops })))
+}
+
+async fn list_repos(
+    State(state): State<AppState>,
+    claims: XrpcClaims,
+    Query(params): Query<SpaceUriQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let _did = require_auth_or_credential(&state, &claims).await?;
+    let space = resolve_space(&state, &params.space).await?;
+
+    let repos = db::list_space_repos(&state.db, state.db_backend, &space.id).await?;
+    Ok(Json(serde_json::json!({ "repos": repos })))
+}
+
+async fn get_space_blob(
+    State(state): State<AppState>,
+    claims: XrpcClaims,
+    Query(params): Query<GetSpaceBlobQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let did = require_auth_or_credential(&state, &claims).await?;
+    let space = resolve_space(&state, &params.space).await?;
+    let has_credential = claims.space_credential.is_some();
+    let membership = require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
+
+    let author_did = db::find_blob_author_did(&state.db, state.db_backend, &space.id, &params.cid)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Blob not found in this space".into()))?;
+
+    let read_access = SpaceReadAccess::from_space_access(membership);
+    check_read_access(&did, &author_did, read_access, has_credential)?;
+
+    let pds_endpoint =
+        crate::profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, &author_did)
+            .await?;
+
+    let url = format!(
+        "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
+        pds_endpoint,
+        urlencoding::encode(&author_did),
+        urlencoding::encode(&params.cid),
+    );
+
+    let resp = state
+        .http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AppError::BadGateway(format!("blob fetch failed: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(AppError::BadGateway(format!(
+            "PDS returned {status} for blob cid={}",
+            params.cid
+        )));
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::BadGateway(format!("failed to read blob body: {e}")))?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        content_type
+            .parse()
+            .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+    );
+
+    Ok((status, headers, bytes))
+}
+
+async fn register_notify(
+    State(state): State<AppState>,
+    claims: XrpcClaims,
+    Json(input): Json<RegisterNotifyInput>,
+) -> Result<impl IntoResponse, AppError> {
+    let did = require_auth_or_credential(&state, &claims).await?;
+    let space = resolve_space(&state, &input.space).await?;
+
+    let id = notifications::register(
+        &state.db,
+        state.db_backend,
+        &space.id,
+        &input.service_did,
+        &input.endpoint,
+        &did,
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+async fn notify_write(
+    State(state): State<AppState>,
+    _claims: XrpcClaims,
+    Json(input): Json<NotifyWriteInput>,
+) -> Result<impl IntoResponse, AppError> {
+    let space = resolve_space(&state, &input.space).await?;
+
+    notifications::dispatch_write_notification(
+        &state.db,
+        state.db_backend,
+        &state.http,
+        &space.id,
+        &input.did,
+        &input.collection,
+        &input.rkey,
+        input.cid.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+async fn notify_space_deleted(
+    State(state): State<AppState>,
+    _claims: XrpcClaims,
+    Json(input): Json<NotifySpaceDeletedInput>,
+) -> Result<impl IntoResponse, AppError> {
+    let space = resolve_space(&state, &input.space).await?;
+
+    notifications::dispatch_space_deleted(&state.db, state.db_backend, &state.http, &space.id)
+        .await?;
+
+    Ok(Json(serde_json::json!({ "success": true })))
 }
 
 async fn get_space_credential(
@@ -1233,18 +1329,29 @@ async fn get_space_credential(
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
-    let grant_claims = crate::spaces::credential::verify_grant(&input.grant, encryption_key)?;
+    let verifying_key = {
+        let signing_key =
+            k256::ecdsa::SigningKey::from_bytes(encryption_key.into()).map_err(|e| {
+                AppError::Internal(format!("failed to derive delegation signing key: {e}"))
+            })?;
+        k256::ecdsa::VerifyingKey::from(&signing_key)
+    };
 
-    let space = resolve_space(&state, &grant_claims.space).await?;
+    let delegation_claims =
+        crate::spaces::credential::verify_delegation_token(&input.grant, &verifying_key)?;
+
+    let space = resolve_space(&state, &delegation_claims.sub).await?;
 
     let client_id = claims.client_key().map(|k| k.to_string());
     let issued = crate::spaces::auth::issue_credential(
         &state.db,
         state.db_backend,
+        &state.http,
         encryption_key,
         &space,
-        &grant_claims.sub,
+        &delegation_claims.iss,
         client_id.as_deref(),
+        &space.authority_did,
     )
     .await?;
 

@@ -14,31 +14,25 @@ pub async fn create_space(
     let now = now_rfc3339();
     let config_json = serde_json::to_string(&space.config)
         .map_err(|e| AppError::Internal(format!("failed to serialize space config: {e}")))?;
-    let allowlist_json = space
-        .app_allowlist
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_default());
-    let denylist_json = space
-        .app_denylist
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let app_access_json = serde_json::to_string(&space.app_access)
+        .map_err(|e| AppError::Internal(format!("failed to serialize app_access: {e}")))?;
 
     let sql = adapt_sql(
-        "INSERT INTO happyview_spaces (id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_spaces (id, did, authority_did, creator_did, type_nsid, skey, display_name, description, mint_policy, app_access, managing_app_did, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
     sqlx::query(&sql)
         .bind(&space.id)
         .bind(&space.did)
-        .bind(&space.owner_did)
+        .bind(&space.authority_did)
+        .bind(&space.creator_did)
         .bind(&space.type_nsid)
         .bind(&space.skey)
         .bind(&space.display_name)
         .bind(&space.description)
-        .bind(space.access_mode.as_str())
-        .bind(&allowlist_json)
-        .bind(&denylist_json)
+        .bind(space.mint_policy.as_str())
+        .bind(&app_access_json)
         .bind(&space.managing_app_did)
         .bind(&config_json)
         .bind(&now)
@@ -56,7 +50,7 @@ pub async fn get_space(
     id: &str,
 ) -> Result<Option<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE id = ?",
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, mint_policy, app_access, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE id = ?",
         backend,
     );
 
@@ -77,7 +71,7 @@ pub async fn get_space_by_address(
     skey: &str,
 ) -> Result<Option<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE did = ? AND type_nsid = ? AND skey = ?",
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, mint_policy, app_access, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE did = ? AND type_nsid = ? AND skey = ?",
         backend,
     );
 
@@ -95,15 +89,15 @@ pub async fn get_space_by_address(
 pub async fn list_spaces_by_owner(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    owner_did: &str,
+    authority_did: &str,
 ) -> Result<Vec<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, owner_did, type_nsid, skey, display_name, description, access_mode, app_allowlist, app_denylist, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE owner_did = ? ORDER BY created_at DESC",
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, mint_policy, app_access, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE authority_did = ? ORDER BY created_at DESC",
         backend,
     );
 
     let rows: Vec<SpaceRow> = sqlx::query_as(&sql)
-        .bind(owner_did)
+        .bind(authority_did)
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list spaces: {e}")))?;
@@ -128,12 +122,12 @@ pub async fn list_spaces_for_user(
 
     let sql = if decoded_cursor.is_some() {
         adapt_sql(
-            "SELECT s.did, s.owner_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? AND (sm.created_at > ? OR (sm.created_at = ? AND ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            "SELECT s.did, s.authority_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? AND (sm.created_at > ? OR (sm.created_at = ? AND ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
             backend,
         )
     } else {
         adapt_sql(
-            "SELECT s.did, s.owner_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? ORDER BY sm.created_at ASC, ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            "SELECT s.did, s.authority_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? ORDER BY sm.created_at ASC, ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
             backend,
         )
     };
@@ -152,9 +146,9 @@ pub async fn list_spaces_for_user(
     let views: Vec<SpaceView> = rows
         .into_iter()
         .map(
-            |(space_did, owner_did, type_nsid, skey, created_at)| SpaceView {
+            |(space_did, authority_did, type_nsid, skey, created_at)| SpaceView {
                 uri: format!("ats://{}/{}/{}", space_did, type_nsid, skey),
-                is_owner: owner_did == did,
+                is_owner: authority_did == did,
                 created_at,
             },
         )
@@ -177,26 +171,19 @@ pub async fn update_space(
     let now = now_rfc3339();
     let config_json = serde_json::to_string(&space.config)
         .map_err(|e| AppError::Internal(format!("failed to serialize space config: {e}")))?;
-    let allowlist_json = space
-        .app_allowlist
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_default());
-    let denylist_json = space
-        .app_denylist
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let app_access_json = serde_json::to_string(&space.app_access)
+        .map_err(|e| AppError::Internal(format!("failed to serialize app_access: {e}")))?;
 
     let sql = adapt_sql(
-        "UPDATE happyview_spaces SET display_name = ?, description = ?, access_mode = ?, app_allowlist = ?, app_denylist = ?, managing_app_did = ?, config = ?, updated_at = ? WHERE id = ?",
+        "UPDATE happyview_spaces SET display_name = ?, description = ?, mint_policy = ?, app_access = ?, managing_app_did = ?, config = ?, updated_at = ? WHERE id = ?",
         backend,
     );
 
     let result = sqlx::query(&sql)
         .bind(&space.display_name)
         .bind(&space.description)
-        .bind(space.access_mode.as_str())
-        .bind(&allowlist_json)
-        .bind(&denylist_json)
+        .bind(space.mint_policy.as_str())
+        .bind(&app_access_json)
         .bind(&space.managing_app_did)
         .bind(&config_json)
         .bind(&now)
@@ -230,11 +217,11 @@ type SpaceRow = (
     String,
     String,
     String,
-    Option<String>,
-    Option<String>,
     String,
     Option<String>,
     Option<String>,
+    String,
+    String,
     Option<String>,
     String,
     Option<String>,
@@ -243,32 +230,24 @@ type SpaceRow = (
 );
 
 fn parse_space_row(r: SpaceRow) -> Result<Space, AppError> {
-    let access_mode = AccessMode::parse(&r.7)
-        .ok_or_else(|| AppError::Internal(format!("invalid access_mode: {}", r.7)))?;
-    let app_allowlist: Option<Vec<String>> =
-        r.8.as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|e| AppError::Internal(format!("invalid app_allowlist: {e}")))?;
-    let app_denylist: Option<Vec<String>> =
-        r.9.as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|e| AppError::Internal(format!("invalid app_denylist: {e}")))?;
+    let mint_policy = MintPolicy::parse(&r.8)
+        .ok_or_else(|| AppError::Internal(format!("invalid mint_policy: {}", r.8)))?;
+    let app_access: AppAccess = serde_json::from_str(&r.9)
+        .map_err(|e| AppError::Internal(format!("invalid app_access: {e}")))?;
     let config: SpaceConfig = serde_json::from_str(&r.11)
         .map_err(|e| AppError::Internal(format!("invalid space config: {e}")))?;
 
     Ok(Space {
         id: r.0,
         did: r.1,
-        owner_did: r.2,
-        type_nsid: r.3,
-        skey: r.4,
-        display_name: r.5,
-        description: r.6,
-        access_mode,
-        app_allowlist,
-        app_denylist,
+        authority_did: r.2,
+        creator_did: r.3,
+        type_nsid: r.4,
+        skey: r.5,
+        display_name: r.6,
+        description: r.7,
+        mint_policy,
+        app_access,
         managing_app_did: r.10,
         config,
         revision: r.12,
@@ -691,6 +670,220 @@ pub async fn update_space_revision(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Repo State
+// ---------------------------------------------------------------------------
+
+pub async fn get_or_create_repo_state(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    author_did: &str,
+) -> Result<RepoState, AppError> {
+    let sql = adapt_sql(
+        "SELECT id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, updated_at FROM happyview_space_repo_state WHERE space_id = ? AND author_did = ?",
+        backend,
+    );
+
+    let row: Option<RepoStateRow> = sqlx::query_as(&sql)
+        .bind(space_id)
+        .bind(author_did)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to get repo state: {e}")))?;
+
+    if let Some(r) = row {
+        return parse_repo_state_row(r);
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_rfc3339();
+    let default_lthash = vec![0u8; 2048];
+    let insert_sql = adapt_sql(
+        "INSERT INTO happyview_space_repo_state (id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?)",
+        backend,
+    );
+    sqlx::query(&insert_sql)
+        .bind(&id)
+        .bind(space_id)
+        .bind(author_did)
+        .bind(&default_lthash)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to create repo state: {e}")))?;
+
+    Ok(RepoState {
+        id,
+        space_id: space_id.to_string(),
+        author_did: author_did.to_string(),
+        lthash_state: default_lthash,
+        rev: None,
+        hash: None,
+        ikm: None,
+        sig: None,
+        mac: None,
+        updated_at: now,
+    })
+}
+
+pub async fn update_repo_state(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    state: &RepoState,
+) -> Result<(), AppError> {
+    let now = now_rfc3339();
+    let sql = adapt_sql(
+        "UPDATE happyview_space_repo_state SET lthash_state = ?, rev = ?, hash = ?, ikm = ?, sig = ?, mac = ?, updated_at = ? WHERE id = ?",
+        backend,
+    );
+
+    sqlx::query(&sql)
+        .bind(&state.lthash_state)
+        .bind(&state.rev)
+        .bind(&state.hash)
+        .bind(&state.ikm)
+        .bind(&state.sig)
+        .bind(&state.mac)
+        .bind(&now)
+        .bind(&state.id)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to update repo state: {e}")))?;
+
+    Ok(())
+}
+
+type RepoStateRow = (
+    String,
+    String,
+    String,
+    Vec<u8>,
+    Option<String>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    String,
+);
+
+fn parse_repo_state_row(r: RepoStateRow) -> Result<RepoState, AppError> {
+    Ok(RepoState {
+        id: r.0,
+        space_id: r.1,
+        author_did: r.2,
+        lthash_state: r.3,
+        rev: r.4,
+        hash: r.5,
+        ikm: r.6,
+        sig: r.7,
+        mac: r.8,
+        updated_at: r.9,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Notification Registrations
+// ---------------------------------------------------------------------------
+
+pub async fn register_notify(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    reg: &NotifyRegistration,
+) -> Result<(), AppError> {
+    let now = now_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_space_notify_registrations (id, space_id, author_did, endpoint, registered_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        backend,
+    );
+
+    sqlx::query(&sql)
+        .bind(&reg.id)
+        .bind(&reg.space_id)
+        .bind(&reg.author_did)
+        .bind(&reg.endpoint)
+        .bind(&reg.registered_by)
+        .bind(&reg.expires_at)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to register notify: {e}")))?;
+
+    Ok(())
+}
+
+pub async fn list_notify_registrations(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    author_did: Option<&str>,
+) -> Result<Vec<NotifyRegistration>, AppError> {
+    let sql = if author_did.is_some() {
+        adapt_sql(
+            "SELECT id, space_id, author_did, endpoint, registered_by, expires_at, created_at FROM happyview_space_notify_registrations WHERE space_id = ? AND author_did = ? ORDER BY created_at ASC",
+            backend,
+        )
+    } else {
+        adapt_sql(
+            "SELECT id, space_id, author_did, endpoint, registered_by, expires_at, created_at FROM happyview_space_notify_registrations WHERE space_id = ? ORDER BY created_at ASC",
+            backend,
+        )
+    };
+
+    let mut query = sqlx::query_as::<_, NotifyRow>(&sql).bind(space_id);
+    if let Some(did) = author_did {
+        query = query.bind(did);
+    }
+
+    let rows = query
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list notify registrations: {e}")))?;
+
+    Ok(rows.into_iter().map(parse_notify_row).collect())
+}
+
+pub async fn delete_notify_registration(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    id: &str,
+) -> Result<bool, AppError> {
+    let sql = adapt_sql(
+        "DELETE FROM happyview_space_notify_registrations WHERE id = ?",
+        backend,
+    );
+
+    let result = sqlx::query(&sql)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to delete notify registration: {e}")))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+type NotifyRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+);
+
+fn parse_notify_row(r: NotifyRow) -> NotifyRegistration {
+    NotifyRegistration {
+        id: r.0,
+        space_id: r.1,
+        author_did: r.2,
+        endpoint: r.3,
+        registered_by: r.4,
+        expires_at: r.5,
+        created_at: r.6,
+    }
+}
+
 type RecordRow = (
     String,
     String,
@@ -716,6 +909,55 @@ fn parse_record_row(r: RecordRow) -> Result<SpaceRecord, AppError> {
         cid: r.6,
         indexed_at: r.7,
     })
+}
+
+/// Find the author DID of any record in the space that contains a blob ref
+/// with the given CID. The CID appears in serialised record JSON as the
+/// `$link` value inside an ATProto blob ref object.
+pub async fn find_blob_author_did(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    blob_cid: &str,
+) -> Result<Option<String>, AppError> {
+    let pattern = format!("%\"$link\":\"{blob_cid}\"%");
+    let sql = adapt_sql(
+        "SELECT author_did FROM happyview_space_records WHERE space_id = ? AND record LIKE ? LIMIT 1",
+        backend,
+    );
+    let row: Option<(String,)> = sqlx::query_as(&sql)
+        .bind(space_id)
+        .bind(&pattern)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to find blob author: {e}")))?;
+    Ok(row.map(|(did,)| did))
+}
+
+// ---------------------------------------------------------------------------
+// Space Repos
+// ---------------------------------------------------------------------------
+
+pub async fn list_space_repos(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let sql = adapt_sql(
+        "SELECT DISTINCT r.author_did, s.rev FROM happyview_space_records r LEFT JOIN happyview_space_repo_state s ON s.space_id = r.space_id AND s.author_did = r.author_did WHERE r.space_id = ? ORDER BY r.author_did ASC",
+        backend,
+    );
+
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(&sql)
+        .bind(space_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list space repos: {e}")))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(did, rev)| serde_json::json!({ "did": did, "rev": rev }))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------

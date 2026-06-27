@@ -21,6 +21,7 @@ pub mod settings;
 mod stats;
 pub(crate) mod types;
 mod users;
+mod verification_methods;
 
 use axum::Router;
 use axum::routing::{delete, get, patch, post, put};
@@ -189,5 +190,13 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             get(service_entries::list_xrpcs)
                 .post(service_entries::add_xrpcs)
                 .delete(service_entries::remove_xrpcs),
+        )
+        .route(
+            "/verification-methods",
+            get(verification_methods::list).post(verification_methods::create),
+        )
+        .route(
+            "/verification-methods/{fragment_id}",
+            delete(verification_methods::delete),
         )
 }

@@ -1,9 +1,19 @@
 pub mod auth;
+pub mod client_attestation;
+pub mod commit;
 pub mod credential;
 pub mod db;
+pub mod lthash;
 pub mod members;
+pub mod notifications;
+pub mod oplog;
 pub mod routes;
+pub mod scope;
+pub mod simplespace;
 pub mod types;
+
+#[cfg(test)]
+mod integration_tests;
 
 use crate::error::AppError;
 use std::fmt;

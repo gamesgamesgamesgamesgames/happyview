@@ -119,17 +119,10 @@ test.describe("Lexicon Services", () => {
     await expect(sheet.getByRole("heading", { name: "Services" })).toBeVisible()
 
     // Should show either service entries or "No services have access"
-    const hasServices = await sheet
-      .locator("table tbody tr")
-      .first()
-      .isVisible({ timeout: 3000 })
-      .catch(() => false)
-    const hasNoServicesMessage = await sheet
-      .getByText(/no services have access/i)
-      .isVisible()
-      .catch(() => false)
-
-    expect(hasServices || hasNoServicesMessage).toBe(true)
+    // (must wait for the loading state to resolve before checking)
+    const serviceRow = sheet.locator("table tbody tr").first()
+    const noServicesMsg = sheet.getByText(/no services have access/i)
+    await expect(serviceRow.or(noServicesMsg)).toBeVisible({ timeout: 5000 })
 
     // Clean up the service entry
     await page.goto("/dashboard/settings/service-identity")

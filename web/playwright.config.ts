@@ -32,6 +32,7 @@ export default defineConfig({
         "script-delete.spec.ts",
         "record-delete.spec.ts",
         "proxy-config.spec.ts",
+        "spaces.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },

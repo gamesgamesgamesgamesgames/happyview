@@ -314,7 +314,29 @@ impl FromRequestParts<AppState> for XrpcClaims {
             }
             Some(_) => Err(AppError::Auth("invalid Authorization scheme".into())),
             None => {
-                // No auth header — anonymous access (client-key only)
+                // No auth header — try cookie auth, fall back to anonymous
+                let jar: SignedCookieJar<Key> = SignedCookieJar::from_request_parts(parts, state)
+                    .await
+                    .map_err(|_| AppError::Auth("failed to read cookies".into()))?;
+
+                if let Some(cookie) = jar.get(COOKIE_NAME) {
+                    let value = cookie.value().to_string();
+                    let (did, client_key) = if let Some((d, k)) = value.split_once(COOKIE_SEP) {
+                        (d.to_string(), Some(k.to_string()))
+                    } else {
+                        (value, None)
+                    };
+                    return Ok(XrpcClaims {
+                        identity: Some(Claims {
+                            did,
+                            client_key,
+                            dpop_key_id: None,
+                        }),
+                        space_credential: None,
+                        service_auth: None,
+                    });
+                }
+
                 Ok(XrpcClaims {
                     identity: None,
                     space_credential: None,

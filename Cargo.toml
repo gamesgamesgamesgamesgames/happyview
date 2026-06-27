@@ -58,6 +58,9 @@ wasmtime-wasi = "29"
 regex = "1.12.3"
 semver = "1.0"
 async-stream = "0.3.6"
+blake3 = "1"
+hkdf = "0.12"
+hmac = "0.12"
 
 [[bin]]
 name = "migrate-lua-sql"

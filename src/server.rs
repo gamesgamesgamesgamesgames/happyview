@@ -69,6 +69,12 @@ pub fn router(state: AppState) -> Router {
                 crate::feature_middleware::require_spaces,
             )),
         )
+        .merge(crate::spaces::simplespace::simplespace_routes().layer(
+            axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::feature_middleware::require_spaces,
+            ),
+        ))
         .nest("/auth", crate::auth::routes::routes())
         .nest("/external-auth", crate::external_auth::routes())
         .nest("/oauth", crate::oauth::routes::routes())
@@ -368,6 +374,12 @@ async fn well_known_did_json(
         .map(|e| (e.fragment_id.clone(), e.service_type.clone()))
         .collect();
 
+    let extra_vms = crate::verification_methods::list_methods(&state.db, state.db_backend)
+        .await?
+        .into_iter()
+        .map(|m| (m.fragment_id, m.key_type, m.public_key_multibase))
+        .collect::<Vec<_>>();
+
     let service_endpoint = format!("https://{host}");
 
     let signing_key_multibase = extract_public_key_multibase(&identity, &state)?;
@@ -378,6 +390,7 @@ async fn well_known_did_json(
         &signing_key_multibase,
         &entry_pairs,
         &service_endpoint,
+        &extra_vms,
     )
     .ok_or_else(|| AppError::NotFound("DID document not available".into()))?;
 

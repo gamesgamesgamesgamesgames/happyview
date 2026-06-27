@@ -9,24 +9,28 @@ use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::plugin::encryption::{decrypt, encrypt};
 use crate::spaces::credential::{
-    DEFAULT_CREDENTIAL_TTL_SECS, SpaceCredentialClaims, sign_credential,
+    DEFAULT_CREDENTIAL_TTL_SECS, SpaceCredentialClaims, make_jti, sign_credential,
 };
-use crate::spaces::types::{AccessMode, Space};
+use crate::spaces::types::{AppAccess, MintPolicy, Space};
 
 pub struct IssuedCredential {
     pub token: String,
     pub expires_at: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn issue_credential(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
+    http: &reqwest::Client,
     encryption_key: &[u8; 32],
     space: &Space,
     subject_did: &str,
     client_id: Option<&str>,
+    authority_did: &str,
 ) -> Result<IssuedCredential, AppError> {
     check_app_access(space, client_id)?;
+    check_mint_policy(http, space, subject_did, client_id, authority_did).await?;
 
     let private_jwk = get_or_create_signing_key(pool, backend, encryption_key, space).await?;
 
@@ -37,12 +41,11 @@ pub async fn issue_credential(
     let exp = now + DEFAULT_CREDENTIAL_TTL_SECS;
 
     let claims = SpaceCredentialClaims {
-        iss: space.did.clone(),
-        sub: subject_did.to_string(),
-        space: format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey),
-        scope: "read".into(),
+        iss: space.authority_did.clone(),
+        sub: format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey),
         iat: now,
         exp,
+        jti: make_jti(),
     };
 
     let token = sign_credential(&claims, &private_jwk)?;
@@ -57,37 +60,188 @@ pub async fn issue_credential(
     Ok(IssuedCredential { token, expires_at })
 }
 
-pub fn check_app_access(space: &Space, client_id: Option<&str>) -> Result<(), AppError> {
-    let Some(client_id) = client_id else {
-        return Ok(());
-    };
-
-    match space.access_mode {
-        AccessMode::DefaultDeny => {
-            if let Some(ref allowlist) = space.app_allowlist {
-                if !allowlist.iter().any(|id| id == client_id) {
-                    return Err(AppError::Forbidden(
-                        "This app is not authorized to access this space".into(),
-                    ));
-                }
-            } else {
-                return Err(AppError::Forbidden(
-                    "Space is in default_deny mode with no allowlist".into(),
-                ));
-            }
+async fn check_mint_policy(
+    http: &reqwest::Client,
+    space: &Space,
+    subject_did: &str,
+    client_id: Option<&str>,
+    authority_did: &str,
+) -> Result<(), AppError> {
+    match space.mint_policy {
+        MintPolicy::Public => Ok(()),
+        MintPolicy::MemberList => {
+            // Caller must already be a member; verified upstream by the credential issuance route.
+            // We trust that the delegation token proves membership was checked.
+            Ok(())
         }
-        AccessMode::DefaultAllow => {
-            if let Some(ref denylist) = space.app_denylist
-                && denylist.iter().any(|id| id == client_id)
-            {
-                return Err(AppError::Forbidden(
-                    "This app has been denied access to this space".into(),
-                ));
+        MintPolicy::ManagingApp => {
+            let managing_app = space.managing_app_did.as_deref().ok_or_else(|| {
+                AppError::Internal(
+                    "space mint_policy is managing-app but managing_app_did is not set".into(),
+                )
+            })?;
+            let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
+            let granted = check_user_access_with_managing_app(
+                http,
+                managing_app,
+                &space_uri,
+                subject_did,
+                client_id,
+                authority_did,
+            )
+            .await?;
+            if granted {
+                Ok(())
+            } else {
+                Err(AppError::Forbidden(
+                    "managing app denied access to this space".into(),
+                ))
             }
         }
     }
+}
 
-    Ok(())
+async fn check_user_access_with_managing_app(
+    http: &reqwest::Client,
+    managing_app: &str,
+    space_uri: &str,
+    user_did: &str,
+    client_id: Option<&str>,
+    authority_did: &str,
+) -> Result<bool, AppError> {
+    // Parse DID#fragment — the fragment identifies the service endpoint in the DID doc.
+    // For outbound callback we derive the endpoint from the DID.
+    let (did, _fragment) = if let Some(pos) = managing_app.find('#') {
+        (&managing_app[..pos], Some(&managing_app[pos + 1..]))
+    } else {
+        (managing_app, None)
+    };
+
+    // Resolve the managing app's PDS/service endpoint from its DID document.
+    let endpoint = resolve_did_service_endpoint(http, did).await?;
+
+    let url = format!(
+        "{}/xrpc/com.atproto.simplespace.checkUserAccess",
+        endpoint.trim_end_matches('/')
+    );
+
+    let mut body = serde_json::json!({
+        "space": space_uri,
+        "did": user_did,
+    });
+    if let Some(cid) = client_id {
+        body["clientId"] = serde_json::Value::String(cid.to_string());
+    }
+
+    // Service auth: iss = authority_did, aud = managing_app DID.
+    // We use a simple unsigned assertion here; a full implementation would sign with the space key.
+    // For now we send the request without service auth and rely on the managing app to trust HappyView.
+    let resp = http
+        .post(&url)
+        .json(&body)
+        .header("X-Authority-Did", authority_did)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("checkUserAccess request failed: {e}")))?;
+
+    if resp.status() == reqwest::StatusCode::FORBIDDEN
+        || resp.status() == reqwest::StatusCode::UNAUTHORIZED
+    {
+        return Ok(false);
+    }
+
+    if !resp.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "checkUserAccess returned unexpected status {}",
+            resp.status()
+        )));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("checkUserAccess response parse failed: {e}")))?;
+
+    Ok(json
+        .get("granted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
+}
+
+async fn resolve_did_service_endpoint(
+    http: &reqwest::Client,
+    did: &str,
+) -> Result<String, AppError> {
+    let url = if did.starts_with("did:plc:") {
+        format!("https://plc.directory/{did}")
+    } else if did.starts_with("did:web:") {
+        let identifier = did.strip_prefix("did:web:").unwrap();
+        let mut segments = identifier.split(':');
+        let host = segments.next().unwrap();
+        let path_segments: Vec<&str> = segments.collect();
+        if path_segments.is_empty() {
+            format!("https://{host}/.well-known/did.json")
+        } else {
+            format!("https://{host}/{}/did.json", path_segments.join("/"))
+        }
+    } else {
+        return Err(AppError::BadRequest(format!(
+            "unsupported DID method for managing app: {did}"
+        )));
+    };
+
+    #[derive(serde::Deserialize)]
+    struct DidDoc {
+        #[serde(default)]
+        service: Vec<DidService>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DidService {
+        id: String,
+        service_endpoint: String,
+    }
+
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("DID resolution failed for {did}: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "DID resolution returned {} for {did}",
+            resp.status()
+        )));
+    }
+
+    let doc: DidDoc = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("invalid DID document for {did}: {e}")))?;
+
+    doc.service
+        .iter()
+        .find(|s| s.id == "#atproto_pds" || s.id == format!("{did}#atproto_pds"))
+        .map(|s| s.service_endpoint.clone())
+        .ok_or_else(|| AppError::Internal(format!("no #atproto_pds service in DID doc for {did}")))
+}
+
+pub fn check_app_access(space: &Space, attested_client_id: Option<&str>) -> Result<(), AppError> {
+    match &space.app_access {
+        AppAccess::Open => Ok(()),
+        AppAccess::AllowList { allowed } => {
+            let client_id = attested_client_id
+                .ok_or_else(|| AppError::Auth("space requires client attestation".into()))?;
+            if allowed.iter().any(|id| id == client_id) {
+                Ok(())
+            } else {
+                Err(AppError::Forbidden(
+                    "this app is not authorized to access this space".into(),
+                ))
+            }
+        }
+    }
 }
 
 async fn get_or_create_signing_key(
@@ -139,7 +293,7 @@ async fn get_or_create_signing_key(
         .bind(&space.id)
         .bind(&encrypted_signing)
         .bind(&encrypted_rotation)
-        .bind(&space.owner_did)
+        .bind(&space.authority_did)
         .bind(&now)
         .execute(pool)
         .await
@@ -219,20 +373,20 @@ async fn store_credential_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spaces::types::{AccessMode, Space, SpaceConfig};
+    use crate::spaces::types::{AppAccess, MintPolicy, Space, SpaceConfig};
 
-    fn test_space(access_mode: AccessMode) -> Space {
+    fn test_space(app_access: AppAccess) -> Space {
         Space {
             id: "test-space".into(),
             did: "did:plc:owner".into(),
-            owner_did: "did:plc:owner".into(),
+            authority_did: "did:plc:owner".into(),
+            creator_did: "did:plc:owner".into(),
             type_nsid: "com.example.forum".into(),
             skey: "main".into(),
             display_name: None,
             description: None,
-            access_mode,
-            app_allowlist: None,
-            app_denylist: None,
+            mint_policy: MintPolicy::MemberList,
+            app_access,
             managing_app_did: None,
             config: SpaceConfig::default(),
             revision: None,
@@ -242,40 +396,40 @@ mod tests {
     }
 
     #[test]
-    fn app_access_default_allow_no_lists() {
-        let space = test_space(AccessMode::DefaultAllow);
+    fn app_access_open_allows_any() {
+        let space = test_space(AppAccess::Open);
         assert!(check_app_access(&space, Some("any-app")).is_ok());
     }
 
     #[test]
-    fn app_access_default_allow_denied() {
-        let mut space = test_space(AccessMode::DefaultAllow);
-        space.app_denylist = Some(vec!["bad-app".into()]);
-
-        assert!(check_app_access(&space, Some("good-app")).is_ok());
-        assert!(check_app_access(&space, Some("bad-app")).is_err());
-    }
-
-    #[test]
-    fn app_access_default_deny_no_allowlist() {
-        let space = test_space(AccessMode::DefaultDeny);
-        assert!(check_app_access(&space, Some("any-app")).is_err());
-    }
-
-    #[test]
-    fn app_access_default_deny_allowed() {
-        let mut space = test_space(AccessMode::DefaultDeny);
-        space.app_allowlist = Some(vec!["good-app".into()]);
-
+    fn app_access_allowlist_permits_listed() {
+        let space = test_space(AppAccess::AllowList {
+            allowed: vec!["good-app".into()],
+        });
         assert!(check_app_access(&space, Some("good-app")).is_ok());
         assert!(check_app_access(&space, Some("other-app")).is_err());
     }
 
     #[test]
-    fn app_access_no_client_id_always_passes() {
-        let space = test_space(AccessMode::DefaultDeny);
+    fn app_access_allowlist_requires_client_id() {
+        let space = test_space(AppAccess::AllowList { allowed: vec![] });
+        assert!(check_app_access(&space, None).is_err());
+    }
+
+    #[test]
+    fn app_access_open_allows_none_client_id() {
+        let space = test_space(AppAccess::Open);
         assert!(check_app_access(&space, None).is_ok());
     }
+
+    #[test]
+    fn app_access_empty_allowlist_rejects() {
+        let space = test_space(AppAccess::AllowList { allowed: vec![] });
+        assert!(check_app_access(&space, Some("any-client")).is_err());
+    }
+
+    // resolve_did_service_endpoint is async and makes HTTP calls to resolve DID
+    // documents, so it cannot be unit-tested without a mock HTTP server.
 
     #[test]
     fn generate_keypair_produces_valid_jwk() {

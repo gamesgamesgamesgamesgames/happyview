@@ -12,6 +12,8 @@ pub enum LexiconType {
     Record,
     Query,
     Procedure,
+    /// A space type declaration: defines the shape and allowed collections for a space type.
+    Space,
     /// Lexicons with no `main` def or a non-endpoint main type (token, object, string, etc.).
     Definitions,
 }
@@ -83,6 +85,10 @@ pub struct ParsedLexicon {
     pub token_cost: Option<u32>,
     /// Optional space type NSID indicating this lexicon is designed for use within spaces of that type.
     pub space_type: Option<String>,
+    /// For space declarations: the human-readable name (1-64 chars).
+    pub space_name: Option<String>,
+    /// For space declarations: the allowed collection NSIDs.
+    pub space_collections: Option<Vec<String>>,
 }
 
 impl ParsedLexicon {
@@ -110,6 +116,7 @@ impl ParsedLexicon {
             Some("record") => LexiconType::Record,
             Some("query") => LexiconType::Query,
             Some("procedure") => LexiconType::Procedure,
+            Some("space") => LexiconType::Space,
             _ => LexiconType::Definitions,
         };
 
@@ -128,6 +135,41 @@ impl ParsedLexicon {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let (space_name, space_collections) = if lexicon_type == LexiconType::Space {
+            let main = main_def.ok_or("space lexicon missing 'defs.main'")?;
+
+            main.get("key")
+                .and_then(|v| v.as_str())
+                .ok_or("space lexicon 'defs.main.key' must be a string")?;
+
+            let name = main
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or("space lexicon 'defs.main.name' must be a string")?;
+            let name_len = name.chars().count();
+            if name_len == 0 || name_len > 64 {
+                return Err("space lexicon 'defs.main.name' must be 1-64 characters".into());
+            }
+
+            let collections_val = main
+                .get("collections")
+                .and_then(|v| v.as_array())
+                .ok_or("space lexicon 'defs.main.collections' must be an array")?;
+            let collections: Vec<String> = collections_val
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| format!("space lexicon 'collections[{i}]' must be a string"))
+                })
+                .collect::<Result<_, _>>()?;
+
+            (Some(name.to_string()), Some(collections))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             id,
             lexicon_type,
@@ -142,6 +184,8 @@ impl ParsedLexicon {
             action,
             token_cost,
             space_type,
+            space_name,
+            space_collections,
         })
     }
 }
@@ -274,6 +318,15 @@ impl LexiconRegistry {
     pub async fn count(&self) -> usize {
         let inner = self.inner.read().await;
         inner.len()
+    }
+
+    /// Look up a space-type declaration by NSID. Returns `None` if not found or not a space type.
+    pub async fn get_space_declaration(&self, id: &str) -> Option<ParsedLexicon> {
+        let inner = self.inner.read().await;
+        inner
+            .get(id)
+            .filter(|lex| lex.lexicon_type == LexiconType::Space)
+            .cloned()
     }
 }
 
@@ -652,6 +705,164 @@ mod tests {
         assert_eq!(ProcedureAction::Update.to_optional_str(), Some("update"));
         assert_eq!(ProcedureAction::Delete.to_optional_str(), Some("delete"));
         assert_eq!(ProcedureAction::Upsert.to_optional_str(), None);
+    }
+
+    fn space_declaration_lexicon_json() -> Value {
+        json!({
+            "lexicon": 1,
+            "id": "com.example.forum",
+            "defs": {
+                "main": {
+                    "type": "space",
+                    "key": "slug",
+                    "name": "Forum",
+                    "collections": [
+                        "com.example.forum.post",
+                        "com.example.forum.comment"
+                    ]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn parse_space_declaration_lexicon() {
+        let parsed = ParsedLexicon::parse(
+            space_declaration_lexicon_json(),
+            1,
+            None,
+            ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed.lexicon_type, LexiconType::Space);
+        assert_eq!(parsed.space_name.as_deref(), Some("Forum"));
+        assert_eq!(
+            parsed.space_collections,
+            Some(vec![
+                "com.example.forum.post".to_string(),
+                "com.example.forum.comment".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_space_declaration_missing_key_returns_error() {
+        let raw = json!({
+            "lexicon": 1,
+            "id": "com.example.forum",
+            "defs": {
+                "main": {
+                    "type": "space",
+                    "name": "Forum",
+                    "collections": []
+                }
+            }
+        });
+        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("key"));
+    }
+
+    #[test]
+    fn parse_space_declaration_missing_name_returns_error() {
+        let raw = json!({
+            "lexicon": 1,
+            "id": "com.example.forum",
+            "defs": {
+                "main": {
+                    "type": "space",
+                    "key": "slug",
+                    "collections": []
+                }
+            }
+        });
+        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("name"));
+    }
+
+    #[test]
+    fn parse_space_declaration_name_too_long_returns_error() {
+        let raw = json!({
+            "lexicon": 1,
+            "id": "com.example.forum",
+            "defs": {
+                "main": {
+                    "type": "space",
+                    "key": "slug",
+                    "name": "a".repeat(65),
+                    "collections": []
+                }
+            }
+        });
+        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("1-64"));
+    }
+
+    #[test]
+    fn parse_space_declaration_missing_collections_returns_error() {
+        let raw = json!({
+            "lexicon": 1,
+            "id": "com.example.forum",
+            "defs": {
+                "main": {
+                    "type": "space",
+                    "key": "slug",
+                    "name": "Forum"
+                }
+            }
+        });
+        let result = ParsedLexicon::parse(raw, 1, None, ProcedureAction::Upsert, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("collections"));
+    }
+
+    #[tokio::test]
+    async fn registry_get_space_declaration() {
+        let reg = LexiconRegistry::new();
+        let parsed = ParsedLexicon::parse(
+            space_declaration_lexicon_json(),
+            1,
+            None,
+            ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        reg.upsert(parsed).await;
+
+        let decl = reg.get_space_declaration("com.example.forum").await;
+        assert!(decl.is_some());
+        assert_eq!(
+            decl.unwrap().space_collections,
+            Some(vec![
+                "com.example.forum.post".to_string(),
+                "com.example.forum.comment".to_string()
+            ])
+        );
+
+        let not_space = reg.get_space_declaration("nonexistent").await;
+        assert!(not_space.is_none());
+    }
+
+    #[tokio::test]
+    async fn registry_get_space_declaration_excludes_non_space_types() {
+        let reg = LexiconRegistry::new();
+        let parsed = ParsedLexicon::parse(
+            record_lexicon_json(),
+            1,
+            None,
+            ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        reg.upsert(parsed).await;
+
+        let result = reg
+            .get_space_declaration("games.gamesgamesgamesgames.game")
+            .await;
+        assert!(result.is_none());
     }
 
     #[test]

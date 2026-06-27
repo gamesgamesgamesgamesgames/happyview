@@ -33,6 +33,7 @@ pub mod service_entries;
 pub mod service_identity;
 pub mod setup;
 pub mod spaces;
+pub mod verification_methods;
 pub mod xrpc;
 
 use auth::oauth_store::{DbSessionStore, DbStateStore};
