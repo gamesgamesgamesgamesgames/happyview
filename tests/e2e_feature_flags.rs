@@ -62,7 +62,7 @@ async fn space_routes_blocked_when_flag_disabled() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/xrpc/dev.happyview.space.list")
+                .uri("/xrpc/com.atproto.space.listSpaces")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -99,7 +99,7 @@ async fn space_routes_allowed_after_enabling_flag() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/xrpc/dev.happyview.space.list")
+                .uri("/xrpc/com.atproto.space.listSpaces")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -151,7 +151,7 @@ async fn space_routes_blocked_again_after_disabling_flag() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/xrpc/dev.happyview.space.list")
+                .uri("/xrpc/com.atproto.space.listSpaces")
                 .body(Body::empty())
                 .unwrap(),
         )

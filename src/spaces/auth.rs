@@ -111,11 +111,19 @@ async fn check_user_access_with_managing_app(
 ) -> Result<bool, AppError> {
     // Parse DID#fragment — the fragment identifies the service endpoint in the DID doc.
     // For outbound callback we derive the endpoint from the DID.
-    let (did, _fragment) = if let Some(pos) = managing_app.find('#') {
+    let (did, fragment) = if let Some(pos) = managing_app.find('#') {
         (&managing_app[..pos], Some(&managing_app[pos + 1..]))
     } else {
         (managing_app, None)
     };
+
+    if let Some(frag) = fragment
+        && frag != "atproto_pds"
+    {
+        return Err(AppError::BadRequest(format!(
+            "unsupported service fragment '#{frag}' for managing app"
+        )));
+    }
 
     // Resolve the managing app's PDS/service endpoint from its DID document.
     let endpoint = resolve_did_service_endpoint(http, did).await?;

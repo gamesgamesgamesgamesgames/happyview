@@ -160,29 +160,6 @@ fn require_auth(claims: &XrpcClaims) -> Result<&crate::auth::Claims, AppError> {
         .ok_or_else(|| AppError::Auth("This endpoint requires authentication".into()))
 }
 
-async fn require_auth_or_credential(
-    state: &AppState,
-    claims: &XrpcClaims,
-) -> Result<String, AppError> {
-    if let Some(identity) = &claims.identity {
-        return Ok(identity.did().to_string());
-    }
-
-    if let Some(token) = &claims.space_credential {
-        let verified = crate::spaces::credential::verify_external_credential(
-            token,
-            &state.http,
-            &state.config.plc_url,
-        )
-        .await?;
-        return Ok(verified.sub);
-    }
-
-    Err(AppError::Auth(
-        "This endpoint requires authentication".into(),
-    ))
-}
-
 async fn resolve_space(state: &AppState, space_uri: &str) -> Result<Space, AppError> {
     let uri = SpaceUri::parse(space_uri)?;
     db::get_space_by_address(
@@ -214,7 +191,7 @@ async fn require_space_admin(state: &AppState, space: &Space, did: &str) -> Resu
         return Ok(());
     }
     Err(AppError::Forbidden(
-        "Only the space owner can perform this action".into(),
+        "Only the space authority can perform this action".into(),
     ))
 }
 
@@ -380,8 +357,9 @@ async fn list_members(
     let space = resolve_space(&state, &query.space).await?;
 
     if !space.config.membership_public {
-        let did = require_auth_or_credential(&state, &xrpc_claims).await?;
-        let member = members::is_member(&state.db, state.db_backend, &space.id, &did).await?;
+        let claims = require_auth(&xrpc_claims)?;
+        let member =
+            members::is_member(&state.db, state.db_backend, &space.id, claims.did()).await?;
         member.ok_or_else(|| AppError::Forbidden("You are not a member of this space".into()))?;
     }
 

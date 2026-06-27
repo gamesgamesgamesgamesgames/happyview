@@ -74,7 +74,7 @@ When a script handles a space-scoped request, the `space` global is set to a tab
 | `space`     | string | The full `ats://` space URI                              |
 | `space_id`  | string | Internal space identifier                                |
 | `did`       | string | The space's DID                                          |
-| `owner_did` | string | The space authority's DID                                |
+| `authority_did` | string | The space authority's DID                            |
 | `type_nsid` | string | Space type NSID                                          |
 | `skey`      | string | Space key                                                |
 

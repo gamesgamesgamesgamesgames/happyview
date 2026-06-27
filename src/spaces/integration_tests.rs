@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(peek_jwt_typ(&token).as_deref(), Some(DELEGATION_TOKEN_TYP));
 
         // Step 2: space host verifies delegation token
-        let verified_delegation = verify_delegation_token(&token, &vk).unwrap();
+        let verified_delegation = verify_delegation_token(&token, &vk, &delegation.aud).unwrap();
         assert_eq!(verified_delegation.iss, "did:plc:member");
         assert_eq!(
             verified_delegation.sub,
@@ -203,7 +203,7 @@ mod tests {
             jti: make_jti(),
         };
         let token = sign_delegation_token(&delegation, &sk).unwrap();
-        let result = verify_delegation_token(&token, &vk);
+        let result = verify_delegation_token(&token, &vk, &delegation.aud);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expired"));
     }

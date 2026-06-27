@@ -32,6 +32,23 @@ pub(super) async fn create(
 ) -> Result<(StatusCode, Json<VerificationMethod>), AppError> {
     auth.require(Permission::SettingsManage).await?;
 
+    if !body.fragment_id.starts_with('#') {
+        return Err(AppError::BadRequest(
+            "fragment_id must start with '#'".into(),
+        ));
+    }
+    let frag_body = &body.fragment_id[1..];
+    if frag_body.is_empty()
+        || !frag_body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(AppError::BadRequest(
+            "fragment_id must contain only alphanumeric characters and underscores after '#'"
+                .into(),
+        ));
+    }
+
     let encryption_key = state
         .config
         .token_encryption_key

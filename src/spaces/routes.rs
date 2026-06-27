@@ -397,7 +397,7 @@ async fn require_space_admin(state: &AppState, space: &Space, did: &str) -> Resu
         return Ok(());
     }
     Err(AppError::Forbidden(
-        "Only the space owner can perform this action".into(),
+        "Only the space authority can perform this action".into(),
     ))
 }
 
@@ -450,6 +450,22 @@ fn content_cid(record: &serde_json::Value) -> String {
     let bytes = serde_json::to_vec(record).unwrap_or_default();
     let hash = Sha256::digest(&bytes);
     format!("bafyrei{}", hex::encode(&hash[..20]))
+}
+
+async fn resolve_client_id_url(
+    state: &AppState,
+    client_key: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT client_id_url FROM happyview_api_clients WHERE client_key = ?",
+        state.db_backend,
+    );
+    let row: Option<(String,)> = sqlx::query_as(&sql)
+        .bind(client_key)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to look up API client: {e}")))?;
+    Ok(row.map(|(url,)| url))
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,12 +1353,27 @@ async fn get_space_credential(
         k256::ecdsa::VerifyingKey::from(&signing_key)
     };
 
-    let delegation_claims =
-        crate::spaces::credential::verify_delegation_token(&input.grant, &verifying_key)?;
+    let delegation_claims = {
+        let unverified_sub = crate::spaces::credential::peek_delegation_sub(&input.grant)
+            .ok_or_else(|| AppError::Auth("invalid delegation token".into()))?;
+        let space_did = crate::spaces::SpaceUri::parse(&unverified_sub)
+            .map(|u| u.did.clone())
+            .unwrap_or_default();
+        let expected_aud = format!("{space_did}#atproto_space_host");
+        crate::spaces::credential::verify_delegation_token(
+            &input.grant,
+            &verifying_key,
+            &expected_aud,
+        )?
+    };
 
     let space = resolve_space(&state, &delegation_claims.sub).await?;
 
-    let client_id = claims.client_key().map(|k| k.to_string());
+    let client_id = if let Some(key) = claims.client_key() {
+        resolve_client_id_url(&state, key).await?
+    } else {
+        None
+    };
     let issued = crate::spaces::auth::issue_credential(
         &state.db,
         state.db_backend,

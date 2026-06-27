@@ -25,6 +25,17 @@ pub fn peek_jwt_typ(token: &str) -> Option<String> {
     header["typ"].as_str().map(|s| s.to_string())
 }
 
+/// Peek at a delegation token's payload to extract the `sub` (space URI) without verifying.
+pub fn peek_delegation_sub(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let claims: DelegationTokenClaims = serde_json::from_slice(&payload_bytes).ok()?;
+    Some(claims.sub)
+}
+
 /// Peek at a space credential JWT's payload to extract the `sub` (space URI) without verifying.
 pub fn peek_credential_sub(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.split('.').collect();
@@ -69,6 +80,7 @@ pub fn sign_delegation_token(
 pub fn verify_delegation_token(
     token: &str,
     verifying_key: &K256VerifyingKey,
+    expected_aud: &str,
 ) -> Result<DelegationTokenClaims, AppError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -130,6 +142,12 @@ pub fn verify_delegation_token(
 
     if now >= claims.exp {
         return Err(AppError::Auth("delegation token has expired".into()));
+    }
+
+    if claims.aud != expected_aud {
+        return Err(AppError::Auth(
+            "delegation token audience does not match this host".into(),
+        ));
     }
 
     Ok(claims)
@@ -448,7 +466,7 @@ mod tests {
         let claims = make_delegation_claims();
 
         let token = sign_delegation_token(&claims, &signing_key).unwrap();
-        let verified = verify_delegation_token(&token, &verifying_key).unwrap();
+        let verified = verify_delegation_token(&token, &verifying_key, &claims.aud).unwrap();
 
         assert_eq!(verified.iss, claims.iss);
         assert_eq!(verified.sub, claims.sub);
@@ -464,8 +482,21 @@ mod tests {
         let claims = make_delegation_claims();
 
         let token = sign_delegation_token(&claims, &signing_key).unwrap();
-        let result = verify_delegation_token(&token, &verifying_key);
+        let result = verify_delegation_token(&token, &verifying_key, &claims.aud);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn delegation_rejects_wrong_aud() {
+        let signing_key = make_k256_signing_key();
+        let verifying_key = K256VerifyingKey::from(&signing_key);
+        let claims = make_delegation_claims();
+
+        let token = sign_delegation_token(&claims, &signing_key).unwrap();
+        let result =
+            verify_delegation_token(&token, &verifying_key, "did:plc:wrong#atproto_space_host");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("audience"));
     }
 
     #[test]
@@ -486,7 +517,7 @@ mod tests {
         };
 
         let token = sign_delegation_token(&claims, &signing_key).unwrap();
-        let result = verify_delegation_token(&token, &verifying_key);
+        let result = verify_delegation_token(&token, &verifying_key, &claims.aud);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expired"));
     }
@@ -510,7 +541,7 @@ mod tests {
             URL_SAFE_NO_PAD.encode(sig.to_bytes())
         );
 
-        let result = verify_delegation_token(&token, &verifying_key);
+        let result = verify_delegation_token(&token, &verifying_key, &claims.aud);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("typ"));
     }

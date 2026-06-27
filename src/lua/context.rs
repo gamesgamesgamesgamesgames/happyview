@@ -8,7 +8,7 @@ pub struct SpaceContext {
     pub space: String,
     pub space_id: String,
     pub did: String,
-    pub owner_did: String,
+    pub authority_did: String,
     pub type_nsid: String,
     pub skey: String,
 }
@@ -21,7 +21,7 @@ fn set_space_context(lua: &Lua, space: Option<&SpaceContext>) -> LuaResult<()> {
             table.set("space", ctx.space.as_str())?;
             table.set("space_id", ctx.space_id.as_str())?;
             table.set("did", ctx.did.as_str())?;
-            table.set("owner_did", ctx.owner_did.as_str())?;
+            table.set("authority_did", ctx.authority_did.as_str())?;
             table.set("type_nsid", ctx.type_nsid.as_str())?;
             table.set("skey", ctx.skey.as_str())?;
             globals.set("space", table)?;
@@ -274,7 +274,7 @@ mod tests {
             space: "ats://did:plc:owner/com.example.forum/main".into(),
             space_id: "space-123".into(),
             did: "did:plc:owner".into(),
-            owner_did: "did:plc:owner".into(),
+            authority_did: "did:plc:owner".into(),
             type_nsid: "com.example.forum".into(),
             skey: "main".into(),
         };

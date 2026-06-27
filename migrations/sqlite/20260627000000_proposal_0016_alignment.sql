@@ -39,7 +39,7 @@ CREATE TABLE happyview_space_repo_state (
     id TEXT PRIMARY KEY,
     space_id TEXT NOT NULL REFERENCES happyview_spaces(id) ON DELETE CASCADE,
     author_did TEXT NOT NULL,
-    lthash_state BLOB NOT NULL DEFAULT X'',
+    lthash_state BLOB NOT NULL DEFAULT (zeroblob(2048)),
     rev TEXT,
     hash BLOB,
     ikm BLOB,
