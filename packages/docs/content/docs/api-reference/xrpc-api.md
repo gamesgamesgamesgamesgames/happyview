@@ -8,8 +8,20 @@ If a query or procedure lexicon has a [Lua script](../guides/lua-scripting.md) a
 
 ## Auth
 
-- **Queries** (`GET /xrpc/{method}`): unauthenticated
-- **Procedures** (`POST /xrpc/{method}`): require DPoP authentication (`Authorization: DPoP` + `DPoP` proof header + `X-Client-Key`)
+XRPC routes accept several authentication methods:
+
+- **DPoP auth** — `Authorization: DPoP <token>` + `DPoP` proof header + `X-Client-Key`
+- **Space credentials** — `Authorization: Bearer <space_credential_jwt>` (space-scoped routes only)
+- **Service auth JWTs** — `Authorization: Bearer <service_auth_jwt>` (inter-service calls)
+- **Cookie-based session auth** — signed session cookies (used by the dashboard, falls back when no `Authorization` header is present)
+- **Anonymous** — no auth headers (identity is `nil` in Lua scripts)
+
+Bearer API keys (`hv_*`) are rejected on XRPC routes — they are only accepted on the [admin API](admin/admin-api.md).
+
+Default auth behavior:
+
+- **Queries** (`GET /xrpc/{method}`): unauthenticated by default (identity available if provided)
+- **Procedures** (`POST /xrpc/{method}`): require authentication (DPoP, session cookie, or service auth)
 - **getProfile**: requires auth
 - **uploadBlob**: requires auth
 

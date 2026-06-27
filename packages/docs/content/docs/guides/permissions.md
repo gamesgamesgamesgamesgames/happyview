@@ -6,57 +6,120 @@ HappyView uses a granular permission system to control access to the admin API. 
 
 ## Permission list
 
-HappyView defines 20 permissions organized by category:
+HappyView defines 44 permissions organized by category:
 
 ### Lexicons
 
-| Permission        | Description                                    |
-| ----------------- | ---------------------------------------------- |
-| `lexicons:create` | Upload and upsert lexicons (local and network) |
-| `lexicons:read`   | List and view lexicon details                  |
-| `lexicons:delete` | Delete lexicons                                |
+| Permission        | Description                          |
+| ----------------- | ------------------------------------ |
+| `lexicons:create` | Upload and register new lexicon schemas |
+| `lexicons:read`   | View registered lexicon schemas      |
+| `lexicons:delete` | Remove lexicon schemas               |
 
 ### Records
 
 | Permission                  | Description                             |
 | --------------------------- | --------------------------------------- |
-| `records:read`              | List and view indexed records           |
-| `records:delete`            | Delete individual records               |
+| `records:read`              | Browse indexed AT Protocol records      |
+| `records:delete`            | Delete individual records from the index |
 | `records:delete-collection` | Bulk-delete all records in a collection |
+
+### Scripts
+
+| Permission       | Description                                       |
+| ---------------- | ------------------------------------------------- |
+| `scripts:read`   | View trigger-keyed scripts                        |
+| `scripts:manage` | Create, update, and delete trigger-keyed scripts  |
 
 ### Script Variables
 
-| Permission                | Description                               |
-| ------------------------- | ----------------------------------------- |
-| `script-variables:create` | Create and update script variables        |
-| `script-variables:read`   | List script variables (values are masked) |
-| `script-variables:delete` | Delete script variables                   |
+| Permission                | Description                                        |
+| ------------------------- | -------------------------------------------------- |
+| `script-variables:create` | Add or update environment variables for Lua scripts |
+| `script-variables:read`   | View script environment variable keys and values   |
+| `script-variables:delete` | Remove script environment variables                |
 
 ### Users
 
-| Permission     | Description                |
-| -------------- | -------------------------- |
-| `users:create` | Add new users              |
-| `users:read`   | List and view user details |
-| `users:update` | Modify user permissions    |
-| `users:delete` | Remove users               |
+| Permission     | Description                            |
+| -------------- | -------------------------------------- |
+| `users:create` | Add new dashboard users                |
+| `users:read`   | View the user list and their permissions |
+| `users:update` | Modify user permissions                |
+| `users:delete` | Remove dashboard users                 |
 
 ### API Keys
 
-| Permission        | Description         |
-| ----------------- | ------------------- |
-| `api-keys:create` | Create new API keys |
-| `api-keys:read`   | List API keys       |
-| `api-keys:delete` | Revoke API keys     |
+| Permission        | Description                              |
+| ----------------- | ---------------------------------------- |
+| `api-keys:create` | Generate new API keys for admin access   |
+| `api-keys:read`   | View existing API keys                   |
+| `api-keys:delete` | Revoke existing API keys                 |
 
-### Operations
+### Backfill
 
-| Permission        | Description              |
-| ----------------- | ------------------------ |
-| `backfill:create` | Start backfill jobs      |
-| `backfill:read`   | View backfill job status |
-| `stats:read`      | View record statistics   |
-| `events:read`     | Query the event log      |
+| Permission        | Description                               |
+| ----------------- | ----------------------------------------- |
+| `backfill:create` | Trigger historical record backfill jobs   |
+| `backfill:read`   | View backfill job status and progress     |
+
+### Labelers
+
+| Permission        | Description                           |
+| ----------------- | ------------------------------------- |
+| `labelers:create` | Subscribe to external labeler services |
+| `labelers:read`   | View subscribed labeler services      |
+| `labelers:delete` | Unsubscribe from labeler services     |
+
+### Settings
+
+| Permission        | Description                                         |
+| ----------------- | --------------------------------------------------- |
+| `settings:manage` | Modify instance settings, logo, and configuration   |
+
+### Plugins
+
+| Permission        | Description                                  |
+| ----------------- | -------------------------------------------- |
+| `plugins:read`    | View installed plugins and their configuration |
+| `plugins:create`  | Install and configure new plugins            |
+| `plugins:delete`  | Uninstall plugins                            |
+
+### API Clients
+
+| Permission           | Description                              |
+| -------------------- | ---------------------------------------- |
+| `api-clients:view`   | View registered OAuth API clients        |
+| `api-clients:create` | Register new OAuth API clients           |
+| `api-clients:edit`   | Modify API client settings and credentials |
+| `api-clients:delete` | Remove registered API clients            |
+
+### Dead Letters
+
+| Permission            | Description                            |
+| --------------------- | -------------------------------------- |
+| `dead-letters:read`   | View failed hook executions            |
+| `dead-letters:manage` | Retry, re-index, or dismiss dead letters |
+
+### Spaces
+
+| Permission                  | Description                                |
+| --------------------------- | ------------------------------------------ |
+| `spaces:create`             | Create new permissioned data spaces        |
+| `spaces:read`               | View space details and metadata            |
+| `spaces:update`             | Modify space settings                      |
+| `spaces:delete`             | Remove spaces and their data               |
+| `spaces:manage-members`     | Add or remove space members and roles      |
+| `spaces:manage-invites`     | Create and revoke space invitations        |
+| `spaces:manage-records`     | Read and write records within spaces       |
+| `spaces:manage-credentials` | Issue and revoke space access credentials  |
+
+### System
+
+| Permission   | Description                              |
+| ------------ | ---------------------------------------- |
+| `stats:read` | View collection statistics and record counts |
+| `events:read` | View the event log                      |
 
 ## Permission templates
 
@@ -64,25 +127,25 @@ Templates are predefined sets of permissions that simplify user creation. Pass a
 
 ### Viewer
 
-Read-only access. Can browse lexicons, records, stats, events, and user lists but cannot modify anything.
+Read-only access. Can browse lexicons, records, scripts, stats, events, dead letters, and user lists but cannot modify anything.
 
-Includes: `lexicons:read`, `records:read`, `script-variables:read`, `users:read`, `api-keys:read`, `backfill:read`, `stats:read`, `events:read`
+Includes: `lexicons:read`, `records:read`, `scripts:read`, `script-variables:read`, `users:read`, `api-keys:read`, `backfill:read`, `stats:read`, `events:read`, `dead-letters:read`
 
 ### Operator
 
-Everything in Viewer, plus the ability to run backfill jobs and manage API keys.
+Everything in Viewer, plus the ability to run backfill jobs, manage API keys, and manage dead letters.
 
-Adds: `backfill:create`, `api-keys:create`, `api-keys:delete`
+Adds: `backfill:create`, `api-keys:create`, `api-keys:delete`, `dead-letters:manage`
 
 ### Manager
 
-Everything in Operator, plus the ability to manage lexicons, records, and script variables.
+Everything in Operator, plus the ability to manage lexicons, records, scripts, labelers, settings, plugins, API clients, and spaces.
 
-Adds: `lexicons:create`, `lexicons:delete`, `script-variables:create`, `script-variables:delete`, `records:delete`
+Adds: `lexicons:create`, `lexicons:delete`, `scripts:manage`, `script-variables:create`, `script-variables:delete`, `records:delete`, `labelers:create`, `labelers:read`, `labelers:delete`, `settings:manage`, `plugins:read`, `plugins:create`, `plugins:delete`, `api-clients:view`, `api-clients:create`, `api-clients:edit`, `api-clients:delete`, `spaces:create`, `spaces:read`, `spaces:update`, `spaces:delete`, `spaces:manage-members`, `spaces:manage-invites`, `spaces:manage-records`, `spaces:manage-credentials`
 
 ### Full Access
 
-All 20 permissions. Equivalent to granting every permission individually (but still not a super user).
+All 44 permissions. Equivalent to granting every permission individually (but still not a super user).
 
 ## Super user
 

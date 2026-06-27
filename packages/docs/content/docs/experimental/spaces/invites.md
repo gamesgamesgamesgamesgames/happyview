@@ -109,7 +109,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createInvit
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `space` | string | Yes | | The space this invite is for |
-| `access` | string | No | `read` | Access level granted on redemption (`read` or `write`) |
+| `access` | string | No | `read` | Access level granted on acceptance (`read`, `read_self`, or `write`) |
 | `maxUses` | integer | No | unlimited | Maximum number of times the invite can be redeemed |
 | `expiresAt` | string (datetime) | No | never | When the invite expires |
 
@@ -129,12 +129,12 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createInvit
 The `token` is only returned once. It is stored as a SHA-256 hash — HappyView cannot recover the plaintext.
 </Callout>
 
-## Redeeming an invite
+## Accepting an invite
 
-Any authenticated user can redeem an invite token to join the space.
+Any authenticated user can accept an invite token to join the space.
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.redeemInvite", {
+const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.acceptInvite", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -146,14 +146,14 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
     token: "a1b2c3d4e5f6...",
   }),
 });
-interface RedeemInviteResponse {
+interface AcceptInviteResponse {
   uri: string;
   access: string;
 }
-const data: RedeemInviteResponse = await response.json();
+const data: AcceptInviteResponse = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.redeemInvite", {
+const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.acceptInvite", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -169,7 +169,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.redeemInvite")
+    .post("https://happyview.example.com/xrpc/dev.happyview.space.acceptInvite")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -183,7 +183,7 @@ let data: serde_json::Value = response.json().await?;
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{"token": "a1b2c3d4e5f6..."}`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.redeemInvite", body)
+  "https://happyview.example.com/xrpc/dev.happyview.space.acceptInvite", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -191,7 +191,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.redeemInvite' \
+curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.acceptInvite' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
@@ -210,7 +210,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.redeemInvit
 }
 ```
 
-Redemption fails if:
+Acceptance fails if:
 
 - The token is invalid (no matching hash found)
 - The invite has been revoked

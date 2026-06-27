@@ -16,6 +16,8 @@ Building an AppView from scratch means wiring up real-time event streams, record
 
 - **Protocol-native:** Works with any PDS, resolves DIDs through the directory, and fetches [network lexicons](guides/lexicons.md#network-lexicons) via DNS authority resolution.
 
+- **Permissioned Spaces:** Experimental support for [AT Protocol Proposal 0016](experimental/spaces/index.md) — membership-gated data containers with per-user repo state, cross-service credentials, and write notifications.
+
 - **Full admin surface:** Built-in [dashboard](getting-started/dashboard.md) and [admin API](api-reference/admin/admin-api.md) for managing lexicons, users, API keys, API clients, backfill jobs, and plugins.
 
 ## Design Principles
@@ -36,4 +38,5 @@ Building an AppView from scratch means wiring up real-time event streams, record
 - [Record & Label Scripts](guides/label-scripts): React to record changes and label events in real time
 - [Labelers](guides/labelers.md): Subscribe to external labelers and manage content labels
 - [Plugins](guides/plugins.md): Integrate with external platforms using WASM plugins
+- [Permissioned Spaces](experimental/spaces/index.md): Create membership-gated data containers with the AT Protocol spaces API
 - [Event Logs](guides/event-logs.md): Monitor system activity, debug script errors, and audit admin actions

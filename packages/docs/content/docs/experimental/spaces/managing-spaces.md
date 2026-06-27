@@ -9,7 +9,7 @@ This API is experimental and will change. See the [Permissioned Spaces overview]
 ## Creating a space
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.createSpace", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.createSpace", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -22,7 +22,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
     skey: "main",
     displayName: "My Forum",
     description: "A place for discussion",
-    accessMode: "default_allow",
+    mintPolicy: "member-list",
   }),
 });
 interface CreateSpaceResponse {
@@ -31,7 +31,7 @@ interface CreateSpaceResponse {
 const data: CreateSpaceResponse = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.createSpace", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.createSpace", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -44,14 +44,14 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
     skey: "main",
     displayName: "My Forum",
     description: "A place for discussion",
-    accessMode: "default_allow",
+    mintPolicy: "member-list",
   }),
 });
 const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.createSpace")
+    .post("https://happyview.example.com/xrpc/com.atproto.simplespace.createSpace")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -60,7 +60,7 @@ let response = client
         "skey": "main",
         "displayName": "My Forum",
         "description": "A place for discussion",
-        "accessMode": "default_allow"
+        "mintPolicy": "member-list"
     }))
     .send()
     .await?;
@@ -72,10 +72,10 @@ body := bytes.NewBufferString(`{
   "skey": "main",
   "displayName": "My Forum",
   "description": "A place for discussion",
-  "accessMode": "default_allow"
+  "mintPolicy": "member-list"
 }`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.createSpace", body)
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.createSpace", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -83,7 +83,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createSpace' \
+curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.createSpace' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
@@ -93,7 +93,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createSpace
     "skey": "main",
     "displayName": "My Forum",
     "description": "A place for discussion",
-    "accessMode": "default_allow"
+    "mintPolicy": "member-list"
   }'
 ```
 
@@ -105,7 +105,8 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createSpace
 | `skey`           | string        | Yes      | Space key; differentiates spaces of the same type |
 | `displayName`    | string        | No       | Human-readable name                               |
 | `description`    | string        | No       | Description of the space                          |
-| `accessMode`     | string        | No       | `default_allow` (default) or `default_deny`       |
+| `mintPolicy`     | string        | No       | `member-list` (default), `public`, or `managing-app` |
+| `appAccess`      | object        | No       | `{"type": "open"}` (default) or `{"type": "allowList", "allowed": [...]}` |
 | `managingAppDid` | string        | No       | DID of the application that manages this space    |
 | `config`         | object        | No       | Space configuration (see below)                   |
 
@@ -117,7 +118,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createSpace
 }
 ```
 
-The creator is automatically added as a write member. Use [`dev.happyview.space.getSpace`](#getting-a-space) to retrieve the full space object.
+The creator is automatically added as a write member. Use [`com.atproto.space.getSpace`](#getting-a-space) to retrieve the full space object.
 
 ### Space configuration
 
@@ -134,7 +135,7 @@ Additional fields are preserved as-is.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/dev.happyview.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -151,7 +152,7 @@ const data: Space = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/dev.happyview.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -164,7 +165,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .get("https://happyview.example.com/xrpc/dev.happyview.space.getSpace")
+    .get("https://happyview.example.com/xrpc/com.atproto.space.getSpace")
     .query(&[("space", "ats://did:plc:abc123/com.example.forum/main")])
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
@@ -175,7 +176,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 req, _ := http.NewRequest("GET",
-  "https://happyview.example.com/xrpc/dev.happyview.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main",
   nil)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
@@ -183,7 +184,7 @@ req.Header.Set("DPoP", dpopProof)
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl 'https://happyview.example.com/xrpc/dev.happyview.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main' \
+curl 'https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>'
@@ -197,7 +198,7 @@ Returns spaces where the authenticated user is a member.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/dev.happyview.space.listSpaces?limit=20",
+  "https://happyview.example.com/xrpc/com.atproto.space.listSpaces?limit=20",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -218,7 +219,7 @@ const data: ListSpacesResponse = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/dev.happyview.space.listSpaces?limit=20",
+  "https://happyview.example.com/xrpc/com.atproto.space.listSpaces?limit=20",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -231,7 +232,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .get("https://happyview.example.com/xrpc/dev.happyview.space.listSpaces")
+    .get("https://happyview.example.com/xrpc/com.atproto.space.listSpaces")
     .query(&[("limit", "20")])
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
@@ -242,7 +243,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 req, _ := http.NewRequest("GET",
-  "https://happyview.example.com/xrpc/dev.happyview.space.listSpaces?limit=20",
+  "https://happyview.example.com/xrpc/com.atproto.space.listSpaces?limit=20",
   nil)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
@@ -250,7 +251,7 @@ req.Header.Set("DPoP", dpopProof)
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl 'https://happyview.example.com/xrpc/dev.happyview.space.listSpaces?limit=20' \
+curl 'https://happyview.example.com/xrpc/com.atproto.space.listSpaces?limit=20' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>'
@@ -258,10 +259,11 @@ curl 'https://happyview.example.com/xrpc/dev.happyview.space.listSpaces?limit=20
 
 **Parameters:**
 
-| Field    | Type    | Required | Default | Description                  |
-| -------- | ------- | -------- | ------- | ---------------------------- |
-| `limit`  | integer | No       | 50      | Max spaces to return (1-100) |
-| `cursor` | string  | No       |         | Pagination cursor            |
+| Field    | Type    | Required | Default        | Description                  |
+| -------- | ------- | -------- | -------------- | ---------------------------- |
+| `did`    | string  | No       | authenticated user | Filter by DID              |
+| `limit`  | integer | No       | 50             | Max spaces to return (1-100) |
+| `cursor` | string  | No       |                | Pagination cursor            |
 
 **Response:**
 
@@ -279,10 +281,10 @@ curl 'https://happyview.example.com/xrpc/dev.happyview.space.listSpaces?limit=20
 
 ## Updating a space
 
-Only the space owner or a HappView super admin can update a space.
+Only the space authority or a HappyView super admin can update a space.
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.updateSpace", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.updateSpace", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -293,13 +295,12 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
   body: JSON.stringify({
     space: "ats://did:plc:abc123/com.example.forum/main",
     displayName: "Updated Forum Name",
-    accessMode: "default_deny",
-    appAllowlist: ["did:web:myapp.example.com"],
+    mintPolicy: "public",
   }),
 });
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.updateSpace", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.updateSpace", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -310,22 +311,20 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
   body: JSON.stringify({
     space: "ats://did:plc:abc123/com.example.forum/main",
     displayName: "Updated Forum Name",
-    accessMode: "default_deny",
-    appAllowlist: ["did:web:myapp.example.com"],
+    mintPolicy: "public",
   }),
 });
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.updateSpace")
+    .post("https://happyview.example.com/xrpc/com.atproto.simplespace.updateSpace")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
     .json(&serde_json::json!({
         "space": "ats://did:plc:abc123/com.example.forum/main",
         "displayName": "Updated Forum Name",
-        "accessMode": "default_deny",
-        "appAllowlist": ["did:web:myapp.example.com"]
+        "mintPolicy": "public"
     }))
     .send()
     .await?;
@@ -334,11 +333,10 @@ let response = client
 body := bytes.NewBufferString(`{
   "space": "ats://did:plc:abc123/com.example.forum/main",
   "displayName": "Updated Forum Name",
-  "accessMode": "default_deny",
-  "appAllowlist": ["did:web:myapp.example.com"]
+  "mintPolicy": "public"
 }`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.updateSpace", body)
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.updateSpace", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -346,7 +344,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.updateSpace' \
+curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.updateSpace' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
@@ -354,8 +352,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.updateSpace
   -d '{
     "space": "ats://did:plc:abc123/com.example.forum/main",
     "displayName": "Updated Forum Name",
-    "accessMode": "default_deny",
-    "appAllowlist": ["did:web:myapp.example.com"]
+    "mintPolicy": "public"
   }'
 ```
 
@@ -363,10 +360,10 @@ All fields except `space` are optional. Only provided fields are updated. To cle
 
 ## Deleting a space
 
-Only the space owner or a HappyView super admin can delete a space.
+Only the space authority or a HappyView super admin can delete a space.
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.deleteSpace", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.deleteSpace", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -380,7 +377,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 });
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.deleteSpace", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.deleteSpace", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -395,7 +392,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.deleteSpace")
+    .post("https://happyview.example.com/xrpc/com.atproto.simplespace.deleteSpace")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -408,7 +405,7 @@ let response = client
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{"space": "ats://did:plc:abc123/com.example.forum/main"}`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.deleteSpace", body)
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.deleteSpace", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -416,7 +413,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.deleteSpace' \
+curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.deleteSpace' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
@@ -425,5 +422,5 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.deleteSpace
 ```
 
 <Callout type="warn">
-Deleting a space does not currently cascade to records, members, or credentials. This behavior may change.
+Deleting a space cascades to all associated records, members, repo state, oplog entries, notification registrations, and credentials.
 </Callout>

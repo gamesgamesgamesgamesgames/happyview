@@ -74,6 +74,7 @@ Returns all key/value pairs stored in the `instance_settings` table, plus any en
 | `backfill_concurrent_resolution` | `BACKFILL_CONCURRENT_RESOLUTION` | `100` | How many DID document lookups to run in parallel during PDS resolution |
 | `backfill_retention_days` | `BACKFILL_RETENTION_DAYS` | `28` | Days to keep per-repo detail data from completed backfill jobs. `0` = keep indefinitely |
 | `verbose_event_logging` | `VERBOSE_EVENT_LOGGING` | `false` | Log every record index, hook execution, and hook skip to the event log. High write volume — recommended only for debugging |
+| `feature.spaces_enabled` | `FEATURE_SPACES_ENABLED` | --- | Enables the experimental Permissioned Spaces API. When `"true"`, space endpoints are available. When absent or any other value, space endpoints return `404 FeatureDisabled` |
 
 ## Upsert a setting
 

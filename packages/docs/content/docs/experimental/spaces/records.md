@@ -18,7 +18,7 @@ ats:// did:plc:abcdefghijklmnop1234567890 / com.example.forum / main        / di
 Requires `write` membership in the space. The rkey is auto-generated using a TID.
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.createRecord", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.space.createRecord", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -43,7 +43,7 @@ interface CreateRecordResponse {
 const data: CreateRecordResponse = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.createRecord", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.space.createRecord", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -65,7 +65,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.createRecord")
+    .post("https://happyview.example.com/xrpc/com.atproto.space.createRecord")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -93,7 +93,7 @@ body := bytes.NewBufferString(`{
   }
 }`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.createRecord", body)
+  "https://happyview.example.com/xrpc/com.atproto.space.createRecord", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -101,7 +101,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createRecord' \
+curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.createRecord' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
@@ -141,7 +141,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createRecor
 Requires `write` membership in the space.
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.putRecord", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.space.putRecord", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -167,7 +167,7 @@ interface PutRecordResponse {
 const data: PutRecordResponse = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.putRecord", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.space.putRecord", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -190,7 +190,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.putRecord")
+    .post("https://happyview.example.com/xrpc/com.atproto.space.putRecord")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -220,7 +220,7 @@ body := bytes.NewBufferString(`{
   }
 }`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.putRecord", body)
+  "https://happyview.example.com/xrpc/com.atproto.space.putRecord", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -228,7 +228,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.putRecord' \
+curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.putRecord' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
@@ -272,6 +272,8 @@ The author DID is taken from the authenticated user. You can only write records 
 
 Requires `read` membership (or a valid [space credential](credentials.md)).
 
+Members with `read_self` access can only retrieve their own records. Attempting to read another user's record returns `403 Forbidden`.
+
 ```ts tab="TypeScript" tab-group="language"
 const params = new URLSearchParams({
   space: "ats://did:plc:abc123/com.example.forum/main",
@@ -279,7 +281,7 @@ const params = new URLSearchParams({
   rkey: "3k2abc",
 });
 const response = await fetch(
-  `https://happyview.example.com/xrpc/dev.happyview.space.getRecord?${params}`,
+  `https://happyview.example.com/xrpc/com.atproto.space.getRecord?${params}`,
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -302,7 +304,7 @@ const params = new URLSearchParams({
   rkey: "3k2abc",
 });
 const response = await fetch(
-  `https://happyview.example.com/xrpc/dev.happyview.space.getRecord?${params}`,
+  `https://happyview.example.com/xrpc/com.atproto.space.getRecord?${params}`,
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -315,7 +317,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .get("https://happyview.example.com/xrpc/dev.happyview.space.getRecord")
+    .get("https://happyview.example.com/xrpc/com.atproto.space.getRecord")
     .query(&[
         ("space", "ats://did:plc:abc123/com.example.forum/main"),
         ("collection", "com.example.forum.post"),
@@ -330,7 +332,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 req, _ := http.NewRequest("GET",
-  "https://happyview.example.com/xrpc/dev.happyview.space.getRecord?space=ats://did:plc:abc123/com.example.forum/main&collection=com.example.forum.post&rkey=3k2abc",
+  "https://happyview.example.com/xrpc/com.atproto.space.getRecord?space=ats://did:plc:abc123/com.example.forum/main&collection=com.example.forum.post&rkey=3k2abc",
   nil)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
@@ -338,7 +340,7 @@ req.Header.Set("DPoP", dpopProof)
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl 'https://happyview.example.com/xrpc/dev.happyview.space.getRecord?space=ats://did:plc:abc123/com.example.forum/main&collection=com.example.forum.post&rkey=3k2abc' \
+curl 'https://happyview.example.com/xrpc/com.atproto.space.getRecord?space=ats://did:plc:abc123/com.example.forum/main&collection=com.example.forum.post&rkey=3k2abc' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>'
@@ -375,7 +377,7 @@ const params = new URLSearchParams({
   limit: "20",
 });
 const response = await fetch(
-  `https://happyview.example.com/xrpc/dev.happyview.space.listRecords?${params}`,
+  `https://happyview.example.com/xrpc/com.atproto.space.listRecords?${params}`,
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -402,7 +404,7 @@ const params = new URLSearchParams({
   limit: "20",
 });
 const response = await fetch(
-  `https://happyview.example.com/xrpc/dev.happyview.space.listRecords?${params}`,
+  `https://happyview.example.com/xrpc/com.atproto.space.listRecords?${params}`,
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -415,7 +417,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .get("https://happyview.example.com/xrpc/dev.happyview.space.listRecords")
+    .get("https://happyview.example.com/xrpc/com.atproto.space.listRecords")
     .query(&[
         ("space", "ats://did:plc:abc123/com.example.forum/main"),
         ("collection", "com.example.forum.post"),
@@ -430,7 +432,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 req, _ := http.NewRequest("GET",
-  "https://happyview.example.com/xrpc/dev.happyview.space.listRecords?space=ats://did:plc:abc123/com.example.forum/main&collection=com.example.forum.post&limit=20",
+  "https://happyview.example.com/xrpc/com.atproto.space.listRecords?space=ats://did:plc:abc123/com.example.forum/main&collection=com.example.forum.post&limit=20",
   nil)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
@@ -438,7 +440,7 @@ req.Header.Set("DPoP", dpopProof)
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl 'https://happyview.example.com/xrpc/dev.happyview.space.listRecords?space=ats://did:plc:abc123/com.example.forum/main&collection=com.example.forum.post&limit=20' \
+curl 'https://happyview.example.com/xrpc/com.atproto.space.listRecords?space=ats://did:plc:abc123/com.example.forum/main&collection=com.example.forum.post&limit=20' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>'
@@ -475,7 +477,7 @@ curl 'https://happyview.example.com/xrpc/dev.happyview.space.listRecords?space=a
 You can only delete your own records. Requires `write` membership.
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.deleteRecord", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.space.deleteRecord", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -491,7 +493,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 });
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.deleteRecord", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.space.deleteRecord", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -508,7 +510,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.deleteRecord")
+    .post("https://happyview.example.com/xrpc/com.atproto.space.deleteRecord")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -527,7 +529,7 @@ body := bytes.NewBufferString(`{
   "rkey": "3k2abc"
 }`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.deleteRecord", body)
+  "https://happyview.example.com/xrpc/com.atproto.space.deleteRecord", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -535,7 +537,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.deleteRecord' \
+curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.deleteRecord' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
@@ -563,7 +565,7 @@ Attempting to delete another user's record returns `403 Forbidden`.
 `applyWrites` performs multiple create, update, and delete operations in a single request. Requires `write` membership.
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.applyWrites", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.space.applyWrites", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -601,7 +603,7 @@ interface ApplyWritesResult {
 const data: { results: ApplyWritesResult[] } = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.applyWrites", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.space.applyWrites", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -636,7 +638,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.applyWrites")
+    .post("https://happyview.example.com/xrpc/com.atproto.space.applyWrites")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -690,7 +692,7 @@ body := bytes.NewBufferString(`{
   ]
 }`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.applyWrites", body)
+  "https://happyview.example.com/xrpc/com.atproto.space.applyWrites", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -698,7 +700,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.applyWrites' \
+curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.applyWrites' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
@@ -779,7 +781,7 @@ Pass the `swapRecord` field on `putRecord`, `deleteRecord`, or individual operat
 
 Pass the `swapCommit` field on `applyWrites` to assert the space's current revision. If another client has written to the space since you last read its state, the operation fails with `409 Conflict` before any writes are applied.
 
-The space's current revision is available as `revision` in the space object returned by `dev.happyview.space.getSpace`.
+The space's current revision is available as `revision` in the space object returned by `com.atproto.space.getSpace`.
 
 ```json
 {
@@ -795,7 +797,7 @@ Records can also be read using a [space credential](credentials.md) instead of d
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/dev.happyview.space.getRecord?space=...&collection=...&rkey=...",
+  "https://happyview.example.com/xrpc/com.atproto.space.getRecord?space=...&collection=...&rkey=...",
   {
     headers: {
       "Authorization": `Bearer ${SPACE_CREDENTIAL}`,
@@ -806,7 +808,7 @@ const data = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/dev.happyview.space.getRecord?space=...&collection=...&rkey=...",
+  "https://happyview.example.com/xrpc/com.atproto.space.getRecord?space=...&collection=...&rkey=...",
   {
     headers: {
       "Authorization": `Bearer ${SPACE_CREDENTIAL}`,
@@ -817,7 +819,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .get("https://happyview.example.com/xrpc/dev.happyview.space.getRecord")
+    .get("https://happyview.example.com/xrpc/com.atproto.space.getRecord")
     .query(&[("space", "..."), ("collection", "..."), ("rkey", "...")])
     .header("Authorization", format!("Bearer {}", space_credential))
     .send()
@@ -826,13 +828,13 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 req, _ := http.NewRequest("GET",
-  "https://happyview.example.com/xrpc/dev.happyview.space.getRecord?space=...&collection=...&rkey=...",
+  "https://happyview.example.com/xrpc/com.atproto.space.getRecord?space=...&collection=...&rkey=...",
   nil)
 req.Header.Set("Authorization", "Bearer "+spaceCredential)
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl 'https://happyview.example.com/xrpc/dev.happyview.space.getRecord?...' \
+curl 'https://happyview.example.com/xrpc/com.atproto.space.getRecord?...' \
   -H 'Authorization: Bearer eyJhbGciOiJFUzI1NiIsInR5cCI6InNwYWNlX2NyZWRlbnRpYWwifQ...'
 ```
 

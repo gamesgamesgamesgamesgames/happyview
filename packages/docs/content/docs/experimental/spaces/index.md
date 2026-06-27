@@ -3,7 +3,7 @@ title: "Overview"
 ---
 
 <Callout type="error" title="Experimental">
-Permissioned Spaces are experimental and the API will change. This implementation follows Daniel Holmgren's [Permissioned Data Diaries](https://dholms.leaflet.pub/3meluqcwky22a) and aligns structurally with the `permissioned-data` branch on `bluesky-social/atproto`, but uses a `dev.happyview` namespace to allow iteration while the official spec stabilizes.
+Permissioned Spaces are experimental and the API will change. This implementation follows [AT Protocol Proposal 0016](https://github.com/bluesky-social/proposals) (Permissioned Data). HappyView uses the `com.atproto.space.*` and `com.atproto.simplespace.*` namespaces. The previous `dev.happyview.space.*` endpoints remain available as backward-compatible aliases until v3.
 </Callout>
 
 Spaces are containers for permissioned data in atproto. Unlike regular public records that live in a user's repo, space records are gated by membership — only members can read or write data within a space.
@@ -71,65 +71,100 @@ curl -X PUT http://127.0.0.1:3000/admin/settings/feature.spaces_enabled \
   -d '{"value": "true"}'
 ```
 
-When disabled, all `/xrpc/dev.happyview.space.*` endpoints return `501 Not Implemented`.
+When disabled, all space endpoints return a `404` error with `FeatureDisabled` as the error code.
 
 ## Endpoints
 
-All space endpoints live under the `dev.happyview.space` namespace and require [DPoP authentication](../../getting-started/authentication.md).
+Space endpoints are split across two namespaces:
 
-| Endpoint                                 | Method | Description                           |
-| ---------------------------------------- | ------ | ------------------------------------- |
-| `dev.happyview.space.createSpace`        | POST   | Create a space                        |
-| `dev.happyview.space.getSpace`           | GET    | Get a space by URI                    |
-| `dev.happyview.space.listSpaces`         | GET    | List spaces by membership             |
-| `dev.happyview.space.updateSpace`        | POST   | Update space metadata                 |
-| `dev.happyview.space.deleteSpace`        | POST   | Delete a space                        |
-| `dev.happyview.space.createRecord`       | POST   | Create a record (auto-generated rkey) |
-| `dev.happyview.space.putRecord`          | POST   | Write a record                        |
-| `dev.happyview.space.getRecord`          | GET    | Get a record                          |
-| `dev.happyview.space.listRecords`        | GET    | List records                          |
-| `dev.happyview.space.deleteRecord`       | POST   | Delete a record                       |
-| `dev.happyview.space.applyWrites`        | POST   | Batch write operations                |
-| `dev.happyview.space.addMember`          | POST   | Add a member                          |
-| `dev.happyview.space.removeMember`       | POST   | Remove a member                       |
-| `dev.happyview.space.listMembers`        | GET    | List resolved members                 |
-| `dev.happyview.space.createInvite`       | POST   | Create an invite                      |
-| `dev.happyview.space.redeemInvite`       | POST   | Redeem an invite                      |
-| `dev.happyview.space.revokeInvite`       | POST   | Revoke an invite                      |
-| `dev.happyview.space.listInvites`        | GET    | List invites                          |
-| `dev.happyview.space.getMemberGrant`     | POST   | Prove membership (step 1)             |
-| `dev.happyview.space.getSpaceCredential` | POST   | Get a space credential (step 2)       |
+- **`com.atproto.space.*`** — protocol-level routes (queries, data, credentials)
+- **`com.atproto.simplespace.*`** — management routes (create/update/delete spaces, membership)
+
+The previous `dev.happyview.space.*` endpoints remain as backward-compatible aliases until v3. All endpoints require [DPoP authentication](../../getting-started/authentication.md) or cookie-based session auth.
+
+| Endpoint                                      | Method | Description                                     |
+| --------------------------------------------- | ------ | ----------------------------------------------- |
+| `com.atproto.simplespace.createSpace`          | POST   | Create a space                                  |
+| `com.atproto.space.getSpace`                   | GET    | Get a space by URI                              |
+| `com.atproto.space.listSpaces`                 | GET    | List spaces by membership                       |
+| `com.atproto.simplespace.updateSpace`          | POST   | Update space metadata                           |
+| `com.atproto.simplespace.deleteSpace`          | POST   | Delete a space                                  |
+| `com.atproto.simplespace.getConfig`            | GET    | Get space configuration                         |
+| `com.atproto.simplespace.updateConfig`         | POST   | Update space configuration                      |
+| `com.atproto.space.createRecord`               | POST   | Create a record (auto-generated rkey)           |
+| `com.atproto.space.putRecord`                  | POST   | Write a record                                  |
+| `com.atproto.space.getRecord`                  | GET    | Get a record                                    |
+| `com.atproto.space.listRecords`                | GET    | List records                                    |
+| `com.atproto.space.deleteRecord`               | POST   | Delete a record                                 |
+| `com.atproto.space.applyWrites`                | POST   | Batch write operations                          |
+| `com.atproto.simplespace.addMember`            | POST   | Add a member                                    |
+| `com.atproto.simplespace.removeMember`         | POST   | Remove a member                                 |
+| `com.atproto.simplespace.listMembers`          | GET    | List resolved members                           |
+| `com.atproto.space.getRepoState`               | GET    | Get per-user repo state (LtHash + commit)       |
+| `com.atproto.space.listRepoOps`                | GET    | List record operation log entries                |
+| `com.atproto.space.listRepos`                  | GET    | List repos (authors) in a space                 |
+| `com.atproto.space.getDelegationToken`         | GET    | Get a delegation token (step 1 of credentials)  |
+| `com.atproto.space.getSpaceCredential`         | POST   | Get a space credential (step 2)                 |
+| `com.atproto.space.getBlob`                    | GET    | Get a blob from a space                         |
+| `com.atproto.space.registerNotify`             | POST   | Register for write notifications                |
+| `com.atproto.space.notifyWrite`                | POST   | Push a write notification                       |
+| `com.atproto.space.notifySpaceDeleted`         | POST   | Push a space-deleted notification               |
+| `dev.happyview.space.createInvite`             | POST   | Create an invite (HappyView extension)          |
+| `dev.happyview.space.acceptInvite`             | POST   | Accept an invite (HappyView extension)          |
+| `dev.happyview.space.revokeInvite`             | POST   | Revoke an invite (HappyView extension)          |
+| `dev.happyview.space.listInvites`              | GET    | List invites (HappyView extension)              |
 
 ## Access model
 
-Spaces have an **access mode** that controls third-party app access:
+Spaces use two independent controls for access:
 
-- **`default_allow`** — any app can access (with optional denylist)
-- **`default_deny`** — only explicitly allowed apps can access
+**Mint policy** controls who can create permissioned repos in the space:
 
-Individual users access spaces through **membership**. Members have either `read` or `write` access. Write access implies read. The space creator is automatically added as a write member.
+- **`member-list`** (default) — only members can create repos
+- **`public`** — anyone can create repos
+- **`managing-app`** — only the managing app can create repos
+
+**App access** controls which third-party apps can interact with the space:
+
+- **`open`** (default) — any app can access
+- **`allowList`** — only explicitly listed apps can access
+
+Individual users access spaces through **membership**. Members have one of three access levels:
+
+- **`write`** — can read and write data
+- **`read`** — can read all data in the space
+- **`read_self`** — can only read their own data within the space
+
+Write access implies read. The space creator is automatically added as a write member.
 
 Spaces also support **delegation** — adding another space as a member, which transitively grants access to all members of the delegated space.
 
-## Divergences from the reference spec
+## Alignment with Proposal 0016
 
-HappyView mostly mirrors [Daniel Holmgren's `permissioned-data` branch](https://github.com/bluesky-social/atproto/tree/permissioned-data) but diverges in some areas. These will narrow as the official spec stabilizes.
+HappyView implements [AT Protocol Proposal 0016](https://github.com/bluesky-social/proposals) (Permissioned Data) with some HappyView-specific extensions.
 
-### HappyView extensions (not in the reference branch)
+### Protocol features implemented
 
-- **`isDelegation` on members** allows spaces to be members of other spaces
-- **`displayName`, `description`, `accessMode` on spaces** — the reference space model is minimal (`uri`, `isOwner`, `isMember`, `createdAt`)
-- **`appAllowlist` / `appDenylist` / `managingAppDid`** — app-level access control layer
-- **`config` object** on spaces (e.g. `membershipPublic`, `recordsPublic`)
-- **Invite system** — `createInvite`, `redeemInvite`, `revokeInvite`, `listInvites`
-- **`read` / `write` access levels** — the reference branch treats membership as binary
+- **Namespace split** — `com.atproto.space.*` for protocol routes, `com.atproto.simplespace.*` for management
+- **Mint policy** — `member-list`, `public`, `managing-app` (replaces `accessMode`)
+- **App access** — `open`, `allowList` (replaces `appAllowlist`/`appDenylist`)
+- **Delegation tokens** — `getDelegationToken` (GET, 60-second TTL) replaces `getMemberGrant`
+- **Space credentials** — `atproto-space-credential+jwt` typ, ES256, 2-hour TTL
+- **Deniable commit signatures** — user signs context (space + rev + random IKM), not content hash
+- **LtHash** — homomorphic set-hash (2048-byte state, 1024 uint16 lanes, BLAKE3 XOF)
+- **Record operation log** — `listRepoOps` returns the oplog for sync
+- **Repo state** — `getRepoState` returns LtHash state + signed commit
+- **Write notifications** — `registerNotify`, `notifyWrite`, `notifySpaceDeleted`
+- **Space-scoped blobs** — `getBlob`
+- **Authority DID** — spaces use `authority_did` (not `owner_did`) with a separate `creator_did`
 
-### Reference features not yet implemented
+### HappyView extensions (not in the protocol spec)
 
-- **Oplogs** — `getRepoOplog`, `getMemberOplog`, `getRepoState`, `getMemberState` (sync primitives for space data)
-- **Push notifications** — `notifyWrite`, `notifyMembership` (service-to-service event delivery)
-- **Space-scoped blobs** — `uploadBlob` for blobs within a space context
-- **Owner record deletion** — in the reference branch the space owner can delete any record; HappyView restricts `deleteRecord` to the record's author only
+- **Invite system** — `createInvite`, `acceptInvite`, `revokeInvite`, `listInvites` (under `dev.happyview.space.*`)
+- **`isDelegation` on members** — allows spaces to be members of other spaces
+- **`displayName`, `description` on spaces** — human-readable metadata
+- **`config` object** — `membershipPublic`, `recordsPublic`, plus arbitrary extra fields
+- **`read_self` access level** — restricts reads to the member's own data
 
 ## Next steps
 
@@ -138,3 +173,4 @@ HappyView mostly mirrors [Daniel Holmgren's `permissioned-data` branch](https://
 - [Records](./records.md) — read and write permissioned data
 - [Credentials](./credentials.md) — cross-service authentication for spaces
 - [Invites](./invites.md) — invite-based membership
+- [Changelog](./changelog.md) — version history

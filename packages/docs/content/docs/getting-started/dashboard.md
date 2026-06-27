@@ -97,6 +97,18 @@ View the current values of all environment variables that affect HappyView's beh
 
 View the audit log of admin actions. Events include user creation, lexicon uploads, permission changes, backfill starts, and more. Each entry shows the event type, severity, actor, subject, and timestamp. Events are retained for the number of days configured by `EVENT_LOG_RETENTION_DAYS` (default 30).
 
+### Service Identity
+
+Configure the AT Protocol service identity for your HappyView instance — either a `did:web` derived from your public URL, a `did:plc` you control, or a linked atproto account. This determines the DID that signs service-level interactions on the network.
+
+### Experiments
+
+Toggle experimental feature flags for your instance. Flags like `feature.spaces_enabled` can be enabled here before they are promoted to stable configuration options.
+
+### Scripts
+
+Manage script variables that are injected into Lua scripts at runtime. Variables defined here are available to all scripts and can be used to store shared configuration without hardcoding values in individual scripts.
+
 ## About
 
 The **About** page shows the current HappyView version and instance configuration: public URL, database backend, Jetstream URL, relay URL, and PLC directory URL.

@@ -130,7 +130,15 @@ curl 'https://happyview.example.com/xrpc/com.example.feed.getHot' \
 
 Queries that don't care who is calling need nothing more than the client key. Procedures — and queries whose Lua scripts read the caller's DID — need a real atproto OAuth session.
 
-XRPC routes only accept **DPoP auth** (`Authorization: DPoP <token>` + `DPoP` proof header + `X-Client-Key`). Bearer tokens and service auth JWTs are not accepted on XRPC endpoints.
+XRPC routes accept several auth methods, resolved in this order:
+
+1. **DPoP auth** (`Authorization: DPoP <token>` + `DPoP` proof header + `X-Client-Key`) — used by third-party apps that went through the [DPoP key provisioning](#dpop-key-provisioning-for-third-party-apps) flow.
+2. **Bearer space credential** (`Authorization: Bearer <space_credential_jwt>`) — a signed JWT granting access to a specific space; accepted on space routes.
+3. **Bearer service auth JWT** (`Authorization: Bearer <service_auth_jwt>`) — a standard atproto inter-service JWT signed by a DID's atproto signing key; the caller is identified as the issuer DID.
+4. **Cookie session** — when no `Authorization` header is present, HappyView falls back to the signed session cookie set after dashboard login.
+5. **Anonymous** — if none of the above is present, the request proceeds with no identity. The endpoint's Lua script determines whether that is acceptable.
+
+Bearer API keys (`hv_*`) are **not** accepted on XRPC endpoints — those are for admin API access only.
 
 Third-party apps authenticate users through the [DPoP key provisioning](#dpop-key-provisioning-for-third-party-apps) flow: your app gets a DPoP keypair from HappyView, runs a standard OAuth flow with the user's PDS using that keypair, then registers the resulting tokens back with HappyView.
 

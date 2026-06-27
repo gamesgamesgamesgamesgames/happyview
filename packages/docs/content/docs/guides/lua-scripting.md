@@ -65,6 +65,28 @@ These globals are set automatically before `handle()` is called.
 | `caller_did` | string? | DID of the authenticated user (nil if unauthenticated) |
 | `env`        | table   | Script variables configured in the dashboard           |
 
+### Space globals
+
+When a script handles a space-scoped request, the `space` global is set to a table with the space's metadata. For non-space requests, `space` is `nil`.
+
+| Field       | Type   | Description                                              |
+| ----------- | ------ | -------------------------------------------------------- |
+| `space`     | string | The full `ats://` space URI                              |
+| `space_id`  | string | Internal space identifier                                |
+| `did`       | string | The space's DID                                          |
+| `owner_did` | string | The space authority's DID                                |
+| `type_nsid` | string | Space type NSID                                          |
+| `skey`      | string | Space key                                                |
+
+```lua
+function handle()
+  if space then
+    log("handling request for space: " .. space.space)
+    log("space type: " .. space.type_nsid)
+  end
+end
+```
+
 ## Utility globals
 
 Available in both queries and procedures:

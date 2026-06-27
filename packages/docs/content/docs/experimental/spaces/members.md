@@ -6,14 +6,14 @@ title: "Members"
 This API is experimental and will change. See the [Permissioned Spaces overview](../spaces.md) for context.
 </Callout>
 
-Membership determines who can read and write within a space. Members have either `read` or `write` access — write implies read.
+Membership determines who can read and write within a space. Members have one of three access levels — `write`, `read`, or `read_self`. Write implies read. `read_self` restricts the member to reading only their own records within the space.
 
 ## Adding a member
 
-Only the space owner or a super admin can add members.
+Only the space authority or a super admin can add members.
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.addMember", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.addMember", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -40,7 +40,7 @@ interface Member {
 const data: { member: Member } = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.addMember", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.addMember", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -59,7 +59,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.addMember")
+    .post("https://happyview.example.com/xrpc/com.atproto.simplespace.addMember")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -81,7 +81,7 @@ body := bytes.NewBufferString(`{
   "isDelegation": false
 }`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.addMember", body)
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.addMember", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -89,7 +89,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.addMember' \
+curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.addMember' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
@@ -108,7 +108,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.addMember' 
 |---|---|---|---|---|
 | `space` | string | Yes | | The space to add the member to |
 | `did` | string | Yes | | DID of the member (or space for delegation) |
-| `access` | string | No | `read` | `read` or `write` |
+| `access` | string | No | `read` | `read`, `read_self`, or `write` |
 | `isDelegation` | boolean | No | `false` | Whether this member is a delegated space |
 
 **Response (201):**
@@ -130,7 +130,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.addMember' 
 ## Removing a member
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.removeMember", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.removeMember", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -145,7 +145,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 });
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.removeMember", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.removeMember", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -161,7 +161,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.removeMember")
+    .post("https://happyview.example.com/xrpc/com.atproto.simplespace.removeMember")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -178,7 +178,7 @@ body := bytes.NewBufferString(`{
   "did": "did:plc:newmember"
 }`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.removeMember", body)
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.removeMember", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -186,7 +186,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.removeMember' \
+curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.removeMember' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
@@ -201,7 +201,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.removeMembe
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/dev.happyview.space.listMembers?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.listMembers?space=ats://did:plc:abc123/com.example.forum/main",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -218,7 +218,7 @@ const data: { members: ResolvedMember[] } = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/dev.happyview.space.listMembers?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.listMembers?space=ats://did:plc:abc123/com.example.forum/main",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -231,7 +231,7 @@ const data = await response.json();
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .get("https://happyview.example.com/xrpc/dev.happyview.space.listMembers")
+    .get("https://happyview.example.com/xrpc/com.atproto.simplespace.listMembers")
     .query(&[("space", "ats://did:plc:abc123/com.example.forum/main")])
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
@@ -242,7 +242,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 req, _ := http.NewRequest("GET",
-  "https://happyview.example.com/xrpc/dev.happyview.space.listMembers?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.listMembers?space=ats://did:plc:abc123/com.example.forum/main",
   nil)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
@@ -250,7 +250,7 @@ req.Header.Set("DPoP", dpopProof)
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl 'https://happyview.example.com/xrpc/dev.happyview.space.listMembers?space=ats://did:plc:abc123/com.example.forum/main' \
+curl 'https://happyview.example.com/xrpc/com.atproto.simplespace.listMembers?space=ats://did:plc:abc123/com.example.forum/main' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>'
@@ -275,7 +275,7 @@ The response returns the **resolved** member list — delegation chains are trav
 A space can be added as a member of another space by setting `isDelegation: true`. This transitively grants access to all members of the delegated space.
 
 ```ts tab="TypeScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.addMember", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.addMember", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -292,7 +292,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 });
 ```
 ```js tab="JavaScript" tab-group="language"
-const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.addMember", {
+const response = await fetch("https://happyview.example.com/xrpc/com.atproto.simplespace.addMember", {
   method: "POST",
   headers: {
     "X-Client-Key": CLIENT_KEY,
@@ -310,7 +310,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 ```
 ```rust tab="Rust" tab-group="language"
 let response = client
-    .post("https://happyview.example.com/xrpc/dev.happyview.space.addMember")
+    .post("https://happyview.example.com/xrpc/com.atproto.simplespace.addMember")
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -331,7 +331,7 @@ body := bytes.NewBufferString(`{
   "isDelegation": true
 }`)
 req, _ := http.NewRequest("POST",
-  "https://happyview.example.com/xrpc/dev.happyview.space.addMember", body)
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.addMember", body)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
 req.Header.Set("DPoP", dpopProof)
@@ -339,7 +339,7 @@ req.Header.Set("Content-Type", "application/json")
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.addMember' \
+curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.addMember' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
