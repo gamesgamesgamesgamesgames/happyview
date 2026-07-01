@@ -15,7 +15,7 @@ The repo DID is included in the signed data — a signature for one user's recor
 
 ## Setup
 
-Attestation signing is enabled by default — HappyView generates a keypair on first startup and persists it to the `instance_settings` database table. No configuration is required.
+Attestation signing is enabled by default — HappyView generates a keypair on first startup and persists it to the `happyview_instance_settings` database table. No configuration is required.
 
 To use an explicit key instead, set the `ATTESTATION_PRIVATE_KEY` environment variable:
 
@@ -32,7 +32,7 @@ The key ID defaults to a `did:web` derived from your `PUBLIC_URL`. For example, 
 HappyView checks for signing configuration in this order:
 
 1. **Environment variables** — if `ATTESTATION_PRIVATE_KEY` is set, it's used
-2. **Database** — if previously generated keys exist in `instance_settings`, they're loaded
+2. **Database** — if previously generated keys exist in `happyview_instance_settings`, they're loaded
 3. **Auto-generation** — a new key is generated and persisted to the database
 
 If key loading fails for any reason, signing is disabled and `atproto.sign` / `atproto.verify_signature` will be `nil` in Lua scripts.

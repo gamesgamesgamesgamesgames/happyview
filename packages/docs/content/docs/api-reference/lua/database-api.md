@@ -153,7 +153,7 @@ Run a raw SQL query against the database. Supports `SELECT`, `INSERT`, `UPDATE`,
 ```lua
 -- Read query
 local rows = db.raw(
-  "SELECT uri, did, record FROM records WHERE collection = $1 AND did = $2 LIMIT $3",
+  "SELECT uri, did, record FROM happyview_records WHERE collection = $1 AND did = $2 LIMIT $3",
   { "xyz.statusphere.status", "did:plc:abc", 10 }
 )
 
@@ -196,9 +196,9 @@ Returns `"sqlite"` or `"postgres"`. Useful when you need database-specific SQL t
 
 ```lua
 if db.backend() == "postgres" then
-  db.raw("SELECT * FROM records WHERE record @> $1::jsonb", { json.encode({ status = "active" }) })
+  db.raw("SELECT * FROM happyview_records WHERE record @> $1::jsonb", { json.encode({ status = "active" }) })
 else
   -- SQLite fallback
-  db.raw("SELECT * FROM records WHERE json_extract(record, '$.status') = $1", { "active" })
+  db.raw("SELECT * FROM happyview_records WHERE json_extract(record, '$.status') = $1", { "active" })
 end
 ```

@@ -58,7 +58,7 @@ resp, err := http.DefaultClient.Do(req)
 curl http://127.0.0.1:3000/admin/settings -H "$AUTH"
 ```
 
-Returns all key/value pairs stored in the `instance_settings` table, plus any env-var fallback values for keys not stored in the database. Each entry includes a `source` field: `"database"` for stored values, `"env"` for env-var fallbacks.
+Returns all key/value pairs stored in the `happyview_instance_settings` table, plus any env-var fallback values for keys not stored in the database. Each entry includes a `source` field: `"database"` for stored values, `"env"` for env-var fallbacks.
 
 ### Known settings
 

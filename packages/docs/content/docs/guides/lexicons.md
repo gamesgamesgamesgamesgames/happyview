@@ -71,8 +71,8 @@ The `value` field of the response is the raw lexicon JSON.
 
 HappyView's Jetstream subscription always includes the `com.atproto.lexicon.schema` collection, so it receives real-time events whenever a lexicon schema record is created, updated, or deleted on the network. When an event arrives, HappyView checks whether the record's DID and rkey (the NSID) match any tracked network lexicon:
 
-- **create/update**: The new schema is parsed and upserted into the `lexicons` table and the in-memory registry. If it's a record-type lexicon, Jetstream collection filters are updated to include the new collection.
-- **delete**: The lexicon is removed from the `lexicons` table and registry, and collection filters are updated accordingly.
+- **create/update**: The new schema is parsed and upserted into the `happyview_lexicons` table and the in-memory registry. If it's a record-type lexicon, Jetstream collection filters are updated to include the new collection.
+- **delete**: The lexicon is removed from the `happyview_lexicons` table and registry, and collection filters are updated accordingly.
 
 ### Startup re-fetch
 

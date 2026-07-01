@@ -51,7 +51,7 @@ This script uses [script variables](../../guides/lua-scripting.md) instead of ha
 | `MEILISEARCH_URL`     | Your Meilisearch instance URL (e.g. `http://meilisearch.railway.internal:7700`) |
 | `MEILISEARCH_API_KEY` | A Meilisearch API key with write permissions                                    |
 
-Script variables are stored in the `script_variables` table and accessible as `env.*` in Lua.
+Script variables are stored in the `happyview_script_variables` table and accessible as `env.*` in Lua.
 
 ## Use case
 

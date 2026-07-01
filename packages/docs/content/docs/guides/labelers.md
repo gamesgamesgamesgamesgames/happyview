@@ -8,7 +8,7 @@ Labelers are external services that apply content labels to records. They operat
 
 A labeler is identified by its DID. When you subscribe to a labeler, HappyView connects directly to the labeler's WebSocket and streams label events in real time. Each label targets a specific record URI and carries a value like `nudity`, `spam`, or any custom string the labeler defines.
 
-Labels are stored in a `labels` table in the database. HappyView tracks a cursor per labeler subscription so it can resume from where it left off after a restart.
+Labels are stored in a `happyview_labels` table in the database. HappyView tracks a cursor per labeler subscription so it can resume from where it left off after a restart.
 
 Records can also have **self-labels** — labels applied by the record's author and embedded directly in the record's `labels.values` array. These are not managed by external labelers but are displayed alongside external labels in the dashboard.
 

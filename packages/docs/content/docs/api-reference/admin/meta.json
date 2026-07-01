@@ -16,6 +16,12 @@
     "domains",
     "script-variables",
     "api-clients",
-    "plugins"
+    "plugins",
+    "dead-letters",
+    "service-identity",
+    "service-entries",
+    "verification-methods",
+    "feature-flags",
+    "permissions"
   ]
 }

@@ -6,11 +6,11 @@ Record and label scripts are Lua scripts that run in response to events on the A
 
 These scripts are event-driven -- they react to incoming Jetstream events (which include events caused by HappyView's own PDS writes), not to XRPC requests. For scripts that run in response to XRPC queries and procedures, see [Lua Scripting](./lua-scripting.md).
 
-> **Migration note:** Prior to v2.9, record scripts were called "index hooks" and were attached directly to lexicons. They now live in their own `scripts` table and are managed separately. Existing index hooks were automatically migrated.
+> **Migration note:** Prior to v2.9, record scripts were called "index hooks" and were attached directly to lexicons. They now live in their own `happyview_scripts` table and are managed separately. Existing index hooks were automatically migrated.
 
 ## Trigger grammar
 
-Every script is identified by a **trigger string** -- the script's `id` in the `scripts` table IS its trigger binding. There is no separate name or host column; the trigger string determines which events the script receives.
+Every script is identified by a **trigger string** -- the script's `id` in the `happyview_scripts` table IS its trigger binding. There is no separate name or host column; the trigger string determines which events the script receives.
 
 ### Record event triggers
 
@@ -140,10 +140,10 @@ Record and label scripts have access to:
 Record and label scripts are designed to be resilient:
 
 1. If a script fails, it retries up to **4 attempts total** (1 initial + 3 retries) with exponential backoff (1s, 2s, 4s delays).
-2. If all attempts are exhausted, the failed event is inserted into the `dead_letter_scripts` table for later inspection.
+2. If all attempts are exhausted, the failed event is inserted into the `happyview_dead_letter_scripts` table for later inspection.
 3. On failure the system **fails open** -- the original record or label is stored as-is so indexing is not permanently blocked. The firehose has no caller to surface errors to.
 
-Failed scripts are logged as errors. Check the [event logs](./event-logs.md) or query the `dead_letter_scripts` table directly to find and replay failures.
+Failed scripts are logged as errors. Check the [event logs](./event-logs.md) or query the `happyview_dead_letter_scripts` table directly to find and replay failures.
 
 ### Performance considerations
 
@@ -151,7 +151,7 @@ Because scripts run synchronously before indexing, they block the Jetstream cons
 
 ### Dead letter table
 
-The `dead_letter_scripts` table stores events that failed all retry attempts:
+The `happyview_dead_letter_scripts` table stores events that failed all retry attempts:
 
 | Column       | Type      | Description                                           |
 | ------------ | --------- | ----------------------------------------------------- |

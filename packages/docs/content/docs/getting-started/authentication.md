@@ -231,11 +231,11 @@ For a service auth JWT to validate:
 - `exp` must be in the future.
 - The signature must verify against the issuer DID's atproto signing key.
 
-As with the other methods, the resolved DID still has to exist in the HappyView `users` table with the right permissions to hit admin endpoints — service auth gets you identified, not privileged.
+As with the other methods, the resolved DID still has to exist in the HappyView `happyview_users` table with the right permissions to hit admin endpoints — service auth gets you identified, not privileged.
 
 ### Admin access and the first user
 
-On a fresh deployment, the `users` table is empty. The first authenticated request to any admin endpoint auto-bootstraps that user as the **super user** with all permissions granted. This includes logging in to the dashboard — the dashboard makes admin API calls on your behalf, so the first person to log in becomes the super user.
+On a fresh deployment, the `happyview_users` table is empty. The first authenticated request to any admin endpoint auto-bootstraps that user as the **super user** with all permissions granted. This includes logging in to the dashboard — the dashboard makes admin API calls on your behalf, so the first person to log in becomes the super user.
 
 To add more users after that, use `POST /admin/users` or the [dashboard](dashboard.md). You can assign permissions individually or use a template (`viewer`, `operator`, `manager`, `full_access`). See [Admin API — Users](../api-reference/admin/users.md) for details.
 

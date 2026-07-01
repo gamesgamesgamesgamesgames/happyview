@@ -6,7 +6,7 @@ title: "Invites"
 This API is experimental and will change. See the [Permissioned Spaces overview](../spaces.md) for context.
 </Callout>
 
-Invites let space owners distribute membership tokens without knowing recipients' DIDs in advance.
+Invites let space authorities distribute membership tokens without knowing recipients' DIDs in advance.
 
 <Callout type="info" title="HappyView Extension">
 Invites are a HappyView-specific feature, not part of the AT Protocol spaces spec. They may be replaced by a different mechanism in the future.
@@ -14,7 +14,7 @@ Invites are a HappyView-specific feature, not part of the AT Protocol spaces spe
 
 ## Creating an invite
 
-Only the space owner or a super admin can create invites.
+Only the space authority or a super admin can create invites.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.createInvite", {
@@ -292,7 +292,7 @@ Revoking an invite prevents future redemptions but does not remove members who a
 
 ## Listing invites
 
-Only the space owner or a super admin can list invites.
+Only the space authority or a super admin can list invites.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(

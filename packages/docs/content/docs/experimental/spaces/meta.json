@@ -6,6 +6,7 @@
     "members",
     "records",
     "credentials",
+    "notifications",
     "invites",
     "changelog"
   ]

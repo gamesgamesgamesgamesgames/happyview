@@ -2,7 +2,7 @@
 title: "Overview"
 ---
 
-The admin API lets you manage lexicons, monitor records, run backfill jobs, and control user access. All endpoints live under `/admin` and require authentication from a DID that exists in the `users` table, with the appropriate [permissions](../../guides/permissions.md) for the endpoint being called. You can also manage all of this through the [web dashboard](../../getting-started/dashboard.md).
+The admin API lets you manage lexicons, monitor records, run backfill jobs, and control user access. All endpoints live under `/admin` and require authentication from a DID that exists in the `happyview_users` table, with the appropriate [permissions](../../guides/permissions.md) for the endpoint being called. You can also manage all of this through the [web dashboard](../../getting-started/dashboard.md).
 
 ## Auth
 
@@ -12,9 +12,9 @@ The admin API supports three authentication methods:
 2. **Service auth JWT** — atproto inter-service authentication via signed JWTs.
 3. **Cookie-based session auth** — signed session cookies set during the dashboard OAuth login flow. The [web dashboard](../../getting-started/dashboard.md) uses this method.
 
-In all cases the resolved DID is checked against the `users` table, and the user's permissions are loaded to authorize the request.
+In all cases the resolved DID is checked against the `happyview_users` table, and the user's permissions are loaded to authorize the request.
 
-**Auto-bootstrap**: If the `users` table is empty, the first authenticated request automatically creates the caller as the **super user** with all permissions granted.
+**Auto-bootstrap**: If the `happyview_users` table is empty, the first authenticated request automatically creates the caller as the **super user** with all permissions granted.
 
 Non-user DIDs receive a `403 Forbidden` response. Users without the required permission for a specific endpoint also receive `403 Forbidden`.
 
@@ -58,6 +58,12 @@ AUTH="Authorization: Bearer $TOKEN"
 | [Script Variables](script-variables.md) | Encrypted key/value pairs for Lua scripts |
 | [API Clients](api-clients.md) | Register and manage third-party XRPC clients |
 | [Plugins](plugins.md) | Install, configure, and manage WASM plugins |
+| [Dead Letters](dead-letters.md) | List, inspect, dismiss, retry, and reindex dead-lettered events |
+| [Service Identity](service-identity.md) | Get and update service identity configuration |
+| [Service Entries](service-entries.md) | Manage service entries and their XRPC bindings |
+| [Verification Methods](verification-methods.md) | Create, list, and delete DID verification methods |
+| [Feature Flags](feature-flags.md) | List feature flag status |
+| [Permissions](permissions.md) | List available permission definitions |
 
 ## Permissions
 
@@ -133,3 +139,33 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/api-clients/{id}`            | `api-clients:view`         |
 | `PUT /admin/api-clients/{id}`            | `api-clients:edit`         |
 | `DELETE /admin/api-clients/{id}`         | `api-clients:delete`       |
+| `GET /admin/dead-letters`                | `dead-letters:read`        |
+| `GET /admin/dead-letters/count`          | `dead-letters:read`        |
+| `GET /admin/dead-letters/{id}`           | `dead-letters:read`        |
+| `POST /admin/dead-letters/{id}/dismiss`  | `dead-letters:manage`      |
+| `POST /admin/dead-letters/{id}/retry`    | `dead-letters:manage`      |
+| `POST /admin/dead-letters/{id}/reindex`  | `dead-letters:manage`      |
+| `POST /admin/dead-letters/bulk/dismiss`  | `dead-letters:manage`      |
+| `POST /admin/dead-letters/bulk/retry`    | `dead-letters:manage`      |
+| `POST /admin/dead-letters/bulk/reindex`  | `dead-letters:manage`      |
+| `GET /admin/service-identity`            | `settings:manage`          |
+| `PUT /admin/service-identity`            | `settings:manage`          |
+| `GET /admin/service-entries`             | `settings:manage`          |
+| `POST /admin/service-entries`            | `settings:manage`          |
+| `PUT /admin/service-entries/{id}`        | `settings:manage`          |
+| `DELETE /admin/service-entries/{id}`     | `settings:manage`          |
+| `GET /admin/service-entries/{id}/xrpcs`  | `settings:manage`          |
+| `POST /admin/service-entries/{id}/xrpcs` | `settings:manage`          |
+| `DELETE /admin/service-entries/{id}/xrpcs`| `settings:manage`         |
+| `POST /admin/service-entries/sync-plc`   | `settings:manage`          |
+| `POST /admin/service-entries/sync-plc/request` | `settings:manage`    |
+| `POST /admin/service-entries/sync-plc/submit`  | `settings:manage`    |
+| `GET /admin/lexicons/{id}/services`      | `settings:manage`          |
+| `GET /admin/verification-methods`        | `settings:manage`          |
+| `POST /admin/verification-methods`       | `settings:manage`          |
+| `DELETE /admin/verification-methods/{fragment_id}` | `settings:manage` |
+| `GET /admin/feature-flags`               | `settings:manage`          |
+| `GET /admin/network-lexicons/resolve/{nsid}` | `lexicons:read`        |
+| `GET /admin/permissions`                 | `users:read`               |
+| `GET /admin/settings/xrpc-proxy`         | `settings:manage`          |
+| `PUT /admin/settings/xrpc-proxy`         | `settings:manage`          |

@@ -120,7 +120,7 @@ curl http://127.0.0.1:3000/admin/plugins -H "$AUTH"
 }
 ```
 
-`secrets_configured` is `true` if the plugin has no required secrets, or if a row exists for it in `plugin_configs`. `update_available` and `pending_releases` are populated from the cached official registry — call `POST /admin/plugins/{id}/check-update` to refresh them.
+`secrets_configured` is `true` if the plugin has no required secrets, or if a row exists for it in `happyview_plugin_configs`. `update_available` and `pending_releases` are populated from the cached official registry — call `POST /admin/plugins/{id}/check-update` to refresh them.
 
 ## Preview a plugin before installing
 
@@ -320,7 +320,7 @@ Requires `plugins:read`. Returns the cached catalog of plugins from the official
 DELETE /admin/plugins/{id}
 ```
 
-Requires `plugins:delete`. Unregisters the plugin from the runtime and deletes its row from the `plugins` table. Secrets stay in `plugin_configs`, so they're reused if you reinstall.
+Requires `plugins:delete`. Unregisters the plugin from the runtime and deletes its row from the `happyview_plugins` table. Secrets stay in `happyview_plugin_configs`, so they're reused if you reinstall.
 
 **Response**: `204 No Content`. Returns `404 Not Found` if no plugin with that id is loaded.
 
@@ -377,7 +377,7 @@ Requires `plugins:read`. Returns the plugin's configured secrets with values mas
 PUT /admin/plugins/{id}/secrets
 ```
 
-Requires `plugins:create`. Encrypts the provided secret values with `TOKEN_ENCRYPTION_KEY` (AES-256-GCM) and upserts them into `plugin_configs`.
+Requires `plugins:create`. Encrypts the provided secret values with `TOKEN_ENCRYPTION_KEY` (AES-256-GCM) and upserts them into `happyview_plugin_configs`.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch("http://127.0.0.1:3000/admin/plugins/steam/secrets", {

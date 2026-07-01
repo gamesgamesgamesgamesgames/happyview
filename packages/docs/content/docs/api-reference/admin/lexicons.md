@@ -514,6 +514,6 @@ curl -X DELETE http://127.0.0.1:3000/admin/network-lexicons/xyz.statusphere.stat
   -H "$AUTH"
 ```
 
-Removes the network lexicon tracking and also deletes the lexicon from the `lexicons` table and in-memory registry.
+Removes the network lexicon tracking and also deletes the lexicon from the `happyview_lexicons` table and in-memory registry.
 
 **Response**: `204 No Content`
