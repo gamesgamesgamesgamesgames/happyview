@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef } from "react";
 
 import { MonacoEditor } from "@/components/monaco-editor";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -18,7 +19,12 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import type { LexiconSummary } from "@/types/lexicons";
 import type { TriggerKind } from "@/types/scripts";
-import { TRIGGER_KIND_LABELS, parseTriggerId } from "@/types/scripts";
+import {
+  DEFAULT_JOB_SCRIPT_BODY,
+  DEFAULT_SCRIPT_BODY,
+  TRIGGER_KIND_LABELS,
+  parseTriggerId,
+} from "@/types/scripts";
 
 /**
  * Sentinel suffix used when the operator picks "Actor" in the lexicon
@@ -27,15 +33,27 @@ import { TRIGGER_KIND_LABELS, parseTriggerId } from "@/types/scripts";
  */
 export const ACTOR_SUFFIX = "_actor";
 
+/**
+ * Sentinel value for the source selector when the operator picks "Job".
+ * The actual suffix is typed into a free-form input (the job type name).
+ */
+export const JOB_SOURCE = "_job";
+
 export interface ScriptFormState {
   /** Trigger kind selector value (e.g. `record.create`). */
   kind: TriggerKind;
   /**
    * Suffix portion of the trigger id — usually an NSID (= a lexicon id),
    * or the literal `_actor` when `kind === "labeler.apply"` for
-   * actor-level labels.
+   * actor-level labels. For jobs, this is the user-typed job type name.
    */
   suffix: string;
+  /**
+   * Which source-selector value was chosen. Usually identical to `suffix`
+   * (i.e. a lexicon NSID or `_actor`). For jobs this is `_job` while
+   * `suffix` holds the free-form job type name.
+   */
+  source: string;
   description: string;
   body: string;
 }
@@ -51,9 +69,15 @@ export function stateFromScript(args: {
   body: string;
 }): ScriptFormState {
   const parsed = parseTriggerId(args.id);
+  const kind = parsed?.kind ?? "record.index";
+  const suffix = parsed?.suffix ?? "";
+  let source = suffix;
+  if (kind === "job.run") source = JOB_SOURCE;
+  else if (suffix === ACTOR_SUFFIX) source = ACTOR_SUFFIX;
   return {
-    kind: parsed?.kind ?? "record.index",
-    suffix: parsed?.suffix ?? "",
+    kind,
+    suffix,
+    source,
     description: args.description ?? "",
     body: args.body,
   };
@@ -93,9 +117,23 @@ const PROCEDURE_ACTIONS: ActionOption[] = [
   { kind: "xrpc.procedure", label: "Procedure handler" },
 ];
 
-function actionsFor(suffix: string, lexicons: LexiconSummary[]): ActionOption[] {
-  if (suffix === ACTOR_SUFFIX) return ACTOR_ACTIONS;
-  const lex = lexicons.find((l) => l.id === suffix);
+const JOB_ACTIONS: ActionOption[] = [{ kind: "job.run", label: "Job runner" }];
+
+const JOB_TYPE_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+
+export function isValidJobType(value: string): boolean {
+  return (
+    value.length > 0 && value.length <= 128 && JOB_TYPE_PATTERN.test(value)
+  );
+}
+
+function actionsFor(
+  source: string,
+  lexicons: LexiconSummary[],
+): ActionOption[] {
+  if (source === ACTOR_SUFFIX) return ACTOR_ACTIONS;
+  if (source === JOB_SOURCE) return JOB_ACTIONS;
+  const lex = lexicons.find((l) => l.id === source);
   if (!lex) return [];
   switch (lex.lexicon_type) {
     case "record":
@@ -129,12 +167,15 @@ export function ScriptForm({
   onChange,
   idLocked,
   lexicons,
+  lexiconsLoading,
 }: {
   state: ScriptFormState;
   onChange: (next: ScriptFormState) => void;
   idLocked?: boolean;
   /** Required when `idLocked` is false; ignored otherwise. */
   lexicons?: LexiconSummary[];
+  /** True while the lexicon list is being fetched. */
+  lexiconsLoading?: boolean;
 }) {
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
@@ -145,6 +186,7 @@ export function ScriptForm({
           state={state}
           onChange={onChange}
           lexicons={lexicons ?? []}
+          lexiconsLoading={lexiconsLoading}
         />
       )}
 
@@ -193,19 +235,23 @@ function TriggerComposer({
   state,
   onChange,
   lexicons,
+  lexiconsLoading,
 }: {
   state: ScriptFormState;
   onChange: (next: ScriptFormState) => void;
   lexicons: LexiconSummary[];
+  lexiconsLoading?: boolean;
 }) {
   const sortedLexicons = useMemo(
     () => [...lexicons].sort((a, b) => a.id.localeCompare(b.id)),
     [lexicons],
   );
   const actions = useMemo(
-    () => actionsFor(state.suffix, lexicons),
-    [state.suffix, lexicons],
+    () => actionsFor(state.source, lexicons),
+    [state.source, lexicons],
   );
+
+  const isJob = state.source === JOB_SOURCE;
 
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -218,14 +264,34 @@ function TriggerComposer({
     }
   }, [actions, onChange]);
 
-  function handleSuffixChange(next: string) {
-    // Pre-snap kind so the resolved trigger id badge updates immediately
-    // rather than flickering through an invalid state.
+  function handleSourceChange(next: string) {
+    const wasJob = state.source === JOB_SOURCE;
+    const isNowJob = next === JOB_SOURCE;
+    const bodyIsDefault =
+      state.body === DEFAULT_SCRIPT_BODY ||
+      state.body === DEFAULT_JOB_SCRIPT_BODY;
+
+    if (isNowJob) {
+      onChange({
+        ...state,
+        source: JOB_SOURCE,
+        suffix: "",
+        kind: "job.run",
+        body: bodyIsDefault ? DEFAULT_JOB_SCRIPT_BODY : state.body,
+      });
+      return;
+    }
     const nextActions = actionsFor(next, lexicons);
     const nextKind = nextActions.some((a) => a.kind === state.kind)
       ? state.kind
       : (nextActions[0]?.kind ?? state.kind);
-    onChange({ ...state, suffix: next, kind: nextKind });
+    onChange({
+      ...state,
+      source: next,
+      suffix: next,
+      kind: nextKind,
+      body: wasJob && bodyIsDefault ? DEFAULT_SCRIPT_BODY : state.body,
+    });
   }
 
   const triggerPreview =
@@ -235,12 +301,12 @@ function TriggerComposer({
     <>
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="flex flex-col gap-1">
-          <Label htmlFor="lexicon-pick" className="text-xs">
-            Lexicon
+          <Label htmlFor="source-pick" className="text-xs">
+            Trigger source
           </Label>
-          <Select value={state.suffix} onValueChange={handleSuffixChange}>
-            <SelectTrigger id="lexicon-pick" size="sm" className="w-full">
-              <SelectValue placeholder="Choose a lexicon" />
+          <Select value={state.source} onValueChange={handleSourceChange}>
+            <SelectTrigger id="source-pick" size="sm" className="w-full">
+              <SelectValue placeholder="Choose a source" />
             </SelectTrigger>
             <SelectContent>
               <SelectGroup>
@@ -250,11 +316,21 @@ function TriggerComposer({
                     (labels on bare DIDs)
                   </span>
                 </SelectItem>
+                <SelectItem value={JOB_SOURCE}>
+                  Job
+                  <span className="text-muted-foreground ml-2 text-xs">
+                    (background job runner)
+                  </span>
+                </SelectItem>
               </SelectGroup>
               <SelectSeparator />
               <SelectGroup>
                 <SelectLabel className="text-xs">Lexicons</SelectLabel>
-                {sortedLexicons.length === 0 ? (
+                {lexiconsLoading ? (
+                  <SelectItem value="__loading__" disabled>
+                    Loading…
+                  </SelectItem>
+                ) : sortedLexicons.length === 0 ? (
                   <SelectItem value="__no_lexicons__" disabled>
                     No lexicons yet
                   </SelectItem>
@@ -271,27 +347,67 @@ function TriggerComposer({
               </SelectGroup>
             </SelectContent>
           </Select>
+          <p className="text-xs text-muted-foreground">
+            What fires this script: a lexicon event, a label, or a background
+            job.
+          </p>
         </div>
         <div className="flex flex-col gap-1">
-          <Label htmlFor="action-pick" className="text-xs">
-            Action
-          </Label>
-          <Select
-            value={state.kind}
-            onValueChange={(v) => onChange({ ...state, kind: v as TriggerKind })}
-            disabled={actions.length <= 1}
-          >
-            <SelectTrigger id="action-pick" size="sm" className="w-full">
-              <SelectValue placeholder="Pick a lexicon first" />
-            </SelectTrigger>
-            <SelectContent>
-              {actions.map((a) => (
-                <SelectItem key={a.kind} value={a.kind}>
-                  {a.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          {isJob ? (
+            <>
+              <Label htmlFor="job-type-input" className="text-xs">
+                Job type
+              </Label>
+              <Input
+                id="job-type-input"
+                value={state.suffix}
+                onChange={(e) => onChange({ ...state, suffix: e.target.value })}
+                placeholder="e.g. export, migrate, sync"
+                className="h-8 text-sm font-mono"
+                aria-invalid={
+                  state.suffix.length > 0 && !isValidJobType(state.suffix)
+                }
+              />
+              {state.suffix.length > 0 && !isValidJobType(state.suffix) ? (
+                <p className="text-xs text-destructive">
+                  Lowercase letters, numbers, dots, hyphens, and underscores
+                  only.
+                </p>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Must match the type passed to{" "}
+                  <code className="bg-muted px-1 rounded font-mono text-xs">
+                    jobs.create()
+                  </code>{" "}
+                  in the queuing script.
+                </p>
+              )}
+            </>
+          ) : (
+            <>
+              <Label htmlFor="action-pick" className="text-xs">
+                Action
+              </Label>
+              <Select
+                value={state.kind}
+                onValueChange={(v) =>
+                  onChange({ ...state, kind: v as TriggerKind })
+                }
+                disabled={actions.length <= 1}
+              >
+                <SelectTrigger id="action-pick" size="sm" className="w-full">
+                  <SelectValue placeholder="Choose a source first" />
+                </SelectTrigger>
+                <SelectContent>
+                  {actions.map((a) => (
+                    <SelectItem key={a.kind} value={a.kind}>
+                      {a.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </>
+          )}
         </div>
       </div>
 
@@ -304,7 +420,9 @@ function TriggerComposer({
             <Badge variant="outline">{triggerPreview}</Badge>
           ) : (
             <span className="text-muted-foreground">
-              Pick a lexicon to compose the trigger id.
+              {isJob
+                ? "Enter a job type to compose the trigger id."
+                : "Pick a source to compose the trigger id."}
             </span>
           )}
         </p>

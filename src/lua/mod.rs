@@ -1,13 +1,14 @@
-mod atproto_api;
-mod context;
+pub(crate) mod atproto_api;
+pub(crate) mod context;
 pub mod db_api;
 mod execute;
-mod http_api;
+pub(crate) mod http_api;
+pub(crate) mod jobs_api;
 pub mod record;
 pub(crate) mod sandbox;
 pub mod scripts;
 pub(crate) mod tid;
-mod xrpc_api;
+pub(crate) mod xrpc_api;
 
 #[allow(unused_imports)]
 pub(crate) use context::SpaceContext;

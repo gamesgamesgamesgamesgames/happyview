@@ -113,6 +113,13 @@ pub enum Permission {
     ScriptsRead,
     #[serde(rename = "scripts:manage")]
     ScriptsManage,
+
+    #[serde(rename = "jobs:read")]
+    JobsRead,
+    #[serde(rename = "jobs:create")]
+    JobsCreate,
+    #[serde(rename = "jobs:manage")]
+    JobsManage,
 }
 
 impl Permission {
@@ -162,6 +169,9 @@ impl Permission {
             Self::SpacesManageCredentials => "spaces:manage-credentials",
             Self::ScriptsRead => "scripts:read",
             Self::ScriptsManage => "scripts:manage",
+            Self::JobsRead => "jobs:read",
+            Self::JobsCreate => "jobs:create",
+            Self::JobsManage => "jobs:manage",
         }
     }
 
@@ -425,6 +435,24 @@ impl Permission {
                 description: "Create, update, and delete trigger-keyed scripts",
                 category: "Scripts",
             },
+            Self::JobsRead => PermissionInfo {
+                key: "jobs:read",
+                name: "View Jobs",
+                description: "View background job status and progress",
+                category: "Jobs",
+            },
+            Self::JobsCreate => PermissionInfo {
+                key: "jobs:create",
+                name: "Create Jobs",
+                description: "Queue new background jobs",
+                category: "Jobs",
+            },
+            Self::JobsManage => PermissionInfo {
+                key: "jobs:manage",
+                name: "Manage Jobs",
+                description: "Cancel, pause, and resume background jobs",
+                category: "Jobs",
+            },
         }
     }
 
@@ -474,6 +502,9 @@ impl Permission {
             Self::SpacesManageCredentials,
             Self::ScriptsRead,
             Self::ScriptsManage,
+            Self::JobsRead,
+            Self::JobsCreate,
+            Self::JobsManage,
         ])
     }
 }
@@ -525,6 +556,9 @@ pub fn catalog() -> Vec<PermissionInfo> {
         SpacesManageInvites,
         SpacesManageRecords,
         SpacesManageCredentials,
+        JobsRead,
+        JobsCreate,
+        JobsManage,
     ]
     .iter()
     .map(|p| p.info())

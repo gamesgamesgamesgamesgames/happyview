@@ -725,6 +725,8 @@ fn register_default_apis(
         .map_err(|e| format!("xrpc api: {e}"))?;
     atproto_api::register_atproto_api(lua, state.clone(), None)
         .map_err(|e| format!("atproto api: {e}"))?;
+    super::jobs_api::register_jobs_api(lua, state.clone(), caller_did.map(String::from))
+        .map_err(|e| format!("jobs api: {e}"))?;
     record::register_record_api_no_auth(lua, state.clone())
         .map_err(|e| format!("record api: {e}"))?;
     register_log_event_api(lua, state, trigger_id, caller_did)?;

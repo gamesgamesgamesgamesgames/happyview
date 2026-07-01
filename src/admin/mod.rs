@@ -6,6 +6,7 @@ mod dead_letters;
 mod domains;
 mod events;
 mod feature_flags;
+mod jobs;
 mod labelers;
 mod lexicons;
 mod network_lexicons;
@@ -62,6 +63,11 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/backfill/{id}/details",
             delete(backfill::flush_backfill_details),
         )
+        .route("/jobs", get(jobs::list_jobs))
+        .route("/jobs/{id}", get(jobs::get_job))
+        .route("/jobs/{id}/cancel", post(jobs::cancel_job))
+        .route("/jobs/{id}/pause", post(jobs::pause_job))
+        .route("/jobs/{id}/resume", post(jobs::resume_job))
         .route("/events", get(events::list_events))
         .route("/users", post(users::create_user).get(users::list_users))
         .route("/users/transfer-super", post(users::transfer_super))

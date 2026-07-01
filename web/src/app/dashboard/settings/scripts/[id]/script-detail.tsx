@@ -66,13 +66,20 @@ export default function ScriptDetail() {
     );
   }, [state, original]);
 
-  async function handleSave() {
-    if (!state || !script) return;
+  useEffect(() => {
+    if (!isDirty) return;
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      e.preventDefault();
+    }
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [isDirty]);
+
+  const handleSave = useCallback(async () => {
+    if (!state || !script || !isDirty || saving) return;
     setSaving(true);
     setError(null);
     try {
-      // PATCH only the editable fields. Trigger id is the PK — to
-      // rename, delete and recreate.
       await patchScript(script.id, {
         body: state.body,
         description: state.description.trim() || null,
@@ -83,7 +90,18 @@ export default function ScriptDetail() {
     } finally {
       setSaving(false);
     }
-  }
+  }, [state, script, isDirty, saving, load]);
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        handleSave();
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handleSave]);
 
   async function handleDelete() {
     if (!script) return;
@@ -126,6 +144,7 @@ export default function ScriptDetail() {
     record: "Record event",
     xrpc: "XRPC handler",
     labeler: "Label arrival",
+    job: "Job runner",
   };
 
   return (
@@ -178,6 +197,9 @@ export default function ScriptDetail() {
             {canManage && (
               <Button onClick={handleSave} disabled={!isDirty || saving}>
                 {saving ? "Saving..." : "Save"}
+                <kbd className="ml-2 text-xs text-muted-foreground opacity-60 hidden sm:inline">
+                  ⌘↵
+                </kbd>
               </Button>
             )}
           </div>
