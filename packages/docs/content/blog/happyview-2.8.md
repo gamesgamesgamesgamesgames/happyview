@@ -7,6 +7,7 @@ author:
   avatar: "/authors/trezy.webp"
 tags:
   - announcements
+atUri: "at://did:plc:qneu5uamqs6cug7sjobbaexm/site.standard.document/3mpokm3dl4t2j"
 ---
 
 v2.8 is mostly bug fixes, but Backfills did get a serious overhaul. The permissions page was also rebuilt to be much more useful, and the docs site has a whole new look.

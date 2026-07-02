@@ -7,6 +7,7 @@ author:
   avatar: "/authors/trezy.webp"
 tags:
   - announcements
+atUri: "at://did:plc:qneu5uamqs6cug7sjobbaexm/site.standard.document/3mpokm3g6zm22"
 ---
 
 Two releases in two days. v2.6, followed closely by v2.7. Neither one has a single marquee feature like [Permissioned Spaces](/blog/happyview-2.5), but together they make the whole system noticeably more solid.

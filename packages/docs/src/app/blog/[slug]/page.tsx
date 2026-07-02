@@ -3,6 +3,7 @@ import { notFound } from 'next/navigation';
 import defaultMdxComponents from 'fumadocs-ui/mdx';
 import { Mermaid } from '@/components/mermaid';
 import { VaporwaveGrid } from '@/components/vaporwave-grid';
+import { getSequoiaPublicationUri } from '@/lib/sequoia';
 import Image from 'next/image';
 
 export default async function BlogPost(props: {
@@ -13,11 +14,18 @@ export default async function BlogPost(props: {
 
   if (!page) notFound();
 
-  const { title, description, date, author, tags } = page.data;
+  const { title, description, date, author, tags, atUri } = page.data;
   const Mdx = page.data.body;
+  const publicationUri = getSequoiaPublicationUri();
 
   return (
     <article className="mx-auto max-w-3xl px-6 py-16" style={{ isolation: 'isolate' }}>
+      {publicationUri && (
+        <link rel="site.standard.publication" href={publicationUri} />
+      )}
+      {atUri && (
+        <link rel="site.standard.document" href={atUri} />
+      )}
       <header className="mb-12">
         <h1 className="text-4xl font-bold mb-4">{title}</h1>
         {description && (

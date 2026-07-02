@@ -7,6 +7,7 @@ author:
   avatar: "/authors/trezy.webp"
 tags:
   - announcements
+atUri: "at://did:plc:qneu5uamqs6cug7sjobbaexm/site.standard.document/3mpokm3ld5m2v"
 ---
 
 I originally built HappyView because I needed it for my own [atproto](https://atproto.com) project, [Cartridge](https://cartridge.dev). v2 is still built for my needs, but now I can hand it to someone else without apologizing.

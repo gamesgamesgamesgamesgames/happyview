@@ -119,6 +119,7 @@ export const blog = defineDocs({
         avatar: z.string(),
       }),
       tags: z.array(z.string()).optional().default([]),
+      atUri: z.string().optional(),
     }),
   },
 });

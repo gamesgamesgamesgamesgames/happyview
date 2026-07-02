@@ -3,6 +3,9 @@
 .next
 .source
 
+# Sequoia publish state (regenerated during build)
+.sequoia-state.json
+
 # Generated changelogs (built from GitHub releases)
 content/docs/reference/changelog.md
 content/docs/sdk/**/changelog.md
