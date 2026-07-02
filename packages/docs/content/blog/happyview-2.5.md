@@ -7,6 +7,7 @@ author:
   avatar: "/authors/trezy.webp"
 tags:
   - announcements
+atUri: "at://did:plc:qneu5uamqs6cug7sjobbaexm/site.standard.document/3mpokm3iq232d"
 ---
 
 HappyView 2.5 is out, and it ships with one of the most anticipated features in the [atproto](https://atproto.com) ecosystem:

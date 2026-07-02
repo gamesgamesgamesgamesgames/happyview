@@ -7,6 +7,7 @@ author:
   avatar: "/authors/trezy.webp"
 tags:
   - announcements
+atUri: "at://did:plc:qneu5uamqs6cug7sjobbaexm/site.standard.document/3mpokm36ivd2d"
 ---
 
 This one's been a long time coming. HappyView finally has a real AT Protocol identity, can do service proxying, and permissioned spaces got a big update to match the official spec.

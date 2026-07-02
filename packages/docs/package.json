@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "next dev --turbopack",
     "generate-changelogs": "node scripts/generate-changelogs.mjs",
-    "build": "npm run generate-changelogs && next build",
+    "sequoia:publish": "node scripts/sequoia-publish.mjs",
+    "build": "npm run generate-changelogs && npm run sequoia:publish && next build",
     "start": "next start"
   },
   "dependencies": {
@@ -29,6 +30,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
+    "sequoia-cli": "^0.5.7",
     "typescript": "^5.7.0"
   }
 }

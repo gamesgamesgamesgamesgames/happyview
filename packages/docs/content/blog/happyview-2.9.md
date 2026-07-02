@@ -7,6 +7,7 @@ author:
   avatar: "/authors/trezy.webp"
 tags:
   - announcements
+atUri: "at://did:plc:qneu5uamqs6cug7sjobbaexm/site.standard.document/3mpokm3b2ua2c"
 ---
 
 2.9 is a big one. Scripts got an overhaul, backfill got way faster, and there's a mountain of bug fixes and performance improvements across the board.
