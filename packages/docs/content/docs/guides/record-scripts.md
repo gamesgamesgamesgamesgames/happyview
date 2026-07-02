@@ -41,6 +41,14 @@ XRPC scripts handle the request and return the response. Without a script, Happy
 
 There is no cascade for label or XRPC triggers -- each trigger string must match exactly.
 
+### Job triggers
+
+| Trigger                    | Fires when                                    |
+| -------------------------- | --------------------------------------------- |
+| `job.run:<type>`           | A background job with the matching type is picked up by the worker |
+
+There is no cascade for job triggers -- the type must match exactly. See [Background Jobs](./background-jobs.md) for the full job scripting guide.
+
 ## Creating scripts
 
 You can create scripts through the [dashboard](../getting-started/dashboard.md) (Settings > Scripts > New) or via the [admin API](../api-reference/admin/scripts.md) (`POST /admin/scripts`).
