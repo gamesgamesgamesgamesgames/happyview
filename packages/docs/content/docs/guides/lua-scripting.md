@@ -69,14 +69,14 @@ These globals are set automatically before `handle()` is called.
 
 When a script handles a space-scoped request, the `space` global is set to a table with the space's metadata. For non-space requests, `space` is `nil`.
 
-| Field       | Type   | Description                                              |
-| ----------- | ------ | -------------------------------------------------------- |
-| `space`     | string | The full `ats://` space URI                              |
-| `space_id`  | string | Internal space identifier                                |
-| `did`       | string | The space's DID                                          |
-| `authority_did` | string | The space authority's DID                            |
-| `type_nsid` | string | Space type NSID                                          |
-| `skey`      | string | Space key                                                |
+| Field           | Type   | Description                 |
+| --------------- | ------ | --------------------------- |
+| `space`         | string | The full `ats://` space URI |
+| `space_id`      | string | Internal space identifier   |
+| `did`           | string | The space's DID             |
+| `authority_did` | string | The space authority's DID   |
+| `type_nsid`     | string | Space type NSID             |
+| `skey`          | string | Space key                   |
 
 ```lua
 function handle()
@@ -178,6 +178,21 @@ See the full [atproto API reference](../api-reference/lua/atproto-api.md) for `a
 The `json` global provides JSON serialization and deserialization.
 
 See the full [JSON API reference](../api-reference/lua/json-api.md) for `json.encode` and `json.decode`.
+
+## Jobs API
+
+The `jobs` table lets any script queue background jobs for long-running work. Available in all script contexts.
+
+See the full [Jobs API reference](../api-reference/lua/jobs-api.md) for `jobs.create()` and the `job` global available inside job scripts.
+
+Quick example:
+
+```lua
+local job_id = jobs.create("export", { collection = collection })
+return { job_id = job_id }
+```
+
+For the full guide on background jobs, see [Background Jobs](background-jobs.md).
 
 ## Debugging
 

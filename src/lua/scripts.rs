@@ -32,9 +32,13 @@
 //!   [`super::execute::execute_procedure_script`] /
 //!   [`super::execute::execute_query_script`] directly.
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+static JOB_TYPE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9._-]*$").unwrap());
 
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
@@ -60,6 +64,7 @@ pub enum TriggerKind {
     XrpcQuery,
     XrpcProcedure,
     LabelerApply,
+    JobRun,
 }
 
 /// A trigger id parsed into `(kind, suffix)`. The suffix is either an NSID
@@ -82,6 +87,7 @@ impl ParsedTrigger {
             TriggerKind::XrpcQuery => format!("xrpc.query:{}", self.suffix),
             TriggerKind::XrpcProcedure => format!("xrpc.procedure:{}", self.suffix),
             TriggerKind::LabelerApply => format!("labeler.apply:{}", self.suffix),
+            TriggerKind::JobRun => format!("job.run:{}", self.suffix),
         }
     }
 
@@ -92,7 +98,8 @@ impl ParsedTrigger {
             format!(
                 "trigger id '{id}' must contain a ':' separator; \
                  valid prefixes: record.{{index,create,update,delete}}:<nsid>, \
-                 xrpc.{{query,procedure}}:<nsid>, labeler.apply:<nsid|_actor>"
+                 xrpc.{{query,procedure}}:<nsid>, labeler.apply:<nsid|_actor>, \
+                 job.run:<type>"
             )
         })?;
 
@@ -108,18 +115,21 @@ impl ParsedTrigger {
             "xrpc.query" => TriggerKind::XrpcQuery,
             "xrpc.procedure" => TriggerKind::XrpcProcedure,
             "labeler.apply" => TriggerKind::LabelerApply,
+            "job.run" => TriggerKind::JobRun,
             other => {
                 return Err(format!(
                     "unknown trigger prefix '{other}'; valid prefixes: \
                      record.{{index,create,update,delete}}, xrpc.{{query,procedure}}, \
-                     labeler.apply"
+                     labeler.apply, job.run"
                 ));
             }
         };
 
-        // Suffix validation: NSID for everything except `labeler.apply:_actor`.
-        match (kind, suffix) {
-            (TriggerKind::LabelerApply, "_actor") => {}
+        // Suffix validation: NSID for most triggers, but `labeler.apply:_actor`
+        // and `job.run:<type>` have their own formats.
+        match kind {
+            TriggerKind::JobRun => validate_job_type(suffix)?,
+            TriggerKind::LabelerApply if suffix == "_actor" => {}
             _ => validate_nsid(suffix)?,
         }
 
@@ -128,6 +138,20 @@ impl ParsedTrigger {
             suffix: suffix.to_string(),
         })
     }
+}
+
+fn validate_job_type(job_type: &str) -> Result<(), String> {
+    if job_type.is_empty() || job_type.len() > 128 {
+        return Err(format!(
+            "invalid job type '{job_type}': must be 1–128 characters"
+        ));
+    }
+    if !JOB_TYPE_RE.is_match(job_type) {
+        return Err(format!(
+            "invalid job type '{job_type}': must match /^[a-z0-9][a-z0-9._-]*$/"
+        ));
+    }
+    Ok(())
 }
 
 /// Minimal NSID validation: at least two dot-separated segments, each
@@ -725,6 +749,8 @@ fn register_default_apis(
         .map_err(|e| format!("xrpc api: {e}"))?;
     atproto_api::register_atproto_api(lua, state.clone(), None)
         .map_err(|e| format!("atproto api: {e}"))?;
+    super::jobs_api::register_jobs_api(lua, state.clone(), caller_did.map(String::from))
+        .map_err(|e| format!("jobs api: {e}"))?;
     record::register_record_api_no_auth(lua, state.clone())
         .map_err(|e| format!("record api: {e}"))?;
     register_log_event_api(lua, state, trigger_id, caller_did)?;
@@ -896,6 +922,21 @@ mod tests {
         let err = ParsedTrigger::parse("record.index").unwrap_err();
         assert!(err.contains("must contain a ':' separator"));
         assert!(err.contains("valid prefixes"));
+    }
+
+    #[test]
+    fn parse_job_run_trigger() {
+        let t = ParsedTrigger::parse("job.run:test.export").unwrap();
+        assert_eq!(t.kind, TriggerKind::JobRun);
+        assert_eq!(t.suffix, "test.export");
+        assert_eq!(t.id(), "job.run:test.export");
+    }
+
+    #[test]
+    fn rejects_bad_job_type() {
+        assert!(ParsedTrigger::parse("job.run:UPPER").is_err());
+        assert!(ParsedTrigger::parse("job.run:has space").is_err());
+        assert!(ParsedTrigger::parse("job.run:").is_err());
     }
 
     #[test]

@@ -22,6 +22,7 @@ import {
   IconSkull,
   IconFlask,
   IconFingerprint,
+  IconPlayerPlay,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -59,6 +60,12 @@ const dataItems: NavItem[] = [
   { title: "Lexicons", url: "/dashboard/lexicons", icon: IconFileDescription },
   { title: "Records", url: "/dashboard/records", icon: IconTable },
   { title: "Backfill", url: "/dashboard/backfill", icon: IconDatabase },
+  {
+    title: "Jobs",
+    url: "/dashboard/jobs",
+    icon: IconPlayerPlay,
+    requiredPermissions: ["jobs:read"],
+  },
   {
     title: "Dead Letters",
     url: "/dashboard/dead-letters",

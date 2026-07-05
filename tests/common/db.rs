@@ -48,7 +48,7 @@ pub async fn truncate_all(pool: &AnyPool) {
     match backend {
         DatabaseBackend::Postgres => {
             sqlx::query(
-                "TRUNCATE happyview_records, happyview_lexicons, happyview_backfill_jobs, happyview_users, happyview_user_permissions, happyview_api_keys, happyview_event_logs, happyview_script_variables, happyview_scripts, happyview_dead_letter_scripts, happyview_dead_letter_hooks, happyview_record_refs, happyview_labeler_subscriptions, happyview_labels, happyview_instance_settings, happyview_domains, happyview_dpop_sessions, happyview_dpop_keys, happyview_api_clients, happyview_delegated_accounts, happyview_account_delegates, happyview_service_identity, happyview_service_entries, happyview_service_entry_xrpcs RESTART IDENTITY CASCADE",
+                "TRUNCATE happyview_records, happyview_lexicons, happyview_backfill_jobs, happyview_users, happyview_user_permissions, happyview_api_keys, happyview_event_logs, happyview_script_variables, happyview_scripts, happyview_dead_letter_scripts, happyview_dead_letter_hooks, happyview_record_refs, happyview_labeler_subscriptions, happyview_labels, happyview_instance_settings, happyview_domains, happyview_dpop_sessions, happyview_dpop_keys, happyview_api_clients, happyview_delegated_accounts, happyview_account_delegates, happyview_service_identity, happyview_service_entries, happyview_service_entry_xrpcs, happyview_jobs RESTART IDENTITY CASCADE",
             )
             .execute(pool)
             .await
@@ -80,6 +80,7 @@ pub async fn truncate_all(pool: &AnyPool) {
                 "happyview_labels",
                 "happyview_instance_settings",
                 "happyview_domains",
+                "happyview_jobs",
             ];
             for table in tables {
                 sqlx::query(&format!("DELETE FROM {table}"))

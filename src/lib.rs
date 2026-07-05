@@ -14,6 +14,7 @@ pub mod feature_flags;
 pub mod feature_middleware;
 pub mod http_retry;
 pub mod jetstream;
+pub mod jobs;
 pub mod labeler;
 pub mod lexicon;
 pub mod lua;

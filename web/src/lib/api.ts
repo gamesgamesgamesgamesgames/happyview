@@ -3,6 +3,7 @@ import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
 import type { BackfillJob, BackfillReposResponse, PdsSummaryResponse } from "@/types/backfill";
+import type { Job, JobsListResponse } from "@/types/jobs";
 import type { UserSummary } from "@/types/users";
 import type { AdminListRecordsResponse } from "@/types/records";
 import type { EventsListResponse } from "@/types/events";
@@ -252,6 +253,38 @@ export function flushBackfillDetails(jobId: string) {
 
 export function flushAllBackfillDetails() {
   return apiFetch(`/admin/backfill/details`, { method: "DELETE" });
+}
+
+// Jobs
+export function getJobs(params: { status?: string; limit?: number; cursor?: string } = {}) {
+  const qs = new URLSearchParams();
+  if (params.status) qs.set("status", params.status);
+  if (params.limit) qs.set("limit", String(params.limit));
+  if (params.cursor) qs.set("cursor", params.cursor);
+  const query = qs.toString();
+  return apiFetch<JobsListResponse>(`/admin/jobs${query ? `?${query}` : ""}`);
+}
+
+export function getJob(id: string) {
+  return apiFetch<Job>(`/admin/jobs/${id}`);
+}
+
+export function cancelJob(id: string) {
+  return apiFetch<{ status: string }>(`/admin/jobs/${id}/cancel`, {
+    method: "POST",
+  });
+}
+
+export function pauseJob(id: string) {
+  return apiFetch<{ status: string }>(`/admin/jobs/${id}/pause`, {
+    method: "POST",
+  });
+}
+
+export function resumeJob(id: string) {
+  return apiFetch<{ status: string }>(`/admin/jobs/${id}/resume`, {
+    method: "POST",
+  });
 }
 
 // Users

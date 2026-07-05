@@ -681,6 +681,15 @@ async fn main() {
 
     happyview::admin::backfill::resume_backfill_jobs(&state).await;
 
+    // Resume interrupted jobs and start the job worker
+    happyview::jobs::worker::resume_interrupted_jobs(&state).await;
+    {
+        let job_state = state.clone();
+        tokio::spawn(async move {
+            happyview::jobs::worker::run_worker(job_state).await;
+        });
+    }
+
     {
         let state = state.clone();
         tokio::spawn(async move {

@@ -1,0 +1,1 @@
+ALTER TABLE happyview_jobs ADD COLUMN inherit_auth BOOLEAN NOT NULL DEFAULT 0;

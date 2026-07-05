@@ -65,6 +65,7 @@ export type TriggerKind =
   | "xrpc.query"
   | "xrpc.procedure"
   | "labeler.apply"
+  | "job.run"
 
 /** Display labels for each trigger kind. */
 export const TRIGGER_KIND_LABELS: Record<TriggerKind, string> = {
@@ -75,21 +76,24 @@ export const TRIGGER_KIND_LABELS: Record<TriggerKind, string> = {
   "xrpc.query": "XRPC query",
   "xrpc.procedure": "XRPC procedure",
   "labeler.apply": "Label arrival",
+  "job.run": "Job runner",
 }
 
 /** Top-level grouping for the Scripts list page. */
-export type TriggerFamily = "record" | "xrpc" | "labeler"
+export type TriggerFamily = "record" | "xrpc" | "labeler" | "job"
 
 export const TRIGGER_FAMILY_LABELS: Record<TriggerFamily, string> = {
   record: "Record events",
   xrpc: "XRPC handlers",
   labeler: "Label arrivals",
+  job: "Job runners",
 }
 
 /** Map a trigger kind to its top-level family. */
 export function familyOf(kind: TriggerKind): TriggerFamily {
   if (kind.startsWith("record.")) return "record"
   if (kind.startsWith("xrpc.")) return "xrpc"
+  if (kind.startsWith("job.")) return "job"
   return "labeler"
 }
 
@@ -113,6 +117,7 @@ export function parseTriggerId(
     "xrpc.query",
     "xrpc.procedure",
     "labeler.apply",
+    "job.run",
   ] as const).find((k) => k === prefix)
   if (!kind) return null
   return { kind, suffix }
@@ -131,5 +136,30 @@ export const DEFAULT_SCRIPT_BODY = `-- Trigger script: receives an \`event\` tab
 function handle()
   log("script fired")
   return event
+end
+`
+
+export const DEFAULT_JOB_SCRIPT_BODY = `-- Job runner: executes as a background job.
+--
+-- Available globals:
+--   job.input      — the input table passed to jobs.create()
+--   job.id         — the job's UUID
+--   job.progress() — persist progress (visible in the dashboard)
+--   job.should_stop() — check for pause/cancel (cooperative)
+--   job.wait(seconds) — sleep (0–3600s)
+--
+-- Available APIs: db.*, http.*, xrpc.*, atproto.*, Record.*, env.<KEY>
+-- Return value becomes the job's result.
+
+function handle()
+  local input = job.input
+
+  job.progress({ status = "working" })
+
+  if job.should_stop() then
+    return { partial = true }
+  end
+
+  return { done = true }
 end
 `
