@@ -23,7 +23,7 @@ pub async fn list_jobs(
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::JobsRead).await?;
 
-    let limit = query.limit.unwrap_or(50).min(100);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
     let (jobs_list, cursor) = jobs::db::list_jobs(
         &state,
         query.status.as_deref(),
@@ -72,7 +72,7 @@ pub async fn cancel_job(
             jobs::db::set_status(&state, &id, "cancelled").await?;
             Ok(Json(serde_json::json!({ "status": "cancelled" })))
         }
-        _ => Err(AppError::BadRequest(format!(
+        _ => Err(AppError::Conflict(format!(
             "cannot cancel job with status: {}",
             job.status
         ))),
@@ -91,7 +91,7 @@ pub async fn pause_job(
         .ok_or_else(|| AppError::NotFound("job not found".into()))?;
 
     if job.status != "running" {
-        return Err(AppError::BadRequest(format!(
+        return Err(AppError::Conflict(format!(
             "cannot pause job with status: {}",
             job.status
         )));
@@ -113,7 +113,7 @@ pub async fn resume_job(
         .ok_or_else(|| AppError::NotFound("job not found".into()))?;
 
     if job.status != "paused" {
-        return Err(AppError::BadRequest(format!(
+        return Err(AppError::Conflict(format!(
             "cannot resume job with status: {}",
             job.status
         )));

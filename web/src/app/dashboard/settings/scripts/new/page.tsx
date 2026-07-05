@@ -75,6 +75,7 @@ function NewScriptInner() {
     if (!isDirty) return;
     function onBeforeUnload(e: BeforeUnloadEvent) {
       e.preventDefault();
+      e.returnValue = "";
     }
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);

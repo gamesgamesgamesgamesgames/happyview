@@ -272,7 +272,7 @@ async fn cancel_paused_job_sets_cancelled() {
 
 #[tokio::test]
 #[serial]
-async fn cancel_completed_job_returns_400() {
+async fn cancel_completed_job_returns_409() {
     common::require_db!();
     let app = TestApp::new().await;
 
@@ -289,7 +289,7 @@ async fn cancel_completed_job_returns_400() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +322,7 @@ async fn pause_running_job_sets_pausing() {
 
 #[tokio::test]
 #[serial]
-async fn pause_pending_job_returns_400() {
+async fn pause_pending_job_returns_409() {
     common::require_db!();
     let app = TestApp::new().await;
 
@@ -339,7 +339,7 @@ async fn pause_pending_job_returns_400() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +372,7 @@ async fn resume_paused_job_sets_pending() {
 
 #[tokio::test]
 #[serial]
-async fn resume_running_job_returns_400() {
+async fn resume_running_job_returns_409() {
     common::require_db!();
     let app = TestApp::new().await;
 
@@ -389,7 +389,7 @@ async fn resume_running_job_returns_400() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
 // ---------------------------------------------------------------------------

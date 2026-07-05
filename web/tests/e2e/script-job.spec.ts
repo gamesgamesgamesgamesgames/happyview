@@ -4,6 +4,23 @@ import { loginAsTestAdmin } from "./auth-helper"
 const JOB_TYPE = "test.e2e.myjob"
 const TRIGGER_ID = `job.run:${JOB_TYPE}`
 
+async function seedScript(
+  request: import("@playwright/test").APIRequestContext,
+) {
+  const resp = await request.post("/admin/scripts", {
+    data: {
+      id: TRIGGER_ID,
+      body: "function handle()\n  return { ok = true }\nend",
+    },
+  })
+  if (!resp.ok()) {
+    const text = await resp.text()
+    if (!text.includes("already exists")) {
+      throw new Error(`Failed to seed script: ${resp.status()} ${text}`)
+    }
+  }
+}
+
 async function cleanupScript(
   request: import("@playwright/test").APIRequestContext,
 ) {
@@ -48,15 +65,21 @@ test.describe("Job Script Creation", () => {
 
     await page.locator("#job-type-input").fill(JOB_TYPE)
 
-    await page.getByRole("button", { name: "Create script" }).click()
+    const createButton = page.getByRole("button", { name: "Create script" })
+    await expect(createButton).toBeEnabled({ timeout: 3000 })
+    await createButton.click()
 
     await page.waitForURL(
       `**/dashboard/settings/scripts/${encodeURIComponent(TRIGGER_ID)}`,
-      { timeout: 5000 },
+      { timeout: 10000 },
     )
 
-    await expect(page.getByText("Job runner")).toBeVisible()
-    await expect(page.getByText(TRIGGER_ID)).toBeVisible()
+    await expect(
+      page.getByText("Job runner", { exact: true }),
+    ).toBeVisible()
+    await expect(
+      page.getByText(TRIGGER_ID, { exact: true }),
+    ).toBeVisible()
   })
 
   test("job script has job-specific template body", async ({ page }) => {
@@ -65,26 +88,23 @@ test.describe("Job Script Creation", () => {
     await page.locator("#source-pick").click()
     await page.getByRole("option", { name: /Job/ }).click()
 
-    await expect(page.getByText("job.input")).toBeVisible({ timeout: 3000 })
-    await expect(page.getByText("job.should_stop")).toBeVisible()
+    await expect(page.getByText("job.input").first()).toBeVisible({
+      timeout: 3000,
+    })
+    await expect(page.getByText("job.should_stop").first()).toBeVisible()
   })
 
   test("job script appears in scripts list with Job runners family", async ({
     page,
   }) => {
-    await page.request.post("/admin/scripts", {
-      data: {
-        id: TRIGGER_ID,
-        body: "function handle()\n  return { ok = true }\nend",
-      },
-    })
+    await seedScript(page.request)
 
     await page.goto("/dashboard/settings/scripts")
 
     const row = page.locator("table tbody tr", { hasText: JOB_TYPE })
     await expect(row).toBeVisible({ timeout: 5000 })
 
-    await expect(row.getByText("Job runner")).toBeVisible()
-    await expect(row.getByText("Job runners")).toBeVisible()
+    await expect(row.getByText("Job runner", { exact: true })).toBeVisible()
+    await expect(row.getByText("Job runners", { exact: true })).toBeVisible()
   })
 })

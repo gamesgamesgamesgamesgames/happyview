@@ -2,7 +2,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::db::{adapt_sql, now_rfc3339};
+use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 
 use super::Job;
@@ -284,10 +284,16 @@ pub async fn find_interrupted_jobs(state: &AppState) -> Vec<Job> {
 pub async fn claim_next_job(state: &AppState) -> Result<Option<Job>, AppError> {
     let now = now_rfc3339();
 
-    let sql = adapt_sql(
-        "UPDATE happyview_jobs SET status = 'running', started_at = ? WHERE id = (SELECT id FROM happyview_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1) RETURNING *",
-        state.db_backend,
-    );
+    let sql = match state.db_backend {
+        DatabaseBackend::Postgres => adapt_sql(
+            "UPDATE happyview_jobs SET status = 'running', started_at = ? WHERE id = (SELECT id FROM happyview_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *",
+            state.db_backend,
+        ),
+        DatabaseBackend::Sqlite => adapt_sql(
+            "UPDATE happyview_jobs SET status = 'running', started_at = ? WHERE id = (SELECT id FROM happyview_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1) AND status = 'pending' RETURNING *",
+            state.db_backend,
+        ),
+    };
 
     let row: Option<JobRow> = sqlx::query_as(&sql)
         .bind(&now)

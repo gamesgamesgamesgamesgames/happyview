@@ -1,8 +1,12 @@
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
-use std::sync::Arc;
+use regex::Regex;
+use std::sync::{Arc, LazyLock};
 
 use crate::AppState;
 use crate::jobs;
+
+static JOB_TYPE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9._-]*$").unwrap());
 
 /// Register the `jobs` table for queuing jobs from scripts.
 /// Available in all script contexts (procedure, query, record-event).
@@ -31,6 +35,15 @@ pub fn register_jobs_api(
                     .unwrap_or(false);
 
                 async move {
+                    if job_type.is_empty()
+                        || job_type.len() > 128
+                        || !JOB_TYPE_PATTERN.is_match(&job_type)
+                    {
+                        return Err(mlua::Error::runtime(
+                            "job_type must be 1-128 characters matching /^[a-z0-9][a-z0-9._-]*$/",
+                        ));
+                    }
+
                     let caller = caller_did.as_deref().ok_or_else(|| {
                         mlua::Error::runtime("jobs.create requires an authenticated caller")
                     })?;
@@ -293,5 +306,25 @@ mod tests {
             .await
             .unwrap();
         assert!(result);
+    }
+
+    #[tokio::test]
+    async fn jobs_create_rejects_invalid_job_type() {
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        let state = test_state();
+        register_jobs_api(&lua, Arc::new(state), Some("did:plc:test".into())).unwrap();
+
+        for bad in [
+            "",
+            "UPPER",
+            "has space",
+            "has:colon",
+            "-leading-dash",
+            ".leading-dot",
+        ] {
+            let script = format!(r#"return jobs.create("{bad}", {{}})"#);
+            let result: mlua::Result<String> = lua.load(&script).eval_async().await;
+            assert!(result.is_err(), "expected error for job_type={bad:?}");
+        }
     }
 }

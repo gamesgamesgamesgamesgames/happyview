@@ -129,9 +129,14 @@ function statusIcon(status: string) {
   }
 }
 
-function hasContent(obj: Record<string, unknown> | null | undefined): boolean {
-  if (!obj) return false;
-  return Object.keys(obj).length > 0;
+function hasContent(value: unknown): boolean {
+  if (value == null) return false;
+  if (typeof value === "object") {
+    return Array.isArray(value)
+      ? value.length > 0
+      : Object.keys(value as Record<string, unknown>).length > 0;
+  }
+  return true;
 }
 
 function relativeTime(dateStr: string): string {
@@ -421,7 +426,7 @@ function JobDetail({
 
         <JsonSection title="Input" data={job.input} defaultOpen />
         <JsonSection title="Progress" data={job.progress} defaultOpen={isActive} />
-        {job.result && <JsonSection title="Result" data={job.result} />}
+        {hasContent(job.result) && <JsonSection title="Result" data={job.result} />}
       </div>
 
       {canManage && (
@@ -484,7 +489,7 @@ function JsonSection({
   defaultOpen = false,
 }: {
   title: string;
-  data: Record<string, unknown> | null;
+  data: unknown;
   defaultOpen?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
