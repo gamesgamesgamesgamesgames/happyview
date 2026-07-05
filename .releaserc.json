@@ -1,6 +1,7 @@
 {
   "branches": [
     "main",
+    { "name": "next", "prerelease": "next" },
     { "name": "dev", "prerelease": "dev" }
   ],
   "tagFormat": "v${version}",

@@ -2,6 +2,7 @@
   "extends": "semantic-release-monorepo",
   "branches": [
     "main",
+    { "name": "next", "prerelease": "next" },
     { "name": "dev", "prerelease": "dev" }
   ],
   "plugins": [

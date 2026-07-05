@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, next, dev]
   pull_request:
-    branches: [main, dev]
+    branches: [main, next, dev]
   workflow_dispatch:
     inputs:
       server:
@@ -301,6 +301,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request'
       && github.head_ref != 'dev'
+      && github.head_ref != 'next'
       && needs.changes.outputs.server == 'true'
     runs-on: ${{ matrix.runs-on }}
     permissions:
@@ -465,7 +466,7 @@ jobs:
   release:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next' || github.ref == 'refs/heads/dev')
       && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
       && needs.unit-tests.result == 'success'
       && needs.e2e-tests.result == 'success'
@@ -767,7 +768,7 @@ jobs:
   release-oauth-client:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next' || github.ref == 'refs/heads/dev')
       && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
       && needs.test-oauth-client.result == 'success'
     needs: [changes, test-oauth-client]
@@ -807,7 +808,7 @@ jobs:
   release-oauth-client-browser:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next' || github.ref == 'refs/heads/dev')
       && (needs.changes.outputs.oauth-client-browser == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-browser))
       && needs.test-oauth-client-browser.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
@@ -839,6 +840,8 @@ jobs:
         run: |
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             DIST_TAG="latest"
+          elif [[ "${{ github.ref }}" == "refs/heads/next" ]]; then
+            DIST_TAG="next"
           else
             DIST_TAG="dev"
           fi
@@ -865,7 +868,7 @@ jobs:
   release-oauth-client-node:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next' || github.ref == 'refs/heads/dev')
       && (needs.changes.outputs.oauth-client-node == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-node))
       && needs.test-oauth-client-node.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
@@ -897,6 +900,8 @@ jobs:
         run: |
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             DIST_TAG="latest"
+          elif [[ "${{ github.ref }}" == "refs/heads/next" ]]; then
+            DIST_TAG="next"
           else
             DIST_TAG="dev"
           fi
@@ -923,7 +928,7 @@ jobs:
   release-lex-agent:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next' || github.ref == 'refs/heads/dev')
       && (needs.changes.outputs.lex-agent == 'true' || (github.event_name == 'workflow_dispatch' && inputs.lex-agent))
       && needs.test-lex-agent.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
@@ -955,6 +960,8 @@ jobs:
         run: |
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             DIST_TAG="latest"
+          elif [[ "${{ github.ref }}" == "refs/heads/next" ]]; then
+            DIST_TAG="next"
           else
             DIST_TAG="dev"
           fi
