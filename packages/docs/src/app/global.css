@@ -169,6 +169,17 @@
   background: rgb(var(--color-bg)) !important;
 }
 
+/* --- Sequoia comments --- */
+
+sequoia-comments {
+  --sequoia-fg-color: rgb(var(--color-fg));
+  --sequoia-bg-color: rgb(var(--color-surface));
+  --sequoia-border-color: rgb(var(--color-border));
+  --sequoia-accent-color: rgb(var(--color-aqua));
+  --sequoia-secondary-color: rgb(var(--color-fg-muted));
+  --sequoia-border-radius: 12px;
+}
+
 /* --- Blog layout --- */
 
 #nd-home-layout {

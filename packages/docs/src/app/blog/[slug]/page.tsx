@@ -2,6 +2,7 @@ import { blogSource } from '@/lib/source';
 import { notFound } from 'next/navigation';
 import defaultMdxComponents from 'fumadocs-ui/mdx';
 import { Mermaid } from '@/components/mermaid';
+import { SequoiaCommentsLoader } from '@/components/sequoia-comments-loader';
 import { VaporwaveGrid } from '@/components/vaporwave-grid';
 import { getSequoiaPublicationUri } from '@/lib/sequoia';
 import Image from 'next/image';
@@ -77,6 +78,10 @@ export default async function BlogPost(props: {
       </header>
       <div className="prose prose-invert max-w-none">
         <Mdx components={{ ...defaultMdxComponents, Mermaid }} />
+      </div>
+      <div className="mt-16 not-prose">
+        <SequoiaCommentsLoader />
+        <sequoia-comments hide="auto" />
       </div>
       <VaporwaveGrid />
     </article>

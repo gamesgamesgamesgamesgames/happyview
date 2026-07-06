@@ -16,6 +16,9 @@
   "bluesky": {
     "enabled": true
   },
+  "ui": {
+    "components": "src/components"
+  },
   "autoSync": true,
   "publishContent": true
 }
