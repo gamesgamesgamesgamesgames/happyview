@@ -2,7 +2,7 @@
 
 import { useEffect } from 'react';
 
-export function SequoiaCommentsLoader() {
+export function SequoiaLoader() {
   useEffect(() => {
     import('./sequoia-comments.js');
   }, []);

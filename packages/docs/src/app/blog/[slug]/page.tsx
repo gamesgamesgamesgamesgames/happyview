@@ -2,7 +2,8 @@ import { blogSource } from '@/lib/source';
 import { notFound } from 'next/navigation';
 import defaultMdxComponents from 'fumadocs-ui/mdx';
 import { Mermaid } from '@/components/mermaid';
-import { SequoiaCommentsLoader } from '@/components/sequoia-comments-loader';
+import { EngagementActions } from '@/components/engagement-actions';
+import { SequoiaLoader } from '@/components/sequoia-loader';
 import { VaporwaveGrid } from '@/components/vaporwave-grid';
 import { getSequoiaPublicationUri } from '@/lib/sequoia';
 import Image from 'next/image';
@@ -27,6 +28,7 @@ export default async function BlogPost(props: {
       {atUri && (
         <link rel="site.standard.document" href={atUri} />
       )}
+      <SequoiaLoader />
       <header className="mb-12">
         <h1 className="text-4xl font-bold mb-4">{title}</h1>
         {description && (
@@ -79,8 +81,8 @@ export default async function BlogPost(props: {
       <div className="prose prose-invert max-w-none">
         <Mdx components={{ ...defaultMdxComponents, Mermaid }} />
       </div>
-      <div className="mt-16 not-prose">
-        <SequoiaCommentsLoader />
+      <div className="mt-16 not-prose flex flex-col gap-8">
+        <EngagementActions documentUri={atUri} publicationUri={publicationUri} />
         <sequoia-comments hide="auto" />
       </div>
       <VaporwaveGrid />
