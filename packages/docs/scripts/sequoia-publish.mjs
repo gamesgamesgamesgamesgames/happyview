@@ -1,7 +1,14 @@
 import { execSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 
-const config = JSON.parse(readFileSync(new URL('../sequoia.json', import.meta.url), 'utf-8'));
+const configPath = new URL('../sequoia.json', import.meta.url);
+
+if (!existsSync(configPath)) {
+  console.log('[sequoia] No sequoia.json found — run `sequoia init` to set up. Skipping publish.');
+  process.exit(0);
+}
+
+const config = JSON.parse(readFileSync(configPath, 'utf-8'));
 
 if (!config.publicationUri) {
   console.log('[sequoia] No publicationUri configured — run `sequoia init` to set up. Skipping publish.');

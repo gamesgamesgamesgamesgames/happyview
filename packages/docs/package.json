@@ -27,12 +27,12 @@
     "react-dom": "^19.2.0",
     "tailwindcss": "^4.2.0",
     "unist-util-visit": "^5.1.0",
+    "sequoia-cli": "^0.5.7",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
-    "sequoia-cli": "^0.5.7",
     "typescript": "^5.7.0"
   }
 }
