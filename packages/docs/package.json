@@ -10,6 +10,8 @@
     "start": "next start"
   },
   "dependencies": {
+    "@atproto/api": "^0.20.25",
+    "@atproto/oauth-client-browser": "^0.4.5",
     "@happyview/design-system": "workspace:*",
     "@tailwindcss/postcss": "^4.2.0",
     "@types/mdast": "^4.0.4",
