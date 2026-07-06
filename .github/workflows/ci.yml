@@ -845,7 +845,7 @@ jobs:
           else
             DIST_TAG="dev"
           fi
-          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version)
+          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version 2>/dev/null || npm view @happyview/oauth-client@latest version)
           node -e "
             const fs = require('fs');
             const pkg = JSON.parse(fs.readFileSync('packages/oauth-client-browser/package.json', 'utf8'));
@@ -905,7 +905,7 @@ jobs:
           else
             DIST_TAG="dev"
           fi
-          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version)
+          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version 2>/dev/null || npm view @happyview/oauth-client@latest version)
           node -e "
             const fs = require('fs');
             const pkg = JSON.parse(fs.readFileSync('packages/oauth-client-node/package.json', 'utf8'));
@@ -965,7 +965,7 @@ jobs:
           else
             DIST_TAG="dev"
           fi
-          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version)
+          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version 2>/dev/null || npm view @happyview/oauth-client@latest version)
           node -e "
             const fs = require('fs');
             const pkg = JSON.parse(fs.readFileSync('packages/lex-agent/package.json', 'utf8'));
