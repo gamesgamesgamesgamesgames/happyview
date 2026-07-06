@@ -1,7 +1,7 @@
 ---
 title: "Looking Ahead with HappyView"
 description: "What's next on the roadmap for your favorite AppView software?"
-date: 2026-07-02
+date: 2026-07-06
 author:
   name: "Trezy"
   avatar: "/authors/trezy.webp"
