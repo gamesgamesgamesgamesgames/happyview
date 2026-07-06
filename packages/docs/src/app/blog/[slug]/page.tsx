@@ -3,9 +3,9 @@ import { notFound } from 'next/navigation';
 import defaultMdxComponents from 'fumadocs-ui/mdx';
 import { Mermaid } from '@/components/mermaid';
 import { EngagementActions } from '@/components/engagement-actions';
-import { SequoiaLoader } from '@/components/sequoia-loader';
+import { PostComments } from '@/components/post-comments';
 import { VaporwaveGrid } from '@/components/vaporwave-grid';
-import { getSequoiaPublicationUri } from '@/lib/sequoia';
+const PUBLICATION_URI = 'at://did:plc:qneu5uamqs6cug7sjobbaexm/site.standard.publication/3mpokbucn3y26';
 import Image from 'next/image';
 
 export default async function BlogPost(props: {
@@ -18,7 +18,7 @@ export default async function BlogPost(props: {
 
   const { title, description, date, author, tags, atUri } = page.data;
   const Mdx = page.data.body;
-  const publicationUri = getSequoiaPublicationUri();
+  const publicationUri = PUBLICATION_URI;
 
   return (
     <article className="mx-auto max-w-3xl px-6 py-16" style={{ isolation: 'isolate' }}>
@@ -28,7 +28,6 @@ export default async function BlogPost(props: {
       {atUri && (
         <link rel="site.standard.document" href={atUri} />
       )}
-      <SequoiaLoader />
       <header className="mb-12">
         <h1 className="text-4xl font-bold mb-4">{title}</h1>
         {description && (
@@ -77,13 +76,20 @@ export default async function BlogPost(props: {
             </div>
           )}
         </div>
+        <div className="mt-6 not-prose">
+          <EngagementActions documentUri={atUri} publicationUri={publicationUri} />
+        </div>
       </header>
       <div className="prose prose-invert max-w-none">
         <Mdx components={{ ...defaultMdxComponents, Mermaid }} />
       </div>
-      <div className="mt-16 not-prose flex flex-col gap-8">
+      <div className="mt-16 not-prose flex flex-col gap-10">
         <EngagementActions documentUri={atUri} publicationUri={publicationUri} />
-        <sequoia-comments hide="auto" />
+        <hr
+          className="border-t"
+          style={{ borderColor: 'rgb(var(--color-border))' }}
+        />
+        <PostComments atUri={atUri} />
       </div>
       <VaporwaveGrid />
     </article>

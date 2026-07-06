@@ -169,17 +169,6 @@
   background: rgb(var(--color-bg)) !important;
 }
 
-/* --- Sequoia comments --- */
-
-sequoia-comments {
-  --sequoia-fg-color: rgb(var(--color-fg));
-  --sequoia-bg-color: rgb(var(--color-surface));
-  --sequoia-border-color: rgb(var(--color-border));
-  --sequoia-accent-color: rgb(var(--color-aqua));
-  --sequoia-secondary-color: rgb(var(--color-fg-muted));
-  --sequoia-border-radius: 12px;
-}
-
 /* --- Blog layout --- */
 
 #nd-home-layout {
@@ -246,4 +235,22 @@ figure.shiki {
     0 0 20px color-mix(in srgb, var(--callout-color) 5%, transparent),
     inset 0 0 16px color-mix(in srgb, var(--callout-color) 2%, transparent);
   border-color: color-mix(in srgb, var(--callout-color) 20%, transparent);
+}
+
+/* --- Toast --- */
+
+@keyframes toast-in-out {
+  0% { transform: translateY(100%); opacity: 0; }
+  12% { transform: translateY(0); opacity: 1; }
+  85% { transform: translateY(0); opacity: 1; }
+  100% { transform: translateY(100%); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @keyframes toast-in-out {
+    0% { opacity: 0; }
+    12% { opacity: 1; }
+    85% { opacity: 1; }
+    100% { opacity: 0; }
+  }
 }

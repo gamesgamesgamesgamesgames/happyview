@@ -6,7 +6,7 @@ import { BrowserOAuthClient } from '@atproto/oauth-client-browser';
 import { getOAuthClient } from '@/lib/atproto-oauth';
 
 type OAuthSession = Awaited<ReturnType<BrowserOAuthClient['restore']>>;
-type PendingAction = 'recommend' | 'subscribe';
+type ActionType = 'recommend' | 'subscribe';
 
 interface EngagementActionsProps {
   documentUri?: string;
@@ -16,11 +16,15 @@ interface EngagementActionsProps {
 export function EngagementActions({ documentUri, publicationUri }: EngagementActionsProps) {
   const clientRef = useRef<BrowserOAuthClient | null>(null);
   const [session, setSession] = useState<OAuthSession | null>(null);
+  const [ready, setReady] = useState(false);
   const [showLogin, setShowLogin] = useState(false);
-  const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
+  const [pendingAction, setPendingAction] = useState<ActionType | null>(null);
   const [recommended, setRecommended] = useState(false);
   const [subscribed, setSubscribed] = useState(false);
-  const [loading, setLoading] = useState<PendingAction | null>(null);
+  const [loading, setLoading] = useState<ActionType | null>(null);
+  const [actionError, setActionError] = useState<ActionType | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   useEffect(() => {
     let cancelled = false;
@@ -36,6 +40,8 @@ export function EngagementActions({ documentUri, publicationUri }: EngagementAct
         }
       } catch {
         // OAuth init can fail on localhost — use http://127.0.0.1:PORT instead
+      } finally {
+        if (!cancelled) setReady(true);
       }
     })();
 
@@ -44,21 +50,31 @@ export function EngagementActions({ documentUri, publicationUri }: EngagementAct
 
   useEffect(() => {
     if (!session) return;
-
     const agent = new Agent(session);
 
     if (documentUri) {
       checkExistingRecord(agent, session.did, 'site.standard.graph.recommend', documentUri, 'document')
         .then(setRecommended);
     }
-
     if (publicationUri) {
       checkExistingRecord(agent, session.did, 'site.standard.graph.subscription', publicationUri, 'publication')
         .then(setSubscribed);
     }
   }, [session, documentUri, publicationUri]);
 
-  const handleAction = useCallback((action: PendingAction) => {
+  useEffect(() => {
+    if (!actionError) return;
+    const timer = setTimeout(() => setActionError(null), 3000);
+    return () => clearTimeout(timer);
+  }, [actionError]);
+
+  const showToast = useCallback((message: string) => {
+    clearTimeout(toastTimerRef.current);
+    setToast(message);
+    toastTimerRef.current = setTimeout(() => setToast(null), 3000);
+  }, []);
+
+  const handleAction = useCallback((action: ActionType) => {
     if (!session) {
       setPendingAction(action);
       setShowLogin(true);
@@ -69,8 +85,10 @@ export function EngagementActions({ documentUri, publicationUri }: EngagementAct
       setRecommended,
       setSubscribed,
       setLoading,
+      setActionError,
+      showToast,
     });
-  }, [session, documentUri, publicationUri]);
+  }, [session, documentUri, publicationUri, showToast]);
 
   useEffect(() => {
     if (session && pendingAction) {
@@ -82,7 +100,6 @@ export function EngagementActions({ documentUri, publicationUri }: EngagementAct
   const handleLogin = async (handle: string) => {
     const client = clientRef.current;
     if (!client) return;
-
     setShowLogin(false);
     await client.signInRedirect(handle, {
       state: window.location.href,
@@ -97,174 +114,260 @@ export function EngagementActions({ documentUri, publicationUri }: EngagementAct
     setSubscribed(false);
   };
 
+  if (!ready) {
+    return (
+      <div className="flex flex-wrap items-center gap-3">
+        {documentUri && <SkeletonPill />}
+        {publicationUri && <SkeletonPill />}
+      </div>
+    );
+  }
+
+  const actionLabel = pendingAction === 'subscribe'
+    ? 'subscribe for updates'
+    : 'recommend this article';
+
   return (
-    <div className="flex flex-wrap items-center gap-3">
-      {documentUri && (
-        <button
-          type="button"
-          onClick={() => handleAction('recommend')}
-          disabled={loading === 'recommend'}
-          className="inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-all duration-200"
-          style={{
-            backgroundColor: recommended
-              ? 'rgb(var(--color-magenta) / 0.15)'
-              : 'rgb(var(--color-surface))',
-            color: recommended
-              ? 'rgb(var(--color-magenta))'
-              : 'rgb(var(--color-fg-muted))',
-            borderWidth: '1px',
-            borderColor: recommended
-              ? 'rgb(var(--color-magenta) / 0.3)'
-              : 'rgb(var(--color-border))',
-          }}
-        >
-          <HeartIcon filled={recommended} />
-          {loading === 'recommend' ? 'Saving...' : recommended ? 'Recommended' : 'Recommend'}
-        </button>
-      )}
+    <div>
+      <div className="flex flex-wrap items-center gap-3">
+        {documentUri && (
+          <button
+            type="button"
+            onClick={() => handleAction('recommend')}
+            disabled={loading === 'recommend'}
+            className="inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-all duration-200"
+            style={{
+              backgroundColor: actionError === 'recommend'
+                ? 'rgb(var(--color-magenta) / 0.25)'
+                : recommended
+                  ? 'rgb(var(--color-magenta) / 0.15)'
+                  : 'rgb(var(--color-surface))',
+              color: actionError === 'recommend'
+                ? 'rgb(var(--color-magenta))'
+                : recommended
+                  ? 'rgb(var(--color-magenta))'
+                  : 'rgb(var(--color-fg-muted))',
+              borderWidth: '1px',
+              borderColor: actionError === 'recommend'
+                ? 'rgb(var(--color-magenta) / 0.5)'
+                : recommended
+                  ? 'rgb(var(--color-magenta) / 0.3)'
+                  : 'rgb(var(--color-border))',
+            }}
+          >
+            <HeartIcon filled={recommended} />
+            {actionError === 'recommend'
+              ? 'Failed'
+              : loading === 'recommend'
+                ? 'Saving...'
+                : recommended
+                  ? 'Recommended'
+                  : 'Recommend'}
+          </button>
+        )}
 
-      {publicationUri && (
-        <button
-          type="button"
-          onClick={() => handleAction('subscribe')}
-          disabled={loading === 'subscribe'}
-          className="inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-all duration-200"
-          style={{
-            backgroundColor: subscribed
-              ? 'rgb(var(--color-aqua) / 0.15)'
-              : 'rgb(var(--color-surface))',
-            color: subscribed
-              ? 'rgb(var(--color-aqua))'
-              : 'rgb(var(--color-fg-muted))',
-            borderWidth: '1px',
-            borderColor: subscribed
-              ? 'rgb(var(--color-aqua) / 0.3)'
-              : 'rgb(var(--color-border))',
-          }}
-        >
-          <BellIcon filled={subscribed} />
-          {loading === 'subscribe' ? 'Saving...' : subscribed ? 'Subscribed' : 'Subscribe'}
-        </button>
-      )}
+        {publicationUri && (
+          <button
+            type="button"
+            onClick={() => handleAction('subscribe')}
+            disabled={loading === 'subscribe'}
+            className="inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-all duration-200"
+            style={{
+              backgroundColor: actionError === 'subscribe'
+                ? 'rgb(var(--color-magenta) / 0.25)'
+                : subscribed
+                  ? 'rgb(var(--color-aqua) / 0.15)'
+                  : 'rgb(var(--color-surface))',
+              color: actionError === 'subscribe'
+                ? 'rgb(var(--color-magenta))'
+                : subscribed
+                  ? 'rgb(var(--color-aqua))'
+                  : 'rgb(var(--color-fg-muted))',
+              borderWidth: '1px',
+              borderColor: actionError === 'subscribe'
+                ? 'rgb(var(--color-magenta) / 0.5)'
+                : subscribed
+                  ? 'rgb(var(--color-aqua) / 0.3)'
+                  : 'rgb(var(--color-border))',
+            }}
+          >
+            <BellIcon filled={subscribed} />
+            {actionError === 'subscribe'
+              ? 'Failed'
+              : loading === 'subscribe'
+                ? 'Saving...'
+                : subscribed
+                  ? 'Subscribed'
+                  : 'Subscribe'}
+          </button>
+        )}
 
-      {session && (
-        <button
-          type="button"
-          onClick={handleLogout}
-          className="text-xs transition-colors duration-200 hover:underline"
-          style={{ color: 'rgb(var(--color-fg-muted))' }}
-        >
-          Log out
-        </button>
-      )}
+        {session && (
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="text-xs transition-colors duration-200 hover:underline"
+            style={{ color: 'rgb(var(--color-fg-muted))' }}
+          >
+            Log out
+          </button>
+        )}
+      </div>
 
-      {showLogin && (
-        <LoginDialog
-          onSubmit={handleLogin}
-          onClose={() => {
-            setShowLogin(false);
-            setPendingAction(null);
-          }}
-        />
+      <div
+        className="grid transition-[grid-template-rows] duration-200 ease-out motion-reduce:!duration-0"
+        style={{ gridTemplateRows: showLogin ? '1fr' : '0fr' }}
+      >
+        <div className="overflow-hidden">
+          <InlineLogin
+            action={actionLabel}
+            onSubmit={handleLogin}
+            onClose={() => { setShowLogin(false); setPendingAction(null); }}
+            visible={showLogin}
+          />
+        </div>
+      </div>
+
+      {toast && (
+        <div className="fixed bottom-6 left-0 right-0 flex justify-center z-40 pointer-events-none">
+          <div
+            className="pointer-events-auto rounded-full px-5 py-2.5 text-sm font-medium"
+            style={{
+              backgroundColor: 'rgb(var(--color-surface))',
+              color: 'rgb(var(--color-fg))',
+              borderWidth: '1px',
+              borderColor: 'rgb(var(--color-border))',
+              boxShadow: '0 4px 24px rgb(0 0 0 / 0.3)',
+              animation: 'toast-in-out 3s ease-out forwards',
+            }}
+          >
+            {toast}
+          </div>
+        </div>
       )}
     </div>
   );
 }
 
-function LoginDialog({
+function SkeletonPill() {
+  return (
+    <div
+      className="rounded-full animate-pulse"
+      style={{
+        width: '120px',
+        height: '36px',
+        backgroundColor: 'rgb(var(--color-surface))',
+      }}
+    />
+  );
+}
+
+function InlineLogin({
+  action,
   onSubmit,
   onClose,
+  visible,
 }: {
+  action: string;
   onSubmit: (handle: string) => void;
   onClose: () => void;
+  visible: boolean;
 }) {
   const [handle, setHandle] = useState('');
+  const [validationError, setValidationError] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
+    if (visible) {
+      const raf = requestAnimationFrame(() => inputRef.current?.focus());
+      return () => cancelAnimationFrame(raf);
+    }
+  }, [visible]);
 
   useEffect(() => {
+    if (!visible) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onClose]);
+  }, [visible, onClose]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = handle.trim();
-    if (trimmed) onSubmit(trimmed);
+    if (!trimmed) return;
+
+    if (!trimmed.includes('.') && !trimmed.startsWith('did:')) {
+      setValidationError('Enter a full handle (e.g. yourname.bsky.social) or a DID.');
+      return;
+    }
+
+    setValidationError('');
+    onSubmit(trimmed);
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
-      style={{ backgroundColor: 'rgb(0 0 0 / 0.6)' }}
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div
-        className="w-full max-w-sm rounded-xl p-6"
-        style={{
-          backgroundColor: 'rgb(var(--color-surface))',
-          borderWidth: '1px',
-          borderColor: 'rgb(var(--color-border))',
-        }}
-      >
-        <h2
-          className="text-lg font-semibold mb-2"
-          style={{ color: 'rgb(var(--color-fg))' }}
-        >
-          Log in with AT Protocol
-        </h2>
-        <p
-          className="text-sm mb-4"
-          style={{ color: 'rgb(var(--color-fg-muted))' }}
-        >
-          Enter your handle to continue.
-        </p>
-        <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+    <div className="pt-4">
+      <p className="text-sm mb-3" style={{ color: 'rgb(var(--color-fg-muted))' }}>
+        Sign in with Bluesky to {action}.
+      </p>
+      <form onSubmit={handleSubmit} className="flex flex-wrap items-start gap-2">
+        <div className="flex-1 min-w-[200px]">
           <input
             ref={inputRef}
             type="text"
             value={handle}
-            onChange={(e) => setHandle(e.target.value)}
+            onChange={(e) => {
+              setHandle(e.target.value);
+              if (validationError) setValidationError('');
+            }}
             placeholder="yourname.bsky.social"
-            className="rounded-lg px-3 py-2 text-sm outline-none"
+            tabIndex={visible ? 0 : -1}
+            className="w-full rounded-lg px-3 py-2 text-sm outline-none"
             style={{
               backgroundColor: 'rgb(var(--color-bg))',
               color: 'rgb(var(--color-fg))',
               borderWidth: '1px',
-              borderColor: 'rgb(var(--color-border))',
+              borderColor: validationError
+                ? 'rgb(var(--color-magenta) / 0.5)'
+                : 'rgb(var(--color-border))',
             }}
+            aria-invalid={!!validationError}
+            aria-describedby={validationError ? 'inline-handle-error' : undefined}
           />
-          <div className="flex gap-2 justify-end">
-            <button
-              type="button"
-              onClick={onClose}
-              className="rounded-lg px-4 py-2 text-sm transition-colors duration-200"
-              style={{ color: 'rgb(var(--color-fg-muted))' }}
+          {validationError && (
+            <p
+              id="inline-handle-error"
+              className="mt-1.5 text-xs"
+              style={{ color: 'rgb(var(--color-magenta))' }}
             >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={!handle.trim()}
-              className="rounded-lg px-4 py-2 text-sm font-medium transition-colors duration-200 disabled:opacity-50"
-              style={{
-                backgroundColor: 'rgb(var(--color-aqua))',
-                color: 'rgb(var(--color-bg))',
-              }}
-            >
-              Log in
-            </button>
-          </div>
-        </form>
-      </div>
+              {validationError}
+            </p>
+          )}
+        </div>
+        <button
+          type="submit"
+          disabled={!handle.trim()}
+          tabIndex={visible ? 0 : -1}
+          className="rounded-lg px-4 py-2 text-sm font-medium transition-colors duration-200 disabled:opacity-50"
+          style={{
+            backgroundColor: 'rgb(var(--color-aqua))',
+            color: 'rgb(var(--color-bg))',
+          }}
+        >
+          Log in
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          tabIndex={visible ? 0 : -1}
+          className="rounded-lg px-4 py-2 text-sm transition-colors duration-200"
+          style={{ color: 'rgb(var(--color-fg-muted))' }}
+        >
+          Cancel
+        </button>
+      </form>
     </div>
   );
 }
@@ -292,13 +395,15 @@ async function checkExistingRecord(
 
 async function performAction(
   session: OAuthSession,
-  action: PendingAction,
+  action: ActionType,
   documentUri: string | undefined,
   publicationUri: string | undefined,
   callbacks: {
     setRecommended: (v: boolean) => void;
     setSubscribed: (v: boolean) => void;
-    setLoading: (v: PendingAction | null) => void;
+    setLoading: (v: ActionType | null) => void;
+    setActionError: (v: ActionType | null) => void;
+    showToast: (message: string) => void;
   },
 ) {
   const agent = new Agent(session);
@@ -317,6 +422,7 @@ async function performAction(
           rkey: existing.split('/').pop()!,
         });
         callbacks.setRecommended(false);
+        callbacks.showToast('Recommendation removed');
       } else {
         await agent.com.atproto.repo.createRecord({
           repo: session.did,
@@ -328,6 +434,7 @@ async function performAction(
           },
         });
         callbacks.setRecommended(true);
+        callbacks.showToast('Recommended!');
       }
     }
 
@@ -343,6 +450,7 @@ async function performAction(
           rkey: existing.split('/').pop()!,
         });
         callbacks.setSubscribed(false);
+        callbacks.showToast('Unsubscribed');
       } else {
         await agent.com.atproto.repo.createRecord({
           repo: session.did,
@@ -354,10 +462,12 @@ async function performAction(
           },
         });
         callbacks.setSubscribed(true);
+        callbacks.showToast('Subscribed to updates');
       }
     }
   } catch (err) {
     console.error(`Failed to ${action}:`, err);
+    callbacks.setActionError(action);
   } finally {
     callbacks.setLoading(null);
   }
