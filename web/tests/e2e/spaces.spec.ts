@@ -57,7 +57,7 @@ test.describe("Spaces API", () => {
     }
     const createBody = await createResp.json()
     expect(createBody).toHaveProperty("uri")
-    expect(createBody.uri).toMatch(/^ats:\/\//)
+    expect(createBody.uri).toMatch(/^at:\/\/.+\/space\//)
     createdSpaceUri = createBody.uri
 
     const listResp = await page.request.get(

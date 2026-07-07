@@ -41,13 +41,13 @@ mod tests {
 
         let sk = test_signing_key();
         let vk = *sk.verifying_key();
-        let space_uri = "ats://did:plc:abc/com.example.forum/main";
+        let space_uri = "at://did:plc:abc/space/com.example.forum/main";
         let rev = "3k2rev1";
 
-        let commit = sign_commit(&hash_after_ab, space_uri, rev, &sk).unwrap();
+        let commit = sign_commit(&hash_after_ab, space_uri, "did:plc:testuser", rev, &sk).unwrap();
         assert_eq!(commit.hash, hash_after_ab);
         assert_eq!(commit.rev, rev);
-        assert!(verify_commit(&commit, space_uri, &vk).is_ok());
+        assert!(verify_commit(&commit, space_uri, "did:plc:testuser", &vk).is_ok());
     }
 
     /// Remove a record — hash must change back toward the previous state.
@@ -76,9 +76,9 @@ mod tests {
 
         let sk = test_signing_key();
         let vk = *sk.verifying_key();
-        let space_uri = "ats://did:plc:abc/com.example.forum/main";
-        let commit = sign_commit(&hash_one, space_uri, "3k2rev2", &sk).unwrap();
-        assert!(verify_commit(&commit, space_uri, &vk).is_ok());
+        let space_uri = "at://did:plc:abc/space/com.example.forum/main";
+        let commit = sign_commit(&hash_one, space_uri, "did:plc:testuser", "3k2rev2", &sk).unwrap();
+        assert!(verify_commit(&commit, space_uri, "did:plc:testuser", &vk).is_ok());
     }
 
     /// Commit signed for one hash must not verify against a different hash.
@@ -94,13 +94,13 @@ mod tests {
 
         let sk = test_signing_key();
         let vk = *sk.verifying_key();
-        let space_uri = "ats://did:plc:abc/com.example.forum/main";
+        let space_uri = "at://did:plc:abc/space/com.example.forum/main";
 
-        let commit_a = sign_commit(&hash_a, space_uri, "rev1", &sk).unwrap();
+        let commit_a = sign_commit(&hash_a, space_uri, "did:plc:testuser", "rev1", &sk).unwrap();
         // Tamper: swap in hash_b
         let mut tampered = commit_a;
         tampered.hash = hash_b;
-        assert!(verify_commit(&tampered, space_uri, &vk).is_err());
+        assert!(verify_commit(&tampered, space_uri, "did:plc:testuser", &vk).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -138,7 +138,7 @@ mod tests {
         // Step 1: member signs delegation token
         let delegation = DelegationTokenClaims {
             iss: "did:plc:member".into(),
-            sub: "ats://did:plc:space/com.example.forum/main".into(),
+            sub: "at://did:plc:space/space/com.example.forum/main".into(),
             aud: "did:plc:space#atproto_space_host".into(),
             iat: now,
             exp: now + DELEGATION_TOKEN_TTL_SECS,
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(verified_delegation.iss, "did:plc:member");
         assert_eq!(
             verified_delegation.sub,
-            "ats://did:plc:space/com.example.forum/main"
+            "at://did:plc:space/space/com.example.forum/main"
         );
 
         // Step 3: space host issues a space credential (using P-256 key)
@@ -175,7 +175,7 @@ mod tests {
         );
         assert_eq!(
             peek_credential_sub(&credential).as_deref(),
-            Some("ats://did:plc:space/com.example.forum/main")
+            Some("at://did:plc:space/space/com.example.forum/main")
         );
 
         // Step 4: verify credential
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(verified_cred.iss, "did:plc:space");
         assert_eq!(
             verified_cred.sub,
-            "ats://did:plc:space/com.example.forum/main"
+            "at://did:plc:space/space/com.example.forum/main"
         );
     }
 
@@ -196,7 +196,7 @@ mod tests {
 
         let delegation = DelegationTokenClaims {
             iss: "did:plc:member".into(),
-            sub: "ats://did:plc:space/com.example.forum/main".into(),
+            sub: "at://did:plc:space/space/com.example.forum/main".into(),
             aud: "did:plc:space#atproto_space_host".into(),
             iat: now - 120,
             exp: now - 60, // already expired
@@ -240,6 +240,7 @@ mod tests {
             rkey: "3k2abc".into(),
             cid: Some("bafyreiabc".into()),
             prev: None,
+            value: None,
             created_at: "2026-01-01T00:00:00Z".into(),
         };
 
@@ -266,6 +267,7 @@ mod tests {
             rkey: "3k2abc".into(),
             cid: None,
             prev: Some("bafyreiabc".into()),
+            value: None,
             created_at: "2026-01-01T00:00:01Z".into(),
         };
 
@@ -499,11 +501,11 @@ mod tests {
         }
 
         let qs = serde_json::json!({
-            "space": "ats://did:plc:abc/com.example.forum/main",
+            "space": "at://did:plc:abc/space/com.example.forum/main",
             "cid": "bafyreiabc123"
         });
         let q: BlobQuery = serde_json::from_value(qs).unwrap();
-        assert_eq!(q.space, "ats://did:plc:abc/com.example.forum/main");
+        assert_eq!(q.space, "at://did:plc:abc/space/com.example.forum/main");
         assert_eq!(q.cid, "bafyreiabc123");
     }
 
@@ -540,7 +542,7 @@ mod tests {
 
         let claims = SpaceCredentialClaims {
             iss: "did:plc:owner".into(),
-            sub: "ats://did:plc:owner/com.example.forum/main".into(),
+            sub: "at://did:plc:owner/space/com.example.forum/main".into(),
             iat: now,
             exp: now + DEFAULT_CREDENTIAL_TTL_SECS,
             jti: make_jti(),
@@ -562,7 +564,7 @@ mod tests {
 
         let claims = SpaceCredentialClaims {
             iss: "did:plc:owner".into(),
-            sub: "ats://did:plc:owner/com.example.forum/main".into(),
+            sub: "at://did:plc:owner/space/com.example.forum/main".into(),
             iat: now,
             exp: now + DEFAULT_CREDENTIAL_TTL_SECS,
             jti: make_jti(),

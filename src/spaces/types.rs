@@ -126,6 +126,8 @@ pub struct OplogEntry {
     pub rkey: String,
     pub cid: Option<String>,
     pub prev: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
     pub created_at: String,
 }
 

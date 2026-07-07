@@ -6,6 +6,7 @@ use sha2::Sha256;
 use crate::error::AppError;
 
 pub struct SignedCommit {
+    pub ver: u32,
     pub hash: [u8; 32],
     pub ikm: [u8; 32],
     pub sig: Vec<u8>,
@@ -13,19 +14,24 @@ pub struct SignedCommit {
     pub rev: String,
 }
 
-pub fn build_context(space_uri: &str, rev: &str, ikm: &[u8; 32]) -> Vec<u8> {
+pub fn build_context(space_uri: &str, author_did: &str, rev: &str, ikm: &[u8; 32]) -> Vec<u8> {
     let tag = b"atproto-space-v1";
     let space_bytes = space_uri.as_bytes();
+    let author_bytes = author_did.as_bytes();
     let rev_bytes = rev.as_bytes();
 
-    let mut ctx =
-        Vec::with_capacity(tag.len() + 2 + space_bytes.len() + 2 + rev_bytes.len() + 2 + 32);
+    let mut ctx = Vec::with_capacity(
+        tag.len() + 2 + space_bytes.len() + 2 + author_bytes.len() + 2 + rev_bytes.len() + 2 + 32,
+    );
 
     ctx.extend_from_slice(tag);
 
     // TLS 1.3 variable-length encoding: big-endian uint16 length prefix
     ctx.extend_from_slice(&(space_bytes.len() as u16).to_be_bytes());
     ctx.extend_from_slice(space_bytes);
+
+    ctx.extend_from_slice(&(author_bytes.len() as u16).to_be_bytes());
+    ctx.extend_from_slice(author_bytes);
 
     ctx.extend_from_slice(&(rev_bytes.len() as u16).to_be_bytes());
     ctx.extend_from_slice(rev_bytes);
@@ -39,15 +45,16 @@ pub fn build_context(space_uri: &str, rev: &str, ikm: &[u8; 32]) -> Vec<u8> {
 pub fn sign_commit(
     hash: &[u8; 32],
     space_uri: &str,
+    author_did: &str,
     rev: &str,
     signing_key: &SigningKey,
 ) -> Result<SignedCommit, AppError> {
     let mut ikm = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut ikm);
 
-    let ctx = build_context(space_uri, rev, &ikm);
+    let ctx = build_context(space_uri, author_did, rev, &ikm);
 
-    // sig covers space + rev + ikm, NOT the hash — prevents rebroadcast proof
+    // sig covers space + author + rev + ikm, NOT the hash — prevents rebroadcast proof
     let sig: Signature = signing_key.sign(&ctx);
 
     // mac = HMAC-SHA256(HKDF-SHA256(ikm, ctx), hash)
@@ -62,6 +69,7 @@ pub fn sign_commit(
     let mac: [u8; 32] = mac_hasher.finalize().into_bytes().into();
 
     Ok(SignedCommit {
+        ver: 1,
         hash: *hash,
         ikm,
         sig: sig.to_bytes().to_vec(),
@@ -73,9 +81,10 @@ pub fn sign_commit(
 pub fn verify_commit(
     commit: &SignedCommit,
     space_uri: &str,
+    author_did: &str,
     verifying_key: &VerifyingKey,
 ) -> Result<(), AppError> {
-    let ctx = build_context(space_uri, &commit.rev, &commit.ikm);
+    let ctx = build_context(space_uri, author_did, &commit.rev, &commit.ikm);
 
     let sig = Signature::from_bytes(commit.sig.as_slice().into())
         .map_err(|_| AppError::Auth("invalid commit signature format".into()))?;
@@ -114,7 +123,8 @@ mod tests {
     #[test]
     fn context_string_format() {
         let ctx = build_context(
-            "ats://did:plc:abc/com.example.forum/main",
+            "at://did:plc:abc/space/com.example.forum/main",
+            "did:plc:testuser",
             "3k2abc",
             &[0xAA; 32],
         );
@@ -124,15 +134,45 @@ mod tests {
 
     #[test]
     fn context_includes_all_fields() {
-        let space = "ats://did:plc:abc/com.example.forum/main";
+        let space = "at://did:plc:abc/space/com.example.forum/main";
+        let author = "did:plc:testuser";
         let rev = "3k2abc";
         let ikm = [0xBB; 32];
-        let ctx = build_context(space, rev, &ikm);
+        let ctx = build_context(space, author, rev, &ikm);
 
-        // Context must contain the space URI, rev, and ikm
+        // Context must contain the space URI, author, rev, and ikm
         assert!(ctx.windows(space.len()).any(|w| w == space.as_bytes()));
+        assert!(ctx.windows(author.len()).any(|w| w == author.as_bytes()));
         assert!(ctx.windows(rev.len()).any(|w| w == rev.as_bytes()));
         assert!(ctx.windows(32).any(|w| w == ikm));
+    }
+
+    #[test]
+    fn context_includes_author_did() {
+        let space = "at://did:plc:abc/space/com.example.forum/main";
+        let author = "did:plc:user1";
+        let rev = "3k2abc";
+        let ikm = [0xBB; 32];
+        let ctx = build_context(space, author, rev, &ikm);
+
+        assert!(ctx.starts_with(b"atproto-space-v1"));
+        assert!(ctx.windows(author.len()).any(|w| w == author.as_bytes()));
+
+        // Author must appear after space and before rev in the byte stream
+        let space_pos = ctx
+            .windows(space.len())
+            .position(|w| w == space.as_bytes())
+            .unwrap();
+        let author_pos = ctx
+            .windows(author.len())
+            .position(|w| w == author.as_bytes())
+            .unwrap();
+        let rev_pos = ctx
+            .windows(rev.len())
+            .position(|w| w == rev.as_bytes())
+            .unwrap();
+        assert!(space_pos < author_pos);
+        assert!(author_pos < rev_pos);
     }
 
     #[test]
@@ -140,16 +180,38 @@ mod tests {
         let sk = test_signing_key();
         let vk = *sk.verifying_key();
         let hash = [0xCC; 32];
-        let space = "ats://did:plc:abc/com.example.forum/main";
+        let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let commit = sign_commit(&hash, space, "3k2rev1", &sk).unwrap();
+        let commit = sign_commit(&hash, space, "did:plc:testuser", "3k2rev1", &sk).unwrap();
 
         assert_eq!(commit.hash, hash);
         assert_eq!(commit.rev, "3k2rev1");
         assert_eq!(commit.mac.len(), 32);
         assert!(!commit.sig.is_empty());
+        assert_eq!(commit.ver, 1);
 
-        assert!(verify_commit(&commit, space, &vk).is_ok());
+        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk).is_ok());
+    }
+
+    #[test]
+    fn commit_has_version() {
+        let sk = test_signing_key();
+        let hash = [0xCC; 32];
+        let space = "at://did:plc:abc/space/com.example.forum/main";
+        let commit = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
+        assert_eq!(commit.ver, 1);
+    }
+
+    #[test]
+    fn verify_rejects_wrong_author() {
+        let sk = test_signing_key();
+        let vk = *sk.verifying_key();
+        let hash = [0xAA; 32];
+        let space = "at://did:plc:abc/space/com.example.forum/main";
+
+        let commit = sign_commit(&hash, space, "did:plc:user1", "rev1", &sk).unwrap();
+        assert!(verify_commit(&commit, space, "did:plc:user1", &vk).is_ok());
+        assert!(verify_commit(&commit, space, "did:plc:user2", &vk).is_err());
     }
 
     #[test]
@@ -161,10 +223,10 @@ mod tests {
         let vk2 = *sk2.verifying_key();
 
         let hash = [0xDD; 32];
-        let space = "ats://did:plc:abc/com.example.forum/main";
+        let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let commit = sign_commit(&hash, space, "rev1", &sk1).unwrap();
-        assert!(verify_commit(&commit, space, &vk2).is_err());
+        let commit = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk1).unwrap();
+        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk2).is_err());
     }
 
     #[test]
@@ -172,11 +234,11 @@ mod tests {
         let sk = test_signing_key();
         let vk = *sk.verifying_key();
         let hash = [0xEE; 32];
-        let space = "ats://did:plc:abc/com.example.forum/main";
+        let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let mut commit = sign_commit(&hash, space, "rev1", &sk).unwrap();
+        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
         commit.hash[0] ^= 0xFF; // tamper
-        assert!(verify_commit(&commit, space, &vk).is_err());
+        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk).is_err());
     }
 
     #[test]
@@ -187,29 +249,38 @@ mod tests {
 
         let commit = sign_commit(
             &hash,
-            "ats://did:plc:abc/com.example.forum/main",
+            "at://did:plc:abc/space/com.example.forum/main",
+            "did:plc:user",
             "rev1",
             &sk,
         )
         .unwrap();
-        assert!(verify_commit(&commit, "ats://did:plc:xyz/com.example.forum/other", &vk).is_err());
+        assert!(
+            verify_commit(
+                &commit,
+                "at://did:plc:xyz/space/com.example.forum/other",
+                "did:plc:user",
+                &vk
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn different_ikm_per_commit() {
         let sk = test_signing_key();
         let hash = [0xAA; 32];
-        let space = "ats://did:plc:abc/com.example.forum/main";
+        let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let c1 = sign_commit(&hash, space, "rev1", &sk).unwrap();
-        let c2 = sign_commit(&hash, space, "rev1", &sk).unwrap();
+        let c1 = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
+        let c2 = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
 
         // Each call generates fresh ikm
         assert_ne!(c1.ikm, c2.ikm);
         // But both verify
         let vk = *sk.verifying_key();
-        assert!(verify_commit(&c1, space, &vk).is_ok());
-        assert!(verify_commit(&c2, space, &vk).is_ok());
+        assert!(verify_commit(&c1, space, "did:plc:testuser", &vk).is_ok());
+        assert!(verify_commit(&c2, space, "did:plc:testuser", &vk).is_ok());
     }
 
     #[test]
@@ -217,11 +288,11 @@ mod tests {
         let sk = test_signing_key();
         let vk = *sk.verifying_key();
         let hash = [0xCC; 32];
-        let space = "ats://did:plc:abc/com.example.forum/main";
+        let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let mut commit = sign_commit(&hash, space, "rev1", &sk).unwrap();
-        assert!(verify_commit(&commit, space, &vk).is_ok());
+        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
+        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk).is_ok());
         commit.mac[0] ^= 0xFF;
-        assert!(verify_commit(&commit, space, &vk).is_err());
+        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk).is_err());
     }
 }

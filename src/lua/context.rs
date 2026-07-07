@@ -271,7 +271,7 @@ mod tests {
         let lua = create_sandbox().unwrap();
         let params = HashMap::new();
         let space = SpaceContext {
-            space: "ats://did:plc:owner/com.example.forum/main".into(),
+            space: "at://did:plc:owner/space/com.example.forum/main".into(),
             space_id: "space-123".into(),
             did: "did:plc:owner".into(),
             authority_did: "did:plc:owner".into(),
@@ -292,7 +292,7 @@ mod tests {
         let space_table: mlua::Table = globals.get("space").unwrap();
         assert_eq!(
             space_table.get::<String>("space").unwrap(),
-            "ats://did:plc:owner/com.example.forum/main"
+            "at://did:plc:owner/space/com.example.forum/main"
         );
         assert_eq!(space_table.get::<String>("space_id").unwrap(), "space-123");
         assert_eq!(space_table.get::<String>("did").unwrap(), "did:plc:owner");

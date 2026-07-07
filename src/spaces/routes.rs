@@ -24,7 +24,14 @@ use crate::spaces::{SpaceUri, db, members, notifications, oplog};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RepoStateQuery {
+struct LatestCommitQuery {
+    space: String,
+    did: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetRepoQuery {
     space: String,
     did: String,
 }
@@ -36,6 +43,7 @@ struct ListRepoOpsQuery {
     did: String,
     limit: Option<i64>,
     cursor: Option<String>,
+    exclude_values: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -218,9 +226,14 @@ pub fn space_routes() -> Router<AppState> {
             get(list_records),
         )
         .route(
-            &format!("/xrpc/{PROTO_NS}.space.getRepoState"),
-            get(get_repo_state),
+            &format!("/xrpc/{PROTO_NS}.space.getLatestCommit"),
+            get(get_latest_commit),
         )
+        .route(
+            &format!("/xrpc/{PROTO_NS}.space.getRepoState"),
+            get(get_latest_commit),
+        )
+        .route(&format!("/xrpc/{PROTO_NS}.space.getRepo"), get(get_repo))
         .route(
             &format!("/xrpc/{PROTO_NS}.space.listRepoOps"),
             get(list_repo_ops),
@@ -409,7 +422,10 @@ async fn require_membership(
     space_credential: Option<&str>,
 ) -> Result<SpaceAccess, AppError> {
     if let Some(token) = space_credential {
-        let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
+        let space_uri = format!(
+            "at://{}/space/{}/{}",
+            space.did, space.type_nsid, space.skey
+        );
         match crate::spaces::credential::verify_external_credential(
             token,
             &state.http,
@@ -490,7 +506,10 @@ async fn get_space(
         }
     }
 
-    let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
     let simplespace_config = serde_json::json!({
         "$type": "com.atproto.simplespace.defs#spaceConfig",
         "mintPolicy": space.mint_policy,
@@ -561,7 +580,7 @@ async fn create_record(
     let rkey = generate_tid();
     let cid = content_cid(&input.record);
     let record_uri = format!(
-        "ats://{}/{}/{}/{}/{}/{}",
+        "at://{}/space/{}/{}/{}/{}/{}",
         space.did, space.type_nsid, space.skey, did, input.collection, rkey
     );
 
@@ -609,7 +628,7 @@ async fn put_record(
 
     let cid = content_cid(&input.record);
     let record_uri = format!(
-        "ats://{}/{}/{}/{}/{}/{}",
+        "at://{}/space/{}/{}/{}/{}/{}",
         space.did, space.type_nsid, space.skey, did, input.collection, input.rkey
     );
 
@@ -653,7 +672,7 @@ async fn delete_record(
     let space = resolve_space(&state, &input.space).await?;
 
     let record_uri = format!(
-        "ats://{}/{}/{}/{}/{}/{}",
+        "at://{}/space/{}/{}/{}/{}/{}",
         space.did, space.type_nsid, space.skey, did, input.collection, input.rkey
     );
 
@@ -722,7 +741,7 @@ async fn apply_writes(
                 let rkey = rkey.unwrap_or_else(generate_tid);
                 let cid = content_cid(&value);
                 let record_uri = format!(
-                    "ats://{}/{}/{}/{}/{}/{}",
+                    "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
                 );
                 let record = SpaceRecord {
@@ -749,7 +768,7 @@ async fn apply_writes(
             } => {
                 let cid = content_cid(&value);
                 let record_uri = format!(
-                    "ats://{}/{}/{}/{}/{}/{}",
+                    "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
                 );
                 let record = SpaceRecord {
@@ -784,7 +803,7 @@ async fn apply_writes(
                 swap_record,
             } => {
                 let record_uri = format!(
-                    "ats://{}/{}/{}/{}/{}/{}",
+                    "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
                 );
                 if let Some(swap_cid) = swap_record {
@@ -1007,7 +1026,7 @@ async fn accept_invite(
     db::increment_invite_uses(&state.db, state.db_backend, &invite.id).await?;
 
     let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
-    let space_uri = space.map(|s| format!("ats://{}/{}/{}", s.did, s.type_nsid, s.skey));
+    let space_uri = space.map(|s| format!("at://{}/space/{}/{}", s.did, s.type_nsid, s.skey));
 
     let mut response = Json(serde_json::json!({
         "uri": space_uri,
@@ -1095,7 +1114,10 @@ async fn get_delegation_token(
         .as_secs();
     let exp = now + crate::spaces::credential::DELEGATION_TOKEN_TTL_SECS;
 
-    let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
     let space_host = format!("{}#atproto_space_host", space.did);
     let delegation_claims = crate::spaces::credential::DelegationTokenClaims {
         iss: did,
@@ -1122,10 +1144,10 @@ async fn get_delegation_token(
 // Protocol endpoint implementations
 // ---------------------------------------------------------------------------
 
-async fn get_repo_state(
+async fn get_latest_commit(
     State(state): State<AppState>,
     claims: XrpcClaims,
-    Query(params): Query<RepoStateQuery>,
+    Query(params): Query<LatestCommitQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = resolve_space(&state, &params.space).await?;
@@ -1149,6 +1171,7 @@ async fn get_repo_state(
         "rev": repo_state.rev,
         "commit": repo_state.hash.as_ref().map(|h| {
             serde_json::json!({
+                "ver": 1,
                 "hash": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h),
                 "ikm": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(repo_state.ikm.as_deref().unwrap_or_default()),
                 "sig": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(repo_state.sig.as_deref().unwrap_or_default()),
@@ -1157,6 +1180,62 @@ async fn get_repo_state(
             })
         }),
     })))
+}
+
+async fn get_repo(
+    State(state): State<AppState>,
+    claims: XrpcClaims,
+    Query(params): Query<GetRepoQuery>,
+) -> Result<Response, AppError> {
+    let did = require_auth_or_credential(&state, &claims).await?;
+    let space = resolve_space(&state, &params.space).await?;
+    let has_credential = claims.space_credential.is_some();
+    let membership = require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
+
+    let read_access = SpaceReadAccess::from_space_access(membership);
+    check_read_access(&did, &params.did, read_access, has_credential)?;
+
+    let repo_state =
+        db::get_or_create_repo_state(&state.db, state.db_backend, &space.id, &params.did).await?;
+    let records =
+        db::list_all_space_records(&state.db, state.db_backend, &space.id, &params.did).await?;
+
+    let commit = crate::spaces::commit::SignedCommit {
+        ver: 1,
+        hash: repo_state
+            .hash
+            .as_deref()
+            .and_then(|h| <[u8; 32]>::try_from(h).ok())
+            .unwrap_or([0u8; 32]),
+        ikm: repo_state
+            .ikm
+            .as_deref()
+            .and_then(|i| <[u8; 32]>::try_from(i).ok())
+            .unwrap_or([0u8; 32]),
+        sig: repo_state.sig.unwrap_or_default(),
+        mac: repo_state
+            .mac
+            .as_deref()
+            .and_then(|m| <[u8; 32]>::try_from(m).ok())
+            .unwrap_or([0u8; 32]),
+        rev: repo_state.rev.unwrap_or_default(),
+    };
+
+    let car_bytes = crate::spaces::car::serialize_repo(&commit, &records)?;
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")],
+        car_bytes,
+    )
+        .into_response())
 }
 
 async fn list_repo_ops(
@@ -1180,15 +1259,29 @@ async fn list_repo_ops(
     check_read_access(&did, &params.did, read_access, has_credential)?;
 
     let limit = params.limit.unwrap_or(100).min(1000);
-    let ops = oplog::list_ops(
-        &state.db,
-        state.db_backend,
-        &space.id,
-        &params.did,
-        params.cursor.as_deref(),
-        limit,
-    )
-    .await?;
+    let exclude_values = params.exclude_values.unwrap_or(false);
+
+    let ops = if exclude_values {
+        oplog::list_ops(
+            &state.db,
+            state.db_backend,
+            &space.id,
+            &params.did,
+            params.cursor.as_deref(),
+            limit,
+        )
+        .await?
+    } else {
+        oplog::list_ops_with_values(
+            &state.db,
+            state.db_backend,
+            &space.id,
+            &params.did,
+            params.cursor.as_deref(),
+            limit,
+        )
+        .await?
+    };
 
     Ok(Json(serde_json::json!({ "ops": ops })))
 }
@@ -1416,12 +1509,12 @@ mod tests {
     #[test]
     fn deserialize_create_record_input() {
         let input: CreateRecordInput = serde_json::from_value(json!({
-            "space": "ats://did:plc:abc/com.example.forum/main",
+            "space": "at://did:plc:abc/space/com.example.forum/main",
             "collection": "com.example.forum.post",
             "record": { "text": "hello" }
         }))
         .unwrap();
-        assert_eq!(input.space, "ats://did:plc:abc/com.example.forum/main");
+        assert_eq!(input.space, "at://did:plc:abc/space/com.example.forum/main");
         assert_eq!(input.collection, "com.example.forum.post");
         assert_eq!(input.record["text"], "hello");
     }
@@ -1429,7 +1522,7 @@ mod tests {
     #[test]
     fn deserialize_put_record_with_swap() {
         let input: PutRecordInput = serde_json::from_value(json!({
-            "space": "ats://did:plc:abc/com.example.forum/main",
+            "space": "at://did:plc:abc/space/com.example.forum/main",
             "collection": "com.example.forum.post",
             "rkey": "3k2abc",
             "record": { "text": "updated" },
@@ -1442,7 +1535,7 @@ mod tests {
     #[test]
     fn deserialize_put_record_without_swap() {
         let input: PutRecordInput = serde_json::from_value(json!({
-            "space": "ats://did:plc:abc/com.example.forum/main",
+            "space": "at://did:plc:abc/space/com.example.forum/main",
             "collection": "com.example.forum.post",
             "rkey": "3k2abc",
             "record": { "text": "hello" }
@@ -1454,7 +1547,7 @@ mod tests {
     #[test]
     fn deserialize_delete_record_with_swap() {
         let input: DeleteRecordInput = serde_json::from_value(json!({
-            "space": "ats://did:plc:abc/com.example.forum/main",
+            "space": "at://did:plc:abc/space/com.example.forum/main",
             "collection": "com.example.forum.post",
             "rkey": "3k2abc",
             "swapRecord": "bafyrei456"
@@ -1552,7 +1645,7 @@ mod tests {
     #[test]
     fn deserialize_apply_writes_input() {
         let input: ApplyWritesInput = serde_json::from_value(json!({
-            "space": "ats://did:plc:abc/com.example.forum/main",
+            "space": "at://did:plc:abc/space/com.example.forum/main",
             "swapCommit": "tid123",
             "writes": [
                 {
@@ -1568,7 +1661,7 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert_eq!(input.space, "ats://did:plc:abc/com.example.forum/main");
+        assert_eq!(input.space, "at://did:plc:abc/space/com.example.forum/main");
         assert_eq!(input.swap_commit.as_deref(), Some("tid123"));
         assert_eq!(input.writes.len(), 2);
     }
@@ -1576,7 +1669,7 @@ mod tests {
     #[test]
     fn deserialize_apply_writes_without_swap_commit() {
         let input: ApplyWritesInput = serde_json::from_value(json!({
-            "space": "ats://did:plc:abc/com.example.forum/main",
+            "space": "at://did:plc:abc/space/com.example.forum/main",
             "writes": [
                 {
                     "action": "create",

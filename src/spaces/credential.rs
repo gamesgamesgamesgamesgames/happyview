@@ -50,7 +50,7 @@ pub fn peek_credential_sub(token: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationTokenClaims {
     pub iss: String, // User DID
-    pub sub: String, // Space URI (ats://...)
+    pub sub: String, // Space URI (at://...)
     pub aud: String, // Space host (did#atproto_space_host)
     pub iat: u64,
     pub exp: u64,
@@ -156,7 +156,7 @@ pub fn verify_delegation_token(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpaceCredentialClaims {
     pub iss: String, // Space authority DID
-    pub sub: String, // Space URI (ats://...)
+    pub sub: String, // Space URI (at://...)
     pub iat: u64,
     pub exp: u64,
     pub jti: String, // Random nonce
@@ -362,7 +362,7 @@ mod tests {
             .as_secs();
         SpaceCredentialClaims {
             iss: "did:plc:spaceowner".into(),
-            sub: "ats://did:plc:spaceowner/com.example.forum/main".into(),
+            sub: "at://did:plc:spaceowner/space/com.example.forum/main".into(),
             iat: now,
             exp: now + DEFAULT_CREDENTIAL_TTL_SECS,
             jti: make_jti(),
@@ -420,7 +420,7 @@ mod tests {
             .as_secs();
         let claims = SpaceCredentialClaims {
             iss: "did:plc:owner".into(),
-            sub: "ats://did:plc:owner/com.example.test/main".into(),
+            sub: "at://did:plc:owner/space/com.example.test/main".into(),
             iat: now - 7200,
             exp: now - 3600,
             jti: make_jti(),
@@ -451,7 +451,7 @@ mod tests {
             .as_secs();
         DelegationTokenClaims {
             iss: "did:plc:member".into(),
-            sub: "ats://did:plc:space/com.example.forum/main".into(),
+            sub: "at://did:plc:space/space/com.example.forum/main".into(),
             aud: "did:plc:space#atproto_space_host".into(),
             iat: now,
             exp: now + DELEGATION_TOKEN_TTL_SECS,
@@ -509,7 +509,7 @@ mod tests {
             .as_secs();
         let claims = DelegationTokenClaims {
             iss: "did:plc:member".into(),
-            sub: "ats://did:plc:space/com.example.forum/main".into(),
+            sub: "at://did:plc:space/space/com.example.forum/main".into(),
             aud: "did:plc:space#atproto_space_host".into(),
             iat: now - 120,
             exp: now - 60,
@@ -575,7 +575,7 @@ mod tests {
         let token = sign_credential(&claims, &keypair.private_jwk).unwrap();
         assert_eq!(
             peek_credential_sub(&token).as_deref(),
-            Some("ats://did:plc:spaceowner/com.example.forum/main")
+            Some("at://did:plc:spaceowner/space/com.example.forum/main")
         );
     }
 

@@ -122,12 +122,12 @@ pub async fn list_spaces_for_user(
 
     let sql = if decoded_cursor.is_some() {
         adapt_sql(
-            "SELECT s.did, s.authority_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? AND (sm.created_at > ? OR (sm.created_at = ? AND ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            "SELECT s.did, s.authority_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? AND (sm.created_at > ? OR (sm.created_at = ? AND ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
             backend,
         )
     } else {
         adapt_sql(
-            "SELECT s.did, s.authority_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? ORDER BY sm.created_at ASC, ('ats://' || s.did || '/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            "SELECT s.did, s.authority_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
             backend,
         )
     };
@@ -147,7 +147,7 @@ pub async fn list_spaces_for_user(
         .into_iter()
         .map(
             |(space_did, authority_did, type_nsid, skey, created_at)| SpaceView {
-                uri: format!("ats://{}/{}/{}", space_did, type_nsid, skey),
+                uri: format!("at://{}/space/{}/{}", space_did, type_nsid, skey),
                 is_owner: authority_did == did,
                 created_at,
             },
@@ -527,6 +527,27 @@ pub async fn list_space_records(
     };
 
     Ok((records, next_cursor))
+}
+
+pub async fn list_all_space_records(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    author_did: &str,
+) -> Result<Vec<SpaceRecord>, AppError> {
+    let sql = adapt_sql(
+        "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE space_id = ? AND author_did = ? ORDER BY collection, rkey",
+        backend,
+    );
+
+    let rows: Vec<RecordRow> = sqlx::query_as(&sql)
+        .bind(space_id)
+        .bind(author_did)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list all space records: {e}")))?;
+
+    rows.into_iter().map(parse_record_row).collect()
 }
 
 pub async fn insert_space_record(

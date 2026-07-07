@@ -307,6 +307,7 @@ async fn oplog_append_and_list() {
             } else {
                 None
             },
+            value: None,
             created_at: now_rfc3339(),
         };
         oplog::append_op(&pool, backend, &entry)
@@ -356,6 +357,7 @@ async fn oplog_list_with_since_rev_cursor() {
             rkey: format!("item-{i}"),
             cid: Some(format!("bafy{i}")),
             prev: None,
+            value: None,
             created_at: now_rfc3339(),
         };
         oplog::append_op(&pool, backend, &entry)

@@ -42,7 +42,10 @@ pub async fn issue_credential(
 
     let claims = SpaceCredentialClaims {
         iss: space.authority_did.clone(),
-        sub: format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey),
+        sub: format!(
+            "at://{}/space/{}/{}",
+            space.did, space.type_nsid, space.skey
+        ),
         iat: now,
         exp,
         jti: make_jti(),
@@ -80,7 +83,10 @@ async fn check_mint_policy(
                     "space mint_policy is managing-app but managing_app_did is not set".into(),
                 )
             })?;
-            let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
+            let space_uri = format!(
+                "at://{}/space/{}/{}",
+                space.did, space.type_nsid, space.skey
+            );
             let granted = check_user_access_with_managing_app(
                 http,
                 managing_app,

@@ -288,7 +288,10 @@ async fn create_space(
     };
     db::add_member(&state.db, state.db_backend, &member).await?;
 
-    let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
     let body = serde_json::json!({
         "uri": space_uri,
     });
@@ -342,7 +345,10 @@ async fn update_space(
 
     db::update_space(&state.db, state.db_backend, &space).await?;
 
-    let space_uri = format!("ats://{}/{}/{}", space.did, space.type_nsid, space.skey);
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
     Ok(Json(serde_json::json!({
         "uri": space_uri,
         "space": space,

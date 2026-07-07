@@ -87,13 +87,13 @@ fn resolve_members_recursive<'a>(
 
 /// Resolve a delegation member entry to the target space ID.
 ///
-/// Delegation entries store either an ats:// URI or a space ID directly.
+/// Delegation entries store either an at:// URI or a space ID directly.
 async fn resolve_delegation_target(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     member: &SpaceMember,
 ) -> Result<Option<String>, AppError> {
-    if member.did.starts_with("ats://") {
+    if member.did.starts_with("at://") {
         let uri = SpaceUri::parse(&member.did)?;
         let space =
             db::get_space_by_address(pool, backend, &uri.did, &uri.type_nsid, &uri.skey).await?;

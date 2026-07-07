@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod car;
 pub mod client_attestation;
 pub mod commit;
 pub mod credential;
@@ -18,10 +19,10 @@ mod integration_tests;
 use crate::error::AppError;
 use std::fmt;
 
-/// A parsed `ats://` URI for addressing permissioned data.
+/// A parsed `at://` URI for addressing permissioned data.
 ///
-/// Full form: `ats://<space-did>/<space-type-nsid>/<skey>/<user-did>/<collection-nsid>/<rkey>`
-/// Space-only form: `ats://<space-did>/<space-type-nsid>/<skey>`
+/// Full form: `at://<space-did>/space/<space-type-nsid>/<skey>/<user-did>/<collection-nsid>/<rkey>`
+/// Space-only form: `at://<space-did>/space/<space-type-nsid>/<skey>`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SpaceUri {
     pub did: String,
@@ -34,39 +35,61 @@ pub struct SpaceUri {
 
 impl SpaceUri {
     pub fn parse(uri: &str) -> Result<Self, AppError> {
-        let stripped = uri
-            .strip_prefix("ats://")
-            .ok_or_else(|| AppError::BadRequest("SpaceUri must start with ats://".into()))?;
+        // Rewrite legacy ats:// URIs (ats://did/type/skey) to at://did/space/type/skey
+        let normalized;
+        let stripped = if let Some(ats_rest) = uri.strip_prefix("ats://") {
+            let ats_parts: Vec<&str> = ats_rest.split('/').collect();
+            if ats_parts.len() >= 3 {
+                normalized = format!("at://{}/space/{}", ats_parts[0], ats_parts[1..].join("/"));
+                normalized
+                    .strip_prefix("at://")
+                    .expect("just constructed with at:// prefix")
+            } else {
+                return Err(AppError::BadRequest(
+                    "ats:// URI requires at least did/type/skey".into(),
+                ));
+            }
+        } else {
+            uri.strip_prefix("at://")
+                .ok_or_else(|| AppError::BadRequest("SpaceUri must start with at://".into()))?
+        };
 
         let parts: Vec<&str> = stripped.split('/').collect();
 
-        if parts.len() < 3 {
+        // Must have at least: did/space/type_nsid/skey (4 segments)
+        if parts.len() < 4 {
             return Err(AppError::BadRequest(
-                "SpaceUri requires at least did/type_nsid/skey".into(),
+                "SpaceUri requires at least did/space/type_nsid/skey".into(),
             ));
         }
 
-        if parts[0].is_empty() || parts[1].is_empty() || parts[2].is_empty() {
+        if parts[1] != "space" {
+            return Err(AppError::BadRequest(
+                "SpaceUri must have 'space' as the second path segment".into(),
+            ));
+        }
+
+        if parts[0].is_empty() || parts[2].is_empty() || parts[3].is_empty() {
             return Err(AppError::BadRequest(
                 "SpaceUri components must not be empty".into(),
             ));
         }
 
         let did = parts[0].to_string();
-        let type_nsid = parts[1].to_string();
-        let skey = parts[2].to_string();
+        let type_nsid = parts[2].to_string();
+        let skey = parts[3].to_string();
 
-        let (user_did, collection, rkey) = if parts.len() >= 6 {
+        let (user_did, collection, rkey) = if parts.len() >= 7 {
             (
-                Some(parts[3].to_string()),
                 Some(parts[4].to_string()),
                 Some(parts[5].to_string()),
+                Some(parts[6].to_string()),
             )
-        } else if parts.len() == 3 {
+        } else if parts.len() == 4 {
             (None, None, None)
         } else {
             return Err(AppError::BadRequest(
-                "SpaceUri must have 3 components (space) or 6 components (record)".into(),
+                "SpaceUri must have 4 components (space) or 7 components (record)".into(),
             ));
         };
 
@@ -81,7 +104,7 @@ impl SpaceUri {
     }
 
     pub fn space_uri(&self) -> String {
-        format!("ats://{}/{}/{}", self.did, self.type_nsid, self.skey)
+        format!("at://{}/space/{}/{}", self.did, self.type_nsid, self.skey)
     }
 
     pub fn is_record_uri(&self) -> bool {
@@ -95,7 +118,11 @@ impl SpaceUri {
 
 impl fmt::Display for SpaceUri {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ats://{}/{}/{}", self.did, self.type_nsid, self.skey)?;
+        write!(
+            f,
+            "at://{}/space/{}/{}",
+            self.did, self.type_nsid, self.skey
+        )?;
         if let (Some(user), Some(col), Some(rkey)) = (&self.user_did, &self.collection, &self.rkey)
         {
             write!(f, "/{}/{}/{}", user, col, rkey)?;
@@ -110,7 +137,7 @@ mod tests {
 
     #[test]
     fn parse_space_uri() {
-        let uri = SpaceUri::parse("ats://did:plc:abc123/com.example.forum/main").unwrap();
+        let uri = SpaceUri::parse("at://did:plc:abc123/space/com.example.forum/main").unwrap();
         assert_eq!(uri.did, "did:plc:abc123");
         assert_eq!(uri.type_nsid, "com.example.forum");
         assert_eq!(uri.skey, "main");
@@ -122,7 +149,7 @@ mod tests {
     #[test]
     fn parse_record_uri() {
         let uri = SpaceUri::parse(
-            "ats://did:plc:abc123/com.example.forum/main/did:plc:user1/com.example.forum.post/3k2abc",
+            "at://did:plc:abc123/space/com.example.forum/main/did:plc:user1/com.example.forum.post/3k2abc",
         )
         .unwrap();
         assert_eq!(uri.did, "did:plc:abc123");
@@ -147,7 +174,7 @@ mod tests {
         };
         assert_eq!(
             uri.to_string(),
-            "ats://did:plc:abc123/com.example.forum/main"
+            "at://did:plc:abc123/space/com.example.forum/main"
         );
     }
 
@@ -163,53 +190,86 @@ mod tests {
         };
         assert_eq!(
             uri.to_string(),
-            "ats://did:plc:abc123/com.example.forum/main/did:plc:user1/com.example.forum.post/3k2abc"
+            "at://did:plc:abc123/space/com.example.forum/main/did:plc:user1/com.example.forum.post/3k2abc"
         );
     }
 
     #[test]
     fn space_uri_extracts_space_part() {
         let uri = SpaceUri::parse(
-            "ats://did:plc:abc123/com.example.forum/main/did:plc:user1/com.example.forum.post/3k2abc",
+            "at://did:plc:abc123/space/com.example.forum/main/did:plc:user1/com.example.forum.post/3k2abc",
         )
         .unwrap();
         assert_eq!(
             uri.space_uri(),
-            "ats://did:plc:abc123/com.example.forum/main"
+            "at://did:plc:abc123/space/com.example.forum/main"
         );
     }
 
     #[test]
-    fn reject_at_scheme() {
+    fn rewrite_ats_space_uri() {
+        let uri = SpaceUri::parse("ats://did:plc:abc123/com.example.forum/main").unwrap();
+        assert_eq!(uri.did, "did:plc:abc123");
+        assert_eq!(uri.type_nsid, "com.example.forum");
+        assert_eq!(uri.skey, "main");
+        assert!(uri.is_space_uri());
+        assert_eq!(
+            uri.to_string(),
+            "at://did:plc:abc123/space/com.example.forum/main"
+        );
+    }
+
+    #[test]
+    fn rewrite_ats_record_uri() {
+        let uri = SpaceUri::parse(
+            "ats://did:plc:abc123/com.example.forum/main/did:plc:user1/com.example.forum.post/3k2abc",
+        )
+        .unwrap();
+        assert_eq!(uri.did, "did:plc:abc123");
+        assert_eq!(uri.type_nsid, "com.example.forum");
+        assert_eq!(uri.skey, "main");
+        assert_eq!(uri.user_did.as_deref(), Some("did:plc:user1"));
+        assert!(uri.is_record_uri());
+    }
+
+    #[test]
+    fn reject_ats_too_few_segments() {
+        let result = SpaceUri::parse("ats://did:plc:abc123/com.example.forum");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reject_missing_space_segment() {
         let result = SpaceUri::parse("at://did:plc:abc123/com.example.forum/main");
         assert!(result.is_err());
     }
 
     #[test]
     fn reject_too_few_components() {
-        let result = SpaceUri::parse("ats://did:plc:abc123/com.example.forum");
+        let result = SpaceUri::parse("at://did:plc:abc123/space/com.example.forum");
         assert!(result.is_err());
     }
 
     #[test]
     fn reject_wrong_component_count() {
-        let result = SpaceUri::parse("ats://did:plc:abc123/com.example.forum/main/did:plc:user1");
+        let result =
+            SpaceUri::parse("at://did:plc:abc123/space/com.example.forum/main/did:plc:user1");
         assert!(result.is_err());
     }
 
     #[test]
     fn reject_empty_components() {
-        let result = SpaceUri::parse("ats:///com.example.forum/main");
+        let result = SpaceUri::parse("at:///space/com.example.forum/main");
         assert!(result.is_err());
     }
 
     #[test]
     fn roundtrip_parse_display() {
-        let original = "ats://did:plc:abc123/com.example.forum/main";
+        let original = "at://did:plc:abc123/space/com.example.forum/main";
         let uri = SpaceUri::parse(original).unwrap();
         assert_eq!(uri.to_string(), original);
 
-        let original_record = "ats://did:plc:abc123/com.example.forum/main/did:plc:user1/com.example.forum.post/3k2abc";
+        let original_record = "at://did:plc:abc123/space/com.example.forum/main/did:plc:user1/com.example.forum.post/3k2abc";
         let uri = SpaceUri::parse(original_record).unwrap();
         assert_eq!(uri.to_string(), original_record);
     }
