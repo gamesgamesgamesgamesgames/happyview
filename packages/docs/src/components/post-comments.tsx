@@ -43,6 +43,7 @@ type LoadState = 'loading' | 'loaded' | 'error' | 'no-ref';
 const PLATFORMS = [
   { key: 'bluesky', name: 'Bluesky', domain: 'bsky.app' },
   { key: 'blacksky', name: 'Blacksky', domain: 'blacksky.app' },
+  { key: 'witchsky', name: 'Witchsky', domain: 'witchsky.app' },
   { key: 'mu', name: 'mu.social', domain: 'mu.social' },
 ] as const;
 
@@ -289,6 +290,7 @@ function PlatformButtonGroup({ postUri }: { postUri: string }) {
 const PLATFORM_FAVICONS: Record<PlatformKey, string> = {
   bluesky: 'https://bsky.app/static/favicon-32x32.png',
   blacksky: 'https://blacksky.app/favicon.ico',
+  witchsky: 'https://witchsky.app/favicon.ico',
   mu: 'https://mu.social/favicon.ico',
 };
 
