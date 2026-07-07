@@ -325,7 +325,7 @@ sequenceDiagram
 
 | Column         | Type        | Description                                      |
 | -------------- | ----------- | ------------------------------------------------ |
-| `uri`          | text (PK)   | `ats://` URI of the record                       |
+| `uri`          | text (PK)   | `at://` URI of the record                        |
 | `space_id`     | text (FK)   | References `spaces.id`                           |
 | `author_did`   | text        | DID of the record author                         |
 | `collection`   | text        | Lexicon NSID                                     |

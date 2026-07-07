@@ -42,7 +42,7 @@ Note: this endpoint is a GET request (not POST). The previous `getMemberGrant` e
 
 ```ts tab="TypeScript" tab-group="language"
 const params = new URLSearchParams({
-  space: "ats://did:plc:abc123/com.example.forum/main",
+  space: "at://did:plc:abc123/space/com.example.forum/main",
 });
 const response = await fetch(`https://happyview.example.com/xrpc/com.atproto.space.getDelegationToken?${params}`, {
   headers: {
@@ -59,7 +59,7 @@ const data: DelegationTokenResponse = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
 const params = new URLSearchParams({
-  space: "ats://did:plc:abc123/com.example.forum/main",
+  space: "at://did:plc:abc123/space/com.example.forum/main",
 });
 const response = await fetch(`https://happyview.example.com/xrpc/com.atproto.space.getDelegationToken?${params}`, {
   headers: {
@@ -73,7 +73,7 @@ const data = await response.json();
 ```rust tab="Rust" tab-group="language"
 let response = client
     .get("https://happyview.example.com/xrpc/com.atproto.space.getDelegationToken")
-    .query(&[("space", "ats://did:plc:abc123/com.example.forum/main")])
+    .query(&[("space", "at://did:plc:abc123/space/com.example.forum/main")])
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -83,7 +83,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 req, _ := http.NewRequest("GET",
-  "https://happyview.example.com/xrpc/com.atproto.space.getDelegationToken?space=ats%3A%2F%2Fdid%3Aplc%3Aabc123%2Fcom.example.forum%2Fmain",
+  "https://happyview.example.com/xrpc/com.atproto.space.getDelegationToken?space=at%3A%2F%2Fdid%3Aplc%3Aabc123%2Fspace%2Fcom.example.forum%2Fmain",
   nil)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
@@ -91,7 +91,7 @@ req.Header.Set("DPoP", dpopProof)
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl 'https://happyview.example.com/xrpc/com.atproto.space.getDelegationToken?space=ats%3A%2F%2Fdid%3Aplc%3Aabc123%2Fcom.example.forum%2Fmain' \
+curl 'https://happyview.example.com/xrpc/com.atproto.space.getDelegationToken?space=at%3A%2F%2Fdid%3Aplc%3Aabc123%2Fspace%2Fcom.example.forum%2Fmain' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>'
@@ -194,7 +194,7 @@ The JWT payload contains:
 | Claim | Description |
 |---|---|
 | `iss` | The space authority's DID (who signed it) |
-| `sub` | The full `ats://` space URI |
+| `sub` | The full `at://` space URI |
 | `iat` | Issued at (Unix timestamp) |
 | `exp` | Expiry (Unix timestamp) |
 | `jti` | Random nonce for replay protection |

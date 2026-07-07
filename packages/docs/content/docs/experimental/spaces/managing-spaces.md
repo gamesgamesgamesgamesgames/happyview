@@ -114,7 +114,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.createS
 
 ```json
 {
-  "uri": "ats://did:plc:abc123/com.example.forum/main"
+  "uri": "at://did:plc:abc123/space/com.example.forum/main"
 }
 ```
 
@@ -135,7 +135,7 @@ Additional fields are preserved as-is.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=at://did:plc:abc123/space/com.example.forum/main",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -153,7 +153,7 @@ const data: GetSpaceResponse = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=at://did:plc:abc123/space/com.example.forum/main",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -167,7 +167,7 @@ const data = await response.json();
 ```rust tab="Rust" tab-group="language"
 let response = client
     .get("https://happyview.example.com/xrpc/com.atproto.space.getSpace")
-    .query(&[("space", "ats://did:plc:abc123/com.example.forum/main")])
+    .query(&[("space", "at://did:plc:abc123/space/com.example.forum/main")])
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -177,7 +177,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 req, _ := http.NewRequest("GET",
-  "https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=at://did:plc:abc123/space/com.example.forum/main",
   nil)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
@@ -185,7 +185,7 @@ req.Header.Set("DPoP", dpopProof)
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl 'https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=ats://did:plc:abc123/com.example.forum/main' \
+curl 'https://happyview.example.com/xrpc/com.atproto.space.getSpace?space=at://did:plc:abc123/space/com.example.forum/main' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>'
@@ -272,7 +272,7 @@ curl 'https://happyview.example.com/xrpc/com.atproto.space.listSpaces?limit=20' 
 {
   "spaces": [
     {
-      "uri": "ats://did:plc:abc123/com.example.forum/main",
+      "uri": "at://did:plc:abc123/space/com.example.forum/main",
       "isOwner": true
     }
   ],
@@ -294,7 +294,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.sim
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
     displayName: "Updated Forum Name",
     mintPolicy: "public",
   }),
@@ -310,7 +310,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.sim
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
     displayName: "Updated Forum Name",
     mintPolicy: "public",
   }),
@@ -323,7 +323,7 @@ let response = client
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
     .json(&serde_json::json!({
-        "space": "ats://did:plc:abc123/com.example.forum/main",
+        "space": "at://did:plc:abc123/space/com.example.forum/main",
         "displayName": "Updated Forum Name",
         "mintPolicy": "public"
     }))
@@ -332,7 +332,7 @@ let response = client
 ```
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
-  "space": "ats://did:plc:abc123/com.example.forum/main",
+  "space": "at://did:plc:abc123/space/com.example.forum/main",
   "displayName": "Updated Forum Name",
   "mintPolicy": "public"
 }`)
@@ -351,7 +351,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.updateS
   -H 'DPoP: <proof>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "space": "ats://did:plc:abc123/com.example.forum/main",
+    "space": "at://did:plc:abc123/space/com.example.forum/main",
     "displayName": "Updated Forum Name",
     "mintPolicy": "public"
   }'
@@ -373,7 +373,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.sim
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
   }),
 });
 ```
@@ -387,7 +387,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.sim
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
   }),
 });
 ```
@@ -398,13 +398,13 @@ let response = client
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
     .json(&serde_json::json!({
-        "space": "ats://did:plc:abc123/com.example.forum/main"
+        "space": "at://did:plc:abc123/space/com.example.forum/main"
     }))
     .send()
     .await?;
 ```
 ```go tab="Go" tab-group="language"
-body := bytes.NewBufferString(`{"space": "ats://did:plc:abc123/com.example.forum/main"}`)
+body := bytes.NewBufferString(`{"space": "at://did:plc:abc123/space/com.example.forum/main"}`)
 req, _ := http.NewRequest("POST",
   "https://happyview.example.com/xrpc/com.atproto.simplespace.deleteSpace", body)
 req.Header.Set("X-Client-Key", clientKey)
@@ -419,7 +419,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.deleteS
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>' \
   -H 'Content-Type: application/json' \
-  -d '{"space": "ats://did:plc:abc123/com.example.forum/main"}'
+  -d '{"space": "at://did:plc:abc123/space/com.example.forum/main"}'
 ```
 
 <Callout type="warn">
@@ -432,7 +432,7 @@ Returns the simplespace configuration for a space. Requires admin access (space 
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/com.atproto.simplespace.getConfig?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.getConfig?space=at://did:plc:abc123/space/com.example.forum/main",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -451,7 +451,7 @@ const data: SpaceConfig = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/com.atproto.simplespace.getConfig?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.getConfig?space=at://did:plc:abc123/space/com.example.forum/main",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -465,7 +465,7 @@ const data = await response.json();
 ```rust tab="Rust" tab-group="language"
 let response = client
     .get("https://happyview.example.com/xrpc/com.atproto.simplespace.getConfig")
-    .query(&[("space", "ats://did:plc:abc123/com.example.forum/main")])
+    .query(&[("space", "at://did:plc:abc123/space/com.example.forum/main")])
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -475,7 +475,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 req, _ := http.NewRequest("GET",
-  "https://happyview.example.com/xrpc/com.atproto.simplespace.getConfig?space=ats://did:plc:abc123/com.example.forum/main",
+  "https://happyview.example.com/xrpc/com.atproto.simplespace.getConfig?space=at://did:plc:abc123/space/com.example.forum/main",
   nil)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
@@ -483,7 +483,7 @@ req.Header.Set("DPoP", dpopProof)
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl 'https://happyview.example.com/xrpc/com.atproto.simplespace.getConfig?space=ats://did:plc:abc123/com.example.forum/main' \
+curl 'https://happyview.example.com/xrpc/com.atproto.simplespace.getConfig?space=at://did:plc:abc123/space/com.example.forum/main' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>'
@@ -520,7 +520,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.sim
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
     mintPolicy: "public",
     appAccess: { type: "allowList", allowed: ["did:web:myapp.example.com"] },
   }),
@@ -536,7 +536,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.sim
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
     mintPolicy: "public",
     appAccess: { type: "allowList", allowed: ["did:web:myapp.example.com"] },
   }),
@@ -549,7 +549,7 @@ let response = client
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
     .json(&serde_json::json!({
-        "space": "ats://did:plc:abc123/com.example.forum/main",
+        "space": "at://did:plc:abc123/space/com.example.forum/main",
         "mintPolicy": "public",
         "appAccess": { "type": "allowList", "allowed": ["did:web:myapp.example.com"] }
     }))
@@ -559,7 +559,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
-  "space": "ats://did:plc:abc123/com.example.forum/main",
+  "space": "at://did:plc:abc123/space/com.example.forum/main",
   "mintPolicy": "public",
   "appAccess": {"type": "allowList", "allowed": ["did:web:myapp.example.com"]}
 }`)
@@ -578,7 +578,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.updateC
   -H 'DPoP: <proof>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "space": "ats://did:plc:abc123/com.example.forum/main",
+    "space": "at://did:plc:abc123/space/com.example.forum/main",
     "mintPolicy": "public",
     "appAccess": {"type": "allowList", "allowed": ["did:web:myapp.example.com"]}
   }'

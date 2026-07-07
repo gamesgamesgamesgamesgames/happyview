@@ -56,7 +56,7 @@ Key terms used throughout the HappyView documentation. For a broader introductio
 
 **Permission template** — A predefined set of permissions that can be applied when creating a user. Templates are: **Viewer** (read-only access), **Operator** (viewer + backfill and API key management), **Manager** (operator + lexicon, record, spaces, and plugin management), and **Full Access** (all 44 permissions).
 
-**Space** — A container for permissioned data in AT Protocol. Identified by a space DID, type NSID, and space key (skey), forming an `ats://` URI.
+**Space** — A container for permissioned data in AT Protocol. Identified by a space DID, type NSID, and space key (skey), forming an `at://` URI with a `space` path segment (e.g. `at://did:plc:abc/space/com.example.forum/main`).
 
 **Space Credential** — A short-lived JWT (`typ: atproto-space-credential+jwt`, ES256, 2-hour TTL) for cross-service read access to space data. Signed by the space's P-256 keypair. Obtained by exchanging a delegation token via `com.atproto.space.getSpaceCredential`.
 

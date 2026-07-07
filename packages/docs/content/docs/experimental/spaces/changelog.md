@@ -2,7 +2,32 @@
 title: "Changelog"
 ---
 
-## Latest — Proposal 0016 Alignment
+## v2.11 — Final Proposal 0016 Alignment
+
+Aligns with the merged [Proposal 0016](https://github.com/bluesky-social/proposals/blob/main/0016-permissioned-data/README.md) specification.
+
+### URI scheme change
+
+- **`ats://` → `at://` with `space` path segment** — space URIs now use the standard `at://` scheme with a literal `space` segment: `at://<did>/space/<type>/<skey>`. Record URIs follow: `at://<did>/space/<type>/<skey>/<author>/<collection>/<rkey>`.
+
+### Endpoint changes
+
+- **`getRepoState` → `getLatestCommit`** — renamed to match the proposal. The old name is kept as a backward-compatible alias.
+- **`getRepo`** (GET) — new endpoint that exports a user's repo as a CAR v1 file (two roots: signedCommit + DRISL index)
+- **`listRepoOps`** now inlines record values by default via LEFT JOIN against `space_records`. Pass `excludeValues=true` for metadata-only responses.
+
+### Commit changes
+
+- **`SignedCommit.ver`** — new version field (currently `1`) for future-proofing
+- **Commit context string** now includes the author's DID: `tag || space || author || rev || ikm` (was `tag || space || rev || ikm`)
+
+### Breaking changes
+
+- All space URIs now use `at://` with a `space` segment instead of `ats://`. Clients using the old scheme must update.
+
+---
+
+## v2.10.0 — Proposal 0016 Alignment
 
 Major restructuring to align with [AT Protocol Proposal 0016](https://github.com/bluesky-social/proposals) (Permissioned Data).
 
@@ -56,6 +81,14 @@ Major restructuring to align with [AT Protocol Proposal 0016](https://github.com
 
 - Feature flag disabled response changed from `501 Not Implemented` to `404` with `FeatureDisabled` error code
 - Deleting a space now cascades to all associated data (records, members, repo state, oplog, notifications, credentials)
+
+---
+
+## v2.8.0
+
+### Bug fixes
+
+- Spaces endpoints now use cursor-based pagination instead of offset-based
 
 ---
 

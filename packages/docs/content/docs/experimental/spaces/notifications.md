@@ -24,7 +24,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.spa
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
     serviceDid: "did:web:feed.example.com",
     endpoint: "https://feed.example.com/webhooks/space-writes",
   }),
@@ -44,7 +44,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.spa
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
     serviceDid: "did:web:feed.example.com",
     endpoint: "https://feed.example.com/webhooks/space-writes",
   }),
@@ -58,7 +58,7 @@ let response = client
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
     .json(&serde_json::json!({
-        "space": "ats://did:plc:abc123/com.example.forum/main",
+        "space": "at://did:plc:abc123/space/com.example.forum/main",
         "serviceDid": "did:web:feed.example.com",
         "endpoint": "https://feed.example.com/webhooks/space-writes"
     }))
@@ -68,7 +68,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
-  "space": "ats://did:plc:abc123/com.example.forum/main",
+  "space": "at://did:plc:abc123/space/com.example.forum/main",
   "serviceDid": "did:web:feed.example.com",
   "endpoint": "https://feed.example.com/webhooks/space-writes"
 }`)
@@ -87,7 +87,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.registerNotif
   -H 'DPoP: <proof>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "space": "ats://did:plc:abc123/com.example.forum/main",
+    "space": "at://did:plc:abc123/space/com.example.forum/main",
     "serviceDid": "did:web:feed.example.com",
     "endpoint": "https://feed.example.com/webhooks/space-writes"
   }'
@@ -97,7 +97,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.registerNotif
 
 | Field        | Type   | Required | Description                                      |
 | ------------ | ------ | -------- | ------------------------------------------------ |
-| `space`      | string | Yes      | Space URI (`ats://...`)                          |
+| `space`      | string | Yes      | Space URI (`at://...`)                           |
 | `serviceDid` | string | Yes      | DID of the service receiving notifications       |
 | `endpoint`   | string | Yes      | HTTPS endpoint to deliver notifications to       |
 
@@ -144,7 +144,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.spa
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
     did: "did:plc:author456",
     collection: "com.example.forum.post",
     rkey: "3jwq5dya2gy2z",
@@ -161,7 +161,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.spa
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
     did: "did:plc:author456",
     collection: "com.example.forum.post",
     rkey: "3jwq5dya2gy2z",
@@ -175,7 +175,7 @@ const data = await response.json();
 let response = client
     .post("https://happyview.example.com/xrpc/com.atproto.space.notifyWrite")
     .json(&serde_json::json!({
-        "space": "ats://did:plc:abc123/com.example.forum/main",
+        "space": "at://did:plc:abc123/space/com.example.forum/main",
         "did": "did:plc:author456",
         "collection": "com.example.forum.post",
         "rkey": "3jwq5dya2gy2z",
@@ -187,7 +187,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
-  "space": "ats://did:plc:abc123/com.example.forum/main",
+  "space": "at://did:plc:abc123/space/com.example.forum/main",
   "did": "did:plc:author456",
   "collection": "com.example.forum.post",
   "rkey": "3jwq5dya2gy2z",
@@ -202,7 +202,7 @@ resp, err := http.DefaultClient.Do(req)
 curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.notifyWrite' \
   -H 'Content-Type: application/json' \
   -d '{
-    "space": "ats://did:plc:abc123/com.example.forum/main",
+    "space": "at://did:plc:abc123/space/com.example.forum/main",
     "did": "did:plc:author456",
     "collection": "com.example.forum.post",
     "rkey": "3jwq5dya2gy2z",
@@ -214,7 +214,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.notifyWrite' 
 
 | Field        | Type          | Required | Description                                      |
 | ------------ | ------------- | -------- | ------------------------------------------------ |
-| `space`      | string        | Yes      | Space URI (`ats://...`)                          |
+| `space`      | string        | Yes      | Space URI (`at://...`)                           |
 | `did`        | string        | Yes      | DID of the author who made the change            |
 | `collection` | string (NSID) | Yes      | Collection the record belongs to                 |
 | `rkey`       | string        | Yes      | Record key                                       |
@@ -239,7 +239,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.spa
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
   }),
 });
 const data = await response.json();
@@ -252,7 +252,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.spa
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "ats://did:plc:abc123/com.example.forum/main",
+    space: "at://did:plc:abc123/space/com.example.forum/main",
   }),
 });
 const data = await response.json();
@@ -262,7 +262,7 @@ const data = await response.json();
 let response = client
     .post("https://happyview.example.com/xrpc/com.atproto.space.notifySpaceDeleted")
     .json(&serde_json::json!({
-        "space": "ats://did:plc:abc123/com.example.forum/main"
+        "space": "at://did:plc:abc123/space/com.example.forum/main"
     }))
     .send()
     .await?;
@@ -270,7 +270,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
-  "space": "ats://did:plc:abc123/com.example.forum/main"
+  "space": "at://did:plc:abc123/space/com.example.forum/main"
 }`)
 req, _ := http.NewRequest("POST",
   "https://happyview.example.com/xrpc/com.atproto.space.notifySpaceDeleted", body)
@@ -281,7 +281,7 @@ resp, err := http.DefaultClient.Do(req)
 curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.notifySpaceDeleted' \
   -H 'Content-Type: application/json' \
   -d '{
-    "space": "ats://did:plc:abc123/com.example.forum/main"
+    "space": "at://did:plc:abc123/space/com.example.forum/main"
   }'
 ```
 
@@ -289,7 +289,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.notifySpaceDe
 
 | Field   | Type   | Required | Description             |
 | ------- | ------ | -------- | ----------------------- |
-| `space` | string | Yes      | Space URI (`ats://...`) |
+| `space` | string | Yes      | Space URI (`at://...`)  |
 
 **Response (200):**
 

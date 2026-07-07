@@ -16,12 +16,12 @@ A **space** is identified by three components:
 - **Type** — the space type as an NSID, describing the modality (e.g. a forum, a group chat, a photo album)
 - **Space key (skey)** — a short string differentiating multiple spaces of the same type
 
-These form the space URI: `ats://<space-did>/<type>/<skey>`
+These form the space URI: `at://<space-did>/space/<type>/<skey>`
 
 A **space record** adds three more components to the URI: the author's DID, the collection NSID, and the record key:
 
 ```
-ats://<space-did>/<type-nsid>/<skey>/<author-did>/<collection>/<rkey>
+at://<space-did>/space/<type-nsid>/<skey>/<author-did>/<collection>/<rkey>
 ```
 
 ## Feature flag
@@ -100,7 +100,8 @@ The previous `dev.happyview.space.*` endpoints remain as backward-compatible ali
 | `com.atproto.simplespace.addMember`            | POST   | Add a member                                    |
 | `com.atproto.simplespace.removeMember`         | POST   | Remove a member                                 |
 | `com.atproto.simplespace.listMembers`          | GET    | List resolved members                           |
-| `com.atproto.space.getRepoState`               | GET    | Get per-user repo state (LtHash + commit)       |
+| `com.atproto.space.getLatestCommit`             | GET    | Get per-user signed commit                      |
+| `com.atproto.space.getRepo`                    | GET    | Export a user's repo as a CAR file               |
 | `com.atproto.space.listRepoOps`                | GET    | List record operation log entries                |
 | `com.atproto.space.listRepos`                  | GET    | List repos (authors) in a space                 |
 | `com.atproto.space.getDelegationToken`         | GET    | Get a delegation token (step 1 of credentials)  |
@@ -150,10 +151,12 @@ HappyView implements [AT Protocol Proposal 0016](https://github.com/bluesky-soci
 - **App access** — `open`, `allowList` (replaces `appAllowlist`/`appDenylist`)
 - **Delegation tokens** — `getDelegationToken` (GET, 60-second TTL) replaces `getMemberGrant`
 - **Space credentials** — `atproto-space-credential+jwt` typ, ES256, 2-hour TTL
-- **Deniable commit signatures** — user signs context (space + rev + random IKM), not content hash
+- **Deniable commit signatures** — user signs context (space + author + rev + random IKM), not content hash
 - **LtHash** — homomorphic set-hash (2048-byte state, 1024 uint16 lanes, BLAKE3 XOF)
-- **Record operation log** — `listRepoOps` returns the oplog for sync
-- **Repo state** — `getRepoState` returns LtHash state + signed commit
+- **SignedCommit** — versioned commit struct (`ver: 1`) with hash, ikm, sig, mac, rev
+- **Record operation log** — `listRepoOps` returns the oplog for sync (values inlined by default, `excludeValues` to opt out)
+- **Latest commit** — `getLatestCommit` returns the signed commit for a user in a space
+- **Repo export** — `getRepo` exports a user's repo as a CAR v1 file (signedCommit + DRISL index)
 - **Write notifications** — `registerNotify`, `notifyWrite`, `notifySpaceDeleted`
 - **Space-scoped blobs** — `getBlob`
 - **Authority DID** — spaces use `authority_did` (not `owner_did`) with a separate `creator_did`
