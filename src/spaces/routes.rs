@@ -1167,18 +1167,31 @@ async fn get_latest_commit(
     let repo_state =
         db::get_or_create_repo_state(&state.db, state.db_backend, &space.id, &params.did).await?;
 
+    let commit = if let Some(h) = repo_state.hash.as_ref() {
+        let ikm = repo_state.ikm.as_deref().ok_or_else(|| {
+            AppError::Internal("corrupt repo state: hash present but ikm missing".into())
+        })?;
+        let sig = repo_state.sig.as_deref().ok_or_else(|| {
+            AppError::Internal("corrupt repo state: hash present but sig missing".into())
+        })?;
+        let mac = repo_state.mac.as_deref().ok_or_else(|| {
+            AppError::Internal("corrupt repo state: hash present but mac missing".into())
+        })?;
+        Some(serde_json::json!({
+            "ver": 1,
+            "hash": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h),
+            "ikm": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ikm),
+            "sig": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig),
+            "mac": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac),
+            "rev": repo_state.rev,
+        }))
+    } else {
+        None
+    };
+
     Ok(Json(serde_json::json!({
         "rev": repo_state.rev,
-        "commit": repo_state.hash.as_ref().map(|h| {
-            serde_json::json!({
-                "ver": 1,
-                "hash": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h),
-                "ikm": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(repo_state.ikm.as_deref().unwrap_or_default()),
-                "sig": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(repo_state.sig.as_deref().unwrap_or_default()),
-                "mac": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(repo_state.mac.as_deref().unwrap_or_default()),
-                "rev": repo_state.rev,
-            })
-        }),
+        "commit": commit,
     })))
 }
 
@@ -1207,25 +1220,38 @@ async fn get_repo(
     let records =
         db::list_all_space_records(&state.db, state.db_backend, &space.id, &params.did).await?;
 
+    let hash = repo_state
+        .hash
+        .as_deref()
+        .ok_or_else(|| AppError::NotFound("no commit exists for this repo".into()))?;
+    let hash: [u8; 32] = hash
+        .try_into()
+        .map_err(|_| AppError::Internal("corrupt repo state: hash is not 32 bytes".into()))?;
+    let ikm: [u8; 32] = repo_state
+        .ikm
+        .as_deref()
+        .ok_or_else(|| AppError::Internal("corrupt repo state: missing ikm".into()))?
+        .try_into()
+        .map_err(|_| AppError::Internal("corrupt repo state: ikm is not 32 bytes".into()))?;
+    let mac: [u8; 32] = repo_state
+        .mac
+        .as_deref()
+        .ok_or_else(|| AppError::Internal("corrupt repo state: missing mac".into()))?
+        .try_into()
+        .map_err(|_| AppError::Internal("corrupt repo state: mac is not 32 bytes".into()))?;
+    let sig = repo_state
+        .sig
+        .ok_or_else(|| AppError::Internal("corrupt repo state: missing sig".into()))?;
+    let rev = repo_state
+        .rev
+        .ok_or_else(|| AppError::Internal("corrupt repo state: missing rev".into()))?;
     let commit = crate::spaces::commit::SignedCommit {
         ver: 1,
-        hash: repo_state
-            .hash
-            .as_deref()
-            .and_then(|h| <[u8; 32]>::try_from(h).ok())
-            .unwrap_or([0u8; 32]),
-        ikm: repo_state
-            .ikm
-            .as_deref()
-            .and_then(|i| <[u8; 32]>::try_from(i).ok())
-            .unwrap_or([0u8; 32]),
-        sig: repo_state.sig.unwrap_or_default(),
-        mac: repo_state
-            .mac
-            .as_deref()
-            .and_then(|m| <[u8; 32]>::try_from(m).ok())
-            .unwrap_or([0u8; 32]),
-        rev: repo_state.rev.unwrap_or_default(),
+        hash,
+        ikm,
+        sig,
+        mac,
+        rev,
     };
 
     let car_bytes = crate::spaces::car::serialize_repo(&commit, &records)?;

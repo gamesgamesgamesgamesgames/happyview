@@ -79,7 +79,12 @@ impl SpaceUri {
         let type_nsid = parts[2].to_string();
         let skey = parts[3].to_string();
 
-        let (user_did, collection, rkey) = if parts.len() >= 7 {
+        let (user_did, collection, rkey) = if parts.len() == 7 {
+            if parts[4].is_empty() || parts[5].is_empty() || parts[6].is_empty() {
+                return Err(AppError::BadRequest(
+                    "SpaceUri record components must not be empty".into(),
+                ));
+            }
             (
                 Some(parts[4].to_string()),
                 Some(parts[5].to_string()),

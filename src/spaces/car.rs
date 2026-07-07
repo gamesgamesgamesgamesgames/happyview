@@ -62,11 +62,12 @@ pub fn serialize_repo(commit: &SignedCommit, records: &[SpaceRecord]) -> Result<
     let mut indexed: Vec<(&SpaceRecord, Vec<u8>, Cid)> = records
         .iter()
         .map(|r| {
-            let block = serde_json::to_vec(&r.record).unwrap_or_default();
+            let block = serde_json::to_vec(&r.record)
+                .map_err(|e| AppError::Internal(format!("failed to serialize record: {e}")))?;
             let cid = make_cid(RAW, &block);
-            (r, block, cid)
+            Ok((r, block, cid))
         })
-        .collect();
+        .collect::<Result<Vec<_>, AppError>>()?;
     indexed.sort_by(|a, b| {
         let ka = format!("{}/{}", a.0.collection, a.0.rkey);
         let kb = format!("{}/{}", b.0.collection, b.0.rkey);

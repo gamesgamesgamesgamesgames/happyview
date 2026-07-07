@@ -84,6 +84,13 @@ pub fn verify_commit(
     author_did: &str,
     verifying_key: &VerifyingKey,
 ) -> Result<(), AppError> {
+    if commit.ver != 1 {
+        return Err(AppError::BadRequest(format!(
+            "unsupported commit version: {}",
+            commit.ver
+        )));
+    }
+
     let ctx = build_context(space_uri, author_did, &commit.rev, &commit.ikm);
 
     let sig = Signature::from_bytes(commit.sig.as_slice().into())
@@ -281,6 +288,18 @@ mod tests {
         let vk = *sk.verifying_key();
         assert!(verify_commit(&c1, space, "did:plc:testuser", &vk).is_ok());
         assert!(verify_commit(&c2, space, "did:plc:testuser", &vk).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_unknown_version() {
+        let sk = test_signing_key();
+        let vk = *sk.verifying_key();
+        let hash = [0xCC; 32];
+        let space = "at://did:plc:abc/space/com.example.forum/main";
+
+        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
+        commit.ver = 2;
+        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk).is_err());
     }
 
     #[test]

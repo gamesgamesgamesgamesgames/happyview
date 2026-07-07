@@ -93,7 +93,7 @@ async fn resolve_delegation_target(
     backend: DatabaseBackend,
     member: &SpaceMember,
 ) -> Result<Option<String>, AppError> {
-    if member.did.starts_with("at://") {
+    if member.did.starts_with("at://") || member.did.starts_with("ats://") {
         let uri = SpaceUri::parse(&member.did)?;
         let space =
             db::get_space_by_address(pool, backend, &uri.did, &uri.type_nsid, &uri.skey).await?;
