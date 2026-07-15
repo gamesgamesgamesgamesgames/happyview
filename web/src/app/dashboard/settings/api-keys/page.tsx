@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Copy, Check } from "lucide-react";
 import { toast } from "sonner";
 
@@ -10,7 +10,9 @@ import {
   getApiKeys,
   createApiKey,
   revokeApiKey,
+  getPermissions,
 } from "@/lib/api";
+import type { PermissionEntry } from "@/lib/api";
 import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import { SiteHeader } from "@/components/site-header";
 import {
@@ -48,26 +50,23 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-const PERMISSION_CATEGORIES: Record<string, string[]> = {
-  Lexicons: ["lexicons:create", "lexicons:read", "lexicons:delete"],
-  Records: ["records:read", "records:delete", "records:delete-collection"],
-  "Script Variables": [
-    "script-variables:create",
-    "script-variables:read",
-    "script-variables:delete",
-  ],
-  Users: ["users:create", "users:read", "users:update", "users:delete"],
-  "API Keys": ["api-keys:create", "api-keys:read", "api-keys:delete"],
-  Backfill: ["backfill:create", "backfill:read"],
-  "API Clients": ["api-clients:view", "api-clients:create", "api-clients:edit", "api-clients:delete"],
-  System: ["stats:read", "events:read"],
-};
-
-const ALL_PERMISSIONS = Object.values(PERMISSION_CATEGORIES).flat();
+function buildCategories(
+  permissions: PermissionEntry[],
+): Record<string, PermissionEntry[]> {
+  const cats: Record<string, PermissionEntry[]> = {};
+  for (const p of permissions) {
+    if (!cats[p.category]) cats[p.category] = [];
+    cats[p.category].push(p);
+  }
+  return cats;
+}
 
 export default function ApiKeysPage() {
   const { hasPermission } = useCurrentUser();
   const [keys, setKeys] = useState<ApiKeySummary[]>([]);
+  const [permissionEntries, setPermissionEntries] = useState<PermissionEntry[]>(
+    [],
+  );
 
   const load = useCallback(() => {
     getApiKeys()
@@ -77,6 +76,9 @@ export default function ApiKeysPage() {
 
   useEffect(() => {
     load();
+    getPermissions()
+      .then((catalog) => setPermissionEntries(catalog.permissions))
+      .catch((e) => toastError("Failed to load permissions", e));
   }, [load]);
 
   async function handleRevoke(id: string) {
@@ -96,7 +98,10 @@ export default function ApiKeysPage() {
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">API Keys</h2>
           {hasPermission("api-keys:create") && (
-            <CreateApiKeyDialog onSuccess={load} />
+            <CreateApiKeyDialog
+              onSuccess={load}
+              permissions={permissionEntries}
+            />
           )}
         </div>
 
@@ -191,12 +196,19 @@ export default function ApiKeysPage() {
 
 function CreateApiKeyDialog({
   onSuccess,
+  permissions,
 }: {
   onSuccess: () => void;
+  permissions: PermissionEntry[];
 }) {
+  const categories = useMemo(
+    () => buildCategories(permissions),
+    [permissions],
+  );
+  const allKeys = useMemo(() => permissions.map((p) => p.key), [permissions]);
+
   const [name, setName] = useState("");
-  const [selectedPermissions, setSelectedPermissions] =
-    useState<string[]>(ALL_PERMISSIONS);
+  const [selectedPermissions, setSelectedPermissions] = useState<string[]>([]);
   const [open, setOpen] = useState(false);
   const [createdKey, setCreatedKey] = useState<CreateApiKeyResponse | null>(
     null
@@ -205,9 +217,11 @@ function CreateApiKeyDialog({
 
   function handleOpenChange(nextOpen: boolean) {
     setOpen(nextOpen);
-    if (!nextOpen) {
+    if (nextOpen) {
+      setSelectedPermissions(allKeys);
+    } else {
       setName("");
-      setSelectedPermissions(ALL_PERMISSIONS);
+      setSelectedPermissions([]);
       if (createdKey) {
         setCreatedKey(null);
         onSuccess();
@@ -312,56 +326,64 @@ function CreateApiKeyDialog({
             <div className="flex flex-col gap-2">
               <Label>Permissions</Label>
               <div className="max-h-64 overflow-y-auto rounded-md border p-3 flex flex-col gap-4">
-                {Object.entries(PERMISSION_CATEGORIES).map(
-                  ([category, perms]) => {
-                    const allSelected = perms.every((p) =>
-                      selectedPermissions.includes(p)
-                    );
-                    const someSelected = perms.some((p) =>
-                      selectedPermissions.includes(p)
-                    );
-                    return (
-                      <div key={category} className="flex flex-col gap-2">
-                        <button
-                          type="button"
-                          className="flex items-center gap-2 text-left"
-                          onClick={() => toggleCategory(perms)}
-                        >
-                          <Checkbox
-                            checked={allSelected}
-                            data-state={
-                              someSelected && !allSelected
-                                ? "indeterminate"
-                                : undefined
-                            }
-                            className="pointer-events-none"
-                          />
-                          <span className="text-sm font-medium">
-                            {category}
-                          </span>
-                        </button>
-                        <div className="ml-6 flex flex-col gap-1.5">
-                          {perms.map((perm) => (
-                            <label
-                              key={perm}
-                              className="flex items-center gap-2 cursor-pointer"
-                            >
-                              <Checkbox
-                                checked={selectedPermissions.includes(perm)}
-                                onCheckedChange={() => togglePermission(perm)}
-                              />
-                              <span className="font-mono text-xs">{perm}</span>
-                            </label>
-                          ))}
-                        </div>
-                      </div>
-                    );
-                  }
+                {Object.keys(categories).length === 0 && (
+                  <p className="text-muted-foreground text-sm">
+                    No permissions available.
+                  </p>
                 )}
+                {Object.entries(categories).map(([category, perms]) => {
+                  const keys = perms.map((p) => p.key);
+                  const allSelected = keys.every((k) =>
+                    selectedPermissions.includes(k)
+                  );
+                  const someSelected = keys.some((k) =>
+                    selectedPermissions.includes(k)
+                  );
+                  return (
+                    <div key={category} className="flex flex-col gap-2">
+                      <button
+                        type="button"
+                        className="flex items-center gap-2 text-left"
+                        onClick={() => toggleCategory(keys)}
+                      >
+                        <Checkbox
+                          checked={allSelected}
+                          data-state={
+                            someSelected && !allSelected
+                              ? "indeterminate"
+                              : undefined
+                          }
+                          className="pointer-events-none"
+                        />
+                        <span className="text-sm font-medium">{category}</span>
+                      </button>
+                      <div className="ml-6 flex flex-col gap-1.5">
+                        {perms.map((perm) => (
+                          <label
+                            key={perm.key}
+                            className="flex items-start gap-2 cursor-pointer"
+                          >
+                            <Checkbox
+                              checked={selectedPermissions.includes(perm.key)}
+                              onCheckedChange={() => togglePermission(perm.key)}
+                              className="mt-0.5"
+                            />
+                            <span className="flex flex-col">
+                              <span className="text-sm">{perm.name}</span>
+                              <span className="font-mono text-xs text-muted-foreground">
+                                {perm.key}
+                              </span>
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
               <p className="text-muted-foreground text-xs">
-                {selectedPermissions.length} of {ALL_PERMISSIONS.length}{" "}
-                permissions selected
+                {selectedPermissions.length} of {allKeys.length} permissions
+                selected
               </p>
             </div>
           </div>
