@@ -601,6 +601,7 @@ async fn apply_writes(
                 rkey,
                 value,
             } => {
+                service::check_collection_allowed(&space, &collection)?;
                 let rkey = rkey.unwrap_or_else(generate_tid);
                 let cid = service::content_cid(&value);
                 let record_uri = format!(
@@ -629,6 +630,7 @@ async fn apply_writes(
                 value,
                 swap_record,
             } => {
+                service::check_collection_allowed(&space, &collection)?;
                 let cid = service::content_cid(&value);
                 let record_uri = format!(
                     "at://{}/space/{}/{}/{}/{}/{}",

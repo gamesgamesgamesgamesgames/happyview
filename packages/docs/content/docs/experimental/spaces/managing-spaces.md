@@ -129,7 +129,7 @@ The `config` object supports:
 | `membershipPublic` | boolean | `false` | Whether the member list is visible without authentication |
 | `recordsPublic`    | boolean | `false` | Whether records are readable without membership           |
 
-Additional fields are preserved as-is.
+Additional fields are preserved as-is. One recognized additional field is `allowedCollections` (a JSON array of collection NSID strings), auto-populated at creation time from the space type lexicon's `defs.main.collections`. When present and non-empty, `createRecord`/`putRecord`/`applyWrites` reject writes (`400`) to any collection not on the list; deletes are never restricted. A space without this field, or with an empty list, allows writes to any collection.
 
 ## Getting a space
 

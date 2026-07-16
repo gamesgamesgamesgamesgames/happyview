@@ -70,6 +70,17 @@ async fn json_of(resp: axum::http::Response<Body>) -> Value {
 /// Create a space authored by `authority` with the given `skey`. Returns the
 /// space's DB id and its `at://` URI.
 async fn create_space(app: &TestApp, authority: &str, skey: &str) -> (String, String) {
+    create_space_with_config(app, authority, skey, SpaceConfig::default()).await
+}
+
+/// Same as `create_space`, but lets the caller supply the seeded space's
+/// `config` (e.g. to set `allowedCollections` for enforcement tests).
+async fn create_space_with_config(
+    app: &TestApp,
+    authority: &str,
+    skey: &str,
+    config: SpaceConfig,
+) -> (String, String) {
     let now = now_rfc3339();
     let id = Uuid::new_v4().to_string();
     let type_nsid = "com.example.records";
@@ -85,7 +96,7 @@ async fn create_space(app: &TestApp, authority: &str, skey: &str) -> (String, St
         mint_policy: MintPolicy::MemberList,
         app_access: AppAccess::Open,
         managing_app_did: None,
-        config: SpaceConfig::default(),
+        config,
         revision: None,
         created_at: now.clone(),
         updated_at: now,
@@ -95,6 +106,16 @@ async fn create_space(app: &TestApp, authority: &str, skey: &str) -> (String, St
         .expect("create_space failed");
     let uri = format!("at://{authority}/space/{type_nsid}/{skey}");
     (id, uri)
+}
+
+/// Build a `SpaceConfig` whose `allowedCollections` extra is set to the
+/// given list of collection NSIDs.
+fn config_with_allowed_collections(allowed: &[&str]) -> SpaceConfig {
+    let mut config = SpaceConfig::default();
+    config
+        .extra
+        .insert("allowedCollections".to_string(), json!(allowed));
+    config
 }
 
 async fn add_member(app: &TestApp, space_id: &str, did: &str, access: SpaceAccess) {
@@ -1209,4 +1230,167 @@ async fn apply_writes_delete_of_nonexistent_record_returns_not_found() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A space whose config declares `allowedCollections` must reject an
+/// applyWrites `create` op targeting a collection not on that list (400),
+/// so a write-member can't use applyWrites to bypass the enforcement that
+/// createRecord/putRecord already apply.
+#[tokio::test]
+#[serial]
+async fn apply_writes_rejects_create_op_with_disallowed_collection() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("authority");
+    let writer = rand_did("writer");
+    let skey = rand_skey("space");
+    let (space_id, space_uri) = create_space_with_config(
+        &app,
+        &authority,
+        &skey,
+        config_with_allowed_collections(&["com.example.allowed"]),
+    )
+    .await;
+    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+
+    let writes = json!([write_op_create(
+        "com.example.denied",
+        Some("should-not-exist"),
+        &json!({ "text": "should be rejected" }),
+    )]);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(apply_writes_req(
+            &space_uri,
+            writes,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // confirm nothing landed
+    let get_resp = app
+        .router
+        .clone()
+        .oneshot(get_record_req(
+            &space_uri,
+            "com.example.denied",
+            "should-not-exist",
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A space whose config declares `allowedCollections` must reject an
+/// applyWrites `update` op targeting a collection not on that list (400).
+#[tokio::test]
+#[serial]
+async fn apply_writes_rejects_update_op_with_disallowed_collection() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("authority");
+    let writer = rand_did("writer");
+    let skey = rand_skey("space");
+    let (space_id, space_uri) = create_space_with_config(
+        &app,
+        &authority,
+        &skey,
+        config_with_allowed_collections(&["com.example.allowed"]),
+    )
+    .await;
+    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+
+    let writes = json!([write_op_update(
+        "com.example.denied",
+        "some-rkey",
+        &json!({ "text": "should be rejected" }),
+        None,
+    )]);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(apply_writes_req(
+            &space_uri,
+            writes,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// applyWrites' `delete` op is NOT gated by `allowedCollections` — deleting
+/// a record in a now-disallowed collection must still work (cleanup should
+/// never be blocked by a config change). This seeds the record directly via
+/// `spaces_db::insert_space_record` (bypassing createRecord's own
+/// enforcement) to simulate a record that predates a stricter
+/// `allowedCollections` config.
+#[tokio::test]
+#[serial]
+async fn apply_writes_delete_op_ignores_disallowed_collection() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("authority");
+    let writer = rand_did("writer");
+    let skey = rand_skey("space");
+    let (space_id, space_uri) = create_space_with_config(
+        &app,
+        &authority,
+        &skey,
+        config_with_allowed_collections(&["com.example.allowed"]),
+    )
+    .await;
+    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+
+    let collection = "com.example.denied";
+    let rkey = "predates-the-restriction";
+    let record_uri =
+        format!("at://{authority}/space/com.example.records/{skey}/{writer}/{collection}/{rkey}");
+    let content = json!({ "text": "grandfathered in" });
+    spaces_db::insert_space_record(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceRecord {
+            uri: record_uri.clone(),
+            space_id: space_id.clone(),
+            author_did: writer.clone(),
+            collection: collection.to_string(),
+            rkey: rkey.to_string(),
+            record: content,
+            cid: "bafyreigrandfathered0000000000000000000".to_string(),
+            indexed_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("seed record failed");
+
+    let writes = json!([write_op_delete(collection, rkey, None)]);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(apply_writes_req(
+            &space_uri,
+            writes,
+            None,
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "delete op must not be gated by allowedCollections"
+    );
 }
