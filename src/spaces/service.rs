@@ -1282,11 +1282,14 @@ mod tests {
     async fn create_space_inserts_and_adds_creator_as_writer() {
         require_test_db!();
         let state = service_empty_db().await; // migrated DB, no spaces
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let creator_did = format!("did:plc:creator{unique}");
+        let skey = format!("general{unique}");
         let space = super::create_space(
             &state,
-            "did:plc:creator",
+            &creator_did,
             "com.example.chat",
-            "general",
+            &skey,
             None,
             None,
             None,
@@ -1296,15 +1299,11 @@ mod tests {
         )
         .await
         .expect("create should succeed");
-        assert_eq!(space.authority_did, "did:plc:creator");
-        let access = crate::spaces::members::is_member(
-            &state.db,
-            state.db_backend,
-            &space.id,
-            "did:plc:creator",
-        )
-        .await
-        .unwrap();
+        assert_eq!(space.authority_did, creator_did);
+        let access =
+            crate::spaces::members::is_member(&state.db, state.db_backend, &space.id, &creator_did)
+                .await
+                .unwrap();
         assert_eq!(access, Some(crate::spaces::types::SpaceAccess::Write));
     }
 
