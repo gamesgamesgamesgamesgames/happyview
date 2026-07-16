@@ -178,4 +178,29 @@ export const HOVER_DOCS = new Map<string, HoverEntry>([
   ["atproto.get_labels_batch", { signature: "atproto.get_labels_batch({uri1, uri2, ...})", description: "Get labels for multiple URIs — returns table keyed by URI", module: "atproto" }],
   ["atproto.sign", { signature: "atproto.sign(record)", description: "Sign a record (requires attestation signer, procedure scripts only) — returns signature object", module: "atproto" }],
   ["atproto.verify_signature", { signature: "atproto.verify_signature(record, sig, repo_did)", description: "Verify a record signature — returns boolean", module: "atproto" }],
+
+  // ── HappyView Spaces API ────────────────────────────────────────────
+  // Note: hover lookup keys on the immediate `<prefix>.<word>` pair, not the
+  // full dotted path — so these are keyed as `spaces.*`, matching how a
+  // hover on `is_member` in `atproto.spaces.is_member` is resolved.
+  ["atproto.spaces", { signature: "atproto.spaces", description: "Permissioned Spaces sub-table", module: "atproto" }],
+  ["spaces.is_member", { signature: "atproto.spaces.is_member(space_uri, did)", description: "Whether did is a member of the space — returns boolean", module: "atproto" }],
+  ["spaces.get_access", { signature: "atproto.spaces.get_access(space_uri, did)", description: "Member's access level — returns 'read' | 'write' | nil", module: "atproto" }],
+  ["spaces.list_members", { signature: "atproto.spaces.list_members(space_uri)", description: "List resolved members — returns array of {did, access}", module: "atproto" }],
+  ["spaces.query", { signature: "atproto.spaces.query({space_uri, collection?, limit?, cursor?})", description: "List records in a space — returns {records, cursor}", module: "atproto" }],
+  ["spaces.get", { signature: "atproto.spaces.get(space_uri)", description: "Look up a space — returns a Space handle or nil (requires caller_did to write)", module: "atproto" }],
+  ["spaces.create", { signature: "atproto.spaces.create({type, skey, display_name?, ...})", description: "Create a space (requires caller_did) — returns a Space handle", module: "atproto" }],
+  ["spaces.accept_invite", { signature: "atproto.spaces.accept_invite({token})", description: "Redeem an invite token and join a space (requires caller_did) — returns a Space handle", module: "atproto" }],
+  ["Space:write_record", { signature: "space:write_record({collection, record})", description: "Create a record with an auto-generated rkey — returns {uri, cid}" }],
+  ["Space:put_record", { signature: "space:put_record({collection, rkey, record, swap_cid?})", description: "Create or overwrite a record at a specific rkey — returns {uri, cid}" }],
+  ["Space:delete_record", { signature: "space:delete_record({collection, rkey, swap_cid?})", description: "Delete a record (author-ownership-only) — returns true" }],
+  ["Space:add_member", { signature: "space:add_member({did, access?, is_delegation?})", description: "Add a member (space-admin only) — returns {did, access}" }],
+  ["Space:remove_member", { signature: "space:remove_member({did})", description: "Remove a member (space-admin only) — returns true" }],
+  ["Space:members", { signature: "space:members()", description: "List resolved members — returns array of {did, access}" }],
+  ["Space:is_member", { signature: "space:is_member(did)", description: "Whether did is a member — returns boolean" }],
+  ["Space:access", { signature: "space:access(did)", description: "Member's access level — returns 'read' | 'write' | nil" }],
+  ["Space:update", { signature: "space:update({display_name?, description?, mint_policy?, app_access?, managing_app_did?, config?})", description: "Update space metadata (space-admin only) — returns true" }],
+  ["Space:delete", { signature: "space:delete()", description: "Delete the space (space-admin only) — returns true" }],
+  ["Space:query", { signature: "space:query({collection?, limit?, cursor?})", description: "List records in the space — returns {records, cursor}" }],
+  ["Space:create_invite", { signature: "space:create_invite({access?, max_uses?, expires_at?})", description: "Create an invite token (space-admin only) — returns {invite_id, token, access, max_uses, expires_at}" }],
 ]);

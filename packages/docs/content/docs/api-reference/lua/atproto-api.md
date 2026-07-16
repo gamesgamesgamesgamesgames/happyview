@@ -242,6 +242,84 @@ if atproto.sign then
 end
 ```
 
+## atproto.spaces
+
+The `atproto.spaces` sub-table provides access to [Permissioned Spaces](../../experimental/spaces/index.md) from Lua scripts. Every function raises if the `spaces_enabled` feature flag is disabled.
+
+### Read-only functions
+
+These are available in all script contexts, including those that have no `caller_did` (anonymous queries and label scripts).
+
+```lua
+atproto.spaces.is_member(space_uri, did) -- boolean
+atproto.spaces.get_access(space_uri, did) -- 'read' | 'write' | nil
+atproto.spaces.list_members(space_uri) -- [{ did, access }]
+atproto.spaces.query({ space_uri, collection?, limit?, cursor? }) -- { records, cursor }
+```
+
+| Function      | Parameters                                             | Description                                                          |
+| ------------- | ------------------------------------------------------- | --------------------------------------------------------------------- |
+| `is_member`   | `space_uri, did`                                        | Whether `did` is a member of the space                                |
+| `get_access`  | `space_uri, did`                                        | The member's access level, or `nil` if not a member                   |
+| `list_members`| `space_uri`                                              | All resolved members as `{ did, access }`                             |
+| `query`       | `{ space_uri, collection?, limit?, cursor? }`            | List records in the space, optionally filtered by collection          |
+
+### Write surface: handles
+
+Three functions return a `Space` userdata handle bound to the calling script's `caller_did`. They require `caller_did` to be set — it is present in authenticated queries, procedure scripts, record-event scripts (where it is the indexed record's author DID), and jobs. Label scripts and anonymous queries have no `caller_did`, so these raise `"this space operation requires an authenticated caller"`.
+
+```lua
+atproto.spaces.get(space_uri) -- Space | nil
+atproto.spaces.create{ type, skey, display_name?, description?, mint_policy?, app_access?, managing_app_did?, config? } -- Space
+atproto.spaces.accept_invite{ token } -- Space
+```
+
+`atproto.spaces.get` does not itself require `caller_did` to look up the space, but the returned handle's write methods will still raise without one.
+
+### Space handle methods
+
+| Method | Signature | Description |
+| --- | --- | --- |
+| `write_record` | `space:write_record{ collection, record }` | Create a record with an auto-generated rkey — returns `{ uri, cid }` |
+| `put_record` | `space:put_record{ collection, rkey, record, swap_cid? }` | Create or overwrite a record at a specific rkey — returns `{ uri, cid }` |
+| `delete_record` | `space:delete_record{ collection, rkey, swap_cid? }` | Delete a record. Requires write membership *and* record authorship — the caller must be a current write-member of the space and the record's author — returns `true` |
+| `add_member` | `space:add_member{ did, access?, is_delegation? }` | Add a member (space-admin only) — returns `{ did, access }` |
+| `remove_member` | `space:remove_member{ did }` | Remove a member (space-admin only) — returns `true` |
+| `members` | `space:members()` | List resolved members — returns `[{ did, access }]` |
+| `is_member` | `space:is_member(did)` | Whether `did` is a member — returns `boolean` |
+| `access` | `space:access(did)` | The member's access level, or `nil` — returns `'read' \| 'write' \| nil` |
+| `update` | `space:update{ display_name?, description?, mint_policy?, app_access?, managing_app_did?, config? }` | Update space metadata (space-admin only) — returns `true` |
+| `delete` | `space:delete()` | Delete the space (space-admin only) — returns `true` |
+| `query` | `space:query{ collection?, limit?, cursor? }` | List records in the space — returns `{ records, cursor }` |
+| `create_invite` | `space:create_invite{ access?, max_uses?, expires_at? }` | Create an invite token (space-admin only) — returns `{ invite_id, token, access, max_uses, expires_at }` |
+
+**Authorization:** writes act strictly as `caller_did`, using the same authorization the HTTP handlers enforce — a write-member for record operations, space-admin for membership/space/invite management. `delete_record` additionally requires record authorship: the caller must be both a current write-member and the record's author (`author_did == caller_did`). The HTTP handlers and the Lua bindings share the same `src/spaces/service.rs` service layer, so behavior can't drift between them.
+
+**`update` patch semantics:** for the nullable fields (`display_name`, `description`, `managing_app_did`), a string value sets the field, `false` clears it, and omitting the key leaves it unchanged. Lua has no way to represent "explicit null" versus "absent" in a table — a `nil` value simply removes the key — so `false` is used as the clear signal instead.
+
+### Examples
+
+```lua
+-- Create a space, write a record, and add a member
+local space = atproto.spaces.create{ type = "com.example.chat", skey = "general" }
+space:write_record{ collection = "com.example.chat.message", record = { text = "hi" } }
+space:add_member{ did = "did:plc:friend", access = "write" }
+```
+
+```lua
+-- Look up an existing space and write to it if the caller is a member
+local space = atproto.spaces.get("at://did:plc:abc123/space/com.example.forum/main")
+if space and space:is_member(caller_did) then
+  space:write_record{ collection = "com.example.forum.post", record = { text = "hello" } }
+end
+```
+
+```lua
+-- Join a space via an invite token, then write as the new member
+local space = atproto.spaces.accept_invite{ token = invite_token }
+space:write_record{ collection = "com.example.chat.message", record = { text = "just joined!" } }
+```
+
 ## atproto.verify_signature
 
 ```lua

@@ -289,6 +289,32 @@ const STATIC_COMPLETIONS: LuaCompletions = {
     { label: "get_labels_batch", detail: "function", description: "Get labels for multiple URIs — atproto.get_labels_batch({uri1, uri2}) → {[uri]: label[]}", insertText: "get_labels_batch(${1:uris})" },
     { label: "sign", detail: "function", description: "Sign a record (requires attestation signer) — atproto.sign(record) → signature", insertText: "sign(${1:record})" },
     { label: "verify_signature", detail: "function", description: "Verify a record signature — atproto.verify_signature(record, sig, repo_did) → boolean", insertText: "verify_signature(${1:record}, ${2:sig}, ${3:repo_did})" },
+    { label: "spaces", detail: "table", description: "Permissioned Spaces sub-table — atproto.spaces.*" },
+  ],
+  // HappyView Spaces API (atproto.spaces.*)
+  spaces: [
+    { label: "is_member", detail: "function", description: "Whether did is a member of the space — atproto.spaces.is_member(space_uri, did) → boolean", insertText: "is_member(${1:space_uri}, ${2:did})" },
+    { label: "get_access", detail: "function", description: "Member's access level — atproto.spaces.get_access(space_uri, did) → 'read' | 'write' | nil", insertText: "get_access(${1:space_uri}, ${2:did})" },
+    { label: "list_members", detail: "function", description: "List resolved members — atproto.spaces.list_members(space_uri) → {did, access}[]", insertText: "list_members(${1:space_uri})" },
+    { label: "query", detail: "function", description: "List records in a space — atproto.spaces.query({space_uri, collection?, limit?, cursor?}) → {records, cursor}", insertText: "query({\n\tspace_uri = ${1:space_uri},\n\t${2}\n})" },
+    { label: "get", detail: "function", description: "Look up a space (requires caller_did to write) — atproto.spaces.get(space_uri) → Space or nil", insertText: "get(${1:space_uri})" },
+    { label: "create", detail: "function", description: "Create a space (requires caller_did) — atproto.spaces.create({type, skey, ...}) → Space", insertText: "create({\n\ttype = ${1:\"com.example.type\"},\n\tskey = ${2:\"skey\"},\n\t${3}\n})" },
+    { label: "accept_invite", detail: "function", description: "Redeem an invite token and join a space (requires caller_did) — atproto.spaces.accept_invite({token}) → Space", insertText: "accept_invite({ token = ${1:token} })" },
+  ],
+  // Space handle methods (returned by atproto.spaces.get/create/accept_invite)
+  Space: [
+    { label: "write_record", detail: "method", description: "Create a record with an auto-generated rkey — space:write_record({collection, record}) → {uri, cid}", insertText: "write_record({\n\tcollection = ${1:\"com.example.collection\"},\n\trecord = {\n\t\t${2}\n\t},\n})" },
+    { label: "put_record", detail: "method", description: "Create or overwrite a record at a specific rkey — space:put_record({collection, rkey, record, swap_cid?}) → {uri, cid}", insertText: "put_record({\n\tcollection = ${1:\"com.example.collection\"},\n\trkey = ${2:rkey},\n\trecord = {\n\t\t${3}\n\t},\n})" },
+    { label: "delete_record", detail: "method", description: "Delete a record (author-ownership-only) — space:delete_record({collection, rkey, swap_cid?}) → true", insertText: "delete_record({ collection = ${1:\"com.example.collection\"}, rkey = ${2:rkey} })" },
+    { label: "add_member", detail: "method", description: "Add a member (space-admin only) — space:add_member({did, access?, is_delegation?}) → {did, access}", insertText: "add_member({ did = ${1:did}, access = ${2:\"write\"} })" },
+    { label: "remove_member", detail: "method", description: "Remove a member (space-admin only) — space:remove_member({did}) → true", insertText: "remove_member({ did = ${1:did} })" },
+    { label: "members", detail: "method", description: "List resolved members — space:members() → {did, access}[]", insertText: "members()" },
+    { label: "is_member", detail: "method", description: "Whether did is a member — space:is_member(did) → boolean", insertText: "is_member(${1:did})" },
+    { label: "access", detail: "method", description: "Member's access level — space:access(did) → 'read' | 'write' | nil", insertText: "access(${1:did})" },
+    { label: "update", detail: "method", description: "Update space metadata (space-admin only) — space:update({display_name?, description?, ...}) → true", insertText: "update({\n\t${1}\n})" },
+    { label: "delete", detail: "method", description: "Delete the space (space-admin only) — space:delete() → true", insertText: "delete()" },
+    { label: "query", detail: "method", description: "List records in the space — space:query({collection?, limit?, cursor?}) → {records, cursor}", insertText: "query({\n\t${1}\n})" },
+    { label: "create_invite", detail: "method", description: "Create an invite token (space-admin only) — space:create_invite({access?, max_uses?, expires_at?}) → {invite_id, token, access, max_uses, expires_at}", insertText: "create_invite({\n\t${1}\n})" },
   ],
 };
 

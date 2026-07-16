@@ -10,6 +10,7 @@ pub mod notifications;
 pub mod oplog;
 pub mod routes;
 pub mod scope;
+pub mod service;
 pub mod simplespace;
 pub mod types;
 

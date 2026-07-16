@@ -7,7 +7,6 @@ use base64::Engine as _;
 use k256;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::XrpcClaims;
@@ -15,8 +14,9 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lua::tid::generate_tid;
 use crate::spaces::scope::{SpaceReadAccess, check_delegation_token_access, check_read_access};
+use crate::spaces::service;
 use crate::spaces::types::*;
-use crate::spaces::{SpaceUri, db, members, notifications, oplog};
+use crate::spaces::{db, members, notifications, oplog};
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -360,7 +360,10 @@ fn require_auth(claims: &XrpcClaims) -> Result<&crate::auth::Claims, AppError> {
 /// Whether a verified space credential has been revoked (e.g. its holder was
 /// removed from the space). Consulted after signature/exp verification so a
 /// leaked or stale credential can be invalidated before its TTL expires (M3).
-async fn space_credential_revoked(state: &AppState, token: &str) -> Result<bool, AppError> {
+pub(crate) async fn space_credential_revoked(
+    state: &AppState,
+    token: &str,
+) -> Result<bool, AppError> {
     let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
     db::is_space_credential_revoked(&state.db, state.db_backend, &token_hash).await
 }
@@ -407,99 +410,6 @@ fn require_notify_caller(claims: &XrpcClaims) -> Result<String, AppError> {
     ))
 }
 
-async fn resolve_space(state: &AppState, space_uri: &str) -> Result<Space, AppError> {
-    let uri = SpaceUri::parse(space_uri)?;
-    db::get_space_by_address(
-        &state.db,
-        state.db_backend,
-        &uri.did,
-        &uri.type_nsid,
-        &uri.skey,
-    )
-    .await?
-    .ok_or_else(|| AppError::NotFound("Space not found".into()))
-}
-
-async fn require_space_admin(state: &AppState, space: &Space, did: &str) -> Result<(), AppError> {
-    if space.authority_did == did {
-        return Ok(());
-    }
-    let sql = adapt_sql(
-        "SELECT is_super FROM happyview_users WHERE did = ?",
-        state.db_backend,
-    );
-    let row: Option<(i32,)> = crate::db::query_as(&sql)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to check admin status: {e}")))?;
-    if row.is_some_and(|(is_super,)| is_super != 0) {
-        return Ok(());
-    }
-    Err(AppError::Forbidden(
-        "Only the space authority can perform this action".into(),
-    ))
-}
-
-async fn require_membership(
-    state: &AppState,
-    space: &Space,
-    did: &str,
-    require_write: bool,
-    space_credential: Option<&str>,
-) -> Result<SpaceAccess, AppError> {
-    if let Some(token) = space_credential {
-        let space_uri = format!(
-            "at://{}/space/{}/{}",
-            space.did, space.type_nsid, space.skey
-        );
-        match crate::spaces::credential::verify_external_credential(
-            token,
-            &state.http,
-            &state.config.plc_url,
-        )
-        .await
-        {
-            Ok(claims) if claims.sub == space_uri => {
-                // A revoked credential is treated as invalid — fall through to
-                // the local membership check rather than granting access.
-                if space_credential_revoked(state, token).await? {
-                    // fall through
-                } else if require_write {
-                    // External credential grants read access only.
-                    return Err(AppError::Forbidden(
-                        "Write access is required for this action".into(),
-                    ));
-                } else {
-                    return Ok(SpaceAccess::Read);
-                }
-            }
-            Ok(_) => {
-                // Credential is valid but for a different space — fall through
-            }
-            Err(_) => {
-                // External verification failed — fall through to local check
-            }
-        }
-    }
-
-    let access = members::is_member(&state.db, state.db_backend, &space.id, did)
-        .await?
-        .ok_or_else(|| AppError::Forbidden("You are not a member of this space".into()))?;
-    if require_write && !access.can_write() {
-        return Err(AppError::Forbidden(
-            "Write access is required for this action".into(),
-        ));
-    }
-    Ok(access)
-}
-
-fn content_cid(record: &serde_json::Value) -> String {
-    let bytes = serde_json::to_vec(record).unwrap_or_default();
-    let hash = Sha256::digest(&bytes);
-    format!("bafyrei{}", hex::encode(&hash[..20]))
-}
-
 async fn resolve_client_id_url(
     state: &AppState,
     client_key: &str,
@@ -525,7 +435,7 @@ async fn get_space(
     xrpc_claims: XrpcClaims,
     Query(query): Query<SpaceUriQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let space = resolve_space(&state, &query.space).await?;
+    let space = service::resolve_space(&state, &query.space).await?;
 
     // If the space's membership is not public, require auth + membership
     if !space.config.membership_public {
@@ -599,45 +509,16 @@ async fn create_record(
     Json(input): Json<CreateRecordInput>,
 ) -> Result<Response, AppError> {
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_membership(
+    let (uri, cid) = service::create_record(
         &state,
-        &space,
         &did,
-        true,
         xrpc_claims.space_credential.as_deref(),
+        &input.space,
+        &input.collection,
+        input.record,
     )
     .await?;
-
-    let rkey = generate_tid();
-    let cid = content_cid(&input.record);
-    let record_uri = format!(
-        "at://{}/space/{}/{}/{}/{}/{}",
-        space.did, space.type_nsid, space.skey, did, input.collection, rkey
-    );
-
-    let record = SpaceRecord {
-        uri: record_uri.clone(),
-        space_id: space.id.clone(),
-        author_did: did,
-        collection: input.collection,
-        rkey,
-        record: input.record,
-        cid: cid.clone(),
-        indexed_at: now_rfc3339(),
-    };
-
-    db::insert_space_record(&state.db, state.db_backend, &record).await?;
-
-    let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
-
-    let body = serde_json::json!({
-        "uri": record_uri,
-        "cid": cid,
-    });
-
-    let mut response = Json(body).into_response();
+    let mut response = Json(serde_json::json!({ "uri": uri, "cid": cid })).into_response();
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
 }
@@ -648,48 +529,18 @@ async fn put_record(
     Json(input): Json<PutRecordInput>,
 ) -> Result<Response, AppError> {
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_membership(
+    let (uri, cid) = service::put_record(
         &state,
-        &space,
         &did,
-        true,
         xrpc_claims.space_credential.as_deref(),
+        &input.space,
+        &input.collection,
+        &input.rkey,
+        input.record,
+        input.swap_record,
     )
     .await?;
-
-    let cid = content_cid(&input.record);
-    let record_uri = format!(
-        "at://{}/space/{}/{}/{}/{}/{}",
-        space.did, space.type_nsid, space.skey, did, input.collection, input.rkey
-    );
-
-    let record = SpaceRecord {
-        uri: record_uri.clone(),
-        space_id: space.id.clone(),
-        author_did: did,
-        collection: input.collection,
-        rkey: input.rkey,
-        record: input.record,
-        cid: cid.clone(),
-        indexed_at: now_rfc3339(),
-    };
-
-    if let Some(swap_cid) = input.swap_record {
-        db::upsert_space_record_with_swap(&state.db, state.db_backend, &record, &swap_cid).await?;
-    } else {
-        db::upsert_space_record(&state.db, state.db_backend, &record).await?;
-    }
-
-    let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
-
-    let body = serde_json::json!({
-        "uri": record_uri,
-        "cid": cid,
-    });
-
-    let mut response = Json(body).into_response();
+    let mut response = Json(serde_json::json!({ "uri": uri, "cid": cid })).into_response();
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
 }
@@ -701,35 +552,15 @@ async fn delete_record(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
     let did = claims.did().to_string();
-    let space = resolve_space(&state, &input.space).await?;
-
-    let record_uri = format!(
-        "at://{}/space/{}/{}/{}/{}/{}",
-        space.did, space.type_nsid, space.skey, did, input.collection, input.rkey
-    );
-
-    if let Some(swap_cid) = input.swap_record {
-        db::delete_space_record_with_swap(&state.db, state.db_backend, &record_uri, &swap_cid)
-            .await?;
-    } else {
-        let record = db::get_space_record(&state.db, state.db_backend, &record_uri).await?;
-        match record {
-            Some(r) if r.author_did != did => {
-                return Err(AppError::Forbidden(
-                    "You can only delete your own records".into(),
-                ));
-            }
-            None => {
-                return Err(AppError::NotFound("Record not found".into()));
-            }
-            _ => {}
-        }
-        db::delete_space_record(&state.db, state.db_backend, &record_uri).await?;
-    }
-
-    let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
-
+    service::delete_record(
+        &state,
+        &did,
+        &input.space,
+        &input.collection,
+        &input.rkey,
+        input.swap_record,
+    )
+    .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -739,8 +570,8 @@ async fn apply_writes(
     Json(input): Json<ApplyWritesInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_membership(
+    let space = service::resolve_space(&state, &input.space).await?;
+    service::require_membership(
         &state,
         &space,
         &did,
@@ -771,7 +602,7 @@ async fn apply_writes(
                 value,
             } => {
                 let rkey = rkey.unwrap_or_else(generate_tid);
-                let cid = content_cid(&value);
+                let cid = service::content_cid(&value);
                 let record_uri = format!(
                     "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
@@ -798,7 +629,7 @@ async fn apply_writes(
                 value,
                 swap_record,
             } => {
-                let cid = content_cid(&value);
+                let cid = service::content_cid(&value);
                 let record_uri = format!(
                     "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
@@ -847,6 +678,19 @@ async fn apply_writes(
                     )
                     .await?;
                 } else {
+                    // Mirrors `service::delete_record`'s non-swap ownership
+                    // check: only the record's own author may delete it.
+                    let existing =
+                        db::get_space_record(&state.db, state.db_backend, &record_uri).await?;
+                    match existing {
+                        Some(r) if r.author_did != did => {
+                            return Err(AppError::Forbidden(
+                                "You can only delete your own records".into(),
+                            ));
+                        }
+                        None => return Err(AppError::NotFound("Record not found".into())),
+                        _ => {}
+                    }
                     db::delete_space_record(&state.db, state.db_backend, &record_uri).await?;
                 }
                 results.push(serde_json::json!({}));
@@ -868,9 +712,9 @@ async fn get_record(
     Query(query): Query<GetRecordQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
-    let space = resolve_space(&state, &query.space).await?;
+    let space = service::resolve_space(&state, &query.space).await?;
     let has_credential = xrpc_claims.space_credential.is_some();
-    let membership = require_membership(
+    let membership = service::require_membership(
         &state,
         &space,
         &did,
@@ -905,9 +749,9 @@ async fn list_records(
     Query(query): Query<ListRecordsQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let did = require_auth_or_credential(&state, &xrpc_claims).await?;
-    let space = resolve_space(&state, &query.space).await?;
+    let space = service::resolve_space(&state, &query.space).await?;
     let has_credential = xrpc_claims.space_credential.is_some();
-    let membership = require_membership(
+    let membership = service::require_membership(
         &state,
         &space,
         &did,
@@ -970,28 +814,15 @@ async fn create_invite(
     Json(input): Json<CreateInviteInput>,
 ) -> Result<Response, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    let mut token_bytes = [0u8; 24];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut token_bytes);
-    let token = hex::encode(token_bytes);
-    let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
-
-    let invite = SpaceInvite {
-        id: Uuid::new_v4().to_string(),
-        space_id: space.id,
-        token_hash,
-        created_by: claims.did().to_string(),
-        access: input.access.unwrap_or(SpaceAccess::Read),
-        max_uses: input.max_uses,
-        uses: 0,
-        expires_at: input.expires_at,
-        revoked: false,
-        created_at: now_rfc3339(),
-    };
-
-    db::create_invite(&state.db, state.db_backend, &invite).await?;
+    let (invite, token) = service::create_invite(
+        &state,
+        claims.did(),
+        &input.space,
+        input.access,
+        input.max_uses,
+        input.expires_at,
+    )
+    .await?;
 
     let mut response = Json(serde_json::json!({
         "inviteId": invite.id,
@@ -1011,58 +842,11 @@ async fn accept_invite(
     Json(input): Json<RedeemInviteInput>,
 ) -> Result<Response, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let did = claims.did().to_string();
-
-    let token_hash = hex::encode(Sha256::digest(input.token.as_bytes()));
-    let invite = db::get_invite_by_token_hash(&state.db, state.db_backend, &token_hash)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Invalid invite token".into()))?;
-
-    if invite.revoked {
-        return Err(AppError::BadRequest("This invite has been revoked".into()));
-    }
-
-    if let Some(max) = invite.max_uses
-        && invite.uses >= max
-    {
-        return Err(AppError::BadRequest(
-            "This invite has reached its maximum uses".into(),
-        ));
-    }
-
-    if let Some(ref expires) = invite.expires_at {
-        let now = now_rfc3339();
-        if now > *expires {
-            return Err(AppError::BadRequest("This invite has expired".into()));
-        }
-    }
-
-    let existing = db::get_member(&state.db, state.db_backend, &invite.space_id, &did).await?;
-    if existing.is_some() {
-        return Err(AppError::Conflict(
-            "You are already a member of this space".into(),
-        ));
-    }
-
-    let member = SpaceMember {
-        id: Uuid::new_v4().to_string(),
-        space_id: invite.space_id.clone(),
-        did,
-        access: invite.access,
-        is_delegation: false,
-        granted_by: Some(invite.created_by.clone()),
-        created_at: now_rfc3339(),
-    };
-
-    db::add_member(&state.db, state.db_backend, &member).await?;
-    db::increment_invite_uses(&state.db, state.db_backend, &invite.id).await?;
-
-    let space = db::get_space(&state.db, state.db_backend, &invite.space_id).await?;
-    let space_uri = space.map(|s| format!("at://{}/space/{}/{}", s.did, s.type_nsid, s.skey));
+    let (space_uri, access) = service::accept_invite(&state, claims.did(), &input.token).await?;
 
     let mut response = Json(serde_json::json!({
         "uri": space_uri,
-        "access": member.access,
+        "access": access,
     }))
     .into_response();
     *response.status_mut() = StatusCode::CREATED;
@@ -1075,8 +859,8 @@ async fn revoke_invite(
     Json(input): Json<RevokeInviteInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
+    let space = service::resolve_space(&state, &input.space).await?;
+    service::require_space_admin(&state, &space, claims.did()).await?;
 
     let revoked = db::revoke_invite(&state.db, state.db_backend, &input.invite_id).await?;
     if !revoked {
@@ -1092,8 +876,8 @@ async fn list_invites(
     Query(query): Query<SpaceUriQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let space = resolve_space(&state, &query.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
+    let space = service::resolve_space(&state, &query.space).await?;
+    service::require_space_admin(&state, &space, claims.did()).await?;
 
     let invites = db::list_invites(&state.db, state.db_backend, &space.id).await?;
 
@@ -1127,9 +911,9 @@ async fn get_delegation_token(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
     let did = claims.did().to_string();
-    let space = resolve_space(&state, &params.space).await?;
+    let space = service::resolve_space(&state, &params.space).await?;
 
-    let membership = require_membership(&state, &space, &did, false, None).await?;
+    let membership = service::require_membership(&state, &space, &did, false, None).await?;
     let read_access = SpaceReadAccess::from_space_access(membership);
     check_delegation_token_access(read_access, false)?;
 
@@ -1182,9 +966,9 @@ async fn get_latest_commit(
     Query(params): Query<LatestCommitQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let did = require_auth_or_credential(&state, &claims).await?;
-    let space = resolve_space(&state, &params.space).await?;
+    let space = service::resolve_space(&state, &params.space).await?;
     let has_credential = claims.space_credential.is_some();
-    let membership = require_membership(
+    let membership = service::require_membership(
         &state,
         &space,
         &did,
@@ -1233,9 +1017,9 @@ async fn get_repo(
     Query(params): Query<GetRepoQuery>,
 ) -> Result<Response, AppError> {
     let did = require_auth_or_credential(&state, &claims).await?;
-    let space = resolve_space(&state, &params.space).await?;
+    let space = service::resolve_space(&state, &params.space).await?;
     let has_credential = claims.space_credential.is_some();
-    let membership = require_membership(
+    let membership = service::require_membership(
         &state,
         &space,
         &did,
@@ -1302,9 +1086,9 @@ async fn list_repo_ops(
     Query(params): Query<ListRepoOpsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let did = require_auth_or_credential(&state, &claims).await?;
-    let space = resolve_space(&state, &params.space).await?;
+    let space = service::resolve_space(&state, &params.space).await?;
     let has_credential = claims.space_credential.is_some();
-    let membership = require_membership(
+    let membership = service::require_membership(
         &state,
         &space,
         &did,
@@ -1349,7 +1133,7 @@ async fn list_repos(
     claims: XrpcClaims,
     Query(params): Query<SpaceUriQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    let space = resolve_space(&state, &params.space).await?;
+    let space = service::resolve_space(&state, &params.space).await?;
 
     // The repo list is the space's participant list. Its visibility follows the
     // `membershipPublic` config (like `get_space` / `listMembers`): public when
@@ -1358,7 +1142,7 @@ async fn list_repos(
     // checked membership, leaking any private space's participants (M2).
     if !space.config.membership_public {
         let did = require_auth_or_credential(&state, &claims).await?;
-        require_membership(
+        service::require_membership(
             &state,
             &space,
             &did,
@@ -1378,9 +1162,9 @@ async fn get_space_blob(
     Query(params): Query<GetSpaceBlobQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let did = require_auth_or_credential(&state, &claims).await?;
-    let space = resolve_space(&state, &params.space).await?;
+    let space = service::resolve_space(&state, &params.space).await?;
     let has_credential = claims.space_credential.is_some();
-    let membership = require_membership(
+    let membership = service::require_membership(
         &state,
         &space,
         &did,
@@ -1451,7 +1235,7 @@ async fn register_notify(
     Json(input): Json<RegisterNotifyInput>,
 ) -> Result<impl IntoResponse, AppError> {
     let did = require_auth_or_credential(&state, &claims).await?;
-    let space = resolve_space(&state, &input.space).await?;
+    let space = service::resolve_space(&state, &input.space).await?;
 
     let id = notifications::register(
         &state.db,
@@ -1475,8 +1259,8 @@ async fn notify_write(
     // write notifications. Previously this ignored the caller entirely, letting
     // anyone spam/forge notifications to registered endpoints (M1).
     let did = require_notify_caller(&claims)?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, &did).await?;
+    let space = service::resolve_space(&state, &input.space).await?;
+    service::require_space_admin(&state, &space, &did).await?;
 
     notifications::dispatch_write_notification(
         &state.db,
@@ -1501,8 +1285,8 @@ async fn notify_space_deleted(
     // Inter-service route: only the space authority (or a super admin) may fire
     // "space deleted" events (which may cause consumers to purge cached data).
     let did = require_notify_caller(&claims)?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, &did).await?;
+    let space = service::resolve_space(&state, &input.space).await?;
+    service::require_space_admin(&state, &space, &did).await?;
 
     notifications::dispatch_space_deleted(&state.db, state.db_backend, &state.http, &space.id)
         .await?;
@@ -1554,12 +1338,12 @@ async fn get_space_credential(
         ));
     }
 
-    let space = resolve_space(&state, &delegation_claims.sub).await?;
+    let space = service::resolve_space(&state, &delegation_claims.sub).await?;
 
     // Re-verify current membership before minting. The `MemberList` mint policy
     // is a no-op that trusts the delegation token, so a member removed within the
     // token's 60s window would otherwise still be able to mint.
-    require_membership(&state, &space, &delegation_claims.iss, false, None).await?;
+    service::require_membership(&state, &space, &delegation_claims.iss, false, None).await?;
 
     let client_id = if let Some(key) = claims.client_key() {
         resolve_client_id_url(&state, key).await?
@@ -1592,16 +1376,16 @@ mod tests {
     #[test]
     fn content_cid_deterministic() {
         let record = json!({"text": "hello"});
-        let cid1 = content_cid(&record);
-        let cid2 = content_cid(&record);
+        let cid1 = service::content_cid(&record);
+        let cid2 = service::content_cid(&record);
         assert_eq!(cid1, cid2);
         assert!(cid1.starts_with("bafyrei"));
     }
 
     #[test]
     fn content_cid_changes_for_different_records() {
-        let a = content_cid(&json!({"text": "hello"}));
-        let b = content_cid(&json!({"text": "world"}));
+        let a = service::content_cid(&json!({"text": "hello"}));
+        let b = service::content_cid(&json!({"text": "world"}));
         assert_ne!(a, b);
     }
 

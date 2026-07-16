@@ -4,12 +4,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use uuid::Uuid;
 
 use crate::AppState;
 use crate::auth::XrpcClaims;
-use crate::db::now_rfc3339;
 use crate::error::AppError;
+use crate::spaces::service;
 use crate::spaces::types::*;
 use crate::spaces::{SpaceUri, db, members};
 
@@ -205,98 +204,24 @@ async fn create_space(
     Json(input): Json<CreateSpaceInput>,
 ) -> Result<Response, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let did = claims.did().to_string();
-
-    if input.type_nsid.is_empty() || input.skey.is_empty() {
-        return Err(AppError::BadRequest("type and skey are required".into()));
-    }
-
-    let existing = db::get_space_by_address(
-        &state.db,
-        state.db_backend,
-        &did,
+    let space = service::create_space(
+        &state,
+        claims.did(),
         &input.type_nsid,
         &input.skey,
+        input.display_name,
+        input.description,
+        input.mint_policy,
+        input.app_access,
+        input.managing_app_did,
+        input.config,
     )
     .await?;
-    if existing.is_some() {
-        return Err(AppError::Conflict(
-            "A space with this address already exists".into(),
-        ));
-    }
-
-    // Optionally resolve the space type declaration from the lexicon registry.
-    // If the type NSID maps to a stored space declaration, use its collections
-    // as the default `allowed_collections` in the space config.
-    let mut config = input.config.unwrap_or_default();
-    if let Some(decl) = state.lexicons.get_space_declaration(&input.type_nsid).await
-        && let Some(collections) = decl.space_collections
-        && !collections.is_empty()
-        && !config.extra.contains_key("allowedCollections")
-    {
-        config.extra.insert(
-            "allowedCollections".to_string(),
-            serde_json::Value::Array(
-                collections
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-
-    let space = Space {
-        id: Uuid::new_v4().to_string(),
-        did: did.clone(),
-        authority_did: did.clone(),
-        creator_did: did.clone(),
-        type_nsid: input.type_nsid,
-        skey: input.skey,
-        display_name: input.display_name,
-        description: input.description,
-        mint_policy: input.mint_policy.unwrap_or(MintPolicy::MemberList),
-        app_access: input.app_access.unwrap_or_default(),
-        managing_app_did: input.managing_app_did,
-        config,
-        revision: None,
-        created_at: now_rfc3339(),
-        updated_at: now_rfc3339(),
-    };
-
-    db::create_space(&state.db, state.db_backend, &space).await?;
-
-    // Auto-provision #atproto_space verification method if TOKEN_ENCRYPTION_KEY is available
-    if let Some(encryption_key) = &state.config.token_encryption_key
-        && let Err(e) = crate::verification_methods::ensure_atproto_space_method(
-            &state.db,
-            state.db_backend,
-            encryption_key,
-        )
-        .await
-    {
-        tracing::warn!("failed to auto-provision #atproto_space verification method: {e}");
-    }
-
-    let member = SpaceMember {
-        id: Uuid::new_v4().to_string(),
-        space_id: space.id.clone(),
-        did: did.clone(),
-        access: SpaceAccess::Write,
-        is_delegation: false,
-        granted_by: Some(did),
-        created_at: now_rfc3339(),
-    };
-    db::add_member(&state.db, state.db_backend, &member).await?;
-
     let space_uri = format!(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    let body = serde_json::json!({
-        "uri": space_uri,
-    });
-
-    let mut response = Json(body).into_response();
+    let mut response = Json(serde_json::json!({ "uri": space_uri })).into_response();
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
 }
@@ -307,11 +232,7 @@ async fn delete_space(
     Json(input): Json<DeleteSpaceInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    db::delete_space(&state.db, state.db_backend, &space.id).await?;
-
+    service::delete_space(&state, claims.did(), &input.space).await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -321,30 +242,18 @@ async fn update_space(
     Json(input): Json<UpdateSpaceInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let mut space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    if let Some(name) = input.display_name {
-        space.display_name = name;
-    }
-    if let Some(desc) = input.description {
-        space.description = desc;
-    }
-    if let Some(policy) = input.mint_policy {
-        space.mint_policy = policy;
-    }
-    if let Some(access) = input.app_access {
-        space.app_access = access;
-    }
-    if let Some(did) = input.managing_app_did {
-        space.managing_app_did = did;
-    }
-    if let Some(config) = input.config {
-        space.config = config;
-    }
-
-    db::update_space(&state.db, state.db_backend, &space).await?;
-
+    let space = service::update_space(
+        &state,
+        claims.did(),
+        &input.space,
+        input.display_name,
+        input.description,
+        input.mint_policy,
+        input.app_access,
+        input.managing_app_did,
+        input.config,
+    )
+    .await?;
     let space_uri = format!(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
@@ -380,28 +289,15 @@ async fn add_member(
     Json(input): Json<AddMemberInput>,
 ) -> Result<Response, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    let existing = db::get_member(&state.db, state.db_backend, &space.id, &input.did).await?;
-    if existing.is_some() {
-        return Err(AppError::Conflict(
-            "Member already exists in this space".into(),
-        ));
-    }
-
-    let member = SpaceMember {
-        id: Uuid::new_v4().to_string(),
-        space_id: space.id,
-        did: input.did,
-        access: input.access.unwrap_or(SpaceAccess::Read),
-        is_delegation: input.is_delegation.unwrap_or(false),
-        granted_by: Some(claims.did().to_string()),
-        created_at: now_rfc3339(),
-    };
-
-    db::add_member(&state.db, state.db_backend, &member).await?;
-
+    let member = service::add_member(
+        &state,
+        claims.did(),
+        &input.space,
+        &input.did,
+        input.access,
+        input.is_delegation,
+    )
+    .await?;
     let mut response = Json(serde_json::json!({ "member": member })).into_response();
     *response.status_mut() = StatusCode::CREATED;
     Ok(response)
@@ -413,24 +309,7 @@ async fn remove_member(
     Json(input): Json<RemoveMemberInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
-    let space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    // Revoke any outstanding space credentials before removing the membership
-    // row. If revocation fails we bail out with the member still present, so a
-    // retry can complete both steps — the reverse order could leave a removed
-    // member holding valid credentials until their 2h TTL (M3). Revoking for a
-    // non-member is a harmless no-op, so the NotFound check still gates on the
-    // delete below.
-    db::revoke_space_credentials_for_member(&state.db, state.db_backend, &space.id, &input.did)
-        .await?;
-
-    let removed = db::remove_member(&state.db, state.db_backend, &space.id, &input.did).await?;
-
-    if !removed {
-        return Err(AppError::NotFound("Member not found in this space".into()));
-    }
-
+    service::remove_member(&state, claims.did(), &input.space, &input.did).await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 

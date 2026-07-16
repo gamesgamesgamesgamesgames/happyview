@@ -7,6 +7,7 @@ pub(crate) mod jobs_api;
 pub mod record;
 pub(crate) mod sandbox;
 pub mod scripts;
+pub(crate) mod spaces_api;
 pub(crate) mod tid;
 pub(crate) mod xrpc_api;
 

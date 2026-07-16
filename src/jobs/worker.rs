@@ -175,6 +175,14 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         let _ = db::set_error(state, &job.id, &format!("atproto api: {e}")).await;
         return;
     }
+    if let Err(e) = crate::lua::spaces_api::register_spaces_write_api(
+        &lua,
+        state_arc.clone(),
+        Some(&job.created_by),
+    ) {
+        let _ = db::set_error(state, &job.id, &format!("spaces write api: {e}")).await;
+        return;
+    }
     if let (Some(c), Some(p)) = (&claims, &pds_auth_arc)
         && let Err(e) = crate::lua::atproto_api::register_atproto_blob_api(
             &lua,
