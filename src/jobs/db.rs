@@ -20,6 +20,8 @@ type JobRow = (
     Option<String>,
     String,
     bool,
+    Option<String>,
+    Option<String>,
 );
 
 fn row_to_job(
@@ -36,6 +38,8 @@ fn row_to_job(
         completed_at,
         created_at,
         inherit_auth,
+        api_client_id,
+        dpop_key_id,
     ): JobRow,
 ) -> Job {
     Job {
@@ -51,6 +55,8 @@ fn row_to_job(
         completed_at,
         created_at,
         inherit_auth,
+        api_client_id,
+        dpop_key_id,
     }
 }
 
@@ -60,6 +66,8 @@ pub async fn create_job(
     input: &Value,
     created_by: &str,
     inherit_auth: bool,
+    api_client_id: Option<&str>,
+    dpop_key_id: Option<&str>,
 ) -> Result<String, AppError> {
     let id = Uuid::new_v4().to_string();
     let now = now_rfc3339();
@@ -67,7 +75,7 @@ pub async fn create_job(
         .map_err(|e| AppError::Internal(format!("failed to serialize job input: {e}")))?;
 
     let sql = adapt_sql(
-        "INSERT INTO happyview_jobs (id, job_type, status, input, created_by, created_at, inherit_auth) VALUES (?, ?, 'pending', ?, ?, ?, ?)",
+        "INSERT INTO happyview_jobs (id, job_type, status, input, created_by, created_at, inherit_auth, api_client_id, dpop_key_id) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
         state.db_backend,
     );
     crate::db::query(&sql)
@@ -77,6 +85,8 @@ pub async fn create_job(
         .bind(created_by)
         .bind(&now)
         .bind(inherit_auth)
+        .bind(api_client_id)
+        .bind(dpop_key_id)
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to create job: {e}")))?;

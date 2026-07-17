@@ -42,12 +42,23 @@ fn admin_post(
 }
 
 async fn seed_job(app: &TestApp, job_type: &str, status: &str) -> String {
+    seed_job_with_dpop(app, job_type, status, false, None, None).await
+}
+
+async fn seed_job_with_dpop(
+    app: &TestApp,
+    job_type: &str,
+    status: &str,
+    inherit_auth: bool,
+    api_client_id: Option<&str>,
+    dpop_key_id: Option<&str>,
+) -> String {
     let id = Uuid::new_v4().to_string();
     let now = happyview::db::now_rfc3339();
     let input = serde_json::to_string(&json!({"test": true})).unwrap();
 
     let sql = adapt_sql(
-        "INSERT INTO happyview_jobs (id, job_type, status, input, progress, created_by, created_at) VALUES (?, ?, ?, ?, '{}', ?, ?)",
+        "INSERT INTO happyview_jobs (id, job_type, status, input, progress, created_by, created_at, inherit_auth, api_client_id, dpop_key_id) VALUES (?, ?, ?, ?, '{}', ?, ?, ?, ?, ?)",
         app.state.db_backend,
     );
     happyview::db::query(&sql)
@@ -57,6 +68,9 @@ async fn seed_job(app: &TestApp, job_type: &str, status: &str) -> String {
         .bind(&input)
         .bind(&app.admin_did)
         .bind(&now)
+        .bind(inherit_auth)
+        .bind(api_client_id)
+        .bind(dpop_key_id)
         .execute(&app.state.db)
         .await
         .expect("seed_job: insert failed");
@@ -488,4 +502,123 @@ async fn full_job_lifecycle() {
     let job = json_body(resp).await;
     assert_eq!(job["status"], "cancelled");
     assert!(job["completed_at"].is_string());
+}
+
+// ---------------------------------------------------------------------------
+// DPoP context persistence
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn create_job_persists_dpop_context() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let id = seed_job_with_dpop(
+        &app,
+        "test.dpop",
+        "pending",
+        true,
+        Some("client_abc"),
+        Some("key_xyz"),
+    )
+    .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(&format!("/admin/jobs/{id}"), app.admin_cookie()))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let job = json_body(resp).await;
+    assert_eq!(job["inherit_auth"], true);
+    assert_eq!(job["api_client_id"], "client_abc");
+    assert_eq!(job["dpop_key_id"], "key_xyz");
+}
+
+#[tokio::test]
+#[serial]
+async fn create_job_without_dpop_has_null_fields() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let id = seed_job(&app, "test.no-dpop", "pending").await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(&format!("/admin/jobs/{id}"), app.admin_cookie()))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let job = json_body(resp).await;
+    assert_eq!(job["inherit_auth"], false);
+    assert_eq!(job["api_client_id"], Value::Null);
+    assert_eq!(job["dpop_key_id"], Value::Null);
+}
+
+#[tokio::test]
+#[serial]
+async fn get_job_returns_dpop_fields_in_response() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let id = seed_job_with_dpop(
+        &app,
+        "test.dpop-api",
+        "pending",
+        true,
+        Some("api_client_123"),
+        Some("dpop_key_456"),
+    )
+    .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(&format!("/admin/jobs/{id}"), app.admin_cookie()))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let job = json_body(resp).await;
+    assert_eq!(job["id"], id);
+    assert_eq!(job["inherit_auth"], true);
+    assert_eq!(job["api_client_id"], "api_client_123");
+    assert_eq!(job["dpop_key_id"], "dpop_key_456");
+}
+
+#[tokio::test]
+#[serial]
+async fn list_jobs_includes_dpop_fields() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    seed_job_with_dpop(
+        &app,
+        "test.list-dpop",
+        "pending",
+        true,
+        Some("list_client"),
+        Some("list_key"),
+    )
+    .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/jobs", app.admin_cookie()))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let jobs = body["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0]["api_client_id"], "list_client");
+    assert_eq!(jobs[0]["dpop_key_id"], "list_key");
+    assert_eq!(jobs[0]["inherit_auth"], true);
 }

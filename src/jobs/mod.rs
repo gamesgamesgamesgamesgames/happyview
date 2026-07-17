@@ -17,4 +17,6 @@ pub struct Job {
     pub completed_at: Option<String>,
     pub created_at: String,
     pub inherit_auth: bool,
+    pub api_client_id: Option<String>,
+    pub dpop_key_id: Option<String>,
 }

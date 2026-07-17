@@ -104,28 +104,46 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     };
 
     let (claims, pds_auth_arc) = if job.inherit_auth {
-        let pds_auth = match repo::get_oauth_session(state, &job.created_by).await {
-            Ok(session) => repo::PdsAuth::OAuth(Arc::new(session)),
-            Err(e) => {
-                let error = format!("failed to obtain PDS auth for {}: {e}", job.created_by);
-                tracing::error!(job_id = %job.id, %error);
-                let _ = db::set_error(state, &job.id, &error).await;
-                log_event(
-                    &state.db,
-                    EventLog {
-                        event_type: "job.failed".to_string(),
-                        severity: Severity::Error,
-                        actor_did: Some(job.created_by.clone()),
-                        subject: Some(job.job_type.clone()),
-                        detail: serde_json::json!({
-                            "job_id": job.id,
-                            "error": error,
-                        }),
-                    },
-                    backend,
-                )
-                .await;
-                return;
+        let pds_auth = if let (Some(api_client_id), Some(dpop_key_id)) =
+            (&job.api_client_id, &job.dpop_key_id)
+        {
+            let encryption_key = match state.config.token_encryption_key.as_ref() {
+                Some(k) => *k,
+                None => {
+                    let error = "inherit_auth with DPoP requires TOKEN_ENCRYPTION_KEY";
+                    let _ = db::set_error(state, &job.id, error).await;
+                    return;
+                }
+            };
+            repo::PdsAuth::Dpop {
+                api_client_id: api_client_id.clone(),
+                dpop_key_id: dpop_key_id.clone(),
+                encryption_key,
+            }
+        } else {
+            match repo::get_oauth_session(state, &job.created_by).await {
+                Ok(session) => repo::PdsAuth::OAuth(Arc::new(session)),
+                Err(e) => {
+                    let error = format!("failed to obtain PDS auth for {}: {e}", job.created_by);
+                    tracing::error!(job_id = %job.id, %error);
+                    let _ = db::set_error(state, &job.id, &error).await;
+                    log_event(
+                        &state.db,
+                        EventLog {
+                            event_type: "job.failed".to_string(),
+                            severity: Severity::Error,
+                            actor_did: Some(job.created_by.clone()),
+                            subject: Some(job.job_type.clone()),
+                            detail: serde_json::json!({
+                                "job_id": job.id,
+                                "error": error,
+                            }),
+                        },
+                        backend,
+                    )
+                    .await;
+                    return;
+                }
             }
         };
         (
@@ -197,7 +215,11 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     if let Err(e) = crate::lua::jobs_api::register_jobs_api(
         &lua,
         state_arc.clone(),
-        Some(job.created_by.clone()),
+        Some(crate::lua::jobs_api::JobsCaller {
+            did: job.created_by.clone(),
+            api_client_id: job.api_client_id.clone(),
+            dpop_key_id: job.dpop_key_id.clone(),
+        }),
     ) {
         let _ = db::set_error(state, &job.id, &format!("jobs api: {e}")).await;
         return;

@@ -296,9 +296,21 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
-    if let Err(e) =
-        super::jobs_api::register_jobs_api(&lua, state_arc.clone(), Some(claims.did().to_string()))
-    {
+    if let Err(e) = super::jobs_api::register_jobs_api(
+        &lua,
+        state_arc.clone(),
+        Some(super::jobs_api::JobsCaller {
+            did: claims.did().to_string(),
+            api_client_id: pds_auth_arc.as_ref().and_then(|a| match a.as_ref() {
+                repo::PdsAuth::Dpop { api_client_id, .. } => Some(api_client_id.clone()),
+                _ => None,
+            }),
+            dpop_key_id: pds_auth_arc.as_ref().and_then(|a| match a.as_ref() {
+                repo::PdsAuth::Dpop { dpop_key_id, .. } => Some(dpop_key_id.clone()),
+                _ => None,
+            }),
+        }),
+    ) {
         let error_message = format!("failed to register jobs API: {e}");
         log_event(
             &state.db,
