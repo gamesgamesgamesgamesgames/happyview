@@ -505,6 +505,155 @@ async fn full_job_lifecycle() {
 }
 
 // ---------------------------------------------------------------------------
+// Job logs
+// ---------------------------------------------------------------------------
+
+async fn seed_job_log(app: &TestApp, job_id: &str, level: &str, message: &str) {
+    let id = Uuid::new_v4().to_string();
+    let now = happyview::db::now_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_job_logs (id, job_id, level, message, created_at) VALUES (?, ?, ?, ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(&id)
+        .bind(job_id)
+        .bind(level)
+        .bind(message)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .expect("seed_job_log: insert failed");
+}
+
+#[tokio::test]
+#[serial]
+async fn list_job_logs_empty() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let id = seed_job(&app, "test.logs", "running").await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/jobs/{id}/logs"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["logs"].as_array().unwrap().len(), 0);
+    assert_eq!(body["cursor"], Value::Null);
+}
+
+#[tokio::test]
+#[serial]
+async fn list_job_logs_returns_seeded_logs() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let id = seed_job(&app, "test.logs", "running").await;
+    seed_job_log(&app, &id, "info", "starting migration").await;
+    seed_job_log(&app, &id, "warn", "rate limited").await;
+    seed_job_log(&app, &id, "info", "migration complete").await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/jobs/{id}/logs"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let logs = body["logs"].as_array().unwrap();
+    assert_eq!(logs.len(), 3);
+    assert_eq!(logs[0]["message"], "starting migration");
+    assert_eq!(logs[0]["level"], "info");
+    assert_eq!(logs[1]["message"], "rate limited");
+    assert_eq!(logs[1]["level"], "warn");
+    assert_eq!(logs[2]["message"], "migration complete");
+}
+
+#[tokio::test]
+#[serial]
+async fn list_job_logs_pagination() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let id = seed_job(&app, "test.logs-page", "running").await;
+    for i in 0..5 {
+        seed_job_log(&app, &id, "info", &format!("log-{i}")).await;
+    }
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/jobs/{id}/logs?limit=2"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let logs = body["logs"].as_array().unwrap();
+    assert_eq!(logs.len(), 2);
+    assert_eq!(logs[0]["message"], "log-0");
+    assert_eq!(logs[1]["message"], "log-1");
+    assert!(body["cursor"].is_string());
+
+    let cursor = body["cursor"].as_str().unwrap();
+    let resp2 = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/jobs/{id}/logs?limit=2&cursor={cursor}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let body2 = json_body(resp2).await;
+    let logs2 = body2["logs"].as_array().unwrap();
+    assert_eq!(logs2.len(), 2);
+    assert_eq!(logs2[0]["message"], "log-2");
+    assert_eq!(logs2[1]["message"], "log-3");
+}
+
+#[tokio::test]
+#[serial]
+async fn list_job_logs_without_auth_returns_401() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let id = seed_job(&app, "test.logs-auth", "running").await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/admin/jobs/{id}/logs"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
 // DPoP context persistence
 // ---------------------------------------------------------------------------
 

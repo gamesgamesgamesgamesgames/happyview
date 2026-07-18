@@ -3,7 +3,7 @@ import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
 import type { BackfillJob, BackfillReposResponse, PdsSummaryResponse } from "@/types/backfill";
-import type { Job, JobsListResponse } from "@/types/jobs";
+import type { Job, JobLogsResponse, JobsListResponse } from "@/types/jobs";
 import type { UserSummary } from "@/types/users";
 import type { AdminListRecordsResponse } from "@/types/records";
 import type { EventsListResponse } from "@/types/events";
@@ -285,6 +285,19 @@ export function resumeJob(id: string) {
   return apiFetch<{ status: string }>(`/admin/jobs/${id}/resume`, {
     method: "POST",
   });
+}
+
+export function getJobLogs(
+  id: string,
+  params: { limit?: number; cursor?: string } = {},
+) {
+  const qs = new URLSearchParams();
+  if (params.limit) qs.set("limit", String(params.limit));
+  if (params.cursor) qs.set("cursor", params.cursor);
+  const query = qs.toString();
+  return apiFetch<JobLogsResponse>(
+    `/admin/jobs/${id}/logs${query ? `?${query}` : ""}`,
+  );
 }
 
 // Users

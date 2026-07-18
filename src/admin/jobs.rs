@@ -122,3 +122,33 @@ pub async fn resume_job(
     jobs::db::set_status(&state, &id, "pending").await?;
     Ok(Json(serde_json::json!({ "status": "pending" })))
 }
+
+#[derive(Deserialize)]
+pub struct ListJobLogsQuery {
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+pub async fn list_job_logs(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+    Query(query): Query<ListJobLogsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::JobsRead).await?;
+
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let (logs, cursor) = jobs::logs::list_logs(
+        &state.db,
+        state.db_backend,
+        &id,
+        limit,
+        query.cursor.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "logs": logs,
+        "cursor": cursor,
+    })))
+}

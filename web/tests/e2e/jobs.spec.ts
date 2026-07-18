@@ -34,10 +34,37 @@ async function seedJob(
   }
 }
 
+async function seedJobLogs(
+  jobId: string,
+  logs: Array<{ level: string; message: string }>,
+): Promise<void> {
+  const client = new pg.Client(DB_URL)
+  await client.connect()
+  try {
+    for (const log of logs) {
+      const id = randomUUID()
+      const now = new Date().toISOString()
+      await client.query(
+        `INSERT INTO happyview_job_logs (id, job_id, level, message, created_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [id, jobId, log.level, log.message, now],
+      )
+    }
+  } finally {
+    await client.end()
+  }
+}
+
 async function cleanupJobs(): Promise<void> {
   const client = new pg.Client(DB_URL)
   await client.connect()
   try {
+    await client.query(
+      `DELETE FROM happyview_job_logs WHERE job_id IN (
+        SELECT id FROM happyview_jobs WHERE created_by = $1
+      )`,
+      [TEST_DID],
+    )
     await client.query(
       "DELETE FROM happyview_jobs WHERE created_by = $1",
       [TEST_DID],
@@ -175,6 +202,33 @@ test.describe("Jobs Dashboard", () => {
     await expect(
       sheet.getByRole("button", { name: "Resume Job" }),
     ).toBeVisible()
+  })
+
+  test("shows logs section in job detail sheet", async ({ page }) => {
+    const id = await seedJob("completed", "test.e2e.logs")
+    await seedJobLogs(id, [
+      { level: "info", message: "starting migration" },
+      { level: "warn", message: "rate limited on blob upload" },
+      { level: "info", message: "migration complete" },
+    ])
+
+    await page.goto("/dashboard/jobs")
+
+    const row = page.locator("table tbody tr", {
+      hasText: "test.e2e.logs",
+    })
+    await expect(row).toBeVisible({ timeout: 5000 })
+    await row.click()
+
+    const sheet = page.locator("[data-state='open'][role='dialog']")
+    await expect(sheet).toBeVisible({ timeout: 3000 })
+
+    await expect(sheet.getByText("Logs", { exact: true })).toBeVisible({ timeout: 5000 })
+    await expect(sheet.getByText("starting migration")).toBeVisible()
+    await expect(sheet.getByText("rate limited on blob upload")).toBeVisible()
+    await expect(sheet.getByText("migration complete")).toBeVisible()
+    await expect(sheet.getByText("WARN")).toBeVisible()
+    await expect(sheet.getByText("INFO").first()).toBeVisible()
   })
 
   test("shows error section for failed job", async ({ page }) => {

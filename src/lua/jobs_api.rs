@@ -153,6 +153,56 @@ pub fn register_job_context(
         job_table.set("wait", wait_fn)?;
     }
 
+    // job.log(message)
+    {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        let log_fn = lua.create_async_function(move |_lua, msg: String| {
+            let state = state.clone();
+            let job_id = job_id.clone();
+            async move {
+                if let Err(e) = crate::jobs::logs::insert_log(
+                    &state.db,
+                    state.db_backend,
+                    &job_id,
+                    "info",
+                    &msg,
+                )
+                .await
+                {
+                    tracing::warn!(job_id = %job_id, error = %e, "job.log insert failed");
+                }
+                Ok(())
+            }
+        })?;
+        job_table.set("log", log_fn)?;
+    }
+
+    // job.warn(message)
+    {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        let warn_fn = lua.create_async_function(move |_lua, msg: String| {
+            let state = state.clone();
+            let job_id = job_id.clone();
+            async move {
+                if let Err(e) = crate::jobs::logs::insert_log(
+                    &state.db,
+                    state.db_backend,
+                    &job_id,
+                    "warn",
+                    &msg,
+                )
+                .await
+                {
+                    tracing::warn!(job_id = %job_id, error = %e, "job.warn insert failed");
+                }
+                Ok(())
+            }
+        })?;
+        job_table.set("warn", warn_fn)?;
+    }
+
     lua.globals().set("job", job_table)?;
     Ok(())
 }
@@ -328,6 +378,8 @@ mod tests {
                 return type(job.progress) == 'function'
                     and type(job.should_stop) == 'function'
                     and type(job.wait) == 'function'
+                    and type(job.log) == 'function'
+                    and type(job.warn) == 'function'
                 "#,
             )
             .eval_async()
@@ -389,6 +441,18 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create happyview_jobs table");
+        crate::db::query(
+            "CREATE TABLE happyview_job_logs (
+                id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                level TEXT NOT NULL DEFAULT 'info',
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create happyview_job_logs table");
         pool
     }
 
@@ -559,5 +623,65 @@ mod tests {
         assert_eq!(row.0, 0);
         assert!(row.1.is_none());
         assert!(row.2.is_none());
+    }
+
+    #[tokio::test]
+    async fn job_log_inserts_info_row() {
+        let pool = migrated_pool().await;
+        let state = test_state_with_pool(pool);
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_job_context(
+            &lua,
+            Arc::new(state.clone()),
+            "log-test-job".into(),
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+        lua.load(r#"job.log("hello from lua")"#)
+            .exec_async()
+            .await
+            .unwrap();
+
+        let row: (String, String, String) = crate::db::query_as(
+            "SELECT job_id, level, message FROM happyview_job_logs WHERE job_id = 'log-test-job'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("log row should exist");
+
+        assert_eq!(row.0, "log-test-job");
+        assert_eq!(row.1, "info");
+        assert_eq!(row.2, "hello from lua");
+    }
+
+    #[tokio::test]
+    async fn job_warn_inserts_warn_row() {
+        let pool = migrated_pool().await;
+        let state = test_state_with_pool(pool);
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_job_context(
+            &lua,
+            Arc::new(state.clone()),
+            "warn-test-job".into(),
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+        lua.load(r#"job.warn("something is off")"#)
+            .exec_async()
+            .await
+            .unwrap();
+
+        let row: (String, String, String) = crate::db::query_as(
+            "SELECT job_id, level, message FROM happyview_job_logs WHERE job_id = 'warn-test-job'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("warn row should exist");
+
+        assert_eq!(row.0, "warn-test-job");
+        assert_eq!(row.1, "warn");
+        assert_eq!(row.2, "something is off");
     }
 }

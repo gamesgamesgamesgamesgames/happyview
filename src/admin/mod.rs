@@ -68,6 +68,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route("/jobs/{id}/cancel", post(jobs::cancel_job))
         .route("/jobs/{id}/pause", post(jobs::pause_job))
         .route("/jobs/{id}/resume", post(jobs::resume_job))
+        .route("/jobs/{id}/logs", get(jobs::list_job_logs))
         .route("/events", get(events::list_events))
         .route("/users", post(users::create_user).get(users::list_users))
         .route("/users/transfer-super", post(users::transfer_super))

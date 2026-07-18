@@ -1,4 +1,5 @@
 pub(crate) mod db;
+pub(crate) mod logs;
 pub mod worker;
 
 use serde::{Deserialize, Serialize};

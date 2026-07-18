@@ -260,6 +260,35 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         return;
     }
 
+    {
+        let existing_log: mlua::Function = lua.globals().get("log").unwrap();
+        let state_for_log = state_arc.clone();
+        let job_id_for_log = job.id.clone();
+        let dual_log = lua
+            .create_async_function(move |_lua, msg: String| {
+                let existing = existing_log.clone();
+                let state = state_for_log.clone();
+                let job_id = job_id_for_log.clone();
+                async move {
+                    let _ = existing.call_async::<()>(msg.clone()).await;
+                    if let Err(e) = crate::jobs::logs::insert_log(
+                        &state.db,
+                        state.db_backend,
+                        &job_id,
+                        "info",
+                        &msg,
+                    )
+                    .await
+                    {
+                        tracing::warn!(job_id = %job_id, error = %e, "dual log insert failed");
+                    }
+                    Ok(())
+                }
+            })
+            .unwrap();
+        let _ = lua.globals().set("log", dual_log);
+    }
+
     if let Err(e) = lua.load(script.body.as_str()).exec() {
         let error = format!("script load failed: {e}");
         let _ = db::set_error(state, &job.id, &error).await;

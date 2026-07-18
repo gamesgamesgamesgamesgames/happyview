@@ -17,3 +17,16 @@ export interface JobsListResponse {
   jobs: Job[]
   cursor: string | null
 }
+
+export interface JobLog {
+  id: string
+  jobId: string
+  level: string
+  message: string
+  createdAt: string
+}
+
+export interface JobLogsResponse {
+  logs: JobLog[]
+  cursor: string | null
+}

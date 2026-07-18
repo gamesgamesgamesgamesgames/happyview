@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   CheckCircle2,
@@ -15,11 +15,12 @@ import { useCurrentUser } from "@/hooks/use-current-user";
 import { toastError } from "@/lib/format";
 import {
   cancelJob,
+  getJobLogs,
   getJobs,
   pauseJob,
   resumeJob,
 } from "@/lib/api";
-import type { Job } from "@/types/jobs";
+import type { Job, JobLog } from "@/types/jobs";
 import { SiteHeader } from "@/components/site-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -427,6 +428,8 @@ function JobDetail({
         <JsonSection title="Input" data={job.input} defaultOpen />
         <JsonSection title="Progress" data={job.progress} defaultOpen={isActive} />
         {hasContent(job.result) && <JsonSection title="Result" data={job.result} />}
+
+        <JobLogs jobId={job.id} isActive={isActive} />
       </div>
 
       {canManage && (
@@ -480,6 +483,76 @@ function JobDetail({
         </SheetFooter>
       )}
     </>
+  );
+}
+
+function JobLogs({ jobId, isActive }: { jobId: string; isActive: boolean }) {
+  const [logs, setLogs] = useState<JobLog[]>([]);
+  const [loading, setLoading] = useState(true);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const load = useCallback(() => {
+    getJobLogs(jobId, { limit: 200 })
+      .then((resp) => {
+        setLogs(resp.logs);
+        setLoading(false);
+      })
+      .catch(() => {
+        setLoading(false);
+      });
+  }, [jobId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  useEffect(() => {
+    if (!isActive) return;
+    const interval = setInterval(load, 3000);
+    return () => clearInterval(interval);
+  }, [load, isActive]);
+
+  useEffect(() => {
+    if (containerRef.current) {
+      containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    }
+  }, [logs]);
+
+  if (loading && logs.length === 0) {
+    return (
+      <div className="text-sm text-muted-foreground flex items-center gap-2">
+        <Loader2 className="size-3 animate-spin" />
+        Loading logs…
+      </div>
+    );
+  }
+
+  if (logs.length === 0) return null;
+
+  return (
+    <div>
+      <span className="text-sm text-muted-foreground">Logs</span>
+      <div
+        ref={containerRef}
+        className="mt-1 rounded-md border bg-muted/30 p-3 font-mono text-xs max-h-64 overflow-y-auto space-y-0.5"
+      >
+        {logs.map((log) => (
+          <div key={log.id} className="flex gap-2">
+            <span className="text-muted-foreground shrink-0 tabular-nums">
+              {new Date(log.createdAt).toLocaleTimeString()}
+            </span>
+            {log.level === "warn" ? (
+              <span className="text-amber-600 dark:text-amber-400 shrink-0">
+                WARN
+              </span>
+            ) : (
+              <span className="text-muted-foreground shrink-0">INFO</span>
+            )}
+            <span className="break-all">{log.message}</span>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
