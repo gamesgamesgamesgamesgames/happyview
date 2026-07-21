@@ -95,24 +95,10 @@ impl AttestationSigner {
             .as_object_mut()
             .ok_or_else(|| AttestationError::Encoding("record must be an object".into()))?;
 
-        // Remove existing signatures for CID computation
         let existing_signatures = obj.remove("signatures");
 
-        // Inject $sig metadata for CID computation
-        let sig_metadata = serde_json::json!({
-            "$type": &self.sig_type,
-            "repository": repository_did,
-        });
-        obj.insert("$sig".to_string(), sig_metadata);
-
-        // Encode to CBOR (DAG-CBOR canonical form)
-        let cbor_bytes = self.encode_dag_cbor(obj)?;
-
-        // Compute CID (sha2-256, dag-cbor codec)
-        let cid = self.compute_cid(&cbor_bytes);
-
-        // Remove $sig (it's only for CID computation)
-        obj.remove("$sig");
+        let body = Self::signable_body(obj, &self.sig_type, repository_did);
+        let cid = self.compute_cid_current(&body)?;
 
         // Sign the CID bytes
         let signature = self.sign_cid(&cid)?;
@@ -144,41 +130,91 @@ impl AttestationSigner {
         Ok(cid)
     }
 
-    /// Encode a JSON object to DAG-CBOR canonical form
-    fn encode_dag_cbor(&self, obj: &Map<String, Value>) -> Result<Vec<u8>, AttestationError> {
-        // Convert to ciborium Value and encode
-        // DAG-CBOR requires deterministic key ordering (lexicographic)
-        let cbor_value = json_to_cbor(&Value::Object(obj.clone()));
+    #[cfg(test)]
+    pub fn sign_record_legacy(
+        &self,
+        record: &mut Value,
+        repository_did: &str,
+    ) -> Result<Cid, AttestationError> {
+        let obj = record
+            .as_object_mut()
+            .ok_or_else(|| AttestationError::Encoding("record must be an object".into()))?;
+        let existing_signatures = obj.remove("signatures");
 
-        let mut buf = Vec::new();
-        ciborium::into_writer(&cbor_value, &mut buf)
-            .map_err(|e| AttestationError::Encoding(format!("CBOR encoding failed: {}", e)))?;
+        let body = Self::signable_body(obj, &self.sig_type, repository_did);
+        let cid = self.compute_cid_legacy(&body)?;
+        let signature = self.sign_cid(&cid)?;
 
-        Ok(buf)
+        let inline_sig = serde_json::json!({
+            "$type": &self.sig_type,
+            "key": &self.key_id,
+            "signature": {
+                "$bytes": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &signature)
+            }
+        });
+
+        let signatures = obj
+            .entry("signatures")
+            .or_insert_with(|| Value::Array(vec![]));
+        if let Value::Array(arr) = signatures {
+            if let Some(Value::Array(existing)) = existing_signatures {
+                for sig in existing {
+                    arr.push(sig);
+                }
+            }
+            arr.push(inline_sig);
+        }
+
+        Ok(cid)
     }
 
-    /// Compute CID from CBOR bytes (sha2-256, dag-cbor codec)
-    fn compute_cid(&self, cbor_bytes: &[u8]) -> Cid {
-        // SHA2-256 hash
-        let digest = Sha256::digest(cbor_bytes);
+    fn compute_cid_current(&self, obj: &Map<String, Value>) -> Result<Cid, AttestationError> {
+        let value = Value::Object(obj.clone());
+        let cbor = crate::cid_verify::record_to_dag_cbor(&value).ok_or_else(|| {
+            AttestationError::Encoding("record cannot be encoded as DAG-CBOR".into())
+        })?;
+        crate::cid_verify::dag_cbor_cid(&cbor)
+            .ok_or_else(|| AttestationError::Encoding("failed to build CID".into()))
+    }
+
+    fn compute_cid_legacy(&self, obj: &Map<String, Value>) -> Result<Cid, AttestationError> {
+        let cbor_value = legacy_json_to_cbor(&Value::Object(obj.clone()));
+
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&cbor_value, &mut cbor)
+            .map_err(|e| AttestationError::Encoding(format!("CBOR encoding failed: {}", e)))?;
+
+        let digest = Sha256::digest(&cbor);
 
         // Create multihash: varint(code) || varint(size) || digest
         let mut multihash_bytes = Vec::new();
-        // SHA2-256 code (0x12)
         multihash_bytes.push(SHA2_256_CODE as u8);
-        // Digest size (32 bytes)
         multihash_bytes.push(32u8);
-        // The digest
         multihash_bytes.extend_from_slice(&digest);
 
         let multihash =
             cid::multihash::Multihash::<64>::from_bytes(&multihash_bytes).expect("valid multihash");
 
-        // CID v1 with dag-cbor codec
-        Cid::new_v1(DAG_CBOR_CODEC, multihash)
+        Ok(Cid::new_v1(DAG_CBOR_CODEC, multihash))
     }
 
-    /// Sign a CID using ECDSA with low-S normalization
+    fn signable_body(
+        record: &Map<String, Value>,
+        sig_type: &str,
+        repository_did: &str,
+    ) -> Map<String, Value> {
+        let mut obj = record.clone();
+        obj.remove("signatures");
+        obj.insert(
+            "$sig".to_string(),
+            serde_json::json!({
+                "$type": sig_type,
+                "repository": repository_did,
+            }),
+        );
+        obj
+    }
+
     fn sign_cid(&self, cid: &Cid) -> Result<Vec<u8>, AttestationError> {
         let cid_bytes = cid.to_bytes();
 
@@ -188,16 +224,12 @@ impl AttestationSigner {
         Ok(signature.to_bytes().to_vec())
     }
 
-    /// Verify that a signature in a record was produced by this signer.
-    ///
-    /// Recomputes the CID from the record (same process as signing) and verifies
-    /// the ECDSA signature using our public key.
-    pub fn verify_record_signature(
+    pub fn verify_record_signature_detailed(
         &self,
         record: &Value,
         signature_obj: &Value,
         repository_did: &str,
-    ) -> Result<bool, AttestationError> {
+    ) -> Result<SignatureVerification, AttestationError> {
         use k256::ecdsa::{VerifyingKey, signature::Verifier};
 
         // Check key ID matches
@@ -207,7 +239,7 @@ impl AttestationSigner {
             .ok_or_else(|| AttestationError::MissingField("signature.key".into()))?;
 
         if key != self.key_id {
-            return Ok(false);
+            return Ok(SignatureVerification::Invalid);
         }
 
         // Extract signature bytes
@@ -224,33 +256,76 @@ impl AttestationSigner {
         let signature = Signature::from_slice(&sig_bytes[..])
             .map_err(|e| AttestationError::Signing(format!("invalid signature bytes: {e}")))?;
 
-        // Recompute CID from record (same as signing)
-        let mut obj = record
+        // Recompute the signed body (same as signing)
+        let obj = record
             .as_object()
-            .ok_or_else(|| AttestationError::Encoding("record must be an object".into()))?
-            .clone();
+            .ok_or_else(|| AttestationError::Encoding("record must be an object".into()))?;
+        let body = Self::signable_body(obj, &self.sig_type, repository_did);
 
-        // Remove signatures for CID computation
-        obj.remove("signatures");
-
-        // Inject $sig metadata
-        let sig_metadata = serde_json::json!({
-            "$type": &self.sig_type,
-            "repository": repository_did,
-        });
-        obj.insert("$sig".to_string(), sig_metadata);
-
-        let cbor_bytes = self.encode_dag_cbor(&obj)?;
-        let cid = self.compute_cid(&cbor_bytes);
-
-        // Verify
         let verifying_key = VerifyingKey::from(&self.signing_key);
-        Ok(verifying_key.verify(&cid.to_bytes(), &signature).is_ok())
+        let matches = |cid: &Cid| verifying_key.verify(&cid.to_bytes(), &signature).is_ok();
+
+        // Current encoding first: it is the common path for anything signed
+        // after the encoder was corrected.
+        if matches(&self.compute_cid_current(&body)?) {
+            return Ok(SignatureVerification::Valid(SignatureEncoding::Current));
+        }
+
+        // Fall back to the pre-fix encoding. This does not weaken the check —
+        // the same key still has to have signed a CID derived from this exact
+        // content; only the canonicalisation differs.
+        if matches(&self.compute_cid_legacy(&body)?) {
+            tracing::warn!(
+                key_id = %self.key_id,
+                repository = %repository_did,
+                "legacy attestation signature verified — signed before the DAG-CBOR \
+                 encoder was corrected; the fallback can be removed once these stop appearing"
+            );
+            return Ok(SignatureVerification::Valid(SignatureEncoding::Legacy));
+        }
+
+        Ok(SignatureVerification::Invalid)
+    }
+
+    /// Verify that a signature in a record was produced by this signer.
+    pub fn verify_record_signature(
+        &self,
+        record: &Value,
+        signature_obj: &Value,
+        repository_did: &str,
+    ) -> Result<bool, AttestationError> {
+        Ok(self
+            .verify_record_signature_detailed(record, signature_obj, repository_did)?
+            .is_valid())
     }
 }
 
-/// Convert JSON Value to ciborium Value with deterministic ordering
-fn json_to_cbor(value: &Value) -> ciborium::Value {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureEncoding {
+    Current,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureVerification {
+    Valid(SignatureEncoding),
+    Invalid,
+}
+
+impl SignatureVerification {
+    pub fn is_valid(&self) -> bool {
+        matches!(self, SignatureVerification::Valid(_))
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        matches!(
+            self,
+            SignatureVerification::Valid(SignatureEncoding::Legacy)
+        )
+    }
+}
+
+fn legacy_json_to_cbor(value: &Value) -> ciborium::Value {
     match value {
         Value::Null => ciborium::Value::Null,
         Value::Bool(b) => ciborium::Value::Bool(*b),
@@ -269,7 +344,7 @@ fn json_to_cbor(value: &Value) -> ciborium::Value {
             // Check for $bytes encoding (base64)
             ciborium::Value::Text(s.clone())
         }
-        Value::Array(arr) => ciborium::Value::Array(arr.iter().map(json_to_cbor).collect()),
+        Value::Array(arr) => ciborium::Value::Array(arr.iter().map(legacy_json_to_cbor).collect()),
         Value::Object(obj) => {
             // Handle special $bytes encoding for binary data
             if obj.len() == 1
@@ -283,7 +358,7 @@ fn json_to_cbor(value: &Value) -> ciborium::Value {
             // Sort keys lexicographically for deterministic encoding
             let mut pairs: Vec<_> = obj
                 .iter()
-                .map(|(k, v)| (ciborium::Value::Text(k.clone()), json_to_cbor(v)))
+                .map(|(k, v)| (ciborium::Value::Text(k.clone()), legacy_json_to_cbor(v)))
                 .collect();
             pairs.sort_by(|a, b| {
                 if let (ciborium::Value::Text(ka), ciborium::Value::Text(kb)) = (&a.0, &b.0) {
@@ -298,12 +373,8 @@ fn json_to_cbor(value: &Value) -> ciborium::Value {
     }
 }
 
-/// Shared attestation signer for the application
 pub type SharedAttestationSigner = Arc<AttestationSigner>;
 
-/// Load attestation signer from environment variables.
-///
-/// Returns `Ok(None)` when no `ATTESTATION_PRIVATE_KEY` is set.
 pub fn load_from_env() -> Result<Option<AttestationSigner>, AttestationError> {
     let private_key = match std::env::var("ATTESTATION_PRIVATE_KEY") {
         Ok(k) => k,
@@ -323,15 +394,6 @@ pub fn load_from_env() -> Result<Option<AttestationSigner>, AttestationError> {
     )?))
 }
 
-/// Load or auto-generate the attestation signer.
-///
-/// Priority order:
-/// 1. Environment variables (`ATTESTATION_PRIVATE_KEY`, etc.)
-/// 2. `instance_settings` table in the database
-/// 3. Generate a fresh key, persist it to `instance_settings`, and use it
-///
-/// `key_id` is derived from `public_url` when not explicitly set:
-/// `did:web:{host}#attestation`
 pub async fn load_or_generate(
     db: &sqlx::AnyPool,
     backend: crate::db::DatabaseBackend,
@@ -339,13 +401,11 @@ pub async fn load_or_generate(
 ) -> Result<AttestationSigner, AttestationError> {
     use crate::db::adapt_sql;
 
-    // 1. Try env vars first (explicit override)
     if let Some(signer) = load_from_env()? {
         tracing::info!("Attestation signer loaded from environment variables");
         return Ok(signer);
     }
 
-    // Derive default key_id from public_url (extract host without adding a url crate dep)
     let host = public_url
         .strip_prefix("https://")
         .or_else(|| public_url.strip_prefix("http://"))
@@ -360,7 +420,6 @@ pub async fn load_or_generate(
     let default_key_id = format!("did:web:{host}#attestation");
     let default_sig_type = "games.gamesgamesgamesgames.attestation".to_string();
 
-    // 2. Try loading from instance_settings
     let sql = adapt_sql(
         "SELECT value FROM happyview_instance_settings WHERE key = ?",
         backend,
@@ -372,7 +431,6 @@ pub async fn load_or_generate(
         .map_err(|e| AttestationError::Encoding(format!("db query failed: {e}")))?;
 
     if let Some((hex_key,)) = existing {
-        // Load key_id and sig_type from DB too (or use defaults)
         let key_id: Option<(String,)> = crate::db::query_as(&sql)
             .bind("attestation_key_id")
             .fetch_optional(db)
@@ -392,7 +450,6 @@ pub async fn load_or_generate(
         );
     }
 
-    // 3. Generate a new key and persist it
     tracing::info!("Generating new attestation signing key");
     let hex_key = {
         // Generate 32 random bytes for a K-256 private key
@@ -492,9 +549,6 @@ mod tests {
         let cid1 = signer.sign_record(&mut r1, "did:plc:test").unwrap();
         let cid2 = signer.sign_record(&mut r2, "did:plc:test").unwrap();
 
-        // Different signatures (random nonce in ECDSA) but...
-        // Actually the CIDs should be the same since they're computed before signing
-        // and the key ordering is normalized
         assert_eq!(cid1, cid2);
     }
 
@@ -519,14 +573,12 @@ mod tests {
 
         let sig = &record["signatures"].as_array().unwrap()[0];
 
-        // Verification should succeed with correct DID
         assert!(
             signer
                 .verify_record_signature(&record, sig, "did:plc:contributor")
                 .unwrap()
         );
 
-        // Verification should fail with wrong DID (replay protection)
         assert!(
             !signer
                 .verify_record_signature(&record, sig, "did:plc:wrong")
@@ -581,7 +633,6 @@ mod tests {
         // Tamper with the record
         record["changes"]["name"] = serde_json::json!("Tampered");
 
-        // Verification should fail
         assert!(
             !signer
                 .verify_record_signature(&record, &sig, "did:plc:test")
@@ -612,10 +663,8 @@ mod tests {
         .await
         .expect("should generate a key");
 
-        // Key ID should be derived from public_url
         assert_eq!(signer.key_id, "did:web:happyview.example.com#attestation");
 
-        // Should be persisted — loading again returns the same key
         let signer2 = load_or_generate(
             &pool,
             crate::db::DatabaseBackend::Sqlite,
@@ -624,7 +673,6 @@ mod tests {
         .await
         .expect("should load from DB");
 
-        // Same key → same public key bytes
         assert_eq!(signer.public_key_bytes(), signer2.public_key_bytes());
     }
 
@@ -663,6 +711,177 @@ mod tests {
             signer
                 .verify_record_signature(&record, sig, "did:plc:user123")
                 .unwrap()
+        );
+    }
+
+    fn test_signer() -> AttestationSigner {
+        AttestationSigner::for_testing(
+            "did:web:test.example#signing".to_string(),
+            "test.signature".to_string(),
+        )
+    }
+
+    fn ordering_sensitive_record() -> Value {
+        serde_json::json!({ "aa": 2, "b": 1 })
+    }
+
+    #[test]
+    fn current_cid_matches_canonical_dag_cbor() {
+        let signer = test_signer();
+        let body = AttestationSigner::signable_body(
+            ordering_sensitive_record().as_object().unwrap(),
+            &signer.sig_type,
+            "did:plc:test",
+        );
+        let expected =
+            crate::cid_verify::compute_record_cid(&Value::Object(body.clone())).expect("encodable");
+        assert_eq!(
+            signer.compute_cid_current(&body).unwrap(),
+            expected,
+            "signing CID must equal what a conforming implementation derives"
+        );
+    }
+
+    #[test]
+    fn legacy_and_current_cids_actually_differ() {
+        let signer = test_signer();
+        let body = AttestationSigner::signable_body(
+            ordering_sensitive_record().as_object().unwrap(),
+            &signer.sig_type,
+            "did:plc:test",
+        );
+        assert_ne!(
+            signer.compute_cid_current(&body).unwrap(),
+            signer.compute_cid_legacy(&body).unwrap(),
+        );
+    }
+
+    #[test]
+    fn new_signatures_verify_as_current() {
+        let signer = test_signer();
+        let mut record = ordering_sensitive_record();
+        signer.sign_record(&mut record, "did:plc:test").unwrap();
+        let sig = record["signatures"][0].clone();
+
+        assert_eq!(
+            signer
+                .verify_record_signature_detailed(&record, &sig, "did:plc:test")
+                .unwrap(),
+            SignatureVerification::Valid(SignatureEncoding::Current),
+        );
+    }
+
+    #[test]
+    fn pre_fix_signatures_still_verify() {
+        let signer = test_signer();
+        let mut record = ordering_sensitive_record();
+        signer
+            .sign_record_legacy(&mut record, "did:plc:test")
+            .unwrap();
+        let sig = record["signatures"][0].clone();
+
+        let outcome = signer
+            .verify_record_signature_detailed(&record, &sig, "did:plc:test")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            SignatureVerification::Valid(SignatureEncoding::Legacy),
+        );
+        assert!(outcome.is_legacy());
+        assert!(
+            signer
+                .verify_record_signature(&record, &sig, "did:plc:test")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn pre_fix_signatures_with_links_still_verify() {
+        let signer = test_signer();
+        let mut record = serde_json::json!({
+            "ref": { "$link": "bafyreigbtj4x7ip5legnfznufuopl4sg4knzc2cof6duas4b3q2fy6swua" },
+            "b": 1,
+            "aa": 2
+        });
+        signer
+            .sign_record_legacy(&mut record, "did:plc:test")
+            .unwrap();
+        let sig = record["signatures"][0].clone();
+
+        assert!(
+            signer
+                .verify_record_signature_detailed(&record, &sig, "did:plc:test")
+                .unwrap()
+                .is_legacy()
+        );
+    }
+
+    #[test]
+    fn fallback_does_not_accept_tampered_records() {
+        let signer = test_signer();
+
+        for legacy in [false, true] {
+            let mut record = serde_json::json!({ "aa": 2, "b": 1, "text": "original" });
+            if legacy {
+                signer
+                    .sign_record_legacy(&mut record, "did:plc:test")
+                    .unwrap();
+            } else {
+                signer.sign_record(&mut record, "did:plc:test").unwrap();
+            }
+            let sig = record["signatures"][0].clone();
+
+            record["text"] = serde_json::json!("tampered");
+            assert_eq!(
+                signer
+                    .verify_record_signature_detailed(&record, &sig, "did:plc:test")
+                    .unwrap(),
+                SignatureVerification::Invalid,
+                "tampered record must be rejected (legacy signature: {legacy})"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_preserves_repository_binding() {
+        let signer = test_signer();
+        let mut record = ordering_sensitive_record();
+        signer
+            .sign_record_legacy(&mut record, "did:plc:original")
+            .unwrap();
+        let sig = record["signatures"][0].clone();
+
+        assert!(
+            signer
+                .verify_record_signature_detailed(&record, &sig, "did:plc:original")
+                .unwrap()
+                .is_valid()
+        );
+        assert_eq!(
+            signer
+                .verify_record_signature_detailed(&record, &sig, "did:plc:attacker")
+                .unwrap(),
+            SignatureVerification::Invalid,
+        );
+    }
+
+    #[test]
+    fn fallback_rejects_forged_signatures() {
+        let signer = test_signer();
+        let mut record = ordering_sensitive_record();
+        signer.sign_record(&mut record, "did:plc:test").unwrap();
+
+        let forged = serde_json::json!({
+            "$type": "test.signature",
+            "key": "did:web:test.example#signing",
+            "signature": { "$bytes": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD, [0x01u8; 64]) }
+        });
+        assert_eq!(
+            signer
+                .verify_record_signature_detailed(&record, &forged, "did:plc:test")
+                .unwrap(),
+            SignatureVerification::Invalid,
         );
     }
 }
