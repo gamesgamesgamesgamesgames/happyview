@@ -3,11 +3,12 @@
 //! the exact same membership/validation/write logic.
 
 use crate::AppState;
-use crate::db::{adapt_sql, now_rfc3339};
+use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lua::tid::generate_tid;
+use crate::spaces::lthash::LtHashState;
 use crate::spaces::types::*;
-use crate::spaces::{SpaceUri, db, members};
+use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog};
 use sha2::{Digest, Sha256};
 
 pub(crate) async fn resolve_space(state: &AppState, space_ref: &str) -> Result<Space, AppError> {
@@ -117,6 +118,100 @@ pub(crate) async fn require_membership(
     Ok(access)
 }
 
+pub(crate) struct AppliedOp {
+    pub action: OplogAction,
+    pub collection: String,
+    pub rkey: String,
+    /// CID written by this op — `None` for a delete.
+    pub new_cid: Option<String>,
+    /// CID this op superseded — `None` for a create.
+    pub old_cid: Option<String>,
+}
+
+pub(crate) async fn commit_write(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space: &Space,
+    author_did: &str,
+    rev: &str,
+    ops: &[AppliedOp],
+) -> Result<(), AppError> {
+    let mut repo_state =
+        db::get_or_create_repo_state(&mut *conn, backend, &space.id, author_did).await?;
+
+    let lthash_bytes: [u8; 2048] = repo_state.lthash_state.as_slice().try_into().map_err(|_| {
+        AppError::Internal(format!(
+            "corrupt repo state: lthash is {} bytes, expected 2048",
+            repo_state.lthash_state.len()
+        ))
+    })?;
+    let mut set_hash = LtHashState::from_bytes(lthash_bytes);
+
+    let now = now_rfc3339();
+    for (idx, op) in ops.iter().enumerate() {
+        if let Some(old) = op.old_cid.as_deref() {
+            set_hash.remove(&lthash::record_element(&op.collection, &op.rkey, old));
+        }
+        if let Some(new) = op.new_cid.as_deref() {
+            set_hash.add(&lthash::record_element(&op.collection, &op.rkey, new));
+        }
+
+        let entry = OplogEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            space_id: space.id.clone(),
+            author_did: author_did.to_string(),
+            rev: rev.to_string(),
+            idx: idx as i32,
+            action: op.action,
+            collection: op.collection.clone(),
+            rkey: op.rkey.clone(),
+            cid: op.new_cid.clone(),
+            prev: op.old_cid.clone(),
+            value: None,
+            created_at: now.clone(),
+        };
+        oplog::append_op(&mut *conn, backend, &entry).await?;
+    }
+
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    let signed = commit::sign_commit(&set_hash.hash(), &space_uri, author_did, rev)?;
+
+    repo_state.lthash_state = set_hash.as_bytes().to_vec();
+    repo_state.rev = Some(signed.rev);
+    repo_state.hash = Some(signed.hash.to_vec());
+    repo_state.ikm = Some(signed.ikm.to_vec());
+    repo_state.mac = Some(signed.mac.to_vec());
+    db::update_repo_state(&mut *conn, backend, &repo_state).await?;
+
+    db::update_space_revision(&mut *conn, backend, &space.id, rev).await?;
+
+    Ok(())
+}
+
+pub(crate) async fn notify_ops(
+    state: &AppState,
+    space: &Space,
+    author_did: &str,
+    ops: &[AppliedOp],
+) {
+    for op in ops {
+        let _ = notifications::dispatch_write_notification(
+            &state.db,
+            state.db_backend,
+            &state.http,
+            &space.id,
+            author_did,
+            &op.collection,
+            &op.rkey,
+            op.new_cid.as_deref(),
+        )
+        .await;
+    }
+}
+
 pub(crate) async fn create_record(
     state: &AppState,
     did: &str,
@@ -145,9 +240,28 @@ pub(crate) async fn create_record(
         cid: cid.clone(),
         indexed_at: now_rfc3339(),
     };
-    db::insert_space_record(&state.db, state.db_backend, &rec).await?;
     let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+    let ops = vec![AppliedOp {
+        action: OplogAction::Create,
+        collection: collection.to_string(),
+        rkey: rec.rkey.clone(),
+        new_cid: Some(cid.clone()),
+        old_cid: None,
+    }];
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    db::insert_space_record(&mut *tx, state.db_backend, &rec).await?;
+    commit_write(&mut tx, state.db_backend, &space, did, &rev, &ops).await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
+
+    notify_ops(state, &space, did, &ops).await;
+
     Ok((record_uri, cid))
 }
 
@@ -181,13 +295,45 @@ pub(crate) async fn put_record(
         cid: cid.clone(),
         indexed_at: now_rfc3339(),
     };
-    if let Some(swap) = swap_cid {
-        db::upsert_space_record_with_swap(&state.db, state.db_backend, &rec, &swap).await?;
-    } else {
-        db::upsert_space_record(&state.db, state.db_backend, &rec).await?;
-    }
     let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
+    let old_cid = match swap_cid.as_deref() {
+        Some(swap) => Some(swap.to_string()),
+        None => db::get_space_record(&mut *tx, state.db_backend, &record_uri)
+            .await?
+            .map(|r| r.cid),
+    };
+    let action = if old_cid.is_some() {
+        OplogAction::Update
+    } else {
+        OplogAction::Create
+    };
+
+    if let Some(swap) = swap_cid {
+        db::upsert_space_record_with_swap(&mut tx, state.db_backend, &rec, &swap).await?;
+    } else {
+        db::upsert_space_record(&mut *tx, state.db_backend, &rec).await?;
+    }
+
+    let ops = vec![AppliedOp {
+        action,
+        collection: collection.to_string(),
+        rkey: rkey.to_string(),
+        new_cid: Some(cid.clone()),
+        old_cid,
+    }];
+    commit_write(&mut tx, state.db_backend, &space, did, &rev, &ops).await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
+
+    notify_ops(state, &space, did, &ops).await;
+
     Ok((record_uri, cid))
 }
 
@@ -206,23 +352,45 @@ pub(crate) async fn delete_record(
         "at://{}/space/{}/{}/{}/{}/{}",
         space.did, space.type_nsid, space.skey, did, collection, rkey
     );
-    if let Some(swap) = swap_cid {
-        db::delete_space_record_with_swap(&state.db, state.db_backend, &record_uri, &swap).await?;
+    let rev = generate_tid();
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
+    let old_cid = if let Some(swap) = swap_cid {
+        db::delete_space_record_with_swap(&mut tx, state.db_backend, &record_uri, &swap).await?;
+        swap
     } else {
-        let record = db::get_space_record(&state.db, state.db_backend, &record_uri).await?;
-        match record {
+        let record = db::get_space_record(&mut *tx, state.db_backend, &record_uri).await?;
+        let cid = match record {
             Some(r) if r.author_did != did => {
                 return Err(AppError::Forbidden(
                     "You can only delete your own records".into(),
                 ));
             }
             None => return Err(AppError::NotFound("Record not found".into())),
-            _ => {}
-        }
-        db::delete_space_record(&state.db, state.db_backend, &record_uri).await?;
-    }
-    let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+            Some(r) => r.cid,
+        };
+        db::delete_space_record(&mut *tx, state.db_backend, &record_uri).await?;
+        cid
+    };
+
+    let ops = vec![AppliedOp {
+        action: OplogAction::Delete,
+        collection: collection.to_string(),
+        rkey: rkey.to_string(),
+        new_cid: None,
+        old_cid: Some(old_cid),
+    }];
+    commit_write(&mut tx, state.db_backend, &space, did, &rev, &ops).await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
+
+    notify_ops(state, &space, did, &ops).await;
+
     Ok(())
 }
 

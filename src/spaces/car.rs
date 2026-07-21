@@ -101,10 +101,6 @@ pub fn serialize_repo(commit: &SignedCommit, records: &[SpaceRecord]) -> Result<
             ciborium::Value::Bytes(commit.ikm.to_vec()),
         ),
         (
-            ciborium::Value::Text("sig".into()),
-            ciborium::Value::Bytes(commit.sig.clone()),
-        ),
-        (
             ciborium::Value::Text("mac".into()),
             ciborium::Value::Bytes(commit.mac.to_vec()),
         ),
@@ -159,7 +155,6 @@ mod tests {
             ver: 1,
             hash: [0u8; 32],
             ikm: [0u8; 32],
-            sig: vec![0u8; 64],
             mac: [0u8; 32],
             rev: "3k2rev1".to_string(),
         }
@@ -180,7 +175,6 @@ mod tests {
             ver: 1,
             hash: [0xAA; 32],
             ikm: [0xBB; 32],
-            sig: vec![0xCC; 64],
             mac: [0xDD; 32],
             rev: "3k2rev1".to_string(),
         };

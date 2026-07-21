@@ -428,7 +428,7 @@ fn parse_member_row(r: MemberRow) -> Result<SpaceMember, AppError> {
 // ---------------------------------------------------------------------------
 
 pub async fn upsert_space_record(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     record: &SpaceRecord,
 ) -> Result<(), AppError> {
@@ -455,7 +455,7 @@ pub async fn upsert_space_record(
         .bind(&record_json)
         .bind(&record.cid)
         .bind(&now)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to upsert space record: {e}")))?;
 
@@ -463,7 +463,7 @@ pub async fn upsert_space_record(
 }
 
 pub async fn get_space_record(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     uri: &str,
 ) -> Result<Option<SpaceRecord>, AppError> {
@@ -474,7 +474,7 @@ pub async fn get_space_record(
 
     let row: Option<RecordRow> = crate::db::query_as(&sql)
         .bind(uri)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to get space record: {e}")))?;
 
@@ -591,7 +591,7 @@ pub async fn list_all_space_records(
 }
 
 pub async fn insert_space_record(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     record: &SpaceRecord,
 ) -> Result<(), AppError> {
@@ -613,7 +613,7 @@ pub async fn insert_space_record(
         .bind(&record_json)
         .bind(&record.cid)
         .bind(&now)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| {
             let msg = e.to_string();
@@ -628,7 +628,7 @@ pub async fn insert_space_record(
 }
 
 pub async fn upsert_space_record_with_swap(
-    pool: &sqlx::AnyPool,
+    conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     record: &SpaceRecord,
     swap_cid: &str,
@@ -648,12 +648,12 @@ pub async fn upsert_space_record_with_swap(
         .bind(&now)
         .bind(&record.uri)
         .bind(swap_cid)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| AppError::Internal(format!("failed to update space record: {e}")))?;
 
     if result.rows_affected() == 0 {
-        let existing = get_space_record(pool, backend, &record.uri).await?;
+        let existing = get_space_record(&mut *conn, backend, &record.uri).await?;
         if existing.is_some() {
             return Err(AppError::Conflict("Record CID mismatch".into()));
         }
@@ -664,7 +664,7 @@ pub async fn upsert_space_record_with_swap(
 }
 
 pub async fn delete_space_record(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     uri: &str,
 ) -> Result<bool, AppError> {
@@ -672,7 +672,7 @@ pub async fn delete_space_record(
 
     let result = crate::db::query(&sql)
         .bind(uri)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to delete space record: {e}")))?;
 
@@ -680,7 +680,7 @@ pub async fn delete_space_record(
 }
 
 pub async fn delete_space_record_with_swap(
-    pool: &sqlx::AnyPool,
+    conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     uri: &str,
     swap_cid: &str,
@@ -693,12 +693,12 @@ pub async fn delete_space_record_with_swap(
     let result = crate::db::query(&sql)
         .bind(uri)
         .bind(swap_cid)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| AppError::Internal(format!("failed to delete space record: {e}")))?;
 
     if result.rows_affected() == 0 {
-        let existing = get_space_record(pool, backend, uri).await?;
+        let existing = get_space_record(&mut *conn, backend, uri).await?;
         if existing.is_some() {
             return Err(AppError::Conflict("Record CID mismatch".into()));
         }
@@ -709,7 +709,7 @@ pub async fn delete_space_record_with_swap(
 }
 
 pub async fn update_space_revision(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     space_id: &str,
     revision: &str,
@@ -724,7 +724,7 @@ pub async fn update_space_revision(
         .bind(revision)
         .bind(&now)
         .bind(space_id)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to update space revision: {e}")))?;
 
@@ -736,20 +736,20 @@ pub async fn update_space_revision(
 // ---------------------------------------------------------------------------
 
 pub async fn get_or_create_repo_state(
-    pool: &sqlx::AnyPool,
+    conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     space_id: &str,
     author_did: &str,
 ) -> Result<RepoState, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, updated_at FROM happyview_space_repo_state WHERE space_id = ? AND author_did = ?",
+        "SELECT id, space_id, author_did, lthash_state, rev, hash, ikm, mac, updated_at FROM happyview_space_repo_state WHERE space_id = ? AND author_did = ?",
         backend,
     );
 
     let row: Option<RepoStateRow> = crate::db::query_as(&sql)
         .bind(space_id)
         .bind(author_did)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|e| AppError::Internal(format!("failed to get repo state: {e}")))?;
 
@@ -761,7 +761,7 @@ pub async fn get_or_create_repo_state(
     let now = now_rfc3339();
     let default_lthash = vec![0u8; 2048];
     let insert_sql = adapt_sql(
-        "INSERT INTO happyview_space_repo_state (id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?)",
+        "INSERT INTO happyview_space_repo_state (id, space_id, author_did, lthash_state, rev, hash, ikm, mac, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)",
         backend,
     );
     crate::db::query(&insert_sql)
@@ -770,7 +770,7 @@ pub async fn get_or_create_repo_state(
         .bind(author_did)
         .bind(&default_lthash)
         .bind(&now)
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| AppError::Internal(format!("failed to create repo state: {e}")))?;
 
@@ -782,20 +782,19 @@ pub async fn get_or_create_repo_state(
         rev: None,
         hash: None,
         ikm: None,
-        sig: None,
         mac: None,
         updated_at: now,
     })
 }
 
 pub async fn update_repo_state(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     state: &RepoState,
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE happyview_space_repo_state SET lthash_state = ?, rev = ?, hash = ?, ikm = ?, sig = ?, mac = ?, updated_at = ? WHERE id = ?",
+        "UPDATE happyview_space_repo_state SET lthash_state = ?, rev = ?, hash = ?, ikm = ?, mac = ?, updated_at = ? WHERE id = ?",
         backend,
     );
 
@@ -804,11 +803,10 @@ pub async fn update_repo_state(
         .bind(&state.rev)
         .bind(&state.hash)
         .bind(&state.ikm)
-        .bind(&state.sig)
         .bind(&state.mac)
         .bind(&now)
         .bind(&state.id)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to update repo state: {e}")))?;
 
@@ -824,7 +822,6 @@ type RepoStateRow = (
     Option<Vec<u8>>,
     Option<Vec<u8>>,
     Option<Vec<u8>>,
-    Option<Vec<u8>>,
     String,
 );
 
@@ -837,9 +834,8 @@ fn parse_repo_state_row(r: RepoStateRow) -> Result<RepoState, AppError> {
         rev: r.4,
         hash: r.5,
         ikm: r.6,
-        sig: r.7,
-        mac: r.8,
-        updated_at: r.9,
+        mac: r.7,
+        updated_at: r.8,
     })
 }
 

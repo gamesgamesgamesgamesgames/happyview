@@ -154,7 +154,6 @@ pub struct RepoState {
     pub rev: Option<String>,
     pub hash: Option<Vec<u8>>,
     pub ikm: Option<Vec<u8>>,
-    pub sig: Option<Vec<u8>>,
     pub mac: Option<Vec<u8>>,
     pub updated_at: String,
 }

@@ -179,7 +179,8 @@ async fn get_or_create_repo_state_creates_default() {
         .expect("create_space failed");
 
     let author_did = "did:plc:repo-author";
-    let state = spaces_db::get_or_create_repo_state(&pool, backend, &space_id, author_did)
+    let mut conn = pool.acquire().await.expect("acquire failed");
+    let state = spaces_db::get_or_create_repo_state(&mut conn, backend, &space_id, author_did)
         .await
         .expect("get_or_create_repo_state failed");
 
@@ -210,10 +211,11 @@ async fn get_or_create_repo_state_is_idempotent() {
         .expect("create_space failed");
 
     let author_did = "did:plc:idem-author";
-    let first = spaces_db::get_or_create_repo_state(&pool, backend, &space_id, author_did)
+    let mut conn = pool.acquire().await.expect("acquire failed");
+    let first = spaces_db::get_or_create_repo_state(&mut conn, backend, &space_id, author_did)
         .await
         .expect("first call failed");
-    let second = spaces_db::get_or_create_repo_state(&pool, backend, &space_id, author_did)
+    let second = spaces_db::get_or_create_repo_state(&mut conn, backend, &space_id, author_did)
         .await
         .expect("second call failed");
 
@@ -240,7 +242,8 @@ async fn update_repo_state_persists_fields() {
         .expect("create_space failed");
 
     let author_did = "did:plc:update-author";
-    let mut state = spaces_db::get_or_create_repo_state(&pool, backend, &space_id, author_did)
+    let mut conn = pool.acquire().await.expect("acquire failed");
+    let mut state = spaces_db::get_or_create_repo_state(&mut conn, backend, &space_id, author_did)
         .await
         .expect("get_or_create failed");
 
@@ -251,7 +254,7 @@ async fn update_repo_state_persists_fields() {
         .await
         .expect("update_repo_state failed");
 
-    let reloaded = spaces_db::get_or_create_repo_state(&pool, backend, &space_id, author_did)
+    let reloaded = spaces_db::get_or_create_repo_state(&mut conn, backend, &space_id, author_did)
         .await
         .expect("reload failed");
 
@@ -315,9 +318,13 @@ async fn oplog_append_and_list() {
             .expect("append_op failed");
     }
 
-    let all_ops = oplog::list_ops(&pool, backend, &space_id, author_did, None, 10)
+    let (all_ops, cursor) = oplog::list_ops(&pool, backend, &space_id, author_did, None, 10)
         .await
         .expect("list_ops failed");
+    assert!(
+        cursor.is_none(),
+        "page is not full, so there is no next page"
+    );
     assert_eq!(all_ops.len(), 3);
     assert!(matches!(all_ops[0].action, OplogAction::Create));
     assert!(matches!(all_ops[1].action, OplogAction::Update));
@@ -365,12 +372,98 @@ async fn oplog_list_with_since_rev_cursor() {
             .expect("append_op failed");
     }
 
-    let after_rev2 = oplog::list_ops(&pool, backend, &space_id, author_did, Some("rev-0002"), 10)
-        .await
-        .expect("list_ops with cursor failed");
+    let (after_rev2, _) =
+        oplog::list_ops(&pool, backend, &space_id, author_did, Some("rev-0002"), 10)
+            .await
+            .expect("list_ops with cursor failed");
 
     assert_eq!(after_rev2.len(), 3);
     assert_eq!(after_rev2[0].rev, "rev-0003");
+
+    let (after_rev2_idx, _) = oplog::list_ops(
+        &pool,
+        backend,
+        &space_id,
+        author_did,
+        Some(&oplog::encode_cursor("rev-0002", -1)),
+        10,
+    )
+    .await
+    .expect("list_ops with composite cursor failed");
+
+    assert_eq!(after_rev2_idx.len(), 4);
+    assert_eq!(after_rev2_idx[0].rev, "rev-0002");
+}
+
+#[tokio::test]
+#[serial]
+async fn oplog_paginates_within_a_single_rev() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let space_id = new_id();
+    let space = make_space(
+        &space_id,
+        "did:plc:batch-owner",
+        "com.example.batch",
+        "batch-skey",
+    );
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .expect("create_space failed");
+
+    let author_did = "did:plc:batch-author";
+
+    for i in 0..5 {
+        let entry = OplogEntry {
+            id: new_id(),
+            space_id: space_id.clone(),
+            author_did: author_did.to_string(),
+            rev: "rev-batch".to_string(),
+            idx: i,
+            action: OplogAction::Create,
+            collection: "com.example.item".to_string(),
+            rkey: format!("item-{i}"),
+            cid: Some(format!("bafy{i}")),
+            prev: None,
+            value: None,
+            created_at: now_rfc3339(),
+        };
+        oplog::append_op(&pool, backend, &entry)
+            .await
+            .expect("append_op failed");
+    }
+
+    let (page1, cursor) = oplog::list_ops(&pool, backend, &space_id, author_did, None, 2)
+        .await
+        .expect("page 1 failed");
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1[0].idx, 0);
+    assert_eq!(page1[1].idx, 1);
+    let cursor = cursor.expect("expected a next-page cursor");
+
+    let (page2, cursor2) = oplog::list_ops(&pool, backend, &space_id, author_did, Some(&cursor), 2)
+        .await
+        .expect("page 2 failed");
+    assert_eq!(page2.len(), 2);
+    assert_eq!(page2[0].idx, 2);
+    assert_eq!(page2[1].idx, 3);
+
+    let (page3, cursor3) = oplog::list_ops(
+        &pool,
+        backend,
+        &space_id,
+        author_did,
+        Some(&cursor2.expect("expected a second cursor")),
+        2,
+    )
+    .await
+    .expect("page 3 failed");
+    assert_eq!(page3.len(), 1, "the tail op must not be dropped");
+    assert_eq!(page3[0].idx, 4);
+    assert!(cursor3.is_none());
 }
 
 // ---------------------------------------------------------------------------

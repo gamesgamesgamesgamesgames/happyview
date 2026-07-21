@@ -364,23 +364,59 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         }
         Err(e) => {
             let error = format!("{e}");
-            tracing::error!(job_id = %job.id, %error, "job script failed");
-            let _ = db::set_error(state, &job.id, &error).await;
-            log_event(
-                &state.db,
-                EventLog {
-                    event_type: "job.failed".to_string(),
-                    severity: Severity::Error,
-                    actor_did: Some(job.created_by.clone()),
-                    subject: Some(job.job_type.clone()),
-                    detail: serde_json::json!({
-                        "job_id": job.id,
-                        "error": error,
-                    }),
-                },
-                backend,
-            )
-            .await;
+            match db::should_stop(state, &job.id).await {
+                Some("pausing") => {
+                    let _ = db::set_status(state, &job.id, "paused").await;
+                    tracing::info!(job_id = %job.id, "job paused (script error during stop: {error})");
+                    log_event(
+                        &state.db,
+                        EventLog {
+                            event_type: "job.paused".to_string(),
+                            severity: Severity::Info,
+                            actor_did: Some(job.created_by.clone()),
+                            subject: Some(job.job_type.clone()),
+                            detail: serde_json::json!({ "job_id": job.id }),
+                        },
+                        backend,
+                    )
+                    .await;
+                }
+                Some("cancelling") => {
+                    let _ = db::set_status(state, &job.id, "cancelled").await;
+                    tracing::info!(job_id = %job.id, "job cancelled (script error during stop: {error})");
+                    log_event(
+                        &state.db,
+                        EventLog {
+                            event_type: "job.cancelled".to_string(),
+                            severity: Severity::Info,
+                            actor_did: Some(job.created_by.clone()),
+                            subject: Some(job.job_type.clone()),
+                            detail: serde_json::json!({ "job_id": job.id }),
+                        },
+                        backend,
+                    )
+                    .await;
+                }
+                _ => {
+                    tracing::error!(job_id = %job.id, %error, "job script failed");
+                    let _ = db::set_error(state, &job.id, &error).await;
+                    log_event(
+                        &state.db,
+                        EventLog {
+                            event_type: "job.failed".to_string(),
+                            severity: Severity::Error,
+                            actor_did: Some(job.created_by.clone()),
+                            subject: Some(job.job_type.clone()),
+                            detail: serde_json::json!({
+                                "job_id": job.id,
+                                "error": error,
+                            }),
+                        },
+                        backend,
+                    )
+                    .await;
+                }
+            }
         }
     }
 }

@@ -1,6 +1,5 @@
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
-use k256::ecdsa::{Signature, SigningKey, VerifyingKey, signature::Signer, signature::Verifier};
 use rand::Rng;
 use sha2::Sha256;
 
@@ -10,7 +9,6 @@ pub struct SignedCommit {
     pub ver: u32,
     pub hash: [u8; 32],
     pub ikm: [u8; 32],
-    pub sig: Vec<u8>,
     pub mac: [u8; 32],
     pub rev: String,
 }
@@ -48,15 +46,11 @@ pub fn sign_commit(
     space_uri: &str,
     author_did: &str,
     rev: &str,
-    signing_key: &SigningKey,
 ) -> Result<SignedCommit, AppError> {
     let mut ikm = [0u8; 32];
     rand::rng().fill_bytes(&mut ikm);
 
     let ctx = build_context(space_uri, author_did, rev, &ikm);
-
-    // sig covers space + author + rev + ikm, NOT the hash — prevents rebroadcast proof
-    let sig: Signature = signing_key.sign(&ctx);
 
     // mac = HMAC-SHA256(HKDF-SHA256(ikm, ctx), hash)
     let hk = Hkdf::<Sha256>::new(None, &ikm);
@@ -73,7 +67,6 @@ pub fn sign_commit(
         ver: 1,
         hash: *hash,
         ikm,
-        sig: sig.to_bytes().to_vec(),
         mac,
         rev: rev.to_string(),
     })
@@ -83,7 +76,6 @@ pub fn verify_commit(
     commit: &SignedCommit,
     space_uri: &str,
     author_did: &str,
-    verifying_key: &VerifyingKey,
 ) -> Result<(), AppError> {
     if commit.ver != 1 {
         return Err(AppError::BadRequest(format!(
@@ -93,12 +85,6 @@ pub fn verify_commit(
     }
 
     let ctx = build_context(space_uri, author_did, &commit.rev, &commit.ikm);
-
-    let sig = Signature::from_slice(commit.sig.as_slice())
-        .map_err(|_| AppError::Auth("invalid commit signature format".into()))?;
-    verifying_key
-        .verify(&ctx, &sig)
-        .map_err(|_| AppError::Auth("commit signature verification failed".into()))?;
 
     // Recompute and verify MAC
     let hk = Hkdf::<Sha256>::new(None, &commit.ikm);
@@ -120,13 +106,6 @@ pub fn verify_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k256::ecdsa::SigningKey;
-
-    fn test_signing_key() -> SigningKey {
-        let mut bytes = [0u8; 32];
-        bytes[31] = 1; // valid non-zero scalar
-        SigningKey::from_slice(&bytes[..]).unwrap()
-    }
 
     #[test]
     fn context_string_format() {
@@ -185,74 +164,69 @@ mod tests {
 
     #[test]
     fn sign_and_verify_roundtrip() {
-        let sk = test_signing_key();
-        let vk = *sk.verifying_key();
         let hash = [0xCC; 32];
         let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let commit = sign_commit(&hash, space, "did:plc:testuser", "3k2rev1", &sk).unwrap();
+        let commit = sign_commit(&hash, space, "did:plc:testuser", "3k2rev1").unwrap();
 
         assert_eq!(commit.hash, hash);
         assert_eq!(commit.rev, "3k2rev1");
         assert_eq!(commit.mac.len(), 32);
-        assert!(!commit.sig.is_empty());
         assert_eq!(commit.ver, 1);
 
-        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk).is_ok());
+        assert!(verify_commit(&commit, space, "did:plc:testuser").is_ok());
     }
 
     #[test]
     fn commit_has_version() {
-        let sk = test_signing_key();
         let hash = [0xCC; 32];
         let space = "at://did:plc:abc/space/com.example.forum/main";
-        let commit = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
+        let commit = sign_commit(&hash, space, "did:plc:testuser", "rev1").unwrap();
         assert_eq!(commit.ver, 1);
     }
 
     #[test]
     fn verify_rejects_wrong_author() {
-        let sk = test_signing_key();
-        let vk = *sk.verifying_key();
         let hash = [0xAA; 32];
         let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let commit = sign_commit(&hash, space, "did:plc:user1", "rev1", &sk).unwrap();
-        assert!(verify_commit(&commit, space, "did:plc:user1", &vk).is_ok());
-        assert!(verify_commit(&commit, space, "did:plc:user2", &vk).is_err());
-    }
-
-    #[test]
-    fn verify_rejects_wrong_key() {
-        let sk1 = test_signing_key();
-        let mut bytes2 = [0u8; 32];
-        bytes2[31] = 2;
-        let sk2 = SigningKey::from_slice(&bytes2[..]).unwrap();
-        let vk2 = *sk2.verifying_key();
-
-        let hash = [0xDD; 32];
-        let space = "at://did:plc:abc/space/com.example.forum/main";
-
-        let commit = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk1).unwrap();
-        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk2).is_err());
+        let commit = sign_commit(&hash, space, "did:plc:user1", "rev1").unwrap();
+        assert!(verify_commit(&commit, space, "did:plc:user1").is_ok());
+        assert!(verify_commit(&commit, space, "did:plc:user2").is_err());
     }
 
     #[test]
     fn verify_rejects_tampered_hash() {
-        let sk = test_signing_key();
-        let vk = *sk.verifying_key();
         let hash = [0xEE; 32];
         let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
+        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1").unwrap();
         commit.hash[0] ^= 0xFF; // tamper
-        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk).is_err());
+        assert!(verify_commit(&commit, space, "did:plc:testuser").is_err());
+    }
+
+    #[test]
+    fn verify_rejects_tampered_ikm() {
+        let hash = [0xEE; 32];
+        let space = "at://did:plc:abc/space/com.example.forum/main";
+
+        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1").unwrap();
+        commit.ikm[0] ^= 0xFF; // tamper — changes both the HKDF salt and the context
+        assert!(verify_commit(&commit, space, "did:plc:testuser").is_err());
+    }
+
+    #[test]
+    fn verify_rejects_tampered_rev() {
+        let hash = [0xEE; 32];
+        let space = "at://did:plc:abc/space/com.example.forum/main";
+
+        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1").unwrap();
+        commit.rev = "rev2".into();
+        assert!(verify_commit(&commit, space, "did:plc:testuser").is_err());
     }
 
     #[test]
     fn verify_rejects_wrong_space() {
-        let sk = test_signing_key();
-        let vk = *sk.verifying_key();
         let hash = [0xFF; 32];
 
         let commit = sign_commit(
@@ -260,7 +234,6 @@ mod tests {
             "at://did:plc:abc/space/com.example.forum/main",
             "did:plc:user",
             "rev1",
-            &sk,
         )
         .unwrap();
         assert!(
@@ -268,7 +241,6 @@ mod tests {
                 &commit,
                 "at://did:plc:xyz/space/com.example.forum/other",
                 "did:plc:user",
-                &vk
             )
             .is_err()
         );
@@ -276,43 +248,38 @@ mod tests {
 
     #[test]
     fn different_ikm_per_commit() {
-        let sk = test_signing_key();
         let hash = [0xAA; 32];
         let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let c1 = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
-        let c2 = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
+        let c1 = sign_commit(&hash, space, "did:plc:testuser", "rev1").unwrap();
+        let c2 = sign_commit(&hash, space, "did:plc:testuser", "rev1").unwrap();
 
         // Each call generates fresh ikm
         assert_ne!(c1.ikm, c2.ikm);
+        assert_ne!(c1.mac, c2.mac);
         // But both verify
-        let vk = *sk.verifying_key();
-        assert!(verify_commit(&c1, space, "did:plc:testuser", &vk).is_ok());
-        assert!(verify_commit(&c2, space, "did:plc:testuser", &vk).is_ok());
+        assert!(verify_commit(&c1, space, "did:plc:testuser").is_ok());
+        assert!(verify_commit(&c2, space, "did:plc:testuser").is_ok());
     }
 
     #[test]
     fn verify_rejects_unknown_version() {
-        let sk = test_signing_key();
-        let vk = *sk.verifying_key();
         let hash = [0xCC; 32];
         let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
+        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1").unwrap();
         commit.ver = 2;
-        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk).is_err());
+        assert!(verify_commit(&commit, space, "did:plc:testuser").is_err());
     }
 
     #[test]
     fn verify_rejects_tampered_mac() {
-        let sk = test_signing_key();
-        let vk = *sk.verifying_key();
         let hash = [0xCC; 32];
         let space = "at://did:plc:abc/space/com.example.forum/main";
 
-        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1", &sk).unwrap();
-        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk).is_ok());
+        let mut commit = sign_commit(&hash, space, "did:plc:testuser", "rev1").unwrap();
+        assert!(verify_commit(&commit, space, "did:plc:testuser").is_ok());
         commit.mac[0] ^= 0xFF;
-        assert!(verify_commit(&commit, space, "did:plc:testuser", &vk).is_err());
+        assert!(verify_commit(&commit, space, "did:plc:testuser").is_err());
     }
 }
