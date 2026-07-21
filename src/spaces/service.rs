@@ -1,7 +1,3 @@
-//! Core record-write service functions for spaces, shared by the HTTP handlers
-//! (`src/spaces/routes.rs`) and (in a later task) a Lua binding, so both call
-//! the exact same membership/validation/write logic.
-
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
@@ -24,10 +20,15 @@ pub(crate) async fn resolve_space(state: &AppState, space_ref: &str) -> Result<S
     .ok_or_else(|| AppError::NotFound("Space not found".into()))
 }
 
-pub(crate) fn content_cid(record: &serde_json::Value) -> String {
-    let bytes = serde_json::to_vec(record).unwrap_or_default();
-    let hash = Sha256::digest(&bytes);
-    format!("bafyrei{}", hex::encode(&hash[..20]))
+pub(crate) fn content_cid(record: &serde_json::Value) -> Result<String, AppError> {
+    crate::cid_verify::compute_record_cid(record)
+        .map(|cid| cid.to_string())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "record cannot be encoded as DAG-CBOR (non-finite number, or malformed $link/$bytes)"
+                    .into(),
+            )
+        })
 }
 
 pub(crate) async fn require_space_admin(
@@ -55,12 +56,6 @@ pub(crate) async fn require_space_admin(
     ))
 }
 
-/// Enforce a space's `allowedCollections` config (`space.config.extra["allowedCollections"]`,
-/// a JSON array of collection NSID strings injected from the lexicon
-/// registry at space-creation time — see `create_space` below). Enforcement
-/// only kicks in when the field is present *and* non-empty, so spaces
-/// without the config (or with an empty list) continue to allow any
-/// collection, preserving backward compatibility.
 pub(crate) fn check_collection_allowed(space: &Space, collection: &str) -> Result<(), AppError> {
     if let Some(serde_json::Value::Array(allowed)) = space.config.extra.get("allowedCollections")
         && !allowed.is_empty()
@@ -122,9 +117,7 @@ pub(crate) struct AppliedOp {
     pub action: OplogAction,
     pub collection: String,
     pub rkey: String,
-    /// CID written by this op — `None` for a delete.
     pub new_cid: Option<String>,
-    /// CID this op superseded — `None` for a create.
     pub old_cid: Option<String>,
 }
 
@@ -225,7 +218,7 @@ pub(crate) async fn create_record(
     check_collection_allowed(&space, collection)?;
 
     let rkey = generate_tid();
-    let cid = content_cid(&record);
+    let cid = content_cid(&record)?;
     let record_uri = format!(
         "at://{}/space/{}/{}/{}/{}/{}",
         space.did, space.type_nsid, space.skey, did, collection, rkey
@@ -280,7 +273,7 @@ pub(crate) async fn put_record(
     require_membership(state, &space, did, true, space_credential).await?;
     check_collection_allowed(&space, collection)?;
 
-    let cid = content_cid(&record);
+    let cid = content_cid(&record)?;
     let record_uri = format!(
         "at://{}/space/{}/{}/{}/{}/{}",
         space.did, space.type_nsid, space.skey, did, collection, rkey
@@ -657,11 +650,6 @@ mod tests {
     use crate::lexicon::LexiconRegistry;
     use tokio::sync::watch;
 
-    /// These are integration tests requiring Postgres, mirroring the skip
-    /// idiom used by `tests/common`'s `require_db!` macro: when
-    /// `TEST_DATABASE_URL` isn't set, the test returns early instead of
-    /// failing, so `cargo test --lib` stays DB-free. Run for real via:
-    /// `TEST_DATABASE_URL=postgres://... cargo test -p happyview spaces::service`
     macro_rules! require_test_db {
         () => {
             if std::env::var("TEST_DATABASE_URL").is_err() {
@@ -671,9 +659,6 @@ mod tests {
         };
     }
 
-    /// Build an `AppState` backed by a migrated, empty Postgres database
-    /// (`TEST_DATABASE_URL`). Callers must have already checked
-    /// `require_test_db!()`.
     async fn service_empty_db() -> AppState {
         let url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must be set for spaces::service integration tests");
@@ -778,19 +763,10 @@ mod tests {
         }
     }
 
-    /// Build a migrated Postgres-backed `AppState` seeded with one space and
-    /// one write-member (also the space's `authority_did`, for later tasks).
-    /// Returns `(state, space_uri, member_did)`.
-    ///
-    /// Uses randomised DIDs/skeys so parallel tests sharing the same
-    /// `TEST_DATABASE_URL` database don't collide (no truncation is needed).
     async fn service_test_db() -> (AppState, String, String) {
         service_test_db_with_config(SpaceConfig::default()).await
     }
 
-    /// Same as `service_test_db`, but lets the caller supply the seeded
-    /// space's `config` (e.g. to set `allowedCollections` for enforcement
-    /// tests).
     async fn service_test_db_with_config(config: SpaceConfig) -> (AppState, String, String) {
         let state = service_empty_db().await;
 
@@ -839,8 +815,6 @@ mod tests {
         (state, space_uri, member_did)
     }
 
-    /// Build a `SpaceConfig` whose `allowedCollections` extra is set to the
-    /// given list of collection NSIDs.
     fn config_with_allowed_collections(allowed: &[&str]) -> SpaceConfig {
         let mut config = SpaceConfig::default();
         config.extra.insert(
@@ -855,8 +829,6 @@ mod tests {
         config
     }
 
-    /// Build a minimal, DB-free `Space` for pure unit tests of
-    /// `check_collection_allowed`.
     fn space_with_config(config: SpaceConfig) -> Space {
         Space {
             id: "space-id".into(),
@@ -910,17 +882,6 @@ mod tests {
         assert!(super::check_collection_allowed(&space, "com.example.anything").is_ok());
     }
 
-    /// `delete_record` builds the record URI from the *caller's own* DID
-    /// (see the `record_uri` construction in `service::delete_record`), so a
-    /// second write-member can never naturally collide with another
-    /// author's URI through the normal create/put/delete API surface — both
-    /// segments are always the same `did`. To exercise the ownership check
-    /// (`r.author_did != did` -> Forbidden) at all we have to manufacture a
-    /// data state where the URI's embedded DID segment (member B) diverges
-    /// from the row's stored `author_did` (member A), by seeding the record
-    /// directly via `db::insert_space_record` rather than going through
-    /// `create_record`/`put_record`. This still exercises the real
-    /// `delete_record` ownership-check code path.
     #[tokio::test]
     async fn delete_record_forbidden_for_non_author() {
         require_test_db!();
@@ -940,8 +901,6 @@ mod tests {
         let space = super::resolve_space(&state, &space_uri).await.unwrap();
         let collection = "com.example.item";
         let rkey = "fixedrkey-ownership";
-        // This is the exact URI `delete_record` will construct when member_b
-        // calls it with this collection/rkey.
         let record_uri = format!(
             "at://{}/space/{}/{}/{}/{}/{}",
             space.did, space.type_nsid, space.skey, member_b, collection, rkey
@@ -954,7 +913,7 @@ mod tests {
             collection: collection.to_string(),
             rkey: rkey.to_string(),
             record: content.clone(),
-            cid: super::content_cid(&content),
+            cid: super::content_cid(&content).expect("test record must be DAG-CBOR encodable"),
             indexed_at: now_rfc3339(),
         };
         db::insert_space_record(&state.db, state.db_backend, &rec)
@@ -977,13 +936,6 @@ mod tests {
         );
     }
 
-    /// A caller who is not a member of the space at all must be rejected
-    /// with `Forbidden` (write-membership check), not `NotFound`. Before the
-    /// membership check was added, `delete_record` would build the record
-    /// URI from the *caller's own* DID, fail to find a row at that URI (since
-    /// the non-member never authored anything), and return `NotFound`
-    /// instead — masking the fact that non-members should never be allowed
-    /// to reach the ownership check at all.
     #[tokio::test]
     async fn delete_record_rejects_non_member() {
         require_test_db!();
@@ -1301,8 +1253,6 @@ mod tests {
         assert!(matches!(err, crate::error::AppError::Forbidden(_)));
     }
 
-    /// A space whose config declares `allowedCollections` must reject a
-    /// `create_record` write to a collection not on that list.
     #[tokio::test]
     async fn create_record_rejects_disallowed_collection() {
         require_test_db!();
@@ -1331,8 +1281,6 @@ mod tests {
         }
     }
 
-    /// A space whose config declares `allowedCollections` still permits a
-    /// `create_record` write to a collection that *is* on the list.
     #[tokio::test]
     async fn create_record_allows_listed_collection() {
         require_test_db!();
@@ -1353,8 +1301,6 @@ mod tests {
         assert!(uri.contains("/com.example.allowed/"));
     }
 
-    /// A space without an `allowedCollections` config (the default,
-    /// backward-compatible case) allows a write to any collection.
     #[tokio::test]
     async fn create_record_allows_any_collection_when_config_absent() {
         require_test_db!();
@@ -1371,8 +1317,6 @@ mod tests {
         .expect("space without allowedCollections config should allow any collection");
     }
 
-    /// A space with an explicitly *empty* `allowedCollections` list also
-    /// allows a write to any collection (same backward-compat rule).
     #[tokio::test]
     async fn create_record_allows_any_collection_when_list_empty() {
         require_test_db!();
@@ -1390,8 +1334,6 @@ mod tests {
         .expect("empty allowedCollections list should allow any collection");
     }
 
-    /// A space whose config declares `allowedCollections` must reject a
-    /// `put_record` write to a collection not on that list.
     #[tokio::test]
     async fn put_record_rejects_disallowed_collection() {
         require_test_db!();
@@ -1422,8 +1364,6 @@ mod tests {
         }
     }
 
-    /// A `put_record` write to a collection ON the space's `allowedCollections`
-    /// list succeeds (positive-case parity with `create_record_allows_listed_collection`).
     #[tokio::test]
     async fn put_record_allows_listed_collection() {
         require_test_db!();

@@ -69,6 +69,10 @@ subtle = "2"
 name = "migrate-lua-sql"
 path = "src/bin/migrate_lua_sql.rs"
 
+[[bin]]
+name = "migrate-space-cids"
+path = "src/bin/migrate_space_cids.rs"
+
 [dev-dependencies]
 wiremock = "0.6"
 tower = { version = "0.5", features = ["util"] }

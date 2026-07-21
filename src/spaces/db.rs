@@ -45,7 +45,7 @@ pub async fn create_space(
 }
 
 pub async fn get_space(
-    pool: &sqlx::AnyPool,
+    executor: impl sqlx::Executor<'_, Database = sqlx::Any>,
     backend: DatabaseBackend,
     id: &str,
 ) -> Result<Option<Space>, AppError> {
@@ -56,7 +56,7 @@ pub async fn get_space(
 
     let row: Option<SpaceRow> = crate::db::query_as(&sql)
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to get space: {e}")))?;
 

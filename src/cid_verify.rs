@@ -1,19 +1,3 @@
-//! Record CID content verification (security review finding L9).
-//!
-//! Records arriving from Jetstream and from PDS backfill carry a CID that was,
-//! until now, trusted verbatim. For backfill the source PDS is attacker-
-//! controllable (via the DID document), so a hostile PDS could serve a record
-//! whose stored CID does not match its content. This module recomputes the CID
-//! from the record's canonical DAG-CBOR encoding so a mismatch can be detected
-//! and the record rejected before it is indexed.
-//!
-//! The canonical encoding (length-first map-key ordering, minimal integers,
-//! CID links as CBOR tag 42, `$bytes` as byte strings) is delegated to
-//! `serde_ipld_dagcbor` — the same DAG-CBOR codec the atproto Rust ecosystem
-//! uses — rather than hand-rolled, so the recomputed CID matches what a PDS
-//! produces. The only atproto-specific step is mapping the JSON `$link` /
-//! `$bytes` conventions onto IPLD before encoding.
-
 use cid::Cid;
 use cid::multihash::Multihash;
 use ipld_core::ipld::Ipld;
@@ -22,9 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-/// DAG-CBOR IPLD codec.
 const DAG_CBOR_CODEC: u64 = 0x71;
-/// SHA2-256 multihash code.
 const SHA2_256_CODE: u64 = 0x12;
 
 /// Outcome of checking a claimed CID against a record's content.
@@ -41,10 +23,6 @@ pub enum CidCheck {
     Skipped,
 }
 
-/// Convert an atproto JSON value into an IPLD value, honoring atproto's
-/// `{"$link": "<cid>"}` (CID link) and `{"$bytes": "<base64>"}` (byte string)
-/// conventions. Returns `None` if the value can't be represented (e.g. a
-/// non-finite number, or a malformed `$link`/`$bytes`).
 fn atproto_json_to_ipld(value: &Value) -> Option<Ipld> {
     Some(match value {
         Value::Null => Ipld::Null,
@@ -69,9 +47,6 @@ fn atproto_json_to_ipld(value: &Value) -> Option<Ipld> {
             Ipld::List(items)
         }
         Value::Object(obj) => {
-            // atproto encodes a CID link as {"$link": "<cid>"} and raw bytes as
-            // {"$bytes": "<base64>"} — single-key objects that must become an
-            // IPLD Link / Bytes rather than a map.
             if obj.len() == 1 {
                 if let Some(Value::String(link)) = obj.get("$link") {
                     return Some(Ipld::Link(Cid::from_str(link).ok()?));
@@ -92,14 +67,13 @@ fn atproto_json_to_ipld(value: &Value) -> Option<Ipld> {
     })
 }
 
-/// Recompute the DAG-CBOR CID (CIDv1, dag-cbor codec, sha2-256) for a record
-/// value. `serde_ipld_dagcbor` produces the canonical encoding (length-first
-/// key ordering, minimal integers, tag-42 links), matching what a PDS emits.
-/// Returns `None` if the value cannot be represented as DAG-CBOR.
-pub fn compute_record_cid(value: &Value) -> Option<Cid> {
+pub fn record_to_dag_cbor(value: &Value) -> Option<Vec<u8>> {
     let ipld = atproto_json_to_ipld(value)?;
-    let cbor = serde_ipld_dagcbor::to_vec(&ipld).ok()?;
-    let digest = Sha256::digest(&cbor);
+    serde_ipld_dagcbor::to_vec(&ipld).ok()
+}
+
+pub fn dag_cbor_cid(cbor: &[u8]) -> Option<Cid> {
+    let digest = Sha256::digest(cbor);
 
     // multihash: <code=0x12><len=0x20><digest>
     let mut mh_bytes = Vec::with_capacity(2 + digest.len());
@@ -111,13 +85,10 @@ pub fn compute_record_cid(value: &Value) -> Option<Cid> {
     Some(Cid::new_v1(DAG_CBOR_CODEC, multihash))
 }
 
-/// Check a claimed CID string against a record value.
-///
-/// - `Skipped` when there is no claimed CID, or the value can't be encoded to
-///   DAG-CBOR (we never reject a record over an encoder limitation).
-/// - `Mismatch` when the claimed CID is malformed, or is a valid CID that does
-///   not match the recomputed content CID.
-/// - `Match` otherwise.
+pub fn compute_record_cid(value: &Value) -> Option<Cid> {
+    dag_cbor_cid(&record_to_dag_cbor(value)?)
+}
+
 pub fn verify_record_cid(claimed_cid: &str, value: &Value) -> CidCheck {
     if claimed_cid.is_empty() {
         return CidCheck::Skipped;
@@ -137,13 +108,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // Ground-truth CIDs, computed independently from the raw DAG-CBOR bytes
-    // (see the L9 implementation notes): CIDv1, dag-cbor codec, sha2-256.
     const EMPTY_MAP_CID: &str = "bafyreigbtj4x7ip5legnfznufuopl4sg4knzc2cof6duas4b3q2fy6swua";
     const A1_CID: &str = "bafyreihltcnuuyqp2jm24aqydpnlj7b6w3ogwrplomrjtg5rifv44mmjey";
-    // {"b":1,"aa":2} under length-first canonical key ordering. The naive
-    // raw-string ordering ("aa" < "b") would give a DIFFERENT CID, so this
-    // vector proves the encoder uses DAG-CBOR canonical ordering.
     const ORDERING_CID: &str = "bafyreihbaf6v4gjeo76rl6ncekrny5lwbgyjf7zdw2m7w77xsjm3xvige4";
 
     #[test]
@@ -190,7 +156,6 @@ mod tests {
 
     #[test]
     fn verify_detects_content_mismatch() {
-        // A structurally valid CID that belongs to a different value.
         assert_eq!(
             verify_record_cid(EMPTY_MAP_CID, &json!({ "text": "hello" })),
             CidCheck::Mismatch
@@ -215,8 +180,6 @@ mod tests {
 
     #[test]
     fn link_encodes_as_ipld_link_not_string() {
-        // {"$link": cid} must encode as a CBOR tag-42 link, so it produces a
-        // different CID than the same CID carried as a plain string.
         let as_link = json!({ "ref": { "$link": EMPTY_MAP_CID } });
         let as_string = json!({ "ref": EMPTY_MAP_CID });
         assert_ne!(
@@ -227,7 +190,6 @@ mod tests {
 
     #[test]
     fn bytes_encode_as_byte_string_not_text() {
-        // {"$bytes": base64} must encode as a CBOR byte string.
         let as_bytes = json!({ "data": { "$bytes": "aGVsbG8=" } }); // "hello"
         let as_string = json!({ "data": "aGVsbG8=" });
         assert_ne!(

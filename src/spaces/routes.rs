@@ -611,7 +611,7 @@ async fn apply_writes(
             } => {
                 service::check_collection_allowed(&space, &collection)?;
                 let rkey = rkey.unwrap_or_else(generate_tid);
-                let cid = service::content_cid(&value);
+                let cid = service::content_cid(&value)?;
                 let record_uri = format!(
                     "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
@@ -646,7 +646,7 @@ async fn apply_writes(
                 swap_record,
             } => {
                 service::check_collection_allowed(&space, &collection)?;
-                let cid = service::content_cid(&value);
+                let cid = service::content_cid(&value)?;
                 let record_uri = format!(
                     "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
@@ -1437,17 +1437,44 @@ mod tests {
     #[test]
     fn content_cid_deterministic() {
         let record = json!({"text": "hello"});
-        let cid1 = service::content_cid(&record);
-        let cid2 = service::content_cid(&record);
+        let cid1 = service::content_cid(&record).expect("encodable");
+        let cid2 = service::content_cid(&record).expect("encodable");
         assert_eq!(cid1, cid2);
         assert!(cid1.starts_with("bafyrei"));
     }
 
     #[test]
     fn content_cid_changes_for_different_records() {
-        let a = service::content_cid(&json!({"text": "hello"}));
-        let b = service::content_cid(&json!({"text": "world"}));
+        let a = service::content_cid(&json!({"text": "hello"})).expect("encodable");
+        let b = service::content_cid(&json!({"text": "world"})).expect("encodable");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn content_cid_matches_canonical_recomputation() {
+        let record = json!({ "$type": "com.example.item", "text": "hello" });
+        let minted = service::content_cid(&record).expect("encodable");
+        assert_eq!(
+            crate::cid_verify::verify_record_cid(&minted, &record),
+            crate::cid_verify::CidCheck::Match,
+        );
+    }
+
+    #[test]
+    fn content_cid_is_independent_of_key_order() {
+        let a = service::content_cid(&json!({ "aa": 2, "b": 1 })).expect("encodable");
+        let b = service::content_cid(&json!({ "b": 1, "aa": 2 })).expect("encodable");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn content_cid_rejects_unencodable_record() {
+        // A malformed `$link` cannot become an IPLD link.
+        let bad = json!({ "ref": { "$link": "not-a-cid" } });
+        assert!(matches!(
+            service::content_cid(&bad),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
