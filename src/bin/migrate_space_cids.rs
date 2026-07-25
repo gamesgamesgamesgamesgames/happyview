@@ -19,6 +19,11 @@ async fn main() {
                 eprintln!("Replaces legacy placeholder space record CIDs with real atproto CIDs,");
                 eprintln!("remaps the oplog, and rebuilds each repo's LtHash and commit.");
                 eprintln!();
+                eprintln!("This normally runs automatically on server startup and does not need");
+                eprintln!(
+                    "to be invoked by hand. Use it to force a re-scan or to preview changes."
+                );
+                eprintln!();
                 eprintln!("Options:");
                 eprintln!("  --dry-run   Compute and report changes, then roll back");
                 eprintln!("  -h, --help  Show this help");

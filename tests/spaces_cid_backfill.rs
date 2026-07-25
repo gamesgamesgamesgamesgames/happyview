@@ -264,3 +264,80 @@ async fn dry_run_changes_nothing() {
         );
     }
 }
+
+#[tokio::test]
+#[serial]
+async fn run_if_needed_repairs_once_then_skips() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let (space_id, _author, records) = seed(&pool, backend).await;
+
+    // First call: does the repair and reports it.
+    let first = cid_backfill::run_if_needed(&pool, backend)
+        .await
+        .expect("first run_if_needed failed")
+        .expect("first call must actually run");
+    assert_eq!(first.records_updated, 2);
+
+    // Records were repaired.
+    for (rkey, value) in &records {
+        let canonical = happyview::cid_verify::compute_record_cid(value)
+            .expect("encodable")
+            .to_string();
+        assert_eq!(stored_cid(&pool, backend, &space_id, rkey).await, canonical);
+    }
+
+    // Second call: marker is set, so it skips entirely without scanning.
+    let second = cid_backfill::run_if_needed(&pool, backend)
+        .await
+        .expect("second run_if_needed failed");
+    assert!(
+        second.is_none(),
+        "a completed backfill must be skipped, not re-run"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn run_if_needed_marks_empty_database_done() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let first = cid_backfill::run_if_needed(&pool, backend)
+        .await
+        .expect("first run_if_needed failed")
+        .expect("first call runs even on an empty database");
+    assert!(first.is_noop());
+
+    let second = cid_backfill::run_if_needed(&pool, backend)
+        .await
+        .expect("second run_if_needed failed");
+    assert!(second.is_none(), "empty database must be marked done");
+}
+
+#[tokio::test]
+#[serial]
+async fn dry_run_does_not_set_the_marker() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    seed(&pool, backend).await;
+
+    cid_backfill::run(&pool, backend, true)
+        .await
+        .expect("dry run failed");
+
+    // The guarded entry point must still see work to do.
+    let report = cid_backfill::run_if_needed(&pool, backend)
+        .await
+        .expect("run_if_needed failed")
+        .expect("dry run must not have set the marker");
+    assert_eq!(report.records_updated, 2);
+}

@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
-use crate::db::{DatabaseBackend, adapt_sql};
+use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lua::tid::generate_tid;
 use crate::spaces::lthash::{LtHashState, record_element};
@@ -25,6 +25,35 @@ impl BackfillReport {
 }
 
 type RecordRow = (String, String, String, String, String, String, String);
+
+const BACKFILL_MARKER_KEY: &str = "space_cid_backfill_completed_at";
+
+async fn read_marker(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Result<Option<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT value FROM happyview_instance_settings WHERE key = ?",
+        backend,
+    );
+    let row: Option<(String,)> = crate::db::query_as(&sql)
+        .bind(BACKFILL_MARKER_KEY)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read backfill marker: {e}")))?;
+    Ok(row.map(|r| r.0))
+}
+
+// Run the repair only if it has not already completed against this database.
+pub async fn run_if_needed(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Result<Option<BackfillReport>, AppError> {
+    if read_marker(pool, backend).await?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(run(pool, backend, false).await?))
+}
 
 pub async fn run(
     pool: &sqlx::AnyPool,
@@ -213,6 +242,20 @@ pub async fn run(
         db::update_space_revision(&mut *tx, backend, &space_id, &rev).await?;
         report.repos_rebuilt += 1;
     }
+
+    let now = now_rfc3339();
+    let marker_sql = adapt_sql(
+        "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        backend,
+    );
+    crate::db::query(&marker_sql)
+        .bind(BACKFILL_MARKER_KEY)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to write backfill marker: {e}")))?;
 
     if dry_run {
         tx.rollback()

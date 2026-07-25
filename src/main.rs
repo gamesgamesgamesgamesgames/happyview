@@ -48,6 +48,32 @@ async fn main() {
         "connected to database"
     );
 
+    match happyview::spaces::cid_backfill::run_if_needed(&db_pool, db_backend).await {
+        Ok(Some(report)) if report.is_noop() => {
+            info!("space CID backfill: nothing to repair");
+        }
+        Ok(Some(report)) => {
+            info!(
+                records_updated = report.records_updated,
+                oplog_rows_remapped = report.oplog_rows_remapped,
+                repos_rebuilt = report.repos_rebuilt,
+                records_unencodable = report.records_unencodable,
+                "space CID backfill applied"
+            );
+            if report.records_unencodable > 0 {
+                tracing::warn!(
+                    count = report.records_unencodable,
+                    "some space records could not be encoded as DAG-CBOR and kept their existing CID"
+                );
+            }
+        }
+        Ok(None) => { /* already completed; skipped without scanning */ }
+        Err(e) => tracing::error!(
+            error = %e,
+            "space CID backfill failed; will retry on next startup"
+        ),
+    }
+
     // Backfill record_refs in the background (first run after upgrade)
     {
         let db_bg = db_pool.clone();
