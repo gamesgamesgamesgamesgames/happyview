@@ -6,7 +6,7 @@ use atrium_oauth::{AuthorizeOptions, KnownScope, Scope};
 use axum::{
     Json, Router,
     extract::{Query, State},
-    response::Redirect,
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, Key, SignedCookieJar};
@@ -160,7 +160,7 @@ async fn callback(
     State(state): State<AppState>,
     jar: SignedCookieJar<Key>,
     Query(query): Query<CallbackQuery>,
-) -> Result<(SignedCookieJar<Key>, Redirect), AppError> {
+) -> Result<Response, AppError> {
     // The callback sets the session cookie; refuse when its signing key is not
     // secure (mirrors the guard in `login`).
     if !state.config.session_secret_secure() {
@@ -170,6 +170,25 @@ async fn callback(
     }
 
     tracing::debug!(state = ?query.state, "callback received");
+
+    if let Some(ref oauth_state) = query.state {
+        use crate::linked_repos::flow::PendingGrant;
+        match crate::linked_repos::flow::take_pending_grant(&state, oauth_state).await? {
+            PendingGrant::Grant { grant_id, origin } => {
+                return linked_repo_callback(&state, &grant_id, origin, query).await;
+            }
+            PendingGrant::Expired => {
+                tracing::warn!(
+                    state = %oauth_state,
+                    "linked-repo callback arrived for an expired or already-claimed authorization"
+                );
+                return Ok(crate::linked_repos::flow::link_result_redirect(
+                    &state, "expired", None,
+                ));
+            }
+            PendingGrant::NotLinked => {}
+        }
+    }
 
     // Look up the redirect URI and client_id from the database before the OAuth library consumes the state
     let (redirect_url, client_id) = if let Some(oauth_state) = &query.state {
@@ -267,7 +286,7 @@ async fn callback(
                     .as_ref()
                     .map(|bp| format!("{}/login?error=not_authorized", bp))
                     .unwrap_or_else(|| "/login?error=not_authorized".into());
-                return Ok((jar, Redirect::to(&login_url)));
+                return Ok((jar, Redirect::to(&login_url)).into_response());
             }
         }
     }
@@ -330,7 +349,86 @@ async fn callback(
         jar.add(session_cookie)
     };
 
-    Ok((jar, Redirect::to(&redirect_url)))
+    Ok((jar, Redirect::to(&redirect_url)).into_response())
+}
+
+async fn linked_repo_callback(
+    state: &AppState,
+    grant_id: &str,
+    origin: crate::linked_repos::flow::AuthOrigin,
+    query: CallbackQuery,
+) -> Result<Response, AppError> {
+    use crate::linked_repos::flow;
+    use crate::linked_repos::flow::AuthOrigin;
+
+    let finish = |status: &str, handle: Option<&str>| -> Response {
+        match origin {
+            AuthOrigin::Admin if status == "success" => {
+                let dashboard = format!(
+                    "{}/dashboard/settings/linked-repos",
+                    state.config.effective_public_url().trim_end_matches('/')
+                );
+                Redirect::to(&dashboard).into_response()
+            }
+            _ => flow::link_result_redirect(state, status, handle),
+        }
+    };
+
+    let grant = match crate::linked_repos::db::get(state, grant_id).await? {
+        Some(grant) => grant,
+        None => return Ok(finish("gone", None)),
+    };
+
+    let client = flow::client_for_grant(state, &grant)?;
+
+    let params = atrium_oauth::CallbackParams {
+        code: query.code,
+        state: query.state,
+        iss: query.iss,
+    };
+
+    let (session, _app_state) = match client.callback(params).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(%grant_id, error = %e, "linked repo OAuth callback failed");
+            return Ok(finish("failed", None));
+        }
+    };
+
+    use atrium_api::agent::SessionManager;
+    let did = session
+        .did()
+        .await
+        .ok_or_else(|| AppError::Internal("linked repo session has no DID".into()))?
+        .as_ref()
+        .to_string();
+
+    if let Err(e) = flow::complete(state, grant_id, &did).await {
+        if let Err(cleanup) = flow::discard_session(state, &did).await {
+            tracing::error!(%did, error = %cleanup, "failed to discard refused linked-repo session");
+        }
+        let status = match &e {
+            AppError::Conflict(_) => "already_linked",
+            _ => "mismatch",
+        };
+        tracing::warn!(%grant_id, %did, error = %e, "linked repo completion refused");
+        return Ok(finish(status, None));
+    }
+
+    match flow::invalidate_invites_for_grant(state, grant_id).await {
+        Ok(n) if n > 0 => {
+            tracing::debug!(%grant_id, count = n, "cleared invites for a now-linked grant")
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(%grant_id, error = %e, "failed to clear invites after linking")
+        }
+    }
+
+    Ok(finish(
+        "success",
+        grant.handle.as_deref().or(Some(did.as_str())),
+    ))
 }
 
 async fn logout(

@@ -19,6 +19,7 @@ pub mod jetstream;
 pub mod jobs;
 pub mod labeler;
 pub mod lexicon;
+pub mod linked_repos;
 pub mod lua;
 pub mod lua_analysis;
 pub mod oauth;
@@ -81,6 +82,7 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub oauth: Arc<auth::OAuthClientRegistry>,
     pub oauth_state_store: DbStateStore,
+    pub linked_repos_client: Arc<HappyViewOAuthClient>,
     pub cookie_key: axum_extra::extract::cookie::Key,
     pub plugin_registry: Arc<plugin::PluginRegistry>,
     pub wasm_runtime: Arc<plugin::WasmRuntime>,

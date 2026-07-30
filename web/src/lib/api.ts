@@ -4,6 +4,11 @@ import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
 import type { BackfillJob, BackfillReposResponse, PdsSummaryResponse } from "@/types/backfill";
 import type { Job, JobLogsResponse, JobsListResponse } from "@/types/jobs";
+import type {
+  CreateLinkedRepoBody,
+  LinkedRepo,
+  LinkedReposListResponse,
+} from "@/types/linked-repos";
 import type { UserSummary } from "@/types/users";
 import type { AdminListRecordsResponse } from "@/types/records";
 import type { EventsListResponse } from "@/types/events";
@@ -35,6 +40,11 @@ export type { CollectionStat, StatsResponse } from "@/types/stats";
 export type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 export type { NetworkLexiconSummary } from "@/types/network-lexicons";
 export type { BackfillJob, BackfillRepoEntry, BackfillReposResponse, PdsSummaryEntry, PdsSummaryResponse, BackfillEvent, BlueskyProfile } from "@/types/backfill";
+export type {
+  LinkedRepo,
+  LinkedReposListResponse,
+  CreateLinkedRepoBody,
+} from "@/types/linked-repos";
 export type { UserSummary } from "@/types/users";
 export type { AdminRecord, AdminListRecordsResponse } from "@/types/records";
 export type { EventLogEntry, EventsListResponse } from "@/types/events";
@@ -297,6 +307,80 @@ export function getJobLogs(
   const query = qs.toString();
   return apiFetch<JobLogsResponse>(
     `/admin/jobs/${id}/logs${query ? `?${query}` : ""}`,
+  );
+}
+
+// Linked Repos
+export function getLinkedRepos() {
+  return apiFetch<LinkedReposListResponse>("/admin/linked-repos");
+}
+
+export function createLinkedRepo(body: CreateLinkedRepoBody) {
+  return apiFetch<LinkedRepo>("/admin/linked-repos", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function authorizeLinkedRepo(id: string) {
+  return apiFetch<{ authorize_url: string }>(
+    `/admin/linked-repos/${id}/authorize`,
+    { method: "POST" },
+  );
+}
+
+export function inviteLinkedRepo(id: string) {
+  return apiFetch<{ invite_url: string; expires_at: string }>(
+    `/admin/linked-repos/${id}/invite`,
+    { method: "POST" },
+  );
+}
+
+export function deleteLinkedRepo(id: string) {
+  return apiFetch<{ deleted: boolean }>(`/admin/linked-repos/${id}`, {
+    method: "DELETE",
+  });
+}
+
+// Linked Repos — outstanding invites. `invite_id` is the stored SHA-256 of
+// the token, not the token itself: the actual link is only ever returned
+// once, at mint time, so this list is metadata-only by design.
+export interface LinkedRepoInvite {
+  invite_id: string;
+  expires_at: string;
+}
+
+export interface LinkedRepoInvitesResponse {
+  invites: LinkedRepoInvite[];
+}
+
+export function getLinkedRepoInvites(id: string) {
+  return apiFetch<LinkedRepoInvitesResponse>(
+    `/admin/linked-repos/${id}/invites`,
+  );
+}
+
+export function revokeLinkedRepoInvite(id: string, inviteId: string) {
+  return apiFetch<{ revoked: boolean }>(
+    `/admin/linked-repos/${id}/invites/${encodeURIComponent(inviteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+// Linked Repos — public invite landing page (unauthenticated, token-gated)
+export interface LinkedRepoInviteInfo {
+  valid: boolean;
+  app_name: string;
+  logo_url: string | null;
+  scopes: string[];
+  reason: string | null;
+  pinned_identifier: string | null;
+  expires_at: string | null;
+}
+
+export function getLinkedRepoInvite(token: string) {
+  return apiFetch<LinkedRepoInviteInfo>(
+    `/auth/linked-repo/info?token=${encodeURIComponent(token)}`,
   );
 }
 

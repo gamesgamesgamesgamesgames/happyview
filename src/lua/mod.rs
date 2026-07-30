@@ -4,6 +4,7 @@ pub mod db_api;
 mod execute;
 pub(crate) mod http_api;
 pub(crate) mod jobs_api;
+pub mod linked_repos_api;
 pub mod record;
 pub(crate) mod sandbox;
 pub mod scripts;

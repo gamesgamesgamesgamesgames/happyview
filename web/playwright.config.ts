@@ -35,6 +35,8 @@ export default defineConfig({
         "proxy-config.spec.ts",
         "spaces.spec.ts",
         "jobs.spec.ts",
+        "linked-repos.spec.ts",
+        "link-invite-pages.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },
@@ -42,6 +44,15 @@ export default defineConfig({
     {
       name: "attach-account",
       testMatch: "setup-attach-account.spec.ts",
+      dependencies: ["post-setup"],
+      use: { browserName: "chromium", ignoreHTTPSErrors: true },
+    },
+    {
+      // Drives a real OAuth authorization against the local PDS, which Caddy
+      // serves over HTTPS with a local CA — hence ignoreHTTPSErrors, same as
+      // the attach-account project.
+      name: "linked-repos-oauth",
+      testMatch: "linked-repos-oauth.spec.ts",
       dependencies: ["post-setup"],
       use: { browserName: "chromium", ignoreHTTPSErrors: true },
     },

@@ -103,10 +103,14 @@ impl TestApp {
             http_client: atrium_http,
         });
         let oauth_pool = db::test_pool().await;
+        let oauth_scopes = vec![
+            Scope::Known(KnownScope::Atproto),
+            Scope::Unknown("identity:*".to_string()),
+        ];
         let oauth = atrium_oauth::OAuthClient::new(OAuthClientConfig {
             client_metadata: AtprotoLocalhostClientMetadata {
                 redirect_uris: Some(vec!["http://127.0.0.1:0/auth/callback".into()]),
-                scopes: Some(vec![Scope::Known(KnownScope::Atproto)]),
+                scopes: Some(oauth_scopes.clone()),
             },
             keys: None,
             state_store: happyview::auth::oauth_store::DbStateStore::new(
@@ -156,6 +160,20 @@ impl TestApp {
             oauth_state_store: happyview::auth::oauth_store::DbStateStore::new(
                 pool.clone(),
                 backend,
+            ),
+            linked_repos_client: std::sync::Arc::new(
+                happyview::linked_repos::client::build(
+                    "https://plc.directory",
+                    "http://127.0.0.1:0/oauth-client-metadata.json",
+                    "http://127.0.0.1:0",
+                    "http://127.0.0.1:0/auth/callback".into(),
+                    true,
+                    oauth_scopes,
+                    happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                    pool.clone(),
+                    backend,
+                )
+                .expect("Failed to create test linked-repo OAuth client"),
             ),
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-that-is-at-least-32-bytes-long",

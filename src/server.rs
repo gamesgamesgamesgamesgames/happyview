@@ -75,6 +75,14 @@ pub fn router(state: AppState) -> Router {
             ),
         ))
         .nest("/auth", crate::auth::routes::routes())
+        .route(
+            "/auth/linked-repo/start",
+            get(crate::linked_repos::flow::start_handler),
+        )
+        .route(
+            "/auth/linked-repo/info",
+            get(crate::linked_repos::flow::invite_info_handler),
+        )
         .nest("/external-auth", crate::external_auth::routes())
         .nest("/oauth", crate::oauth::routes::routes())
         // https://atproto.com/specs/oauth#types-of-clients
@@ -404,6 +412,22 @@ async fn client_metadata(
 
     if let Some(uri) = crate::admin::settings::get_setting(pool, "policy_uri", backend).await {
         metadata["policy_uri"] = serde_json::Value::String(uri);
+    }
+
+    let base_scopes = crate::linked_repos::scope::client_base_scopes(
+        oauth_client.client_metadata.scope.as_deref(),
+        &oauth_client.client_metadata.client_id,
+    );
+    match crate::linked_repos::db::all_scopes(&state).await {
+        Ok(grant_scopes) => {
+            let union = crate::linked_repos::scope::union(&grant_scopes, &base_scopes);
+            metadata["scope"] = serde_json::Value::String(union);
+        }
+        Err(e) => {
+            // Serving a doc without grant scopes would break every linked-repo
+            // authorization; log loudly rather than failing silently.
+            tracing::error!(error = %e, "failed to compute linked-repo scope union");
+        }
     }
 
     Json(metadata)

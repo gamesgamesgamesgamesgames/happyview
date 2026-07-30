@@ -6,7 +6,7 @@ HappyView uses a granular permission system to control access to the admin API. 
 
 ## Permission list
 
-HappyView defines 44 permissions organized by category:
+HappyView defines 49 permissions organized by category:
 
 ### Lexicons
 
@@ -114,6 +114,24 @@ HappyView defines 44 permissions organized by category:
 | `spaces:manage-records`     | Read and write records within spaces       |
 | `spaces:manage-credentials` | Issue and revoke space access credentials  |
 
+### Jobs
+
+| Permission     | Description                                 |
+| -------------- | ------------------------------------------- |
+| `jobs:read`    | View background job status and progress     |
+| `jobs:create`  | Queue new background jobs                   |
+| `jobs:manage`  | Cancel, pause, and resume background jobs   |
+
+### Linked Repos
+
+| Permission            | Description                                                  |
+| --------------------- | ------------------------------------------------------------ |
+| `linked-repos:read`   | View linked repos, their status, and their outstanding invites |
+| `linked-repos:create` | Add linked repos, start authorizations, mint and revoke invites |
+| `linked-repos:delete` | Revoke linked repos and delete their stored sessions          |
+
+Revoking an invite uses `linked-repos:create` rather than `linked-repos:delete`, because minting and revoking are one lifecycle. `linked-repos:delete` is reserved for destroying a grant and the OAuth session behind it. See [Linked Repos](./linked-repos.md).
+
 ### System
 
 | Permission   | Description                              |
@@ -145,7 +163,7 @@ Adds: `lexicons:create`, `lexicons:delete`, `scripts:manage`, `script-variables:
 
 ### Full Access
 
-All 44 permissions. Equivalent to granting every permission individually (but still not a super user).
+All 49 permissions. Equivalent to granting every permission individually (but still not a super user).
 
 ## Super user
 

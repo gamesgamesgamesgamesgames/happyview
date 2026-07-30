@@ -23,6 +23,7 @@ import {
   IconFlask,
   IconFingerprint,
   IconPlayerPlay,
+  IconLink,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -134,6 +135,12 @@ const systemItems: NavItem[] = [
     url: "/dashboard/settings/xrpc-proxy",
     icon: IconArrowsShuffle,
     requiredPermissions: ["settings:manage"],
+  },
+  {
+    title: "Linked Repos",
+    url: "/dashboard/settings/linked-repos",
+    icon: IconLink,
+    requiredPermissions: ["linked-repos:read"],
   },
   {
     title: "ENV Variables",

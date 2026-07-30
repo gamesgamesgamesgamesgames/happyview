@@ -474,11 +474,13 @@ async fn main() {
         Scope::Unknown("identity:*".to_string()),
     ];
 
+    let linked_repos_scopes = oauth_scopes.clone();
+
     let oauth_client = if is_loopback {
         info!("Using loopback OAuth client metadata (local development)");
         atrium_oauth::OAuthClient::new(OAuthClientConfig {
             client_metadata: AtprotoLocalhostClientMetadata {
-                redirect_uris: Some(vec![callback_url]),
+                redirect_uris: Some(vec![callback_url.clone()]),
                 scopes: Some(oauth_scopes),
             },
             keys: None,
@@ -495,7 +497,7 @@ async fn main() {
                     config.effective_public_url().trim_end_matches('/')
                 ),
                 client_uri: Some(config.effective_public_url()),
-                redirect_uris: vec![callback_url],
+                redirect_uris: vec![callback_url.clone()],
                 token_endpoint_auth_method: AuthMethod::None,
                 grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
                 scopes: oauth_scopes,
@@ -510,12 +512,24 @@ async fn main() {
         .expect("Failed to create OAuth client")
     };
 
-    // Derive the cookie signing key from SESSION_SECRET when it is secure. When
-    // it is not, log the problem loudly and fall back to an ephemeral random key
-    // so no attacker can forge cookies with a known/weak key. Cookie-based auth
-    // is disabled in this state (see the auth extractors and login handlers);
-    // DPoP, service auth, and API-key auth are unaffected. The server still boots
-    // so the dashboard can surface the misconfiguration to an operator.
+    let linked_repos_client = Arc::new(
+        happyview::linked_repos::client::build(
+            &config.plc_url,
+            &format!(
+                "{}/oauth-client-metadata.json",
+                config.effective_public_url().trim_end_matches('/')
+            ),
+            &config.effective_public_url(),
+            callback_url.clone(),
+            is_loopback,
+            linked_repos_scopes,
+            oauth_state_store.clone(),
+            db_pool.clone(),
+            db_backend,
+        )
+        .expect("Failed to create linked-repo OAuth client"),
+    );
+
     let cookie_key = if config.session_secret_secure() {
         axum_extra::extract::cookie::Key::derive_from(config.session_secret.as_bytes())
     } else {
@@ -667,6 +681,7 @@ async fn main() {
         rate_limiter,
         oauth: oauth_registry,
         oauth_state_store,
+        linked_repos_client,
         cookie_key,
         plugin_registry,
         wasm_runtime,
@@ -682,6 +697,14 @@ async fn main() {
 
     labeler::spawn(state.clone(), labeler_subscriptions_rx);
     tokio::spawn(labeler::spawn_label_gc(state.db.clone(), state.db_backend));
+
+    {
+        let gc_db = state.db.clone();
+        let gc_backend = state.db_backend;
+        tokio::spawn(async move {
+            happyview::auth::state_gc::run_expired_state_gc(gc_db, gc_backend).await;
+        });
+    }
 
     tokio::spawn(happyview::event_log::spawn_retention_cleanup(
         state.db.clone(),
@@ -721,6 +744,13 @@ async fn main() {
         let state = state.clone();
         tokio::spawn(async move {
             happyview::admin::backfill::run_backfill_retention_cleanup(&state).await;
+        });
+    }
+
+    {
+        let keepalive_state = state.clone();
+        tokio::spawn(async move {
+            happyview::linked_repos::worker::run_keepalive(keepalive_state).await;
         });
     }
 

@@ -50,11 +50,20 @@ impl From<serde_json::Error> for StoreError {
 pub struct DbSessionStore {
     pool: AnyPool,
     backend: DatabaseBackend,
+    table: &'static str,
 }
 
 impl DbSessionStore {
     pub fn new(pool: AnyPool, backend: DatabaseBackend) -> Self {
-        Self { pool, backend }
+        Self::new_with_table(pool, backend, "happyview_oauth_sessions")
+    }
+
+    pub fn new_with_table(pool: AnyPool, backend: DatabaseBackend, table: &'static str) -> Self {
+        Self {
+            pool,
+            backend,
+            table,
+        }
     }
 }
 
@@ -63,7 +72,7 @@ impl Store<Did, Session> for DbSessionStore {
 
     async fn get(&self, key: &Did) -> Result<Option<Session>, Self::Error> {
         let row: Option<(String,)> = crate::db::query_as(&adapt_sql(
-            "SELECT session_data FROM happyview_oauth_sessions WHERE did = ?",
+            &format!("SELECT session_data FROM {} WHERE did = ?", self.table),
             self.backend,
         ))
         .bind(key.as_ref())
@@ -79,8 +88,12 @@ impl Store<Did, Session> for DbSessionStore {
     async fn set(&self, key: Did, value: Session) -> Result<(), Self::Error> {
         let json = serde_json::to_string(&value)?;
         crate::db::query(&adapt_sql(
-            "INSERT INTO happyview_oauth_sessions (did, session_data, updated_at) VALUES (?, ?, datetime('now'))
-             ON CONFLICT (did) DO UPDATE SET session_data = EXCLUDED.session_data, updated_at = datetime('now')",
+            &format!(
+                "INSERT INTO {} (did, session_data, updated_at) VALUES (?, ?, datetime('now')) \
+                 ON CONFLICT (did) DO UPDATE SET session_data = EXCLUDED.session_data, \
+                 updated_at = datetime('now')",
+                self.table
+            ),
             self.backend,
         ))
         .bind(key.as_ref())
@@ -92,7 +105,7 @@ impl Store<Did, Session> for DbSessionStore {
 
     async fn del(&self, key: &Did) -> Result<(), Self::Error> {
         crate::db::query(&adapt_sql(
-            "DELETE FROM happyview_oauth_sessions WHERE did = ?",
+            &format!("DELETE FROM {} WHERE did = ?", self.table),
             self.backend,
         ))
         .bind(key.as_ref())
@@ -102,7 +115,7 @@ impl Store<Did, Session> for DbSessionStore {
     }
 
     async fn clear(&self) -> Result<(), Self::Error> {
-        crate::db::query("DELETE FROM happyview_oauth_sessions")
+        crate::db::query(&format!("DELETE FROM {}", self.table))
             .execute(&self.pool)
             .await?;
         Ok(())
