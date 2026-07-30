@@ -407,6 +407,83 @@ async fn resume_running_job_returns_409() {
 }
 
 // ---------------------------------------------------------------------------
+// Worker: claim → execute → complete
+//
+// This is the only coverage that exercises `claim_next_job`, whose
+// `UPDATE ... RETURNING` writes `status = 'running'` *before* the returned row
+// is decoded. A decode failure there leaves the job marked running with nobody
+// executing it, and every read below goes through raw SQL rather than the admin
+// API so a failure here points at the worker rather than the read path.
+// ---------------------------------------------------------------------------
+
+async fn seed_script(app: &TestApp, trigger_id: &str, body: &str) {
+    // created_at/updated_at have no default on Postgres — bind them explicitly.
+    let now = happyview::db::now_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) VALUES (?, ?, 'lua', ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(trigger_id)
+        .bind(body)
+        .bind(&now)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .expect("seed_script: insert failed");
+}
+
+async fn job_row(app: &TestApp, id: &str) -> (String, Option<String>, Option<String>) {
+    let sql = adapt_sql(
+        "SELECT status, result, error FROM happyview_jobs WHERE id = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query_as::<(String, Option<String>, Option<String>)>(&sql)
+        .bind(id)
+        .fetch_one(&app.state.db)
+        .await
+        .expect("job_row: select failed")
+}
+
+/// Poll until the job leaves the pending/running states, or time out.
+async fn await_terminal_status(
+    app: &TestApp,
+    id: &str,
+) -> (String, Option<String>, Option<String>) {
+    for _ in 0..100 {
+        let row = job_row(app, id).await;
+        if !matches!(row.0.as_str(), "pending" | "running") {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    job_row(app, id).await
+}
+
+#[tokio::test]
+#[serial]
+async fn worker_runs_pending_job_to_completion() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    seed_script(
+        &app,
+        "job.run:test.worker",
+        "function handle() return { ok = true } end",
+    )
+    .await;
+    let id = seed_job(&app, "test.worker", "pending").await;
+
+    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let (status, result, error) = await_terminal_status(&app, &id).await;
+    worker.abort();
+
+    assert_eq!(status, "completed", "job error: {error:?}");
+    let result: Value = serde_json::from_str(&result.expect("no result persisted")).unwrap();
+    assert_eq!(result["ok"], true);
+}
+
+// ---------------------------------------------------------------------------
 // Auth: unauthenticated requests
 // ---------------------------------------------------------------------------
 

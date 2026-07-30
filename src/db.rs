@@ -408,6 +408,91 @@ mod tests {
     use super::*;
     use chrono::Datelike;
 
+    const CAST_ON_READ: &[&str] = &[
+        "service_identity.setup_complete",
+        "happyview_jobs.inherit_auth",
+    ];
+
+    const UNMAPPABLE_DECLTYPES: &[&str] =
+        &["boolean", "bool", "date", "time", "datetime", "timestamp"];
+
+    #[test]
+    fn sqlite_migrations_declare_no_unmappable_column_types() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("migrations/sqlite must exist")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no SQLite migrations found in {dir:?}");
+
+        let mut offenders = Vec::new();
+
+        for path in &files {
+            let sql = std::fs::read_to_string(path).expect("failed to read migration");
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            let mut current_table = String::from("<unknown>");
+
+            for line in sql.lines() {
+                let line = line.split("--").next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let lower = line.to_ascii_lowercase();
+
+                // Track the enclosing CREATE TABLE so offenders can be named.
+                if let Some(rest) = lower.strip_prefix("create table") {
+                    let rest = rest.trim_start_matches(" if not exists").trim();
+                    current_table = rest
+                        .split(['(', ' '])
+                        .find(|s| !s.is_empty())
+                        .unwrap_or("<unknown>")
+                        .to_string();
+                }
+
+                // `ALTER TABLE <t> ADD COLUMN <col> <type>` names its own table.
+                let (table, decl) = if let Some(idx) = lower.find("add column") {
+                    let table = lower
+                        .strip_prefix("alter table")
+                        .and_then(|r| r.split_whitespace().next())
+                        .unwrap_or("<unknown>")
+                        .to_string();
+                    (table, line[idx + "add column".len()..].trim())
+                } else {
+                    (current_table.clone(), line)
+                };
+
+                // A column declaration is `<name> <type> ...`; anything whose
+                // first token is a keyword (CREATE, PRIMARY, FOREIGN, …) is not.
+                let mut tokens = decl.split_whitespace();
+                let (Some(name), Some(ty)) = (tokens.next(), tokens.next()) else {
+                    continue;
+                };
+                let ty = ty.trim_end_matches(',').to_ascii_lowercase();
+                if !UNMAPPABLE_DECLTYPES.contains(&ty.as_str()) {
+                    continue;
+                }
+
+                let name = name.trim_matches('"').to_ascii_lowercase();
+                let qualified = format!("{table}.{name}");
+                if !CAST_ON_READ.contains(&qualified.as_str()) {
+                    offenders.push(format!("{file}: {qualified} declared {ty}"));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "SQLite columns declared with a type sqlx's `Any` driver cannot decode:\n  {}\n\n\
+             Any query selecting one of these fails to decode the whole row on SQLite \
+             (Postgres is unaffected, so CI will not catch it). Either declare the column \
+             INTEGER, or read it as `CAST({{col}} AS INTEGER)` in every query and add it to \
+             CAST_ON_READ above.",
+            offenders.join("\n  ")
+        );
+    }
+
     #[test]
     fn escape_like_escapes_metacharacters() {
         assert_eq!(escape_like("bafyrealcid"), "bafyrealcid"); // unchanged
