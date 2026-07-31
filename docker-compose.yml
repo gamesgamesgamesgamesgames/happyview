@@ -1,3 +1,10 @@
+# Explicit project name. All three compose files live in this directory, so
+# without this they would all default to the directory name — sharing
+# container names, networks and volumes. `down` in one would then tear down
+# the others, which is exactly what used to happen when a dev stack and a
+# test run overlapped.
+name: happyview
+
 services:
   # Postgres is optional — only needed if you set DATABASE_URL to a postgres:// URL.
   # SQLite is the default and requires no container. To use Postgres, uncomment this
