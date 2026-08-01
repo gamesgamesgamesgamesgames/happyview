@@ -2,7 +2,7 @@
 title: "Record & Label Scripts"
 ---
 
-Record and label scripts are Lua scripts that run in response to events on the AT Protocol network. **Record scripts** fire when a record in a collection is created, updated, or deleted. **Label scripts** fire when a label is applied to a record or actor. Both run **before** the event is indexed, giving you the ability to filter, transform, or trigger side effects.
+Record and label scripts are Lua scripts that run in response to events on the atproto network. **Record scripts** fire when a record in a collection is created, updated, or deleted. **Label scripts** fire when a label is applied to a record or actor. Both run **before** the event is indexed, giving you the ability to filter, transform, or trigger side effects.
 
 These scripts are event-driven -- they react to incoming Jetstream events (which include events caused by HappyView's own PDS writes), not to XRPC requests. For scripts that run in response to XRPC queries and procedures, see [Lua Scripting](./lua-scripting.md).
 

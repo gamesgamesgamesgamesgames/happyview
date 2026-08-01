@@ -19,7 +19,7 @@ cp .env.example .env
 Edit `.env` and set at least `PUBLIC_URL` (e.g. `http://127.0.0.1:3000`) and `SESSION_SECRET` (at least 64 characters). The defaults work for everything else. See [Configuration](../configuration.md) for the full list of environment variables.
 
 <Callout type="warn" title="Use 127.0.0.1, not localhost">
-ATProto OAuth loopback clients are registered with `127.0.0.1`. If you set `PUBLIC_URL` to `http://localhost:3000`, OAuth sign-in will fail because the redirect URI won't match the loopback client ID. Always use `http://127.0.0.1:3000` for local development.
+atproto OAuth loopback clients are registered with `127.0.0.1`. If you set `PUBLIC_URL` to `http://localhost:3000`, OAuth sign-in will fail because the redirect URI won't match the loopback client ID. Always use `http://127.0.0.1:3000` for local development.
 </Callout>
 
 ## 2. Start the stack

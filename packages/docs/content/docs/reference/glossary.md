@@ -2,11 +2,11 @@
 title: "Glossary"
 ---
 
-Key terms used throughout the HappyView documentation. For a broader introduction to the atproto, see the [official ATProto glossary](https://atproto.com/guides/glossary).
+Key terms used throughout the HappyView documentation. For a broader introduction to the atproto, see the [official atproto glossary](https://atproto.com/guides/glossary).
 
 ## atproto terms
 
-**AppView** — A backend service that indexes atproto records and serves them through an API. HappyView is an AppView. See the [ATProto docs](https://atproto.com/guides/glossary#app-view) for more.
+**AppView** — A backend service that indexes atproto records and serves them through an API. HappyView is an AppView. See the [atproto docs](https://atproto.com/guides/glossary#app-view) for more.
 
 **DID** (Decentralized Identifier) — A persistent, globally unique identifier for an account (e.g. `did:plc:abc123`).
 
@@ -52,11 +52,11 @@ Key terms used throughout the HappyView documentation. For a broader introductio
 
 **Permission** — A granular access control right that authorizes a specific action in the admin API. HappyView defines 44 permissions organized by category (e.g. `lexicons:create`, `users:read`). See [Permissions](../guides/permissions.md).
 
-**Permissioned Data** — AT Protocol data that is gated by membership in a space, as opposed to public repo data. Defined by AT Protocol Proposal 0016.
+**Permissioned Data** — atproto data that is gated by membership in a space, as opposed to public repo data. Defined by atproto Proposal 0016.
 
 **Permission template** — A predefined set of permissions that can be applied when creating a user. Templates are: **Viewer** (read-only access), **Operator** (viewer + backfill and API key management), **Manager** (operator + lexicon, record, spaces, and plugin management), and **Full Access** (all 44 permissions).
 
-**Space** — A container for permissioned data in AT Protocol. Identified by a space DID, type NSID, and space key (skey), forming an `at://` URI with a `space` path segment (e.g. `at://did:plc:abc/space/com.example.forum/main`).
+**Space** — A container for permissioned data in atproto. Identified by a space DID, type NSID, and space key (skey), forming an `at://` URI with a `space` path segment (e.g. `at://did:plc:abc/space/com.example.forum/main`).
 
 **Space Credential** — A short-lived JWT (`typ: atproto-space-credential+jwt`, ES256, 2-hour TTL) for cross-service read access to space data. Signed by the space's P-256 keypair. Obtained by exchanging a delegation token via `com.atproto.space.getSpaceCredential`.
 

@@ -17,6 +17,7 @@
     "domains",
     "script-variables",
     "api-clients",
+    "linked-repos",
     "plugins",
     "dead-letters",
     "service-identity",

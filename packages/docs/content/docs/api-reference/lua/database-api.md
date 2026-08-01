@@ -181,7 +181,7 @@ Available internal tables:
 
 | Table | Contents |
 | --- | --- |
-| `happyview_records` | indexed AT Protocol records |
+| `happyview_records` | indexed atproto records |
 | `happyview_record_refs` | backlink index |
 | `happyview_labels` | applied labels |
 | `happyview_lexicons` | uploaded lexicons |

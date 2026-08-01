@@ -27,7 +27,7 @@ SESSION_SECRET=change-me-in-production
 ```
 
 <Callout type="warn" title="Use 127.0.0.1, not localhost">
-ATProto OAuth loopback clients are registered with `127.0.0.1`. If you set `PUBLIC_URL` to `http://localhost:3000`, OAuth sign-in will fail because the redirect URI won't match the loopback client ID. Always use `http://127.0.0.1:3000` for local development.
+atproto OAuth loopback clients are registered with `127.0.0.1`. If you set `PUBLIC_URL` to `http://localhost:3000`, OAuth sign-in will fail because the redirect URI won't match the loopback client ID. Always use `http://127.0.0.1:3000` for local development.
 </Callout>
 
 Or if you prefer Postgres:

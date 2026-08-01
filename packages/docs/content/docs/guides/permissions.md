@@ -20,7 +20,7 @@ HappyView defines 49 permissions organized by category:
 
 | Permission                  | Description                             |
 | --------------------------- | --------------------------------------- |
-| `records:read`              | Browse indexed AT Protocol records      |
+| `records:read`              | Browse indexed atproto records      |
 | `records:delete`            | Delete individual records from the index |
 | `records:delete-collection` | Bulk-delete all records in a collection |
 

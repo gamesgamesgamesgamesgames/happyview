@@ -8,6 +8,7 @@
     "atproto-api",
     "json-api",
     "jobs-api",
+    "linked-repos-api",
     "utility-globals",
     "standard-libraries"
   ]

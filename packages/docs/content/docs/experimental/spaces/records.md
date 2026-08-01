@@ -6,7 +6,7 @@ title: "Records"
 This API is experimental and will change. See the [Permissioned Spaces overview](../spaces.md) for context.
 </Callout>
 
-Space records are stored separately from public AT Protocol records. They use the `at://` scheme with a `space` path segment to distinguish them from public records:
+Space records are stored separately from public atproto records. They use the `at://` scheme with a `space` path segment to distinguish them from public records:
 
 ```
 at:// did:plc:abcdefghijklmnop1234567890 / space / com.example.forum / main        / did:plc:author / com.example.forum.post / abcdefghijklmnop1234567890

@@ -2,7 +2,7 @@
 title: "Node Client"
 ---
 
-Server-side OAuth client for authenticating with a HappyView instance using AT Protocol. Built on top of [`@happyview/oauth-client`](../oauth-client/overview.md), matching the API surface of [`@atproto/oauth-client-node`](https://www.npmjs.com/package/@atproto/oauth-client-node).
+Server-side OAuth client for authenticating with a HappyView instance using atproto. Built on top of [`@happyview/oauth-client`](../oauth-client/overview.md), matching the API surface of [`@atproto/oauth-client-node`](https://www.npmjs.com/package/@atproto/oauth-client-node).
 
 ## Installation
 

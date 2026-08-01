@@ -345,7 +345,7 @@ The `redirect_uris` array must include the `redirectUri` your client is configur
 
 ## Local development
 
-For local development with ATProto's loopback client ID convention, use `buildLoopbackClientId`:
+For local development with atproto's loopback client ID convention, use `buildLoopbackClientId`:
 
 ```typescript
 import { buildLoopbackClientId } from "@happyview/oauth-client-browser";
