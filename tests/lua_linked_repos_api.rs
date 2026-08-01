@@ -603,3 +603,133 @@ async fn global_is_registered_for_record_event_scripts() {
     assert_eq!(out["count"], 1);
     assert_eq!(out["did"], "did:plc:234567abcdefghijklmnopqr");
 }
+
+// ---------------------------------------------------------------------------
+// Local record index mirroring
+//
+// `pds::create_record` / `put_record` / `delete_record` keep `happyview_records`
+// in step after a successful PDS write, the same way `Record:save()` does. The
+// upsert deliberately swallows its errors — the PDS write has already landed —
+// so a column/bind mismatch would be silent. These cover the statement itself.
+// ---------------------------------------------------------------------------
+
+async fn fetch_indexed_row(
+    app: &TestApp,
+    uri: &str,
+) -> Option<(String, String, String, String, Option<String>)> {
+    let sql = happyview::db::adapt_sql(
+        "SELECT did, collection, rkey, cid, indexed_at FROM happyview_records WHERE uri = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query_as(&sql)
+        .bind(uri)
+        .fetch_optional(&app.state.db)
+        .await
+        .expect("fetch indexed row")
+}
+
+#[tokio::test]
+#[serial]
+async fn index_write_mirrors_a_linked_repo_write() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let uri = "at://did:plc:target/games.gamesgamesgamesgames.game/abc123";
+    happyview::linked_repos::pds::index_write(
+        &app.state,
+        "did:plc:target",
+        "games.gamesgamesgamesgames.game",
+        uri,
+        "bafyreiexample",
+        &serde_json::json!({
+            "$type": "games.gamesgamesgamesgames.game",
+            "name": "Grand Space Odyssey",
+        }),
+    )
+    .await;
+
+    let (did, collection, rkey, cid, indexed_at) =
+        fetch_indexed_row(&app, uri).await.expect("row was indexed");
+    assert_eq!(did, "did:plc:target");
+    assert_eq!(collection, "games.gamesgamesgamesgames.game");
+    assert_eq!(rkey, "abc123");
+    // The real CID from the PDS response, not a placeholder — this is the
+    // reason the mirroring lives here rather than in Lua, where `save_local()`
+    // can only ever record NULL.
+    assert_eq!(cid, "bafyreiexample");
+    // Not seen on the firehose yet, so no arrival time.
+    assert_eq!(indexed_at, None);
+}
+
+#[tokio::test]
+#[serial]
+async fn index_write_preserves_network_indexed_at_on_update() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let uri = "at://did:plc:target/games.gamesgamesgamesgames.game/abc123";
+    let record = serde_json::json!({"$type": "games.gamesgamesgamesgames.game", "name": "v1"});
+    happyview::linked_repos::pds::index_write(
+        &app.state,
+        "did:plc:target",
+        "games.gamesgamesgamesgames.game",
+        uri,
+        "bafyv1",
+        &record,
+    )
+    .await;
+
+    // Pretend Jetstream echoed the record back and stamped its arrival.
+    let arrived = "2026-07-24T16:21:56.566+00:00";
+    let sql = happyview::db::adapt_sql(
+        "UPDATE happyview_records SET indexed_at = ? WHERE uri = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(arrived)
+        .bind(uri)
+        .execute(&app.state.db)
+        .await
+        .expect("stamp indexed_at");
+
+    // A later linked-repo write to the same record.
+    happyview::linked_repos::pds::index_write(
+        &app.state,
+        "did:plc:target",
+        "games.gamesgamesgamesgames.game",
+        uri,
+        "bafyv2",
+        &serde_json::json!({"$type": "games.gamesgamesgamesgames.game", "name": "v2"}),
+    )
+    .await;
+
+    let (_, _, _, cid, indexed_at) = fetch_indexed_row(&app, uri).await.expect("row still there");
+    assert_eq!(cid, "bafyv2", "the update landed");
+    assert_eq!(
+        indexed_at.as_deref(),
+        Some(arrived),
+        "an AppView-side write must not overwrite network-arrival provenance",
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn unindex_write_removes_the_row() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let uri = "at://did:plc:target/games.gamesgamesgamesgames.game/abc123";
+    happyview::linked_repos::pds::index_write(
+        &app.state,
+        "did:plc:target",
+        "games.gamesgamesgamesgames.game",
+        uri,
+        "bafyreiexample",
+        &serde_json::json!({"$type": "games.gamesgamesgamesgames.game", "name": "gone soon"}),
+    )
+    .await;
+    assert!(fetch_indexed_row(&app, uri).await.is_some());
+
+    happyview::linked_repos::pds::unindex_write(&app.state, uri).await;
+    assert!(fetch_indexed_row(&app, uri).await.is_none());
+}

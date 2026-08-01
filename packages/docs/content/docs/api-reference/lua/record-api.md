@@ -59,6 +59,14 @@ r:set_rkey("my-key")
 local key = r:generate_rkey()
 ```
 
+### `save_local` and network provenance
+
+`cid` and `indexed_at` describe the record as it exists **on the network**, so `save_local()` never writes them.
+
+On an existing record — the redaction flow this method exists for — both are left exactly as they were. The CID still describes what the PDS holds, since editing the local copy doesn't change the repo's copy, and it's what `_cid` feeds into strongRefs. `indexed_at` still records when the firehose delivered it.
+
+On a record that has never existed on a PDS, there is nothing to describe: `cid` is empty and `indexed_at` is NULL. A row with `indexed_at IS NULL` is precisely "written locally, not yet echoed back" — use `COALESCE(indexed_at, created_at)` when you need a timestamp regardless.
+
 **Key type behavior for `generate_rkey()`:**
 
 | Key type        | Generated rkey                    |

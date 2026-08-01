@@ -138,6 +138,71 @@ async fn post_json(
     }
 }
 
+/// Mirror a successful linked-repo write into the local record index.
+///
+/// This matches what `Record:save()` does after its own PDS write
+/// (`lua/record.rs`): a best-effort upsert plus a `sync_refs` pass, with no
+/// filter on whether the collection is a tracked record lexicon. Failures are
+/// swallowed deliberately — the PDS write has already landed, so the caller's
+/// operation succeeded whether or not we managed to index it, and the record
+/// will be indexed anyway when Jetstream echoes it back.
+///
+/// `indexed_at` is left alone: it is network-arrival provenance, and this
+/// record has not come back over the firehose yet. See [`crate::db::NO_INDEXED_AT`].
+///
+/// Public so tests can exercise the statement directly. They need to: the
+/// errors are swallowed here, so a column/bind mismatch would be invisible in
+/// production rather than loud.
+pub async fn index_write(
+    state: &AppState,
+    did: &str,
+    collection: &str,
+    uri: &str,
+    cid: &str,
+    record: &Value,
+) {
+    let backend = state.db_backend;
+    let rkey = uri.split('/').next_back().unwrap_or_default();
+    let record_str = serde_json::to_string(record).unwrap_or_default();
+    let now = crate::db::now_rfc3339();
+
+    let sql = crate::db::adapt_sql(
+        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (uri) DO UPDATE
+               SET record = EXCLUDED.record,
+                   cid = EXCLUDED.cid"#,
+        backend,
+    );
+    let _ = crate::db::query(&sql)
+        .bind(uri)
+        .bind(did)
+        .bind(collection)
+        .bind(rkey)
+        .bind(&record_str)
+        .bind(cid)
+        .bind(crate::db::NO_INDEXED_AT)
+        .bind(&now)
+        .execute(&state.db)
+        .await;
+
+    let _ = crate::record_refs::sync_refs(&state.db, uri, collection, record, backend).await;
+}
+
+/// Remove a record from the local index after a successful linked-repo delete.
+///
+/// Unlike `Record:delete()`, which drops the local row even when the PDS call
+/// fails, this only runs once the PDS has actually accepted the delete —
+/// `delete_record` propagates PDS errors to its caller rather than logging and
+/// continuing.
+pub async fn unindex_write(state: &AppState, uri: &str) {
+    let sql = crate::db::adapt_sql(
+        "DELETE FROM happyview_records WHERE uri = ?",
+        state.db_backend,
+    );
+    let _ = crate::db::query(&sql).bind(uri).execute(&state.db).await;
+}
+
 fn extract_uri_cid(value: &Value, nsid: &str) -> Result<(String, String), AppError> {
     let uri = value
         .get("uri")
@@ -171,7 +236,9 @@ pub async fn create_record(
     }
 
     let out = post_json(&session, "com.atproto.repo.createRecord", &body).await?;
-    extract_uri_cid(&out, "createRecord")
+    let (uri, cid) = extract_uri_cid(&out, "createRecord")?;
+    index_write(state, did, collection, &uri, &cid, &body["record"]).await;
+    Ok((uri, cid))
 }
 
 pub async fn put_record(
@@ -197,7 +264,9 @@ pub async fn put_record(
     }
 
     let out = post_json(&session, "com.atproto.repo.putRecord", &body).await?;
-    extract_uri_cid(&out, "putRecord")
+    let (uri, cid) = extract_uri_cid(&out, "putRecord")?;
+    index_write(state, did, collection, &uri, &cid, &body["record"]).await;
+    Ok((uri, cid))
 }
 
 pub async fn delete_record(
@@ -217,6 +286,7 @@ pub async fn delete_record(
     });
 
     post_json(&session, "com.atproto.repo.deleteRecord", &body).await?;
+    unindex_write(state, &format!("at://{did}/{collection}/{rkey}")).await;
     Ok(())
 }
 

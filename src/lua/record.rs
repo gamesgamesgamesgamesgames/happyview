@@ -152,8 +152,7 @@ pub(crate) fn register_record_api(
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT (uri) DO UPDATE
                                SET record = EXCLUDED.record,
-                                   cid = EXCLUDED.cid,
-                                   indexed_at = ?"#,
+                                   cid = EXCLUDED.cid"#,
                         backend,
                     );
                     let _ = crate::db::query(&upsert_sql)
@@ -163,8 +162,7 @@ pub(crate) fn register_record_api(
                         .bind(&rkey)
                         .bind(&data_str)
                         .bind(cid)
-                        .bind(&now)
-                        .bind(&now)
+                        .bind(crate::db::NO_INDEXED_AT)
                         .bind(&now)
                         .execute(&state.db)
                         .await;
@@ -212,8 +210,8 @@ pub(crate) fn register_record_api(
                         let data_str = serde_json::to_string(&data).unwrap_or_default();
                         let now = now_rfc3339();
                         let upsert_sql = adapt_sql(
-                            r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?)
+                            r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                ON CONFLICT (uri) DO UPDATE
                                    SET record = EXCLUDED.record,
                                        cid = EXCLUDED.cid"#,
@@ -226,6 +224,7 @@ pub(crate) fn register_record_api(
                             .bind(rkey)
                             .bind(&data_str)
                             .bind(cid)
+                            .bind(crate::db::NO_INDEXED_AT)
                             .bind(&now)
                             .execute(&state.db)
                             .await;
@@ -341,6 +340,9 @@ pub(crate) fn register_record_api(
     // `_repo_override` / `claims.did()` for the repo, and generate an
     // rkey via `_key_type` if `_rkey` isn't set. Errors clearly when no
     // DID can be determined.
+    //
+    // `cid` and `indexed_at` are network-derived and are never written here —
+    // see the comment on the upsert below.
     {
         let state = state.clone();
         let claims = claims.clone();
@@ -417,15 +419,25 @@ pub(crate) fn register_record_api(
                     (uri, repo, rkey)
                 };
 
-                // NULL CID — no PDS round-trip means we have no real CID
-                // to record.
+                // `save_local` never touches a PDS, so it has no CID of its own.
+                //
+                // On update it leaves the stored one alone. The CID describes
+                // the version the PDS holds, and a local-only edit — the
+                // redaction flow this method exists for — doesn't change that.
+                // It's also what `_cid` feeds into strongRefs, which must point
+                // at what's actually in the repo. Overwriting it here used to
+                // destroy that, exactly the way overwriting `indexed_at`
+                // destroyed network-arrival provenance.
+                //
+                // On insert there has never been a PDS version to describe, so
+                // the CID is empty rather than NULL: the column is NOT NULL on
+                // both backends, and `cid_verify` already reads an empty CID as
+                // "nothing to check" (`CidCheck::Skipped`).
                 let upsert_sql = adapt_sql(
                     r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT (uri) DO UPDATE
-                           SET record = EXCLUDED.record,
-                               cid = EXCLUDED.cid,
-                               indexed_at = ?"#,
+                           SET record = EXCLUDED.record"#,
                     backend,
                 );
                 crate::db::query(&upsert_sql)
@@ -434,9 +446,8 @@ pub(crate) fn register_record_api(
                     .bind(&collection)
                     .bind(&rkey)
                     .bind(&data_str)
-                    .bind(Option::<String>::None)
-                    .bind(&now)
-                    .bind(&now)
+                    .bind("")
+                    .bind(crate::db::NO_INDEXED_AT)
                     .bind(&now)
                     .execute(&state.db)
                     .await
@@ -445,7 +456,6 @@ pub(crate) fn register_record_api(
                 let _ = sync_refs(&state.db, &uri, &collection, &data, backend).await;
 
                 this.raw_set("_uri", uri.as_str())?;
-                this.raw_set("_cid", mlua::Value::Nil)?;
 
                 Ok(this)
             }
@@ -756,8 +766,7 @@ pub(crate) fn register_record_api(
                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                        ON CONFLICT (uri) DO UPDATE
                                            SET record = EXCLUDED.record,
-                                               cid = EXCLUDED.cid,
-                                               indexed_at = ?"#,
+                                               cid = EXCLUDED.cid"#,
                                     backend,
                                 );
                                 let _ = crate::db::query(&upsert_sql)
@@ -767,8 +776,7 @@ pub(crate) fn register_record_api(
                                 .bind(&rkey)
                                 .bind(&data_str)
                                 .bind(cid)
-                                .bind(&now)
-                                .bind(&now)
+                                .bind(crate::db::NO_INDEXED_AT)
                                 .bind(&now)
                                 .execute(&state.db)
                                 .await;
@@ -821,8 +829,8 @@ pub(crate) fn register_record_api(
                                     let data_str = serde_json::to_string(&data).unwrap_or_default();
                                     let now = now_rfc3339();
                                     let upsert_sql = adapt_sql(
-                                        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
-                                           VALUES (?, ?, ?, ?, ?, ?, ?)
+                                        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                            ON CONFLICT (uri) DO UPDATE
                                                SET record = EXCLUDED.record,
                                                    cid = EXCLUDED.cid"#,
@@ -835,6 +843,7 @@ pub(crate) fn register_record_api(
                                     .bind(rkey)
                                     .bind(&data_str)
                                     .bind(cid)
+                                    .bind(crate::db::NO_INDEXED_AT)
                                     .bind(&now)
                                     .execute(&state.db)
                                     .await;
