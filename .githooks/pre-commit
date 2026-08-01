@@ -1,0 +1,29 @@
+#!/bin/sh
+
+# Fast checks only. The exhaustive lint (`cargo clippy --all-targets`) lives in
+# .githooks/pre-push — see that file for why.
+#
+# Enable with: git config core.hooksPath .githooks
+
+# Run rustfmt check
+cargo fmt -- --check
+if [ $? -ne 0 ]; then
+    echo "rustfmt check failed. Run 'cargo fmt' to fix."
+    exit 1
+fi
+
+# Lint the source itself (lib + bins). This skips the 42 integration test
+# binaries and the `#[cfg(test)]` modules inside src/, which together are ~45
+# extra compilation units — nearly all of them link steps, and the reason a
+# commit used to sit on "Building [===>] 733/783". Test code is still linted
+# and type-checked on push.
+#
+# CARGO_TARGET_DIR keeps clippy out of the directory `cargo test` and `cargo
+# build` use. Clippy runs a different rustc wrapper, so sharing a target dir
+# makes the two invalidate each other's cache and rebuild the world on every
+# alternation.
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/clippy}" cargo clippy -- -D warnings
+if [ $? -ne 0 ]; then
+    echo "clippy check failed. Fix the warnings above."
+    exit 1
+fi
