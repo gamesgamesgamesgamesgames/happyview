@@ -20,6 +20,38 @@ fn pds_error(context: &str, e: AppError) -> mlua::Error {
     }
 }
 
+/// Reject a `Record` write aimed at a repo the caller has no credentials for.
+///
+/// `record:set_repo()` will point a write at any DID, but a `Record` write acts
+/// as the caller either way: the DPoP path looks up a session keyed by the
+/// target DID, and the cookie path presents the caller's own token. Neither can
+/// write to somebody else's repo, so such a write can never succeed — the only
+/// question is how confusingly it fails.
+///
+/// Badly, without this check. The DPoP path dies deep in session lookup with
+/// `PDS createRecord failed: not found: DPoP session not found`, which reads as
+/// a broken login. That error cost one reporter several days and three
+/// rewritten OAuth clients before the real answer surfaced: the instance was
+/// never given access to the repo the script had redirected the write to.
+///
+/// Writing to another account's repo is what [`linked_repos`](crate::lua::linked_repos_api)
+/// is for.
+fn check_writable_repo(
+    repo: &str,
+    caller_did: &str,
+    delegate_did: Option<&str>,
+) -> mlua::Result<()> {
+    if repo == caller_did || Some(repo) == delegate_did {
+        return Ok(());
+    }
+    Err(mlua::Error::runtime(format!(
+        "cannot write to repo {repo}: a Record write acts as the caller \
+         ({caller_did}), so it can only target the caller's own repo. To write \
+         to another account's repo, an admin must link that repo, and the \
+         script should use linked_repos.get(\"{repo}\") instead of set_repo()."
+    )))
+}
+
 const INTERNAL_FIELDS: &[&str] = &[
     "_collection",
     "_uri",
@@ -95,6 +127,7 @@ pub(crate) fn register_record_api(
                     .as_deref()
                     .or(delegate_did.as_deref())
                     .unwrap_or_else(|| claims.did());
+                check_writable_repo(repo, claims.did(), delegate_did.as_deref())?;
 
                 // Validate required fields against schema
                 if let mlua::Value::Table(ref schema_table) = schema {
@@ -291,26 +324,41 @@ pub(crate) fn register_record_api(
                 // reflected in the local DB even when the PDS is down or
                 // refuses the call. The local row is the source of truth
                 // for the index.
-                match pds_auth
-                    .post_json(&state, repo, "com.atproto.repo.deleteRecord", &pds_body)
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => {}
-                    Ok(resp) => {
-                        let status = resp.status();
-                        let body = resp.text().await.unwrap_or_default();
-                        tracing::warn!(
-                            uri = %uri,
-                            "PDS deleteRecord returned {status}: {body} \
-                             — proceeding with local delete anyway"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            uri = %uri,
-                            "PDS deleteRecord failed: {e} \
-                             — proceeding with local delete anyway"
-                        );
+                //
+                // A delete aimed at somebody else's repo is skipped rather
+                // than attempted: it acts as the caller, so it can only fail,
+                // and it would fail as `DPoP session not found` — an error
+                // about the caller's login rather than about the repo the
+                // script pointed at. Unlike `:save()` this isn't fatal, since
+                // dropping the record from the index is still meaningful.
+                if let Err(e) = check_writable_repo(repo, claims.did(), delegate_did.as_deref()) {
+                    tracing::warn!(
+                        uri = %uri,
+                        "skipping PDS deleteRecord: {e} \
+                         — proceeding with local delete anyway"
+                    );
+                } else {
+                    match pds_auth
+                        .post_json(&state, repo, "com.atproto.repo.deleteRecord", &pds_body)
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {}
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            tracing::warn!(
+                                uri = %uri,
+                                "PDS deleteRecord returned {status}: {body} \
+                                 — proceeding with local delete anyway"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                uri = %uri,
+                                "PDS deleteRecord failed: {e} \
+                                 — proceeding with local delete anyway"
+                            );
+                        }
                     }
                 }
 
@@ -719,6 +767,7 @@ pub(crate) fn register_record_api(
                                 .as_deref()
                                 .or(delegate_did.as_deref())
                                 .unwrap_or_else(|| claims.did());
+                            check_writable_repo(repo, claims.did(), delegate_did.as_deref())?;
                             if let Some(ref uri) = existing_uri {
                                 let rkey = uri
                                     .split('/')
@@ -1155,6 +1204,49 @@ fn extract_record_data(lua: &Lua, table: &mlua::Table, collection: &str) -> LuaR
 mod tests {
     use super::*;
     use mlua::Lua;
+
+    const CALLER: &str = "did:plc:caller";
+    const OTHER: &str = "did:plc:someoneelse";
+
+    #[test]
+    fn writes_to_the_callers_own_repo_are_allowed() {
+        assert!(check_writable_repo(CALLER, CALLER, None).is_ok());
+    }
+
+    #[test]
+    fn writes_to_a_delegated_repo_are_allowed() {
+        let delegate = "did:plc:delegated";
+        assert!(check_writable_repo(delegate, CALLER, Some(delegate)).is_ok());
+        // The caller's own repo stays writable while delegating.
+        assert!(check_writable_repo(CALLER, CALLER, Some(delegate)).is_ok());
+    }
+
+    #[test]
+    fn writes_to_a_foreign_repo_are_refused() {
+        let err = check_writable_repo(OTHER, CALLER, None)
+            .expect_err("writing to another account's repo cannot succeed");
+        let msg = err.to_string();
+
+        // The message has to name the repo that was actually targeted and
+        // point at the mechanism that does work. The failure it replaces —
+        // `DPoP session not found` — named neither, and reads as a broken
+        // login rather than a repo the instance has no access to.
+        assert!(msg.contains(OTHER), "should name the target repo: {msg}");
+        assert!(msg.contains(CALLER), "should name the caller: {msg}");
+        assert!(
+            msg.contains("linked_repos"),
+            "should point at linked repos: {msg}"
+        );
+        assert!(
+            !msg.contains("DPoP"),
+            "should not blame the caller's session: {msg}"
+        );
+    }
+
+    #[test]
+    fn delegating_does_not_open_up_unrelated_repos() {
+        assert!(check_writable_repo(OTHER, CALLER, Some("did:plc:delegated")).is_err());
+    }
 
     #[test]
     fn validate_required_fields_passes_when_present() {
