@@ -53,6 +53,13 @@ pub fn register_jobs_api(
                         ));
                     }
 
+                    if crate::jobs::native::is_reserved(&job_type) {
+                        return Err(mlua::Error::runtime(format!(
+                            "job_type prefix '{}' is reserved for built-in jobs",
+                            crate::jobs::native::RESERVED_PREFIX
+                        )));
+                    }
+
                     let caller = caller.as_ref().ok_or_else(|| {
                         mlua::Error::runtime("jobs.create requires an authenticated caller")
                     })?;
@@ -221,6 +228,7 @@ mod tests {
             port: 3000,
             database_url: String::new(),
             database_backend: crate::db::DatabaseBackend::Sqlite,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),
@@ -481,6 +489,7 @@ mod tests {
             port: 3000,
             database_url: String::new(),
             database_backend: crate::db::DatabaseBackend::Sqlite,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),

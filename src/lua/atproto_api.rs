@@ -682,6 +682,7 @@ mod tests {
             port: 3000,
             database_url: String::new(),
             database_backend: crate::db::DatabaseBackend::Sqlite,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),

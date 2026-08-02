@@ -279,6 +279,56 @@ pub fn decode_cursor(cursor: &str) -> Option<(String, String)> {
     Some((ts.to_string(), uri.to_string()))
 }
 
+/// Default `journal_size_limit`: 64 MiB. Caps how large the `-wal` file is left
+/// after a checkpoint. Without it the WAL stays at its high-water mark forever,
+/// so a single large delete permanently inflates disk usage.
+pub const DEFAULT_JOURNAL_SIZE_LIMIT: u64 = 67_108_864;
+
+/// Parse `SQLITE_JOURNAL_SIZE_LIMIT`. `-1` means "no limit" and is represented
+/// as `u64::MAX`; anything unparseable falls back to the default rather than
+/// failing boot over a maintenance knob.
+pub fn parse_journal_size_limit(raw: Option<&str>) -> u64 {
+    match raw {
+        None => DEFAULT_JOURNAL_SIZE_LIMIT,
+        Some("-1") => u64::MAX,
+        Some(s) => s
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_JOURNAL_SIZE_LIMIT),
+    }
+}
+
+/// Resolve the configured journal size limit from the environment.
+pub fn journal_size_limit_bytes() -> u64 {
+    parse_journal_size_limit(std::env::var("SQLITE_JOURNAL_SIZE_LIMIT").ok().as_deref())
+}
+
+/// Apply per-connection SQLite pragmas to every pooled connection.
+///
+/// `journal_size_limit` is per-connection and not persisted in the database
+/// file, so unlike `journal_mode` it cannot be set once against the pool — that
+/// would reach only whichever single connection served the statement.
+fn with_sqlite_pragmas(
+    opts: PoolOptions<sqlx::Any>,
+    backend: DatabaseBackend,
+) -> PoolOptions<sqlx::Any> {
+    if backend != DatabaseBackend::Sqlite {
+        return opts;
+    }
+    let limit = journal_size_limit_bytes();
+    opts.after_connect(move |conn, _meta| {
+        Box::pin(async move {
+            let sql = if limit == u64::MAX {
+                "PRAGMA journal_size_limit = -1".to_string()
+            } else {
+                format!("PRAGMA journal_size_limit = {limit}")
+            };
+            crate::db::query(&sql).execute(&mut *conn).await?;
+            Ok(())
+        })
+    })
+}
+
 /// Connect to the configured database and run migrations.
 pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
     sqlx::any::install_default_drivers();
@@ -305,16 +355,28 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
             DatabaseBackend::Postgres => 32,
         });
 
-    let pool = PoolOptions::<sqlx::Any>::new()
-        .max_connections(max_connections)
-        .acquire_timeout(std::time::Duration::from_secs(10))
-        .idle_timeout(std::time::Duration::from_secs(300))
-        .connect(url)
-        .await
-        .expect("Failed to connect to database");
+    let pool = with_sqlite_pragmas(
+        PoolOptions::<sqlx::Any>::new()
+            .max_connections(max_connections)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .idle_timeout(std::time::Duration::from_secs(300)),
+        backend,
+    )
+    .connect(url)
+    .await
+    .expect("Failed to connect to database");
 
     // Enable foreign keys and WAL mode for SQLite
     if backend == DatabaseBackend::Sqlite {
+        // Must run before any table exists: on a populated database this is a
+        // silent no-op until a full VACUUM rebuilds the file. New instances get
+        // incremental vacuum from birth; existing ones need the one-time repair
+        // in `maintenance::vacuum`.
+        crate::db::query("PRAGMA auto_vacuum = INCREMENTAL")
+            .execute(&pool)
+            .await
+            .expect("Failed to set auto_vacuum");
+
         crate::db::query("PRAGMA foreign_keys = ON")
             .execute(&pool)
             .await
@@ -344,6 +406,19 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
     migrator.run(&pool).await.expect("Failed to run migrations");
 
     pool
+}
+
+/// Extract the filesystem path from a `sqlite://` URL, dropping query params.
+/// Returns `None` for non-SQLite URLs and for in-memory databases.
+pub fn sqlite_path_from_url(url: &str) -> Option<std::path::PathBuf> {
+    let rest = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))?;
+    let path = rest.split('?').next().unwrap_or(rest);
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path))
 }
 
 pub fn backfill_pool_ceiling(backend: DatabaseBackend) -> u32 {
@@ -390,13 +465,16 @@ pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPo
 
     tracing::info!(max_connections, "backfill pool sized");
 
-    let pool = PoolOptions::<sqlx::Any>::new()
-        .max_connections(max_connections)
-        .acquire_timeout(std::time::Duration::from_secs(30))
-        .idle_timeout(std::time::Duration::from_secs(300))
-        .connect(url)
-        .await
-        .expect("Failed to connect backfill database pool");
+    let pool = with_sqlite_pragmas(
+        PoolOptions::<sqlx::Any>::new()
+            .max_connections(max_connections)
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .idle_timeout(std::time::Duration::from_secs(300)),
+        backend,
+    )
+    .connect(url)
+    .await
+    .expect("Failed to connect backfill database pool");
 
     if backend == DatabaseBackend::Sqlite {
         crate::db::query("PRAGMA foreign_keys = ON")
@@ -422,6 +500,7 @@ pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPo
 mod tests {
     use super::*;
     use chrono::Datelike;
+    use serial_test::serial;
 
     const CAST_ON_READ: &[&str] = &[
         "service_identity.setup_complete",
@@ -858,5 +937,97 @@ mod tests {
         let dt = parse_dt("2025-03-16 12:34:56");
         assert_eq!(dt.year(), 2025);
         assert_eq!(dt.month(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // journal_size_limit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn journal_size_limit_defaults_to_64_mib() {
+        assert_eq!(parse_journal_size_limit(None), 67_108_864);
+    }
+
+    #[test]
+    fn journal_size_limit_parses_env_value() {
+        assert_eq!(parse_journal_size_limit(Some("1048576")), 1_048_576);
+    }
+
+    #[test]
+    fn journal_size_limit_rejects_garbage_and_uses_default() {
+        assert_eq!(parse_journal_size_limit(Some("banana")), 67_108_864);
+        assert_eq!(parse_journal_size_limit(Some("")), 67_108_864);
+    }
+
+    #[test]
+    fn journal_size_limit_allows_unlimited_sentinel() {
+        // -1 disables the limit; it is the one negative value SQLite accepts.
+        assert_eq!(parse_journal_size_limit(Some("-1")), u64::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // sqlite_path_from_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sqlite_path_from_url_strips_scheme_and_params() {
+        assert_eq!(
+            sqlite_path_from_url("sqlite://data/happyview.db?mode=rwc"),
+            Some(std::path::PathBuf::from("data/happyview.db"))
+        );
+        assert_eq!(
+            sqlite_path_from_url("sqlite:/var/lib/hv.db"),
+            Some(std::path::PathBuf::from("/var/lib/hv.db"))
+        );
+        assert_eq!(sqlite_path_from_url("postgres://localhost/hv"), None);
+        assert_eq!(sqlite_path_from_url("sqlite://:memory:"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // with_sqlite_pragmas: journal_size_limit actually reaches pooled
+    // connections, not just the one `connect()` happens to touch first.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[serial]
+    async fn journal_size_limit_pragma_reaches_pooled_connections() {
+        let path =
+            std::env::temp_dir().join(format!("hv-journal-pragma-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+
+        // SAFETY: this test is `#[serial]`; no other test reads or mutates
+        // this variable concurrently.
+        unsafe {
+            std::env::set_var("SQLITE_JOURNAL_SIZE_LIMIT", "1048576");
+        }
+        let pool = connect(&url, DatabaseBackend::Sqlite).await;
+        unsafe {
+            std::env::remove_var("SQLITE_JOURNAL_SIZE_LIMIT");
+        }
+
+        // Hold several connections open simultaneously so the pool has to
+        // actually establish more than one, proving `after_connect` runs on
+        // each rather than on a single lucky connection reused by every
+        // acquire.
+        let mut conns = Vec::new();
+        for _ in 0..4 {
+            conns.push(pool.acquire().await.expect("failed to acquire connection"));
+        }
+
+        for mut conn in conns {
+            let (limit,): (i64,) = crate::db::query_as("PRAGMA journal_size_limit")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("failed to read journal_size_limit");
+            assert_eq!(
+                limit, 1_048_576,
+                "journal_size_limit pragma did not reach a pooled connection"
+            );
+        }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }

@@ -897,3 +897,56 @@ async fn admin_delete_not_found() {
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+#[serial]
+async fn delete_collection_enqueues_a_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/admin/records/collection?collection=app.test.post")
+                .header(app.admin_cookie().0, app.admin_cookie().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    let job_id = body["job_id"].as_str().expect("job_id missing");
+
+    // These four columns are exactly what the reserved-prefix authorization
+    // boundary depends on: the literal job type, an input built only from the
+    // validated `collection` param (no other request-controlled key), no
+    // inherited PDS session for a local-table delete, and `created_by`
+    // sourced from the authenticated session rather than the request.
+    let sql = happyview::db::adapt_sql(
+        "SELECT job_type, input, created_by, CAST(inherit_auth AS INTEGER) FROM happyview_jobs WHERE id = ?",
+        app.state.db_backend,
+    );
+    let (job_type, input, created_by, inherit_auth): (String, String, String, i64) =
+        happyview::db::query_as(&sql)
+            .bind(job_id)
+            .fetch_one(&app.state.db)
+            .await
+            .expect("job row missing");
+    assert_eq!(job_type, "happyview.delete-collection");
+    assert_eq!(inherit_auth, 0, "must not inherit a PDS session");
+    assert_eq!(created_by, app.admin_did, "must come from the auth session");
+    let input_json: serde_json::Value = serde_json::from_str(&input).unwrap();
+    assert_eq!(
+        input_json,
+        serde_json::json!({ "collection": "app.test.post" }),
+        "input must carry exactly the validated collection and nothing else"
+    );
+}

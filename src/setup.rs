@@ -605,6 +605,12 @@ async fn complete(_auth: UserAuth, State(state): State<AppState>) -> Result<Stat
     require_setup_incomplete(&state).await?;
     service_identity::mark_setup_complete(&state.db, state.db_backend).await?;
 
+    // A database created by this version already has incremental auto-vacuum and
+    // has nothing stranded, so it must never be prompted to vacuum.
+    if let Err(e) = crate::maintenance::vacuum::mark_not_needed(&state.db, state.db_backend).await {
+        tracing::warn!(error = %e, "failed to mark vacuum as not needed");
+    }
+
     log_event(
         &state.db,
         EventLog {

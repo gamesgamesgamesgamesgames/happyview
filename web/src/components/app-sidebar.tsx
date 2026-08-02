@@ -5,6 +5,7 @@ import {
   IconDashboard,
   IconFileDescription,
   IconDatabase,
+  IconDatabaseCog,
   IconTable,
   IconClipboardList,
   IconUsers,
@@ -122,6 +123,12 @@ const systemItems: NavItem[] = [
     title: "General",
     url: "/dashboard/settings/general",
     icon: IconSettings,
+    requiredPermissions: ["settings:manage"],
+  },
+  {
+    title: "Database",
+    url: "/dashboard/settings/database",
+    icon: IconDatabaseCog,
     requiredPermissions: ["settings:manage"],
   },
   {

@@ -508,10 +508,68 @@ export function deleteRecord(uri: string) {
 }
 
 export function deleteCollectionRecords(collection: string) {
-  return apiFetch<{ deleted: number }>(
+  return apiFetch<{ job_id: string }>(
     `/admin/records/collection?${new URLSearchParams({ collection })}`,
     { method: "DELETE" },
   );
+}
+
+// Database (SQLite disk reclamation)
+export interface DatabaseDiskReport {
+  db_bytes: number;
+  wal_bytes: number;
+  // `null` means free space could not be measured — NOT that it measured
+  // zero. Render that case as "unknown", never as "0 B".
+  db_fs_free: number | null;
+  temp_fs_free: number | null;
+  // Whether the database and temp directories share a filesystem, which
+  // changes how much headroom a VACUUM needs (1.2x vs 2.2x the db size).
+  same_filesystem: boolean;
+  db_path: string;
+  temp_path: string;
+}
+
+export interface VacuumResult {
+  status: "ok" | "failed";
+  at: string;
+  db_bytes_before: number;
+  db_bytes_after: number;
+  reclaimed_bytes: number;
+  error: string | null;
+}
+
+export type VacuumFeasibility =
+  | { status: "ok" }
+  | { status: "insufficient"; needed: number; available: number; path: string }
+  | { status: "unknown"; path: string };
+
+export interface DatabaseStatus {
+  backend: "sqlite" | "postgres";
+  disk: DatabaseDiskReport | null;
+  feasibility: VacuumFeasibility | null;
+  vacuum: {
+    requested_at: string | null;
+    attempt_started_at: string | null;
+    completed_at: string | null;
+    last_result: VacuumResult | null;
+  };
+  journal_size_limit: number;
+}
+
+export function getDatabaseStatus() {
+  return apiFetch<DatabaseStatus>("/admin/database/status");
+}
+
+export function scheduleVacuum() {
+  return apiFetch<{ scheduled: boolean }>("/admin/database/vacuum/schedule", {
+    method: "POST",
+  });
+}
+
+export function cancelVacuum() {
+  return apiFetch<{ scheduled: boolean }>("/admin/database/vacuum/schedule", {
+    method: "DELETE",
+  });
 }
 
 // Script Variables

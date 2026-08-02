@@ -22,6 +22,7 @@ pub mod lexicon;
 pub mod linked_repos;
 pub mod lua;
 pub mod lua_analysis;
+pub mod maintenance;
 pub mod oauth;
 pub mod plc;
 pub mod plugin;

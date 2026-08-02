@@ -151,6 +151,12 @@ fn validate_job_type(job_type: &str) -> Result<(), String> {
             "invalid job type '{job_type}': must match /^[a-z0-9][a-z0-9._-]*$/"
         ));
     }
+    if crate::jobs::native::is_reserved(job_type) {
+        return Err(format!(
+            "invalid job type '{job_type}': the '{}' prefix is reserved for built-in jobs",
+            crate::jobs::native::RESERVED_PREFIX
+        ));
+    }
     Ok(())
 }
 
@@ -902,6 +908,7 @@ mod tests {
             port: 3000,
             database_url: String::new(),
             database_backend: crate::db::DatabaseBackend::Sqlite,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),

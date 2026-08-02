@@ -74,6 +74,29 @@ async fn main() {
         ),
     }
 
+    match happyview::maintenance::vacuum::run_if_requested(
+        &db_pool,
+        db_backend,
+        &config.database_url,
+    )
+    .await
+    {
+        Ok(Some(result)) if result.status == "ok" => {
+            info!(
+                reclaimed = %happyview::maintenance::vacuum::human_bytes(result.reclaimed_bytes),
+                "scheduled vacuum complete"
+            );
+        }
+        Ok(Some(result)) => {
+            tracing::error!(
+                error = %result.error.clone().unwrap_or_default(),
+                "scheduled vacuum failed"
+            );
+        }
+        Ok(None) => { /* not scheduled */ }
+        Err(e) => tracing::error!(error = %e, "scheduled vacuum could not be evaluated"),
+    }
+
     // Backfill record_refs in the background (first run after upgrade)
     {
         let db_bg = db_pool.clone();

@@ -177,27 +177,38 @@ pub(super) struct DeleteCollectionParams {
     pub collection: String,
 }
 
-/// DELETE /admin/records/collection?collection=X — delete all records in a collection.
+/// DELETE /admin/records/collection?collection=X — enqueue deletion of every
+/// record in a collection.
+///
+/// Returns `202` with a job id rather than deleting inline: a large collection
+/// takes long enough that a synchronous request would time out, and running it
+/// as a job gives progress, pause and cancel through the existing jobs UI.
 pub(super) async fn delete_collection_records(
     State(state): State<AppState>,
     auth: UserAuth,
     Query(params): Query<DeleteCollectionParams>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     auth.require(Permission::RecordsDeleteCollection).await?;
     auth.require(Permission::RecordsDelete).await?;
-    let backend = state.db_backend;
-    let sql = adapt_sql(
-        "DELETE FROM happyview_records WHERE collection = ?",
-        backend,
-    );
-    let result = crate::db::query(&sql)
-        .bind(&params.collection)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to delete records: {e}")))?;
 
-    Ok(Json(
-        serde_json::json!({ "deleted": result.rows_affected() }),
+    if params.collection.trim().is_empty() {
+        return Err(AppError::BadRequest("collection is required".into()));
+    }
+
+    let job_id = crate::jobs::db::create_job(
+        &state,
+        "happyview.delete-collection",
+        &serde_json::json!({ "collection": params.collection }),
+        &auth.did,
+        false,
+        None,
+        None,
+    )
+    .await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_id": job_id })),
     ))
 }
 

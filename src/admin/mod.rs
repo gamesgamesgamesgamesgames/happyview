@@ -2,6 +2,7 @@ mod api_clients;
 mod api_keys;
 pub(crate) mod auth;
 pub mod backfill;
+mod database;
 mod dead_letters;
 mod domains;
 mod events;
@@ -115,6 +116,11 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route(
             "/records/collection",
             delete(records::delete_collection_records),
+        )
+        .route("/database/status", get(database::status))
+        .route(
+            "/database/vacuum/schedule",
+            post(database::schedule_vacuum).delete(database::cancel_vacuum),
         )
         .route(
             "/network-lexicons",

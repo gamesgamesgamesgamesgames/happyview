@@ -51,8 +51,15 @@ impl TestApp {
         let config = Config {
             host: "127.0.0.1".into(),
             port: 0,
-            database_url: String::new(),
+            // Real value (not the pool, which comes from `db::test_pool()`
+            // above) so that code reading `config.database_url` directly —
+            // e.g. `disk::report` behind `/admin/database/status` — sees a
+            // file it can actually stat on SQLite. Nothing else in the
+            // binary reads this field outside of `main.rs`'s own startup,
+            // which `TestApp` bypasses entirely.
+            database_url: std::env::var("TEST_DATABASE_URL").unwrap_or_default(),
             database_backend: backend,
+            sqlite_journal_size_limit: happyview::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: "http://127.0.0.1:0".into(),
             session_secret: "test-session-secret-0123456789abcdef".into(),
             jetstream_url: "wss://jetstream1.us-east.bsky.network".into(),
