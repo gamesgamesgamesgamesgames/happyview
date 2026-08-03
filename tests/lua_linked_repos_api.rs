@@ -594,8 +594,12 @@ async fn global_is_registered_for_record_event_scripts() {
         },
     )
     .await
-    .unwrap()
-    .expect("script returned a table");
+    .unwrap();
+
+    let out = match out {
+        happyview::lua::RecordHookOutcome::Replace(v) => v,
+        other => panic!("expected the script's table back, got {other:?}"),
+    };
 
     assert_eq!(out["kind"], "table");
     assert_eq!(out["get"], "function");

@@ -81,7 +81,7 @@ The function is called once per event.
 | `true`       | The original record is stored as-is                         |
 | *(no script)* | The original record is stored as-is                        |
 
-On **delete** events, returning `nil` skips the delete (the record stays in the database).
+On **delete** events, returning `nil` skips the delete (the record stays in the database). Because a delete event carries no `record`, `return record` returns `nil` there -- use `return true` to let a delete proceed.
 
 **Important:** If your script has side effects (e.g. syncing to a search index) but you want normal indexing to proceed, return `record` or `true` -- not nothing. A missing return statement returns `nil`, which **skips indexing**.
 
@@ -183,7 +183,7 @@ Create a script with trigger `record.index:your.collection.nsid` to skip indexin
 ```lua
 function handle()
   if action == "delete" then
-    return record  -- allow deletes to proceed
+    return true  -- allow deletes to proceed
   end
 
   if record.title == nil or record.title == "" then
@@ -201,7 +201,7 @@ Enrich a record with a computed field before it is stored:
 ```lua
 function handle()
   if action == "delete" then
-    return record
+    return true
   end
 
   record.slug = string.lower(string.gsub(record.title or "", "%s+", "-"))
@@ -222,7 +222,7 @@ function handle()
       record = record
     })
   })
-  return record
+  return record or true  -- `record` is nil on delete; `true` lets it proceed
 end
 ```
 
@@ -254,7 +254,7 @@ function handle()
     })
   end
 
-  return record
+  return record or true  -- `record` is nil on delete; `true` lets it proceed
 end
 ```
 
@@ -289,7 +289,7 @@ function handle()
     })
   end
 
-  return record
+  return record or true  -- `record` is nil on delete; `true` lets it proceed
 end
 ```
 

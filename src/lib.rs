@@ -38,6 +38,8 @@ pub mod service_entries;
 pub mod service_identity;
 pub mod setup;
 pub mod spaces;
+#[cfg(test)]
+pub mod test_support;
 pub mod verification_methods;
 pub mod xrpc;
 

@@ -322,20 +322,37 @@ pub struct RecordEventPayload<'a> {
     pub record: Option<&'a Value>,
 }
 
-/// Run the record-event script (if any) for a given event. Returns the
-/// record body the indexer should store: `Some(record)` to proceed,
-/// `None` to skip indexing.
+/// What a record-event script chain decided for an event.
+///
+/// Deliberately not `Option<Value>`. A delete carries no record body, so
+/// "no script ran" and "the script returned `nil`" both used to spell
+/// themselves `None`, and the delete path read the first as the second —
+/// an instance with no scripts at all silently skipped every delete (#80).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordHookOutcome {
+    /// Index the event with the body it arrived with. Either no script ran,
+    /// or the script waved the event through without rewriting it.
+    Proceed,
+    /// Index this body in place of the one that arrived. Only meaningful for
+    /// create/update — a delete has no body to replace.
+    Replace(Value),
+    /// Skip the event entirely — the script returned `nil`. Only ever
+    /// produced by a script that actually ran.
+    Skip,
+}
+
+/// Run the record-event script (if any) for a given event.
 ///
 /// Failure mode is fail-open: a script that exhausts its retry budget is
-/// dead-lettered and the indexer proceeds with the original record.
+/// dead-lettered and the event proceeds as if no script had run.
 pub async fn run_record_event_script(
     state: &AppState,
     payload: RecordEventPayload<'_>,
-) -> Option<Value> {
+) -> RecordHookOutcome {
     let resolved = match resolve_record_event(state, payload.nsid, payload.action).await {
         Some(s) => s,
-        // No script for this trigger → indexer keeps the original record.
-        None => return payload.record.cloned(),
+        // No script for this trigger → index the event unchanged.
+        None => return RecordHookOutcome::Proceed,
     };
 
     let host_id = format!("{}:{}", payload.nsid, payload.action);
@@ -419,21 +436,23 @@ pub async fn run_record_event_script(
     )
     .await;
 
-    // Fail-open: indexer proceeds with the original record.
-    payload.record.cloned()
+    // Fail-open: index the event as if no script had run. For a delete this
+    // means the delete still happens — the record body it lacks is not a
+    // reason to keep a record its PDS no longer has.
+    RecordHookOutcome::Proceed
 }
 
 /// Single attempt at the record-event Lua script. Used internally by the
 /// retry loop and externally by admin retry endpoints.
 ///
-/// Returns `Ok(Some(value))` to continue indexing with `value`,
-/// `Ok(None)` when the script returned `nil` (skip), or `Err(msg)` on
-/// any execution failure.
+/// Returns `Ok(Replace(value))` to continue indexing with `value`,
+/// `Ok(Skip)` when the script returned `nil`, `Ok(Proceed)` when it waved
+/// the event through, or `Err(msg)` on any execution failure.
 pub async fn run_record_event_once(
     state: &AppState,
     script: &ResolvedScript,
     payload: RecordEventPayload<'_>,
-) -> Result<Option<Value>, String> {
+) -> Result<RecordHookOutcome, String> {
     if script.language != ScriptLanguage::Lua {
         return Err(format!(
             "this binary cannot run {} scripts",
@@ -493,15 +512,15 @@ pub async fn run_record_event_once(
         .map_err(|e| e.to_string())?;
 
     match result {
-        mlua::Value::Nil => Ok(None),
+        mlua::Value::Nil => Ok(RecordHookOutcome::Skip),
         mlua::Value::Table(_) => {
             let v: Value = lua
                 .from_value(result)
                 .map_err(|e| format!("convert lua return to JSON: {e}"))?;
-            Ok(Some(v))
+            Ok(RecordHookOutcome::Replace(v))
         }
-        // Non-nil, non-table return — pass-through: keep the original record.
-        _ => Ok(payload.record.cloned()),
+        // Non-nil, non-table return (`return true`) — pass-through.
+        _ => Ok(RecordHookOutcome::Proceed),
     }
 }
 

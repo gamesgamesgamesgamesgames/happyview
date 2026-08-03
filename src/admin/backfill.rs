@@ -1378,8 +1378,9 @@ async fn fetch_records_from_pds(
             )
             .await
             {
-                None => continue,
-                Some(v) => v,
+                crate::lua::RecordHookOutcome::Skip => continue,
+                crate::lua::RecordHookOutcome::Replace(v) => v,
+                crate::lua::RecordHookOutcome::Proceed => entry.value.clone(),
             };
 
             batch.push(PreparedRecord {
