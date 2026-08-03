@@ -205,4 +205,82 @@ test.describe("Linked Repos", () => {
     await expect(dialog.getByText(/grants broad write access/i)).toBeVisible()
     await expect(createLinkButton).toBeEnabled()
   })
+
+  test("builds repo actions from checkboxes", async ({ page }) => {
+    await page.goto("/dashboard/settings/linked-repos")
+    await page.getByRole("button", { name: "Link a repo" }).click()
+
+    const dialog = page.getByRole("dialog")
+    await expect(dialog).toBeVisible({ timeout: 3000 })
+
+    const createLinkButton = dialog.getByRole("button", { name: "Create link" })
+    await dialog.getByLabel("Scope 1 prefix").fill("repo")
+    await dialog.getByLabel("Scope 1 value").fill(TEST_NSID)
+
+    // A collection with no actions serialises to `repo:<nsid>`, which the
+    // server reads as create *and* update *and* delete. The builder refuses to
+    // emit that by accident — scopes are immutable, so an over-broad grant made
+    // by not choosing can only be fixed by re-linking the repo.
+    await expect(dialog.getByText("select at least one action")).toBeVisible()
+    await expect(createLinkButton).toBeDisabled()
+
+    await dialog.getByLabel("create", { exact: true }).check()
+    await expect(
+      dialog.getByText(`atproto repo:${TEST_NSID}?action=create`),
+    ).toBeVisible()
+    await expect(createLinkButton).toBeEnabled()
+
+    // Actions serialise in declaration order, not the order they were clicked,
+    // so the same access always produces the same string.
+    await dialog.getByLabel("delete", { exact: true }).check()
+    await dialog.getByLabel("update", { exact: true }).check()
+    await expect(
+      dialog.getByText(`atproto repo:${TEST_NSID}?action=create,update,delete`),
+    ).toBeVisible()
+
+    // `update` without `create` can't upsert — flagged on the row that has the
+    // problem rather than as a general note nobody reads.
+    await dialog.getByLabel("create", { exact: true }).uncheck()
+    await dialog.getByLabel("delete", { exact: true }).uncheck()
+    await expect(dialog.getByText(/can't/).first()).toBeVisible()
+    await expect(
+      dialog.getByText(`atproto repo:${TEST_NSID}?action=update`),
+    ).toBeVisible()
+    // Still a legitimate grant, just a narrow one — warned about, not blocked.
+    await expect(createLinkButton).toBeEnabled()
+  })
+
+  test("hoists a pasted action query into the checkboxes", async ({ page }) => {
+    await page.goto("/dashboard/settings/linked-repos")
+    await page.getByRole("button", { name: "Link a repo" }).click()
+
+    const dialog = page.getByRole("dialog")
+    await expect(dialog).toBeVisible({ timeout: 3000 })
+
+    const value = dialog.getByLabel("Scope 1 value")
+    await dialog.getByLabel("Scope 1 prefix").fill("repo")
+
+    // Pasting a whole scope keeps working: the query is lifted into the boxes
+    // and the field is left holding the collection alone, so there's never a
+    // second, invisible copy of the action list.
+    await value.fill(`${TEST_NSID}?action=create,update`)
+    await expect(value).toHaveValue(TEST_NSID)
+    await expect(dialog.getByLabel("create", { exact: true })).toBeChecked()
+    await expect(dialog.getByLabel("update", { exact: true })).toBeChecked()
+    await expect(dialog.getByLabel("delete", { exact: true })).not.toBeChecked()
+    await expect(
+      dialog.getByText(`atproto repo:${TEST_NSID}?action=create,update`),
+    ).toBeVisible()
+
+    // A malformed action list is left in the field so the error can name it,
+    // rather than being silently swallowed by the checkboxes.
+    await value.fill(`${TEST_NSID}?action=frobnicate`)
+    await expect(value).toHaveValue(`${TEST_NSID}?action=frobnicate`)
+    await expect(
+      dialog.getByText("unknown repo action: frobnicate"),
+    ).toBeVisible()
+    await expect(
+      dialog.getByRole("button", { name: "Create link" }),
+    ).toBeDisabled()
+  })
 })

@@ -59,8 +59,16 @@ export function LinkRepoDialog({
   const [lastAction, setLastAction] = useState<SubmitAction | null>(null);
   const [copied, setCopied] = useState(false);
 
+  // Builder-level problems the scope string can't express on its own: a `repo`
+  // row with no actions checked serialises to `repo:<nsid>`, which is valid and
+  // grants *everything*. The builder reports it here rather than the string
+  // being re-read, since only the builder knows nothing was picked.
+  const [scopeSelectionError, setScopeSelectionError] = useState<string | null>(
+    null,
+  );
+
   const handleTrimmed = handle.trim();
-  const scopeError = validateScopeString(scopes);
+  const scopeError = validateScopeString(scopes) ?? scopeSelectionError;
   // The builder always emits `atproto`, so a non-empty scope string no longer
   // means the operator picked anything — keep a grant that can do nothing from
   // being created by merely opening this dialog. Once the grant exists its
@@ -77,6 +85,7 @@ export function LinkRepoDialog({
       setHandle("");
       setReason("");
       setScopes("");
+      setScopeSelectionError(null);
       setRepoId(null);
       setInviteResult(null);
       setSubmitting(null);
@@ -222,6 +231,7 @@ export function LinkRepoDialog({
                   key={formKey}
                   value={scopes}
                   onChange={setScopes}
+                  onValidityChange={setScopeSelectionError}
                 />
               </>
             )}
