@@ -574,7 +574,7 @@ X-Client-Key: hvc_...
 X-Client-Secret: hvs_...
 ```
 
-**Public** (must prove key possession):
+**With a DPoP proof** (any client type — proves key possession, revokes just that device's session):
 
 ```http
 DELETE /oauth/sessions/did:plc:user123
@@ -582,6 +582,8 @@ X-Client-Key: hvc_...
 Authorization: DPoP <access_token>
 DPoP: <proof_jwt>
 ```
+
+The proof's `htu` must equal the URL as sent, including any percent-encoding in the DID.
 
 ### DPoP proof format
 

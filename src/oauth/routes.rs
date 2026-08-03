@@ -1,4 +1,4 @@
-use axum::extract::{FromRequest, Path, State};
+use axum::extract::{FromRequest, OriginalUri, Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -23,6 +23,31 @@ pub fn routes() -> Router<AppState> {
             "/sessions/{did}/devices/{session_id}",
             axum::routing::delete(delete_device_session),
         )
+}
+
+/// The request path exactly as the client sent it.
+///
+/// Two things make this different from `req.uri().path()`. This router is
+/// nested under `/oauth`, so the handler's own URI has that prefix stripped;
+/// and percent-encoding must survive, because a DPoP `htu` is whatever the
+/// client signed, which is whatever it put on the wire. Rebuilding the path
+/// from an already-decoded `Path` segment silently rejects any client that
+/// encodes the DID — a mismatch the caller has no way to fix from their side.
+fn original_request_path(req: &axum::extract::Request) -> String {
+    req.extensions()
+        .get::<OriginalUri>()
+        .map(|uri| uri.path().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string())
+}
+
+/// Build the `htu` a DPoP proof is validated against.
+fn dpop_htu(state: &AppState, host: &str, path: &str) -> String {
+    let scheme = if state.config.public_url.starts_with("https") {
+        "https"
+    } else {
+        "http"
+    };
+    format!("{}://{}{}", scheme, host, path)
 }
 
 // --- Request / response types ---
@@ -331,8 +356,9 @@ async fn register_session(
 
 /// GET /oauth/sessions/:did — retrieve session info (scopes).
 ///
-/// Same auth as DELETE: confidential clients use `X-Client-Key` + `X-Client-Secret`,
-/// public clients use `X-Client-Key` + `Authorization: DPoP <token>` + `DPoP` proof.
+/// Same auth as DELETE: `X-Client-Key` + `X-Client-Secret` looks the session up
+/// by (client, user); otherwise `X-Client-Key` + `Authorization: DPoP <token>` +
+/// a `DPoP` proof identifies the specific device session.
 async fn get_session(
     State(state): State<AppState>,
     Path(did): Path<String>,
@@ -378,29 +404,21 @@ async fn get_session(
         let resolved =
             client_auth::resolve_client_by_key(&state.db, state.db_backend, &client_key).await?;
 
-        if resolved.client_type != "public" {
-            return Err(AppError::Auth(
-                "non-public clients must provide X-Client-Secret".into(),
-            ));
-        }
-
         let auth_header = req
             .headers()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| {
-                AppError::Auth("public clients must provide Authorization: DPoP <token>".into())
+                AppError::Auth("DPoP auth requires Authorization: DPoP <token>".into())
             })?;
         let access_token = auth_header.strip_prefix("DPoP ").ok_or_else(|| {
-            AppError::Auth("public clients must use DPoP authorization scheme".into())
+            AppError::Auth("DPoP auth requires the DPoP authorization scheme".into())
         })?;
         let dpop_proof = req
             .headers()
             .get("dpop")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                AppError::Auth("public clients must provide DPoP proof header".into())
-            })?;
+            .ok_or_else(|| AppError::Auth("DPoP auth requires a DPoP proof header".into()))?;
 
         let thumbprint = crate::oauth::dpop_proof::extract_proof_thumbprint(dpop_proof)?;
         let dpop_key_id = keys::get_dpop_key_id_by_thumbprint(
@@ -411,17 +429,12 @@ async fn get_session(
         )
         .await?;
 
-        let scheme = if state.config.public_url.starts_with("https") {
-            "https"
-        } else {
-            "http"
-        };
         let host = req
             .headers()
             .get("host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("localhost");
-        let request_url = format!("{}://{}/oauth/sessions/{}", scheme, host, did);
+        let request_url = dpop_htu(&state, host, &original_request_path(&req));
 
         crate::oauth::dpop_proof::validate_dpop_proof(
             dpop_proof,
@@ -452,8 +465,18 @@ async fn get_session(
 
 /// DELETE /oauth/sessions/:did — logout / revoke a session.
 ///
-/// Confidential clients authenticate with `X-Client-Key` + `X-Client-Secret`.
-/// Public clients authenticate with `X-Client-Key` + `Authorization: DPoP <token>` + `DPoP` proof.
+/// With `X-Client-Secret`, every session for this user+client is revoked.
+/// Otherwise the caller authenticates with `X-Client-Key` + `Authorization:
+/// DPoP <token>` + a `DPoP` proof, and only that device's session is revoked.
+///
+/// DPoP auth is accepted regardless of `client_type`, matching what `/xrpc/*`
+/// already accepts. Requiring the client secret here — but not for the calls
+/// the same credentials make everywhere else — meant a confidential client
+/// using DPoP could never log out: the 401 left the session in local storage,
+/// the next restore signed the user back in, and the next logout failed the
+/// same way. The DPoP proof is possession of the session key, which is the
+/// same thing that authorises using the session; revoking it is strictly less
+/// dangerous than continuing to use it.
 async fn delete_session(
     State(state): State<AppState>,
     Path(did): Path<String>,
@@ -499,29 +522,21 @@ async fn delete_session(
         let resolved =
             client_auth::resolve_client_by_key(&state.db, state.db_backend, &client_key).await?;
 
-        if resolved.client_type != "public" {
-            return Err(AppError::Auth(
-                "non-public clients must provide X-Client-Secret".into(),
-            ));
-        }
-
         let auth_header = req
             .headers()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| {
-                AppError::Auth("public clients must provide Authorization: DPoP <token>".into())
+                AppError::Auth("DPoP auth requires Authorization: DPoP <token>".into())
             })?;
         let access_token = auth_header.strip_prefix("DPoP ").ok_or_else(|| {
-            AppError::Auth("public clients must use DPoP authorization scheme".into())
+            AppError::Auth("DPoP auth requires the DPoP authorization scheme".into())
         })?;
         let dpop_proof = req
             .headers()
             .get("dpop")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                AppError::Auth("public clients must provide DPoP proof header".into())
-            })?;
+            .ok_or_else(|| AppError::Auth("DPoP auth requires a DPoP proof header".into()))?;
 
         let thumbprint = crate::oauth::dpop_proof::extract_proof_thumbprint(dpop_proof)?;
         let dpop_key_id = keys::get_dpop_key_id_by_thumbprint(
@@ -532,17 +547,12 @@ async fn delete_session(
         )
         .await?;
 
-        let scheme = if state.config.public_url.starts_with("https") {
-            "https"
-        } else {
-            "http"
-        };
         let host = req
             .headers()
             .get("host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("localhost");
-        let request_url = format!("{}://{}/oauth/sessions/{}", scheme, host, did);
+        let request_url = dpop_htu(&state, host, &original_request_path(&req));
 
         crate::oauth::dpop_proof::validate_dpop_proof(
             dpop_proof,
@@ -627,7 +637,7 @@ async fn list_device_sessions(
     Path(did): Path<String>,
     req: axum::extract::Request,
 ) -> Result<Json<Vec<DeviceSessionInfo>>, AppError> {
-    let request_path = req.uri().path().to_string();
+    let request_path = original_request_path(&req);
     let headers = SessionAuthHeaders::from_request(&req);
     let client = resolve_session_client(&state, &headers, &request_path, "GET").await?;
 
@@ -654,7 +664,7 @@ async fn delete_device_session(
     Path((did, session_id)): Path<(String, String)>,
     req: axum::extract::Request,
 ) -> Result<StatusCode, AppError> {
-    let request_path = req.uri().path().to_string();
+    let request_path = original_request_path(&req);
     let headers = SessionAuthHeaders::from_request(&req);
     let client = resolve_session_client(&state, &headers, &request_path, "DELETE").await?;
 
@@ -702,34 +712,24 @@ async fn resolve_session_client(
         client_auth::resolve_client_by_key(&state.db, state.db_backend, &headers.client_key)
             .await?;
 
-    if resolved.client_type != "public" {
-        return Err(AppError::Auth(
-            "non-public clients must provide X-Client-Secret".into(),
-        ));
-    }
-
-    let auth_header = headers.auth_header.as_deref().ok_or_else(|| {
-        AppError::Auth("public clients must provide Authorization: DPoP <token>".into())
-    })?;
-    let access_token = auth_header.strip_prefix("DPoP ").ok_or_else(|| {
-        AppError::Auth("public clients must use DPoP authorization scheme".into())
-    })?;
+    let auth_header = headers
+        .auth_header
+        .as_deref()
+        .ok_or_else(|| AppError::Auth("DPoP auth requires Authorization: DPoP <token>".into()))?;
+    let access_token = auth_header
+        .strip_prefix("DPoP ")
+        .ok_or_else(|| AppError::Auth("DPoP auth requires the DPoP authorization scheme".into()))?;
     let dpop_proof = headers
         .dpop_proof
         .as_deref()
-        .ok_or_else(|| AppError::Auth("public clients must provide DPoP proof header".into()))?;
+        .ok_or_else(|| AppError::Auth("DPoP auth requires a DPoP proof header".into()))?;
 
     let thumbprint = crate::oauth::dpop_proof::extract_proof_thumbprint(dpop_proof)?;
     let _dpop_key_id =
         keys::get_dpop_key_id_by_thumbprint(&state.db, state.db_backend, &resolved.id, &thumbprint)
             .await?;
 
-    let scheme = if state.config.public_url.starts_with("https") {
-        "https"
-    } else {
-        "http"
-    };
-    let request_url = format!("{}://{}{}", scheme, headers.host, request_path);
+    let request_url = dpop_htu(state, &headers.host, request_path);
 
     crate::oauth::dpop_proof::validate_dpop_proof(
         dpop_proof,

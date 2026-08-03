@@ -118,6 +118,24 @@ await client.deleteSession("did:plc:abc123");
 
 This deletes the session from both HappyView and local storage.
 
+**The local cleanup always happens.** A `404`, `401`, or `403` from the server is treated as a completed logout — the session is either already gone or the credential is no longer usable, so there is nothing left to revoke. A `5xx` or a network error still throws, because the server may genuinely still hold a live session and you should know that, but it throws *after* the local session has been cleared. Either way the user ends up logged out on this device, and calling `deleteSession` again is safe.
+
+### Forgetting a session locally
+
+```typescript
+await client.forgetSession("did:plc:abc123");
+```
+
+Clears the stored session without contacting the server. Use it when revocation is impossible — an unreachable instance, or a credential the server has already rejected. Nothing is revoked, so the instance may still consider the session live until it expires naturally.
+
+### Storage keys
+
+`STORAGE_PREFIX` (`"happyview:session:"`) and `LAST_ACTIVE_KEY` (`"happyview:last-active-did"`) are exported, so tooling that needs to inspect or clear stored sessions directly can do so without hardcoding the format:
+
+```typescript
+import { STORAGE_PREFIX, LAST_ACTIVE_KEY } from "@happyview/oauth-client";
+```
+
 ## Adapters
 
 ### CryptoAdapter

@@ -977,3 +977,173 @@ async fn test_public_client_dpop_delete_session() {
     let get_resp = app.router.clone().oneshot(get_req).await.unwrap();
     assert_ne!(get_resp.status(), StatusCode::OK);
 }
+
+/// A confidential client can provision a DPoP key and use it against `/xrpc/*`
+/// without ever presenting its secret, because `resolve_dpop_claims` does not
+/// look at `client_type`. Revoking the session it just used must not be the one
+/// operation that demands more — otherwise logout 401s forever while every
+/// other call succeeds, and the client cannot get out of the loop.
+#[tokio::test]
+#[serial]
+async fn test_confidential_client_dpop_delete_session_without_secret() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
+
+    let key_req = post_json_with_headers(
+        "/oauth/dpop-keys",
+        &json!({}),
+        vec![
+            ("x-client-key", &client_key),
+            ("x-client-secret", &client_secret),
+        ],
+    );
+    let key_resp = app.router.clone().oneshot(key_req).await.unwrap();
+    assert_eq!(key_resp.status(), StatusCode::CREATED);
+    let key_body = response_json(key_resp).await;
+    let provision_id = key_body["provision_id"].as_str().unwrap();
+    let dpop_key = &key_body["dpop_key"];
+
+    let did = "did:plc:confidentialdelete";
+    let access_token = "confidential-delete-token";
+
+    app.mock_session_verification(did, did).await;
+
+    let session_req = post_json_with_headers(
+        "/oauth/sessions",
+        &json!({
+            "provision_id": provision_id,
+            "did": did,
+            "access_token": access_token,
+            "scopes": "atproto",
+            "pds_url": "https://pds.example.com",
+        }),
+        vec![
+            ("x-client-key", &client_key),
+            ("x-client-secret", &client_secret),
+        ],
+    );
+    let session_resp = app.router.clone().oneshot(session_req).await.unwrap();
+    assert_eq!(session_resp.status(), StatusCode::CREATED);
+
+    // DPoP proof only — no X-Client-Secret, exactly what the JS SDK sends.
+    let request_url = format!("http://127.0.0.1/oauth/sessions/{}", did);
+    let proof = generate_dpop_proof(dpop_key, "DELETE", &request_url, access_token, None)
+        .expect("failed to generate DPoP proof");
+
+    let del_req = delete_with_headers(
+        &format!("/oauth/sessions/{}", did),
+        vec![
+            ("x-client-key", &client_key),
+            ("authorization", &format!("DPoP {}", access_token)),
+            ("dpop", &proof),
+        ],
+    );
+    let del_resp = app.router.clone().oneshot(del_req).await.unwrap();
+    assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
+}
+
+/// The device-session route builds its htu from the request path rather than
+/// from a format string, and this router is nested under `/oauth` — so the
+/// handler's own `req.uri()` has that prefix stripped. The client signs the
+/// full URL it requested, so the server has to reconstruct the full one too.
+/// Every existing test of this route authenticates with the client secret and
+/// so never reaches the proof check.
+#[tokio::test]
+#[serial]
+async fn test_dpop_delete_device_session_htu_includes_router_prefix() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
+    let did = "did:plc:devicedpop";
+
+    let (_prov, dpop_key, session_id) =
+        provision_and_register(&app, &client_key, &client_secret, did, "device-dpop-token").await;
+
+    let path = format!("/oauth/sessions/{}/devices/{}", did, session_id);
+    let request_url = format!("http://127.0.0.1{}", path);
+    let proof = generate_dpop_proof(&dpop_key, "DELETE", &request_url, "device-dpop-token", None)
+        .expect("failed to generate DPoP proof");
+
+    let del_req = delete_with_headers(
+        &path,
+        vec![
+            ("x-client-key", &client_key),
+            ("authorization", "DPoP device-dpop-token"),
+            ("dpop", &proof),
+        ],
+    );
+    let del_resp = app.router.clone().oneshot(del_req).await.unwrap();
+    assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
+}
+
+/// The htu is whatever the client actually signed, which is whatever it put on
+/// the wire. A client that percent-encodes the DID signs the encoded form, so
+/// rebuilding the URL from a decoded path segment produces a mismatch that no
+/// caller can fix from their side.
+#[tokio::test]
+#[serial]
+async fn test_public_client_dpop_delete_session_percent_encoded_did() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, _secret, _id) = app
+        .create_api_client("public", Some(vec!["http://localhost:3000".to_string()]))
+        .await;
+
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use sha2::{Digest, Sha256};
+
+    let verifier = "test-verifier-for-encoded-delete";
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+
+    let key_req = post_json_with_headers(
+        "/oauth/dpop-keys",
+        &json!({ "pkce_challenge": challenge }),
+        vec![
+            ("x-client-key", &client_key),
+            ("origin", "http://localhost:3000"),
+        ],
+    );
+    let key_resp = app.router.clone().oneshot(key_req).await.unwrap();
+    assert_eq!(key_resp.status(), StatusCode::CREATED);
+    let key_body = response_json(key_resp).await;
+    let provision_id = key_body["provision_id"].as_str().unwrap();
+    let dpop_key = &key_body["dpop_key"];
+
+    let did = "did:plc:encodeddelete";
+    let encoded_did = "did%3Aplc%3Aencodeddelete";
+    let access_token = "encoded-delete-token";
+
+    app.mock_session_verification(did, did).await;
+
+    let session_req = post_json_with_headers(
+        "/oauth/sessions",
+        &json!({
+            "provision_id": provision_id,
+            "pkce_verifier": verifier,
+            "did": did,
+            "access_token": access_token,
+            "scopes": "atproto",
+            "pds_url": "https://pds.example.com",
+        }),
+        vec![("x-client-key", &client_key)],
+    );
+    let session_resp = app.router.clone().oneshot(session_req).await.unwrap();
+    assert_eq!(session_resp.status(), StatusCode::CREATED);
+
+    let request_url = format!("http://127.0.0.1/oauth/sessions/{}", encoded_did);
+    let proof = generate_dpop_proof(dpop_key, "DELETE", &request_url, access_token, None)
+        .expect("failed to generate DPoP proof");
+
+    let del_req = delete_with_headers(
+        &format!("/oauth/sessions/{}", encoded_did),
+        vec![
+            ("x-client-key", &client_key),
+            ("authorization", &format!("DPoP {}", access_token)),
+            ("dpop", &proof),
+        ],
+    );
+    let del_resp = app.router.clone().oneshot(del_req).await.unwrap();
+    assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
+}
