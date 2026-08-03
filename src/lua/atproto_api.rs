@@ -324,13 +324,25 @@ pub fn register_atproto_api(
                     .from_value(sig)
                     .map_err(|e| mlua::Error::runtime(format!("atproto.verify_signature: {e}")))?;
 
-                match signer.verify_record_signature(&record_json, &sig_json, &repo_did) {
-                    Ok(valid) => Ok(valid),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "atproto.verify_signature failed");
-                        Ok(false)
-                    }
-                }
+                // `false` and an error are different facts, and only `false`
+                // is a statement about the record: it means we checked and the
+                // signature does not match. An error means we could not check
+                // — malformed signature bytes, a missing field, a record that
+                // will not encode. Collapsing the second into the first would
+                // let any fault in this path present to a script as "this user
+                // forged their records", with nothing in the logs to say
+                // otherwise. Callers that want the old behaviour can `pcall`.
+                signer
+                    .verify_record_signature(&record_json, &sig_json, &repo_did)
+                    .map_err(|e| {
+                        tracing::warn!(
+                            repository = %repo_did,
+                            error = %e,
+                            "atproto.verify_signature could not check the signature — \
+                             this is not a statement that the record is forged"
+                        );
+                        mlua::Error::runtime(format!("atproto.verify_signature: {e}"))
+                    })
             },
         )?;
         atproto_table.set("verify_signature", verify_fn)?;
@@ -947,6 +959,45 @@ mod tests {
         "#;
         let result: bool = lua.load(chunk).eval_async().await.unwrap();
         assert!(!result);
+    }
+
+    /// "We checked and it does not match" and "we could not check" are
+    /// different facts, and only the first is a statement about the record.
+    /// A script that cannot tell them apart will accuse a user of forgery
+    /// because of a decode bug.
+    #[tokio::test]
+    async fn verify_signature_distinguishes_unverifiable_from_invalid() {
+        let state = test_state_with_signer("");
+        let lua = mlua::Lua::new();
+        register_atproto_api(&lua, Arc::new(state), Some("did:plc:caller")).unwrap();
+
+        let chunk = r#"
+            local record = { contributionType = "correction", changes = { name = "Original" } }
+            local sig = atproto.sign(record)
+
+            -- A well-formed signature over a different payload: genuinely invalid.
+            local tampered = { contributionType = "correction", changes = { name = "Tampered" } }
+            local mismatch_ok, mismatch = pcall(atproto.verify_signature, tampered, sig, "did:plc:caller")
+
+            -- Signature bytes that are not base64 at all: unverifiable.
+            sig.signature["$bytes"] = "not!valid!base64"
+            local undecodable_ok, undecodable = pcall(atproto.verify_signature, record, sig, "did:plc:caller")
+
+            return mismatch_ok, mismatch, undecodable_ok, tostring(undecodable)
+        "#;
+        let (mismatch_ok, mismatch, undecodable_ok, undecodable): (bool, bool, bool, String) =
+            lua.load(chunk).eval_async().await.unwrap();
+
+        assert!(mismatch_ok, "a mismatch is an answer, not a failure");
+        assert!(!mismatch, "a signature over a different payload is invalid");
+        assert!(
+            !undecodable_ok,
+            "an unverifiable signature must not be reported as invalid"
+        );
+        assert!(
+            undecodable.contains("invalid base64"),
+            "the error must name the cause, got: {undecodable}"
+        );
     }
 
     #[tokio::test]
