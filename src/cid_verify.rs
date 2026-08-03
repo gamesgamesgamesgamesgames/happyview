@@ -9,6 +9,26 @@ use std::str::FromStr;
 const DAG_CBOR_CODEC: u64 = 0x71;
 const SHA2_256_CODE: u64 = 0x12;
 
+/// The codec for `$bytes` in the atproto data model — the one place that
+/// encoding is decided, so every producer and consumer of `$bytes` agrees.
+///
+/// The data model specifies RFC-4648 §4 base64 in which `=` padding is
+/// **optional**. Both forms name the same bytes, so both must decode:
+/// jetstream emits `$bytes` unpadded, our own signer emits it padded, and a
+/// signature we wrote ourselves comes back off the firehose two characters
+/// shorter. A padding-strict engine reads that as corruption and reports a
+/// record we signed as unverifiable — which downstream becomes an accusation
+/// of forgery aimed at the record's author.
+///
+/// Encoding is unchanged from `general_purpose::STANDARD` (padding on,
+/// standard alphabet); only the decoder is made indifferent.
+pub const BYTES_B64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::general_purpose::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    );
+
 /// Outcome of checking a claimed CID against a record's content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CidCheck {
@@ -52,9 +72,7 @@ fn atproto_json_to_ipld(value: &Value) -> Option<Ipld> {
                     return Some(Ipld::Link(Cid::from_str(link).ok()?));
                 }
                 if let Some(Value::String(b64)) = obj.get("$bytes") {
-                    let bytes =
-                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-                            .ok()?;
+                    let bytes = base64::Engine::decode(&BYTES_B64, b64).ok()?;
                     return Some(Ipld::Bytes(bytes));
                 }
             }
@@ -140,6 +158,23 @@ mod tests {
                 .expect("encodable")
                 .to_string(),
             ORDERING_CID
+        );
+    }
+
+    /// `=` padding on `$bytes` is optional in the data model, so the same
+    /// bytes may arrive either way and must yield the same CID. If the
+    /// unpadded form fails to encode, `verify_record_cid` degrades to
+    /// `Skipped` and the record is indexed with its CID unchecked.
+    #[test]
+    fn padded_and_unpadded_bytes_produce_the_same_cid() {
+        let padded = json!({ "sig": { "$bytes": "3q2+7w==" } });
+        let unpadded = json!({ "sig": { "$bytes": "3q2+7w" } });
+
+        let padded_cid = compute_record_cid(&padded).expect("padded is encodable");
+        assert_eq!(
+            compute_record_cid(&unpadded),
+            Some(padded_cid),
+            "unpadded $bytes must encode to the same CID"
         );
     }
 

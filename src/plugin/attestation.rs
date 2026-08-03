@@ -108,7 +108,7 @@ impl AttestationSigner {
             "$type": &self.sig_type,
             "key": &self.key_id,
             "signature": {
-                "$bytes": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &signature)
+                "$bytes": base64::Engine::encode(&crate::cid_verify::BYTES_B64, &signature)
             }
         });
 
@@ -149,7 +149,7 @@ impl AttestationSigner {
             "$type": &self.sig_type,
             "key": &self.key_id,
             "signature": {
-                "$bytes": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &signature)
+                "$bytes": base64::Engine::encode(&crate::cid_verify::BYTES_B64, &signature)
             }
         });
 
@@ -249,9 +249,8 @@ impl AttestationSigner {
             .and_then(|b| b.as_str())
             .ok_or_else(|| AttestationError::MissingField("signature.signature.$bytes".into()))?;
 
-        let sig_bytes =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, sig_bytes_b64)
-                .map_err(|e| AttestationError::Encoding(format!("invalid base64: {e}")))?;
+        let sig_bytes = base64::Engine::decode(&crate::cid_verify::BYTES_B64, sig_bytes_b64)
+            .map_err(|e| AttestationError::Encoding(format!("invalid base64: {e}")))?;
 
         let signature = Signature::from_slice(&sig_bytes[..])
             .map_err(|e| AttestationError::Signing(format!("invalid signature bytes: {e}")))?;
@@ -349,8 +348,7 @@ fn legacy_json_to_cbor(value: &Value) -> ciborium::Value {
             // Handle special $bytes encoding for binary data
             if obj.len() == 1
                 && let Some(Value::String(b64)) = obj.get("$bytes")
-                && let Ok(bytes) =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                && let Ok(bytes) = base64::Engine::decode(&crate::cid_verify::BYTES_B64, b64)
             {
                 return ciborium::Value::Bytes(bytes);
             }
@@ -813,6 +811,37 @@ mod tests {
                 .verify_record_signature_detailed(&record, &sig, "did:plc:test")
                 .unwrap()
                 .is_legacy()
+        );
+    }
+
+    /// The data model makes `=` padding optional on `$bytes`, and at least one
+    /// major implementation (jetstream) omits it. A signature we emitted padded
+    /// comes back off the firehose 86 characters instead of 88, and must still
+    /// verify — the padding carries no information, only the bytes do.
+    #[test]
+    fn signatures_verify_with_unpadded_bytes() {
+        let signer = test_signer();
+        let mut record = ordering_sensitive_record();
+        signer.sign_record(&mut record, "did:plc:test").unwrap();
+
+        let padded = record["signatures"][0]["signature"]["$bytes"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let unpadded = padded.trim_end_matches('=').to_string();
+        assert_ne!(
+            padded, unpadded,
+            "signing must emit padding for this to test anything"
+        );
+
+        record["signatures"][0]["signature"]["$bytes"] = serde_json::json!(unpadded);
+        let sig = record["signatures"][0].clone();
+
+        assert_eq!(
+            signer
+                .verify_record_signature_detailed(&record, &sig, "did:plc:test")
+                .unwrap(),
+            SignatureVerification::Valid(SignatureEncoding::Current),
         );
     }
 
