@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -22,8 +23,14 @@ use crate::http_retry::parse_retry_after;
 use crate::profile;
 
 use super::auth::UserAuth;
+use super::backfill_errors::{BackfillErrorKind, ERROR_DETAIL_CAP, ErrorCounts};
+use super::backfill_retry::{
+    DeferredItem, DeferredQueue, DrainStep, HostCooldowns, next_drain_step,
+};
 use super::permissions::Permission;
-use super::types::{BackfillJob, CreateBackfillBody};
+use super::types::{
+    BackfillErrorCount, BackfillErrorEntry, BackfillErrorsResponse, BackfillJob, CreateBackfillBody,
+};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -115,6 +122,50 @@ fn publish_event(state: &AppState, event: super::types::BackfillEvent) {
     let _ = state.backfill_events_tx.send(event);
 }
 
+/// Current job state, straight from the database.
+///
+/// The SSE stream is otherwise delta-only over a lossy broadcast channel, so a
+/// client that connects mid-phase or misses an event has no way to recover.
+/// A snapshot is how it resyncs.
+async fn build_job_snapshot(state: &AppState, job_id: &str) -> Option<super::types::BackfillEvent> {
+    let sql = adapt_sql(
+        "SELECT status, stage, total_repos, resolved_repos, processed_repos, total_records, error_counts \
+         FROM happyview_backfill_jobs WHERE id = ?",
+        state.db_backend,
+    );
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        String,
+        String,
+        Option<i32>,
+        Option<i32>,
+        Option<i32>,
+        Option<i32>,
+        Option<String>,
+    )> = crate::db::query_as(&sql)
+        .bind(job_id)
+        .fetch_optional(&state.backfill_db)
+        .await
+        .ok()
+        .flatten();
+
+    let (status, stage, total_repos, resolved_repos, processed_repos, total_records, error_counts) =
+        row?;
+
+    Some(super::types::BackfillEvent::JobSnapshot {
+        job_id: job_id.to_string(),
+        status,
+        stage,
+        total_repos,
+        resolved_repos,
+        processed_repos,
+        total_records,
+        error_counts: error_counts
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({})),
+    })
+}
+
 fn random_batch_threshold(base: i32) -> i32 {
     let low = base - base / 10;
     rand::rng().random_range(low..=base)
@@ -155,6 +206,14 @@ async fn load_concurrency(state: &AppState) -> BackfillConcurrency {
         pds,
         dids_per_pds,
     }
+}
+
+async fn load_max_attempts(state: &AppState) -> u32 {
+    super::settings::get_setting(&state.db, "backfill_max_attempts", state.db_backend)
+        .await
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3u32)
+        .clamp(1, 10)
 }
 
 async fn fail_job(state: &AppState, job_id: &str, error: &str) {
@@ -461,6 +520,65 @@ async fn discover_repos_from_relay(
 // Pipelined Phase 2+3: Resolve PDS endpoints and fetch records concurrently
 // ---------------------------------------------------------------------------
 
+/// Finish resolving one DID: persist its PDS endpoint, publish the resolved
+/// event, bump the resolved-repo counter (flushing to the DB on schedule),
+/// and hand the `(did, pds)` pair to the fetcher.
+///
+/// Shared by the resolver's primary stream and its deferred-retry drain so
+/// both paths do exactly the same thing on success, rather than the drain
+/// pass repeating this by hand.
+///
+/// Returns `false` once `tx_resolver` has closed — the fetcher already
+/// exited, so there is nothing left to resolve for.
+#[allow(clippy::too_many_arguments)]
+async fn on_resolved(
+    resolver_state: &AppState,
+    resolver_job_id: &str,
+    did: String,
+    pds: String,
+    resolver_resolved: &AtomicI32,
+    next_flush: &mut i32,
+    tx_resolver: &mpsc::Sender<(String, String)>,
+) -> bool {
+    let sql = adapt_sql(
+        "UPDATE happyview_backfill_repos SET pds_endpoint = ? WHERE job_id = ? AND did = ?",
+        resolver_state.db_backend,
+    );
+    let _ = crate::db::query(&sql)
+        .bind(&pds)
+        .bind(resolver_job_id)
+        .bind(&did)
+        .execute(&resolver_state.backfill_db)
+        .await;
+
+    publish_event(
+        resolver_state,
+        super::types::BackfillEvent::RepoResolved {
+            job_id: resolver_job_id.to_string(),
+            did: did.clone(),
+            pds_endpoint: pds.clone(),
+        },
+    );
+
+    let count = resolver_resolved.fetch_add(1, Ordering::Relaxed) + 1;
+    if count >= *next_flush {
+        update_job_counter(resolver_state, resolver_job_id, "resolved_repos", count).await;
+        *next_flush = count + random_batch_threshold(100);
+    }
+    publish_event(
+        resolver_state,
+        super::types::BackfillEvent::JobCounters {
+            job_id: resolver_job_id.to_string(),
+            total_repos: None,
+            resolved_repos: Some(count),
+            processed_repos: None,
+            total_records: None,
+        },
+    );
+
+    tx_resolver.send((did, pds)).await.is_ok()
+}
+
 async fn run_pipelined_resolve_and_fetch(
     state: &AppState,
     job_id: &str,
@@ -522,12 +640,18 @@ async fn run_pipelined_resolve_and_fetch(
     let tx_resolver = tx.clone();
     let tx_backlog = tx.clone();
 
+    // One error sink for the whole job, shared by every phase and (once Task 7
+    // lands) every per-PDS worker — see `ErrorRecorder`'s doc comment for why
+    // it must not be constructed per-worker.
+    let recorder = Arc::new(super::backfill_errors::ErrorRecorder::new(state, job_id).await);
+
     // --- Resolver task ---
     let resolution_concurrency = concurrency.resolution;
     let resolver_state = state.clone();
     let resolver_job_id = job_id.to_string();
     let resolver_resolved = Arc::clone(&resolved_repos);
     let resolver_cancelled = Arc::clone(&cancelled);
+    let resolver_recorder = Arc::clone(&recorder);
 
     let resolver_handle = tokio::spawn(async move {
         let sql = adapt_sql(
@@ -543,6 +667,12 @@ async fn run_pipelined_resolve_and_fetch(
         let mut attempted: i32 = 0;
         let mut next_flush = random_batch_threshold(100);
         let mut next_cancel_check = random_batch_threshold(10);
+        let max_attempts = load_max_attempts(&resolver_state).await;
+        // Local to this task, not job-wide state: every worker Task 7 spawns
+        // gets its own cooldowns and queue, keyed to the PDS host(s) it alone
+        // talks to.
+        let mut cooldowns = HostCooldowns::new();
+        let mut deferred: DeferredQueue<String> = DeferredQueue::new();
 
         let stream_state = resolver_state.clone();
         let stream_cancelled = Arc::clone(&resolver_cancelled);
@@ -554,9 +684,12 @@ async fn run_pipelined_resolve_and_fetch(
                     if cancelled.load(Ordering::Relaxed) {
                         return None;
                     }
-                    let result =
-                        profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, &did)
-                            .await;
+                    let result = profile::resolve_pds_endpoint_once(
+                        &state.http,
+                        &state.config.plc_url,
+                        &did,
+                    )
+                    .await;
                     Some((did, result))
                 }
             })
@@ -569,54 +702,62 @@ async fn run_pipelined_resolve_and_fetch(
 
             match result {
                 Ok(pds) => {
-                    let sql = adapt_sql(
-                        "UPDATE happyview_backfill_repos SET pds_endpoint = ? WHERE job_id = ? AND did = ?",
-                        resolver_state.db_backend,
-                    );
-                    let _ = crate::db::query(&sql)
-                        .bind(&pds)
-                        .bind(&resolver_job_id)
-                        .bind(&did)
-                        .execute(&resolver_state.backfill_db)
-                        .await;
-
-                    publish_event(
+                    let host = profile::did_doc_host(&resolver_state.config.plc_url, &did);
+                    cooldowns.record_success(&host);
+                    if !on_resolved(
                         &resolver_state,
-                        super::types::BackfillEvent::RepoResolved {
-                            job_id: resolver_job_id.clone(),
-                            did: did.clone(),
-                            pds_endpoint: pds.clone(),
-                        },
-                    );
-
-                    let count = resolver_resolved.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count >= next_flush {
-                        update_job_counter(
-                            &resolver_state,
-                            &resolver_job_id,
-                            "resolved_repos",
-                            count,
-                        )
-                        .await;
-                        next_flush = count + random_batch_threshold(100);
-                    }
-                    publish_event(
-                        &resolver_state,
-                        super::types::BackfillEvent::JobCounters {
-                            job_id: resolver_job_id.clone(),
-                            total_repos: None,
-                            resolved_repos: Some(count),
-                            processed_repos: None,
-                            total_records: None,
-                        },
-                    );
-
-                    if tx_resolver.send((did, pds)).await.is_err() {
+                        &resolver_job_id,
+                        did,
+                        pds,
+                        &resolver_resolved,
+                        &mut next_flush,
+                        &tx_resolver,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            job_id = %resolver_job_id,
+                            deferred_queued = deferred.len(),
+                            "fetcher channel closed while resolving; abandoning the \
+                             remaining resolved DIDs — they will not be fetched, \
+                             counted, or recorded as errors"
+                        );
                         break;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(did, error = %e, "failed to resolve PDS endpoint, skipping DID");
+                Err(failure) => {
+                    let host = profile::did_doc_host(&resolver_state.config.plc_url, &did);
+                    let now = std::time::Instant::now();
+                    let attempts = 1;
+
+                    if failure.kind.is_retryable() && attempts < max_attempts {
+                        cooldowns.record_failure(&host, failure.retry_after, now);
+                        deferred.push(DeferredItem {
+                            payload: did.clone(),
+                            host,
+                            attempts,
+                            eligible_at: now,
+                        });
+                    } else {
+                        resolver_recorder
+                            .record(
+                                &resolver_state,
+                                &resolver_job_id,
+                                &did,
+                                None,
+                                "resolve",
+                                &failure,
+                                attempts,
+                            )
+                            .await;
+                        tracing::warn!(
+                            did,
+                            kind = failure.kind.as_str(),
+                            attempts,
+                            "giving up resolving PDS endpoint: {}",
+                            failure.message
+                        );
+                    }
                 }
             }
 
@@ -630,6 +771,114 @@ async fn run_pipelined_resolve_and_fetch(
             }
         }
 
+        // Deferred pass. The primary stream is exhausted, so anything still
+        // here is waiting on a clock rather than on work.
+        loop {
+            if resolver_cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            match next_drain_step(&mut deferred, &cooldowns, Duration::from_secs(2)).await {
+                DrainStep::Done => break,
+                DrainStep::Slept => {
+                    if should_stop_worker(&resolver_state, &resolver_job_id).await {
+                        resolver_cancelled.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                DrainStep::Retry(item) => {
+                    let attempts = item.attempts + 1;
+                    match profile::resolve_pds_endpoint_once(
+                        &resolver_state.http,
+                        &resolver_state.config.plc_url,
+                        &item.payload,
+                    )
+                    .await
+                    {
+                        Ok(pds) => {
+                            cooldowns.record_success(&item.host);
+                            // Same path as the primary Ok arm.
+                            if !on_resolved(
+                                &resolver_state,
+                                &resolver_job_id,
+                                item.payload,
+                                pds,
+                                &resolver_resolved,
+                                &mut next_flush,
+                                &tx_resolver,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    job_id = %resolver_job_id,
+                                    deferred_queued = deferred.len(),
+                                    "fetcher channel closed while draining deferred \
+                                     resolutions; abandoning the remaining queued DIDs \
+                                     — they will not be fetched, counted, or recorded \
+                                     as errors"
+                                );
+                                break;
+                            }
+                        }
+                        Err(failure) => {
+                            let now = std::time::Instant::now();
+                            if failure.kind.is_retryable() && attempts < max_attempts {
+                                let host = item.host.clone();
+                                cooldowns.record_failure(&host, failure.retry_after, now);
+                                deferred.push(DeferredItem {
+                                    attempts,
+                                    eligible_at: now,
+                                    ..item
+                                });
+                                // A host that has stopped answering must not be
+                                // re-asked once per cooldown for every DID
+                                // behind it — that turns a bounded drain into a
+                                // multi-day one. Declare it down and record the
+                                // whole queue at once, so every DID still lands
+                                // in `backfill_errors` with the right kind.
+                                if cooldowns.is_saturated(&host) {
+                                    let abandoned = deferred.drain_host(&host);
+                                    tracing::warn!(
+                                        host,
+                                        abandoned = abandoned.len(),
+                                        kind = failure.kind.as_str(),
+                                        "host failed {} times consecutively; giving up on \
+                                         its remaining deferred resolutions: {}",
+                                        cooldowns.consecutive_failures(&host),
+                                        failure.message
+                                    );
+                                    for item in abandoned {
+                                        resolver_recorder
+                                            .record(
+                                                &resolver_state,
+                                                &resolver_job_id,
+                                                &item.payload,
+                                                None,
+                                                "resolve",
+                                                &failure,
+                                                item.attempts,
+                                            )
+                                            .await;
+                                    }
+                                }
+                            } else {
+                                resolver_recorder
+                                    .record(
+                                        &resolver_state,
+                                        &resolver_job_id,
+                                        &item.payload,
+                                        None,
+                                        "resolve",
+                                        &failure,
+                                        attempts,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Persist final resolved count
         let final_resolved = resolver_resolved.load(Ordering::Relaxed);
         update_job_counter(
@@ -639,7 +888,12 @@ async fn run_pipelined_resolve_and_fetch(
             final_resolved,
         )
         .await;
-        // tx is dropped here, signalling the fetcher that no more DIDs are coming
+        resolver_recorder
+            .flush(&resolver_state, &resolver_job_id)
+            .await;
+        // tx_resolver is dropped here, at the end of this task's async block —
+        // only now does the fetcher learn that no more DIDs are coming, which
+        // is why the deferred pass above must finish before this point.
     });
 
     // --- Also send already-resolved-but-unfetched DIDs to the fetcher ---
@@ -747,6 +1001,7 @@ async fn run_pipelined_resolve_and_fetch(
                 total_records: Arc::clone(&total_records),
                 cancelled: Arc::clone(&cancelled),
                 dids_per_pds: concurrency.dids_per_pds,
+                recorder: Arc::clone(&recorder),
             };
 
             worker_handles.push(tokio::spawn(async move {
@@ -796,6 +1051,7 @@ async fn run_pipelined_resolve_and_fetch(
             total_records: Arc::clone(&total_records),
             cancelled: Arc::clone(&cancelled),
             dids_per_pds: concurrency.dids_per_pds,
+            recorder: Arc::clone(&recorder),
         };
 
         worker_handles.push(tokio::spawn(async move {
@@ -821,6 +1077,15 @@ async fn run_pipelined_resolve_and_fetch(
     // Wait for resolver and backlog tasks
     let _ = resolver_handle.await;
     let _ = backlog_handle.await;
+
+    // Flush again now that every PDS worker (and the resolver) has finished.
+    // The resolver already flushed once inside its own task when resolution
+    // finished, but that predates most of the fetch phase's give-ups —
+    // fetching is the long pole, so flushing only there left `error_counts`
+    // frozen at a resolve-only snapshot. This must come after both joins
+    // above: flushing earlier could race the resolver's own flush and get
+    // overwritten by its older counts.
+    recorder.flush(&state, job_id).await;
 
     let final_repos = processed_repos.load(Ordering::Relaxed);
     let final_records = total_records.load(Ordering::Relaxed);
@@ -848,7 +1113,188 @@ struct FetchContext {
     total_records: Arc<AtomicI32>,
     cancelled: Arc<AtomicBool>,
     dids_per_pds: usize,
+    // Shared with every other PDS worker for this job — see the doc comment
+    // on `recorder`'s construction in `run_pipelined_resolve_and_fetch` for
+    // why this must be a clone, never a fresh `ErrorRecorder::new`.
+    recorder: Arc<super::backfill_errors::ErrorRecorder>,
 }
+
+/// DIDs already recorded as a fetch-phase give-up, so a DID that fails on
+/// several collections produces one error row and one count, not N of each.
+///
+/// The detail table's primary key is `(job_id, did, phase)`, so the Nth write
+/// for one DID upserts over the first while `ErrorCounts` gains N — which is
+/// how a 20-lexicon job could report "20,000 failed" for 1,000 dead repos and
+/// announce a cap it had not reached. Collapsing here rather than widening the
+/// key keeps `backfill_errors_list`'s `did > ?` keyset cursor sound.
+///
+/// One set per worker is one set per job for any given DID, since a DID is
+/// routed to exactly one PDS worker.
+type RecordedDids = std::collections::HashSet<String>;
+
+/// Order a DID's failed collections so a retryable failure is handled first.
+///
+/// Only the first give-up for a DID is recorded, and a retryable kind is the
+/// more useful one to keep: `retry-failed` selects on retryability, so this is
+/// what keeps the DID reachable by a retry job.
+fn retryable_give_ups_first(failures: &mut [(String, FetchOutcome)]) {
+    failures.sort_by_key(|(_, outcome)| match outcome {
+        FetchOutcome::Failed { failure, .. } => !failure.kind.is_retryable(),
+        FetchOutcome::Complete { .. } => true,
+    });
+}
+
+/// One fetch failure for one (did, collection): either defer it for retry or
+/// hand it to the recorder as a give-up.
+///
+/// Shared by every place a `FetchOutcome::Failed` is handled — the primary
+/// per-DID results arm, the post-cancellation drain, and the deferred-retry
+/// loop — so the retry/give-up policy can't drift between them.
+#[allow(clippy::too_many_arguments)]
+async fn defer_or_give_up_fetch(
+    state: &AppState,
+    job_id: &str,
+    pds_endpoint: &str,
+    pds_host: &str,
+    recorder: &super::backfill_errors::ErrorRecorder,
+    cooldowns: &mut HostCooldowns,
+    deferred: &mut DeferredQueue<(String, String, Option<String>)>,
+    recorded: &mut RecordedDids,
+    max_attempts: u32,
+    did: String,
+    collection: String,
+    cursor: Option<String>,
+    failure: crate::admin::backfill_errors::BackfillFailure,
+    attempts: u32,
+) {
+    let now = std::time::Instant::now();
+    if failure.kind.is_retryable() && attempts < max_attempts {
+        cooldowns.record_failure(pds_host, failure.retry_after, now);
+        deferred.push(DeferredItem {
+            payload: (did, collection, cursor),
+            host: pds_host.to_string(),
+            attempts,
+            eligible_at: now,
+        });
+    } else {
+        record_fetch_give_up(
+            state,
+            job_id,
+            recorder,
+            recorded,
+            &did,
+            &collection,
+            &failure,
+            attempts,
+        )
+        .await;
+        tracing::warn!(
+            did,
+            collection,
+            pds = %pds_endpoint,
+            kind = failure.kind.as_str(),
+            attempts,
+            "giving up fetching records from PDS: {}",
+            failure.message
+        );
+    }
+}
+
+/// Record one fetch-phase give-up, at most once per DID per job.
+///
+/// The `tracing` line stays per-collection at every call site — an operator
+/// reading logs wants to know which collection failed. Only the *row* and the
+/// *count*, which are per-DID by the detail table's key, are collapsed.
+#[allow(clippy::too_many_arguments)]
+async fn record_fetch_give_up(
+    state: &AppState,
+    job_id: &str,
+    recorder: &super::backfill_errors::ErrorRecorder,
+    recorded: &mut RecordedDids,
+    did: &str,
+    collection: &str,
+    failure: &crate::admin::backfill_errors::BackfillFailure,
+    attempts: u32,
+) {
+    if !recorded.insert(did.to_string()) {
+        return;
+    }
+    recorder
+        .record(
+            state,
+            job_id,
+            did,
+            Some(collection),
+            "fetch",
+            failure,
+            attempts,
+        )
+        .await;
+}
+
+/// Give up on a PDS that has stopped answering, rather than re-offering it one
+/// deferred item per cooldown.
+///
+/// A no-op unless the host is saturated, so the healthy path — a transient
+/// rate limit that clears on the first successful retry — is untouched. Every
+/// abandoned item still reaches the recorder carrying the failure that killed
+/// the host, so the error taxonomy the dashboard reads is unchanged; only the
+/// time taken to reach it stops scaling with the queue length.
+#[allow(clippy::too_many_arguments)]
+async fn abandon_saturated_pds(
+    state: &AppState,
+    job_id: &str,
+    pds_endpoint: &str,
+    pds_host: &str,
+    recorder: &super::backfill_errors::ErrorRecorder,
+    cooldowns: &HostCooldowns,
+    deferred: &mut DeferredQueue<(String, String, Option<String>)>,
+    recorded: &mut RecordedDids,
+    failure: &crate::admin::backfill_errors::BackfillFailure,
+) {
+    // Only a host-level failure may be attributed to the rest of the queue.
+    // A `repo_not_found` is a property of the one repo that provoked it, so
+    // stamping it onto every other DID behind this host would misreport them
+    // in exactly the way this feature exists to prevent — and a definitive
+    // answer from a live server is evidence the host is answering, not that
+    // it is down.
+    if !failure.kind.is_retryable() || !cooldowns.is_saturated(pds_host) {
+        return;
+    }
+    let abandoned = deferred.drain_host(pds_host);
+    if abandoned.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        pds = %pds_endpoint,
+        host = pds_host,
+        abandoned = abandoned.len(),
+        kind = failure.kind.as_str(),
+        "PDS failed {} times consecutively; giving up on its remaining deferred \
+         fetches: {}",
+        cooldowns.consecutive_failures(pds_host),
+        failure.message
+    );
+    for item in abandoned {
+        let (did, collection, _cursor) = item.payload;
+        record_fetch_give_up(
+            state,
+            job_id,
+            recorder,
+            recorded,
+            &did,
+            &collection,
+            failure,
+            item.attempts,
+        )
+        .await;
+    }
+}
+
+/// The result of fetching every collection for one DID: total records
+/// fetched, whether any collection succeeded (clears the host's cooldown),
+/// and the per-collection failures still needing a defer-or-give-up decision.
+type DidFetchResult = (String, i32, bool, Vec<(String, FetchOutcome)>);
 
 async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::Receiver<String>) {
     let FetchContext {
@@ -859,18 +1305,53 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
         total_records,
         cancelled,
         dids_per_pds,
+        recorder,
     } = ctx;
     let mut fetches = FuturesUnordered::new();
     let mut rx_open = true;
     let mut next_flush = random_batch_threshold(10);
+
+    let max_attempts = load_max_attempts(&state).await;
+    let pds_host = profile::host_of(&pds_endpoint);
+    // Local to this worker, not job-wide state: every PDS worker owns its own
+    // cooldown and queue, keyed to the one host it alone talks to.
+    let mut cooldowns = HostCooldowns::new();
+    let mut deferred: DeferredQueue<(String, String, Option<String>)> = DeferredQueue::new();
+    let mut recorded: RecordedDids = RecordedDids::new();
 
     loop {
         tokio::select! {
             biased;
 
             Some(result) = fetches.next(), if !fetches.is_empty() => {
-                let (did, records): (String, i32) = result;
+                let (did, records, any_success, mut failures): DidFetchResult = result;
                 total_records.fetch_add(records, Ordering::Relaxed);
+                if any_success {
+                    cooldowns.record_success(&pds_host);
+                }
+                retryable_give_ups_first(&mut failures);
+                for (collection, outcome) in failures {
+                    let FetchOutcome::Failed { cursor, failure, .. } = outcome else {
+                        continue;
+                    };
+                    defer_or_give_up_fetch(
+                        &state,
+                        job_id.as_str(),
+                        &pds_endpoint,
+                        &pds_host,
+                        &recorder,
+                        &mut cooldowns,
+                        &mut deferred,
+                        &mut recorded,
+                        max_attempts,
+                        did.clone(),
+                        collection,
+                        cursor,
+                        failure,
+                        1,
+                    )
+                    .await;
+                }
 
                 // Mark DID as completed
                 let sql = adapt_sql(
@@ -929,32 +1410,33 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
 
                         fetches.push(async move {
                             let mut count: i32 = 0;
+                            let mut any_success = false;
+                            let mut failures: Vec<(String, FetchOutcome)> = Vec::new();
                             for collection in collections.iter() {
                                 if cancelled.load(Ordering::Relaxed) {
                                     break;
                                 }
-                                match fetch_records_from_pds(
+                                match fetch_records_page_loop(
                                     &state,
                                     &pds_endpoint,
                                     &did,
                                     collection,
+                                    None,
                                     &cancelled,
                                 )
                                 .await
                                 {
-                                    Ok(c) => count += c as i32,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            did,
-                                            collection,
-                                            pds = %pds_endpoint,
-                                            error = %e,
-                                            "failed to fetch records from PDS"
-                                        );
+                                    FetchOutcome::Complete { count: c } => {
+                                        count += c as i32;
+                                        any_success = true;
+                                    }
+                                    outcome @ FetchOutcome::Failed { count: c, .. } => {
+                                        count += c as i32;
+                                        failures.push((collection.clone(), outcome));
                                     }
                                 }
                             }
-                            (did, count)
+                            (did, count, any_success, failures)
                         });
                     }
                     _ => {
@@ -969,8 +1451,37 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
 
     // Drain any remaining fetches
     while let Some(result) = fetches.next().await {
-        let (did, records): (String, i32) = result;
+        let (did, records, any_success, mut failures): DidFetchResult = result;
         total_records.fetch_add(records, Ordering::Relaxed);
+        if any_success {
+            cooldowns.record_success(&pds_host);
+        }
+        retryable_give_ups_first(&mut failures);
+        for (collection, outcome) in failures {
+            let FetchOutcome::Failed {
+                cursor, failure, ..
+            } = outcome
+            else {
+                continue;
+            };
+            defer_or_give_up_fetch(
+                &state,
+                job_id.as_str(),
+                &pds_endpoint,
+                &pds_host,
+                &recorder,
+                &mut cooldowns,
+                &mut deferred,
+                &mut recorded,
+                max_attempts,
+                did.clone(),
+                collection,
+                cursor,
+                failure,
+                1,
+            )
+            .await;
+        }
 
         let sql = adapt_sql(
             "UPDATE happyview_backfill_repos SET status = 'completed', records_fetched = ? WHERE job_id = ? AND did = ?",
@@ -995,6 +1506,79 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
 
         processed_repos.fetch_add(1, Ordering::Relaxed);
     }
+
+    // Deferred pass. All primary fetches are exhausted, so anything still
+    // here is waiting on a clock rather than on work.
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        match next_drain_step(&mut deferred, &cooldowns, Duration::from_secs(2)).await {
+            DrainStep::Done => break,
+            DrainStep::Slept => {
+                if should_stop_worker(&state, job_id.as_str()).await {
+                    cancelled.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            DrainStep::Retry(item) => {
+                let (did, collection, cursor) = item.payload;
+                let attempts = item.attempts + 1;
+                match fetch_records_page_loop(
+                    &state,
+                    &pds_endpoint,
+                    &did,
+                    &collection,
+                    cursor,
+                    &cancelled,
+                )
+                .await
+                {
+                    FetchOutcome::Complete { count } => {
+                        cooldowns.record_success(&pds_host);
+                        total_records.fetch_add(count as i32, Ordering::Relaxed);
+                    }
+                    FetchOutcome::Failed {
+                        count,
+                        cursor,
+                        failure,
+                    } => {
+                        total_records.fetch_add(count as i32, Ordering::Relaxed);
+                        let last_failure = failure.clone();
+                        defer_or_give_up_fetch(
+                            &state,
+                            job_id.as_str(),
+                            &pds_endpoint,
+                            &pds_host,
+                            &recorder,
+                            &mut cooldowns,
+                            &mut deferred,
+                            &mut recorded,
+                            max_attempts,
+                            did,
+                            collection,
+                            cursor,
+                            failure,
+                            attempts,
+                        )
+                        .await;
+                        abandon_saturated_pds(
+                            &state,
+                            job_id.as_str(),
+                            &pds_endpoint,
+                            &pds_host,
+                            &recorder,
+                            &cooldowns,
+                            &mut deferred,
+                            &mut recorded,
+                            &last_failure,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1592,14 @@ async fn run_fetching_phase(
     concurrency: &BackfillConcurrency,
 ) -> (i32, i32) {
     set_stage(state, job_id, "fetching_records").await;
+
+    // One error sink for the whole job, shared by every PDS below — see
+    // `ErrorRecorder`'s doc comment for why a per-worker recorder would be
+    // wrong. This function only runs once per job (the alternate, "already
+    // resolved" path to `run_pipelined_resolve_and_fetch`), so constructing
+    // it once here follows the same one-per-job rule.
+    let recorder = Arc::new(super::backfill_errors::ErrorRecorder::new(state, job_id).await);
+    let max_attempts = load_max_attempts(state).await;
 
     // Load pending repos grouped by PDS
     let sql = adapt_sql(
@@ -1076,53 +1668,146 @@ async fn run_fetching_phase(
             let cancelled = Arc::clone(&cancelled);
             let next_flush = Arc::clone(&next_flush);
             let job_id = Arc::clone(&job_id_arc);
+            let recorder = Arc::clone(&recorder);
 
             async move {
+                // Local to this PDS, not job-wide state: every PDS here gets
+                // its own cooldown and queue, keyed to the one host it alone
+                // talks to.
+                let pds_host = profile::host_of(&pds_endpoint);
+                let mut cooldowns = HostCooldowns::new();
+                let mut deferred: DeferredQueue<(String, String, Option<String>)> =
+                    DeferredQueue::new();
+                let mut recorded: RecordedDids = RecordedDids::new();
+
                 stream::iter(dids)
-                    .for_each_concurrent(dids_per_pds, |did| {
+                    .map(|did| {
                         let state = Arc::clone(&state);
                         let collections = Arc::clone(&collections);
-                        let processed_repos = Arc::clone(&processed_repos);
-                        let total_records = Arc::clone(&total_records);
                         let cancelled = Arc::clone(&cancelled);
-                        let next_flush = Arc::clone(&next_flush);
                         let pds_endpoint = pds_endpoint.clone();
-                        let job_id = Arc::clone(&job_id);
 
                         async move {
                             if cancelled.load(Ordering::Relaxed) {
-                                return;
+                                return (did, 0i32, false, Vec::new());
                             }
 
                             let mut did_records: i32 = 0;
+                            let mut any_success = false;
+                            let mut failures: Vec<(String, FetchOutcome)> = Vec::new();
                             for collection in collections.iter() {
                                 if cancelled.load(Ordering::Relaxed) {
                                     break;
                                 }
-                                match fetch_records_from_pds(
+                                match fetch_records_page_loop(
                                     &state,
                                     &pds_endpoint,
                                     &did,
                                     collection,
+                                    None,
                                     &cancelled,
                                 )
                                 .await
                                 {
-                                    Ok(count) => {
+                                    FetchOutcome::Complete { count } => {
                                         did_records += count as i32;
-                                        total_records
-                                            .fetch_add(count as i32, Ordering::Relaxed);
+                                        any_success = true;
                                     }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            did,
-                                            collection,
-                                            pds = %pds_endpoint,
-                                            error = %e,
-                                            "failed to fetch records from PDS"
-                                        );
+                                    outcome @ FetchOutcome::Failed { count, .. } => {
+                                        did_records += count as i32;
+                                        failures.push((collection.clone(), outcome));
                                     }
                                 }
+                            }
+                            (did, did_records, any_success, failures)
+                        }
+                    })
+                    // Fetches for different DIDs on this PDS run concurrently;
+                    // `for_each` below still consumes their results one at a
+                    // time, which is what lets the cooldown/deferred-queue
+                    // bookkeeping below use plain `&mut` instead of a lock.
+                    .buffer_unordered(dids_per_pds)
+                    .for_each(|(did, did_records, any_success, mut failures)| {
+                        // `HostCooldowns`/`DeferredQueue` can't be borrowed
+                        // into the returned future here — `for_each`'s FnMut
+                        // signature doesn't let a captured `&mut` escape into
+                        // it (a borrow-checker limitation, not a concurrency
+                        // one; `for_each` still drives one future to
+                        // completion before calling this closure again). So
+                        // the defer/give-up decision is made synchronously
+                        // here, before the async block, which only awaits
+                        // the give-ups' recorder I/O.
+                        total_records.fetch_add(did_records, Ordering::Relaxed);
+                        if any_success {
+                            cooldowns.record_success(&pds_host);
+                        }
+
+                        retryable_give_ups_first(&mut failures);
+                        // At most one give-up per DID reaches the recorder —
+                        // the detail table is keyed `(job_id, did, phase)`, so
+                        // recording once per failed collection inflated
+                        // `error_counts` against the rows it was supposed to
+                        // summarise. `retryable_give_ups_first` above is what
+                        // decides *which* one survives.
+                        let mut give_up: Option<(
+                            String,
+                            String,
+                            crate::admin::backfill_errors::BackfillFailure,
+                        )> = None;
+                        for (collection, outcome) in failures {
+                            let FetchOutcome::Failed { cursor, failure, .. } = outcome else {
+                                continue;
+                            };
+                            let attempts = 1;
+                            if failure.kind.is_retryable() && attempts < max_attempts {
+                                let now = std::time::Instant::now();
+                                cooldowns.record_failure(&pds_host, failure.retry_after, now);
+                                deferred.push(DeferredItem {
+                                    payload: (did.clone(), collection, cursor),
+                                    host: pds_host.clone(),
+                                    attempts,
+                                    eligible_at: now,
+                                });
+                            } else {
+                                // Logged per collection even when only one is
+                                // recorded: the log is where an operator finds
+                                // out *which* collection failed.
+                                tracing::warn!(
+                                    did,
+                                    collection,
+                                    pds = %pds_endpoint,
+                                    kind = failure.kind.as_str(),
+                                    attempts,
+                                    "giving up fetching records from PDS: {}",
+                                    failure.message
+                                );
+                                if give_up.is_none() && recorded.insert(did.clone()) {
+                                    give_up = Some((did.clone(), collection, failure));
+                                }
+                            }
+                        }
+
+                        let state = Arc::clone(&state);
+                        let processed_repos = Arc::clone(&processed_repos);
+                        let total_records = Arc::clone(&total_records);
+                        let cancelled = Arc::clone(&cancelled);
+                        let next_flush = Arc::clone(&next_flush);
+                        let job_id = Arc::clone(&job_id);
+                        let recorder = Arc::clone(&recorder);
+
+                        async move {
+                            if let Some((did, collection, failure)) = give_up {
+                                recorder
+                                    .record(
+                                        &state,
+                                        job_id.as_str(),
+                                        &did,
+                                        Some(collection.as_str()),
+                                        "fetch",
+                                        &failure,
+                                        1,
+                                    )
+                                    .await;
                             }
 
                             // Mark DID as completed
@@ -1171,9 +1856,82 @@ async fn run_fetching_phase(
                         }
                     })
                     .await;
+
+                // Deferred pass. All primary fetches for this PDS are
+                // exhausted, so anything still here is waiting on a clock
+                // rather than on work.
+                loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match next_drain_step(&mut deferred, &cooldowns, Duration::from_secs(2)).await
+                    {
+                        DrainStep::Done => break,
+                        DrainStep::Slept => {
+                            if should_stop_worker(&state, job_id.as_str()).await {
+                                cancelled.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                        DrainStep::Retry(item) => {
+                            let (did, collection, cursor) = item.payload;
+                            let attempts = item.attempts + 1;
+                            match fetch_records_page_loop(
+                                &state,
+                                &pds_endpoint,
+                                &did,
+                                &collection,
+                                cursor,
+                                &cancelled,
+                            )
+                            .await
+                            {
+                                FetchOutcome::Complete { count } => {
+                                    cooldowns.record_success(&pds_host);
+                                    total_records.fetch_add(count as i32, Ordering::Relaxed);
+                                }
+                                FetchOutcome::Failed { count, cursor, failure } => {
+                                    total_records.fetch_add(count as i32, Ordering::Relaxed);
+                                    let last_failure = failure.clone();
+                                    defer_or_give_up_fetch(
+                                        &state,
+                                        job_id.as_str(),
+                                        &pds_endpoint,
+                                        &pds_host,
+                                        &recorder,
+                                        &mut cooldowns,
+                                        &mut deferred,
+                                        &mut recorded,
+                                        max_attempts,
+                                        did,
+                                        collection,
+                                        cursor,
+                                        failure,
+                                        attempts,
+                                    )
+                                    .await;
+                                    abandon_saturated_pds(
+                                        &state,
+                                        job_id.as_str(),
+                                        &pds_endpoint,
+                                        &pds_host,
+                                        &recorder,
+                                        &cooldowns,
+                                        &mut deferred,
+                                        &mut recorded,
+                                        &last_failure,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         })
         .await;
+
+    recorder.flush(&state, job_id).await;
 
     let final_repos = processed_repos.load(Ordering::Relaxed);
     let final_records = total_records.load(Ordering::Relaxed);
@@ -1293,17 +2051,39 @@ async fn batch_upsert_records(state: &AppState, batch: &[PreparedRecord]) {
     }
 }
 
+/// The outcome of a records-page-loop attempt.
+///
+/// `Failed` carries the cursor reached so far so a retry can resume
+/// mid-pagination instead of restarting the DID's collection from page one.
+pub(super) enum FetchOutcome {
+    Complete {
+        count: u32,
+    },
+    Failed {
+        count: u32,
+        // Read by the deferred-retry wiring in both fetch call sites, to
+        // resume mid-pagination instead of restarting the DID's collection.
+        cursor: Option<String>,
+        failure: crate::admin::backfill_errors::BackfillFailure,
+    },
+}
+
 /// Fetch all records for a given DID and collection from a PDS via
-/// `com.atproto.repo.listRecords`, paginating and handling rate limits.
-async fn fetch_records_from_pds(
+/// `com.atproto.repo.listRecords`, paginating from `start_cursor`.
+///
+/// This is a single attempt at draining the collection: it never sleeps on a
+/// rate limit and never retries a transport or server error. It returns
+/// `Failed` with the cursor reached so far so the caller can defer and resume.
+async fn fetch_records_page_loop(
     state: &AppState,
     pds_endpoint: &str,
     did: &str,
     collection: &str,
+    start_cursor: Option<String>,
     cancelled: &AtomicBool,
-) -> Result<u32, String> {
+) -> FetchOutcome {
     let base = pds_endpoint.trim_end_matches('/');
-    let mut cursor: Option<String> = None;
+    let mut cursor: Option<String> = start_cursor;
     let mut count: u32 = 0;
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -1317,28 +2097,49 @@ async fn fetch_records_from_pds(
             url.push_str(&format!("&cursor={c}"));
         }
 
-        let resp = state
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("PDS request failed: {e}"))?;
-
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let wait = parse_retry_after(resp.headers());
-            tracing::warn!(did, collection, wait, "rate limited by PDS, sleeping");
-            tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
-            continue;
-        }
+        let resp = match state.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return FetchOutcome::Failed {
+                    count,
+                    cursor,
+                    failure: crate::admin::backfill_errors::BackfillFailure::from_reqwest(&e),
+                };
+            }
+        };
 
         if !resp.status().is_success() {
-            return Err(format!("PDS returned {}", resp.status()));
+            // The body is the only thing that distinguishes the common cases —
+            // a PDS answers `400 InvalidRequest / Could not find repo` for an
+            // account that has been deleted or migrated away, which is routine
+            // during backfill and not worth investigating. Without it, every
+            // non-2xx reads identically.
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = resp.text().await.unwrap_or_default();
+            return FetchOutcome::Failed {
+                count,
+                cursor,
+                failure: crate::admin::backfill_errors::BackfillFailure::from_pds_response(
+                    status, &body, &headers,
+                ),
+            };
         }
 
-        let body: ListRecordsResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("invalid PDS response: {e}"))?;
+        let body: ListRecordsResponse = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                return FetchOutcome::Failed {
+                    count,
+                    cursor,
+                    failure: crate::admin::backfill_errors::BackfillFailure {
+                        kind: crate::admin::backfill_errors::BackfillErrorKind::Other,
+                        message: format!("invalid PDS response: {e}"),
+                        retry_after: None,
+                    },
+                };
+            }
+        };
 
         let page_count = body.records.len();
 
@@ -1402,7 +2203,7 @@ async fn fetch_records_from_pds(
         }
     }
 
-    Ok(count)
+    FetchOutcome::Complete { count }
 }
 
 // ---------------------------------------------------------------------------
@@ -1881,6 +2682,15 @@ pub(super) async fn backfill_events(
     let mut rx = state.backfill_events_tx.subscribe();
 
     let stream = async_stream::stream! {
+        #[allow(clippy::collapsible_if)]
+        if let Some(snapshot) = build_job_snapshot(&state, &job_id).await {
+            if let Ok(json) = serde_json::to_string(&snapshot) {
+                yield Ok(axum::response::sse::Event::default().event("event").data(json));
+            }
+        } else {
+            tracing::warn!(job_id, "could not build initial job snapshot for SSE client");
+        }
+
         loop {
             match rx.recv().await {
                 Ok(event) => {
@@ -1890,7 +2700,8 @@ pub(super) async fn backfill_events(
                         | super::types::BackfillEvent::RepoFetched { job_id, .. }
                         | super::types::BackfillEvent::JobCounters { job_id, .. }
                         | super::types::BackfillEvent::JobStageChanged { job_id, .. }
-                        | super::types::BackfillEvent::JobCompleted { job_id, .. } => job_id,
+                        | super::types::BackfillEvent::JobCompleted { job_id, .. }
+                        | super::types::BackfillEvent::JobSnapshot { job_id, .. } => job_id,
                     };
                     if *event_job_id != job_id {
                         continue;
@@ -1900,7 +2711,15 @@ pub(super) async fn backfill_events(
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(job_id, skipped = n, "SSE client lagged behind");
+                    tracing::warn!(job_id, skipped = n, "SSE client lagged behind, resyncing");
+                    // Dropped deltas are unrecoverable; a snapshot is the only way back to
+                    // a correct view.
+                    #[allow(clippy::collapsible_if)]
+                    if let Some(snapshot) = build_job_snapshot(&state, &job_id).await {
+                        if let Ok(json) = serde_json::to_string(&snapshot) {
+                            yield Ok(axum::response::sse::Event::default().event("event").data(json));
+                        }
+                    }
                     continue;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -2014,6 +2833,333 @@ pub(super) async fn backfill_pds_summary(
         .collect();
 
     Ok(Json(super::types::PdsSummaryResponse { pds_endpoints }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct BackfillErrorsQuery {
+    kind: Option<String>,
+    cursor: Option<String>,
+    limit: Option<i32>,
+}
+
+/// GET /admin/backfill/{id}/errors — paginated failure detail plus exact
+/// per-kind totals.
+///
+/// Named `..._list` rather than `backfill_errors`, which is already the SSE
+/// stream handler's name.
+pub(super) async fn backfill_errors_list(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    auth: UserAuth,
+    axum::extract::Query(query): axum::extract::Query<BackfillErrorsQuery>,
+) -> Result<Json<BackfillErrorsResponse>, AppError> {
+    auth.require(Permission::BackfillRead).await?;
+
+    // Clamped on both ends: SQLite reads a negative LIMIT as "no limit", which
+    // would return the whole job's error set (up to ERROR_DETAIL_CAP rows) in
+    // one response.
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let kind_filter = if query.kind.is_some() {
+        " AND kind = ?"
+    } else {
+        ""
+    };
+    // Keyset pagination on `did` alone assumes at most one row per
+    // (job_id, did) — the primary key is actually (job_id, did, phase), so a
+    // DID with rows in two phases would let `did > ?` skip one at a page
+    // boundary. That can't happen today: a DID that fails at `resolve` never
+    // reaches `fetch`, and repeat `fetch` failures upsert into the same row.
+    // That's a property of the current failure state machine, not of the
+    // schema — a future change there could silently start skipping rows.
+    let cursor_filter = if query.cursor.is_some() {
+        " AND did > ?"
+    } else {
+        ""
+    };
+
+    let sql_str = format!(
+        "SELECT did, collection, phase, kind, message, attempts, last_at \
+         FROM happyview_backfill_errors WHERE job_id = ?{kind_filter}{cursor_filter} \
+         ORDER BY did ASC LIMIT ?",
+    );
+    let sql = adapt_sql(&sql_str, state.db_backend);
+
+    #[allow(clippy::type_complexity)]
+    let mut q =
+        crate::db::query_as::<(String, Option<String>, String, String, String, i32, String)>(&sql)
+            .bind(&job_id);
+    if let Some(ref kind) = query.kind {
+        q = q.bind(kind);
+    }
+    if let Some(ref cursor) = query.cursor {
+        q = q.bind(cursor);
+    }
+    q = q.bind(limit + 1);
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(String, Option<String>, String, String, String, i32, String)> = q
+        .fetch_all(&state.backfill_db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to query backfill errors: {e}")))?;
+
+    let has_more = rows.len() > limit as usize;
+    let errors: Vec<BackfillErrorEntry> = rows
+        .into_iter()
+        .take(limit as usize)
+        .map(
+            |(did, collection, phase, kind, message, attempts, last_at)| BackfillErrorEntry {
+                did,
+                collection,
+                phase,
+                kind,
+                message,
+                attempts,
+                last_at,
+            },
+        )
+        .collect();
+
+    let cursor = if has_more {
+        errors.last().map(|e| e.did.clone())
+    } else {
+        None
+    };
+
+    let error_counts = load_live_error_counts(&state, &job_id).await;
+    let counts: Vec<BackfillErrorCount> = BackfillErrorKind::all()
+        .into_iter()
+        .filter_map(|kind| {
+            let count = error_counts.get(kind);
+            if count == 0 {
+                return None;
+            }
+            Some(BackfillErrorCount {
+                kind: kind.as_str().to_string(),
+                count,
+                retryable: kind.is_retryable(),
+            })
+        })
+        .collect();
+    let capped = error_counts.total() >= ERROR_DETAIL_CAP;
+
+    Ok(Json(BackfillErrorsResponse {
+        errors,
+        cursor,
+        counts,
+        capped,
+        cap: ERROR_DETAIL_CAP,
+    }))
+}
+
+/// Per-kind counts for a job, reconciling the two partial views of them.
+///
+/// `error_counts` on the job row is only written by `ErrorRecorder::flush`, and
+/// every flush site is terminal — so for the whole of a multi-hour backfill it
+/// reads as empty and the dashboard shows no Errors row at all, and a crash
+/// loses everything accumulated since the last flush while the detail rows it
+/// summarises survive. Counting the detail table fixes both, and is exact below
+/// `ERROR_DETAIL_CAP`. Above the cap rows stop being written and the JSON is the
+/// only source left, so take whichever is larger per kind rather than either
+/// one alone.
+async fn load_live_error_counts(state: &AppState, job_id: &str) -> ErrorCounts {
+    let mut counts = load_error_counts(state, job_id).await;
+
+    let sql = adapt_sql(
+        "SELECT kind, COUNT(*) FROM happyview_backfill_errors WHERE job_id = ? GROUP BY kind",
+        state.db_backend,
+    );
+    let rows: Vec<(String, i64)> = crate::db::query_as(&sql)
+        .bind(job_id)
+        .fetch_all(&state.backfill_db)
+        .await
+        .unwrap_or_default();
+
+    for (kind, count) in rows {
+        // An unrecognised kind is skipped, not fatal — same rule as
+        // `ErrorCounts::from_json`.
+        if let Some(kind) = BackfillErrorKind::parse(&kind) {
+            counts.raise_to(kind, count);
+        }
+    }
+
+    counts
+}
+
+async fn load_error_counts(state: &AppState, job_id: &str) -> ErrorCounts {
+    let sql = adapt_sql(
+        "SELECT error_counts FROM happyview_backfill_jobs WHERE id = ?",
+        state.db_backend,
+    );
+    crate::db::query_as::<(Option<String>,)>(&sql)
+        .bind(job_id)
+        .fetch_optional(&state.backfill_db)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|(json,)| json)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .map(|v| ErrorCounts::from_json(&v))
+        .unwrap_or_default()
+}
+
+#[derive(Deserialize)]
+pub(super) struct RetryFailedBody {
+    kinds: Option<Vec<String>>,
+}
+
+/// POST /admin/backfill/{id}/retry-failed — spawn a new job scoped to just
+/// the failed DIDs from `job_id`.
+///
+/// A new job rather than mutating the finished one, seeded with
+/// `stage = 'resolving_pds'` so `run_backfill_job` skips discovery (its DIDs
+/// are already known) and enters the resolve/fetch pipeline directly.
+pub(super) async fn retry_failed_backfill(
+    State(state): State<AppState>,
+    admin: UserAuth,
+    Path(job_id): Path<String>,
+    Json(body): Json<RetryFailedBody>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    admin.require(Permission::BackfillCreate).await?;
+    let backend = state.db_backend;
+
+    let sql = adapt_sql(
+        "SELECT collection, did FROM happyview_backfill_jobs WHERE id = ?",
+        backend,
+    );
+    let row: Option<(Option<String>, Option<String>)> = crate::db::query_as(&sql)
+        .bind(&job_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to query backfill job: {e}")))?;
+
+    let Some((collection, did)) = row else {
+        return Err(AppError::NotFound("backfill job not found".into()));
+    };
+
+    let kinds: Vec<&'static str> = match &body.kinds {
+        Some(requested) if !requested.is_empty() => requested
+            .iter()
+            .filter_map(|s| BackfillErrorKind::parse(s))
+            .map(BackfillErrorKind::as_str)
+            .collect(),
+        _ => BackfillErrorKind::all()
+            .into_iter()
+            .filter(|k| k.is_retryable())
+            .map(BackfillErrorKind::as_str)
+            .collect(),
+    };
+
+    if kinds.is_empty() {
+        return Err(AppError::BadRequest(
+            "no retryable failures for this job".into(),
+        ));
+    }
+
+    let placeholders = vec!["?"; kinds.len()].join(", ");
+    let sql_str = format!(
+        "SELECT DISTINCT did FROM happyview_backfill_errors WHERE job_id = ? AND kind IN ({placeholders})",
+    );
+    let sql = adapt_sql(&sql_str, backend);
+    let mut q = crate::db::query_as::<(String,)>(&sql).bind(&job_id);
+    for kind in &kinds {
+        q = q.bind(*kind);
+    }
+    let dids: Vec<(String,)> = q
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to query failed DIDs: {e}")))?;
+
+    if dids.is_empty() {
+        return Err(AppError::BadRequest(
+            "no retryable failures for this job".into(),
+        ));
+    }
+
+    let now = now_rfc3339();
+    let new_job_id = Uuid::new_v4().to_string();
+
+    // The job row and its seeded repos must appear together or not at all: a
+    // failure partway through the chunked insert must not leave behind a job
+    // marked `running` with no worker and no (or partial) repos to work on,
+    // indistinguishable from a live job until the next restart's
+    // `resume_backfill_jobs` sweep notices it. Committing before spawning the
+    // worker also matters — spawning inside the transaction would let the
+    // worker observe rows that could still roll back.
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
+    let sql = adapt_sql(
+        "INSERT INTO happyview_backfill_jobs \
+         (id, collection, did, status, stage, started_at, created_at) \
+         VALUES (?, ?, ?, 'running', 'resolving_pds', ?, ?)",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(&new_job_id)
+        .bind(&collection)
+        .bind(&did)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to create retry job: {e}")))?;
+
+    // SQLite has a 999 bound-parameter limit; each row uses 2 params.
+    let chunk_size = if backend == crate::db::DatabaseBackend::Sqlite {
+        499
+    } else {
+        1000
+    };
+    for chunk in dids.chunks(chunk_size) {
+        let placeholders = vec!["(?, ?)"; chunk.len()].join(", ");
+        let sql_str = format!(
+            "INSERT INTO happyview_backfill_repos (job_id, did) VALUES {placeholders} ON CONFLICT DO NOTHING",
+        );
+        let sql = adapt_sql(&sql_str, backend);
+        let mut insert = crate::db::query(&sql);
+        for (did,) in chunk {
+            insert = insert.bind(&new_job_id).bind(did);
+        }
+        insert
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to seed retry repos: {e}")))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit retry job: {e}")))?;
+
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "backfill.retry_started".to_string(),
+            severity: Severity::Info,
+            actor_did: Some(admin.did.clone()),
+            subject: collection.clone(),
+            detail: serde_json::json!({
+                "job_id": new_job_id,
+                "source_job_id": job_id,
+                "retried_repos": dids.len(),
+            }),
+        },
+        backend,
+    )
+    .await;
+
+    let spawn_state = state.clone();
+    let spawn_job_id = new_job_id.clone();
+    tokio::spawn(async move {
+        run_backfill_job(spawn_state, spawn_job_id).await;
+    });
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "id": new_job_id })),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2145,5 +3291,670 @@ pub async fn resume_backfill_jobs(state: &AppState) {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::test_support::{memory_pool, test_state_with_pool};
+
+    async fn state_with_job(
+        job_id: &str,
+        status: &str,
+        stage: &str,
+        error_counts: Option<&str>,
+    ) -> AppState {
+        let pool = memory_pool().await;
+        crate::db::query(
+            "CREATE TABLE happyview_backfill_jobs (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                total_repos INTEGER,
+                resolved_repos INTEGER,
+                processed_repos INTEGER,
+                total_records INTEGER,
+                error_counts TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("create happyview_backfill_jobs table: {e}"));
+
+        crate::db::query(
+            "INSERT INTO happyview_backfill_jobs \
+             (id, status, stage, total_repos, resolved_repos, processed_repos, total_records, error_counts) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(job_id)
+        .bind(status)
+        .bind(stage)
+        .bind(10i32)
+        .bind(4i32)
+        .bind(2i32)
+        .bind(50i32)
+        .bind(error_counts)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("insert backfill job: {e}"));
+
+        test_state_with_pool(pool)
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_current_row() {
+        let state = state_with_job(
+            "job-1",
+            "running",
+            "resolving_and_fetching",
+            Some(r#"{"dns_failure":2}"#),
+        )
+        .await;
+
+        let event = build_job_snapshot(&state, "job-1")
+            .await
+            .expect("snapshot for existing job");
+
+        match event {
+            super::super::types::BackfillEvent::JobSnapshot {
+                job_id,
+                status,
+                stage,
+                total_repos,
+                resolved_repos,
+                processed_repos,
+                total_records,
+                error_counts,
+            } => {
+                assert_eq!(job_id, "job-1");
+                assert_eq!(status, "running");
+                assert_eq!(stage, "resolving_and_fetching");
+                assert_eq!(total_repos, Some(10));
+                assert_eq!(resolved_repos, Some(4));
+                assert_eq!(processed_repos, Some(2));
+                assert_eq!(total_records, Some(50));
+                assert_eq!(error_counts, serde_json::json!({"dns_failure": 2}));
+            }
+            other => panic!("expected JobSnapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_defaults_error_counts_when_null() {
+        let state = state_with_job("job-2", "completed", "completed", None).await;
+
+        let event = build_job_snapshot(&state, "job-2")
+            .await
+            .expect("snapshot for existing job");
+
+        match event {
+            super::super::types::BackfillEvent::JobSnapshot { error_counts, .. } => {
+                assert_eq!(error_counts, serde_json::json!({}));
+            }
+            other => panic!("expected JobSnapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_none_for_unknown_job() {
+        let state = state_with_job("job-3", "running", "discovering_repos", None).await;
+
+        assert!(build_job_snapshot(&state, "does-not-exist").await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Errors API
+    // -----------------------------------------------------------------------
+
+    async fn state_with_errors_job(
+        job_id: &str,
+        collection: Option<&str>,
+        error_counts_json: &str,
+    ) -> AppState {
+        let pool = memory_pool().await;
+        crate::db::query(
+            "CREATE TABLE happyview_backfill_jobs (
+                id TEXT PRIMARY KEY,
+                collection TEXT,
+                did TEXT,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                total_repos INTEGER,
+                resolved_repos INTEGER,
+                processed_repos INTEGER,
+                total_records INTEGER,
+                error TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL,
+                error_counts TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("create happyview_backfill_jobs table: {e}"));
+
+        crate::db::query(
+            "CREATE TABLE happyview_backfill_errors (
+                job_id TEXT NOT NULL,
+                did TEXT NOT NULL,
+                collection TEXT,
+                phase TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                message TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                last_at TEXT NOT NULL,
+                PRIMARY KEY (job_id, did, phase)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("create happyview_backfill_errors table: {e}"));
+
+        crate::db::query(
+            "CREATE TABLE happyview_backfill_repos (
+                job_id TEXT NOT NULL,
+                did TEXT NOT NULL,
+                pds_endpoint TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                records_fetched INTEGER DEFAULT 0,
+                PRIMARY KEY (job_id, did)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("create happyview_backfill_repos table: {e}"));
+
+        crate::db::query(
+            "INSERT INTO happyview_backfill_jobs \
+             (id, collection, did, status, stage, created_at, error_counts) \
+             VALUES (?, ?, NULL, 'completed', 'completed', '2026-01-01T00:00:00+00:00', ?)",
+        )
+        .bind(job_id)
+        .bind(collection)
+        .bind(error_counts_json)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("insert backfill job: {e}"));
+
+        test_state_with_pool(pool)
+    }
+
+    fn super_auth(state: &AppState) -> UserAuth {
+        UserAuth {
+            did: "did:plc:admin".to_string(),
+            user_id: "admin".to_string(),
+            is_super: true,
+            permissions: std::collections::HashSet::new(),
+            db: state.db.clone(),
+            db_backend: state.db_backend,
+        }
+    }
+
+    async fn insert_error(
+        state: &AppState,
+        job_id: &str,
+        did: &str,
+        phase: &str,
+        kind: BackfillErrorKind,
+    ) {
+        crate::db::query(
+            "INSERT INTO happyview_backfill_errors \
+             (job_id, did, collection, phase, kind, message, attempts, last_at) \
+             VALUES (?, ?, NULL, ?, ?, 'boom', 1, '2026-01-01T00:00:00+00:00')",
+        )
+        .bind(job_id)
+        .bind(did)
+        .bind(phase)
+        .bind(kind.as_str())
+        .execute(&state.backfill_db)
+        .await
+        .unwrap_or_else(|e| panic!("insert backfill error: {e}"));
+    }
+
+    #[tokio::test]
+    async fn errors_list_reports_exact_counts_and_capped_flag() {
+        let state = state_with_errors_job(
+            "job-err-1",
+            Some("dummy.collection"),
+            r#"{"dns_failure":2,"repo_not_found":1}"#,
+        )
+        .await;
+        insert_error(
+            &state,
+            "job-err-1",
+            "did:plc:a",
+            "resolve",
+            BackfillErrorKind::DnsFailure,
+        )
+        .await;
+        insert_error(
+            &state,
+            "job-err-1",
+            "did:plc:b",
+            "resolve",
+            BackfillErrorKind::DnsFailure,
+        )
+        .await;
+        insert_error(
+            &state,
+            "job-err-1",
+            "did:plc:c",
+            "fetch",
+            BackfillErrorKind::RepoNotFound,
+        )
+        .await;
+
+        let response = backfill_errors_list(
+            State(state.clone()),
+            Path("job-err-1".to_string()),
+            super_auth(&state),
+            axum::extract::Query(BackfillErrorsQuery {
+                kind: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("list errors")
+        .0;
+
+        assert_eq!(response.errors.len(), 3);
+        assert!(!response.capped);
+
+        let dns = response
+            .counts
+            .iter()
+            .find(|c| c.kind == "dns_failure")
+            .expect("dns_failure present");
+        assert_eq!(dns.count, 2);
+        assert!(dns.retryable);
+
+        let repo = response
+            .counts
+            .iter()
+            .find(|c| c.kind == "repo_not_found")
+            .expect("repo_not_found present");
+        assert_eq!(repo.count, 1);
+        assert!(!repo.retryable);
+
+        // Zero-count kinds are skipped rather than zero-filled.
+        assert!(!response.counts.iter().any(|c| c.kind == "timeout"));
+    }
+
+    #[tokio::test]
+    async fn errors_list_counts_are_live_before_the_first_flush() {
+        // `error_counts` is only written by a terminal `ErrorRecorder::flush`,
+        // so mid-run it is empty (or, after a crash, stale) while detail rows
+        // pile up underneath. Counting the table is what puts an Errors row on
+        // the dashboard during the hours a backfill actually takes.
+        let state = state_with_errors_job("job-err-live", None, "{}").await;
+        for (did, kind) in [
+            ("did:plc:a", BackfillErrorKind::DnsFailure),
+            ("did:plc:b", BackfillErrorKind::DnsFailure),
+            ("did:plc:c", BackfillErrorKind::RepoNotFound),
+        ] {
+            insert_error(&state, "job-err-live", did, "resolve", kind).await;
+        }
+
+        let response = backfill_errors_list(
+            State(state.clone()),
+            Path("job-err-live".to_string()),
+            super_auth(&state),
+            axum::extract::Query(BackfillErrorsQuery {
+                kind: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("list errors")
+        .0;
+
+        let dns = response
+            .counts
+            .iter()
+            .find(|c| c.kind == "dns_failure")
+            .expect("dns_failure present despite an empty error_counts");
+        assert_eq!(dns.count, 2);
+        assert_eq!(
+            response
+                .counts
+                .iter()
+                .find(|c| c.kind == "repo_not_found")
+                .map(|c| c.count),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn errors_list_counts_keep_the_json_where_it_exceeds_the_table() {
+        // Above `ERROR_DETAIL_CAP` rows stop being written, so the flushed JSON
+        // is the only remaining record of how many failures there were. The
+        // table must raise a count, never lower one.
+        let state =
+            state_with_errors_job("job-err-max", None, r#"{"dns_failure":9000,"timeout":1}"#).await;
+        insert_error(
+            &state,
+            "job-err-max",
+            "did:plc:a",
+            "resolve",
+            BackfillErrorKind::DnsFailure,
+        )
+        .await;
+        for did in ["did:plc:b", "did:plc:c"] {
+            insert_error(
+                &state,
+                "job-err-max",
+                did,
+                "resolve",
+                BackfillErrorKind::Timeout,
+            )
+            .await;
+        }
+
+        let response = backfill_errors_list(
+            State(state.clone()),
+            Path("job-err-max".to_string()),
+            super_auth(&state),
+            axum::extract::Query(BackfillErrorsQuery {
+                kind: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("list errors")
+        .0;
+
+        let count = |kind: &str| {
+            response
+                .counts
+                .iter()
+                .find(|c| c.kind == kind)
+                .map(|c| c.count)
+        };
+        // JSON wins where it is higher...
+        assert_eq!(count("dns_failure"), Some(9000));
+        // ...and the table wins where it is.
+        assert_eq!(count("timeout"), Some(2));
+    }
+
+    #[test]
+    fn a_retryable_give_up_is_recorded_in_preference_to_a_permanent_one() {
+        // Only one give-up per DID reaches the recorder; `retry-failed`
+        // selects on retryability, so the retryable one is what keeps the DID
+        // reachable by a retry job.
+        use crate::admin::backfill_errors::BackfillFailure;
+
+        let failed = |kind: BackfillErrorKind| FetchOutcome::Failed {
+            count: 0,
+            cursor: None,
+            failure: BackfillFailure {
+                kind,
+                message: String::new(),
+                retry_after: None,
+            },
+        };
+
+        let mut failures = vec![
+            (
+                "app.bsky.feed.post".to_string(),
+                failed(BackfillErrorKind::RepoNotFound),
+            ),
+            (
+                "app.bsky.feed.like".to_string(),
+                failed(BackfillErrorKind::Other),
+            ),
+            (
+                "app.bsky.graph.follow".to_string(),
+                failed(BackfillErrorKind::Timeout),
+            ),
+        ];
+        retryable_give_ups_first(&mut failures);
+
+        assert_eq!(failures[0].0, "app.bsky.graph.follow");
+        // The rest keep their original relative order, so the log stays
+        // predictable.
+        assert_eq!(failures[1].0, "app.bsky.feed.post");
+        assert_eq!(failures[2].0, "app.bsky.feed.like");
+    }
+
+    #[tokio::test]
+    async fn errors_list_reports_capped_once_the_total_reaches_the_cap() {
+        let state = state_with_errors_job(
+            "job-err-cap",
+            None,
+            &format!(r#"{{"dns_failure":{ERROR_DETAIL_CAP}}}"#),
+        )
+        .await;
+
+        let response = backfill_errors_list(
+            State(state.clone()),
+            Path("job-err-cap".to_string()),
+            super_auth(&state),
+            axum::extract::Query(BackfillErrorsQuery {
+                kind: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("list errors")
+        .0;
+
+        assert!(response.capped);
+        assert_eq!(response.cap, ERROR_DETAIL_CAP);
+    }
+
+    #[tokio::test]
+    async fn errors_list_filters_by_kind_and_paginates_by_cursor() {
+        let state = state_with_errors_job("job-err-2", None, "{}").await;
+        for (did, kind) in [
+            ("did:plc:a", BackfillErrorKind::DnsFailure),
+            ("did:plc:b", BackfillErrorKind::DnsFailure),
+            ("did:plc:c", BackfillErrorKind::RepoNotFound),
+        ] {
+            insert_error(&state, "job-err-2", did, "resolve", kind).await;
+        }
+
+        let response = backfill_errors_list(
+            State(state.clone()),
+            Path("job-err-2".to_string()),
+            super_auth(&state),
+            axum::extract::Query(BackfillErrorsQuery {
+                kind: Some("dns_failure".to_string()),
+                cursor: None,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("list errors")
+        .0;
+
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(response.errors[0].did, "did:plc:a");
+        assert_eq!(response.errors[0].kind, "dns_failure");
+        assert_eq!(response.cursor.as_deref(), Some("did:plc:a"));
+
+        // Turn the page: the cursor from page 1 must reach the remaining
+        // dns_failure row (did:plc:b) and not did:plc:c, which is filtered
+        // out by kind, and the second page must terminate the pagination.
+        let page2 = backfill_errors_list(
+            State(state.clone()),
+            Path("job-err-2".to_string()),
+            super_auth(&state),
+            axum::extract::Query(BackfillErrorsQuery {
+                kind: Some("dns_failure".to_string()),
+                cursor: response.cursor.clone(),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .expect("list errors page 2")
+        .0;
+
+        assert_eq!(page2.errors.len(), 1);
+        assert_eq!(page2.errors[0].did, "did:plc:b");
+        assert_eq!(page2.errors[0].kind, "dns_failure");
+        assert_eq!(page2.cursor, None, "second page should end the pagination");
+    }
+
+    #[tokio::test]
+    async fn retry_failed_seeds_new_job_from_retryable_kinds_only() {
+        let state = state_with_errors_job(
+            "job-retry-1",
+            Some("dummy.collection"),
+            r#"{"dns_failure":2,"repo_not_found":1}"#,
+        )
+        .await;
+        insert_error(
+            &state,
+            "job-retry-1",
+            "did:plc:a",
+            "resolve",
+            BackfillErrorKind::DnsFailure,
+        )
+        .await;
+        insert_error(
+            &state,
+            "job-retry-1",
+            "did:plc:b",
+            "resolve",
+            BackfillErrorKind::DnsFailure,
+        )
+        .await;
+        insert_error(
+            &state,
+            "job-retry-1",
+            "did:plc:c",
+            "fetch",
+            BackfillErrorKind::RepoNotFound,
+        )
+        .await;
+
+        let (status, Json(body)) = retry_failed_backfill(
+            State(state.clone()),
+            super_auth(&state),
+            Path("job-retry-1".to_string()),
+            Json(RetryFailedBody { kinds: None }),
+        )
+        .await
+        .expect("retry-failed");
+
+        assert_eq!(status, StatusCode::CREATED);
+        let new_job_id = body["id"].as_str().expect("id field").to_string();
+        assert_ne!(new_job_id, "job-retry-1");
+
+        let (stage,): (String,) =
+            crate::db::query_as("SELECT stage FROM happyview_backfill_jobs WHERE id = ?")
+                .bind(&new_job_id)
+                .fetch_one(&state.backfill_db)
+                .await
+                .expect("new job row");
+        assert_eq!(stage, "resolving_pds");
+
+        let mut repo_dids: Vec<String> = crate::db::query_as::<(String,)>(
+            "SELECT did FROM happyview_backfill_repos WHERE job_id = ? ORDER BY did",
+        )
+        .bind(&new_job_id)
+        .fetch_all(&state.backfill_db)
+        .await
+        .expect("repo rows")
+        .into_iter()
+        .map(|(did,)| did)
+        .collect();
+        repo_dids.sort();
+        assert_eq!(
+            repo_dids,
+            vec!["did:plc:a".to_string(), "did:plc:b".to_string()],
+            "only the retryable dns_failure DIDs should be re-seeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_failed_honors_explicit_kinds_beyond_the_default_retryable_set() {
+        let state = state_with_errors_job(
+            "job-retry-2",
+            Some("dummy.collection"),
+            r#"{"repo_not_found":1}"#,
+        )
+        .await;
+        insert_error(
+            &state,
+            "job-retry-2",
+            "did:plc:a",
+            "fetch",
+            BackfillErrorKind::RepoNotFound,
+        )
+        .await;
+
+        let (status, Json(body)) = retry_failed_backfill(
+            State(state.clone()),
+            super_auth(&state),
+            Path("job-retry-2".to_string()),
+            Json(RetryFailedBody {
+                kinds: Some(vec!["repo_not_found".to_string()]),
+            }),
+        )
+        .await
+        .expect("retry-failed with an explicit non-retryable kind");
+
+        assert_eq!(status, StatusCode::CREATED);
+        let new_job_id = body["id"].as_str().expect("id field").to_string();
+        let (did,): (String,) =
+            crate::db::query_as("SELECT did FROM happyview_backfill_repos WHERE job_id = ?")
+                .bind(&new_job_id)
+                .fetch_one(&state.backfill_db)
+                .await
+                .expect("repo row");
+        assert_eq!(did, "did:plc:a");
+    }
+
+    #[tokio::test]
+    async fn retry_failed_rejects_when_nothing_retryable() {
+        let state = state_with_errors_job(
+            "job-retry-3",
+            Some("dummy.collection"),
+            r#"{"repo_not_found":1}"#,
+        )
+        .await;
+        insert_error(
+            &state,
+            "job-retry-3",
+            "did:plc:a",
+            "fetch",
+            BackfillErrorKind::RepoNotFound,
+        )
+        .await;
+
+        let err = retry_failed_backfill(
+            State(state.clone()),
+            super_auth(&state),
+            Path("job-retry-3".to_string()),
+            Json(RetryFailedBody { kinds: None }),
+        )
+        .await
+        .expect_err("should reject a job with no retryable failures");
+
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn retry_failed_returns_not_found_for_unknown_job() {
+        let state = state_with_errors_job("job-retry-4", None, "{}").await;
+
+        let err = retry_failed_backfill(
+            State(state.clone()),
+            super_auth(&state),
+            Path("does-not-exist".to_string()),
+            Json(RetryFailedBody { kinds: None }),
+        )
+        .await
+        .expect_err("should 404 for an unknown job");
+
+        assert!(matches!(err, AppError::NotFound(_)));
     }
 }

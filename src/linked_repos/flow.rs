@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
-use atrium_oauth::{AuthorizeOptions, DefaultHttpClient, Scope};
+use atrium_oauth::{AuthorizeOptions, Scope};
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use base64::Engine;
@@ -64,7 +64,9 @@ pub async fn resolve_identifier(
 
     let resolver = AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
         dns_txt_resolver: NativeDnsResolver::new(),
-        http_client: Arc::new(DefaultHttpClient::default()),
+        http_client: Arc::new(crate::http_retry::HappyViewHttpClient::new(
+            crate::http_retry::shared_client().clone(),
+        )),
     });
 
     use atrium_common::resolver::Resolver;

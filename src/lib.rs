@@ -53,21 +53,22 @@ use rate_limit::RateLimiter;
 use std::sync::Arc;
 use tokio::sync::watch;
 
+use crate::http_retry::HappyViewHttpClient;
 use atrium_identity::did::CommonDidResolver;
 use atrium_identity::handle::AtprotoHandleResolver;
-use atrium_oauth::DefaultHttpClient;
 
 pub type HappyViewOAuthClient = atrium_oauth::OAuthClient<
     DbStateStore,
     DbSessionStore,
-    CommonDidResolver<DefaultHttpClient>,
-    AtprotoHandleResolver<NativeDnsResolver, DefaultHttpClient>,
+    CommonDidResolver<HappyViewHttpClient>,
+    AtprotoHandleResolver<NativeDnsResolver, HappyViewHttpClient>,
+    HappyViewHttpClient,
 >;
 
 pub type HappyViewOAuthSession = atrium_oauth::OAuthSession<
-    DefaultHttpClient,
-    CommonDidResolver<DefaultHttpClient>,
-    AtprotoHandleResolver<NativeDnsResolver, DefaultHttpClient>,
+    HappyViewHttpClient,
+    CommonDidResolver<HappyViewHttpClient>,
+    AtprotoHandleResolver<NativeDnsResolver, HappyViewHttpClient>,
     DbSessionStore,
 >;
 

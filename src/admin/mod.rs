@@ -2,6 +2,8 @@ mod api_clients;
 mod api_keys;
 pub(crate) mod auth;
 pub mod backfill;
+pub mod backfill_errors;
+pub mod backfill_retry;
 mod database;
 mod dead_letters;
 mod domains;
@@ -60,6 +62,11 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route(
             "/backfill/{id}/pds-summary",
             get(backfill::backfill_pds_summary),
+        )
+        .route("/backfill/{id}/errors", get(backfill::backfill_errors_list))
+        .route(
+            "/backfill/{id}/retry-failed",
+            post(backfill::retry_failed_backfill),
         )
         .route(
             "/backfill/{id}/details",

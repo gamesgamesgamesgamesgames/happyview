@@ -119,6 +119,21 @@ pub enum BackfillEvent {
         status: String,
         error: Option<String>,
     },
+    /// Current job state, straight from the database.
+    ///
+    /// The SSE stream is otherwise delta-only over a lossy broadcast channel,
+    /// so a client that connects mid-phase or misses an event has no way to
+    /// recover. A snapshot is how it resyncs.
+    JobSnapshot {
+        job_id: String,
+        status: String,
+        stage: String,
+        total_repos: Option<i32>,
+        resolved_repos: Option<i32>,
+        processed_repos: Option<i32>,
+        total_records: Option<i32>,
+        error_counts: serde_json::Value,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +165,42 @@ pub(crate) struct PdsSummaryEntry {
 #[derive(Serialize)]
 pub(crate) struct PdsSummaryResponse {
     pub(crate) pds_endpoints: Vec<PdsSummaryEntry>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct BackfillErrorEntry {
+    pub(crate) did: String,
+    pub(crate) collection: Option<String>,
+    pub(crate) phase: String,
+    pub(crate) kind: String,
+    pub(crate) message: String,
+    pub(crate) attempts: i32,
+    pub(crate) last_at: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct BackfillErrorsResponse {
+    pub(crate) errors: Vec<BackfillErrorEntry>,
+    pub(crate) cursor: Option<String>,
+    /// Exact per-kind totals, which stay correct past the detail cap.
+    pub(crate) counts: Vec<BackfillErrorCount>,
+    /// True when detail rows stopped being written.
+    pub(crate) capped: bool,
+    /// `ERROR_DETAIL_CAP`, served so the dashboard's truncation notice never
+    /// hardcodes the number and goes stale if the constant is retuned.
+    pub(crate) cap: i64,
+}
+
+/// One kind's total, carrying its own retryability.
+///
+/// `retryable` is served rather than duplicated in the dashboard: it is policy,
+/// and `BackfillErrorKind::is_retryable` is its only definition. A TypeScript
+/// copy would drift the first time a kind is added.
+#[derive(Serialize)]
+pub(crate) struct BackfillErrorCount {
+    pub(crate) kind: String,
+    pub(crate) count: i64,
+    pub(crate) retryable: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig};
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{
-    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, DefaultHttpClient,
-    GrantType, OAuthClientConfig, OAuthResolverConfig, Scope,
+    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, GrantType,
+    OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 
 use crate::HappyViewOAuthClient;
@@ -26,7 +26,9 @@ pub fn build(
     pool: sqlx::AnyPool,
     backend: DatabaseBackend,
 ) -> Result<HappyViewOAuthClient, String> {
-    let http = Arc::new(DefaultHttpClient::default());
+    let http = Arc::new(crate::http_retry::HappyViewHttpClient::new(
+        crate::http_retry::shared_client().clone(),
+    ));
     let resolver = OAuthResolverConfig {
         did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
             plc_directory_url: plc_url.to_string(),
@@ -52,6 +54,9 @@ pub fn build(
             state_store,
             session_store,
             resolver,
+            http_client: crate::http_retry::HappyViewHttpClient::new(
+                crate::http_retry::shared_client().clone(),
+            ),
         })
     } else {
         atrium_oauth::OAuthClient::new(OAuthClientConfig {
@@ -69,6 +74,9 @@ pub fn build(
             state_store,
             session_store,
             resolver,
+            http_client: crate::http_retry::HappyViewHttpClient::new(
+                crate::http_retry::shared_client().clone(),
+            ),
         })
     };
 

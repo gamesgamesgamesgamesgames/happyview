@@ -44,6 +44,27 @@ fn validate_session_secret(secret: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Build the outbound `User-Agent`.
+///
+/// Something issuing requests to hundreds of strangers' servers should say who
+/// it is. `HAPPYVIEW_USER_AGENT` overrides entirely, so an operator can add a
+/// contact address or suppress the instance URL.
+pub fn build_user_agent(override_value: Option<String>, public_url: &str) -> String {
+    if let Some(ua) = override_value {
+        let trimmed = ua.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    let public_url = public_url.trim().trim_end_matches('/');
+    if public_url.is_empty() {
+        format!("HappyView/{version}")
+    } else {
+        format!("HappyView/{version} (+{public_url})")
+    }
+}
+
 /// Parse the optional `TOKEN_ENCRYPTION_KEY`, distinguishing "unset"
 /// (`Ok(None)` — encryption-dependent features are simply off) from "set but
 /// invalid" (`Err`), so a botched key is reported loudly at startup instead of
@@ -71,6 +92,7 @@ pub struct Config {
     pub database_backend: DatabaseBackend,
     pub sqlite_journal_size_limit: u64,
     pub public_url: String,
+    pub user_agent: String,
     pub session_secret: String,
     pub jetstream_url: String,
     pub relay_url: String,
@@ -95,6 +117,8 @@ impl Config {
             .and_then(|s| DatabaseBackend::from_str(&s))
             .unwrap_or_else(|| DatabaseBackend::from_url(&database_url));
 
+        let public_url = env::var("PUBLIC_URL").expect("PUBLIC_URL must be set");
+
         Self {
             host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into()),
             port: env::var("PORT")
@@ -104,7 +128,8 @@ impl Config {
             database_url,
             database_backend,
             sqlite_journal_size_limit: crate::db::journal_size_limit_bytes(),
-            public_url: env::var("PUBLIC_URL").expect("PUBLIC_URL must be set"),
+            user_agent: build_user_agent(env::var("HAPPYVIEW_USER_AGENT").ok(), &public_url),
+            public_url,
             // Not required and never defaulted to a placeholder: an unset,
             // insecure, or too-short value is surfaced via `config_errors()` and
             // disables cookie auth rather than aborting boot. See C3.
@@ -242,6 +267,7 @@ mod tests {
             database_backend: DatabaseBackend::Postgres,
             sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: String::new(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -570,6 +596,7 @@ mod tests {
             database_backend: DatabaseBackend::Postgres,
             sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: "https://example.com".into(),
+            user_agent: String::new(),
             session_secret: String::new(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -597,6 +624,7 @@ mod tests {
             database_backend: DatabaseBackend::Postgres,
             sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: "https://example.com".into(),
+            user_agent: String::new(),
             session_secret: String::new(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -624,6 +652,7 @@ mod tests {
             database_backend: DatabaseBackend::Postgres,
             sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: "https://example.com/".into(),
+            user_agent: String::new(),
             session_secret: String::new(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -651,6 +680,7 @@ mod tests {
             database_backend: DatabaseBackend::Postgres,
             sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: String::new(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -673,6 +703,36 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_defaults_to_name_version_and_public_url() {
+        assert_eq!(
+            build_user_agent(None, "https://hv.example.com"),
+            format!(
+                "HappyView/{} (+https://hv.example.com)",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    #[test]
+    fn user_agent_omits_url_when_public_url_is_empty() {
+        assert_eq!(
+            build_user_agent(None, ""),
+            format!("HappyView/{}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn user_agent_env_override_wins() {
+        assert_eq!(
+            build_user_agent(
+                Some("Custom/1.0 (+mailto:a@b.c)".into()),
+                "https://hv.example.com"
+            ),
+            "Custom/1.0 (+mailto:a@b.c)"
+        );
+    }
+
+    #[test]
     fn url_with_base_path_without_base_path() {
         let config = Config {
             host: String::new(),
@@ -681,6 +741,7 @@ mod tests {
             database_backend: DatabaseBackend::Postgres,
             sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: String::new(),
             jetstream_url: String::new(),
             relay_url: String::new(),

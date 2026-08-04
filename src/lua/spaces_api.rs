@@ -556,6 +556,7 @@ mod tests {
             database_backend: crate::db::DatabaseBackend::Sqlite,
             sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -575,7 +576,7 @@ mod tests {
         let (labeler_tx, _) = watch::channel(());
         sqlx::any::install_default_drivers();
         let test_db = sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap();
-        let atrium_http = std::sync::Arc::new(atrium_oauth::DefaultHttpClient::default());
+        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
         let did_resolver = atrium_identity::did::CommonDidResolver::new(
             atrium_identity::did::CommonDidResolverConfig {
                 plc_directory_url: "https://plc.directory".into(),
@@ -610,6 +611,7 @@ mod tests {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
         AppState {
@@ -758,6 +760,7 @@ mod tests {
             database_backend: backend,
             sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -776,7 +779,7 @@ mod tests {
         let (collections_tx, _) = watch::channel(vec![]);
         let (labeler_subscriptions_tx, _) = watch::channel(());
 
-        let atrium_http = std::sync::Arc::new(atrium_oauth::DefaultHttpClient::default());
+        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
         let did_resolver = atrium_identity::did::CommonDidResolver::new(
             atrium_identity::did::CommonDidResolverConfig {
                 plc_directory_url: "https://plc.directory".into(),
@@ -805,6 +808,7 @@ mod tests {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
 

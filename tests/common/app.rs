@@ -1,8 +1,7 @@
 use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig};
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{
-    AtprotoLocalhostClientMetadata, DefaultHttpClient, KnownScope, OAuthClientConfig,
-    OAuthResolverConfig, Scope,
+    AtprotoLocalhostClientMetadata, KnownScope, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 use axum::Router;
 use axum::http::Request;
@@ -61,6 +60,7 @@ impl TestApp {
             database_backend: backend,
             sqlite_journal_size_limit: happyview::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: "http://127.0.0.1:0".into(),
+            user_agent: String::new(),
             session_secret: "test-session-secret-0123456789abcdef".into(),
             jetstream_url: "wss://jetstream1.us-east.bsky.network".into(),
             relay_url: mock_url.clone(),
@@ -100,7 +100,8 @@ impl TestApp {
         let (collections_tx, _collections_rx) = watch::channel(initial_collections);
         let (labeler_subscriptions_tx, _) = watch::channel(());
 
-        let atrium_http = std::sync::Arc::new(DefaultHttpClient::default());
+        let atrium_http =
+            std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
         let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
             plc_directory_url: "https://plc.directory".into(),
             http_client: std::sync::Arc::clone(&atrium_http),
@@ -131,6 +132,7 @@ impl TestApp {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: happyview::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
 

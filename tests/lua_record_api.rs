@@ -8,8 +8,7 @@ mod common;
 use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig};
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{
-    AtprotoLocalhostClientMetadata, DefaultHttpClient, KnownScope, OAuthClientConfig,
-    OAuthResolverConfig, Scope,
+    AtprotoLocalhostClientMetadata, KnownScope, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 use happyview::AppState;
 use happyview::config::Config;
@@ -31,6 +30,7 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
         database_backend: backend,
         sqlite_journal_size_limit: happyview::db::DEFAULT_JOURNAL_SIZE_LIMIT,
         public_url: String::new(),
+        user_agent: String::new(),
         base_path: None,
         session_secret: "test-secret".into(),
         jetstream_url: String::new(),
@@ -48,7 +48,7 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
     };
     let (tx, _) = watch::channel(vec![]);
     let (labeler_tx, _) = watch::channel(());
-    let atrium_http = std::sync::Arc::new(DefaultHttpClient::default());
+    let atrium_http = std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
     let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
         plc_directory_url: "https://plc.directory".into(),
         http_client: std::sync::Arc::clone(&atrium_http),
@@ -72,6 +72,7 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
             authorization_server_metadata: Default::default(),
             protected_resource_metadata: Default::default(),
         },
+        http_client: happyview::http_retry::HappyViewHttpClient::default(),
     })
     .expect("Failed to create test OAuth client");
     AppState {

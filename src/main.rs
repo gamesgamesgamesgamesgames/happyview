@@ -15,8 +15,8 @@ use tracing::{info, warn};
 use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig};
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{
-    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, DefaultHttpClient,
-    GrantType, KnownScope, OAuthClientConfig, OAuthResolverConfig, Scope,
+    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, GrantType, KnownScope,
+    OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 
 #[tokio::main]
@@ -168,7 +168,7 @@ async fn main() {
         .expect("failed to load lexicons");
 
     // Re-fetch all network lexicons from their respective PDSes.
-    let http = reqwest::Client::new();
+    let http = happyview::http_retry::init_shared_client(&config.user_agent);
     let network_rows: Vec<(String, Option<String>, Option<String>)> = crate::db::query_as(
         "SELECT id, authority_did, target_collection FROM happyview_lexicons WHERE source = 'network'",
     )
@@ -467,7 +467,14 @@ async fn main() {
         "{}/auth/callback",
         config.effective_public_url().trim_end_matches('/')
     );
-    let atrium_http = Arc::new(DefaultHttpClient::default());
+    // Use our UA-and-timeout-configured client for OAuth traffic. atrium-oauth's
+    // `default-client` feature (which we no longer enable — see Cargo.toml)
+    // used to build its own unconfigured `reqwest::Client::new()` here, with no
+    // seam for headers or timeouts; this identifies OAuth requests and gives
+    // them the shared connect/read timeouts instead.
+    let atrium_http = Arc::new(happyview::http_retry::HappyViewHttpClient::new(
+        http.clone(),
+    ));
 
     let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
         plc_directory_url: config.plc_url.clone(),
@@ -510,6 +517,7 @@ async fn main() {
             state_store: oauth_state_store.clone(),
             session_store: DbSessionStore::new(db_pool.clone(), db_backend),
             resolver: resolver_config,
+            http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         })
         .expect("Failed to create OAuth client")
     } else {
@@ -531,6 +539,7 @@ async fn main() {
             state_store: oauth_state_store.clone(),
             session_store: DbSessionStore::new(db_pool.clone(), db_backend),
             resolver: resolver_config,
+            http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         })
         .expect("Failed to create OAuth client")
     };
@@ -613,7 +622,10 @@ async fn main() {
             domain_base_url.trim_end_matches('/')
         );
 
-        let domain_http = Arc::new(DefaultHttpClient::default());
+        // Same reasoning as `atrium_http` above.
+        let domain_http = Arc::new(happyview::http_retry::HappyViewHttpClient::new(
+            http.clone(),
+        ));
         let domain_resolver = OAuthResolverConfig {
             did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                 plc_directory_url: config.plc_url.clone(),
@@ -642,6 +654,7 @@ async fn main() {
             state_store: oauth_state_store.clone(),
             session_store: DbSessionStore::new(db_pool.clone(), db_backend),
             resolver: domain_resolver,
+            http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         }) {
             Ok(client) => {
                 info!(domain = %domain.url, "Registered domain OAuth client");

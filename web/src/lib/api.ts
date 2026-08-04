@@ -2,7 +2,12 @@ import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
-import type { BackfillJob, BackfillReposResponse, PdsSummaryResponse } from "@/types/backfill";
+import type {
+  BackfillJob,
+  BackfillReposResponse,
+  PdsSummaryResponse,
+  BackfillErrorsResponse,
+} from "@/types/backfill";
 import type { Job, JobLogsResponse, JobsListResponse } from "@/types/jobs";
 import type {
   CreateLinkedRepoBody,
@@ -263,6 +268,27 @@ export function flushBackfillDetails(jobId: string) {
 
 export function flushAllBackfillDetails() {
   return apiFetch(`/admin/backfill/details`, { method: "DELETE" });
+}
+
+export function getBackfillErrors(
+  jobId: string,
+  params: { kind?: string; cursor?: string; limit?: number } = {},
+) {
+  const search = new URLSearchParams();
+  if (params.kind) search.set("kind", params.kind);
+  if (params.cursor) search.set("cursor", params.cursor);
+  if (params.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return apiFetch<BackfillErrorsResponse>(
+    `/admin/backfill/${jobId}/errors${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export function retryFailedBackfill(jobId: string, kinds?: string[]) {
+  return apiFetch<{ id: string }>(`/admin/backfill/${jobId}/retry-failed`, {
+    method: "POST",
+    body: JSON.stringify(kinds ? { kinds } : {}),
+  });
 }
 
 // Jobs

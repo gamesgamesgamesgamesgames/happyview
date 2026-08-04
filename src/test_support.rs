@@ -34,6 +34,7 @@ pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
         database_backend: crate::db::DatabaseBackend::Sqlite,
         sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
         public_url: String::new(),
+        user_agent: String::new(),
         session_secret: "test-secret".into(),
         jetstream_url: String::new(),
         relay_url: String::new(),
@@ -52,7 +53,7 @@ pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
     let (tx, _) = watch::channel(vec![]);
     let (labeler_tx, _) = watch::channel(());
     let backend = crate::db::DatabaseBackend::Sqlite;
-    let atrium_http = Arc::new(atrium_oauth::DefaultHttpClient::default());
+    let atrium_http = Arc::new(crate::http_retry::HappyViewHttpClient::default());
     let did_resolver = atrium_identity::did::CommonDidResolver::new(
         atrium_identity::did::CommonDidResolverConfig {
             plc_directory_url: "https://plc.directory".into(),
@@ -82,6 +83,7 @@ pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
             authorization_server_metadata: Default::default(),
             protected_resource_metadata: Default::default(),
         },
+        http_client: crate::http_retry::HappyViewHttpClient::default(),
     })
     .expect("test OAuth client");
     AppState {
