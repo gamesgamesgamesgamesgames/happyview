@@ -923,16 +923,28 @@ async fn run_pipelined_resolve_and_fetch(
     drop(tx);
 
     // --- Fetcher: receive (did, pds) pairs and dispatch to PDS workers ---
-    // Each PDS gets its own worker with a DID channel. Workers acquire a
-    // semaphore permit before starting, limiting concurrent PDS connections.
-    // We never hold the workers lock across an `.await` — use `try_send` to
-    // avoid blocking when a worker's channel is full (overflow goes to a
-    // retry queue drained on each iteration).
+    // Each PDS gets its own worker with a DID channel, and every worker starts
+    // immediately — see `FetchContext::requests` for why gating startup on a
+    // semaphore deadlocks the job. Concurrency is capped on in-flight requests
+    // instead. We never hold the workers lock across an `.await` — use
+    // `try_send` to avoid blocking when a worker's channel is full (overflow
+    // goes to a retry queue drained on each iteration).
     let state = Arc::new(state.clone());
     let collections = Arc::new(collections.to_vec());
     let job_id_arc = Arc::new(job_id.to_string());
 
-    let pds_semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.pds));
+    // Derived from the two existing settings rather than introduced as a third,
+    // so every deployment keeps the effective concurrency it has today: the old
+    // scheme allowed `pds` workers each with `dids_per_pds` fetches in flight.
+    // The difference is that those requests are no longer confined to `pds`
+    // endpoints — they spread across every PDS in the job, which is what stops
+    // a handful of hosts absorbing the whole rate-limit budget while the rest
+    // sit idle.
+    let request_limit = concurrency
+        .pds
+        .saturating_mul(concurrency.dids_per_pds)
+        .max(1);
+    let pds_semaphore = Arc::new(tokio::sync::Semaphore::new(request_limit));
     let mut pds_workers: HashMap<String, mpsc::Sender<String>> = HashMap::new();
     let mut worker_handles = FuturesUnordered::new();
     let mut overflow: Vec<(String, String)> = Vec::new();
@@ -987,8 +999,9 @@ async fn run_pipelined_resolve_and_fetch(
             // Remove stale workers whose channels have closed
             pds_workers.retain(|_, tx| !tx.is_closed());
 
-            // Spawn a new PDS worker
-            let permit = Arc::clone(&pds_semaphore);
+            // Spawn a new PDS worker. It starts consuming immediately; only
+            // its requests are capped.
+            let requests = Arc::clone(&pds_semaphore);
             let (pds_tx, pds_rx) = mpsc::channel::<String>(64);
             let _ = pds_tx.try_send(did);
             pds_workers.insert(pds_endpoint.clone(), pds_tx);
@@ -1002,14 +1015,10 @@ async fn run_pipelined_resolve_and_fetch(
                 cancelled: Arc::clone(&cancelled),
                 dids_per_pds: concurrency.dids_per_pds,
                 recorder: Arc::clone(&recorder),
+                requests,
             };
 
             worker_handles.push(tokio::spawn(async move {
-                let _permit = permit
-                    .acquire()
-                    .await
-                    .expect("semaphore should not be closed");
-
                 run_pds_worker(ctx, pds_endpoint, pds_rx).await;
             }));
         }
@@ -1033,12 +1042,17 @@ async fn run_pipelined_resolve_and_fetch(
         pds_workers.retain(|_, tx| !tx.is_closed());
 
         if let Some(pds_tx) = pds_workers.get(&pds_endpoint) {
-            // Channel is bounded; this can block, but all senders are done so it's fine
+            // Bounded channel, so this can block — but only until the worker
+            // consumes, and every worker in the map is running (startup is no
+            // longer gated on a permit). When it *was* gated, a worker parked
+            // waiting for a permit could never drain this queue, this send
+            // blocked forever, `pds_workers` was never dropped, and no running
+            // worker could exit to release a permit: the job deadlocked.
             let _ = pds_tx.send(did).await;
             continue;
         }
 
-        let permit = Arc::clone(&pds_semaphore);
+        let requests = Arc::clone(&pds_semaphore);
         let (pds_tx, pds_rx) = mpsc::channel::<String>(64);
         let _ = pds_tx.try_send(did);
         pds_workers.insert(pds_endpoint.clone(), pds_tx);
@@ -1052,14 +1066,10 @@ async fn run_pipelined_resolve_and_fetch(
             cancelled: Arc::clone(&cancelled),
             dids_per_pds: concurrency.dids_per_pds,
             recorder: Arc::clone(&recorder),
+            requests,
         };
 
         worker_handles.push(tokio::spawn(async move {
-            let _permit = permit
-                .acquire()
-                .await
-                .expect("semaphore should not be closed");
-
             run_pds_worker(ctx, pds_endpoint.clone(), pds_rx).await;
         }));
     }
@@ -1117,6 +1127,15 @@ struct FetchContext {
     // on `recorder`'s construction in `run_pipelined_resolve_and_fetch` for
     // why this must be a clone, never a fresh `ErrorRecorder::new`.
     recorder: Arc<super::backfill_errors::ErrorRecorder>,
+    /// Caps in-flight PDS requests across the whole job.
+    ///
+    /// This gates *requests*, never worker startup. Gating startup deadlocks:
+    /// a worker cannot exit until its channel closes, and its channel closes
+    /// only when the dispatcher finishes, so no permit is ever released during
+    /// dispatch — a worker that never got one never drains its bounded queue,
+    /// and the dispatcher then blocks forever trying to fill it. Every worker
+    /// must be able to consume the moment its sender exists.
+    requests: Arc<tokio::sync::Semaphore>,
 }
 
 /// DIDs already recorded as a fetch-phase give-up, so a DID that fails on
@@ -1306,6 +1325,7 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
         cancelled,
         dids_per_pds,
         recorder,
+        requests,
     } = ctx;
     let mut fetches = FuturesUnordered::new();
     let mut rx_open = true;
@@ -1407,6 +1427,7 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
                         let collections = collections.clone();
                         let pds_endpoint = pds_endpoint.clone();
                         let cancelled = Arc::clone(&cancelled);
+                        let requests = Arc::clone(&requests);
 
                         fetches.push(async move {
                             let mut count: i32 = 0;
@@ -1416,6 +1437,13 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
                                 if cancelled.load(Ordering::Relaxed) {
                                     break;
                                 }
+                                // Per collection, not per DID: a job spanning
+                                // twenty lexicons must not pin one permit for
+                                // all twenty sequential request streams.
+                                let _permit = requests
+                                    .acquire()
+                                    .await
+                                    .expect("request semaphore is never closed");
                                 match fetch_records_page_loop(
                                     &state,
                                     &pds_endpoint,
@@ -1524,7 +1552,14 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
             DrainStep::Retry(item) => {
                 let (did, collection, cursor) = item.payload;
                 let attempts = item.attempts + 1;
-                match fetch_records_page_loop(
+                // A retry is a request like any other and counts against the
+                // same budget, or a job full of retrying workers would ignore
+                // the cap entirely.
+                let permit = requests
+                    .acquire()
+                    .await
+                    .expect("request semaphore is never closed");
+                let outcome = fetch_records_page_loop(
                     &state,
                     &pds_endpoint,
                     &did,
@@ -1532,8 +1567,9 @@ async fn run_pds_worker(ctx: FetchContext, pds_endpoint: String, mut rx: mpsc::R
                     cursor,
                     &cancelled,
                 )
-                .await
-                {
+                .await;
+                drop(permit);
+                match outcome {
                     FetchOutcome::Complete { count } => {
                         cooldowns.record_success(&pds_host);
                         total_records.fetch_add(count as i32, Ordering::Relaxed);
