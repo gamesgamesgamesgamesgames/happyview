@@ -3,7 +3,7 @@ title: "Overview"
 ---
 
 <Callout type="error" title="Experimental">
-Permissioned Spaces are experimental and the API will change. This implementation follows [AT Protocol Proposal 0016](https://github.com/bluesky-social/proposals) (Permissioned Data). HappyView uses the `com.atproto.space.*` and `com.atproto.simplespace.*` namespaces. The previous `dev.happyview.space.*` endpoints remain available as backward-compatible aliases until v3.
+Permissioned Spaces are experimental and the API will change. This implementation follows [atproto Proposal 0016](https://github.com/bluesky-social/proposals) (Permissioned Data). HappyView uses the `com.atproto.space.*` and `com.atproto.simplespace.*` namespaces. The previous `dev.happyview.space.*` endpoints remain available as backward-compatible aliases until v3.
 </Callout>
 
 Spaces are containers for permissioned data in atproto. Unlike regular public records that live in a user's repo, space records are gated by membership — only members can read or write data within a space.
@@ -142,7 +142,7 @@ Spaces also support **delegation** — adding another space as a member, which t
 
 ## Alignment with Proposal 0016
 
-HappyView implements [AT Protocol Proposal 0016](https://github.com/bluesky-social/proposals) (Permissioned Data) with some HappyView-specific extensions.
+HappyView implements [atproto Proposal 0016](https://github.com/bluesky-social/proposals) (Permissioned Data) with some HappyView-specific extensions.
 
 ### Protocol features implemented
 

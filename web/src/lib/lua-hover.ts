@@ -177,7 +177,7 @@ export const HOVER_DOCS = new Map<string, HoverEntry>([
   ["atproto.get_labels", { signature: "atproto.get_labels(uri)", description: "Get labels for a URI — returns array of {src, uri, val, cts}", module: "atproto" }],
   ["atproto.get_labels_batch", { signature: "atproto.get_labels_batch({uri1, uri2, ...})", description: "Get labels for multiple URIs — returns table keyed by URI", module: "atproto" }],
   ["atproto.sign", { signature: "atproto.sign(record)", description: "Sign a record (requires attestation signer, procedure scripts only) — returns signature object", module: "atproto" }],
-  ["atproto.verify_signature", { signature: "atproto.verify_signature(record, sig, repo_did)", description: "Verify a record signature — returns boolean", module: "atproto" }],
+  ["atproto.verify_signature", { signature: "atproto.verify_signature(record, sig, repo_did)", description: "Verify a record signature — returns boolean; raises if the signature can't be checked at all (wrap in pcall to tell 'forged' from 'unverifiable')", module: "atproto" }],
 
   // ── HappyView Spaces API ────────────────────────────────────────────
   // Note: hover lookup keys on the immediate `<prefix>.<word>` pair, not the

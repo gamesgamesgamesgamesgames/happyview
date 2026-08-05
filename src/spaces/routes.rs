@@ -593,6 +593,14 @@ async fn apply_writes(
     }
 
     let mut results = Vec::with_capacity(input.writes.len());
+    let rev = generate_tid();
+    let mut ops: Vec<service::AppliedOp> = Vec::with_capacity(input.writes.len());
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
 
     for op in input.writes {
         match op {
@@ -603,7 +611,7 @@ async fn apply_writes(
             } => {
                 service::check_collection_allowed(&space, &collection)?;
                 let rkey = rkey.unwrap_or_else(generate_tid);
-                let cid = service::content_cid(&value);
+                let cid = service::content_cid(&value)?;
                 let record_uri = format!(
                     "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
@@ -612,13 +620,20 @@ async fn apply_writes(
                     uri: record_uri.clone(),
                     space_id: space.id.clone(),
                     author_did: did.clone(),
-                    collection,
-                    rkey,
+                    collection: collection.clone(),
+                    rkey: rkey.clone(),
                     record: value,
                     cid: cid.clone(),
                     indexed_at: now_rfc3339(),
                 };
-                db::insert_space_record(&state.db, state.db_backend, &record).await?;
+                db::insert_space_record(&mut *tx, state.db_backend, &record).await?;
+                ops.push(service::AppliedOp {
+                    action: OplogAction::Create,
+                    collection,
+                    rkey,
+                    new_cid: Some(cid.clone()),
+                    old_cid: None,
+                });
                 results.push(serde_json::json!({
                     "uri": record_uri,
                     "cid": cid,
@@ -631,7 +646,7 @@ async fn apply_writes(
                 swap_record,
             } => {
                 service::check_collection_allowed(&space, &collection)?;
-                let cid = service::content_cid(&value);
+                let cid = service::content_cid(&value)?;
                 let record_uri = format!(
                     "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
@@ -640,23 +655,40 @@ async fn apply_writes(
                     uri: record_uri.clone(),
                     space_id: space.id.clone(),
                     author_did: did.clone(),
-                    collection,
-                    rkey,
+                    collection: collection.clone(),
+                    rkey: rkey.clone(),
                     record: value,
                     cid: cid.clone(),
                     indexed_at: now_rfc3339(),
                 };
+                let old_cid = match swap_record.as_deref() {
+                    Some(swap) => Some(swap.to_string()),
+                    None => db::get_space_record(&mut *tx, state.db_backend, &record_uri)
+                        .await?
+                        .map(|r| r.cid),
+                };
                 if let Some(swap_cid) = swap_record {
                     db::upsert_space_record_with_swap(
-                        &state.db,
+                        &mut tx,
                         state.db_backend,
                         &record,
                         &swap_cid,
                     )
                     .await?;
                 } else {
-                    db::upsert_space_record(&state.db, state.db_backend, &record).await?;
+                    db::upsert_space_record(&mut *tx, state.db_backend, &record).await?;
                 }
+                ops.push(service::AppliedOp {
+                    action: if old_cid.is_some() {
+                        OplogAction::Update
+                    } else {
+                        OplogAction::Create
+                    },
+                    collection,
+                    rkey,
+                    new_cid: Some(cid.clone()),
+                    old_cid,
+                });
                 results.push(serde_json::json!({
                     "uri": record_uri,
                     "cid": cid,
@@ -671,37 +703,50 @@ async fn apply_writes(
                     "at://{}/space/{}/{}/{}/{}/{}",
                     space.did, space.type_nsid, space.skey, did, collection, rkey
                 );
-                if let Some(swap_cid) = swap_record {
+                let old_cid = if let Some(swap_cid) = swap_record {
                     db::delete_space_record_with_swap(
-                        &state.db,
+                        &mut tx,
                         state.db_backend,
                         &record_uri,
                         &swap_cid,
                     )
                     .await?;
+                    swap_cid
                 } else {
                     // Mirrors `service::delete_record`'s non-swap ownership
                     // check: only the record's own author may delete it.
                     let existing =
-                        db::get_space_record(&state.db, state.db_backend, &record_uri).await?;
-                    match existing {
+                        db::get_space_record(&mut *tx, state.db_backend, &record_uri).await?;
+                    let cid = match existing {
                         Some(r) if r.author_did != did => {
                             return Err(AppError::Forbidden(
                                 "You can only delete your own records".into(),
                             ));
                         }
                         None => return Err(AppError::NotFound("Record not found".into())),
-                        _ => {}
-                    }
-                    db::delete_space_record(&state.db, state.db_backend, &record_uri).await?;
-                }
+                        Some(r) => r.cid,
+                    };
+                    db::delete_space_record(&mut *tx, state.db_backend, &record_uri).await?;
+                    cid
+                };
+                ops.push(service::AppliedOp {
+                    action: OplogAction::Delete,
+                    collection,
+                    rkey,
+                    new_cid: None,
+                    old_cid: Some(old_cid),
+                });
                 results.push(serde_json::json!({}));
             }
         }
     }
 
-    let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+    service::commit_write(&mut tx, state.db_backend, &space, &did, &rev, &ops).await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
+
+    service::notify_ops(&state, &space, &did, &ops).await;
 
     Ok(Json(serde_json::json!({
         "results": results,
@@ -962,6 +1007,25 @@ async fn get_delegation_token(
 // Protocol endpoint implementations
 // ---------------------------------------------------------------------------
 
+fn repo_state_commit_json(repo_state: &RepoState) -> Result<Option<serde_json::Value>, AppError> {
+    let Some(h) = repo_state.hash.as_deref() else {
+        return Ok(None);
+    };
+    let ikm = repo_state.ikm.as_deref().ok_or_else(|| {
+        AppError::Internal("corrupt repo state: hash present but ikm missing".into())
+    })?;
+    let mac = repo_state.mac.as_deref().ok_or_else(|| {
+        AppError::Internal("corrupt repo state: hash present but mac missing".into())
+    })?;
+    Ok(Some(serde_json::json!({
+        "ver": 1,
+        "hash": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h),
+        "ikm": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ikm),
+        "mac": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac),
+        "rev": repo_state.rev,
+    })))
+}
+
 async fn get_latest_commit(
     State(state): State<AppState>,
     claims: XrpcClaims,
@@ -982,30 +1046,15 @@ async fn get_latest_commit(
     let read_access = SpaceReadAccess::from_space_access(membership);
     check_read_access(&did, &params.did, read_access, has_credential)?;
 
+    let mut conn = state
+        .db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
     let repo_state =
-        db::get_or_create_repo_state(&state.db, state.db_backend, &space.id, &params.did).await?;
+        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
 
-    let commit = if let Some(h) = repo_state.hash.as_ref() {
-        let ikm = repo_state.ikm.as_deref().ok_or_else(|| {
-            AppError::Internal("corrupt repo state: hash present but ikm missing".into())
-        })?;
-        let sig = repo_state.sig.as_deref().ok_or_else(|| {
-            AppError::Internal("corrupt repo state: hash present but sig missing".into())
-        })?;
-        let mac = repo_state.mac.as_deref().ok_or_else(|| {
-            AppError::Internal("corrupt repo state: hash present but mac missing".into())
-        })?;
-        Some(serde_json::json!({
-            "ver": 1,
-            "hash": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h),
-            "ikm": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ikm),
-            "sig": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig),
-            "mac": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac),
-            "rev": repo_state.rev,
-        }))
-    } else {
-        None
-    };
+    let commit = repo_state_commit_json(&repo_state)?;
 
     Ok(Json(serde_json::json!({
         "rev": repo_state.rev,
@@ -1033,8 +1082,14 @@ async fn get_repo(
     let read_access = SpaceReadAccess::from_space_access(membership);
     check_read_access(&did, &params.did, read_access, has_credential)?;
 
+    let mut conn = state
+        .db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
     let repo_state =
-        db::get_or_create_repo_state(&state.db, state.db_backend, &space.id, &params.did).await?;
+        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
+    drop(conn);
     let records =
         db::list_all_space_records(&state.db, state.db_backend, &space.id, &params.did).await?;
 
@@ -1057,9 +1112,6 @@ async fn get_repo(
         .ok_or_else(|| AppError::Internal("corrupt repo state: missing mac".into()))?
         .try_into()
         .map_err(|_| AppError::Internal("corrupt repo state: mac is not 32 bytes".into()))?;
-    let sig = repo_state
-        .sig
-        .ok_or_else(|| AppError::Internal("corrupt repo state: missing sig".into()))?;
     let rev = repo_state
         .rev
         .ok_or_else(|| AppError::Internal("corrupt repo state: missing rev".into()))?;
@@ -1067,7 +1119,6 @@ async fn get_repo(
         ver: 1,
         hash,
         ikm,
-        sig,
         mac,
         rev,
     };
@@ -1102,10 +1153,10 @@ async fn list_repo_ops(
     let read_access = SpaceReadAccess::from_space_access(membership);
     check_read_access(&did, &params.did, read_access, has_credential)?;
 
-    let limit = params.limit.unwrap_or(100).min(1000);
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
     let exclude_values = params.exclude_values.unwrap_or(false);
 
-    let ops = if exclude_values {
+    let (ops, cursor) = if exclude_values {
         oplog::list_ops(
             &state.db,
             state.db_backend,
@@ -1127,7 +1178,20 @@ async fn list_repo_ops(
         .await?
     };
 
-    Ok(Json(serde_json::json!({ "ops": ops })))
+    let mut conn = state
+        .db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+    let repo_state =
+        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, &params.did).await?;
+    let commit = repo_state_commit_json(&repo_state)?;
+
+    Ok(Json(serde_json::json!({
+        "ops": ops,
+        "cursor": cursor,
+        "commit": commit,
+    })))
 }
 
 async fn list_repos(
@@ -1137,11 +1201,6 @@ async fn list_repos(
 ) -> Result<impl IntoResponse, AppError> {
     let space = service::resolve_space(&state, &params.space).await?;
 
-    // The repo list is the space's participant list. Its visibility follows the
-    // `membershipPublic` config (like `get_space` / `listMembers`): public when
-    // set, otherwise the caller must be an authenticated member (or authority /
-    // space-credential holder). Previously this required *some* auth but never
-    // checked membership, leaking any private space's participants (M2).
     if !space.config.membership_public {
         let did = require_auth_or_credential(&state, &claims).await?;
         service::require_membership(
@@ -1378,17 +1437,44 @@ mod tests {
     #[test]
     fn content_cid_deterministic() {
         let record = json!({"text": "hello"});
-        let cid1 = service::content_cid(&record);
-        let cid2 = service::content_cid(&record);
+        let cid1 = service::content_cid(&record).expect("encodable");
+        let cid2 = service::content_cid(&record).expect("encodable");
         assert_eq!(cid1, cid2);
         assert!(cid1.starts_with("bafyrei"));
     }
 
     #[test]
     fn content_cid_changes_for_different_records() {
-        let a = service::content_cid(&json!({"text": "hello"}));
-        let b = service::content_cid(&json!({"text": "world"}));
+        let a = service::content_cid(&json!({"text": "hello"})).expect("encodable");
+        let b = service::content_cid(&json!({"text": "world"})).expect("encodable");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn content_cid_matches_canonical_recomputation() {
+        let record = json!({ "$type": "com.example.item", "text": "hello" });
+        let minted = service::content_cid(&record).expect("encodable");
+        assert_eq!(
+            crate::cid_verify::verify_record_cid(&minted, &record),
+            crate::cid_verify::CidCheck::Match,
+        );
+    }
+
+    #[test]
+    fn content_cid_is_independent_of_key_order() {
+        let a = service::content_cid(&json!({ "aa": 2, "b": 1 })).expect("encodable");
+        let b = service::content_cid(&json!({ "b": 1, "aa": 2 })).expect("encodable");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn content_cid_rejects_unencodable_record() {
+        // A malformed `$link` cannot become an IPLD link.
+        let bad = json!({ "ref": { "$link": "not-a-cid" } });
+        assert!(matches!(
+            service::content_cid(&bad),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]

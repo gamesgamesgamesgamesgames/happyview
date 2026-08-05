@@ -334,7 +334,17 @@ Verifies that an inline signature was produced by this HappyView instance. Only 
 | `signature` | table  | The signature object from `atproto.sign()` |
 | `repo_did`  | string | The repo DID                               |
 
-**Returns:** `true` if the signature is valid, `false` otherwise. Returns `false` on failure rather than raising an error.
+**Returns:** `true` if the signature is valid, `false` if it is not.
+
+**Raises** when the signature cannot be checked at all — signature bytes that aren't valid base64, a missing `key` or `$bytes` field, a record that can't be encoded. These are not the same fact:
+
+| Outcome  | Meaning                                                              |
+| -------- | -------------------------------------------------------------------- |
+| `true`   | We checked. The signature is genuine.                                 |
+| `false`  | We checked. The signature does not match this record — it is forged.  |
+| _raises_ | We could not check. This says nothing about the record.               |
+
+The distinction matters because `verify_signature` is almost always used as a guard, and treating "could not check" as "forged" turns any fault in the verification path into an accusation against a user. If your guard rejects records on `false`, wrap the call in `pcall` and handle the raise as a distinct case — retry it, count it, or alert on it, but don't record it as forgery.
 
 ### Examples
 
@@ -345,5 +355,16 @@ local sig = atproto.sign(record)
 local valid = atproto.verify_signature(record, sig, caller_did)
 if not valid then
   return { error = "signature verification failed" }
+end
+```
+
+```lua
+-- Guard that keeps "forged" and "unverifiable" apart
+local ok, valid = pcall(atproto.verify_signature, record, sig, repo_did)
+if not ok then
+  -- valid holds the error message; we learned nothing about the record
+  return { error = "could not verify signature: " .. tostring(valid) }
+elseif not valid then
+  return { error = "record signature is not ours" }
 end
 ```

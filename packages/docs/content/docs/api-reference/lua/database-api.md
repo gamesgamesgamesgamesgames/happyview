@@ -25,6 +25,10 @@ The `cursor` is an opaque string returned in a previous response. Pass it throug
 
 The `sort` field can be a top-level column (`indexed_at`, `did`, `uri`) or any field inside the record (e.g. `name`, `createdAt`). Nested paths are supported with dot notation and array indices (e.g. `author.handle`, `scores[0]`).
 
+<Callout type="warn">
+`indexed_at` records when a record arrived **from the network**, not when the AppView last wrote it. A record this instance just created is NULL there until Jetstream echoes it back, so sorting or filtering on `indexed_at` puts brand-new records in an unintuitive spot for that window. Sort on `created_at` (the default when no `sort` is given) or on a record field like `createdAt` when you want write order.
+</Callout>
+
 ### Filtering
 
 The `filter` option lets you restrict results by record field values. Field names correspond to the fields defined in your lexicon schema (e.g. `streamer`, `status`, `viewers`).
@@ -177,7 +181,7 @@ Available internal tables:
 
 | Table | Contents |
 | --- | --- |
-| `happyview_records` | indexed AT Protocol records |
+| `happyview_records` | indexed atproto records |
 | `happyview_record_refs` | backlink index |
 | `happyview_labels` | applied labels |
 | `happyview_lexicons` | uploaded lexicons |

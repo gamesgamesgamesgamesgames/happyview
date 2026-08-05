@@ -2,8 +2,18 @@ import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
-import type { BackfillJob, BackfillReposResponse, PdsSummaryResponse } from "@/types/backfill";
+import type {
+  BackfillJob,
+  BackfillReposResponse,
+  PdsSummaryResponse,
+  BackfillErrorsResponse,
+} from "@/types/backfill";
 import type { Job, JobLogsResponse, JobsListResponse } from "@/types/jobs";
+import type {
+  CreateLinkedRepoBody,
+  LinkedRepo,
+  LinkedReposListResponse,
+} from "@/types/linked-repos";
 import type { UserSummary } from "@/types/users";
 import type { AdminListRecordsResponse } from "@/types/records";
 import type { EventsListResponse } from "@/types/events";
@@ -35,6 +45,11 @@ export type { CollectionStat, StatsResponse } from "@/types/stats";
 export type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 export type { NetworkLexiconSummary } from "@/types/network-lexicons";
 export type { BackfillJob, BackfillRepoEntry, BackfillReposResponse, PdsSummaryEntry, PdsSummaryResponse, BackfillEvent, BlueskyProfile } from "@/types/backfill";
+export type {
+  LinkedRepo,
+  LinkedReposListResponse,
+  CreateLinkedRepoBody,
+} from "@/types/linked-repos";
 export type { UserSummary } from "@/types/users";
 export type { AdminRecord, AdminListRecordsResponse } from "@/types/records";
 export type { EventLogEntry, EventsListResponse } from "@/types/events";
@@ -255,6 +270,27 @@ export function flushAllBackfillDetails() {
   return apiFetch(`/admin/backfill/details`, { method: "DELETE" });
 }
 
+export function getBackfillErrors(
+  jobId: string,
+  params: { kind?: string; cursor?: string; limit?: number } = {},
+) {
+  const search = new URLSearchParams();
+  if (params.kind) search.set("kind", params.kind);
+  if (params.cursor) search.set("cursor", params.cursor);
+  if (params.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return apiFetch<BackfillErrorsResponse>(
+    `/admin/backfill/${jobId}/errors${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export function retryFailedBackfill(jobId: string, kinds?: string[]) {
+  return apiFetch<{ id: string }>(`/admin/backfill/${jobId}/retry-failed`, {
+    method: "POST",
+    body: JSON.stringify(kinds ? { kinds } : {}),
+  });
+}
+
 // Jobs
 export function getJobs(params: { status?: string; limit?: number; cursor?: string } = {}) {
   const qs = new URLSearchParams();
@@ -297,6 +333,80 @@ export function getJobLogs(
   const query = qs.toString();
   return apiFetch<JobLogsResponse>(
     `/admin/jobs/${id}/logs${query ? `?${query}` : ""}`,
+  );
+}
+
+// Linked Repos
+export function getLinkedRepos() {
+  return apiFetch<LinkedReposListResponse>("/admin/linked-repos");
+}
+
+export function createLinkedRepo(body: CreateLinkedRepoBody) {
+  return apiFetch<LinkedRepo>("/admin/linked-repos", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function authorizeLinkedRepo(id: string) {
+  return apiFetch<{ authorize_url: string }>(
+    `/admin/linked-repos/${id}/authorize`,
+    { method: "POST" },
+  );
+}
+
+export function inviteLinkedRepo(id: string) {
+  return apiFetch<{ invite_url: string; expires_at: string }>(
+    `/admin/linked-repos/${id}/invite`,
+    { method: "POST" },
+  );
+}
+
+export function deleteLinkedRepo(id: string) {
+  return apiFetch<{ deleted: boolean }>(`/admin/linked-repos/${id}`, {
+    method: "DELETE",
+  });
+}
+
+// Linked Repos — outstanding invites. `invite_id` is the stored SHA-256 of
+// the token, not the token itself: the actual link is only ever returned
+// once, at mint time, so this list is metadata-only by design.
+export interface LinkedRepoInvite {
+  invite_id: string;
+  expires_at: string;
+}
+
+export interface LinkedRepoInvitesResponse {
+  invites: LinkedRepoInvite[];
+}
+
+export function getLinkedRepoInvites(id: string) {
+  return apiFetch<LinkedRepoInvitesResponse>(
+    `/admin/linked-repos/${id}/invites`,
+  );
+}
+
+export function revokeLinkedRepoInvite(id: string, inviteId: string) {
+  return apiFetch<{ revoked: boolean }>(
+    `/admin/linked-repos/${id}/invites/${encodeURIComponent(inviteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+// Linked Repos — public invite landing page (unauthenticated, token-gated)
+export interface LinkedRepoInviteInfo {
+  valid: boolean;
+  app_name: string;
+  logo_url: string | null;
+  scopes: string[];
+  reason: string | null;
+  pinned_identifier: string | null;
+  expires_at: string | null;
+}
+
+export function getLinkedRepoInvite(token: string) {
+  return apiFetch<LinkedRepoInviteInfo>(
+    `/auth/linked-repo/info?token=${encodeURIComponent(token)}`,
   );
 }
 
@@ -424,10 +534,68 @@ export function deleteRecord(uri: string) {
 }
 
 export function deleteCollectionRecords(collection: string) {
-  return apiFetch<{ deleted: number }>(
+  return apiFetch<{ job_id: string }>(
     `/admin/records/collection?${new URLSearchParams({ collection })}`,
     { method: "DELETE" },
   );
+}
+
+// Database (SQLite disk reclamation)
+export interface DatabaseDiskReport {
+  db_bytes: number;
+  wal_bytes: number;
+  // `null` means free space could not be measured — NOT that it measured
+  // zero. Render that case as "unknown", never as "0 B".
+  db_fs_free: number | null;
+  temp_fs_free: number | null;
+  // Whether the database and temp directories share a filesystem, which
+  // changes how much headroom a VACUUM needs (1.2x vs 2.2x the db size).
+  same_filesystem: boolean;
+  db_path: string;
+  temp_path: string;
+}
+
+export interface VacuumResult {
+  status: "ok" | "failed";
+  at: string;
+  db_bytes_before: number;
+  db_bytes_after: number;
+  reclaimed_bytes: number;
+  error: string | null;
+}
+
+export type VacuumFeasibility =
+  | { status: "ok" }
+  | { status: "insufficient"; needed: number; available: number; path: string }
+  | { status: "unknown"; path: string };
+
+export interface DatabaseStatus {
+  backend: "sqlite" | "postgres";
+  disk: DatabaseDiskReport | null;
+  feasibility: VacuumFeasibility | null;
+  vacuum: {
+    requested_at: string | null;
+    attempt_started_at: string | null;
+    completed_at: string | null;
+    last_result: VacuumResult | null;
+  };
+  journal_size_limit: number;
+}
+
+export function getDatabaseStatus() {
+  return apiFetch<DatabaseStatus>("/admin/database/status");
+}
+
+export function scheduleVacuum() {
+  return apiFetch<{ scheduled: boolean }>("/admin/database/vacuum/schedule", {
+    method: "POST",
+  });
+}
+
+export function cancelVacuum() {
+  return apiFetch<{ scheduled: boolean }>("/admin/database/vacuum/schedule", {
+    method: "DELETE",
+  });
 }
 
 // Script Variables

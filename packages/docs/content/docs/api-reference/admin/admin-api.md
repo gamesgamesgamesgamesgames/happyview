@@ -115,6 +115,9 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/records/collections`         | `records:read`             |
 | `DELETE /admin/records`                  | `records:delete`           |
 | `DELETE /admin/records/collection`       | `records:delete-collection`|
+| `GET /admin/database/status`             | `settings:manage`          |
+| `POST /admin/database/vacuum/schedule`   | `settings:manage`          |
+| `DELETE /admin/database/vacuum/schedule` | `settings:manage`          |
 | `GET /admin/settings`                    | `settings:manage`          |
 | `GET /admin/settings/db-info`            | `settings:manage`          |
 | `PUT /admin/settings/{key}`              | `settings:manage`          |
@@ -169,3 +172,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/permissions`                 | `users:read`               |
 | `GET /admin/settings/xrpc-proxy`         | `settings:manage`          |
 | `PUT /admin/settings/xrpc-proxy`         | `settings:manage`          |
+
+### Database disk usage and vacuum
+
+`GET /admin/database/status` reports the database and write-ahead log size, free disk space, and the status of the one-time SQLite vacuum described in [Configuration](../../getting-started/configuration.md). `POST /admin/database/vacuum/schedule` arms the vacuum to run at the next restart; `DELETE /admin/database/vacuum/schedule` disarms it. These only apply to SQLite — on a Postgres-backed instance, scheduling returns `400 Bad Request` rather than silently doing nothing.

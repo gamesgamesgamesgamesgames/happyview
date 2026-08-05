@@ -10,6 +10,7 @@ HappyView is configured via environment variables. A `.env` file in the project 
 |----------|----------|---------|-------------|
 | `DATABASE_URL` | yes | --- | Database connection string. SQLite (`sqlite://path/to/db?mode=rwc`) or Postgres (`postgres://user:pass@host/db`) |
 | `DATABASE_BACKEND` | no | auto-detected | Force `sqlite` or `postgres`. Auto-detected from `DATABASE_URL` scheme if not set |
+| `SQLITE_JOURNAL_SIZE_LIMIT` | no | `67108864` (64 MiB) | Bytes. Caps how large the SQLite write-ahead log is allowed to grow before it's truncated back down after a checkpoint, bounding disk usage from WAL growth. SQLite-only; ignored on Postgres |
 | `PUBLIC_URL` | yes | --- | Public-facing URL for HappyView (used for OAuth callbacks, e.g. `https://happyview.example.com`). **For local development, use `http://127.0.0.1:3000` — not `localhost`** (see note below). Do **not** include the base path — see `BASE_PATH` |
 | `BASE_PATH` | no | _(none)_ | Subpath prefix for mounting HappyView behind a reverse proxy (e.g. `/hv`). Must start with `/` and have no trailing slash. When set, all routes are served under this prefix and the dashboard is accessible at `https://example.com/hv/`. See [Reverse proxy subpath](deployment/production.md#reverse-proxy-subpath) |
 | `SESSION_SECRET` | no | dev default | Secret key for signing session cookies (at least 64 characters). **Must be set in production** |
@@ -39,7 +40,7 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `POLICY_URI` | no | --- | URL to privacy policy. Overridden by database setting if set via admin API |
 
 <Callout type="warn" title="Use 127.0.0.1, not localhost">
-ATProto OAuth loopback clients are registered with `127.0.0.1`. If you set `PUBLIC_URL` to `http://localhost:3000`, OAuth sign-in will fail because the redirect URI won't match the loopback client ID. Always use `http://127.0.0.1:3000` for local development.
+atproto OAuth loopback clients are registered with `127.0.0.1`. If you set `PUBLIC_URL` to `http://localhost:3000`, OAuth sign-in will fail because the redirect URI won't match the loopback client ID. Always use `http://127.0.0.1:3000` for local development.
 </Callout>
 
 ## Example `.env`
@@ -57,6 +58,7 @@ SESSION_SECRET=change-me-in-production
 # BASE_PATH=/hv
 # HOST=0.0.0.0
 # PORT=3000
+# SQLITE_JOURNAL_SIZE_LIMIT=67108864
 # JETSTREAM_URL=wss://jetstream1.us-east.bsky.network
 # RELAY_URL=https://bsky.network
 # PLC_URL=https://plc.directory

@@ -79,10 +79,16 @@ function handle()
     return { record = record, verified = false }
   end
 
-  local valid = atproto.verify_signature(record, sig, record.did)
+  local ok, valid = pcall(atproto.verify_signature, record, sig, record.did)
+  if not ok then
+    -- Couldn't check — that is not the same as "the signature is bad".
+    return { record = record, verified = nil, error = tostring(valid) }
+  end
   return { record = record, verified = valid }
 end
 ```
+
+`verify_signature` returns `false` only when it checked the signature and it didn't match. It **raises** when it couldn't check — signature bytes that aren't valid base64, a missing field, a record that won't encode. Keep those apart: a script that treats "couldn't check" as `false` will report a fault in its own verification path as a forged record, which is a serious thing to tell a user about their own data.
 
 ### Checking availability
 

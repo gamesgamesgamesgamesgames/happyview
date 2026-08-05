@@ -9,7 +9,7 @@ This API is experimental and will change. See the [Permissioned Spaces overview]
 Invites let space authorities distribute membership tokens without knowing recipients' DIDs in advance.
 
 <Callout type="info" title="HappyView Extension">
-Invites are a HappyView-specific feature, not part of the AT Protocol spaces spec. They may be replaced by a different mechanism in the future.
+Invites are a HappyView-specific feature, not part of the atproto spaces spec. They may be replaced by a different mechanism in the future.
 </Callout>
 
 ## Creating an invite

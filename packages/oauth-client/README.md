@@ -95,6 +95,16 @@ const session = await client.restoreSession("did:plc:abc123");
 await client.deleteSession("did:plc:abc123");
 ```
 
+The local session is always cleared, even when the server refuses the revocation. `404`, `401`, and `403` are treated as a completed logout — the credential is already gone or unusable, so there is nothing left to revoke. `5xx` and network errors still throw, so you know revocation may not have reached the server, but they throw after the local cleanup: a failed logout can never leave the user signed in.
+
+To clear a session locally without contacting the server:
+
+```typescript
+await client.forgetSession("did:plc:abc123");
+```
+
+`STORAGE_PREFIX` and `LAST_ACTIVE_KEY` are exported for tooling that needs to inspect stored sessions directly.
+
 ## Adapters
 
 ### CryptoAdapter

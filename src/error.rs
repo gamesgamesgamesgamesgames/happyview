@@ -49,6 +49,29 @@ pub fn parse_lua_line(raw: &str) -> (Option<u32>, String) {
     (None, raw.to_string())
 }
 
+/// Render an error together with its full `source()` chain.
+///
+/// `reqwest::Error`'s `Display` deliberately omits its source, so a transport
+/// failure formats as nothing more than `error sending request for url (…)` —
+/// leaving NXDOMAIN, TLS failure, connection refused and timeout completely
+/// indistinguishable in the logs. That is exactly the information needed to
+/// tell "this host is gone" from "we are misconfigured", so walk the chain and
+/// append each cause.
+pub fn describe_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // Chains frequently restate the outer message; don't repeat it.
+        if !out.ends_with(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
 #[derive(Debug)]
 pub enum AppError {
     Auth(String),
@@ -360,6 +383,72 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, raw_body);
+    }
+
+    #[derive(Debug)]
+    struct TestError {
+        message: &'static str,
+        cause: Option<Box<TestError>>,
+    }
+
+    impl std::fmt::Display for TestError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for TestError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause
+                .as_ref()
+                .map(|c| c.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn describe_error_chain_includes_every_cause() {
+        // The shape reqwest actually produces: a useless outer message wrapping
+        // the cause that says what really happened.
+        let err = TestError {
+            message: "error sending request for url (https://hackrlabs.dev/.well-known/did.json)",
+            cause: Some(Box::new(TestError {
+                message: "client error (Connect)",
+                cause: Some(Box::new(TestError {
+                    message: "dns error: failed to lookup address information",
+                    cause: None,
+                })),
+            })),
+        };
+
+        let rendered = describe_error_chain(&err);
+        assert!(
+            rendered.contains("dns error: failed to lookup address information"),
+            "the root cause must survive rendering, got: {rendered}"
+        );
+        assert!(rendered.contains("client error (Connect)"));
+        assert!(rendered.starts_with("error sending request for url"));
+    }
+
+    #[test]
+    fn describe_error_chain_handles_no_source() {
+        let err = TestError {
+            message: "standalone failure",
+            cause: None,
+        };
+        assert_eq!(describe_error_chain(&err), "standalone failure");
+    }
+
+    #[test]
+    fn describe_error_chain_does_not_repeat_restated_causes() {
+        // Some error types embed their cause's text in their own Display.
+        let err = TestError {
+            message: "outer: inner detail",
+            cause: Some(Box::new(TestError {
+                message: "inner detail",
+                cause: None,
+            })),
+        };
+        assert_eq!(describe_error_chain(&err), "outer: inner detail");
     }
 
     #[test]

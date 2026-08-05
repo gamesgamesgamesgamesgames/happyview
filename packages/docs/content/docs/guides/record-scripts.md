@@ -2,7 +2,7 @@
 title: "Record & Label Scripts"
 ---
 
-Record and label scripts are Lua scripts that run in response to events on the AT Protocol network. **Record scripts** fire when a record in a collection is created, updated, or deleted. **Label scripts** fire when a label is applied to a record or actor. Both run **before** the event is indexed, giving you the ability to filter, transform, or trigger side effects.
+Record and label scripts are Lua scripts that run in response to events on the atproto network. **Record scripts** fire when a record in a collection is created, updated, or deleted. **Label scripts** fire when a label is applied to a record or actor. Both run **before** the event is indexed, giving you the ability to filter, transform, or trigger side effects.
 
 These scripts are event-driven -- they react to incoming Jetstream events (which include events caused by HappyView's own PDS writes), not to XRPC requests. For scripts that run in response to XRPC queries and procedures, see [Lua Scripting](./lua-scripting.md).
 
@@ -81,7 +81,7 @@ The function is called once per event.
 | `true`       | The original record is stored as-is                         |
 | *(no script)* | The original record is stored as-is                        |
 
-On **delete** events, returning `nil` skips the delete (the record stays in the database).
+On **delete** events, returning `nil` skips the delete (the record stays in the database). Because a delete event carries no `record`, `return record` returns `nil` there -- use `return true` to let a delete proceed.
 
 **Important:** If your script has side effects (e.g. syncing to a search index) but you want normal indexing to proceed, return `record` or `true` -- not nothing. A missing return statement returns `nil`, which **skips indexing**.
 
@@ -183,7 +183,7 @@ Create a script with trigger `record.index:your.collection.nsid` to skip indexin
 ```lua
 function handle()
   if action == "delete" then
-    return record  -- allow deletes to proceed
+    return true  -- allow deletes to proceed
   end
 
   if record.title == nil or record.title == "" then
@@ -201,7 +201,7 @@ Enrich a record with a computed field before it is stored:
 ```lua
 function handle()
   if action == "delete" then
-    return record
+    return true
   end
 
   record.slug = string.lower(string.gsub(record.title or "", "%s+", "-"))
@@ -222,7 +222,7 @@ function handle()
       record = record
     })
   })
-  return record
+  return record or true  -- `record` is nil on delete; `true` lets it proceed
 end
 ```
 
@@ -254,7 +254,7 @@ function handle()
     })
   end
 
-  return record
+  return record or true  -- `record` is nil on delete; `true` lets it proceed
 end
 ```
 
@@ -289,7 +289,7 @@ function handle()
     })
   end
 
-  return record
+  return record or true  -- `record` is nil on delete; `true` lets it proceed
 end
 ```
 

@@ -1,0 +1,11 @@
+-- Drop the asymmetric commit signature from space repo state.
+--
+-- Permissioned Data Diary 7 establishes that asymmetric signatures on data are
+-- an anti-pattern for permissioned data: a signature is an irrevocable,
+-- redistributable proof of authenticity that survives escaping the space's
+-- access boundary. Space commits are now authenticated solely by the deniable
+-- HMAC (`mac`, keyed from the per-commit `ikm`).
+--
+-- The column was never populated in production — the commit machinery had no
+-- production callers until the write path was wired up alongside this change.
+ALTER TABLE happyview_space_repo_state DROP COLUMN sig;

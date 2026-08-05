@@ -2,6 +2,9 @@ mod api_clients;
 mod api_keys;
 pub(crate) mod auth;
 pub mod backfill;
+pub mod backfill_errors;
+pub mod backfill_retry;
+mod database;
 mod dead_letters;
 mod domains;
 mod events;
@@ -9,6 +12,7 @@ mod feature_flags;
 mod jobs;
 mod labelers;
 mod lexicons;
+mod linked_repos;
 mod network_lexicons;
 pub(crate) mod permissions;
 mod plugins;
@@ -59,6 +63,11 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/backfill/{id}/pds-summary",
             get(backfill::backfill_pds_summary),
         )
+        .route("/backfill/{id}/errors", get(backfill::backfill_errors_list))
+        .route(
+            "/backfill/{id}/retry-failed",
+            post(backfill::retry_failed_backfill),
+        )
         .route(
             "/backfill/{id}/details",
             delete(backfill::flush_backfill_details),
@@ -69,6 +78,30 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route("/jobs/{id}/pause", post(jobs::pause_job))
         .route("/jobs/{id}/resume", post(jobs::resume_job))
         .route("/jobs/{id}/logs", get(jobs::list_job_logs))
+        .route(
+            "/linked-repos",
+            get(linked_repos::list_linked_repos).post(linked_repos::create_linked_repo),
+        )
+        .route(
+            "/linked-repos/{id}",
+            delete(linked_repos::delete_linked_repo),
+        )
+        .route(
+            "/linked-repos/{id}/authorize",
+            post(linked_repos::authorize_linked_repo),
+        )
+        .route(
+            "/linked-repos/{id}/invite",
+            post(linked_repos::invite_linked_repo),
+        )
+        .route(
+            "/linked-repos/{id}/invites",
+            get(linked_repos::list_linked_repo_invites),
+        )
+        .route(
+            "/linked-repos/{id}/invites/{invite_id}",
+            delete(linked_repos::revoke_linked_repo_invite),
+        )
         .route("/events", get(events::list_events))
         .route("/users", post(users::create_user).get(users::list_users))
         .route("/users/transfer-super", post(users::transfer_super))
@@ -90,6 +123,11 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route(
             "/records/collection",
             delete(records::delete_collection_records),
+        )
+        .route("/database/status", get(database::status))
+        .route(
+            "/database/vacuum/schedule",
+            post(database::schedule_vacuum).delete(database::cancel_vacuum),
         )
         .route(
             "/network-lexicons",

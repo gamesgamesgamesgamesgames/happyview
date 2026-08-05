@@ -29,7 +29,7 @@ Aligns with the merged [Proposal 0016](https://github.com/bluesky-social/proposa
 
 ## v2.10.0 — Proposal 0016 Alignment
 
-Major restructuring to align with [AT Protocol Proposal 0016](https://github.com/bluesky-social/proposals) (Permissioned Data).
+Major restructuring to align with [atproto Proposal 0016](https://github.com/bluesky-social/proposals) (Permissioned Data).
 
 ### Namespace split
 

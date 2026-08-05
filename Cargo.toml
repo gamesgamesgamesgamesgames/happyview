@@ -9,7 +9,7 @@ default-run = "happyview"
 aes-gcm = "0.11"
 anyhow = "1"
 arc-swap = "1"
-atrium-oauth = { version = "0.1", features = ["default-client"] }
+atrium-oauth = { version = "0.1", default-features = false }
 atrium-identity = "0.1"
 atrium-common = "0.1"
 atrium-api = { version = "0.25", features = ["agent"] }
@@ -34,7 +34,7 @@ multibase = "0.9"
 p256 = { version = "0.14", features = ["pkcs8", "ecdsa"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.10"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "gzip"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_ipld_dagcbor = "0.6"
@@ -60,6 +60,7 @@ regex = "1.12.3"
 semver = "1.0"
 async-stream = "0.3.6"
 blake3 = "1"
+fs4 = "0.13"
 hkdf = "0.13"
 hmac = "0.13"
 sqlparser = "0.62.0"
@@ -68,6 +69,10 @@ subtle = "2"
 [[bin]]
 name = "migrate-lua-sql"
 path = "src/bin/migrate_lua_sql.rs"
+
+[[bin]]
+name = "migrate-space-cids"
+path = "src/bin/migrate_space_cids.rs"
 
 [dev-dependencies]
 wiremock = "0.6"

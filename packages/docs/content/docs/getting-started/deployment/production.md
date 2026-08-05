@@ -49,7 +49,7 @@ The base path is applied at container startup without rebuilding the image, so p
 
 ### XRPC endpoints
 
-ATProto clients expect XRPC endpoints at `/xrpc/*` on the domain root. When using a base path, configure your reverse proxy to rewrite `/xrpc/*` requests so they reach HappyView under its base path. Here's an example using Caddy:
+atproto clients expect XRPC endpoints at `/xrpc/*` on the domain root. When using a base path, configure your reverse proxy to rewrite `/xrpc/*` requests so they reach HappyView under its base path. Here's an example using Caddy:
 
 ```
 example.com {
@@ -63,7 +63,7 @@ example.com {
         redir /hv/ permanent
     }
 
-    # ATProto XRPC — rewrite to base path before proxying
+    # atproto XRPC — rewrite to base path before proxying
     handle /xrpc/* {
         rewrite * /hv{uri}
         reverse_proxy happyview:3000

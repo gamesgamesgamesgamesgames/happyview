@@ -9,13 +9,6 @@ mod tests {
 
     use crate::spaces::commit::{sign_commit, verify_commit};
     use crate::spaces::lthash::{LtHashState, record_element};
-    use k256::ecdsa::SigningKey;
-
-    fn test_signing_key() -> SigningKey {
-        let mut bytes = [0u8; 32];
-        bytes[31] = 1;
-        SigningKey::from_slice(&bytes[..]).unwrap()
-    }
 
     /// Add two records, generate a commit over the hash, verify it.
     #[test]
@@ -39,15 +32,13 @@ mod tests {
             "hash must change after second add"
         );
 
-        let sk = test_signing_key();
-        let vk = *sk.verifying_key();
         let space_uri = "at://did:plc:abc/space/com.example.forum/main";
         let rev = "3k2rev1";
 
-        let commit = sign_commit(&hash_after_ab, space_uri, "did:plc:testuser", rev, &sk).unwrap();
+        let commit = sign_commit(&hash_after_ab, space_uri, "did:plc:testuser", rev).unwrap();
         assert_eq!(commit.hash, hash_after_ab);
         assert_eq!(commit.rev, rev);
-        assert!(verify_commit(&commit, space_uri, "did:plc:testuser", &vk).is_ok());
+        assert!(verify_commit(&commit, space_uri, "did:plc:testuser").is_ok());
     }
 
     /// Remove a record — hash must change back toward the previous state.
@@ -74,11 +65,9 @@ mod tests {
             "hash after delete must match single-record state"
         );
 
-        let sk = test_signing_key();
-        let vk = *sk.verifying_key();
         let space_uri = "at://did:plc:abc/space/com.example.forum/main";
-        let commit = sign_commit(&hash_one, space_uri, "did:plc:testuser", "3k2rev2", &sk).unwrap();
-        assert!(verify_commit(&commit, space_uri, "did:plc:testuser", &vk).is_ok());
+        let commit = sign_commit(&hash_one, space_uri, "did:plc:testuser", "3k2rev2").unwrap();
+        assert!(verify_commit(&commit, space_uri, "did:plc:testuser").is_ok());
     }
 
     /// Commit signed for one hash must not verify against a different hash.
@@ -92,15 +81,13 @@ mod tests {
         state_b.add(&record_element("col", "key2", "cid2"));
         let hash_b = state_b.hash();
 
-        let sk = test_signing_key();
-        let vk = *sk.verifying_key();
         let space_uri = "at://did:plc:abc/space/com.example.forum/main";
 
-        let commit_a = sign_commit(&hash_a, space_uri, "did:plc:testuser", "rev1", &sk).unwrap();
+        let commit_a = sign_commit(&hash_a, space_uri, "did:plc:testuser", "rev1").unwrap();
         // Tamper: swap in hash_b
         let mut tampered = commit_a;
         tampered.hash = hash_b;
-        assert!(verify_commit(&tampered, space_uri, "did:plc:testuser", &vk).is_err());
+        assert!(verify_commit(&tampered, space_uri, "did:plc:testuser").is_err());
     }
 
     // -----------------------------------------------------------------------

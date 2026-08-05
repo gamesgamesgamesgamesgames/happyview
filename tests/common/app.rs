@@ -1,8 +1,7 @@
 use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig};
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{
-    AtprotoLocalhostClientMetadata, DefaultHttpClient, KnownScope, OAuthClientConfig,
-    OAuthResolverConfig, Scope,
+    AtprotoLocalhostClientMetadata, KnownScope, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 use axum::Router;
 use axum::http::Request;
@@ -51,9 +50,17 @@ impl TestApp {
         let config = Config {
             host: "127.0.0.1".into(),
             port: 0,
-            database_url: String::new(),
+            // Real value (not the pool, which comes from `db::test_pool()`
+            // above) so that code reading `config.database_url` directly —
+            // e.g. `disk::report` behind `/admin/database/status` — sees a
+            // file it can actually stat on SQLite. Nothing else in the
+            // binary reads this field outside of `main.rs`'s own startup,
+            // which `TestApp` bypasses entirely.
+            database_url: std::env::var("TEST_DATABASE_URL").unwrap_or_default(),
             database_backend: backend,
+            sqlite_journal_size_limit: happyview::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: "http://127.0.0.1:0".into(),
+            user_agent: String::new(),
             session_secret: "test-session-secret-0123456789abcdef".into(),
             jetstream_url: "wss://jetstream1.us-east.bsky.network".into(),
             relay_url: mock_url.clone(),
@@ -93,7 +100,8 @@ impl TestApp {
         let (collections_tx, _collections_rx) = watch::channel(initial_collections);
         let (labeler_subscriptions_tx, _) = watch::channel(());
 
-        let atrium_http = std::sync::Arc::new(DefaultHttpClient::default());
+        let atrium_http =
+            std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
         let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
             plc_directory_url: "https://plc.directory".into(),
             http_client: std::sync::Arc::clone(&atrium_http),
@@ -103,10 +111,14 @@ impl TestApp {
             http_client: atrium_http,
         });
         let oauth_pool = db::test_pool().await;
+        let oauth_scopes = vec![
+            Scope::Known(KnownScope::Atproto),
+            Scope::Unknown("identity:*".to_string()),
+        ];
         let oauth = atrium_oauth::OAuthClient::new(OAuthClientConfig {
             client_metadata: AtprotoLocalhostClientMetadata {
                 redirect_uris: Some(vec!["http://127.0.0.1:0/auth/callback".into()]),
-                scopes: Some(vec![Scope::Known(KnownScope::Atproto)]),
+                scopes: Some(oauth_scopes.clone()),
             },
             keys: None,
             state_store: happyview::auth::oauth_store::DbStateStore::new(
@@ -120,6 +132,7 @@ impl TestApp {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: happyview::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
 
@@ -156,6 +169,20 @@ impl TestApp {
             oauth_state_store: happyview::auth::oauth_store::DbStateStore::new(
                 pool.clone(),
                 backend,
+            ),
+            linked_repos_client: std::sync::Arc::new(
+                happyview::linked_repos::client::build(
+                    "https://plc.directory",
+                    "http://127.0.0.1:0/oauth-client-metadata.json",
+                    "http://127.0.0.1:0",
+                    "http://127.0.0.1:0/auth/callback".into(),
+                    true,
+                    oauth_scopes,
+                    happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                    pool.clone(),
+                    backend,
+                )
+                .expect("Failed to create test linked-repo OAuth client"),
             ),
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-that-is-at-least-32-bytes-long",

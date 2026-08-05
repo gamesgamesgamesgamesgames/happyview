@@ -120,6 +120,13 @@ pub enum Permission {
     JobsCreate,
     #[serde(rename = "jobs:manage")]
     JobsManage,
+
+    #[serde(rename = "linked-repos:read")]
+    LinkedReposRead,
+    #[serde(rename = "linked-repos:create")]
+    LinkedReposCreate,
+    #[serde(rename = "linked-repos:delete")]
+    LinkedReposDelete,
 }
 
 impl Permission {
@@ -172,6 +179,9 @@ impl Permission {
             Self::JobsRead => "jobs:read",
             Self::JobsCreate => "jobs:create",
             Self::JobsManage => "jobs:manage",
+            Self::LinkedReposRead => "linked-repos:read",
+            Self::LinkedReposCreate => "linked-repos:create",
+            Self::LinkedReposDelete => "linked-repos:delete",
         }
     }
 
@@ -453,6 +463,24 @@ impl Permission {
                 description: "Cancel, pause, and resume background jobs",
                 category: "Jobs",
             },
+            Self::LinkedReposRead => PermissionInfo {
+                key: "linked-repos:read",
+                name: "View Linked Repos",
+                description: "View linked repos, their status, and their scopes",
+                category: "Linked Repos",
+            },
+            Self::LinkedReposCreate => PermissionInfo {
+                key: "linked-repos:create",
+                name: "Link Repos",
+                description: "Add linked repos and start authorization flows",
+                category: "Linked Repos",
+            },
+            Self::LinkedReposDelete => PermissionInfo {
+                key: "linked-repos:delete",
+                name: "Unlink Repos",
+                description: "Revoke linked repos and delete their stored sessions",
+                category: "Linked Repos",
+            },
         }
     }
 
@@ -505,6 +533,9 @@ impl Permission {
             Self::JobsRead,
             Self::JobsCreate,
             Self::JobsManage,
+            Self::LinkedReposRead,
+            Self::LinkedReposCreate,
+            Self::LinkedReposDelete,
         ])
     }
 }
@@ -559,6 +590,9 @@ pub fn catalog() -> Vec<PermissionInfo> {
         JobsRead,
         JobsCreate,
         JobsManage,
+        LinkedReposRead,
+        LinkedReposCreate,
+        LinkedReposDelete,
     ]
     .iter()
     .map(|p| p.info())

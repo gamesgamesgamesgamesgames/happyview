@@ -195,6 +195,14 @@ await client.revoke(session.did);
 `logout()` still works as an alias for `revoke()`.
 </Callout>
 
+The stored session is always cleared, even when the server refuses the revocation. `404`, `401`, and `403` are treated as a completed logout — there is no live credential left to revoke. `5xx` and network errors still throw so you know revocation may not have reached the server, but they throw after the local session is gone, so the user is never left signed in by a failed logout.
+
+To clear a session locally without contacting the server at all:
+
+```typescript
+await client.forgetSession(session.did);
+```
+
 ## Resolution utilities
 
 | Property | Type     | Description                              |
@@ -345,7 +353,7 @@ The `redirect_uris` array must include the `redirectUri` your client is configur
 
 ## Local development
 
-For local development with ATProto's loopback client ID convention, use `buildLoopbackClientId`:
+For local development with atproto's loopback client ID convention, use `buildLoopbackClientId`:
 
 ```typescript
 import { buildLoopbackClientId } from "@happyview/oauth-client-browser";

@@ -7,7 +7,6 @@ use crate::spaces::types::SpaceRecord;
 
 const SHA2_256: u64 = 0x12;
 const DAG_CBOR: u64 = 0x71;
-const RAW: u64 = 0x55;
 
 fn unsigned_varint(mut value: u64) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -35,7 +34,6 @@ fn make_cid(codec: u64, block: &[u8]) -> Cid {
     Cid::new_v1(codec, mh)
 }
 
-// DAG-CBOR CID link: CBOR tag 42 wrapping bytes prefixed with 0x00 (multibase identity)
 fn cid_link(cid: &Cid) -> ciborium::Value {
     let mut bytes = vec![0x00u8]; // multibase identity prefix
     bytes.extend_from_slice(&cid.to_bytes());
@@ -58,13 +56,13 @@ fn write_car_block(out: &mut Vec<u8>, cid: &Cid, block: &[u8]) {
 }
 
 pub fn serialize_repo(commit: &SignedCommit, records: &[SpaceRecord]) -> Result<Vec<u8>, AppError> {
-    // Build record blocks sorted by collection/rkey
     let mut indexed: Vec<(&SpaceRecord, Vec<u8>, Cid)> = records
         .iter()
         .map(|r| {
-            let block = serde_json::to_vec(&r.record)
-                .map_err(|e| AppError::Internal(format!("failed to serialize record: {e}")))?;
-            let cid = make_cid(RAW, &block);
+            let block = crate::cid_verify::record_to_dag_cbor(&r.record).ok_or_else(|| {
+                AppError::Internal(format!("record {} cannot be encoded as DAG-CBOR", r.uri))
+            })?;
+            let cid = make_cid(DAG_CBOR, &block);
             Ok((r, block, cid))
         })
         .collect::<Result<Vec<_>, AppError>>()?;
@@ -99,10 +97,6 @@ pub fn serialize_repo(commit: &SignedCommit, records: &[SpaceRecord]) -> Result<
         (
             ciborium::Value::Text("ikm".into()),
             ciborium::Value::Bytes(commit.ikm.to_vec()),
-        ),
-        (
-            ciborium::Value::Text("sig".into()),
-            ciborium::Value::Bytes(commit.sig.clone()),
         ),
         (
             ciborium::Value::Text("mac".into()),
@@ -159,7 +153,6 @@ mod tests {
             ver: 1,
             hash: [0u8; 32],
             ikm: [0u8; 32],
-            sig: vec![0u8; 64],
             mac: [0u8; 32],
             rev: "3k2rev1".to_string(),
         }
@@ -180,7 +173,6 @@ mod tests {
             ver: 1,
             hash: [0xAA; 32],
             ikm: [0xBB; 32],
-            sig: vec![0xCC; 64],
             mac: [0xDD; 32],
             rev: "3k2rev1".to_string(),
         };
@@ -213,6 +205,55 @@ mod tests {
 
         let car = serialize_repo(&commit, &records).unwrap();
         assert!(car.len() > 100);
+    }
+
+    #[test]
+    fn record_block_cid_is_the_records_real_cid() {
+        let value = serde_json::json!({ "$type": "com.example.post", "text": "hello" });
+        let expected = crate::cid_verify::compute_record_cid(&value).expect("encodable");
+
+        let records = vec![SpaceRecord {
+            uri: "u1".into(),
+            space_id: "s".into(),
+            author_did: "d".into(),
+            collection: "com.example.post".into(),
+            rkey: "1".into(),
+            record: value,
+            cid: expected.to_string(),
+            indexed_at: "2026-01-01".into(),
+        }];
+
+        let car = serialize_repo(&test_commit(), &records).unwrap();
+        let needle = expected.to_bytes();
+        assert!(
+            car.windows(needle.len()).any(|w| w == needle),
+            "CAR must address the record block by its canonical DAG-CBOR CID"
+        );
+    }
+
+    #[test]
+    fn record_blocks_are_dag_cbor_not_json() {
+        let records = vec![SpaceRecord {
+            uri: "u1".into(),
+            space_id: "s".into(),
+            author_did: "d".into(),
+            collection: "com.example.post".into(),
+            rkey: "1".into(),
+            record: serde_json::json!({ "text": "hello" }),
+            cid: "unused".into(),
+            indexed_at: "2026-01-01".into(),
+        }];
+
+        let car = serialize_repo(&test_commit(), &records).unwrap();
+        let json = br#"{"text":"hello"}"#;
+        assert!(
+            !car.windows(json.len()).any(|w| w == json),
+            "record must not be embedded as raw JSON"
+        );
+        // The DAG-CBOR encoding of {"text":"hello"} is present instead.
+        let cbor = crate::cid_verify::record_to_dag_cbor(&serde_json::json!({ "text": "hello" }))
+            .expect("encodable");
+        assert!(car.windows(cbor.len()).any(|w| w == cbor));
     }
 
     #[test]

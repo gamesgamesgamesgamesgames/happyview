@@ -197,7 +197,9 @@ mod tests {
             port: 3000,
             database_url: String::new(),
             database_backend: DatabaseBackend::Sqlite,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -223,7 +225,7 @@ mod tests {
             .max_connections(1)
             .connect_lazy("sqlite::memory:")
             .unwrap();
-        let atrium_http = std::sync::Arc::new(atrium_oauth::DefaultHttpClient::default());
+        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
         let did_resolver = atrium_identity::did::CommonDidResolver::new(
             atrium_identity::did::CommonDidResolverConfig {
                 plc_directory_url: "https://plc.directory".into(),
@@ -258,6 +260,7 @@ mod tests {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
         AppState {
@@ -283,6 +286,25 @@ mod tests {
             oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
                 test_db.clone(),
                 DatabaseBackend::Sqlite,
+            ),
+            linked_repos_client: std::sync::Arc::new(
+                crate::linked_repos::client::build(
+                    "https://plc.directory",
+                    "http://127.0.0.1:0/oauth-client-metadata.json",
+                    "http://127.0.0.1:0",
+                    "http://127.0.0.1:0/auth/callback".into(),
+                    true,
+                    vec![atrium_oauth::Scope::Known(
+                        atrium_oauth::KnownScope::Atproto,
+                    )],
+                    crate::auth::oauth_store::DbStateStore::new(
+                        test_db.clone(),
+                        DatabaseBackend::Sqlite,
+                    ),
+                    test_db.clone(),
+                    DatabaseBackend::Sqlite,
+                )
+                .expect("Failed to create test linked-repo OAuth client"),
             ),
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-for-tests-only-not-production",

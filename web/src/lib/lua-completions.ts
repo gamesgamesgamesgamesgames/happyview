@@ -288,7 +288,7 @@ const STATIC_COMPLETIONS: LuaCompletions = {
     { label: "get_labels", detail: "function", description: "Get labels for a URI — atproto.get_labels(uri) → label[]", insertText: "get_labels(${1:uri})" },
     { label: "get_labels_batch", detail: "function", description: "Get labels for multiple URIs — atproto.get_labels_batch({uri1, uri2}) → {[uri]: label[]}", insertText: "get_labels_batch(${1:uris})" },
     { label: "sign", detail: "function", description: "Sign a record (requires attestation signer) — atproto.sign(record) → signature", insertText: "sign(${1:record})" },
-    { label: "verify_signature", detail: "function", description: "Verify a record signature — atproto.verify_signature(record, sig, repo_did) → boolean", insertText: "verify_signature(${1:record}, ${2:sig}, ${3:repo_did})" },
+    { label: "verify_signature", detail: "function", description: "Verify a record signature — atproto.verify_signature(record, sig, repo_did) → boolean; raises when the signature can't be checked (pcall to distinguish from a mismatch)", insertText: "verify_signature(${1:record}, ${2:sig}, ${3:repo_did})" },
     { label: "spaces", detail: "table", description: "Permissioned Spaces sub-table — atproto.spaces.*" },
   ],
   // HappyView Spaces API (atproto.spaces.*)

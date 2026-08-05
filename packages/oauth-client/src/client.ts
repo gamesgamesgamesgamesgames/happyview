@@ -14,7 +14,10 @@ import type {
   StoredSession,
 } from "./types";
 
-const STORAGE_PREFIX = "happyview:session:";
+/// The storage keys this client reads and writes. Exported because a consumer
+/// recovering a wedged session by hand would otherwise have to hardcode them,
+/// which silently breaks the day they are renamed.
+export const STORAGE_PREFIX = "happyview:session:";
 export const LAST_ACTIVE_KEY = "happyview:last-active-did";
 
 export interface FetchMetadataOptions {
@@ -192,24 +195,55 @@ export class HappyViewOAuthClient {
     return session;
   }
 
+  /**
+   * Revoke the session server-side and clear it locally.
+   *
+   * The local cleanup runs unconditionally. If it did not, a server that
+   * refuses the revocation would leave the session in storage, `restore()`
+   * would sign the user back in on the next load, and the next logout would
+   * fail identically — a loop with no exit through this API.
+   */
   async deleteSession(did: string): Promise<void> {
-    const session = await this.restoreSession(did);
-    if (session) {
-      const resp = await session.fetchHandler(
-        `${this.instanceUrl}/oauth/sessions/${did}`,
-        { method: "DELETE" },
-      );
-
-      if (!resp.ok && resp.status !== 404) {
-        const body = await resp.json().catch(() => ({}));
-        throw new ApiError(
-          `Failed to delete session: ${resp.status} ${(body as any).error ?? (body as any).message ?? resp.statusText}`,
-          resp.status,
-          body,
+    try {
+      const session = await this.restoreSession(did);
+      if (session) {
+        const resp = await session.fetchHandler(
+          `${this.instanceUrl}/oauth/sessions/${did}`,
+          { method: "DELETE" },
         );
-      }
-    }
 
+        // 404: already gone. 401/403: the credential is itself invalid, so
+        // there is no live session left to revoke. None of these is a logout
+        // that failed, so none of them should be reported as one.
+        const alreadyUnusable =
+          resp.status === 404 || resp.status === 401 || resp.status === 403;
+
+        if (!resp.ok && !alreadyUnusable) {
+          const body = await resp.json().catch(() => ({}));
+          throw new ApiError(
+            `Failed to delete session: ${resp.status} ${(body as any).error ?? (body as any).message ?? resp.statusText}`,
+            resp.status,
+            body,
+          );
+        }
+      }
+    } finally {
+      // 5xx and network errors still throw — the server may genuinely still
+      // hold a live session and the caller deserves to know. They throw from
+      // here, after the local state is gone, so the user is logged out either
+      // way.
+      await this.forgetSession(did);
+    }
+  }
+
+  /**
+   * Clear a session locally without contacting the server.
+   *
+   * The escape hatch for a session that cannot be revoked remotely — a revoked
+   * or expired credential, an unreachable instance. Nothing is revoked, so the
+   * server may still consider the session live until it expires.
+   */
+  async forgetSession(did: string): Promise<void> {
     await this.storage.delete(`${STORAGE_PREFIX}${did}`);
 
     const lastActive = await this.storage.get(LAST_ACTIVE_KEY);

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig};
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{
-    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, DefaultHttpClient,
-    GrantType, OAuthClientConfig, OAuthResolverConfig,
+    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, GrantType,
+    OAuthClientConfig, OAuthResolverConfig,
 };
 
 use crate::HappyViewOAuthClient;
@@ -179,7 +179,9 @@ impl OAuthClientRegistry {
             scopes
         };
 
-        let http = Arc::new(DefaultHttpClient::default());
+        let http = Arc::new(crate::http_retry::HappyViewHttpClient::new(
+            crate::http_retry::shared_client().clone(),
+        ));
         let resolver = OAuthResolverConfig {
             did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                 plc_directory_url: plc_url.to_string(),
@@ -203,6 +205,9 @@ impl OAuthClientRegistry {
                 state_store: state_store.clone(),
                 session_store: DbSessionStore::new(session_store_pool.clone(), *db_backend),
                 resolver,
+                http_client: crate::http_retry::HappyViewHttpClient::new(
+                    crate::http_retry::shared_client().clone(),
+                ),
             })
         } else {
             atrium_oauth::OAuthClient::new(OAuthClientConfig {
@@ -220,6 +225,9 @@ impl OAuthClientRegistry {
                 state_store: state_store.clone(),
                 session_store: DbSessionStore::new(session_store_pool.clone(), *db_backend),
                 resolver,
+                http_client: crate::http_retry::HappyViewHttpClient::new(
+                    crate::http_retry::shared_client().clone(),
+                ),
             })
         };
 
@@ -277,7 +285,9 @@ impl OAuthClientRegistry {
             };
 
             // Each OAuthClient needs its own resolver instances (they're not Clone)
-            let http = Arc::new(DefaultHttpClient::default());
+            let http = Arc::new(crate::http_retry::HappyViewHttpClient::new(
+                crate::http_retry::shared_client().clone(),
+            ));
             let resolver = OAuthResolverConfig {
                 did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                     plc_directory_url: plc_url.to_string(),
@@ -301,6 +311,9 @@ impl OAuthClientRegistry {
                     state_store: state_store.clone(),
                     session_store: DbSessionStore::new(session_store_pool.clone(), db_backend),
                     resolver,
+                    http_client: crate::http_retry::HappyViewHttpClient::new(
+                        crate::http_retry::shared_client().clone(),
+                    ),
                 })
             } else {
                 atrium_oauth::OAuthClient::new(OAuthClientConfig {
@@ -318,6 +331,9 @@ impl OAuthClientRegistry {
                     state_store: state_store.clone(),
                     session_store: DbSessionStore::new(session_store_pool.clone(), db_backend),
                     resolver,
+                    http_client: crate::http_retry::HappyViewHttpClient::new(
+                        crate::http_retry::shared_client().clone(),
+                    ),
                 })
             };
 

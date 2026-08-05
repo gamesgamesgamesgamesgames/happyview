@@ -14,6 +14,8 @@ import {
   getBackfillJobs,
   getBackfillRepos,
   getBackfillPdsSummary,
+  getBackfillErrors,
+  retryFailedBackfill,
   flushBackfillDetails,
   flushAllBackfillDetails,
   getLexicons,
@@ -23,6 +25,8 @@ import type {
   BackfillRepoEntry,
   PdsSummaryEntry,
   BackfillEvent,
+  BackfillErrorCount,
+  BackfillErrorEntry,
   BlueskyProfile,
 } from "@/types/backfill";
 import { CheckCircle2, ChevronRight, Circle, Loader2, PauseCircle } from "lucide-react";
@@ -87,6 +91,26 @@ const PROGRESS_PHASES = [
   "fetching_records",
 ] as const;
 
+// Operators read these, not enum names.
+const ERROR_KIND_LABELS: Record<string, string> = {
+  dns_failure: "Domain not resolving",
+  connection_failed: "Could not connect",
+  timeout: "Timed out",
+  pds_server_error: "Server error",
+  rate_limited: "Rate limited",
+  did_doc_not_found: "No did.json (404)",
+  did_doc_forbidden: "Blocked (403)",
+  did_doc_invalid: "Invalid DID document",
+  repo_not_found: "Repo deleted or moved",
+  repo_deactivated: "Account deactivated",
+  repo_takendown: "Account taken down",
+  other: "Other",
+};
+
+function errorKindLabel(kind: string): string {
+  return ERROR_KIND_LABELS[kind] ?? kind.replace(/_/g, " ");
+}
+
 function statusBadge(job: BackfillJob) {
   switch (job.status) {
     case "completed":
@@ -138,6 +162,19 @@ function phaseIndex(stage: string): number {
     stage as (typeof PROGRESS_PHASES)[number],
   );
   return idx;
+}
+
+// The four progress counters only ever increase within a job run (each phase
+// seeds its atomic from a DB count and increments), so when reconciling a
+// snapshot value against the client's current value, the larger of the two
+// is always correct — never a step backwards.
+function maxCount(
+  snapshot: number | null | undefined,
+  current: number | null,
+): number | null {
+  if (snapshot == null) return current;
+  if (current == null) return snapshot;
+  return Math.max(snapshot, current);
 }
 
 // SSE via Web Worker — events are batched off the main thread and flushed periodically
@@ -376,6 +413,111 @@ function ProfileRow({ did, profile, suffix }: {
   );
 }
 
+// One failure kind within the Errors row: a collapsible sub-row that lazily
+// loads its own DIDs on expand, same lazy pattern as the other detail lists.
+function ErrorKindGroup({
+  jobId,
+  kind,
+  count,
+  retryable,
+  canRetry,
+  retrying,
+  onRetry,
+  profiles,
+  onVisibleDidsChange,
+}: {
+  jobId: string;
+  kind: string;
+  count: number;
+  retryable: boolean;
+  canRetry: boolean;
+  retrying: boolean;
+  onRetry: (kinds: string[]) => void;
+  profiles: Map<string, BlueskyProfile>;
+  onVisibleDidsChange: (dids: string[]) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [entries, setEntries] = useState<BackfillErrorEntry[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    if (open && !loaded) {
+      getBackfillErrors(jobId, { kind, limit: 50 })
+        .then((resp) => {
+          setEntries(resp.errors);
+          setCursor(resp.cursor);
+          setLoaded(true);
+        })
+        .catch(() => {});
+    }
+  }, [jobId, kind, open, loaded]);
+
+  const loadMore = useCallback(async () => {
+    if (!cursor) return;
+    try {
+      const resp = await getBackfillErrors(jobId, { kind, cursor, limit: 50 });
+      setEntries((prev) => [...prev, ...resp.errors]);
+      setCursor(resp.cursor);
+    } catch { /* ignore */ }
+  }, [jobId, kind, cursor]);
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <div className="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-accent/50">
+        <CollapsibleTrigger asChild>
+          <button type="button" className="flex flex-1 items-center gap-2 text-left cursor-pointer">
+            <ChevronRight
+              className={`size-3.5 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
+            />
+            <span className="flex-1 truncate">{errorKindLabel(kind)}</span>
+            <span className="tabular-nums text-muted-foreground">{count.toLocaleString()}</span>
+          </button>
+        </CollapsibleTrigger>
+        {retryable && canRetry && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-6 shrink-0 px-2 text-xs"
+            disabled={retrying}
+            onClick={() => onRetry([kind])}
+          >
+            Retry these
+          </Button>
+        )}
+      </div>
+      <CollapsibleContent>
+        <div className="border-t bg-background">
+          {!loaded ? (
+            <div className="flex items-center justify-center py-3">
+              <Loader2 className="size-4 animate-spin text-muted-foreground" />
+            </div>
+          ) : entries.length > 0 ? (
+            <VirtualList
+              items={entries}
+              getKey={(e) => e.did}
+              onVisibleKeysChange={onVisibleDidsChange}
+              hasMore={!!cursor}
+              onLoadMore={loadMore}
+              rowHeight={44}
+              renderRow={(entry) => (
+                <div className="py-0.5">
+                  <CompactRepoRow did={entry.did} profile={profiles.get(entry.did)} />
+                  <p className="truncate px-3 text-[11px] text-muted-foreground">
+                    {entry.message}
+                  </p>
+                </div>
+              )}
+            />
+          ) : (
+            <p className="py-3 text-center text-xs text-muted-foreground">No entries.</p>
+          )}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
 export default function BackfillPage() {
   const { hasPermission } = useCurrentUser();
   const [jobs, setJobs] = useState<BackfillJob[]>([]);
@@ -510,6 +652,7 @@ export default function BackfillPage() {
                 job={selectedJob}
                 canCancel={hasPermission("backfill:create")}
                 canFlush={canFlush}
+                canRetry={hasPermission("backfill:create")}
                 onJobUpdate={(updater) => {
                   setJobs((prev) =>
                     prev.map((j) =>
@@ -529,6 +672,10 @@ export default function BackfillPage() {
                   await resumeBackfillJob(selectedJob.id);
                   load();
                 }}
+                onRetry={async (kinds) => {
+                  await retryFailedBackfill(selectedJob.id, kinds);
+                  load();
+                }}
               />
             )}
           </SheetContent>
@@ -542,22 +689,27 @@ function JobDetail({
   job,
   canCancel,
   canFlush,
+  canRetry,
   onJobUpdate,
   onCancel,
   onPause,
   onResume,
+  onRetry,
 }: {
   job: BackfillJob;
   canCancel: boolean;
   canFlush: boolean;
+  canRetry: boolean;
   onJobUpdate: (updater: (job: BackfillJob) => BackfillJob) => void;
   onCancel: () => Promise<void>;
   onPause: () => Promise<void>;
   onResume: () => Promise<void>;
+  onRetry: (kinds?: string[]) => Promise<void>;
 }) {
   const [cancelling, setCancelling] = useState(false);
   const [pausing, setPausing] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const current = phaseIndex(job.stage);
   const allDone = job.status === "completed";
   const isActive = job.status === "running" || job.status === "cancelling" || job.status === "pausing";
@@ -574,6 +726,42 @@ function JobDetail({
   const [fetchedRepos, setFetchedRepos] = useState<BackfillRepoEntry[]>([]);
   const [fetchedCursor, setFetchedCursor] = useState<string | null>(null);
   const [fetchedLoaded, setFetchedLoaded] = useState(false);
+
+  // Error summary state. Sourced from the errors API (not `job.error_counts`)
+  // because that's the only place `retryable` per kind is served — see the
+  // dispatcher's note that a client-side retryable set must not be
+  // hardcoded. `job.error_counts` (populated live via SSE `job_snapshot`,
+  // Task 8) is used only as a cheap trigger to refresh this summary while a
+  // job is actively running; it is never itself rendered, since it carries
+  // no `retryable` flag and the `/status` list endpoint that seeds `jobs[]`
+  // doesn't return it at all, which would otherwise make this row vanish
+  // for a job that isn't currently connected over SSE.
+  const [errorSummary, setErrorSummary] = useState<BackfillErrorCount[]>([]);
+  const [errorsCapped, setErrorsCapped] = useState(false);
+  const [errorsCap, setErrorsCap] = useState(0);
+  const [errorsOpen, setErrorsOpen] = useState(false);
+  const [visibleErrorDidsByKind, setVisibleErrorDidsByKind] = useState<Record<string, string[]>>({});
+
+  const jobErrorTotal = useMemo(
+    () => (job.error_counts ? Object.values(job.error_counts).reduce((a, b) => a + b, 0) : 0),
+    [job.error_counts],
+  );
+
+  useEffect(() => {
+    getBackfillErrors(job.id, { limit: 1 })
+      .then((resp) => {
+        setErrorSummary(resp.counts);
+        setErrorsCapped(resp.capped);
+        setErrorsCap(resp.cap);
+      })
+      .catch(() => {});
+  }, [job.id, jobErrorTotal]);
+
+  const errorsTotal = useMemo(
+    () => errorSummary.reduce((sum, c) => sum + c.count, 0),
+    [errorSummary],
+  );
+  const anyRetryable = useMemo(() => errorSummary.some((c) => c.retryable), [errorSummary]);
 
   // Refs for open state and callbacks so the SSE callback doesn't need to re-bind on toggle
   const onJobUpdateRef = useRef(onJobUpdate);
@@ -631,6 +819,18 @@ function JobDetail({
       toast.success("Backfill job resumed");
     } finally {
       setResuming(false);
+    }
+  }
+
+  async function handleRetry(kinds?: string[]) {
+    setRetrying(true);
+    try {
+      await onRetry(kinds);
+      toast.success("Retry job started");
+    } catch (e: unknown) {
+      toastError("Failed to start retry", e);
+    } finally {
+      setRetrying(false);
     }
   }
 
@@ -693,7 +893,26 @@ function JobDetail({
     const update = onJobUpdateRef.current;
 
     for (const e of events) {
-      if (e.type === "job_counters") {
+      if (e.type === "job_snapshot") {
+        // `status`/`stage` are written to the DB unconditionally before every
+        // publish, so they're always authoritative — replace wholesale, same
+        // as `error_counts`, a whole object that should be replaced as one.
+        // The four progress counters are batch-written to the DB (~every
+        // 10-100 items) while their deltas publish on every item, so a
+        // snapshot can legitimately read behind a delta the client already
+        // applied — take the larger value so a resync can't count the UI
+        // backwards.
+        update((j) => ({
+          ...j,
+          status: e.status ?? j.status,
+          stage: e.stage ?? j.stage,
+          total_repos: maxCount(e.total_repos, j.total_repos),
+          resolved_repos: maxCount(e.resolved_repos, j.resolved_repos),
+          processed_repos: maxCount(e.processed_repos, j.processed_repos),
+          total_records: maxCount(e.total_records, j.total_records),
+          error_counts: e.error_counts ?? j.error_counts,
+        }));
+      } else if (e.type === "job_counters") {
         update((j) => ({
           ...j,
           ...(e.total_repos != null && { total_repos: e.total_repos }),
@@ -719,8 +938,11 @@ function JobDetail({
     const dids = new Set<string>();
     for (const d of visibleDiscoveredDids) dids.add(d);
     for (const d of visibleFetchedDids) dids.add(d);
+    for (const kindDids of Object.values(visibleErrorDidsByKind)) {
+      for (const d of kindDids) dids.add(d);
+    }
     return Array.from(dids);
-  }, [visibleDiscoveredDids, visibleFetchedDids]);
+  }, [visibleDiscoveredDids, visibleFetchedDids, visibleErrorDidsByKind]);
 
   const profiles = useBlueskyProfiles(allVisibleDids);
 
@@ -906,6 +1128,61 @@ function JobDetail({
                 <p className="py-3 text-center text-xs text-muted-foreground">No repos fetched yet.</p>
               ) : null}
             </ProgressRow>
+            {errorsTotal > 0 && (
+              <ProgressRow
+                label="Errors"
+                active={false}
+                reached
+                value={
+                  <span className="font-medium text-destructive">
+                    <AnimatedNumber value={errorsTotal} />
+                  </span>
+                }
+                suffix="failed"
+                loading={false}
+                open={errorsOpen}
+                onOpenChange={setErrorsOpen}
+              >
+                <div className="divide-y">
+                  {(errorsCapped || (canRetry && anyRetryable)) && (
+                    <div className="flex items-center justify-between gap-2 px-3 py-2 text-xs">
+                      <span className="text-muted-foreground">
+                        {errorsCapped
+                          ? `Detail log capped — showing first ${errorsCap.toLocaleString()} of ${errorsTotal.toLocaleString()}`
+                          : null}
+                      </span>
+                      {canRetry && anyRetryable && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 shrink-0 px-2 text-xs"
+                          disabled={retrying}
+                          onClick={() => handleRetry(undefined)}
+                        >
+                          Retry all failed
+                        </Button>
+                      )}
+                    </div>
+                  )}
+                  {errorSummary.map((c) => (
+                    <ErrorKindGroup
+                      key={c.kind}
+                      jobId={job.id}
+                      kind={c.kind}
+                      count={c.count}
+                      retryable={c.retryable}
+                      canRetry={canRetry}
+                      retrying={retrying}
+                      onRetry={handleRetry}
+                      profiles={profiles}
+                      onVisibleDidsChange={(dids) =>
+                        setVisibleErrorDidsByKind((prev) => ({ ...prev, [c.kind]: dids }))
+                      }
+                    />
+                  ))}
+                </div>
+              </ProgressRow>
+            )}
           </div>
         </div>
       </div>

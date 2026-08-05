@@ -19,8 +19,10 @@ pub mod jetstream;
 pub mod jobs;
 pub mod labeler;
 pub mod lexicon;
+pub mod linked_repos;
 pub mod lua;
 pub mod lua_analysis;
+pub mod maintenance;
 pub mod oauth;
 pub mod plc;
 pub mod plugin;
@@ -36,6 +38,8 @@ pub mod service_entries;
 pub mod service_identity;
 pub mod setup;
 pub mod spaces;
+#[cfg(test)]
+pub mod test_support;
 pub mod verification_methods;
 pub mod xrpc;
 
@@ -49,21 +53,22 @@ use rate_limit::RateLimiter;
 use std::sync::Arc;
 use tokio::sync::watch;
 
+use crate::http_retry::HappyViewHttpClient;
 use atrium_identity::did::CommonDidResolver;
 use atrium_identity::handle::AtprotoHandleResolver;
-use atrium_oauth::DefaultHttpClient;
 
 pub type HappyViewOAuthClient = atrium_oauth::OAuthClient<
     DbStateStore,
     DbSessionStore,
-    CommonDidResolver<DefaultHttpClient>,
-    AtprotoHandleResolver<NativeDnsResolver, DefaultHttpClient>,
+    CommonDidResolver<HappyViewHttpClient>,
+    AtprotoHandleResolver<NativeDnsResolver, HappyViewHttpClient>,
+    HappyViewHttpClient,
 >;
 
 pub type HappyViewOAuthSession = atrium_oauth::OAuthSession<
-    DefaultHttpClient,
-    CommonDidResolver<DefaultHttpClient>,
-    AtprotoHandleResolver<NativeDnsResolver, DefaultHttpClient>,
+    HappyViewHttpClient,
+    CommonDidResolver<HappyViewHttpClient>,
+    AtprotoHandleResolver<NativeDnsResolver, HappyViewHttpClient>,
     DbSessionStore,
 >;
 
@@ -81,6 +86,7 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub oauth: Arc<auth::OAuthClientRegistry>,
     pub oauth_state_store: DbStateStore,
+    pub linked_repos_client: Arc<HappyViewOAuthClient>,
     pub cookie_key: axum_extra::extract::cookie::Key,
     pub plugin_registry: Arc<plugin::PluginRegistry>,
     pub wasm_runtime: Arc<plugin::WasmRuntime>,

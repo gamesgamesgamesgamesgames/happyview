@@ -8,8 +8,7 @@ mod common;
 use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig};
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{
-    AtprotoLocalhostClientMetadata, DefaultHttpClient, KnownScope, OAuthClientConfig,
-    OAuthResolverConfig, Scope,
+    AtprotoLocalhostClientMetadata, KnownScope, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 use happyview::AppState;
 use happyview::config::Config;
@@ -29,7 +28,9 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
         port: 3000,
         database_url: String::new(),
         database_backend: backend,
+        sqlite_journal_size_limit: happyview::db::DEFAULT_JOURNAL_SIZE_LIMIT,
         public_url: String::new(),
+        user_agent: String::new(),
         base_path: None,
         session_secret: "test-secret".into(),
         jetstream_url: String::new(),
@@ -47,7 +48,7 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
     };
     let (tx, _) = watch::channel(vec![]);
     let (labeler_tx, _) = watch::channel(());
-    let atrium_http = std::sync::Arc::new(DefaultHttpClient::default());
+    let atrium_http = std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
     let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
         plc_directory_url: "https://plc.directory".into(),
         http_client: std::sync::Arc::clone(&atrium_http),
@@ -71,6 +72,7 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
             authorization_server_metadata: Default::default(),
             protected_resource_metadata: Default::default(),
         },
+        http_client: happyview::http_retry::HappyViewHttpClient::default(),
     })
     .expect("Failed to create test OAuth client");
     AppState {
@@ -92,6 +94,20 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
             std::sync::Arc::new(oauth),
         )),
         oauth_state_store: happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+        linked_repos_client: std::sync::Arc::new(
+            happyview::linked_repos::client::build(
+                "https://plc.directory",
+                "http://127.0.0.1:0/oauth-client-metadata.json",
+                "http://127.0.0.1:0",
+                "http://127.0.0.1:0/auth/callback".into(),
+                true,
+                vec![Scope::Known(KnownScope::Atproto)],
+                happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                pool.clone(),
+                backend,
+            )
+            .expect("Failed to create test linked-repo OAuth client"),
+        ),
         cookie_key: axum_extra::extract::cookie::Key::derive_from(
             b"test-secret-that-is-at-least-32-bytes-long",
         ),
@@ -115,6 +131,10 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
     }
 }
 
+/// Arrival time stamped on seeded rows, standing in for what the Jetstream
+/// consumer would have written.
+const SEEDED_INDEXED_AT: &str = "2026-07-24T16:21:56.566+00:00";
+
 async fn seed_record(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -125,8 +145,8 @@ async fn seed_record(
     record: serde_json::Value,
 ) {
     let sql = adapt_sql(
-        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
     happyview::db::query(&sql)
@@ -136,10 +156,30 @@ async fn seed_record(
         .bind(rkey)
         .bind(serde_json::to_string(&record).unwrap_or_default())
         .bind("bafyseed")
+        .bind(SEEDED_INDEXED_AT)
         .bind(now_rfc3339())
         .execute(pool)
         .await
         .expect("failed to seed record");
+}
+
+/// Read back the two network-derived columns. `indexed_at` is `None` when SQL
+/// NULL — the correct state for a record written locally and not yet echoed
+/// back by Jetstream.
+async fn fetch_provenance(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    uri: &str,
+) -> Option<(String, Option<String>)> {
+    let sql = adapt_sql(
+        "SELECT cid, indexed_at FROM happyview_records WHERE uri = ?",
+        backend,
+    );
+    happyview::db::query_as(&sql)
+        .bind(uri)
+        .fetch_optional(pool)
+        .await
+        .expect("fetch provenance")
 }
 
 async fn count_records(pool: &sqlx::AnyPool, backend: DatabaseBackend, uri: &str) -> i64 {
@@ -328,6 +368,13 @@ async fn record_instance_save_local_updates_existing_row() {
     assert_eq!(body["$type"], "test.collection");
     // Row count unchanged (upsert).
     assert_eq!(count_records(&pool, backend, uri).await, 1);
+
+    // A local-only edit must not disturb the network-derived columns. The CID
+    // still describes what the PDS holds — redacting our copy doesn't change
+    // their copy — and it's what strongRefs are built from.
+    let (cid, indexed_at) = fetch_provenance(&pool, backend, uri).await.unwrap();
+    assert_eq!(cid, "bafyseed");
+    assert_eq!(indexed_at.as_deref(), Some(SEEDED_INDEXED_AT));
 }
 
 #[tokio::test]
@@ -361,6 +408,15 @@ async fn record_save_local_creates_new_row_when_repo_set() {
     let body = fetch_record_body(&pool, backend, &uri).await.unwrap();
     assert_eq!(body["value"], 42);
     assert_eq!(body["$type"], "test.collection");
+
+    // This record has never existed on a PDS, so there is no CID describing it
+    // and it has never arrived from the network.
+    let (cid, indexed_at) = fetch_provenance(&pool, backend, &uri).await.unwrap();
+    assert_eq!(cid, "", "no PDS version means no CID to record");
+    // Asserts the explicit NULL bind rather than an omitted column: SQLite
+    // declares `indexed_at TEXT DEFAULT (datetime('now'))`, which would
+    // otherwise fabricate an arrival time on that backend but not on Postgres.
+    assert_eq!(indexed_at, None);
 }
 
 #[tokio::test]

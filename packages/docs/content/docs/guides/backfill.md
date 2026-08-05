@@ -22,7 +22,7 @@ Progress counters (`total_repos`, `resolved_repos`, `processed_repos`, `total_re
 
 ### Rate limiting
 
-All three phases handle HTTP 429 responses. HappyView reads the `RateLimit-Reset` header (a Unix timestamp, the AT Protocol convention) to determine how long to wait, falling back to the `retry-after` header, then defaulting to 5 seconds.
+All three phases handle HTTP 429 responses. HappyView reads the `RateLimit-Reset` header (a Unix timestamp, the atproto convention) to determine how long to wait, falling back to the `retry-after` header, then defaulting to 5 seconds.
 
 ## Job lifecycle
 

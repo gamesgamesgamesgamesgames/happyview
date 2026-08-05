@@ -5,6 +5,7 @@ import {
   IconDashboard,
   IconFileDescription,
   IconDatabase,
+  IconDatabaseCog,
   IconTable,
   IconClipboardList,
   IconUsers,
@@ -23,6 +24,7 @@ import {
   IconFlask,
   IconFingerprint,
   IconPlayerPlay,
+  IconLink,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -82,6 +84,12 @@ const accessItems: NavItem[] = [
     requiredPermissions: ["users:read"],
   },
   {
+    title: "Linked Repos",
+    url: "/dashboard/settings/linked-repos",
+    icon: IconLink,
+    requiredPermissions: ["linked-repos:read"],
+  },
+  {
     title: "API Keys",
     url: "/dashboard/settings/api-keys",
     icon: IconKey,
@@ -121,6 +129,12 @@ const systemItems: NavItem[] = [
     title: "General",
     url: "/dashboard/settings/general",
     icon: IconSettings,
+    requiredPermissions: ["settings:manage"],
+  },
+  {
+    title: "Database",
+    url: "/dashboard/settings/database",
+    icon: IconDatabaseCog,
     requiredPermissions: ["settings:manage"],
   },
   {
@@ -191,7 +205,10 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       .then((info) => {
         if (!cancelled) {
           if (info.restart_recommended) {
-            addReason("backfill-pool", "Backfill pool is undersized for current concurrency settings.");
+            addReason(
+              "backfill-pool",
+              "Backfill pool is undersized for current concurrency settings.",
+            );
           } else {
             removeReason("backfill-pool");
           }
