@@ -64,6 +64,8 @@ Keep in mind that the time it takes for `VACUUM` to run scales with the size of 
 
 ### Bug fixes
 
+- **Fixed a deadlock that could occur during backfill.**
+  [insert "nobody understands semaphores" meme here]
 - **Fixed the jobs system when using SQLite.**
   An issue with `inherit_auth` caused all jobs to stall on HappyView instances using SQLite.
 - **Permissioned spaces now use proper CIDs.**
@@ -85,6 +87,13 @@ Three advisories, all in dependencies:
 
 - **[RUSTSEC-2026-0222](https://rustsec.org/advisories/RUSTSEC-2026-0222) / [GHSA-hgjw-h833-99q9](https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-hgjw-h833-99q9)** - "Stores can mix up type indices between engines" (CVSS 3.8, low) in `wasmtime`. Fixed by moving to 36.0.13, which also bumps everything that ships alongside it: the `cranelift` crates, `pulley-interpreter`, `pulley-macros`, `winch-codegen`, and the `wasmtime-internal-*` crates.
 - **[RUSTSEC-2026-0221](https://rustsec.org/advisories/RUSTSEC-2026-0221)** - an unsoundness in `event-listener` where a `!Send` tag could cross a thread boundary via `StackSlot` and cause a data race in safe code. Fixed in 5.4.2, which also drops `concurrent-queue` from HappyView's dependency tree entirely.
+
+## Contributors
+
+Huge thanks to the following users and contributors that helped me identify various issues:
+
+- [Tierney (@bnb.im)](https://bsky.app/profile/bnb.im) for putting HappyView through its paces and identifying several issues, including the ballooning SQLite issue and several backfill scenarios that weren't well-handled.
+- [Florian (@flo-bit.dev)](https://bsky.app/profile/flo-bit.dev) for helping identify the backfill deadlock issue.
 
 ## Go play
 
