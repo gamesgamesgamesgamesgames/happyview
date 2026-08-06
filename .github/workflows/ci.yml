@@ -625,9 +625,16 @@ jobs:
           MAJOR="${VERSION%%.*}"
           MINOR="${VERSION#*.}"
           MINOR="${MINOR%%.*}"
+          # A `-` suffix means semantic-release cut this from `dev` (e.g. 2.13.0-dev.1).
+          # Prereleases must never move the stable moving tags.
+          case "$VERSION" in
+            *-*) PRERELEASE=true ;;
+            *)   PRERELEASE=false ;;
+          esac
           echo "full=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "major=${MAJOR}" >> "$GITHUB_OUTPUT"
           echo "major_minor=${MAJOR}.${MINOR}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
 
       - name: Extract GHCR metadata
         id: meta-ghcr
@@ -636,8 +643,8 @@ jobs:
           images: ${{ env.GHCR_IMAGE }}
           tags: |
             type=raw,value=${{ steps.version.outputs.full }}
-            type=raw,value=${{ steps.version.outputs.major_minor }}
-            type=raw,value=${{ steps.version.outputs.major }}
+            type=raw,value=${{ steps.version.outputs.major_minor }},enable=${{ steps.version.outputs.prerelease == 'false' }}
+            type=raw,value=${{ steps.version.outputs.major }},enable=${{ steps.version.outputs.prerelease == 'false' }}
             type=sha
 
       # TODO: Re-enable once ATCR rate limit issue is resolved
@@ -699,6 +706,42 @@ jobs:
       #       docker buildx imagetools create $ATCR_TAGS \
       #         ${{ env.ATCR_IMAGE }}@${{ steps.build-atcr.outputs.digest }}
       #     fi
+
+  # ---------------------------------------------------------------------------
+  # `latest` — retag the finished multi-arch manifest.
+  #
+  # Deliberately not part of `build`'s tag set: those tags are applied per-arch
+  # with `imagetools create --append`, which would append this release's digests
+  # onto whatever index `latest` already points at. `latest` needs no build at
+  # all — once `build` completes, the versioned manifest exists and this is a
+  # single atomic retag of it.
+  #
+  # Skipped for prereleases, since `release` also runs on `dev`.
+  # ---------------------------------------------------------------------------
+  tag-latest:
+    needs: [release, build]
+    if: needs.release.outputs.version != '' && !contains(needs.release.outputs.version, '-')
+    runs-on: depot-ubuntu-24.04
+    permissions:
+      packages: write
+    env:
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point latest at the released version
+        run: |
+          docker buildx imagetools create \
+            -t "${GHCR_IMAGE}:latest" \
+            "${GHCR_IMAGE}:${{ needs.release.outputs.version }}"
 
   # ---------------------------------------------------------------------------
   # SDK — per-package tests + releases
