@@ -107,23 +107,29 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
             .await;
             let rec_to_store = match hook_result {
                 RecordHookOutcome::Skip => {
-                    log_event(
-                        db,
-                        EventLog {
-                            event_type: "record.skipped".to_string(),
-                            severity: Severity::Info,
-                            actor_did: None,
-                            subject: Some(uri.clone()),
-                            detail: serde_json::json!({
-                                "collection": record.collection,
-                                "did": record.did,
-                                "rkey": record.rkey,
-                                "reason": "script returned nil",
-                            }),
-                        },
-                        state.db_backend,
-                    )
-                    .await;
+                    // Gated like `record.created`/`record.deleted` below: a
+                    // filtering script skips far more records than it keeps, so
+                    // logging every skip writes a row per discarded firehose
+                    // record.
+                    if state.verbose_event_logging.load(Ordering::Relaxed) {
+                        log_event(
+                            db,
+                            EventLog {
+                                event_type: "record.skipped".to_string(),
+                                severity: Severity::Info,
+                                actor_did: None,
+                                subject: Some(uri.clone()),
+                                detail: serde_json::json!({
+                                    "collection": record.collection,
+                                    "did": record.did,
+                                    "rkey": record.rkey,
+                                    "reason": "script returned nil",
+                                }),
+                            },
+                            state.db_backend,
+                        )
+                        .await;
+                    }
                     return;
                 }
                 RecordHookOutcome::Replace(v) => v,
@@ -228,23 +234,26 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
             )
             .await;
             if hook_result == RecordHookOutcome::Skip {
-                log_event(
-                    db,
-                    EventLog {
-                        event_type: "record.skipped".to_string(),
-                        severity: Severity::Info,
-                        actor_did: None,
-                        subject: Some(uri.clone()),
-                        detail: serde_json::json!({
-                            "collection": record.collection,
-                            "did": record.did,
-                            "rkey": record.rkey,
-                            "reason": "script returned nil",
-                        }),
-                    },
-                    backend,
-                )
-                .await;
+                // Gated for the same reason as the create path above.
+                if state.verbose_event_logging.load(Ordering::Relaxed) {
+                    log_event(
+                        db,
+                        EventLog {
+                            event_type: "record.skipped".to_string(),
+                            severity: Severity::Info,
+                            actor_did: None,
+                            subject: Some(uri.clone()),
+                            detail: serde_json::json!({
+                                "collection": record.collection,
+                                "did": record.did,
+                                "rkey": record.rkey,
+                                "reason": "script returned nil",
+                            }),
+                        },
+                        backend,
+                    )
+                    .await;
+                }
                 return;
             }
 
@@ -507,6 +516,27 @@ mod tests {
         }
     }
 
+    fn create_event() -> RecordEvent {
+        RecordEvent {
+            did: "did:plc:abc".to_string(),
+            collection: NSID.to_string(),
+            rkey: "rkey1".to_string(),
+            action: "create".to_string(),
+            record: Some(serde_json::json!({"text": "hello"})),
+            cid: None,
+        }
+    }
+
+    async fn skipped_event_count(state: &AppState) -> i64 {
+        let row: (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'record.skipped'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("count record.skipped events");
+        row.0
+    }
+
     async fn install_script(state: &AppState, trigger: &str, body: &str) {
         crate::db::query(
             "INSERT INTO happyview_scripts (id, body, script_type) VALUES (?, ?, 'lua')",
@@ -600,6 +630,101 @@ mod tests {
         assert!(
             record_exists(&state).await,
             "create with no registered script must index the record"
+        );
+    }
+
+    /// `record.skipped` is per-record telemetry on the *most common* outcome
+    /// for a filtering script, so it belongs behind the same `verbose_event_logging`
+    /// gate as its `record.created`/`record.deleted` siblings. Ungated, it wrote a
+    /// row for every discarded firehose record: on upvote.at that was 5.7M of the
+    /// 5.8M rows in `happyview_event_logs`, ~2.7 GB, against 397 `record.created`.
+    #[tokio::test]
+    async fn create_skip_is_not_logged_while_verbose_logging_is_off() {
+        let state = tracked_state().await;
+        install_script(
+            &state,
+            &format!("record.create:{NSID}"),
+            "function handle() return nil end",
+        )
+        .await;
+
+        handle_record_event(&state, &create_event()).await;
+
+        assert!(
+            !record_exists(&state).await,
+            "a create script returning nil must skip indexing"
+        );
+        assert_eq!(
+            skipped_event_count(&state).await,
+            0,
+            "record.skipped must not be logged while verbose event logging is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_skip_is_not_logged_while_verbose_logging_is_off() {
+        let state = tracked_state().await;
+        install_script(
+            &state,
+            &format!("record.delete:{NSID}"),
+            "function handle() return nil end",
+        )
+        .await;
+        insert_record(&state).await;
+
+        handle_record_event(&state, &delete_event()).await;
+
+        assert!(
+            record_exists(&state).await,
+            "a delete script returning nil must keep the record"
+        );
+        assert_eq!(
+            skipped_event_count(&state).await,
+            0,
+            "record.skipped must not be logged while verbose event logging is off"
+        );
+    }
+
+    /// The gate must suppress the log, not remove it: with verbose logging on,
+    /// both skip paths still report.
+    #[tokio::test]
+    async fn create_skip_is_logged_when_verbose_logging_is_on() {
+        let state = tracked_state().await;
+        state.verbose_event_logging.store(true, Ordering::Relaxed);
+        install_script(
+            &state,
+            &format!("record.create:{NSID}"),
+            "function handle() return nil end",
+        )
+        .await;
+
+        handle_record_event(&state, &create_event()).await;
+
+        assert_eq!(
+            skipped_event_count(&state).await,
+            1,
+            "record.skipped must still be logged when verbose event logging is on"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_skip_is_logged_when_verbose_logging_is_on() {
+        let state = tracked_state().await;
+        state.verbose_event_logging.store(true, Ordering::Relaxed);
+        install_script(
+            &state,
+            &format!("record.delete:{NSID}"),
+            "function handle() return nil end",
+        )
+        .await;
+        insert_record(&state).await;
+
+        handle_record_event(&state, &delete_event()).await;
+
+        assert_eq!(
+            skipped_event_count(&state).await,
+            1,
+            "record.skipped must still be logged when verbose event logging is on"
         );
     }
 }
