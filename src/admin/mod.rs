@@ -103,6 +103,8 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             delete(linked_repos::revoke_linked_repo_invite),
         )
         .route("/events", get(events::list_events))
+        .route("/events/count", get(events::count_events))
+        .route("/events/purge", post(events::purge_events))
         .route("/users", post(users::create_user).get(users::list_users))
         .route("/users/transfer-super", post(users::transfer_super))
         .route(

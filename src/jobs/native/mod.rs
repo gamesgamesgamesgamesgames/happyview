@@ -8,6 +8,7 @@
 //! performs. Only internal Rust callers may enqueue these.
 
 pub mod delete_collection;
+pub mod purge_event_logs;
 
 use crate::AppState;
 
@@ -18,7 +19,7 @@ use super::Job;
 pub const RESERVED_PREFIX: &str = "happyview.";
 
 /// Every implemented native job type.
-const NATIVE_TYPES: &[&str] = &["happyview.delete-collection"];
+const NATIVE_TYPES: &[&str] = &["happyview.delete-collection", "happyview.purge-event-logs"];
 
 /// Whether a job type is reserved. Reserved-but-unimplemented types are still
 /// refused, so adding a handler later can never be shadowed by a user script
@@ -42,6 +43,7 @@ pub enum NativeOutcome {
 pub async fn execute(state: &AppState, job: &Job) -> NativeOutcome {
     match job.job_type.as_str() {
         "happyview.delete-collection" => delete_collection::run(state, job).await,
+        "happyview.purge-event-logs" => purge_event_logs::run(state, job).await,
         other => NativeOutcome::Failed(format!("no native handler for job type '{other}'")),
     }
 }
@@ -69,5 +71,11 @@ mod tests {
         // Reserved but unimplemented: still refused to callers, but not dispatched.
         assert!(!is_native("happyview.not-a-real-job"));
         assert!(!is_native("pet.trezy.reset-account"));
+    }
+
+    #[test]
+    fn purge_event_logs_is_native_and_reserved() {
+        assert!(is_native("happyview.purge-event-logs"));
+        assert!(is_reserved("happyview.purge-event-logs"));
     }
 }

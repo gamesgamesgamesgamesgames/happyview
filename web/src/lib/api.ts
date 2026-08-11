@@ -540,6 +540,41 @@ export function deleteCollectionRecords(collection: string) {
   );
 }
 
+export interface EventPurgeFilter {
+  event_type?: string;
+  category?: string;
+  severity?: string;
+  subject?: string;
+  before?: string;
+  after?: string;
+}
+
+// Strips blank/undefined entries so `countEvents` and `purgeEvents` always
+// agree on what "no filter" means for a field — an explicit `""` (e.g. a
+// filter typed in then cleared) must be treated the same as an absent key,
+// not sent as a literal empty-string filter.
+function cleanEventPurgeFilter(
+  filter: EventPurgeFilter,
+): Record<string, string> {
+  const cleaned: Record<string, string> = {};
+  for (const [key, value] of Object.entries(filter)) {
+    if (value) cleaned[key] = value;
+  }
+  return cleaned;
+}
+
+export function countEvents(filter: EventPurgeFilter) {
+  const params = new URLSearchParams(cleanEventPurgeFilter(filter));
+  return apiFetch<{ count: number }>(`/admin/events/count?${params}`);
+}
+
+export function purgeEvents(filter: EventPurgeFilter) {
+  return apiFetch<{ job_id: string }>("/admin/events/purge", {
+    method: "POST",
+    body: JSON.stringify(cleanEventPurgeFilter(filter)),
+  });
+}
+
 // Database (SQLite disk reclamation)
 export interface DatabaseDiskReport {
   db_bytes: number;

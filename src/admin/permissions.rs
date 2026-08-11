@@ -60,6 +60,8 @@ pub enum Permission {
 
     #[serde(rename = "events:read")]
     EventsRead,
+    #[serde(rename = "events:purge")]
+    EventsPurge,
 
     #[serde(rename = "labelers:create")]
     LabelersCreate,
@@ -153,6 +155,7 @@ impl Permission {
             Self::BackfillRead => "backfill:read",
             Self::StatsRead => "stats:read",
             Self::EventsRead => "events:read",
+            Self::EventsPurge => "events:purge",
             Self::LabelersCreate => "labelers:create",
             Self::LabelersRead => "labelers:read",
             Self::LabelersDelete => "labelers:delete",
@@ -305,6 +308,12 @@ impl Permission {
                 key: "events:read",
                 name: "View Events",
                 description: "View the event log",
+                category: "System",
+            },
+            Self::EventsPurge => PermissionInfo {
+                key: "events:purge",
+                name: "Purge Events",
+                description: "Bulk-delete event log entries matching a filter",
                 category: "System",
             },
             Self::LabelersCreate => PermissionInfo {
@@ -507,6 +516,7 @@ impl Permission {
             Self::BackfillRead,
             Self::StatsRead,
             Self::EventsRead,
+            Self::EventsPurge,
             Self::LabelersCreate,
             Self::LabelersRead,
             Self::LabelersDelete,
@@ -566,6 +576,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         BackfillRead,
         StatsRead,
         EventsRead,
+        EventsPurge,
         LabelersCreate,
         LabelersRead,
         LabelersDelete,
@@ -813,6 +824,18 @@ mod tests {
                     entry.key
                 );
             }
+        }
+    }
+
+    #[test]
+    fn events_purge_is_registered_and_not_granted_by_default_templates() {
+        assert_eq!(Permission::EventsPurge.as_str(), "events:purge");
+        assert!(Permission::all().contains(&Permission::EventsPurge));
+        for template in [Template::Viewer, Template::Operator, Template::Manager] {
+            assert!(
+                !template.permissions().contains(&Permission::EventsPurge),
+                "purging the audit log must not come with a built-in role template"
+            );
         }
     }
 }
