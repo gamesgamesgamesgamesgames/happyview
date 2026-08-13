@@ -744,7 +744,6 @@ async fn main() {
 
     tokio::spawn(happyview::event_log::spawn_retention_cleanup(
         state.db.clone(),
-        state.config.event_log_retention_days,
         state.db_backend,
     ));
 
