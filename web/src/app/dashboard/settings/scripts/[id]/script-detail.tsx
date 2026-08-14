@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
+import { AlertTriangle } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { deleteScript, getScript, patchScript } from "@/lib/api";
@@ -12,6 +13,17 @@ import {
   parseTriggerId,
 } from "@/types/scripts";
 import { SiteHeader } from "@/components/site-header";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 
@@ -106,7 +118,6 @@ export default function ScriptDetail() {
 
   async function handleDelete() {
     if (!script) return;
-    if (!confirm(`Delete script '${script.id}'?`)) return;
     setDeleting(true);
     try {
       await deleteScript(script.id);
@@ -186,13 +197,55 @@ export default function ScriptDetail() {
 
         <footer className="bg-sidebar-accent flex justify-between gap-2 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
           {canManage && (
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleting}
-            >
-              {deleting ? "Deleting..." : "Delete script"}
-            </Button>
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button variant="destructive" disabled={deleting}>
+                  {deleting ? "Deleting..." : "Delete script"}
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Delete script?</AlertDialogTitle>
+                  <AlertDialogDescription asChild>
+                    <div className="flex flex-col gap-3">
+                      <p>
+                        This will permanently remove the script. This action
+                        cannot be undone.
+                      </p>
+                      {script?.recreatable === false && (
+                        <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
+                          <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
+                          <p className="text-xs text-amber-500">
+                            This script&rsquo;s trigger id no longer satisfies
+                            current NSID rules. It will keep firing and can
+                            still be edited in place — but once deleted, it{" "}
+                            <span className="font-medium">
+                              cannot be recreated
+                            </span>{" "}
+                            with the same id. Deletion is not required to
+                            change it.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel disabled={deleting}>
+                    Cancel
+                  </AlertDialogCancel>
+                  <AlertDialogAction
+                    variant="destructive"
+                    disabled={deleting}
+                    onClick={handleDelete}
+                  >
+                    {script?.recreatable === false
+                      ? "Delete anyway"
+                      : "Delete"}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           )}
           <div className="flex gap-2">
             {canManage && (
