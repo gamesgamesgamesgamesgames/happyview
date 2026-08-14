@@ -37,9 +37,16 @@ pub(super) async fn put(
         config.nsids.clear();
     }
 
-    // Validate NSID patterns
+    // Validate only patterns that aren't already stored. A pattern accepted
+    // by an older, laxer validator and still sitting in the config is
+    // grandfathered — revalidating it on every PUT would 400 an operator who
+    // never touched it, just for toggling proxy mode. A newly added pattern
+    // gets the full check.
+    let stored = (**state.proxy_config.load()).clone();
     for pattern in &config.nsids {
-        validate_nsid_pattern(pattern).map_err(AppError::BadRequest)?;
+        if !stored.nsids.contains(pattern) {
+            validate_nsid_pattern(pattern).map_err(AppError::BadRequest)?;
+        }
     }
 
     let json = serde_json::to_string(&config)

@@ -1,3 +1,9 @@
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+happyview-nsid = { path = "crates/happyview-nsid" }
+
 [package]
 name = "happyview"
 version = "0.1.0"
@@ -20,6 +26,7 @@ base64 = "0.22"
 dashmap = "6"
 data-encoding = "2"
 dotenvy = "0.15"
+happyview-nsid = { workspace = true }
 hex = "0.4"
 futures-util = "0.3"
 jose-jwk = { version = "0.1", default-features = false, features = ["p256"] }

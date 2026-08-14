@@ -45,45 +45,10 @@ fn nsid_matches(pattern: &str, nsid: &str) -> bool {
     }
 }
 
+/// Re-exported so `admin::proxy_config` keeps a stable import path. The rules
+/// live in `happyview-nsid` alongside every other NSID rule.
 pub fn validate_nsid_pattern(pattern: &str) -> Result<(), String> {
-    if pattern.is_empty() {
-        return Err("NSID pattern must not be empty".into());
-    }
-
-    let (base, is_wildcard) = if let Some(prefix) = pattern.strip_suffix(".*") {
-        (prefix, true)
-    } else {
-        (pattern, false)
-    };
-
-    let segments: Vec<&str> = base.split('.').collect();
-    if segments.len() < 2 {
-        return Err(format!(
-            "NSID pattern must have at least two segments: {pattern}"
-        ));
-    }
-
-    for segment in &segments {
-        if segment.is_empty() {
-            return Err(format!("NSID pattern has empty segment: {pattern}"));
-        }
-        if !segment
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
-            return Err(format!(
-                "NSID segment contains invalid characters: {pattern}"
-            ));
-        }
-    }
-
-    if !is_wildcard && segments.len() < 3 {
-        return Err(format!(
-            "Exact NSID must have at least three segments: {pattern}"
-        ));
-    }
-
-    Ok(())
+    happyview_nsid::validate_nsid_pattern(pattern).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -194,6 +159,12 @@ mod tests {
         assert!(validate_nsid_pattern("com..example").is_err());
         assert!(validate_nsid_pattern(".com.example").is_err());
         assert!(validate_nsid_pattern("com.example.").is_err());
+    }
+
+    #[test]
+    fn validate_digit_leading_authority_pattern() {
+        assert!(validate_nsid_pattern("pics.2bit.*").is_ok());
+        assert!(validate_nsid_pattern("pics.2bit.feed.getPhotos").is_ok());
     }
 
     #[test]

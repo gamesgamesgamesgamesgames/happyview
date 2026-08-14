@@ -130,7 +130,7 @@ impl ParsedTrigger {
         match kind {
             TriggerKind::JobRun => validate_job_type(suffix)?,
             TriggerKind::LabelerApply if suffix == "_actor" => {}
-            _ => validate_nsid(suffix)?,
+            _ => happyview_nsid::validate_nsid(suffix).map_err(|e| e.to_string())?,
         }
 
         Ok(Self {
@@ -156,39 +156,6 @@ fn validate_job_type(job_type: &str) -> Result<(), String> {
             "invalid job type '{job_type}': the '{}' prefix is reserved for built-in jobs",
             crate::jobs::native::RESERVED_PREFIX
         ));
-    }
-    Ok(())
-}
-
-/// Minimal NSID validation: at least two dot-separated segments, each
-/// non-empty and matching `[a-zA-Z][a-zA-Z0-9-]*`. Mirrors the AT Protocol
-/// spec's character class for everyday use; full Unicode strictness lives
-/// in atrium downstream.
-fn validate_nsid(nsid: &str) -> Result<(), String> {
-    let segments: Vec<&str> = nsid.split('.').collect();
-    if segments.len() < 2 {
-        return Err(format!(
-            "invalid NSID '{nsid}': need at least 2 dot-separated segments"
-        ));
-    }
-    for (idx, seg) in segments.iter().enumerate() {
-        if seg.is_empty() {
-            return Err(format!("invalid NSID '{nsid}': empty segment"));
-        }
-        let mut chars = seg.chars();
-        let first = chars.next().unwrap();
-        if !first.is_ascii_alphabetic() {
-            return Err(format!(
-                "invalid NSID '{nsid}': segment {idx} must start with a letter"
-            ));
-        }
-        for c in chars {
-            if !c.is_ascii_alphanumeric() && c != '-' {
-                return Err(format!(
-                    "invalid NSID '{nsid}': segment {idx} contains invalid character '{c}'"
-                ));
-            }
-        }
     }
     Ok(())
 }
@@ -1150,15 +1117,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_nsid() {
-        // single segment
-        assert!(ParsedTrigger::parse("record.index:foo").is_err());
-        // empty suffix
-        assert!(ParsedTrigger::parse("record.index:").is_err());
-        // non-letter start
+    fn delegates_nsid_validation_to_the_shared_crate() {
+        // Shape rules are the crate's job and are pinned by the interop corpus
+        // there. This only proves the wiring.
+        assert!(ParsedTrigger::parse("xrpc.query:pics.2bit.feed.getPhotos").is_ok());
         assert!(ParsedTrigger::parse("record.index:1.foo").is_err());
-        // invalid char
-        assert!(ParsedTrigger::parse("record.index:com.foo!bar").is_err());
+        assert!(ParsedTrigger::parse("record.index:").is_err());
     }
 
     #[test]

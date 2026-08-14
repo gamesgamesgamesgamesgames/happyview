@@ -1,5 +1,3 @@
-use atrium_api::types::string::Nsid;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoAction {
     Create,
@@ -62,7 +60,7 @@ fn validate_repo(rest: &str) -> Result<(), String> {
         return Err("repo scope requires a collection or *".into());
     }
     if target != "*" {
-        Nsid::new(target.to_string()).map_err(|_| format!("invalid NSID: {target}"))?;
+        happyview_nsid::validate_nsid(target).map_err(|_| format!("invalid NSID: {target}"))?;
     }
     let Some(query) = query else { return Ok(()) };
 

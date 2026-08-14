@@ -27,6 +27,10 @@ on:
         description: "Build lex-agent"
         type: boolean
         default: false
+      nsid:
+        description: "Build nsid"
+        type: boolean
+        default: false
   delete:
 
 env:
@@ -49,6 +53,7 @@ jobs:
       oauth-client-browser: ${{ steps.filter.outputs.oauth-client-browser }}
       oauth-client-node: ${{ steps.filter.outputs.oauth-client-node }}
       lex-agent: ${{ steps.filter.outputs.lex-agent }}
+      nsid: ${{ steps.filter.outputs.nsid }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -64,6 +69,7 @@ jobs:
               - 'migrations/**'
               - 'tests/**'
               - 'Cargo.*'
+              - 'crates/**'
               - 'Dockerfile'
               - 'docker-compose*'
               - 'entrypoint.sh'
@@ -79,6 +85,9 @@ jobs:
             lex-agent:
               - 'packages/oauth-client/**'
               - 'packages/lex-agent/**'
+            nsid:
+              - 'crates/happyview-nsid/**'
+              - 'packages/nsid/**'
 
   # ---------------------------------------------------------------------------
   # Server — unit tests, e2e tests, frontend build, lint
@@ -145,6 +154,9 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --lib
+
+      - name: Run crate tests
+        run: cargo test -p happyview-nsid
 
   e2e-tests:
     needs: changes
@@ -253,7 +265,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   audit:
     needs: changes
@@ -847,6 +859,29 @@ jobs:
       - name: Test
         run: bun run --filter '@happyview/lex-agent' test
 
+  test-nsid:
+    needs: changes
+    if: always() && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
+    runs-on: depot-ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build
+        run: bun run --filter '@happyview/nsid' build
+
+      - name: Typecheck
+        run: bun run --filter '@happyview/nsid' typecheck
+
+      - name: Test
+        run: bun run --filter '@happyview/nsid' test
+
   release-oauth-client:
     if: >-
       always()
@@ -1059,6 +1094,46 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: packages/lex-agent
+        run: npx semantic-release
+
+  release-nsid:
+    if: >-
+      always()
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
+      && needs.test-nsid.result == 'success'
+    needs: [changes, test-nsid]
+    runs-on: depot-ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build nsid
+        run: bun run --filter '@happyview/nsid' build
+
+      - name: Configure npm auth for bun publish
+        run: echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+
+      - name: Release nsid
+        env:
+          GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: packages/nsid
         run: npx semantic-release
 
   # ---------------------------------------------------------------------------
