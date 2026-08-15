@@ -4,13 +4,6 @@
  * The pattern below is byte-identical to `happyview_nsid::NSID_PATTERN` in
  * `crates/happyview-nsid/src/lib.rs`. Both are pinned by the same vendored
  * interop corpus.
- *
- * `web/src/lib/lexicon-schema.ts` is a third copy that is currently only
- * *functionally* equivalent — it spells the name segment
- * `(\.[a-zA-Z]([a-zA-Z0-9]{0,62})?)$`, the spec's literal text, where these
- * use `(\.[a-zA-Z][a-zA-Z0-9]{0,62})$`. Same match set, since `{0,62}`
- * already permits zero. Task 11 replaces it with an import of this constant,
- * which is what makes all three byte-identical.
  */
 
 /**

@@ -10,6 +10,8 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { NSID_PATTERN } from "@happyview/nsid";
+
 export const LEXICON_SCHEMA_URI = "https://atproto.com/schemas/lexicon-v1.json";
 
 export const lexiconJsonSchema: Record<string, any> = {
@@ -33,8 +35,7 @@ export const lexiconJsonSchema: Record<string, any> = {
       type: "string",
       description:
         "Namespaced Identifier (NSID) for this lexicon, e.g. 'app.bsky.feed.post'. Minimum 3 dot-separated segments.",
-      pattern:
-        "^[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(\\.[a-zA-Z]([a-zA-Z0-9]{0,62})?)$",
+      pattern: NSID_PATTERN,
       maxLength: 317,
     },
     description: {

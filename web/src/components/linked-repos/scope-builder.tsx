@@ -3,6 +3,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
 
+import { isValidNsid } from "@happyview/nsid";
+
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
@@ -51,14 +53,6 @@ function isRepoAction(value: string): value is RepoAction {
  */
 function orderActions(actions: readonly string[]): RepoAction[] {
   return REPO_ACTIONS.filter((a) => actions.includes(a));
-}
-
-// Same regex atrium_api::types::string::Nsid::new() compiles server-side.
-const NSID_RE =
-  /^[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(\.[a-zA-Z][a-zA-Z0-9]{0,62})$/;
-
-function isValidNsid(nsid: string): boolean {
-  return nsid.length <= 317 && NSID_RE.test(nsid);
 }
 
 function splitQuery(rest: string): [string, string | null] {

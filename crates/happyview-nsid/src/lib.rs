@@ -21,16 +21,7 @@ use regex_lite::Regex;
 /// a digit. This is the rule HappyView used to get wrong.
 ///
 /// This string is byte-identical to the `NSID_PATTERN` exported by
-/// `@happyview/nsid`.
-///
-/// `web/src/lib/lexicon-schema.ts` is a third copy that is currently
-/// *functionally* equivalent but not byte-identical: it spells the name
-/// segment `(\.[a-zA-Z]([a-zA-Z0-9]{0,62})?)$`, the spec's literal text,
-/// where this uses `(\.[a-zA-Z][a-zA-Z0-9]{0,62})$`, the form atrium and
-/// jacquard use. Both match the same set of strings — `{0,62}` already
-/// permits zero — so this is a spelling difference, not a behavioural one.
-/// Task 11 of the consolidation plan replaces that inline string with an
-/// import of `NSID_PATTERN`, which is what finally makes all three identical.
+/// `@happyview/nsid`, and the same vendored interop corpus pins both.
 pub const NSID_PATTERN: &str = r"^[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(\.[a-zA-Z][a-zA-Z0-9]{0,62})$";
 
 /// Maximum total NSID length. The pattern bounds each segment but not the total,
