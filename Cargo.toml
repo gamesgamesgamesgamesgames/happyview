@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["tests/fixtures/test_plugin"]
 
 [workspace.dependencies]
 happyview-nsid = { path = "crates/happyview-nsid" }
