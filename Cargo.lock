@@ -1820,6 +1820,7 @@ dependencies = [
  "futures",
  "futures-util",
  "happyview-nsid",
+ "happyview-scopes",
  "hex",
  "hickory-resolver",
  "hkdf 0.13.0",
@@ -1868,6 +1869,15 @@ version = "0.1.0"
 dependencies = [
  "regex-lite",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "happyview-scopes"
+version = "0.1.0"
+dependencies = [
+ "happyview-nsid",
+ "serde_json",
+ "urlencoding",
 ]
 
 [[package]]

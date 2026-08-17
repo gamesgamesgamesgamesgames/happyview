@@ -724,9 +724,17 @@ export function setFeatureFlag(key: string, enabled: boolean) {
 }
 
 // Proxy config
+export type ProxyRouting = "authority" | "serviceproxy";
+
 export type ProxyConfig = {
   mode: "disabled" | "open" | "allowlist" | "blocklist";
   nsids: string[];
+  /**
+   * Omitted on save means "leave unchanged" — the server preserves the stored
+   * value rather than resetting it, so a form that only edits the mode cannot
+   * silently revert routing.
+   */
+  routing?: ProxyRouting;
 };
 
 export function getProxyConfig() {

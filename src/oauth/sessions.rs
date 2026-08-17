@@ -155,6 +155,31 @@ pub async fn get_dpop_session(
 
 /// Look up a DPoP session by api_client_id and dpop_key_id, decrypting tokens.
 /// Used by the auth middleware where the key ID is derived from the DPoP proof thumbprint.
+/// Look up just the granted scopes for a session.
+///
+/// Deliberately does not decrypt the tokens: a scope check has no business
+/// touching them, and this runs on every forwarded request.
+pub async fn get_dpop_session_scopes(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    dpop_key_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT scopes FROM happyview_dpop_sessions WHERE api_client_id = ? AND dpop_key_id = ?",
+        backend,
+    );
+
+    let row: Option<(String,)> = crate::db::query_as(&sql)
+        .bind(api_client_id)
+        .bind(dpop_key_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to look up DPoP session scopes: {e}")))?;
+
+    Ok(row.map(|(scopes,)| scopes))
+}
+
 pub async fn get_dpop_session_by_key_id(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,

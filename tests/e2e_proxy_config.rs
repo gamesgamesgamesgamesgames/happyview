@@ -96,6 +96,120 @@ async fn put_and_get_allowlist() {
     );
 }
 
+/// Routing and mode are independent axes, and the dashboard's proxy-mode form
+/// only sends `mode` and `nsids`. An omitted `routing` therefore has to mean
+/// "leave it alone" — if it meant "use the default", every mode toggle would
+/// silently revert an operator's routing choice.
+#[tokio::test]
+#[serial]
+async fn put_without_routing_preserves_the_stored_routing() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    // Opt in to service proxying.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/settings/xrpc-proxy",
+            app.admin_cookie(),
+            &json!({ "mode": "open", "nsids": [], "routing": "serviceproxy" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Now change only the mode, exactly as the dashboard form does.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/settings/xrpc-proxy",
+            app.admin_cookie(),
+            &json!({ "mode": "allowlist", "nsids": ["com.example.*"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings/xrpc-proxy", app.admin_cookie()))
+        .await
+        .unwrap();
+    let json = json_body(resp).await;
+    assert_eq!(json["mode"], "allowlist");
+    assert_eq!(
+        json["routing"], "serviceproxy",
+        "changing the mode must not reset routing"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn put_can_change_routing_explicitly() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/settings/xrpc-proxy",
+            app.admin_cookie(),
+            &json!({ "mode": "open", "nsids": [], "routing": "serviceproxy" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings/xrpc-proxy", app.admin_cookie()))
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["routing"], "serviceproxy");
+
+    // And back again.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/settings/xrpc-proxy",
+            app.admin_cookie(),
+            &json!({ "mode": "open", "nsids": [], "routing": "authority" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings/xrpc-proxy", app.admin_cookie()))
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["routing"], "authority");
+}
+
+/// A fresh instance must not be service-proxying until someone asks for it.
+#[tokio::test]
+#[serial]
+async fn default_routing_is_authority() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings/xrpc-proxy", app.admin_cookie()))
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["routing"], "authority");
+}
+
 #[tokio::test]
 #[serial]
 async fn disabled_mode_clears_nsids() {
@@ -224,6 +338,7 @@ async fn put_keeping_stored_legacy_pattern_succeeds() {
         .proxy_config
         .store(std::sync::Arc::new(happyview::proxy_config::ProxyConfig {
             mode: happyview::proxy_config::ProxyMode::Allowlist,
+            routing: happyview::proxy_config::ProxyRouting::Authority,
             nsids: vec!["com.foo-.*".to_string()],
         }));
 
@@ -265,6 +380,7 @@ async fn put_adding_new_invalid_pattern_alongside_stored_legacy_one_is_rejected(
         .proxy_config
         .store(std::sync::Arc::new(happyview::proxy_config::ProxyConfig {
             mode: happyview::proxy_config::ProxyMode::Allowlist,
+            routing: happyview::proxy_config::ProxyRouting::Authority,
             nsids: vec!["com.foo-.*".to_string()],
         }));
 

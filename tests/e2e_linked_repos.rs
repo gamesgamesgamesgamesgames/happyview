@@ -1669,7 +1669,7 @@ async fn put_record_passes_scope_check_with_both_create_and_update() {
         None,
         None,
         None,
-        "repo:com.example.note?action=create,update",
+        "repo:com.example.note?action=create&action=update",
         "did:plc:admin",
     )
     .await

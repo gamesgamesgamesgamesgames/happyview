@@ -12,9 +12,14 @@ FROM rust:1.96.1-bookworm AS builder
 WORKDIR /app
 
 # Build dependencies first (cached until Cargo.toml/Cargo.lock change)
+# Every workspace member needs its manifest and a stub source here, or cargo
+# cannot resolve the workspace and the dependency-cache layer fails outright.
+# Adding a crate under crates/ means adding it to this list too.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/happyview-nsid/Cargo.toml crates/happyview-nsid/
-RUN mkdir -p crates/happyview-nsid/src && touch crates/happyview-nsid/src/lib.rs
+COPY crates/happyview-scopes/Cargo.toml crates/happyview-scopes/
+RUN mkdir -p crates/happyview-nsid/src crates/happyview-scopes/src \
+    && touch crates/happyview-nsid/src/lib.rs crates/happyview-scopes/src/lib.rs
 RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && touch src/lib.rs && echo "fn main() {}" > src/bin/migrate_lua_sql.rs && echo "fn main() {}" > src/bin/migrate_space_cids.rs
 ENV SQLX_OFFLINE=true
 RUN cargo build --release && rm -rf src target/release/.fingerprint/happyview-*

@@ -1,0 +1,2254 @@
+{
+  "reference": "@atproto/oauth-scopes@0.3.1",
+  "parse": [
+    {
+      "scope": "repo:com.example.post",
+      "prefix": "repo",
+      "valid": true,
+      "canonical": "repo:com.example.post"
+    },
+    {
+      "scope": "repo:*",
+      "prefix": "repo",
+      "valid": true,
+      "canonical": "repo:*"
+    },
+    {
+      "scope": "repo:com.example.post?action=create",
+      "prefix": "repo",
+      "valid": true,
+      "canonical": "repo:com.example.post?action=create"
+    },
+    {
+      "scope": "repo:com.example.post?action=create&action=update",
+      "prefix": "repo",
+      "valid": true,
+      "canonical": "repo:com.example.post?action=create&action=update"
+    },
+    {
+      "scope": "repo:com.example.post?action=create,update",
+      "prefix": "repo",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "repo:com.example.post?action=",
+      "prefix": "repo",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "repo:com.example.post?action=frobnicate",
+      "prefix": "repo",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "repo:com.example.post?foo=bar",
+      "prefix": "repo",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "repo:com.example.post?collection=com.other.x",
+      "prefix": "repo",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "repo?collection=com.example.post",
+      "prefix": "repo",
+      "valid": true,
+      "canonical": "repo:com.example.post"
+    },
+    {
+      "scope": "repo?collection=a.b.c&collection=d.e.f",
+      "prefix": "repo",
+      "valid": true,
+      "canonical": "repo?collection=a.b.c&collection=d.e.f"
+    },
+    {
+      "scope": "repo?collection=com.example.post&action=delete",
+      "prefix": "repo",
+      "valid": true,
+      "canonical": "repo:com.example.post?action=delete"
+    },
+    {
+      "scope": "repo:",
+      "prefix": "repo",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "repo",
+      "prefix": "repo",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "repo:notannsid",
+      "prefix": "repo",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "repo:com",
+      "prefix": "repo",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "repo:pics.2bit.feed.photo",
+      "prefix": "repo",
+      "valid": true,
+      "canonical": "repo:pics.2bit.feed.photo"
+    },
+    {
+      "scope": "rpc:com.example.a",
+      "prefix": "rpc",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "rpc:com.example.a?aud=*",
+      "prefix": "rpc",
+      "valid": true,
+      "canonical": "rpc:com.example.a?aud=*"
+    },
+    {
+      "scope": "rpc:*?aud=*",
+      "prefix": "rpc",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "rpc:com.example.a?aud=did:web:example.com%23svc",
+      "prefix": "rpc",
+      "valid": true,
+      "canonical": "rpc:com.example.a?aud=did:web:example.com%23svc"
+    },
+    {
+      "scope": "rpc:com.example.a?aud=did:plc:6msi3pj7krzih5qxqtryxlzw%23atproto_pds",
+      "prefix": "rpc",
+      "valid": true,
+      "canonical": "rpc:com.example.a?aud=did:plc:6msi3pj7krzih5qxqtryxlzw%23atproto_pds"
+    },
+    {
+      "scope": "rpc:com.example.a?aud=did:plc:abc%23svc",
+      "prefix": "rpc",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "rpc:com.example.a?aud=did:web:example.com",
+      "prefix": "rpc",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "rpc:com.example.a?aud=did:web:example.com%23",
+      "prefix": "rpc",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "rpc:com.example.a?aud=did:foo:bar%23svc",
+      "prefix": "rpc",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "rpc:com.example.a?aud=did:web:example.com%3A3000%23s",
+      "prefix": "rpc",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "rpc?lxm=com.example.a&lxm=com.example.b&aud=*",
+      "prefix": "rpc",
+      "valid": true,
+      "canonical": "rpc?lxm=com.example.a&lxm=com.example.b&aud=*"
+    },
+    {
+      "scope": "rpc:com.example.a?aud=*&aud=*",
+      "prefix": "rpc",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "blob:*/*",
+      "prefix": "blob",
+      "valid": true,
+      "canonical": "blob:*/*"
+    },
+    {
+      "scope": "blob:image/*",
+      "prefix": "blob",
+      "valid": true,
+      "canonical": "blob:image/*"
+    },
+    {
+      "scope": "blob:image/png",
+      "prefix": "blob",
+      "valid": true,
+      "canonical": "blob:image/png"
+    },
+    {
+      "scope": "blob:image",
+      "prefix": "blob",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "blob:",
+      "prefix": "blob",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "blob:image/png?accept=text/plain",
+      "prefix": "blob",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "blob?accept=image/png&accept=text/plain",
+      "prefix": "blob",
+      "valid": true,
+      "canonical": "blob?accept=image/png&accept=text/plain"
+    },
+    {
+      "scope": "blob:*/png",
+      "prefix": "blob",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "identity:handle",
+      "prefix": "identity",
+      "valid": true,
+      "canonical": "identity:handle"
+    },
+    {
+      "scope": "identity:*",
+      "prefix": "identity",
+      "valid": true,
+      "canonical": "identity:*"
+    },
+    {
+      "scope": "identity:email",
+      "prefix": "identity",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "identity:",
+      "prefix": "identity",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "account:email",
+      "prefix": "account",
+      "valid": true,
+      "canonical": "account:email"
+    },
+    {
+      "scope": "account:repo",
+      "prefix": "account",
+      "valid": true,
+      "canonical": "account:repo"
+    },
+    {
+      "scope": "account:status",
+      "prefix": "account",
+      "valid": true,
+      "canonical": "account:status"
+    },
+    {
+      "scope": "account:bogus",
+      "prefix": "account",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "account:email?action=manage",
+      "prefix": "account",
+      "valid": true,
+      "canonical": "account:email?action=manage"
+    },
+    {
+      "scope": "account:email?action=read&action=manage",
+      "prefix": "account",
+      "valid": true,
+      "canonical": "account:email?action=read&action=manage"
+    },
+    {
+      "scope": "account:email?action=read,manage",
+      "prefix": "account",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "account:email?action=bogus",
+      "prefix": "account",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "include:com.example.authBasic",
+      "prefix": "include",
+      "valid": true,
+      "canonical": "include:com.example.authBasic"
+    },
+    {
+      "scope": "include:com.example.authBasic?aud=did:web:x.com%23svc",
+      "prefix": "include",
+      "valid": true,
+      "canonical": "include:com.example.authBasic?aud=did:web:x.com%23svc"
+    },
+    {
+      "scope": "include:com.example.authBasic?aud=notadid",
+      "prefix": "include",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "include:notannsid",
+      "prefix": "include",
+      "valid": false,
+      "canonical": null
+    },
+    {
+      "scope": "include:",
+      "prefix": "include",
+      "valid": false,
+      "canonical": null
+    }
+  ],
+  "matches": [
+    {
+      "grant": "atproto",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:chat.bsky",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:email",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": true
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto transition:generic transition:chat.bsky",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": true
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:com.example.post?action=create",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": true
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": true
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto repo:*",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": true
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:image/*",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": true
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": true
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto blob:*/*",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": true
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:com.example.a?aud=*",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": true
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": true
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": true
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto rpc:*?aud=did:web:x.com%23svc",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": true
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:handle",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": true
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": true
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto identity:*",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": true
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "repo",
+      "collection": "com.example.post",
+      "action": "delete",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "repo",
+      "collection": "com.other.x",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "repo",
+      "collection": "chat.bsky.x.y",
+      "action": "create",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "rpc",
+      "lxm": "com.example.a",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "rpc",
+      "lxm": "com.example.b",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "rpc",
+      "lxm": "chat.bsky.convo.listConvos",
+      "aud": "did:web:x.com#svc",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "blob",
+      "mime": "image/png",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "blob",
+      "mime": "video/mp4",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "blob",
+      "mime": "image/*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "blob",
+      "mime": "notamime",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "identity",
+      "attr": "handle",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "identity",
+      "attr": "*",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "account",
+      "attr": "email",
+      "action": "read",
+      "allowed": true
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "account",
+      "attr": "email",
+      "action": "manage",
+      "allowed": true
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "account",
+      "attr": "status",
+      "action": "read",
+      "allowed": false
+    },
+    {
+      "grant": "atproto account:email?action=manage",
+      "kind": "account",
+      "attr": "repo",
+      "action": "manage",
+      "allowed": false
+    }
+  ],
+  "includes": [
+    {
+      "scope": "include:com.example.authBasic",
+      "set": {
+        "permissions": [
+          {
+            "resource": "repo",
+            "collection": [
+              "com.example.profile"
+            ]
+          },
+          {
+            "resource": "repo",
+            "collection": [
+              "app.bsky.feed.post"
+            ]
+          },
+          {
+            "resource": "repo",
+            "collection": [
+              "*"
+            ]
+          }
+        ]
+      },
+      "expanded": [
+        "repo:com.example.profile"
+      ]
+    },
+    {
+      "scope": "include:com.example.authBasic",
+      "set": {
+        "permissions": [
+          {
+            "resource": "rpc",
+            "lxm": [
+              "com.example.getFeed"
+            ]
+          },
+          {
+            "resource": "rpc",
+            "lxm": [
+              "com.example.getFeed"
+            ],
+            "aud": "*"
+          },
+          {
+            "resource": "rpc",
+            "lxm": [
+              "com.example.getFeed"
+            ],
+            "inheritAud": true
+          }
+        ]
+      },
+      "expanded": [
+        "rpc:com.example.getFeed?aud=*"
+      ]
+    },
+    {
+      "scope": "include:com.example.authBasic?aud=did:web:x.com%23svc",
+      "set": {
+        "permissions": [
+          {
+            "resource": "rpc",
+            "lxm": [
+              "com.example.getFeed"
+            ],
+            "inheritAud": true
+          },
+          {
+            "resource": "rpc",
+            "lxm": [
+              "com.example.getFeed"
+            ],
+            "aud": "did:web:evil.com#svc"
+          },
+          {
+            "resource": "rpc",
+            "lxm": [
+              "app.bsky.feed.getFeed"
+            ],
+            "inheritAud": true
+          }
+        ]
+      },
+      "expanded": [
+        "rpc:com.example.getFeed?aud=did:web:x.com%23svc"
+      ]
+    },
+    {
+      "scope": "include:com.example.authBasic",
+      "set": {
+        "permissions": [
+          {
+            "resource": "account",
+            "attr": "email"
+          },
+          {
+            "resource": "repo",
+            "collection": [
+              "com.example.a",
+              "com.example.b"
+            ],
+            "action": [
+              "create"
+            ]
+          }
+        ]
+      },
+      "expanded": [
+        "repo?collection=com.example.a&collection=com.example.b&action=create"
+      ]
+    }
+  ]
+}

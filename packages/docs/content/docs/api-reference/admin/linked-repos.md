@@ -26,7 +26,7 @@ Returns every grant, newest first. Never includes session data or tokens.
       "did": "did:plc:abc123",
       "handle": "partner.example.com",
       "reason": "Mirror published notes",
-      "scopes": "atproto repo:com.example.note?action=create,update",
+      "scopes": "atproto repo:com.example.note?action=create&action=update",
       "status": "active",
       "last_error": null,
       "last_refreshed_at": "2026-07-30T12:00:00Z",
@@ -60,7 +60,7 @@ POST /admin/linked-repos
 {
   "handle": "partner.example.com",
   "reason": "Mirror published notes",
-  "scopes": "repo:com.example.note?action=create,update"
+  "scopes": "repo:com.example.note?action=create&action=update"
 }
 ```
 

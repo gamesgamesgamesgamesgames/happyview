@@ -42,7 +42,7 @@ test.describe("Linked Repos — invitee-facing pages", () => {
     const created = await page.request.post("/admin/linked-repos", {
       data: {
         reason: "Mirror published notes",
-        scopes: `atproto repo:${TEST_NSID}?action=create,update`,
+        scopes: `atproto repo:${TEST_NSID}?action=create&action=update`,
       },
     })
     expect(created.ok()).toBeTruthy()

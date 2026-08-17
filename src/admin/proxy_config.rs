@@ -6,7 +6,7 @@ use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
-use crate::proxy_config::{ProxyConfig, ProxyMode, validate_nsid_pattern};
+use crate::proxy_config::{ProxyConfig, ProxyMode, ProxyRouting, validate_nsid_pattern};
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -24,13 +24,37 @@ pub(super) async fn get(
     Ok(Json(config))
 }
 
+/// The PUT body.
+///
+/// `routing` is optional and **absent means unchanged**, not "reset to the
+/// default". The dashboard's proxy-mode form does not send it, so deserialising
+/// straight into [`ProxyConfig`] — where the field carries a serde default —
+/// would silently revert an operator's routing choice every time they toggled a
+/// mode or edited an NSID.
+#[derive(serde::Deserialize)]
+pub(super) struct ProxyConfigUpdate {
+    mode: ProxyMode,
+    #[serde(default)]
+    nsids: Vec<String>,
+    #[serde(default)]
+    routing: Option<ProxyRouting>,
+}
+
 /// PUT /admin/settings/xrpc-proxy
 pub(super) async fn put(
     State(state): State<AppState>,
     auth: UserAuth,
-    Json(mut config): Json<ProxyConfig>,
+    Json(update): Json<ProxyConfigUpdate>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+
+    let stored = (**state.proxy_config.load()).clone();
+
+    let mut config = ProxyConfig {
+        mode: update.mode,
+        nsids: update.nsids,
+        routing: update.routing.unwrap_or(stored.routing),
+    };
 
     // Clear nsids for modes that don't use them
     if matches!(config.mode, ProxyMode::Disabled | ProxyMode::Open) {
@@ -42,7 +66,6 @@ pub(super) async fn put(
     // grandfathered — revalidating it on every PUT would 400 an operator who
     // never touched it, just for toggling proxy mode. A newly added pattern
     // gets the full check.
-    let stored = (**state.proxy_config.load()).clone();
     for pattern in &config.nsids {
         if !stored.nsids.contains(pattern) {
             validate_nsid_pattern(pattern).map_err(AppError::BadRequest)?;

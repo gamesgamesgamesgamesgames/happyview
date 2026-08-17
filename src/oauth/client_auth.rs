@@ -153,135 +153,143 @@ pub async fn resolve_client_by_key(
 
 /// Validate that token scopes are allowed by the client's registered scopes.
 ///
+/// The grammar and the subset rules are `happyview-scopes`', which is pinned to
+/// the reference implementation. What is HappyView's is resolving `include:`
+/// scopes, because only HappyView has a lexicon registry to resolve them with.
+///
 /// Rules:
-/// - `atproto` must be present in token scopes (always implicitly allowed)
-/// - Every non-`atproto` scope in the token must appear in the client's registered scopes
-/// - `include:X` client scopes are expanded by looking up the permission set
-///   lexicon `X` and extracting its `rpc:` and `repo:` permissions
-/// - `repo?collection=X&collection=Y` scopes (PDS-granted) are allowed if the
-///   client has `transition:generic` or has collection-level permissions from
-///   expanded `include:` scopes
+/// - `atproto` must be present in the token scopes and is always allowed
+/// - every other token scope must be fully covered by the client's registered
+///   scopes, *including* the actions it grants — a token asking for create,
+///   update and delete is not satisfied by a client registered for create alone
+/// - `include:X` client scopes expand to the permissions declared by permission
+///   set lexicon `X`, subject to that set's authority containment
 pub async fn validate_scopes(
     token_scopes: &str,
     client_scopes: &str,
     lexicons: &crate::lexicon::LexiconRegistry,
 ) -> Result<(), AppError> {
-    let token_set: std::collections::HashSet<&str> = token_scopes.split_whitespace().collect();
-    let mut client_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let token_list = happyview_scopes::parse_scope_list(token_scopes);
 
-    for scope in client_scopes.split_whitespace() {
-        if let Some(perm_set_id) = scope.strip_prefix("include:") {
-            expand_permission_set(perm_set_id, lexicons, &mut client_set).await;
-        }
-        client_set.insert(scope.to_string());
-    }
-
-    if !token_set.contains("atproto") {
+    if !token_list.iter().any(|s| s == "atproto") {
         return Err(AppError::BadRequest(
             "token must include the 'atproto' scope".into(),
         ));
     }
 
-    let has_generic = client_set.contains("transition:generic");
-
-    for scope in &token_set {
-        if *scope == "atproto" {
-            continue;
+    let mut effective: Vec<String> = Vec::new();
+    for scope in happyview_scopes::parse_scope_list(client_scopes) {
+        if scope.starts_with("include:") {
+            expand_permission_set(&scope, lexicons, &mut effective).await;
         }
-        if client_set.contains(*scope) {
-            continue;
-        }
+        effective.push(scope);
+    }
 
-        // The PDS grants `repo?collection=X&collection=Y` to restrict which
-        // collections the token can access.  Allow if the client has broad
-        // access (`transition:generic`) or has matching collection-level
-        // permissions from expanded `include:` scopes.
-        if let Some(query) = scope.strip_prefix("repo?") {
-            if has_generic {
-                continue;
-            }
-            let all_allowed = query.split('&').all(|param| {
-                let Some(col) = param.strip_prefix("collection=") else {
-                    return true;
-                };
-                let prefix = format!("repo:{}?", col);
-                client_set.iter().any(|cs| cs.starts_with(&prefix))
-            });
-            if all_allowed {
-                continue;
-            }
-        }
+    let client = happyview_scopes::ScopePermissions::from_scopes(effective);
 
-        // The PDS also grants bare `repo:COLLECTION` scopes (without
-        // `?action=`).  Match if the expanded client set has any
-        // `repo:COLLECTION?action=...` entry for that collection.
-        if let Some(collection) = scope.strip_prefix("repo:") {
-            let prefix = format!("repo:{}?", collection);
-            if client_set.iter().any(|cs| cs.starts_with(&prefix)) {
-                continue;
-            }
+    for scope in &token_list {
+        if !client.covers_scope(scope) {
+            return Err(AppError::BadRequest(format!(
+                "scope '{scope}' is not allowed for this client"
+            )));
         }
-
-        return Err(AppError::BadRequest(format!(
-            "scope '{}' is not allowed for this client",
-            scope
-        )));
     }
 
     Ok(())
 }
 
-/// Expand a permission set lexicon into individual `rpc:` and `repo:` scopes.
+/// Expand an `include:<nsid>` scope into the permissions its lexicon declares.
+///
+/// Resolution is the only part that is HappyView's: fetch the lexicon, hand the
+/// document to the shared crate, and take back the permissions it yields. The
+/// crate applies the rules that make this safe — a permission set may only
+/// grant NSIDs under its own authority, may not pin a concrete `aud`, and its
+/// `rpc` permissions need an audience to be expressible at all.
+///
+/// A missing or malformed set contributes nothing rather than failing the
+/// whole validation, matching the reference, which skips what it cannot use.
 async fn expand_permission_set(
-    nsid: &str,
+    scope: &str,
     lexicons: &crate::lexicon::LexiconRegistry,
-    out: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
 ) {
-    let lexicon = match lexicons.get(nsid).await {
-        Some(l) => l,
-        None => {
-            tracing::warn!(nsid = %nsid, "permission set lexicon not found in registry");
-            return;
-        }
+    let Some(include) = happyview_scopes::IncludeScope::parse(scope) else {
+        tracing::warn!(%scope, "malformed include: scope");
+        return;
     };
 
-    let permissions = match lexicon
+    let Some(lexicon) = lexicons.get(&include.nsid).await else {
+        tracing::warn!(nsid = %include.nsid, "permission set lexicon not found in registry");
+        return;
+    };
+
+    let Some(permissions) = lexicon
         .raw
         .get("defs")
         .and_then(|d| d.get("main"))
         .and_then(|m| m.get("permissions"))
         .and_then(|p| p.as_array())
-    {
-        Some(p) => p,
-        None => return,
+    else {
+        return;
     };
 
-    for perm in permissions {
-        let resource = perm.get("resource").and_then(|r| r.as_str()).unwrap_or("");
-        match resource {
-            "rpc" => {
-                if let Some(lxms) = perm.get("lxm").and_then(|l| l.as_array()) {
-                    for lxm in lxms {
-                        if let Some(s) = lxm.as_str() {
-                            out.insert(format!("rpc:{s}"));
-                        }
+    let set = happyview_scopes::LexPermissionSet {
+        permissions: permissions.iter().filter_map(lex_permission).collect(),
+    };
+
+    for permission in include.expand(&set) {
+        match permission {
+            happyview_scopes::IncludedPermission::Repo(p) => {
+                for collection in &p.collection {
+                    for action in &p.action {
+                        out.push(format!("repo:{collection}?action={}", action.as_str()));
                     }
                 }
             }
-            "repo" => {
-                if let Some(collections) = perm.get("collection").and_then(|c| c.as_array()) {
-                    for col in collections {
-                        if let Some(s) = col.as_str() {
-                            out.insert(format!("repo:{s}?action=create"));
-                            out.insert(format!("repo:{s}?action=update"));
-                            out.insert(format!("repo:{s}?action=delete"));
-                        }
-                    }
+            happyview_scopes::IncludedPermission::Rpc(p) => {
+                for lxm in &p.lxm {
+                    // `aud` is not optional in the grammar. Emitting a bare
+                    // `rpc:<lxm>` here, as this used to, produced a scope string
+                    // the reference rejects outright — so an `include:` set's
+                    // rpc permissions never actually matched anything.
+                    out.push(format!("rpc:{lxm}?aud={}", urlencoding::encode(&p.aud)));
                 }
             }
-            _ => {}
         }
     }
+}
+
+/// Convert one lexicon `permission` entry into the crate's representation,
+/// preserving scalar/list arity — the reference treats a scalar supplied where
+/// a list belongs as invalidating the permission rather than coercing it.
+fn lex_permission(value: &serde_json::Value) -> Option<happyview_scopes::LexPermission> {
+    use happyview_scopes::LexValue;
+
+    let obj = value.as_object()?;
+    let resource = obj.get("resource")?.as_str()?.to_string();
+
+    let params = obj
+        .iter()
+        .filter(|(k, _)| k.as_str() != "resource" && k.as_str() != "type")
+        .filter_map(|(k, v)| {
+            let value = match v {
+                serde_json::Value::Array(items) => LexValue::List(
+                    items
+                        .iter()
+                        .map(|i| i.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()?,
+                ),
+                serde_json::Value::Bool(b) => LexValue::Bool(*b),
+                serde_json::Value::String(s) => LexValue::Scalar(s.clone()),
+                // Anything else cannot appear in a valid permission; keep the
+                // key so the crate's unknown-key check still rejects it.
+                _ => LexValue::Scalar(String::new()),
+            };
+            Some((k.clone(), value))
+        })
+        .collect();
+
+    Some(happyview_scopes::LexPermission { resource, params })
 }
 
 /// Verify a PKCE challenge against a verifier.
@@ -368,6 +376,7 @@ mod tests {
                         {
                             "type": "permission",
                             "resource": "rpc",
+                            "aud": "*",
                             "lxm": ["com.example.getProfile", "com.example.putProfile"]
                         },
                         {
@@ -390,20 +399,199 @@ mod tests {
         reg.upsert(parsed).await;
 
         let result = validate_scopes(
-            "atproto rpc:com.example.getProfile repo:com.example.profile?action=create",
+            "atproto rpc:com.example.getProfile?aud=* repo:com.example.profile?action=create",
             "atproto include:com.example.authBasic",
             &reg,
         )
         .await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
 
         let result = validate_scopes(
-            "atproto rpc:com.example.notAllowed",
+            "atproto rpc:com.example.notAllowed?aud=*",
             "atproto include:com.example.authBasic",
             &reg,
         )
         .await;
         assert!(result.is_err());
+    }
+
+    /// A permission set may only grant NSIDs under its own authority group.
+    ///
+    /// Without this, publishing a permission-set lexicon would be enough to
+    /// vouch for someone else's collections. This check did not exist before
+    /// the shared crate; it is the reason adopting it is a behaviour change.
+    #[tokio::test]
+    async fn include_cannot_grant_another_authoritys_collection() {
+        let reg = empty_registry();
+        let raw = serde_json::json!({
+            "lexicon": 1,
+            "id": "com.example.authBasic",
+            "defs": {
+                "main": {
+                    "type": "permission-set",
+                    "permissions": [
+                        {
+                            "type": "permission",
+                            "resource": "repo",
+                            "collection": ["com.example.profile"]
+                        },
+                        {
+                            "type": "permission",
+                            "resource": "repo",
+                            "collection": ["app.bsky.feed.post"]
+                        }
+                    ]
+                }
+            }
+        });
+        let parsed = crate::lexicon::ParsedLexicon::parse(
+            raw,
+            1,
+            None,
+            crate::lexicon::ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        reg.upsert(parsed).await;
+
+        // Its own authority: granted.
+        assert!(
+            validate_scopes(
+                "atproto repo:com.example.profile?action=create",
+                "atproto include:com.example.authBasic",
+                &reg,
+            )
+            .await
+            .is_ok()
+        );
+
+        // Someone else's: dropped during expansion, so never granted.
+        assert!(
+            validate_scopes(
+                "atproto repo:app.bsky.feed.post?action=create",
+                "atproto include:com.example.authBasic",
+                &reg,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    /// Containment is all-or-nothing *per permission entry*, not per NSID: one
+    /// entry listing a foreign collection alongside its own grants neither.
+    /// Splitting them into separate entries is what keeps the local one.
+    #[tokio::test]
+    async fn include_drops_a_whole_entry_that_reaches_outside_its_authority() {
+        let reg = empty_registry();
+        let raw = serde_json::json!({
+            "lexicon": 1,
+            "id": "com.example.authBasic",
+            "defs": {
+                "main": {
+                    "type": "permission-set",
+                    "permissions": [
+                        {
+                            "type": "permission",
+                            "resource": "repo",
+                            "collection": ["com.example.profile", "app.bsky.feed.post"]
+                        }
+                    ]
+                }
+            }
+        });
+        let parsed = crate::lexicon::ParsedLexicon::parse(
+            raw,
+            1,
+            None,
+            crate::lexicon::ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        reg.upsert(parsed).await;
+
+        for scope in [
+            "atproto repo:com.example.profile?action=create",
+            "atproto repo:app.bsky.feed.post?action=create",
+        ] {
+            assert!(
+                validate_scopes(scope, "atproto include:com.example.authBasic", &reg)
+                    .await
+                    .is_err(),
+                "{scope} should not be granted by a mixed-authority entry"
+            );
+        }
+    }
+
+    /// An `rpc` permission with no audience is not expressible, so a permission
+    /// set declaring one expands to nothing. This used to emit a bare
+    /// `rpc:<lxm>`, which the grammar rejects — meaning it matched nothing
+    /// anyway, just less visibly.
+    #[tokio::test]
+    async fn include_rpc_without_an_audience_grants_nothing() {
+        let reg = empty_registry();
+        let raw = serde_json::json!({
+            "lexicon": 1,
+            "id": "com.example.authBasic",
+            "defs": {
+                "main": {
+                    "type": "permission-set",
+                    "permissions": [
+                        {
+                            "type": "permission",
+                            "resource": "rpc",
+                            "lxm": ["com.example.getProfile"]
+                        }
+                    ]
+                }
+            }
+        });
+        let parsed = crate::lexicon::ParsedLexicon::parse(
+            raw,
+            1,
+            None,
+            crate::lexicon::ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        reg.upsert(parsed).await;
+
+        assert!(
+            validate_scopes(
+                "atproto rpc:com.example.getProfile?aud=*",
+                "atproto include:com.example.authBasic",
+                &reg,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    /// Subsetting is per-action: a client registered for `create` alone does
+    /// not satisfy a token asking for every action on the same collection.
+    #[tokio::test]
+    async fn validate_scopes_subsetting_is_per_action() {
+        let reg = empty_registry();
+
+        assert!(
+            validate_scopes(
+                "atproto repo:com.example.post?action=create",
+                "atproto repo:com.example.post?action=create&action=update",
+                &reg,
+            )
+            .await
+            .is_ok()
+        );
+
+        // The bare form grants all three, which `?action=create` does not cover.
+        assert!(
+            validate_scopes(
+                "atproto repo:com.example.post",
+                "atproto repo:com.example.post?action=create",
+                &reg,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

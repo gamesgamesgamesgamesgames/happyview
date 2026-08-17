@@ -9,7 +9,6 @@ use crate::error::AppError;
 use crate::rate_limit::CheckResult;
 
 use super::pds::pds_post_blob;
-use super::session::get_oauth_session;
 
 pub async fn upload_blob(
     State(state): State<AppState>,
@@ -47,37 +46,57 @@ pub async fn upload_blob(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
-    let mut response = if let Some(client_key) = claims.client_key() {
-        let encryption_key = state
-            .config
-            .token_encryption_key
-            .as_ref()
-            .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
+    // The auth branch is the shared one, so this route and the service-proxy
+    // path cannot drift apart in how they resolve credentials.
+    let auth = crate::repo::pds_auth_for_claims(&state, &claims).await?;
 
-        let api_client_id = crate::repo::get_dpop_client_id(&state, client_key).await?;
-        let dpop_key_id = claims
-            .dpop_key_id()
-            .ok_or_else(|| AppError::Internal("DPoP key ID not available in claims".into()))?;
+    // A blob scope is a MIME pattern, so the check is on the declared
+    // content-type. Parameters are stripped and case folded first — that is
+    // HTTP's business, not the scope grammar's, which matches only a clean
+    // type/subtype.
+    if let Some(scopes) = auth.granted_scopes(&state).await? {
+        let mime = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim()
+            .to_ascii_lowercase();
+        let granted = happyview_scopes::ScopePermissions::parse(&scopes);
+        crate::xrpc::scope_check::check(
+            &granted,
+            &[crate::xrpc::scope_check::Required::Blob { mime }],
+            "com.atproto.repo.uploadBlob",
+        )?;
+    }
 
-        let resp = crate::oauth::pds_write::dpop_pds_post_blob(
-            &state.http,
-            &state.db,
-            state.db_backend,
-            encryption_key,
-            &state.oauth,
-            &state.config.plc_url,
-            &api_client_id,
-            claims.did(),
+    let mut response = match &auth {
+        crate::repo::PdsAuth::Dpop {
+            api_client_id,
             dpop_key_id,
-            content_type,
-            body,
-        )
-        .await?;
+            encryption_key,
+        } => {
+            // Blobs are raw bytes with a caller-chosen content type, so they do
+            // not go through the JSON forward helper.
+            let resp = crate::oauth::pds_write::dpop_pds_post_blob(
+                &state.http,
+                &state.db,
+                state.db_backend,
+                encryption_key,
+                &state.oauth,
+                &state.config.plc_url,
+                api_client_id,
+                claims.did(),
+                dpop_key_id,
+                content_type,
+                body,
+            )
+            .await?;
 
-        crate::repo::forward_pds_response(resp).await?
-    } else {
-        let session = get_oauth_session(&state, claims.did()).await?;
-        pds_post_blob(&state, &session, content_type, body).await?
+            crate::repo::forward_pds_response(resp).await?
+        }
+        crate::repo::PdsAuth::OAuth(session) => {
+            pds_post_blob(&state, session, content_type, body).await?
+        }
     };
 
     if let Some(CheckResult::Allowed {

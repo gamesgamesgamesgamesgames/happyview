@@ -60,6 +60,27 @@ function splitQuery(rest: string): [string, string | null] {
   return i === -1 ? [rest, null] : [rest.slice(0, i), rest.slice(i + 1)];
 }
 
+/**
+ * Read an `action=` query into its list of actions.
+ *
+ * Repeated keys, not a comma-joined list: `?action=create&action=update`. The
+ * AT Protocol scope grammar parses query parameters with `URLSearchParams`
+ * semantics, so `?action=create,update` is a *single* value `"create,update"`,
+ * which is not a known action. An authorization server rejects the whole
+ * request with `invalid_scope` — "Unsupported scope" — and because scopes are
+ * immutable, a grant written that way can never complete authorization.
+ *
+ * Returns `null` when the query is not an action list at all.
+ */
+function readActionQuery(query: string): string[] | null {
+  const params = new URLSearchParams(query);
+  for (const key of params.keys()) {
+    if (key !== "action") return null;
+  }
+  const actions = params.getAll("action");
+  return actions.length ? actions : null;
+}
+
 function validateRepoRest(rest: string): string | null {
   const [target, query] = splitQuery(rest);
   if (!target) return "repo scope requires a collection or *";
@@ -68,10 +89,21 @@ function validateRepoRest(rest: string): string | null {
   if (!query.startsWith("action=")) {
     return `unsupported repo scope parameter: ${query}`;
   }
-  const actions = query.slice("action=".length);
+  const actions = readActionQuery(query);
   if (!actions) return "repo scope action list must not be empty";
-  for (const action of actions.split(",")) {
-    if (!isRepoAction(action)) return `unknown repo action: ${action}`;
+  for (const action of actions) {
+    if (!isRepoAction(action)) {
+      // Name the fix, because the comma form is the intuitive spelling and the
+      // server-side error it eventually produces does not explain itself.
+      if (action.includes(",")) {
+        return `repo actions are repeated parameters, not a comma-separated list — write ${action
+          .split(",")
+          .filter(Boolean)
+          .map((a) => `action=${a}`)
+          .join("&")}`;
+      }
+      return `unknown repo action: ${action}`;
+    }
   }
   return null;
 }
@@ -185,8 +217,12 @@ function hoistRepoActions(
 ): { rest: string; actions: RepoAction[] } | null {
   const [target, query] = splitQuery(value);
   if (query === null || !query.startsWith("action=")) return null;
-  const actions = query.slice("action=".length).split(",").filter(Boolean);
-  if (actions.length === 0 || !actions.every(isRepoAction)) return null;
+  const actions = readActionQuery(query);
+  // A comma-joined list is deliberately *not* hoisted: it stays in the field so
+  // `validateRepoRest` can explain what is wrong with it. Lifting it into the
+  // checkboxes would silently rewrite a scope the operator typed, and hide that
+  // any existing grant spelled that way is one an authorization server refuses.
+  if (!actions || !actions.every(isRepoAction)) return null;
   return { rest: target, actions: orderActions(actions) };
 }
 
@@ -225,7 +261,7 @@ function rowToToken(row: ScopeRow): string {
     // — but it still has to render something for the preview and the error to
     // describe.
     return actions.length
-      ? `repo:${rest}?action=${actions.join(",")}`
+      ? `repo:${rest}?${actions.map((a) => `action=${a}`).join("&")}`
       : `repo:${rest}`;
   }
   return `${prefix}:${rest}`;

@@ -235,7 +235,7 @@ test.describe("Linked Repos", () => {
     await dialog.getByLabel("delete", { exact: true }).check()
     await dialog.getByLabel("update", { exact: true }).check()
     await expect(
-      dialog.getByText(`atproto repo:${TEST_NSID}?action=create,update,delete`),
+      dialog.getByText(`atproto repo:${TEST_NSID}?action=create&action=update&action=delete`),
     ).toBeVisible()
 
     // `update` without `create` can't upsert — flagged on the row that has the
@@ -263,13 +263,13 @@ test.describe("Linked Repos", () => {
     // Pasting a whole scope keeps working: the query is lifted into the boxes
     // and the field is left holding the collection alone, so there's never a
     // second, invisible copy of the action list.
-    await value.fill(`${TEST_NSID}?action=create,update`)
+    await value.fill(`${TEST_NSID}?action=create&action=update`)
     await expect(value).toHaveValue(TEST_NSID)
     await expect(dialog.getByLabel("create", { exact: true })).toBeChecked()
     await expect(dialog.getByLabel("update", { exact: true })).toBeChecked()
     await expect(dialog.getByLabel("delete", { exact: true })).not.toBeChecked()
     await expect(
-      dialog.getByText(`atproto repo:${TEST_NSID}?action=create,update`),
+      dialog.getByText(`atproto repo:${TEST_NSID}?action=create&action=update`),
     ).toBeVisible()
 
     // A malformed action list is left in the field so the error can name it,

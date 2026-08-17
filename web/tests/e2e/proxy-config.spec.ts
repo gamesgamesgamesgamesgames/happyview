@@ -69,4 +69,41 @@ test.describe("Proxy Config Settings", () => {
     await page.getByRole("button", { name: "Save changes" }).click()
     await expect(page.getByText("Proxy settings saved.")).toBeVisible({ timeout: 5000 })
   })
+
+  test("defaults to authority routing", async ({ page }) => {
+    const authority = page.locator("input[type='radio'][value='authority']")
+    await expect(authority).toBeVisible({ timeout: 5000 })
+    await expect(authority).toBeChecked()
+  })
+
+  test("routing survives a mode change", async ({ page }) => {
+    // Routing and mode are independent axes, and the form posts both. If the
+    // server treated an omitted `routing` as "reset to default" — which it did
+    // before `ProxyConfigUpdate` — editing the mode would silently revert an
+    // operator's routing choice. This is that regression, end to end.
+    const serviceProxy = page.locator("input[type='radio'][value='serviceproxy']")
+    await expect(serviceProxy).toBeVisible({ timeout: 5000 })
+    await serviceProxy.check()
+    await page.getByRole("button", { name: "Save changes" }).click()
+    await expect(page.getByText("Proxy settings saved.")).toBeVisible({ timeout: 5000 })
+
+    // Now change only the mode.
+    await page.locator("input[type='radio'][value='blocklist']").check()
+    await page.getByRole("button", { name: "Save changes" }).click()
+    await expect(page.getByText("Proxy settings saved.")).toBeVisible({ timeout: 5000 })
+
+    await page.reload()
+    await expect(
+      page.locator("input[type='radio'][value='serviceproxy']"),
+    ).toBeChecked({ timeout: 5000 })
+    await expect(
+      page.locator("input[type='radio'][value='blocklist']"),
+    ).toBeChecked()
+
+    // Restore defaults for subsequent tests.
+    await page.locator("input[type='radio'][value='authority']").check()
+    await page.locator("input[type='radio'][value='open']").check()
+    await page.getByRole("button", { name: "Save changes" }).click()
+    await expect(page.getByText("Proxy settings saved.")).toBeVisible({ timeout: 5000 })
+  })
 })

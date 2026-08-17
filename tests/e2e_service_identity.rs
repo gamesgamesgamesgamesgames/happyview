@@ -1706,6 +1706,7 @@ async fn proxy_config_disabled_rejects_unknown_method() {
         .proxy_config
         .store(std::sync::Arc::new(happyview::proxy_config::ProxyConfig {
             mode: happyview::proxy_config::ProxyMode::Disabled,
+            routing: happyview::proxy_config::ProxyRouting::Authority,
             nsids: vec![],
         }));
 
@@ -1743,6 +1744,7 @@ async fn proxy_config_allowlist_rejects_unlisted_method() {
         .proxy_config
         .store(std::sync::Arc::new(happyview::proxy_config::ProxyConfig {
             mode: happyview::proxy_config::ProxyMode::Allowlist,
+            routing: happyview::proxy_config::ProxyRouting::Authority,
             nsids: vec!["com.allowed.*".to_string()],
         }));
 
