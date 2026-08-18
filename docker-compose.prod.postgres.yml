@@ -1,0 +1,217 @@
+# Production stack — Postgres.
+#
+# The sibling of `docker-compose.prod.sqlite.yml`. Pick one: SQLite for small
+# to medium instances, Postgres when you need multiple HappyView replicas
+# sharing a database, a larger-than-memory working set, or external tools with
+# direct read access to the records table.
+#
+# Its own project name, so `down` here never tears down the SQLite prod stack,
+# the dev stack (`happyview`), or the test stacks (`happyview-test`,
+# `happyview-e2e`). Every compose file in this directory would otherwise
+# default to the same project name and share containers, networks and volumes.
+name: happyview-prod-postgres
+
+# Required variables (keep them in their own file — see the warning below):
+#
+#   PUBLIC_URL           https://happyview.example.com — must match exactly the
+#                        URL users hit, scheme included, or OAuth login breaks.
+#                        Do NOT include BASE_PATH here.
+#   SESSION_SECRET       openssl rand -base64 48   (>= 64 chars recommended)
+#   TOKEN_ENCRYPTION_KEY openssl rand -base64 32   (exactly 32 bytes, base64)
+#   POSTGRES_PASSWORD    openssl rand -hex 32
+#
+# Compose fails fast with a message naming the generator command if any is
+# missing.
+#
+# Compose auto-loads a `.env` sitting beside this file, so a development `.env`
+# left in a deployment clone will quietly supply these — including the
+# `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` triplet that `.env.example`
+# ships commented out. Keep production values in their own file and pass it
+# explicitly:
+#
+#   docker compose --env-file .env.prod -f docker-compose.prod.postgres.yml up -d
+#
+# HappyView does not terminate TLS. Put a reverse proxy (Caddy, nginx,
+# Cloudflare Tunnel, a platform load balancer) in front of it and point
+# PUBLIC_URL at the public HTTPS URL.
+
+services:
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-17}
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-happyview}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?generate one with `openssl rand -hex 32`}
+      POSTGRES_DB: ${POSTGRES_DB:-happyview}
+      # Without this, the image trusts any connection from inside the compose
+      # network regardless of password.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+
+    # Raised from the stock 100. HappyView opens two pools: the main one
+    # (DATABASE_MAX_CONNECTIONS, default 32 on Postgres) and a separate backfill
+    # pool sized `(BACKFILL_CONCURRENT_PDS * BACKFILL_CONCURRENT_DIDS_PER_PDS)
+    # + BACKFILL_CONCURRENT_RESOLUTION + 4` — 134 on the defaults, capped at
+    # 256. Both are lazy, so an idle instance holds almost nothing, but a
+    # running backfill peaks near 166 and the stock limit would fail it with
+    # "sorry, too many clients already". Raise this further if you raise the
+    # backfill concurrency, add replicas, or lower DATABASE_MAX_CONNECTIONS.
+    command:
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-200}
+
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+    # Not published. The only client is HappyView, over the compose network.
+    # Uncomment to reach it with psql from the host — bound to loopback, since
+    # `ports` bypasses the host firewall on most Docker installs.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+    healthcheck:
+      # `$$` escapes compose interpolation, so the container's own environment
+      # supplies these rather than the host's.
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    # Docker's default SIGTERM is a Postgres *smart* shutdown: it waits for
+    # every client to disconnect, so it hangs for the full grace period and
+    # then takes a SIGKILL, leaving the next boot to run crash recovery. SIGINT
+    # is the fast shutdown — roll back open transactions, checkpoint, exit.
+    stop_signal: SIGINT
+    stop_grace_period: 60s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  happyview:
+    image: ghcr.io/gamesgamesgamesgamesgames/happyview:${HAPPYVIEW_VERSION:-latest}
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    # Published on loopback by default — the reverse proxy in front is what
+    # should be exposed. Set HTTP_BIND=0.0.0.0:3000 to publish on all
+    # interfaces, or drop `ports` entirely and attach the proxy to this
+    # compose network.
+    ports:
+      - "${HTTP_BIND:-127.0.0.1:3000}:3000"
+
+    environment:
+      # --- Database -----------------------------------------------------
+      # Assembled from the same values the postgres service uses, so the two
+      # cannot drift. The backend is auto-detected from the URL scheme.
+      #
+      # A password containing `@`, `/`, `:` or `#` must be percent-encoded here
+      # — those are URL delimiters and would truncate the connection string.
+      # `openssl rand -hex 32` avoids the problem entirely.
+      DATABASE_URL: postgres://${POSTGRES_USER:-happyview}:${POSTGRES_PASSWORD:?generate one with `openssl rand -hex 32`}@postgres:5432/${POSTGRES_DB:-happyview}
+      # Main pool ceiling. Must be counted against POSTGRES_MAX_CONNECTIONS
+      # above, together with the backfill pool and any replicas.
+      DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-32}
+
+      # --- Identity / networking ----------------------------------------
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL to the public HTTPS URL, e.g. https://happyview.example.com}
+      HOST: 0.0.0.0
+      PORT: "3000"
+      # Subpath prefix when sharing a domain with another service, e.g. /hv.
+      # PUBLIC_URL must NOT include it. Applied at container start, so no
+      # rebuild is needed. /health stays at the domain root regardless.
+      BASE_PATH: ${BASE_PATH:-}
+
+      # --- Secrets ------------------------------------------------------
+      # Signs the dashboard session cookie. An unset or too-short value does
+      # not stop boot — it silently disables cookie login — so it is required
+      # here instead.
+      SESSION_SECRET: ${SESSION_SECRET:?generate one with `openssl rand -base64 48`}
+      # AES-256-GCM key for OAuth tokens, DPoP private keys and plugin secrets
+      # at rest. Without it, DPoP sessions, spaces and service identity are
+      # disabled. Rotating it makes everything already encrypted unreadable.
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?generate one with `openssl rand -base64 32` (must decode to exactly 32 bytes)}
+      # Attestation signing uses a key generated and persisted to the database
+      # on first run. To supply your own, uncomment this — but note it must be
+      # a valid hex-encoded 32-byte secp256k1 key. An empty value is treated as
+      # "set", and fails signer construction instead of falling back to the
+      # generated key, which is why it is not declared with an empty default.
+      # ATTESTATION_PRIVATE_KEY: ${ATTESTATION_PRIVATE_KEY:-}
+
+      # --- Upstream services --------------------------------------------
+      JETSTREAM_URL: ${JETSTREAM_URL:-wss://jetstream1.us-east.bsky.network}
+      RELAY_URL: ${RELAY_URL:-https://bsky.network}
+      PLC_URL: ${PLC_URL:-https://plc.directory}
+
+      # --- Branding -----------------------------------------------------
+      # Seed values for the OAuth authorization screen, each overridden by the
+      # matching dashboard setting once one is saved. Left undeclared on
+      # purpose: the code distinguishes unset from empty, and an empty value
+      # here would put a blank app name and empty URIs on the consent screen
+      # rather than falling back to the defaults. Uncomment to use them.
+      # APP_NAME: ${APP_NAME:-}
+      # LOGO_URI: ${LOGO_URI:-}
+      # TOS_URI: ${TOS_URI:-}
+      # POLICY_URI: ${POLICY_URI:-}
+
+      # --- Operational ---------------------------------------------------
+      # The dev default (`happyview=debug`) is very noisy in production.
+      RUST_LOG: ${RUST_LOG:-happyview=info,tower_http=info,sqlx=warn}
+      EVENT_LOG_RETENTION_DAYS: ${EVENT_LOG_RETENTION_DAYS:-30}
+      DEFAULT_RATE_LIMIT_CAPACITY: ${DEFAULT_RATE_LIMIT_CAPACITY:-100}
+      DEFAULT_RATE_LIMIT_REFILL_RATE: ${DEFAULT_RATE_LIMIT_REFILL_RATE:-2.0}
+      # Backfill concurrency. Each of these feeds the backfill pool size — see
+      # the POSTGRES_MAX_CONNECTIONS note above before raising them.
+      # BACKFILL_CONCURRENT_PDS: ${BACKFILL_CONCURRENT_PDS:-10}
+      # BACKFILL_CONCURRENT_DIDS_PER_PDS: ${BACKFILL_CONCURRENT_DIDS_PER_PDS:-3}
+      # BACKFILL_CONCURRENT_RESOLUTION: ${BACKFILL_CONCURRENT_RESOLUTION:-100}
+      # Plugins to preload, comma-separated: `id|url|sha256:<digest>`.
+      # PLUGIN_URLS: ${PLUGIN_URLS:-}
+
+    # The runtime image carries no curl or wget, so this probes /health over
+    # bash's /dev/tcp. `sh` is dash here and does not support it — hence CMD
+    # rather than CMD-SHELL.
+    #
+    # 60s covers migrations on first boot. Unlike the SQLite stack there is no
+    # startup VACUUM to wait out — scheduling one is rejected with 400 on
+    # Postgres — so this does not need the SQLite file's longer window.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/3000 && printf "GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 && head -n 1 <&3 | grep -q 200'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+    # `entrypoint.sh` execs the server, making it PID 1 — where the kernel
+    # drops signals that have only their default disposition, and the server
+    # installs no SIGTERM handler. Without an init, every `stop`, `restart` and
+    # `down` therefore hangs for the full grace period and ends in SIGKILL
+    # (exit 137). `init: true` puts tini at PID 1 to forward the signal, so the
+    # server exits promptly. Note this is prompt, not graceful: there is no
+    # graceful-shutdown handler, so in-flight requests are dropped either way,
+    # and an interrupted job is re-queued on the next boot.
+    init: true
+    stop_grace_period: 30s
+
+    # Container stdout is the only log sink; without a cap json-file logs grow
+    # unbounded. Ship these to an aggregator if you need retention.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  # The database. This is the only stateful path — back this volume up.
+  pgdata:
