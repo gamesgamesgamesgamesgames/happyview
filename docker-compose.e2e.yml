@@ -96,3 +96,10 @@ services:
 
 volumes:
   caddy_data:
+
+networks:
+  default:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 3fff:e2e::/64
