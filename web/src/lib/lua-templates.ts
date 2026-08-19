@@ -2,7 +2,7 @@ export const LEXICON_TEMPLATE = JSON.stringify(
   {
     $type: "com.atproto.lexicon.schema",
     lexicon: 1,
-    id: "",
+    id: "com.example.myRecord",
     defs: {
       main: {
         type: "record",
@@ -17,16 +17,16 @@ export const LEXICON_TEMPLATE = JSON.stringify(
   },
   null,
   2,
-)
+);
 
 export function procedureScript(collection: string): string {
-  const target = collection || "COLLECTION"
+  const target = collection || "COLLECTION";
   return `function handle()
   local r = Record("${target}", input)
   r:save()
   return { uri = r._uri, cid = r._cid }
 end
-`
+`;
 }
 
 export function indexHookScript(): string {
@@ -39,11 +39,11 @@ export function indexHookScript(): string {
     log(action .. " " .. uri)
   end
 end
-`
+`;
 }
 
 export function queryScript(collection: string): string {
-  const target = collection || "COLLECTION"
+  const target = collection || "COLLECTION";
   return `collection = "${target}"
 
 function handle()
@@ -62,5 +62,5 @@ function handle()
     cursor = params.cursor,
   })
 end
-`
+`;
 }

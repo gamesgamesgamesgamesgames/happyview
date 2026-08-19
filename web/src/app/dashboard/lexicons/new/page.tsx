@@ -9,6 +9,7 @@ import {
   resolveNetworkLexicon,
   uploadLexicon,
 } from "@/lib/api";
+import { isValidNsid } from "@happyview/nsid";
 import { LEXICON_TEMPLATE } from "@/lib/lua-templates";
 import { CodePanels } from "@/components/code-panels";
 import { SiteHeader } from "@/components/site-header";
@@ -54,6 +55,20 @@ export default function AddLexiconPage() {
     } catch {
       return lastValidType.current;
     }
+  }, [json]);
+
+  const localIdError = useMemo(() => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(json);
+    } catch {
+      return "Lexicon JSON is not valid JSON.";
+    }
+    const id = (parsed as { id?: unknown } | null)?.id;
+    if (typeof id !== "string" || !isValidNsid(id)) {
+      return "Lexicon ID must be a valid NSID, e.g. com.example.myRecord.";
+    }
+    return null;
   }, [json]);
 
   const showLocalTargetCollection =
@@ -200,7 +215,17 @@ export default function AddLexiconPage() {
                 </div>
               )}
 
-              <Button onClick={handleUploadLocal} disabled={submitting}>
+              {localIdError && (
+                <p className="text-muted-foreground self-center text-sm">
+                  {localIdError}
+                </p>
+              )}
+
+              <Button
+                onClick={handleUploadLocal}
+                disabled={submitting || localIdError !== null}
+                title={localIdError ?? undefined}
+              >
                 {submitting ? "Uploading..." : "Upload"}
               </Button>
             </footer>

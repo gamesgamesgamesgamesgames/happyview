@@ -4,5 +4,6 @@
 //! rules around.
 
 pub mod disk;
+pub mod lexicon_ids;
 pub mod nsid_audit;
 pub mod vacuum;

@@ -97,10 +97,8 @@ async fn main() {
         Err(e) => tracing::error!(error = %e, "scheduled vacuum could not be evaluated"),
     }
 
-    // Read-only, fail-open: warns about stored trigger ids / proxy patterns
-    // the NSID consolidation's tightened validation would now reject, so a
-    // config that already works is never a reason to stop booting.
     happyview::maintenance::nsid_audit::run(&db_pool, db_backend).await;
+    happyview::maintenance::lexicon_ids::run(&db_pool, db_backend).await;
 
     // Backfill record_refs in the background (first run after upgrade)
     {

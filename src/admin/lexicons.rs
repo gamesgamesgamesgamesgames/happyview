@@ -50,6 +50,8 @@ pub(super) async fn upload_lexicon(
         .ok_or_else(|| AppError::BadRequest("lexicon JSON must have a string 'id' field".into()))?
         .to_string();
 
+    happyview_nsid::validate_nsid(&id).map_err(|e| AppError::BadRequest(e.to_string()))?;
+
     // Validate action
     let action =
         ProcedureAction::from_optional_str(body.action.as_deref()).map_err(AppError::BadRequest)?;

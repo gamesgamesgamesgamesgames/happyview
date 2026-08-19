@@ -33,6 +33,7 @@ POST /admin/lexicons
 interface LexiconResult {
   id: string;
   revision: number;
+  backfill_job_id: string | null;
 }
 
 const response = await fetch("http://127.0.0.1:3000/admin/lexicons", {
@@ -169,19 +170,31 @@ curl -X POST http://127.0.0.1:3000/admin/lexicons \
 
 | Field               | Type    | Required | Description                                                           |
 | ------------------- | ------- | -------- | --------------------------------------------------------------------- |
-| `lexicon_json`      | object  | yes      | Raw lexicon JSON (must have `lexicon: 1` and `id`)                    |
-| `backfill`          | boolean | no       | Whether uploading triggers historical backfill (default `true`)       |
+| `lexicon_json`      | object  | yes      | Raw lexicon JSON (must have `lexicon: 1` and a valid NSID `id`)       |
+| `backfill`          | boolean | no       | Whether the first upload triggers a historical backfill (default `true`) |
 | `target_collection` | string  | no       | For query/procedure lexicons, the record collection they operate on   |
 | `token_cost`        | integer | no       | Token cost for query/procedure endpoints (overrides instance default) |
+
+The `id` must be a valid [NSID](https://atproto.com/specs/nsid) — it is the
+lexicon's primary key, the XRPC method it is served at, and, for record
+lexicons, the collection HappyView filters Jetstream on. An `id` that is empty
+or malformed is rejected with `400 Bad Request`.
 
 **Response**: `201 Created` (new) or `200 OK` (upsert)
 
 ```json
 {
   "id": "xyz.statusphere.status",
-  "revision": 1
+  "revision": 1,
+  "backfill_job_id": "9f1c8e2a-7b40-4d1e-9f3a-2c5b8d6e1a04"
 }
 ```
+
+`backfill_job_id` is the id of the [backfill job](backfill.md) this upload
+started, or `null` if it started none — because `backfill` was `false`, because
+this was an upsert rather than a first upload, because the lexicon is not a
+record type, or because the caller lacks `backfill:create`. Poll it via
+`GET /admin/backfill/status`.
 
 ## List lexicons
 

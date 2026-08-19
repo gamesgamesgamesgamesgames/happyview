@@ -534,3 +534,49 @@ async fn upload_lexicon_with_invalid_action_returns_400() {
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+#[serial]
+async fn upload_lexicon_with_empty_id_returns_400() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let mut lexicon = fixtures::game_record_lexicon();
+    lexicon["id"] = json!("");
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/lexicons",
+            app.admin_cookie(),
+            &json!({ "lexicon_json": lexicon }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[serial]
+async fn upload_lexicon_with_malformed_nsid_returns_400() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let mut lexicon = fixtures::game_record_lexicon();
+    lexicon["id"] = json!("not-an-nsid");
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/lexicons",
+            app.admin_cookie(),
+            &json!({ "lexicon_json": lexicon }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
