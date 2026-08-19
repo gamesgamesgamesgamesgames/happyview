@@ -187,7 +187,7 @@ async fn plc_register(
         .as_ref()
         .ok_or_else(|| AppError::Internal("no signing key stored".into()))?;
     let signing_key_bytes = crate::plc::decrypt_key(signing_key_enc, encryption_key)?;
-    let signing_key_did = crate::plc::private_key_to_did_key(&signing_key_bytes)?;
+    let signing_key_did = happyview_plc::private_key_to_did_key(&signing_key_bytes)?;
 
     // Decrypt rotation key
     let sql = crate::db::adapt_sql(
@@ -202,7 +202,7 @@ async fn plc_register(
         .and_then(|(k,)| k)
         .ok_or_else(|| AppError::Internal("no rotation key stored".into()))?;
     let rotation_key_bytes = crate::plc::decrypt_key(&rotation_key_enc, encryption_key)?;
-    let rotation_key_did = crate::plc::private_key_to_did_key(&rotation_key_bytes)?;
+    let rotation_key_did = happyview_plc::private_key_to_did_key(&rotation_key_bytes)?;
 
     let rotation_signing_key =
         p256::ecdsa::SigningKey::from_slice(rotation_key_bytes.as_slice())
@@ -219,16 +219,16 @@ async fn plc_register(
         })
         .collect();
 
-    let params = crate::plc::PlcGenesisParams {
+    let params = happyview_plc::PlcGenesisParams {
         rotation_key_did_key: rotation_key_did,
         signing_key_did_key: signing_key_did,
         service_entries,
     };
 
     // Build, sign, derive DID, and submit
-    let unsigned = crate::plc::build_unsigned_genesis(&params);
-    let signed = crate::plc::sign_operation(&unsigned, &rotation_signing_key)?;
-    let did = crate::plc::derive_did(&signed)?;
+    let unsigned = happyview_plc::build_unsigned_genesis(&params);
+    let signed = happyview_plc::sign_operation(&unsigned, &rotation_signing_key)?;
+    let did = happyview_plc::derive_did(&signed)?;
 
     crate::plc::submit_genesis(&state.http, &state.config.plc_url, &did, &signed).await?;
 

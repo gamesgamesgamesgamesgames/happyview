@@ -186,7 +186,7 @@ pub(super) async fn sync_plc(
     // Fetch last PLC operation to get prev CID and preserve existing fields
     let plc_url = &state.config.plc_url;
     let last_op = crate::plc::fetch_last_operation(&state.http, plc_url, did).await?;
-    let prev_cid = crate::plc::extract_prev_cid(&last_op)?;
+    let prev_cid = happyview_plc::extract_prev_cid(&last_op)?;
 
     // Preserve existing fields from the current DID document
     let rotation_keys: Vec<String> = last_op["rotationKeys"]
@@ -250,7 +250,7 @@ pub(super) async fn sync_plc(
     }
 
     // Build, sign, and submit the update operation
-    let unsigned = crate::plc::build_update_operation(
+    let unsigned = happyview_plc::build_update_operation(
         &prev_cid,
         rotation_keys,
         verification_methods,
@@ -275,7 +275,7 @@ pub(super) async fn sync_plc(
         p256::ecdsa::SigningKey::from_slice(rotation_key_bytes.as_slice())
             .map_err(|e| AppError::Internal(format!("invalid rotation key: {e}")))?;
 
-    let signed = crate::plc::sign_operation(&unsigned, &rotation_signing_key)?;
+    let signed = happyview_plc::sign_operation(&unsigned, &rotation_signing_key)?;
     crate::plc::submit_operation(&state.http, plc_url, did, &signed).await?;
 
     log_event(

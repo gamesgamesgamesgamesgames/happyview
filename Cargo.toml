@@ -4,6 +4,7 @@ exclude = ["tests/fixtures/test_plugin"]
 
 [workspace.dependencies]
 happyview-nsid = { path = "crates/happyview-nsid" }
+happyview-plc = { path = "crates/happyview-plc" }
 happyview-scopes = { path = "crates/happyview-scopes" }
 
 [package]
@@ -29,6 +30,7 @@ dashmap = "6"
 data-encoding = "2"
 dotenvy = "0.15"
 happyview-nsid = { workspace = true }
+happyview-plc = { workspace = true }
 happyview-scopes = { workspace = true }
 hex = "0.4"
 futures-util = "0.3"

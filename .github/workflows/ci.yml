@@ -156,7 +156,7 @@ jobs:
         run: cargo test --lib
 
       - name: Run crate tests
-        run: cargo test -p happyview-nsid
+        run: cargo test --workspace --exclude happyview
 
   e2e-tests:
     needs: changes
