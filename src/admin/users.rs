@@ -55,6 +55,9 @@ pub(super) async fn create_user(
         }
     }
 
+    let resolved = crate::identity::resolve_identifier(&body.did).await?;
+    let did = resolved.did;
+
     let user_id = Uuid::new_v4().to_string();
     let now = now_rfc3339();
     let backend = state.db_backend;
@@ -64,9 +67,22 @@ pub(super) async fn create_user(
         backend,
     );
 
+    let existing: Option<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT id FROM happyview_users WHERE did = ?",
+        backend,
+    ))
+    .bind(&did)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(format!("user lookup failed: {e}")))?;
+
+    if existing.is_some() {
+        return Err(AppError::Conflict(format!("user '{did}' already exists")));
+    }
+
     crate::db::query(&insert_sql)
         .bind(&user_id)
-        .bind(&body.did)
+        .bind(&did)
         .bind(0_i32)
         .bind(&now)
         .execute(&state.db)
@@ -100,7 +116,7 @@ pub(super) async fn create_user(
             event_type: "user.created".to_string(),
             severity: Severity::Info,
             actor_did: Some(auth.did.clone()),
-            subject: Some(body.did.clone()),
+            subject: Some(did.clone()),
             detail: serde_json::json!({
                 "template": template_name,
                 "permissions": perms_to_grant,
@@ -114,7 +130,7 @@ pub(super) async fn create_user(
         StatusCode::CREATED,
         Json(serde_json::json!({
             "id": user_id,
-            "did": body.did,
+            "did": did,
         })),
     ))
 }

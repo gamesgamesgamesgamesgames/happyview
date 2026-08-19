@@ -39,6 +39,7 @@ export default defineConfig({
         "jobs.spec.ts",
         "linked-repos.spec.ts",
         "link-invite-pages.spec.ts",
+        "users-add.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },

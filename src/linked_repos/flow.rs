@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{AuthorizeOptions, Scope};
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -12,7 +11,6 @@ use sha2::{Digest, Sha256};
 use crate::AppState;
 use crate::HappyViewOAuthClient;
 use crate::db::{adapt_sql, now_rfc3339};
-use crate::dns::NativeDnsResolver;
 use crate::error::AppError;
 
 use super::db;
@@ -41,44 +39,13 @@ fn is_loopback_url(url: &str) -> bool {
     url.contains("127.0.0.1") || url.contains("[::1]") || url.contains("localhost")
 }
 
-pub struct ResolvedIdentifier {
-    pub did: String,
-    pub handle: Option<String>,
-}
+pub use crate::identity::ResolvedIdentifier;
 
 pub async fn resolve_identifier(
     _state: &AppState,
     input: &str,
 ) -> Result<ResolvedIdentifier, AppError> {
-    if input.starts_with("did:") {
-        let did = atrium_api::types::string::Did::new(input.to_string())
-            .map_err(|e| AppError::BadRequest(format!("invalid DID {input}: {e}")))?;
-        return Ok(ResolvedIdentifier {
-            did: did.as_str().to_string(),
-            handle: None,
-        });
-    }
-
-    let handle = atrium_api::types::string::Handle::new(input.to_string())
-        .map_err(|_| AppError::BadRequest(format!("invalid handle: {input}")))?;
-
-    let resolver = AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
-        dns_txt_resolver: NativeDnsResolver::new(),
-        http_client: Arc::new(crate::http_retry::HappyViewHttpClient::new(
-            crate::http_retry::shared_client().clone(),
-        )),
-    });
-
-    use atrium_common::resolver::Resolver;
-    let did = resolver
-        .resolve(&handle)
-        .await
-        .map_err(|e| AppError::BadRequest(format!("could not resolve handle {input}: {e}")))?;
-
-    Ok(ResolvedIdentifier {
-        did: did.as_ref().to_string(),
-        handle: Some(input.to_string()),
-    })
+    crate::identity::resolve_identifier(input).await
 }
 
 pub fn client_for_grant(

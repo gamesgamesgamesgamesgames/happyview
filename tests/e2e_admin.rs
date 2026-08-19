@@ -1141,3 +1141,94 @@ async fn delete_collection_enqueues_a_job() {
         "input must carry exactly the validated collection and nothing else"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Identifier resolution on user creation (issue #85)
+// ---------------------------------------------------------------------------
+
+/// A handle that cannot be resolved must be refused outright. Storing it
+/// verbatim produces a row whose `did` column holds a handle, and the login
+/// authorization check in `auth::routes` matches the OAuth session's DID
+/// exactly — so such a user can never sign in, and the failure surfaces at
+/// login rather than at the point of the mistake.
+#[tokio::test]
+#[serial]
+async fn admin_create_rejects_unresolvable_handle() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({ "did": "nonexistent-handle.invalid" });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/users", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // And no row was created.
+    let count: (i64,) = happyview::db::query_as(&adapt_sql(
+        "SELECT COUNT(*) FROM happyview_users WHERE did = ?",
+        app.state.db_backend,
+    ))
+    .bind("nonexistent-handle.invalid")
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(count.0, 0, "an unresolvable handle must not be stored");
+}
+
+/// Input that is neither a DID nor a syntactically valid handle is refused
+/// before any network work is attempted.
+#[tokio::test]
+#[serial]
+async fn admin_create_rejects_malformed_identifier() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    for bad in ["not a handle", "", "@"] {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_post(
+                "/admin/users",
+                app.admin_cookie(),
+                &json!({ "did": bad }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected {bad:?} to be refused"
+        );
+    }
+}
+
+/// Adding the same account twice reports a conflict rather than a 500 from the
+/// UNIQUE constraint on `did`.
+#[tokio::test]
+#[serial]
+async fn admin_create_duplicate_did_conflicts() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({ "did": "did:plc:duplicate" });
+
+    let first = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/users", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/users", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+}

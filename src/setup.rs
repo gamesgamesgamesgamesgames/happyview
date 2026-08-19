@@ -650,96 +650,22 @@ async fn resolve_identity(
         return Ok(Json(vec![]));
     }
 
-    // If it's already a DID, resolve the profile directly
-    if q.starts_with("did:") {
-        match crate::profile::resolve_profile(&state.http, &state.config.plc_url, &q).await {
-            Ok(profile) => {
-                return Ok(Json(vec![ResolveResult {
-                    did: profile.did,
-                    handle: Some(profile.handle),
-                    display_name: profile.display_name,
-                    avatar: profile.avatar_url,
-                }]));
-            }
-            Err(_) => {
-                // Return the DID as-is if profile resolution fails
-                return Ok(Json(vec![ResolveResult {
-                    did: q.to_string(),
-                    handle: None,
-                    display_name: None,
-                    avatar: None,
-                }]));
-            }
-        }
+    let Ok(resolved) = crate::identity::resolve_identifier(&q).await else {
+        return Ok(Json(vec![]));
+    };
+
+    match crate::profile::resolve_profile(&state.http, &state.config.plc_url, &resolved.did).await {
+        Ok(profile) => Ok(Json(vec![ResolveResult {
+            did: profile.did,
+            handle: Some(profile.handle),
+            display_name: profile.display_name,
+            avatar: profile.avatar_url,
+        }])),
+        Err(_) => Ok(Json(vec![ResolveResult {
+            did: resolved.did,
+            handle: resolved.handle,
+            display_name: None,
+            avatar: None,
+        }])),
     }
-
-    // Try to resolve the handle to a DID, then fetch the profile.
-    // AT Protocol handle resolution: check DNS TXT `_atproto.<handle>` for `did=<DID>`,
-    // or fall back to `https://<handle>/.well-known/atproto-did`.
-    let handle = q.trim_start_matches('@').to_string();
-    let did = resolve_handle_to_did(&state.http, &handle).await;
-
-    match did {
-        Some(did) => {
-            match crate::profile::resolve_profile(&state.http, &state.config.plc_url, &did).await {
-                Ok(profile) => Ok(Json(vec![ResolveResult {
-                    did: profile.did,
-                    handle: Some(profile.handle),
-                    display_name: profile.display_name,
-                    avatar: profile.avatar_url,
-                }])),
-                Err(_) => Ok(Json(vec![ResolveResult {
-                    did,
-                    handle: Some(handle),
-                    display_name: None,
-                    avatar: None,
-                }])),
-            }
-        }
-        None => Ok(Json(vec![])),
-    }
-}
-
-/// Resolve an AT Protocol handle to a DID.
-/// Tries HTTPS well-known first, then DNS TXT `_atproto.<handle>` fallback.
-async fn resolve_handle_to_did(http: &reqwest::Client, handle: &str) -> Option<String> {
-    // Try HTTPS well-known first (simpler, no DNS library needed here)
-    let url = format!("https://{}/.well-known/atproto-did", handle);
-    if let Ok(resp) = http.get(&url).send().await
-        && resp.status().is_success()
-        && let Ok(text) = resp.text().await
-    {
-        let did = text.trim().to_string();
-        if did.starts_with("did:") {
-            return Some(did);
-        }
-    }
-
-    // Try DNS TXT record `_atproto.<handle>`
-    use hickory_resolver::Resolver;
-    use hickory_resolver::proto::rr::RData;
-    let lookup_name = format!("_atproto.{}.", handle);
-    if let Ok(resolver) = Resolver::builder_tokio().and_then(|b| b.build())
-        && let Ok(txt_lookup) = resolver.txt_lookup(&lookup_name).await
-    {
-        let did = txt_lookup
-            .answers()
-            .iter()
-            .filter_map(|r| match &r.data {
-                RData::TXT(txt) => Some(txt),
-                _ => None,
-            })
-            .flat_map(|txt| txt.txt_data.iter())
-            .filter_map(|data| {
-                let s = std::str::from_utf8(data).ok()?;
-                s.strip_prefix("did=")
-            })
-            .next()
-            .map(|s| s.to_string());
-        if did.is_some() {
-            return did;
-        }
-    }
-
-    None
 }

@@ -789,17 +789,19 @@ function AddUserDialog({
   templates: PermissionTemplate[];
   templatePermissions: Record<string, string[]>;
 }) {
-  const [did, setDid] = useState("");
+  const [identifier, setIdentifier] = useState("");
   const [template, setTemplate] = useState<string>("");
   const [open, setOpen] = useState(false);
 
   async function handleAdd() {
     try {
-      const body: { did: string; template?: string } = { did };
+      const body: { did: string; template?: string } = {
+        did: identifier.trim(),
+      };
       if (template) body.template = template;
       await addUser(body);
       toast.success("User added");
-      setDid("");
+      setIdentifier("");
       setTemplate("");
       setOpen(false);
       onSuccess();
@@ -817,19 +819,22 @@ function AddUserDialog({
         <ResponsiveDialogHeader>
           <ResponsiveDialogTitle>Add User</ResponsiveDialogTitle>
           <ResponsiveDialogDescription>
-            Add a new user by their DID and optionally assign a permission
-            template.
+            Add a new user by their handle or DID, and optionally assign a
+            permission template.
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
         <div className="flex flex-col gap-4">
           <div className="flex flex-col gap-2">
-            <Label htmlFor="user-did">DID</Label>
+            <Label htmlFor="user-did">Handle or DID</Label>
             <Input
               id="user-did"
-              value={did}
-              onChange={(e) => setDid(e.target.value)}
-              placeholder="did:plc:..."
+              value={identifier}
+              onChange={(e) => setIdentifier(e.target.value)}
+              placeholder="alice.bsky.social or did:plc:..."
             />
+            <p className="text-muted-foreground text-xs">
+              Handles are resolved to a DID when the user is added.
+            </p>
           </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="user-template">Template</Label>
@@ -856,7 +861,7 @@ function AddUserDialog({
           <ResponsiveDialogClose asChild>
             <Button variant="outline">Cancel</Button>
           </ResponsiveDialogClose>
-          <Button onClick={handleAdd} disabled={!did.trim()}>
+          <Button onClick={handleAdd} disabled={!identifier.trim()}>
             Add
           </Button>
         </ResponsiveDialogFooter>
