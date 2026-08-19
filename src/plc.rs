@@ -52,6 +52,15 @@ pub fn sign_operation(
 
     // p256 Signer::sign hashes the message with SHA-256 internally (standard ECDSA)
     let signature: p256::ecdsa::Signature = rotation_key.sign(&cbor);
+
+    // The PLC directory verifies with `@atproto/crypto`, which runs `verifySig`
+    // with `lowS: true` unless a caller opts into malleable signatures — and no
+    // caller there does. P-256 leaves S wherever ECDSA put it, so about half of
+    // all operations came back `400 Invalid signature on op` until this
+    // normalization; the other half were accepted, which made it read as a flaky
+    // PLC rather than a signing bug.
+    let signature = signature.normalize_s();
+
     let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     let mut signed = unsigned_op.clone();
@@ -238,6 +247,37 @@ mod tests {
         assert_eq!(op["alsoKnownAs"].as_array().unwrap().len(), 0);
         // No sig field on unsigned op
         assert!(op.get("sig").is_none());
+    }
+
+    /// The PLC directory verifies operations with `@atproto/crypto`, whose
+    /// `verifySig` defaults to `lowS: true` — a signature whose S value sits in
+    /// the upper half of the curve order is rejected as malleable. P-256 signing
+    /// does not normalize S on its own, so roughly half of all operations were
+    /// refused with `Invalid signature on op` until `sign_operation` normalized
+    /// it. One key would reproduce that only half the time; 64 make a
+    /// regression a certainty rather than a flake.
+    #[test]
+    fn sign_operation_produces_low_s_signatures() {
+        let params = PlcGenesisParams {
+            rotation_key_did_key: "did:key:zRotation".into(),
+            signing_key_did_key: "did:key:zSigning".into(),
+            service_entries: vec![],
+        };
+        let unsigned = build_unsigned_genesis(&params);
+
+        for i in 0..64 {
+            let key = test_signing_key();
+            let signed = sign_operation(&unsigned, &key).unwrap();
+            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(signed["sig"].as_str().unwrap())
+                .unwrap();
+            let sig = p256::ecdsa::Signature::from_slice(&raw).unwrap();
+            assert_eq!(
+                sig.normalize_s(),
+                sig,
+                "signature {i} has a high S value and PLC would reject it as malleable"
+            );
+        }
     }
 
     #[test]
