@@ -2407,8 +2407,25 @@ pub(super) async fn create_backfill(
     Json(body): Json<CreateBackfillBody>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     admin.require(Permission::BackfillCreate).await?;
-    let backend = state.db_backend;
 
+    let job_id = start_backfill(&state, body.collection, body.did, &admin.did).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": job_id,
+            "status": "running",
+        })),
+    ))
+}
+
+pub(crate) async fn start_backfill(
+    state: &AppState,
+    collection: Option<String>,
+    did: Option<String>,
+    actor_did: &str,
+) -> Result<String, AppError> {
+    let backend = state.db_backend;
     let now = now_rfc3339();
     let job_id = Uuid::new_v4().to_string();
     let sql = adapt_sql(
@@ -2417,8 +2434,8 @@ pub(super) async fn create_backfill(
     );
     let row: (String,) = crate::db::query_as(&sql)
         .bind(&job_id)
-        .bind(&body.collection)
-        .bind(&body.did)
+        .bind(&collection)
+        .bind(&did)
         .bind(&now)
         .bind(&now)
         .fetch_one(&state.db)
@@ -2432,8 +2449,8 @@ pub(super) async fn create_backfill(
         EventLog {
             event_type: "backfill.started".to_string(),
             severity: Severity::Info,
-            actor_did: Some(admin.did.clone()),
-            subject: body.collection.clone(),
+            actor_did: Some(actor_did.to_string()),
+            subject: collection.clone(),
             detail: serde_json::json!({
                 "job_id": job_id.clone(),
             }),
@@ -2448,13 +2465,7 @@ pub(super) async fn create_backfill(
         run_backfill_job(spawn_state, spawn_job_id).await;
     });
 
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "id": job_id,
-            "status": "running",
-        })),
-    ))
+    Ok(job_id)
 }
 
 /// POST /admin/backfill/{id}/cancel — cancel a running backfill job.

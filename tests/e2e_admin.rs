@@ -351,6 +351,197 @@ async fn lexicon_missing_id_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+// ---------------------------------------------------------------------------
+// Lexicon-triggered backfill
+// ---------------------------------------------------------------------------
+
+/// Count backfill jobs for a collection.
+async fn backfill_job_count(app: &TestApp, collection: &str) -> i64 {
+    let sql = adapt_sql(
+        "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE collection = ?",
+        app.state.db_backend,
+    );
+    let row: (i64,) = happyview::db::query_as(&sql)
+        .bind(collection)
+        .fetch_one(&app.state.db)
+        .await
+        .expect("count backfill jobs");
+    row.0
+}
+
+#[tokio::test]
+#[serial]
+async fn record_lexicon_with_backfill_starts_a_backfill_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": true
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json = json_body(resp).await;
+    let job_id = json["backfill_job_id"]
+        .as_str()
+        .expect("backfill_job_id in upload response");
+
+    let sql = adapt_sql(
+        "SELECT collection FROM happyview_backfill_jobs WHERE id = ?",
+        app.state.db_backend,
+    );
+    let row: Option<(Option<String>,)> = happyview::db::query_as(&sql)
+        .bind(job_id)
+        .fetch_optional(&app.state.db)
+        .await
+        .expect("query backfill job");
+    assert_eq!(
+        row.expect("backfill job row exists").0.as_deref(),
+        Some("games.gamesgamesgamesgames.game"),
+        "the job must target the uploaded lexicon's collection"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn re_uploading_a_lexicon_does_not_start_a_second_backfill_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": true
+    });
+
+    for _ in 0..2 {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    assert_eq!(
+        backfill_job_count(&app, "games.gamesgamesgamesgames.game").await,
+        1,
+        "only the first upload (revision 1) may start a backfill"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn record_lexicon_without_backfill_starts_no_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": false
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(json_body(resp).await["backfill_job_id"].is_null());
+
+    assert_eq!(
+        backfill_job_count(&app, "games.gamesgamesgamesgames.game").await,
+        0
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn query_lexicon_with_backfill_starts_no_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({
+        "lexicon_json": fixtures::list_games_query_lexicon(),
+        "backfill": true,
+        "target_collection": "games.gamesgamesgamesgames.game"
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(
+        json_body(resp).await["backfill_job_id"].is_null(),
+        "there is nothing to backfill for a non-record lexicon"
+    );
+}
+
+/// An uploader holding `lexicons:create` but not `backfill:create` gets the
+/// lexicon, not a 403 — the backfill is skipped and reported as skipped.
+#[tokio::test]
+#[serial]
+async fn lexicon_upload_without_backfill_permission_skips_the_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let create = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/api-keys",
+            app.admin_cookie(),
+            &json!({ "name": "lexicon-only", "permissions": ["lexicons:create"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let key = response_json(create).await["key"]
+        .as_str()
+        .expect("api key returned")
+        .to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/lexicons")
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "lexicon_json": fixtures::game_record_lexicon(),
+                        "backfill": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "a missing backfill permission must not fail the upload"
+    );
+    assert!(json_body(resp).await["backfill_job_id"].is_null());
+
+    assert_eq!(
+        backfill_job_count(&app, "games.gamesgamesgamesgames.game").await,
+        0
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn lexicon_list_all() {
