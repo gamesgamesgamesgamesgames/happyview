@@ -629,6 +629,8 @@ Validation rules:
 
 By default, a client's scopes are just `atproto`. You can add custom scopes when creating or updating the client.
 
+### Permission sets
+
 HappyView supports an `include:` directive that expands permission sets defined in lexicons. For example, if your instance has a lexicon `com.example.authBasic` with a `permissions` array in its definition, you can set the client's scopes to:
 
 ```

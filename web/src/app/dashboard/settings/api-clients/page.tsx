@@ -14,6 +14,7 @@ import { toast } from "sonner";
 import { useConfig } from "@/lib/config-context";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { toastError } from "@/lib/format";
+import { docsUrl } from "@/lib/docs";
 import {
   getApiClients,
   createApiClient,
@@ -193,7 +194,8 @@ export default function ApiClientsPage() {
                     colSpan={10}
                     className="text-muted-foreground text-center"
                   >
-                    No API clients yet. Register an application to enable OAuth authentication through this AppView.
+                    No API clients yet. Register an application to enable OAuth
+                    authentication through this AppView.
                   </TableCell>
                 </TableRow>
               )}
@@ -447,7 +449,9 @@ function CreateApiClientDialog({ onSuccess }: { onSuccess: () => void }) {
                   client secret.
                 </p>
                 <a
-                  href="/docs/getting-started/authentication#pkce"
+                  href={docsUrl(
+                    "/getting-started/authentication#api-clients-confidential-vs-public",
+                  )}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="inline-flex items-center gap-1 text-sm text-primary hover:underline"
@@ -598,7 +602,7 @@ function CreateApiClientDialog({ onSuccess }: { onSuccess: () => void }) {
                     <code>transition:generic</code> grants broad write access to
                     any collection. Prefer specific scopes or{" "}
                     <a
-                      href="https://docs.happyview.dev/guides/features/api-clients#permission-sets"
+                      href={docsUrl("/guides/api-clients#permission-sets")}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="underline"
@@ -888,7 +892,7 @@ function EditApiClientDialog({
                   broad write access to any collection. Prefer specific scopes
                   or{" "}
                   <a
-                    href="https://docs.happyview.dev/guides/features/api-clients#permission-sets"
+                    href={docsUrl("/guides/api-clients#permission-sets")}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="underline"
