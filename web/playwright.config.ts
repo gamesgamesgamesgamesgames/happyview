@@ -33,6 +33,7 @@ export default defineConfig({
         "lexicon-backfill.spec.ts",
         "script-delete.spec.ts",
         "script-job.spec.ts",
+        "script-unload-guard.spec.ts",
         "record-delete.spec.ts",
         "proxy-config.spec.ts",
         "spaces.spec.ts",

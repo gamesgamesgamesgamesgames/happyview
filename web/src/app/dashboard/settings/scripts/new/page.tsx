@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
@@ -71,9 +71,20 @@ function NewScriptInner() {
     );
   }, [state]);
 
+  // Set once the script is persisted. The unload guard reads it through a ref
+  // rather than state because it has to be current at the moment the browser
+  // asks, which is the same tick the save navigates in — a re-render would be
+  // too late.
+  const savedRef = useRef(false);
+
   useEffect(() => {
     if (!isDirty) return;
     function onBeforeUnload(e: BeforeUnloadEvent) {
+      // The post-save router.push leaves the page for real: `output: "export"`
+      // prerenders no payload for the [id] detail route, so the client router
+      // falls back to a full page load. Warning about losing work we just
+      // saved would be a lie, and answering "Cancel" to it strands the form.
+      if (savedRef.current) return;
       e.preventDefault();
       e.returnValue = "";
     }
@@ -97,9 +108,15 @@ function NewScriptInner() {
         body: state.body,
         description: state.description.trim() || null,
       });
+      savedRef.current = true;
       router.push(`/dashboard/settings/scripts/${encodeURIComponent(id)}`);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      // Also runs on the success path. The navigation that follows a save is a
+      // full page load, and a load can be abandoned — by a prompt the operator
+      // cancels, or by a network failure — so leaving the button spinning on
+      // the way out strands the form with no way back.
       setSaving(false);
     }
   }, [canSave, state, router]);
