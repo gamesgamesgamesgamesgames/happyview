@@ -2,7 +2,7 @@
 title: "From Source"
 ---
 
-This guide runs HappyView directly with `cargo run`. If you'd rather use Docker Compose, see [Local Development with Docker](docker.md).
+This guide runs HappyView directly with `cargo run`. If you'd rather run the whole stack in containers, see [Local Development](local-development.md). To deploy from prebuilt images, see [Docker](docker.md).
 
 ## Prerequisites
 
@@ -12,7 +12,7 @@ This guide runs HappyView directly with `cargo run`. If you'd rather use Docker 
 ## 1. Clone and configure
 
 ```sh
-git clone git@tangled.org:gamesgamesgamesgames.games/happyview
+git clone git@github.com:gamesgamesgamesgamesgames/happyview
 cd happyview
 cp .env.example .env
 ```

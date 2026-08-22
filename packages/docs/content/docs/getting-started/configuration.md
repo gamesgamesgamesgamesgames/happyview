@@ -2,7 +2,7 @@
 title: "Configuration"
 ---
 
-HappyView is configured via environment variables. A `.env` file in the project root is loaded automatically on startup. See [Deployment](deployment/docker.md) for local setup or [Production Deployment](deployment/production.md) for production setup.
+HappyView is configured via environment variables. A `.env` file in the project root is loaded automatically on startup. See [Local Development](deployment/local-development.md) for local setup, [Docker](deployment/docker.md) for deploying from published images, or [Production](deployment/production.md) for the hardening checklist.
 
 ## Environment variables
 

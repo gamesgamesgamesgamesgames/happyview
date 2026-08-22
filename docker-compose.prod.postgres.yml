@@ -33,7 +33,9 @@ name: happyview-prod-postgres
 #
 # HappyView does not terminate TLS. Put a reverse proxy (Caddy, nginx,
 # Cloudflare Tunnel, a platform load balancer) in front of it and point
-# PUBLIC_URL at the public HTTPS URL.
+# PUBLIC_URL at the public HTTPS URL. If you don't already have one, a
+# commented-out Caddy service at the bottom of this file will do it, with
+# certificates obtained and renewed automatically.
 
 services:
   postgres:
@@ -212,6 +214,86 @@ services:
         max-size: "10m"
         max-file: "5"
 
+  # --------------------------------------------------------------------------
+  # Optional: Caddy as the TLS-terminating reverse proxy.
+  #
+  # HappyView does not terminate TLS. Uncommenting this puts Caddy in front of
+  # it with an automatically obtained and renewed Let's Encrypt certificate.
+  # Skip it if you already have a proxy, a platform load balancer, or a
+  # Cloudflare Tunnel doing the same job.
+  #
+  # Create a `Caddyfile` beside this file containing:
+  #
+  #   {$CADDY_DOMAIN} {
+  #       reverse_proxy happyview:3000
+  #   }
+  #
+  # and set CADDY_DOMAIN in your env file to the hostname from PUBLIC_URL with
+  # the scheme stripped — `happyview.example.com` for
+  # `https://happyview.example.com`. PUBLIC_URL itself stays the full URL.
+  #
+  # Two things to change above when you enable this:
+  #
+  #   - Delete the `ports` block from the `happyview` service. Caddy reaches it
+  #     over the compose network, so publishing it to the host as well only
+  #     widens the exposure. Leave HTTP_BIND unset.
+  #   - Point DNS at this host *before* the first `up`. Caddy asks Let's
+  #     Encrypt for a certificate on startup, and a challenge against a
+  #     hostname that does not resolve here fails and retries with backoff.
+  #
+  # For a subpath deployment (BASE_PATH), the Caddyfile needs an extra rewrite
+  # so `/xrpc/*` still resolves at the domain root — see "Reverse proxy
+  # subpath" in the deployment docs.
+  #
+  # caddy:
+  #   image: caddy:2-alpine
+  #   restart: unless-stopped
+  #
+  #   # Deliberately `service_started`, not `service_healthy`. Caddy should come
+  #   # up and start the ACME exchange immediately rather than waiting out
+  #   # HappyView's start period, which on a first boot is minutes of migrations
+  #   # with nothing listening on 80 or 443. A request arriving before the
+  #   # backend is ready just gets a 502.
+  #   depends_on:
+  #     happyview:
+  #       condition: service_started
+  #
+  #   # Port 80 is not optional and must stay open. It serves the HTTP->HTTPS
+  #   # redirect *and* the ACME HTTP-01 challenge — which is also how renewal
+  #   # works, so closing it once the first certificate issues makes renewal
+  #   # fail silently about 60 days later. 443/udp carries HTTP/3.
+  #   #
+  #   # DNS-01 (needed for wildcards, or when 80 cannot be exposed) is not
+  #   # possible with this image: the stock build ships no DNS provider
+  #   # modules, and adding one means building a custom image with xcaddy.
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #     - "443:443/udp"
+  #
+  #   environment:
+  #     CADDY_DOMAIN: ${CADDY_DOMAIN:?set CADDY_DOMAIN to the hostname in PUBLIC_URL, without the scheme}
+  #
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     # Issued certificates and the ACME account key. This MUST persist.
+  #     # Without it every recreate re-issues from scratch, and Let's Encrypt
+  #     # allows only 5 duplicate certificates per week before it starts
+  #     # refusing — which locks the site out of HTTPS for days. Back it up
+  #     # with the same care as the data volume, or accept a re-issue on
+  #     # restore.
+  #     - caddy-data:/data
+  #     - caddy-config:/config
+  #
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "5"
+
 volumes:
   # The database. This is the only stateful path — back this volume up.
   pgdata:
+  # Uncomment together with the caddy service above.
+  # caddy-data:
+  # caddy-config:

@@ -4,6 +4,7 @@
     "railway",
     "docker",
     "other",
+    "local-development",
     "production"
   ]
 }
