@@ -19,13 +19,13 @@ ghcr.io/gamesgamesgamesgamesgames/happyview
 
 Multi-arch manifests are published for `linux/amd64` and `linux/arm64` on every release.
 
-| Tag           | Moves                          | Use for                                        |
-| ------------- | ------------------------------ | ---------------------------------------------- |
-| `latest`      | Every stable release           | Trying HappyView out                           |
-| `2.13.0`      | Never                          | Production                                     |
-| `2.13`        | Every stable patch in that minor | Automatic patch updates                       |
-| `2`           | Every stable minor in that major | Automatic minor updates                       |
-| `sha-abc1234` | Never                          | Pinning to an exact commit                     |
+| Tag           | Moves                            | Use for                    |
+| ------------- | -------------------------------- | -------------------------- |
+| `latest`      | Every stable release             | Trying HappyView out       |
+| `2.13.0`      | Never                            | Production                 |
+| `2.13`        | Every stable patch in that minor | Automatic patch updates    |
+| `2`           | Every stable minor in that major | Automatic minor updates    |
+| `sha-abc1234` | Never                            | Pinning to an exact commit |
 
 Prereleases cut from the `dev` branch (e.g. `2.13.0-dev.1`) are published under their full version only. They never move `latest`, `2.13`, or `2`.
 
@@ -37,22 +37,26 @@ Every Compose file below reads `HAPPYVIEW_VERSION` and defaults to `latest`. Set
 
 Pick one Compose file. Both live at the repository root:
 
-| File                                | Database | Best for                                                                                       |
-| ----------------------------------- | -------- | ---------------------------------------------------------------------------------------------- |
-| `docker-compose.prod.sqlite.yml`    | SQLite   | Small to medium instances. One container, one volume, no database to operate                   |
-| `docker-compose.prod.postgres.yml`  | Postgres | Multiple HappyView replicas sharing a database, larger-than-memory working sets, or external tools reading the records table directly |
+| File                               | Database | Best for                                                                                                                              |
+| ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `docker-compose.prod.sqlite.yml`   | SQLite   | Small to medium instances. One container, one volume, no database to operate                                                          |
+| `docker-compose.prod.postgres.yml` | Postgres | Multiple HappyView replicas sharing a database, larger-than-memory working sets, or external tools reading the records table directly |
 
 See the [database setup guide](../../guides/database/database-setup.md) for the full comparison. Migrations run automatically on startup on either backend, and both directions are [migratable](../../guides/database/sqlite-to-postgres-migration.md) later.
 
 Make a directory for the deployment and download the one you picked as `docker-compose.yml`, so `docker compose` finds it without a `-f` flag:
 
 ```sh
-mkdir happyview && cd happyview
+mkdir -p happyview && cd happyview
+```
 
+```sh
 # SQLite
 curl -o docker-compose.yml https://raw.githubusercontent.com/gamesgamesgamesgamesgames/happyview/main/docker-compose.prod.sqlite.yml
+```
 
-# ...or Postgres
+```sh
+# Postgres
 curl -o docker-compose.yml https://raw.githubusercontent.com/gamesgamesgamesgamesgames/happyview/main/docker-compose.prod.postgres.yml
 ```
 
@@ -87,6 +91,7 @@ The steps above assume a directory containing nothing but the Compose file and y
 ```sh
 docker compose --env-file .env.prod -f docker-compose.prod.sqlite.yml up -d
 ```
+
 </Callout>
 
 <Callout type="warn" title="Percent-encode Postgres passwords">
@@ -126,7 +131,7 @@ Then, in `.env` and the Compose file:
 - Add `CADDY_DOMAIN` to `.env` — the hostname from `PUBLIC_URL` with the scheme stripped, so `happyview.example.com` for `https://happyview.example.com`. `PUBLIC_URL` itself stays the full URL.
 - Delete the `ports` block from the `happyview` service. Caddy reaches it over the Compose network, so publishing it to the host as well only widens the exposure. Leave `HTTP_BIND` unset.
 
-Point DNS at the host *before* the first `up`. Caddy requests a certificate on startup, and a challenge for a hostname that doesn't resolve to this host fails and retries with backoff.
+Point DNS at the host _before_ the first `up`. Caddy requests a certificate on startup, and a challenge for a hostname that doesn't resolve to this host fails and retries with backoff.
 
 <Callout type="warn" title="Port 80 has to stay open">
 It serves the HTTP→HTTPS redirect *and* the ACME HTTP-01 challenge — which is also how renewal works. Closing it once the first certificate has issued makes renewal fail silently about 60 days later. DNS-01, the usual alternative, isn't available here: the stock `caddy` image ships no DNS provider modules, and adding one means building a custom image with xcaddy.
@@ -154,34 +159,34 @@ From there, follow the [Quickstart](../quickstart.md) from step 3 to add your fi
 
 Beyond the required secrets, both Compose files expose these with production defaults. Override them in `.env`.
 
-| Variable                         | Default                                    | Notes                                                                 |
-| -------------------------------- | ------------------------------------------ | --------------------------------------------------------------------- |
-| `HAPPYVIEW_VERSION`              | `latest`                                   | Image tag to deploy                                                   |
-| `HTTP_BIND`                      | `127.0.0.1:3000`                           | Host address the container publishes on                               |
-| `BASE_PATH`                      | _(none)_                                   | Subpath prefix, e.g. `/hv`. `PUBLIC_URL` must not include it          |
-| `RUST_LOG`                       | `happyview=info,tower_http=info,sqlx=warn` | The dev default is very noisy in production                           |
-| `JETSTREAM_URL`                  | `wss://jetstream1.us-east.bsky.network`    | Real-time record stream                                               |
-| `RELAY_URL`                      | `https://bsky.network`                     | Used for [backfill](../../guides/backfill.md) repo discovery          |
-| `PLC_URL`                        | `https://plc.directory`                    | DID resolution                                                        |
-| `EVENT_LOG_RETENTION_DAYS`       | `30`                                       | `0` keeps [event logs](../../guides/event-logs.md) indefinitely       |
-| `DEFAULT_RATE_LIMIT_CAPACITY`    | `100`                                      | Per-client token bucket capacity                                      |
-| `DEFAULT_RATE_LIMIT_REFILL_RATE` | `2.0`                                      | Tokens per second                                                     |
+| Variable                         | Default                                    | Notes                                                           |
+| -------------------------------- | ------------------------------------------ | --------------------------------------------------------------- |
+| `HAPPYVIEW_VERSION`              | `latest`                                   | Image tag to deploy                                             |
+| `HTTP_BIND`                      | `127.0.0.1:3000`                           | Host address the container publishes on                         |
+| `BASE_PATH`                      | _(none)_                                   | Subpath prefix, e.g. `/hv`. `PUBLIC_URL` must not include it    |
+| `RUST_LOG`                       | `happyview=info,tower_http=info,sqlx=warn` | The dev default is very noisy in production                     |
+| `JETSTREAM_URL`                  | `wss://jetstream1.us-east.bsky.network`    | Real-time record stream                                         |
+| `RELAY_URL`                      | `https://bsky.network`                     | Used for [backfill](../../guides/backfill.md) repo discovery    |
+| `PLC_URL`                        | `https://plc.directory`                    | DID resolution                                                  |
+| `EVENT_LOG_RETENTION_DAYS`       | `30`                                       | `0` keeps [event logs](../../guides/event-logs.md) indefinitely |
+| `DEFAULT_RATE_LIMIT_CAPACITY`    | `100`                                      | Per-client token bucket capacity                                |
+| `DEFAULT_RATE_LIMIT_REFILL_RATE` | `2.0`                                      | Tokens per second                                               |
 
 SQLite stack only:
 
-| Variable                    | Default            | Notes                                                                                              |
-| --------------------------- | ------------------ | -------------------------------------------------------------------------------------------------- |
+| Variable                    | Default             | Notes                                                                                                                                          |
+| --------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SQLITE_JOURNAL_SIZE_LIMIT` | `67108864` (64 MiB) | Caps the `-wal` file after a checkpoint. Deleting rows grows the WAL for the duration of the delete, so this bounds a delete's peak disk usage |
 
 Postgres stack only:
 
-| Variable                   | Default     | Notes                                                        |
-| -------------------------- | ----------- | ------------------------------------------------------------ |
-| `POSTGRES_VERSION`         | `17`        | Image tag for the `postgres` service                         |
-| `POSTGRES_USER`            | `happyview` |                                                              |
-| `POSTGRES_DB`              | `happyview` |                                                              |
-| `POSTGRES_MAX_CONNECTIONS` | `200`       | Raised from the stock 100; see the note below                |
-| `DATABASE_MAX_CONNECTIONS` | `32`        | Main pool ceiling                                            |
+| Variable                   | Default     | Notes                                         |
+| -------------------------- | ----------- | --------------------------------------------- |
+| `POSTGRES_VERSION`         | `17`        | Image tag for the `postgres` service          |
+| `POSTGRES_USER`            | `happyview` |                                               |
+| `POSTGRES_DB`              | `happyview` |                                               |
+| `POSTGRES_MAX_CONNECTIONS` | `200`       | Raised from the stock 100; see the note below |
+| `DATABASE_MAX_CONNECTIONS` | `32`        | Main pool ceiling                             |
 
 The full environment variable reference is in [Configuration](../configuration.md). A few that aren't wired into the Compose files — `ATTESTATION_PRIVATE_KEY`, `APP_NAME`, `LOGO_URI`, `TOS_URI`, `POLICY_URI`, and the `BACKFILL_CONCURRENT_*` tuning knobs — are present as commented-out lines you can uncomment.
 
@@ -220,9 +225,9 @@ For an external probe, `GET /health` returns `200 ok` once HappyView can bind it
 
 Both stacks set `init: true`. The entrypoint `exec`s the server, making it PID 1, where the kernel drops signals that have only their default disposition, and the server installs no `SIGTERM` handler. Without an init, every `stop`, `restart`, and `down` would hang for the full grace period and end in `SIGKILL` (exit 137). `init: true` puts tini at PID 1 to forward the signal so the server exits promptly.
 
-This is *prompt*, not *graceful*: there is no graceful-shutdown handler, so in-flight requests are dropped either way, and an interrupted [job](../../guides/background-jobs.md) is re-queued on the next boot.
+This is _prompt_, not _graceful_: there is no graceful-shutdown handler, so in-flight requests are dropped either way, and an interrupted [job](../../guides/background-jobs.md) is re-queued on the next boot.
 
-The Postgres service additionally uses `stop_signal: SIGINT`. Docker's default `SIGTERM` is a Postgres *smart* shutdown, which waits for every client to disconnect, so it would hang for the full grace period and take a `SIGKILL`, leaving the next boot to run crash recovery. `SIGINT` is the fast shutdown: roll back open transactions, checkpoint, exit.
+The Postgres service additionally uses `stop_signal: SIGINT`. Docker's default `SIGTERM` is a Postgres _smart_ shutdown, which waits for every client to disconnect, so it would hang for the full grace period and take a `SIGKILL`, leaving the next boot to run crash recovery. `SIGINT` is the fast shutdown: roll back open transactions, checkpoint, exit.
 
 ### Logs
 

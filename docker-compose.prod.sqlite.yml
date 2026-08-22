@@ -150,7 +150,7 @@ services:
   # the scheme stripped — `happyview.example.com` for
   # `https://happyview.example.com`. PUBLIC_URL itself stays the full URL.
   #
-  # Two things to change above when you enable this:
+  # When you enable this, also:
   #
   #   - Delete the `ports` block from the `happyview` service. Caddy reaches it
   #     over the compose network, so publishing it to the host as well only
@@ -176,10 +176,10 @@ services:
   #     happyview:
   #       condition: service_started
   #
-  #   # Port 80 is not optional and must stay open. It serves the HTTP->HTTPS
-  #   # redirect *and* the ACME HTTP-01 challenge — which is also how renewal
-  #   # works, so closing it once the first certificate issues makes renewal
-  #   # fail silently about 60 days later. 443/udp carries HTTP/3.
+  #   # Port 80 must stay open. It serves the HTTP->HTTPS redirect *and* the
+  #   # ACME HTTP-01 challenge — which is also how renewal works, so closing it
+  #   # once the first certificate issues makes renewal fail silently about 60
+  #   # days later. 443/udp carries HTTP/3.
   #   #
   #   # DNS-01 (needed for wildcards, or when 80 cannot be exposed) is not
   #   # possible with this image: the stock build ships no DNS provider
