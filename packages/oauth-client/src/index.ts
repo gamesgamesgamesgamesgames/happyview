@@ -8,6 +8,7 @@ export {
 } from "./client";
 export type { FetchMetadataOptions } from "./client";
 export { importJwk } from "./import-jwk";
+export { jwkThumbprint } from "./thumbprint";
 export {
   ApiError,
   AuthenticationError,

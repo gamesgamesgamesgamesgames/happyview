@@ -3,6 +3,7 @@ import {
   HappyViewOAuthClient,
   OAuthCallbackError,
   TokenExchangeError,
+  jwkThumbprint,
   type StorageAdapter,
 } from "@happyview/oauth-client";
 import {
@@ -182,6 +183,100 @@ describe("HappyViewBrowserClient", () => {
       localStorage.key(i),
     ).find((k) => k?.includes("pending-auth"));
     expect(stateKey).toBeDefined();
+  });
+
+  test("prepareLogin binds the PAR request to the provisioned DPoP key", async () => {
+    // ⚠ AN UNBOUND PAR IS OFF-SPEC AND SOME PDS IMPLEMENTATIONS REJECT IT
+    // OUTRIGHT. bsky's PDS tolerated a PAR carrying neither a `DPoP` header nor
+    // `dpop_jkt`, but that tolerance is on a deprecation notice and other
+    // implementations (cocoon) fail on it. The client provisions the key
+    // itself, so nothing outside the SDK can supply the binding.
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.prepareLogin("user.bsky.social");
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    expect(parCall).toBeDefined();
+
+    const body = (parCall![1] as RequestInit).body as URLSearchParams;
+    expect(body.get("dpop_jkt")).toBe(await jwkThumbprint(testJwk));
+  });
+
+  test("prepareLogin lets an explicit dpop_jkt override the derived one", async () => {
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.prepareLogin("user.bsky.social", {
+      dpop_jkt: "caller-supplied",
+    });
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    const body = (parCall![1] as RequestInit).body as URLSearchParams;
+    expect(body.get("dpop_jkt")).toBe("caller-supplied");
+  });
+
+  test("prepareLogin binds the direct authorization URL when the server has no PAR endpoint", async () => {
+    // The no-PAR fallback builds the same params into a query string and needs
+    // the same binding, or the fallback path stays off-spec.
+    const inner = mockFetchForFullFlow();
+    const fetchFn = mock(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.includes(".well-known/oauth-authorization-server")) {
+          return new Response(
+            JSON.stringify({
+              issuer: "https://pds.example.com",
+              authorization_endpoint: "https://pds.example.com/oauth/authorize",
+              token_endpoint: "https://pds.example.com/oauth/token",
+            }),
+            { status: 200 },
+          );
+        }
+        return inner(input, init);
+      },
+    );
+    const client = createClient(fetchFn as unknown as typeof globalThis.fetch);
+
+    const { authorizationUrl } = await client.prepareLogin("user.bsky.social");
+
+    const params = new URL(authorizationUrl).searchParams;
+    expect(params.get("dpop_jkt")).toBe(await jwkThumbprint(testJwk));
+  });
+
+  test("the PAR dpop_jkt matches the key that proves possession at the token endpoint", async () => {
+    // ⚠ THIS IS THE INVARIANT THE WHOLE BINDING RESTS ON. `dpop_jkt` is a
+    // promise to the authorization server about which key will show up at the
+    // token endpoint; if the two ever come from different keys the server is
+    // right to reject the exchange, and the failure lands at `callback` rather
+    // than where the mismatch was introduced. Asserted across a real
+    // prepareLogin → callback pair rather than within either one.
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    const { state } = await client.prepareLogin("user.bsky.social");
+    await client.callback(`?code=auth-code-123&state=${state}`);
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    const jkt = ((parCall![1] as RequestInit).body as URLSearchParams).get(
+      "dpop_jkt",
+    );
+
+    const tokenCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/token"),
+    );
+    const proof = new Headers((tokenCall![1] as RequestInit).headers).get(
+      "dpop",
+    )!;
+    const proofHeader = JSON.parse(atob(proof.split(".")[0]));
+
+    expect(jkt).toBe(await jwkThumbprint(proofHeader.jwk));
   });
 
   test("callback exchanges code for tokens with DPoP proof and registers session", async () => {

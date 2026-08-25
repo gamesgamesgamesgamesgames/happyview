@@ -327,15 +327,42 @@ async fn register_session(
     )
     .await?;
 
+    // ⚠ A SESSION WITH NO REFRESH TOKEN CANNOT OUTLIVE ITS ACCESS TOKEN, AND IT
+    // USED TO REGISTER IN COMPLETE SILENCE. Everything works until the access
+    // token expires; from then on every PDS write fails in `pds_write.rs` with
+    // "token expired and no refresh_token available" — hours later, surfacing
+    // out of Lua, with nothing tying it back to the registration that doomed it.
+    // The client cannot see it either: browsers persist only the access token,
+    // so `restore()` keeps reporting a healthy signed-in user. Observed live as
+    // a player who looked logged in and could not write anything.
+    //
+    // Still accepted rather than rejected: an access-token-only session is
+    // genuinely usable until it expires, and refusing it would turn a
+    // degraded login into no login at all for any authorization server that
+    // does not issue refresh tokens. It only has to stop being invisible.
+    let refreshable = body.refresh_token.is_some();
+    if !refreshable {
+        tracing::warn!(
+            client_key = %client_key,
+            did = %body.did,
+            "registered a DPoP session with no refresh token; it will stop working when the access token expires"
+        );
+    }
+
     log_event(
         &state.db,
         EventLog {
             event_type: "dpop_session.created".to_string(),
-            severity: Severity::Info,
+            severity: if refreshable {
+                Severity::Info
+            } else {
+                Severity::Warn
+            },
             actor_did: Some(body.did.clone()),
             subject: Some(client.client_key.clone()),
             detail: serde_json::json!({
                 "scopes": body.scopes,
+                "refreshable": refreshable,
             }),
         },
         state.db_backend,

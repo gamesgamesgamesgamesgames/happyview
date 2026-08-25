@@ -6,6 +6,7 @@ import {
   MemoryStorage,
   OAuthCallbackError,
   TokenExchangeError,
+  jwkThumbprint,
 } from "@happyview/oauth-client";
 import { HappyViewNodeClient } from "../node-client";
 
@@ -194,6 +195,40 @@ describe("HappyViewNodeClient", () => {
       (parCall![1] as RequestInit).body as string,
     );
     expect(body.get("scope")).toBe("atproto transition:generic");
+  });
+
+  test("authorize binds the PAR request to the provisioned DPoP key", async () => {
+    // ⚠ AN UNBOUND PAR IS OFF-SPEC. See the matching test in
+    // oauth-client-browser for the full story; the client provisions the key
+    // itself, so nothing outside the SDK can supply the binding.
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.authorize("user.bsky.social");
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    expect(parCall).toBeDefined();
+    const body = new URLSearchParams(
+      (parCall![1] as RequestInit).body as string,
+    );
+    expect(body.get("dpop_jkt")).toBe(await jwkThumbprint(testJwk));
+  });
+
+  test("authorize lets an explicit dpop_jkt override the derived one", async () => {
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.authorize("user.bsky.social", { dpop_jkt: "caller-supplied" });
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    const body = new URLSearchParams(
+      (parCall![1] as RequestInit).body as string,
+    );
+    expect(body.get("dpop_jkt")).toBe("caller-supplied");
   });
 
   test("authorize uses custom state", async () => {

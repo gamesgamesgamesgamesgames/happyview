@@ -1147,3 +1147,146 @@ async fn test_public_client_dpop_delete_session_percent_encoded_did() {
     let del_resp = app.router.clone().oneshot(del_req).await.unwrap();
     assert_eq!(del_resp.status(), StatusCode::NO_CONTENT);
 }
+
+/// Registering a session with no refresh token must be recorded as a problem.
+///
+/// ⚠ SUCH A SESSION IS A TIME BOMB, AND IT USED TO REGISTER IN TOTAL SILENCE.
+/// Without a refresh token the session works exactly until the access token
+/// expires, at which point every write fails with "token expired and no
+/// refresh_token available" — hours later, from Lua, with nothing tying it back
+/// to the moment the session was made. Meanwhile the client's `restore()` keeps
+/// reporting the user signed in, because the browser only stores the access
+/// token. Observed live: a player who looked logged in and could not write.
+#[tokio::test]
+#[serial]
+async fn test_register_session_without_refresh_token_is_logged_as_a_warning() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
+
+    let key_req = post_json_with_headers(
+        "/oauth/dpop-keys",
+        &json!({}),
+        vec![
+            ("x-client-key", &client_key),
+            ("x-client-secret", &client_secret),
+        ],
+    );
+    let key_resp = app.router.clone().oneshot(key_req).await.unwrap();
+    let key_body = response_json(key_resp).await;
+    let provision_id = key_body["provision_id"].as_str().unwrap();
+
+    app.mock_session_verification("did:plc:norefresh", "did:plc:norefresh")
+        .await;
+    let session_req = post_json_with_headers(
+        "/oauth/sessions",
+        &json!({
+            "provision_id": provision_id,
+            "did": "did:plc:norefresh",
+            "access_token": "test-access-token-123",
+            // No refresh_token — this is the case under test.
+            "scopes": "atproto",
+            "pds_url": "https://pds.example.com",
+        }),
+        vec![
+            ("x-client-key", &client_key),
+            ("x-client-secret", &client_secret),
+        ],
+    );
+    let session_resp = app.router.clone().oneshot(session_req).await.unwrap();
+
+    // Still accepted: an access-token-only session is usable until it expires,
+    // and refusing it would lock out any authorization server that does not
+    // issue refresh tokens. It must simply stop being invisible.
+    assert_eq!(session_resp.status(), StatusCode::CREATED);
+
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
+
+    let sql = happyview::db::adapt_sql(
+        "SELECT severity, detail FROM happyview_event_logs WHERE event_type = ? AND actor_did = ?",
+        app.state.db_backend,
+    );
+    let rows: Vec<(String, String)> = happyview::db::query_as(&sql)
+        .bind("dpop_session.created")
+        .bind("did:plc:norefresh")
+        .fetch_all(&app.state.db)
+        .await
+        .expect("failed to query event_logs");
+
+    assert_eq!(rows.len(), 1, "expected one dpop_session.created row");
+    let (severity, detail) = &rows[0];
+    assert_eq!(
+        severity, "warn",
+        "a session that cannot outlive its access token must not be logged as routine info"
+    );
+    let detail: serde_json::Value = serde_json::from_str(detail).unwrap();
+    assert_eq!(
+        detail["refreshable"], false,
+        "the event must say plainly that the session has no refresh token"
+    );
+}
+
+/// The ordinary case stays quiet, so the warning above keeps its meaning.
+#[tokio::test]
+#[serial]
+async fn test_register_session_with_refresh_token_stays_info() {
+    common::require_db!();
+    let app = common::app::TestApp::new_with_encryption().await;
+    let (client_key, client_secret, _id) = app.create_api_client("confidential", None).await;
+
+    let key_req = post_json_with_headers(
+        "/oauth/dpop-keys",
+        &json!({}),
+        vec![
+            ("x-client-key", &client_key),
+            ("x-client-secret", &client_secret),
+        ],
+    );
+    let key_resp = app.router.clone().oneshot(key_req).await.unwrap();
+    let key_body = response_json(key_resp).await;
+    let provision_id = key_body["provision_id"].as_str().unwrap();
+
+    app.mock_session_verification("did:plc:hasrefresh", "did:plc:hasrefresh")
+        .await;
+    let session_req = post_json_with_headers(
+        "/oauth/sessions",
+        &json!({
+            "provision_id": provision_id,
+            "did": "did:plc:hasrefresh",
+            "access_token": "test-access-token-123",
+            "refresh_token": "test-refresh-token-456",
+            "scopes": "atproto",
+            "pds_url": "https://pds.example.com",
+        }),
+        vec![
+            ("x-client-key", &client_key),
+            ("x-client-secret", &client_secret),
+        ],
+    );
+    let session_resp = app.router.clone().oneshot(session_req).await.unwrap();
+    assert_eq!(session_resp.status(), StatusCode::CREATED);
+
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+    }
+
+    let sql = happyview::db::adapt_sql(
+        "SELECT severity, detail FROM happyview_event_logs WHERE event_type = ? AND actor_did = ?",
+        app.state.db_backend,
+    );
+    let rows: Vec<(String, String)> = happyview::db::query_as(&sql)
+        .bind("dpop_session.created")
+        .bind("did:plc:hasrefresh")
+        .fetch_all(&app.state.db)
+        .await
+        .expect("failed to query event_logs");
+
+    assert_eq!(rows.len(), 1, "expected one dpop_session.created row");
+    assert_eq!(rows[0].0, "info");
+    let detail: serde_json::Value = serde_json::from_str(&rows[0].1).unwrap();
+    assert_eq!(detail["refreshable"], true);
+}
