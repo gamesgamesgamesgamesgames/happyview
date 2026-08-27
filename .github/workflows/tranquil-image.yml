@@ -76,16 +76,25 @@ jobs:
           # `ls-remote --tags --refs` prints "<sha><TAB>refs/tags/<tag>" lines
           # in whatever order the server feels like, NOT version order — it is
           # not safe to assume the last line, or a plain `sort`, gives the
-          # newest release. `--refs` already drops annotated-tag `^{}`
-          # dereferences, so what's left is one line per tag. The sed filters
-          # to plain vX.Y.Z tags and flips each surviving line to
-          # "<tag><TAB><sha>"; sorting that on the tag column with `-V`
-          # (version sort: compares digit runs numerically) is what makes
-          # "v0.6.10" correctly land after "v0.6.9" instead of before it under
-          # a plain lexicographic sort. The tab is built with `printf` and
-          # spliced in rather than written as `\t` in the sed script, since
-          # `\t` in a pattern/replacement is a GNU sed extension BSD sed
-          # doesn't share — this way it works on either.
+          # newest release. `--refs` drops annotated-tag `^{}` dereferences,
+          # which is exactly what TAG SELECTION wants: one line per tag, so
+          # sorting that on the tag column with `-V` (version sort: compares
+          # digit runs numerically) is what makes "v0.6.10" correctly land
+          # after "v0.6.9" instead of before it under a plain lexicographic
+          # sort. The sed filters to plain vX.Y.Z tags and flips each
+          # surviving line to "<tag><TAB><sha>". The tab is built with
+          # `printf` and spliced in rather than written as `\t` in the sed
+          # script, since `\t` in a pattern/replacement is a GNU sed
+          # extension BSD sed doesn't share — this way it works on either.
+          #
+          # That SHA is the tag object's own sha, not the commit it points
+          # at, whenever the chosen tag is annotated (a lightweight tag has
+          # no separate object, so there the two happen to coincide). A
+          # clone checks out the commit, so resolving the SHA that
+          # `TRANQUIL_SHA` needs is a second, targeted `ls-remote` for that
+          # one tag's plain and peeled (`^{}`) refs, preferring the peeled
+          # one when it's present rather than trying to fold both jobs into
+          # one cleverer `ls-remote --tags --refs` + sed pass.
           tab=$(printf '\t')
           best_line=$(
             git ls-remote --tags --refs "$UPSTREAM" \
@@ -98,7 +107,21 @@ jobs:
             exit 1
           fi
           tag=$(printf '%s' "$best_line" | cut -f1)
-          sha=$(printf '%s' "$best_line" | cut -f2)
+
+          # Peel the chosen tag to the commit it points at. An annotated tag
+          # returns two lines here — the tag object, then "<tag>^{}" for the
+          # commit — and we want the second. A lightweight tag returns only
+          # the first, since it has no separate object to peel; that line's
+          # sha is already the commit sha, so it's the fallback.
+          peel_lines=$(git ls-remote "$UPSTREAM" "refs/tags/${tag}" "refs/tags/${tag}^{}")
+          sha=$(printf '%s\n' "$peel_lines" | awk -F"$tab" -v ref="refs/tags/${tag}^{}" '$2==ref{print $1}')
+          if [ -z "$sha" ]; then
+            sha=$(printf '%s\n' "$peel_lines" | awk -F"$tab" -v ref="refs/tags/${tag}" '$2==ref{print $1}')
+          fi
+          if [ -z "$sha" ]; then
+            echo "ERROR: could not resolve a commit sha for $tag at $UPSTREAM" >&2
+            exit 1
+          fi
           echo "Resolved $UPSTREAM $tag -> $sha"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
