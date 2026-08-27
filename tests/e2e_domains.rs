@@ -350,3 +350,235 @@ async fn domain_scoped_route_works_with_known_host() {
         json["public_url"]
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn domain_create_registers_domain_specific_client_not_primary() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let key = happyview::oauth::client_keys::generate_client_key("test-owner")
+        .expect("generate client key");
+    let jwk = happyview::oauth::client_keys::to_atrium_jwk(&key).expect("convert to atrium jwk");
+    app.state.client_jwks = vec![jwk];
+    app.rebuild_router();
+
+    seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+
+    let domain_url = "https://confidential.e2e-domains-test.invalid";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains",
+            app.admin_cookie(),
+            &json!({ "url": domain_url }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "expected 201 on create, got {}",
+        resp.status()
+    );
+
+    let domain_client = app.state.oauth.get_for_domain(domain_url);
+    let primary_client = app.state.oauth.primary_client();
+
+    assert!(
+        !std::sync::Arc::ptr_eq(&domain_client, &primary_client),
+        "domain client fell back to the primary client instead of building its own"
+    );
+    assert_eq!(
+        domain_client.client_metadata.token_endpoint_auth_method,
+        Some("private_key_jwt".to_string()),
+        "expected the domain's own confidential client, got metadata {:?}",
+        domain_client.client_metadata
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn domain_create_fails_and_rolls_back_on_client_id_collision() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+
+    let colliding_url = "https://colliding.e2e-domains-test.invalid";
+    let client_id_url = format!(
+        "{}/oauth-client-metadata.json",
+        app.state
+            .config
+            .url_with_base_path(colliding_url)
+            .trim_end_matches('/')
+    );
+
+    app.state.oauth.register_domain_client(
+        colliding_url.to_string(),
+        client_id_url.clone(),
+        app.state.oauth.primary_client(),
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains",
+            app.admin_cookie(),
+            &json!({ "url": colliding_url }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "expected 500 when the OAuth client collides, got {}",
+        resp.status()
+    );
+
+    // No row was left behind.
+    let row: Option<(String,)> = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT id FROM happyview_domains WHERE url = ?",
+        app.state.db_backend,
+    ))
+    .bind(colliding_url)
+    .fetch_optional(&app.state.db)
+    .await
+    .unwrap();
+    assert!(
+        row.is_none(),
+        "expected the failed domain's row to be rolled back, found {:?}",
+        row
+    );
+
+    // No cache entry was left behind either.
+    let host = "colliding.e2e-domains-test.invalid";
+    assert!(
+        app.state.domain_cache.get(host).await.is_none(),
+        "expected no domain_cache entry for a domain whose client failed to register"
+    );
+
+    assert!(
+        std::sync::Arc::ptr_eq(
+            &app.state.oauth.get_domain_client(colliding_url).unwrap(),
+            &app.state.oauth.primary_client()
+        ),
+        "the pre-existing domain client registration should be unaffected by the failed create"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn domain_create_compensates_registry_on_commit_failure() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+
+    if app.state.db_backend != happyview::db::DatabaseBackend::Postgres {
+        eprintln!("skipped (commit-failure injection requires a real Postgres COMMIT)");
+        return;
+    }
+
+    let key = happyview::oauth::client_keys::generate_client_key("test-owner")
+        .expect("generate client key");
+    let jwk = happyview::oauth::client_keys::to_atrium_jwk(&key).expect("convert to atrium jwk");
+    app.state.client_jwks = vec![jwk];
+    app.rebuild_router();
+
+    seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+
+    happyview::db::query("DROP TRIGGER IF EXISTS test17_fail_commit_trigger ON happyview_domains")
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    happyview::db::query(
+        "CREATE OR REPLACE FUNCTION test17_fail_commit() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.url = 'https://forced-commit-failure.e2e-domains-test.invalid' THEN
+                 RAISE EXCEPTION 'test17: forced commit failure';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    happyview::db::query(
+        "CREATE CONSTRAINT TRIGGER test17_fail_commit_trigger
+         AFTER INSERT ON happyview_domains
+         DEFERRABLE INITIALLY DEFERRED
+         FOR EACH ROW EXECUTE FUNCTION test17_fail_commit()",
+    )
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+
+    let domain_url = "https://forced-commit-failure.e2e-domains-test.invalid";
+    let client_id_url = format!(
+        "{}/oauth-client-metadata.json",
+        app.state
+            .config
+            .url_with_base_path(domain_url)
+            .trim_end_matches('/')
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains",
+            app.admin_cookie(),
+            &json!({ "url": domain_url }),
+        ))
+        .await
+        .unwrap();
+
+    happyview::db::query("DROP TRIGGER IF EXISTS test17_fail_commit_trigger ON happyview_domains")
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    happyview::db::query("DROP FUNCTION IF EXISTS test17_fail_commit()")
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "expected 500 when the commit itself fails, got {}",
+        resp.status()
+    );
+
+    let row: Option<(String,)> = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT id FROM happyview_domains WHERE url = ?",
+        app.state.db_backend,
+    ))
+    .bind(domain_url)
+    .fetch_optional(&app.state.db)
+    .await
+    .unwrap();
+    assert!(
+        row.is_none(),
+        "expected no row after a forced commit failure, found {:?}",
+        row
+    );
+
+    // No cache entry.
+    let host = "forced-commit-failure.e2e-domains-test.invalid";
+    assert!(
+        app.state.domain_cache.get(host).await.is_none(),
+        "expected no domain_cache entry after a forced commit failure"
+    );
+
+    assert!(
+        app.state.oauth.get_domain_client(domain_url).is_none(),
+        "expected the domain client registration to be undone after a commit failure"
+    );
+    assert!(
+        app.state.oauth.get(&client_id_url).is_none(),
+        "expected the client_id_url registry entry to be undone after a commit failure"
+    );
+}

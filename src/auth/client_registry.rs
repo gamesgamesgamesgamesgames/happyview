@@ -14,8 +14,14 @@ use crate::auth::oauth_store::{DbSessionStore, DbStateStore};
 use crate::db::{DatabaseBackend, adapt_sql};
 use crate::dns::NativeDnsResolver;
 
-fn is_loopback_url(url: &str) -> bool {
-    url.contains("127.0.0.1") || url.contains("[::1]") || url.contains("localhost")
+pub fn is_loopback_url(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => matches!(
+            parsed.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        ),
+        Err(_) => false,
+    }
 }
 
 /// Parameters needed to build an OAuth client for an API client registration.
@@ -24,6 +30,7 @@ pub struct ApiClientOAuthParams {
     pub state_store: DbStateStore,
     pub session_store_pool: sqlx::AnyPool,
     pub db_backend: DatabaseBackend,
+    pub client_keys: Option<Vec<jose_jwk::Jwk>>,
 }
 
 /// Registry of OAuth clients, keyed by `client_id_url`.
@@ -169,6 +176,7 @@ impl OAuthClientRegistry {
             state_store,
             session_store_pool,
             db_backend,
+            client_keys,
         } = params;
         let scopes = crate::auth::parse_scope_string(scopes_str);
         let scopes = if scopes.is_empty() {
@@ -215,13 +223,19 @@ impl OAuthClientRegistry {
                     client_id: client_id_url.to_string(),
                     client_uri: Some(client_uri.to_string()),
                     redirect_uris,
-                    token_endpoint_auth_method: AuthMethod::None,
+                    token_endpoint_auth_method: if client_keys.is_some() {
+                        AuthMethod::PrivateKeyJwt
+                    } else {
+                        AuthMethod::None
+                    },
                     grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
                     scopes,
                     jwks_uri: None,
-                    token_endpoint_auth_signing_alg: None,
+                    token_endpoint_auth_signing_alg: client_keys
+                        .as_ref()
+                        .map(|_| "ES256".to_string()),
                 },
-                keys: None,
+                keys: client_keys.clone(),
                 state_store: state_store.clone(),
                 session_store: DbSessionStore::new(session_store_pool.clone(), *db_backend),
                 resolver,
@@ -352,6 +366,34 @@ impl OAuthClientRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn is_loopback_url_matches_the_host_exactly() {
+        for url in [
+            "http://localhost",
+            "http://localhost:3000",
+            "http://127.0.0.1:3200",
+            "http://127.0.0.1:9999",
+            "http://127.0.0.1:0",
+            "http://[::1]:8080",
+        ] {
+            assert!(is_loopback_url(url), "{url} should be loopback");
+        }
+
+        for url in [
+            "https://happyview.localhost",
+            "https://localhost.example.com",
+            "https://mylocalhost.com",
+            "https://127.0.0.1.example.com",
+            "https://example.com",
+        ] {
+            assert!(!is_loopback_url(url), "{url} should NOT be loopback");
+        }
+
+        assert!(!is_loopback_url("not a url"));
+        assert!(!is_loopback_url(""));
+        assert!(!is_loopback_url("localhost:3000"));
+    }
+
     use super::*;
 
     // Note: we can't easily construct real OAuthClient instances in unit tests
@@ -445,5 +487,95 @@ mod tests {
         assert!(!is_domain_client_id(
             "https://api.example.com/oauth-client-metadata.json"
         ));
+    }
+
+    #[tokio::test]
+    async fn register_api_client_confidential_vs_public() {
+        let pool = crate::test_support::memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let http = Arc::new(crate::http_retry::HappyViewHttpClient::default());
+        let primary = atrium_oauth::OAuthClient::new(OAuthClientConfig {
+            client_metadata: AtprotoLocalhostClientMetadata {
+                redirect_uris: None,
+                scopes: None,
+            },
+            keys: None,
+            state_store: DbStateStore::new(pool.clone(), backend),
+            session_store: DbSessionStore::new(pool.clone(), backend),
+            resolver: OAuthResolverConfig {
+                did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
+                    plc_directory_url: "https://plc.directory".into(),
+                    http_client: Arc::clone(&http),
+                }),
+                handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
+                    dns_txt_resolver: NativeDnsResolver::new(),
+                    http_client: Arc::clone(&http),
+                }),
+                authorization_server_metadata: Default::default(),
+                protected_resource_metadata: Default::default(),
+            },
+            http_client: crate::http_retry::HappyViewHttpClient::default(),
+        })
+        .expect("primary loopback client");
+        let registry = OAuthClientRegistry::new(Arc::new(primary));
+
+        let key = crate::oauth::client_keys::generate_client_key("test-owner")
+            .expect("generate client key");
+        let jwk = crate::oauth::client_keys::to_atrium_jwk(&key).expect("convert to atrium jwk");
+
+        let confidential_url = "https://example.com/oauth-client-metadata.json";
+        registry
+            .register_api_client(
+                confidential_url,
+                "https://example.com",
+                vec!["https://example.com/auth/callback".to_string()],
+                "atproto",
+                &ApiClientOAuthParams {
+                    plc_url: "https://plc.directory".into(),
+                    state_store: DbStateStore::new(pool.clone(), backend),
+                    session_store_pool: pool.clone(),
+                    db_backend: backend,
+                    client_keys: Some(vec![jwk]),
+                },
+            )
+            .expect("register confidential client");
+
+        let confidential = registry
+            .get(confidential_url)
+            .expect("confidential client registered");
+        assert_eq!(
+            confidential.client_metadata.token_endpoint_auth_method,
+            Some("private_key_jwt".to_string())
+        );
+        assert_eq!(
+            confidential.client_metadata.token_endpoint_auth_signing_alg,
+            Some("ES256".to_string())
+        );
+        assert!(confidential.client_metadata.jwks.is_some());
+
+        let public_url = "https://other.example.com/oauth-client-metadata.json";
+        registry
+            .register_api_client(
+                public_url,
+                "https://other.example.com",
+                vec!["https://other.example.com/auth/callback".to_string()],
+                "atproto",
+                &ApiClientOAuthParams {
+                    plc_url: "https://plc.directory".into(),
+                    state_store: DbStateStore::new(pool.clone(), backend),
+                    session_store_pool: pool.clone(),
+                    db_backend: backend,
+                    client_keys: None,
+                },
+            )
+            .expect("register public client");
+
+        let public = registry.get(public_url).expect("public client registered");
+        assert_eq!(
+            public.client_metadata.token_endpoint_auth_method,
+            Some("none".to_string())
+        );
+        assert_eq!(public.client_metadata.token_endpoint_auth_signing_alg, None);
+        assert!(public.client_metadata.jwks.is_none());
     }
 }

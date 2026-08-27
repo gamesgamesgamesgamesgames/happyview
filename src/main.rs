@@ -489,9 +489,7 @@ async fn main() {
         http_client: Arc::clone(&atrium_http),
     });
 
-    let is_loopback = config.public_url.contains("127.0.0.1")
-        || config.public_url.contains("[::1]")
-        || config.public_url.contains("localhost");
+    let is_loopback = happyview::auth::client_registry::is_loopback_url(&config.public_url);
 
     let resolver_config = OAuthResolverConfig {
         did_resolver,
@@ -508,6 +506,20 @@ async fn main() {
     ];
 
     let linked_repos_scopes = oauth_scopes.clone();
+
+    let instance_key = happyview::oauth::client_keys::ensure_instance_key(
+        &db_pool,
+        db_backend,
+        config.token_encryption_key.as_ref(),
+    )
+    .await
+    .expect("Failed to load OAuth client authentication key");
+
+    let client_jwks = vec![
+        happyview::oauth::client_keys::to_atrium_jwk(&instance_key)
+            .expect("Failed to convert client key to JWK"),
+    ];
+    info!(kid = %instance_key.kid, "confidential OAuth client key ready");
 
     let oauth_client = if is_loopback {
         info!("Using loopback OAuth client metadata (local development)");
@@ -532,13 +544,13 @@ async fn main() {
                 ),
                 client_uri: Some(config.effective_public_url()),
                 redirect_uris: vec![callback_url.clone()],
-                token_endpoint_auth_method: AuthMethod::None,
+                token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
                 grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
                 scopes: oauth_scopes,
                 jwks_uri: None,
-                token_endpoint_auth_signing_alg: None,
+                token_endpoint_auth_signing_alg: Some("ES256".to_string()),
             },
-            keys: None,
+            keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
             session_store: DbSessionStore::new(db_pool.clone(), db_backend),
             resolver: resolver_config,
@@ -561,6 +573,7 @@ async fn main() {
             oauth_state_store.clone(),
             db_pool.clone(),
             db_backend,
+            Some(client_jwks.clone()),
         )
         .expect("Failed to create linked-repo OAuth client"),
     );
@@ -647,13 +660,13 @@ async fn main() {
                 client_id: domain_client_id.clone(),
                 client_uri: Some(domain_base_url.clone()),
                 redirect_uris: vec![domain_callback_url],
-                token_endpoint_auth_method: AuthMethod::None,
+                token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
                 grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
                 scopes: vec![Scope::Known(KnownScope::Atproto)],
                 jwks_uri: None,
-                token_endpoint_auth_signing_alg: None,
+                token_endpoint_auth_signing_alg: Some("ES256".to_string()),
             },
-            keys: None,
+            keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
             session_store: DbSessionStore::new(db_pool.clone(), db_backend),
             resolver: domain_resolver,
@@ -730,6 +743,7 @@ async fn main() {
         proxy_config,
         backfill_events_tx,
         verbose_event_logging,
+        client_jwks,
     };
 
     jetstream::spawn(state.clone(), collections_rx);

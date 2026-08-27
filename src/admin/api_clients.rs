@@ -96,6 +96,7 @@ pub(super) async fn create_api_client(
         state_store: state.oauth_state_store.clone(),
         session_store_pool: state.db.clone(),
         db_backend: state.db_backend,
+        client_keys: None,
     };
     if let Err(e) = state.oauth.register_api_client(
         &body.client_id_url,
@@ -387,6 +388,9 @@ pub(super) async fn update_api_client(
         state_store: state.oauth_state_store.clone(),
         session_store_pool: state.db.clone(),
         db_backend: state.db_backend,
+        // Third-party client: it publishes its own metadata document, so we
+        // must not declare private_key_jwt on its behalf.
+        client_keys: None,
     };
     if is_active != 0 {
         let redirect_uris: Vec<String> =

@@ -58,14 +58,12 @@ test.describe("Setup - did:plc", () => {
   })
 
   // Restore setup state for subsequent tests
-  test.afterAll(async ({ browser }) => {
+  test.afterAll(async ({ browser, baseURL }) => {
     await resetServiceIdentity()
     const page = await browser.newPage()
     try {
       await loginAsTestAdmin(page)
-      await page.goto(
-        (process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:3200") + "/setup",
-      )
+      await page.goto(`${baseURL}/setup`)
       const skipCard = page.getByText(/skip for now/i)
       if (
         await skipCard.isVisible({ timeout: 5000 }).catch(() => false)

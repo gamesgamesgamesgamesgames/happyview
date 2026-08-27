@@ -303,6 +303,7 @@ mod tests {
                     ),
                     test_db.clone(),
                     DatabaseBackend::Sqlite,
+                    None,
                 )
                 .expect("Failed to create test linked-repo OAuth client"),
             ),
@@ -324,6 +325,7 @@ mod tests {
             ))),
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_jwks: Vec::new(),
         }
     }
 

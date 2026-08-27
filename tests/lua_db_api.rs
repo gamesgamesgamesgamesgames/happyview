@@ -100,6 +100,7 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
                 happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
                 pool.clone(),
                 backend,
+                None,
             )
             .expect("Failed to create test linked-repo OAuth client"),
         ),
@@ -123,6 +124,7 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
         backfill_db: pool.clone(),
         backfill_events_tx: tokio::sync::broadcast::channel(16).0,
         verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        client_jwks: Vec::new(),
     }
 }
 

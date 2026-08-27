@@ -1,4 +1,4 @@
-import { defineConfig } from "@playwright/test"
+import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -8,7 +8,9 @@ export default defineConfig({
   workers: 1,
   reporter: process.env.CI ? [["html"], ["github"]] : [["html"]],
   use: {
-    baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:3200",
+    baseURL:
+      process.env.PLAYWRIGHT_BASE_URL || "https://happyview.127-0-0-1.sslip.io",
+    ignoreHTTPSErrors: true,
     trace: "on-first-retry",
   },
   projects: [
@@ -41,6 +43,7 @@ export default defineConfig({
         "linked-repos.spec.ts",
         "link-invite-pages.spec.ts",
         "users-add.spec.ts",
+        "confidential-client.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },
@@ -49,16 +52,13 @@ export default defineConfig({
       name: "attach-account",
       testMatch: "setup-attach-account.spec.ts",
       dependencies: ["post-setup"],
-      use: { browserName: "chromium", ignoreHTTPSErrors: true },
+      use: { browserName: "chromium" },
     },
     {
-      // Drives a real OAuth authorization against the local PDS, which Caddy
-      // serves over HTTPS with a local CA — hence ignoreHTTPSErrors, same as
-      // the attach-account project.
       name: "linked-repos-oauth",
       testMatch: "linked-repos-oauth.spec.ts",
       dependencies: ["post-setup"],
-      use: { browserName: "chromium", ignoreHTTPSErrors: true },
+      use: { browserName: "chromium" },
     },
     {
       name: "didplc-setup",
@@ -74,4 +74,4 @@ export default defineConfig({
     },
   ],
   globalSetup: "./tests/e2e/global-setup.ts",
-})
+});

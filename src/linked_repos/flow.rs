@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::AppState;
 use crate::HappyViewOAuthClient;
+use crate::auth::client_registry::is_loopback_url;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 
@@ -33,10 +34,6 @@ fn random_token() -> String {
 
 fn expires_at(secs: i64) -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339()
-}
-
-fn is_loopback_url(url: &str) -> bool {
-    url.contains("127.0.0.1") || url.contains("[::1]") || url.contains("localhost")
 }
 
 pub use crate::identity::ResolvedIdentifier;
@@ -70,6 +67,7 @@ pub fn client_for_grant(
         state.oauth_state_store.clone(),
         state.db.clone(),
         state.db_backend,
+        None,
     )
     .map(Arc::new)
     .map_err(AppError::Internal)
@@ -601,13 +599,5 @@ mod tests {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "token must be URL-safe, got {a}"
         );
-    }
-
-    #[test]
-    fn is_loopback_url_matches_local_hosts() {
-        assert!(is_loopback_url("http://localhost:3000"));
-        assert!(is_loopback_url("http://127.0.0.1:3000"));
-        assert!(is_loopback_url("http://[::1]:3000"));
-        assert!(!is_loopback_url("https://appview.example.com"));
     }
 }

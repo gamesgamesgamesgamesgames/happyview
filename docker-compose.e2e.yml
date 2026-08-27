@@ -35,7 +35,7 @@ services:
         condition: service_healthy
 
   pds:
-    image: atcr.io/tranquil.farm/tranquil-pds:latest
+    image: ghcr.io/gamesgamesgamesgamesgames/tranquil-dev:latest
     environment:
       DATABASE_URL: postgres://happyview:happyview@postgres:5432/pds
       PLC_DIRECTORY_URL: http://plc:2582
@@ -61,6 +61,13 @@ services:
       default:
         aliases:
           - pds.localhost
+          - happyview.127-0-0-1.sslip.io
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /data/caddy/pki/authorities/local/root.crt"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 2s
 
   happyview:
     build:
@@ -73,7 +80,7 @@ services:
     entrypoint: ["/bin/sh", "/e2e-entrypoint.sh"]
     environment:
       DATABASE_URL: postgres://happyview:happyview@postgres:5432/happyview_test
-      PUBLIC_URL: http://127.0.0.1:3200
+      PUBLIC_URL: https://happyview.127-0-0-1.sslip.io
       HOST: 0.0.0.0
       PORT: "3000"
       PLC_URL: http://plc:2582
@@ -92,7 +99,7 @@ services:
       plc:
         condition: service_started
       caddy:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   caddy_data:

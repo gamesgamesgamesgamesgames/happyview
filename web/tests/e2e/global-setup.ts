@@ -1,23 +1,26 @@
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
 async function waitForService(url: string, name: string, timeoutMs = 60000) {
-  const start = Date.now()
+  const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      const resp = await fetch(url)
-      if (resp.ok) return
+      const resp = await fetch(url);
+      if (resp.ok) return;
     } catch {
       // Service not ready yet
     }
-    await new Promise((r) => setTimeout(r, 1000))
+    await new Promise((r) => setTimeout(r, 1000));
   }
-  throw new Error(`${name} did not become healthy within ${timeoutMs}ms`)
+  throw new Error(`${name} did not become healthy within ${timeoutMs}ms`);
 }
 
 async function globalSetup() {
-  const baseURL = process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:3200"
+  const baseURL =
+    process.env.PLAYWRIGHT_BASE_URL || "https://happyview.127-0-0-1.sslip.io";
 
-  await waitForService(`${baseURL}/health`, "HappyView")
-  await waitForService("http://localhost:2582/_health", "PLC Directory")
-  await waitForService("http://localhost:3100/health", "Tranquil PDS")
+  await waitForService(`${baseURL}/health`, "HappyView");
+  await waitForService("http://localhost:2582/_health", "PLC Directory");
+  await waitForService("http://localhost:3100/health", "Tranquil PDS");
 }
 
-export default globalSetup
+export default globalSetup;

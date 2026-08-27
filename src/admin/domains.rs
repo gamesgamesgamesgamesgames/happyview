@@ -75,9 +75,7 @@ pub(super) async fn create(
         return Err(AppError::BadRequest("URL must contain a host".into()));
     }
 
-    let is_loopback = state.config.public_url.contains("127.0.0.1")
-        || state.config.public_url.contains("[::1]")
-        || state.config.public_url.contains("localhost");
+    let is_loopback = crate::auth::client_registry::is_loopback_url(&state.config.public_url);
 
     if parsed.scheme() != "https" && !is_loopback {
         return Err(AppError::BadRequest("URL scheme must be https".into()));
@@ -102,6 +100,12 @@ pub(super) async fn create(
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_rfc3339();
 
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
     let sql = adapt_sql(
         "INSERT INTO happyview_domains (id, url, is_primary, created_at, updated_at) VALUES (?, ?, 0, ?, ?)",
         state.db_backend,
@@ -111,7 +115,7 @@ pub(super) async fn create(
         .bind(&url)
         .bind(&now)
         .bind(&now)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("failed to create domain: {e}")))?;
 
@@ -130,19 +134,16 @@ pub(super) async fn create(
         domain_base_url.trim_end_matches('/')
     );
 
-    // Register the OAuth client for this domain
-    state.oauth.register_domain_client(
-        url.clone(),
-        client_id_url.clone(),
-        state.oauth.primary_client(),
-    );
-
-    // Build a proper OAuth client if not loopback
-    let domain_is_loopback =
-        url.contains("127.0.0.1") || url.contains("[::1]") || url.contains("localhost");
-    if !domain_is_loopback {
+    let domain_is_loopback = crate::auth::client_registry::is_loopback_url(&url);
+    if domain_is_loopback {
+        state.oauth.register_domain_client(
+            url.clone(),
+            client_id_url.clone(),
+            state.oauth.primary_client(),
+        );
+    } else {
         let callback = format!("{}/auth/callback", domain_base_url.trim_end_matches('/'));
-        if let Err(e) = state.oauth.register_api_client(
+        match state.oauth.register_api_client(
             &client_id_url,
             &url,
             vec![callback],
@@ -152,18 +153,31 @@ pub(super) async fn create(
                 state_store: state.oauth_state_store.clone(),
                 session_store_pool: state.db.clone(),
                 db_backend: state.db_backend,
+                client_keys: Some(state.client_jwks.clone()),
             },
         ) {
-            tracing::error!(domain = %url, error = %e, "Failed to create OAuth client for domain");
-        } else {
-            // Move from `clients` (where register_api_client puts it) to domain_clients + clients
-            if let Some(client) = state.oauth.get(&client_id_url) {
-                state.oauth.remove(&client_id_url);
-                state
-                    .oauth
-                    .register_domain_client(url.clone(), client_id_url, client);
+            Ok(()) => {
+                if let Some(client) = state.oauth.get(&client_id_url) {
+                    state.oauth.remove(&client_id_url);
+                    state
+                        .oauth
+                        .register_domain_client(url.clone(), client_id_url.clone(), client);
+                }
+            }
+            Err(e) => {
+                tracing::error!(domain = %url, error = %e, "Failed to create OAuth client for domain");
+                return Err(AppError::Internal(format!(
+                    "failed to create OAuth client for domain '{url}': {e}"
+                )));
             }
         }
+    }
+
+    if let Err(e) = tx.commit().await {
+        state.oauth.remove_domain_client(&url, &client_id_url);
+        return Err(AppError::Internal(format!(
+            "failed to commit domain creation: {e}"
+        )));
     }
 
     // Update in-memory cache
