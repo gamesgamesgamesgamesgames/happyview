@@ -429,13 +429,46 @@ The `dpop_key` is the full private JWK. Store it securely — you'll use it to s
 
 #### Phase 2: OAuth with the user's PDS
 
-Run a standard atproto OAuth flow with the user's PDS authorization server, using the provisioned DPoP key as your keypair. HappyView is not involved in this step.
+Run a standard atproto OAuth flow with the user's PDS authorization server, using the provisioned DPoP key as your keypair.
 
 1. Resolve the user's handle to a DID
 2. Resolve the DID document to find the PDS URL
 3. Fetch the PDS's OAuth authorization server metadata
 4. Redirect the user to the PDS authorization endpoint
 5. Exchange the authorization code for tokens (using DPoP proofs signed with the provisioned key)
+
+HappyView is not involved in any of this — unless your `client_id_url` document declares `private_key_jwt`, in which case it holds your app's signing key and needs to be asked for a signed assertion at two separate points below.
+
+##### Confidential clients: attaching the client assertion
+
+Publishing `token_endpoint_auth_method: "private_key_jwt"` (and a `jwks_uri` pointing back at HappyView) on your `client_id_url` document makes your app a confidential atproto OAuth client, which the PDS trusts with much longer-lived sessions than a public client gets. HappyView can hold the signing key for you — generate one from **Settings > API Clients > (your client) > AT Protocol Client Auth** in the dashboard, or via `POST /admin/api-clients/{id}/auth-key` — and use `POST /oauth/client-assertion` to sign on your behalf.
+
+<Callout type="warn">
+The assertion is required **at both the pushed authorization request (PAR) and the token exchange** — these are two separate requests to the PDS's authorization server, each needing its own freshly signed assertion (they expire after 60 seconds). Signing once and reusing it for both calls will be rejected by the PDS.
+</Callout>
+
+```http
+POST /oauth/client-assertion
+X-Client-Key: hvc_...
+X-Client-Secret: hvs_...
+Content-Type: application/json
+
+{"issuer": "https://bsky.social"}
+```
+
+**Response:**
+
+```json
+{
+  "client_assertion": "eyJhbG...",
+  "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+  "expires_in": 60
+}
+```
+
+`issuer` is the `issuer` field from the PDS authorization server's metadata (step 3 above). Call this endpoint once before submitting the PAR request, attaching `client_assertion` and `client_assertion_type` as form parameters alongside your other PAR fields, and again before the token exchange request, attaching them there too. Public clients skip this entirely — PKCE is their proof of possession.
+
+There is no flag anywhere marking your client confidential — the PDS decides by reading your `client_id_url` document, and `/oauth/client-assertion` will sign for you regardless of whether that document is actually correct yet. If it isn't, the PDS ends up treating your app as public even though you're sending an assertion, which is confusing to debug from the outside. Check the "AT Protocol Client Auth" card in the dashboard (or `POST /admin/api-clients/{id}/auth-key/recheck`) — it reads the same document and reports in plain language exactly what's wrong with it.
 
 #### Phase 3: Register the session
 

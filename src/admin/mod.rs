@@ -1,4 +1,4 @@
-mod api_clients;
+pub(crate) mod api_clients;
 mod api_keys;
 pub(crate) mod auth;
 pub mod backfill;
@@ -191,6 +191,14 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             get(api_clients::get_api_client)
                 .put(api_clients::update_api_client)
                 .delete(api_clients::delete_api_client),
+        )
+        .route(
+            "/api-clients/{id}/auth-key",
+            post(api_clients::provision_auth_key).get(api_clients::get_auth_key),
+        )
+        .route(
+            "/api-clients/{id}/auth-key/recheck",
+            post(api_clients::recheck_auth_key),
         )
         .route("/domains", post(domains::create).get(domains::list))
         .route("/domains/{id}", delete(domains::delete))

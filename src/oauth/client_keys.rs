@@ -233,10 +233,26 @@ pub async fn load_keys(
         .collect()
 }
 
+/// Mark every key an owner holds as revoked.
+pub async fn revoke_keys_for_owner(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    owner: &str,
+) -> Result<(), AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_oauth_client_keys SET status = 'revoked', retired_at = ? WHERE owner = ? AND status != 'revoked'",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(now_rfc3339())
+        .bind(owner)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to revoke client keys: {e}")))?;
+    Ok(())
+}
+
 /// Return the instance's current key, generating and storing one on first call.
-///
-/// Called from `main` before any OAuth client is built. Idempotent, so a
-/// restart never mints a second key and never invalidates a live session.
 pub async fn ensure_instance_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,

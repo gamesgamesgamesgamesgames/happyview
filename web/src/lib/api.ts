@@ -23,6 +23,8 @@ import type { LabelerSummary } from "@/types/labelers";
 import type {
   ApiClientSummary,
   CreateApiClientResponse,
+  ApiClientAuthKey,
+  ApiClientAuthProbe,
 } from "@/types/api-clients";
 import type { SettingEntry } from "@/types/settings";
 import type {
@@ -74,6 +76,8 @@ export type { RecordLabel } from "@/types/records";
 export type {
   ApiClientSummary,
   CreateApiClientResponse,
+  ApiClientAuthKey,
+  ApiClientAuthProbe,
 } from "@/types/api-clients";
 export type { SettingEntry, InstanceSettings } from "@/types/settings";
 export { INSTANCE_SETTING_KEYS } from "@/types/settings";
@@ -824,6 +828,27 @@ export function deleteApiClient(id: string) {
   return apiFetch(`/admin/api-clients/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+// API client AT Protocol authentication key (private_key_jwt confidentiality)
+export function getApiClientAuthKey(id: string) {
+  return apiFetch<ApiClientAuthKey>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-key`,
+  );
+}
+
+export function provisionApiClientAuthKey(id: string) {
+  return apiFetch<ApiClientAuthKey>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-key`,
+    { method: "POST" },
+  );
+}
+
+export function recheckApiClientAuthKey(id: string) {
+  return apiFetch<ApiClientAuthProbe>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-key/recheck`,
+    { method: "POST" },
+  );
 }
 
 // Event Logs

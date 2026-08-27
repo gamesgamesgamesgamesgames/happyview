@@ -481,6 +481,127 @@ pub(super) async fn update_api_client(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Mint the client's ES256 authentication key, or return the existing one.
+pub(super) async fn provision_auth_key(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::ApiClientsEdit).await?;
+
+    let existing = crate::oauth::client_keys::load_keys(
+        &state.db,
+        state.db_backend,
+        state.config.token_encryption_key.as_ref(),
+        &id,
+    )
+    .await?;
+
+    let kid = match existing
+        .into_iter()
+        .find(|k| k.status == crate::oauth::client_keys::KeyStatus::Current)
+    {
+        Some(key) => key.kid,
+        None => {
+            let key = crate::oauth::client_keys::generate_client_key(&id)?;
+            crate::oauth::client_keys::insert_key(
+                &state.db,
+                state.db_backend,
+                state.config.token_encryption_key.as_ref(),
+                &key,
+            )
+            .await?;
+            key.kid
+        }
+    };
+
+    Ok(Json(serde_json::json!({
+        "kid": kid,
+        "jwks_uri": jwks_uri_for(&state, &id),
+    })))
+}
+
+/// GET /admin/api-clients/:id/auth-key — the client's current auth key, if any.
+pub(super) async fn get_auth_key(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::ApiClientsView).await?;
+
+    let keys = crate::oauth::client_keys::load_keys(
+        &state.db,
+        state.db_backend,
+        state.config.token_encryption_key.as_ref(),
+        &id,
+    )
+    .await?;
+
+    let key = keys
+        .into_iter()
+        .find(|k| k.status == crate::oauth::client_keys::KeyStatus::Current)
+        .ok_or_else(|| AppError::NotFound("no client authentication key".into()))?;
+
+    Ok(Json(serde_json::json!({
+        "kid": key.kid,
+        "jwks_uri": jwks_uri_for(&state, &id),
+    })))
+}
+
+fn registration_constraint_reason(client_id_url: &str) -> Option<String> {
+    if crate::auth::client_registry::is_loopback_url(client_id_url) {
+        return Some(
+            "this app's client_id_url is a loopback address (localhost/127.0.0.1). \
+             Loopback clients always register as public OAuth clients — no published \
+             document can make one confidential — so this is expected and there is \
+             nothing to fix in the document."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+/// POST /admin/api-clients/:id/auth-key/recheck — re-probe the client's
+/// published metadata document and re-register it if its confidentiality
+/// verdict changed.
+pub(super) async fn recheck_auth_key(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::ApiClientsEdit).await?;
+
+    let client_id_url =
+        crate::oauth::pds_write::lookup_client_id_url(&state.db, state.db_backend, &id).await?;
+
+    let confidential = state
+        .oauth
+        .refresh_client_confidentiality(&state, &id, &client_id_url)
+        .await?;
+
+    let probe = crate::oauth::client_probe::cached(&state, &id, &client_id_url).await?;
+    let reason = if !confidential && probe.confidential {
+        registration_constraint_reason(&client_id_url).unwrap_or(probe.reason)
+    } else {
+        probe.reason
+    };
+
+    Ok(Json(serde_json::json!({
+        "confidential": confidential,
+        "reason": reason,
+        "checked_at": probe.checked_at,
+    })))
+}
+
+pub(crate) fn jwks_uri_for(state: &AppState, api_client_id: &str) -> String {
+    format!(
+        "{}/oauth/clients/{}/jwks.json",
+        state.config.effective_public_url().trim_end_matches('/'),
+        api_client_id
+    )
+}
+
 /// DELETE /admin/api-clients/:id — delete an API client.
 pub(super) async fn delete_api_client(
     State(state): State<AppState>,
@@ -488,6 +609,10 @@ pub(super) async fn delete_api_client(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::ApiClientsDelete).await?;
+
+    // Revoke any client-authentication key before the row is deleted, so a
+    // deleted client's key cannot keep signing or appearing in its JWKS.
+    crate::oauth::client_keys::revoke_keys_for_owner(&state.db, state.db_backend, &id).await?;
 
     // Look up client_id_url and client_key before deleting so we can remove from registries.
     let lookup_sql = adapt_sql(

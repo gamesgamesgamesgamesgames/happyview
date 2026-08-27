@@ -5,6 +5,8 @@ import {
   AlertTriangle,
   Copy,
   Check,
+  KeyRound,
+  RefreshCw,
   Trash2,
   X,
   ExternalLink,
@@ -16,14 +18,20 @@ import { useCurrentUser } from "@/hooks/use-current-user";
 import { toastError } from "@/lib/format";
 import { docsUrl } from "@/lib/docs";
 import {
+  ApiError,
   getApiClients,
   createApiClient,
   updateApiClient,
   deleteApiClient,
+  getApiClientAuthKey,
+  provisionApiClientAuthKey,
+  recheckApiClientAuthKey,
 } from "@/lib/api";
 import type {
   ApiClientSummary,
   CreateApiClientResponse,
+  ApiClientAuthKey,
+  ApiClientAuthProbe,
 } from "@/types/api-clients";
 import { SiteHeader } from "@/components/site-header";
 import {
@@ -249,6 +257,9 @@ export default function ApiClientsPage() {
                   </TableCell>
                   <TableCell className="w-10 sticky right-0 bg-inherit z-[1]">
                     <div className="flex gap-1">
+                      {hasPermission("api-clients:edit") && (
+                        <ApiClientAuthDialog client={client} />
+                      )}
                       {hasPermission("api-clients:edit") && (
                         <EditApiClientDialog client={client} onSuccess={load} />
                       )}
@@ -961,6 +972,278 @@ function EditApiClientDialog({
           <Button onClick={handleSave} disabled={saving}>
             {saving ? "Saving..." : "Save"}
           </Button>
+        </ResponsiveDialogFooter>
+      </ResponsiveDialogContent>
+    </ResponsiveDialog>
+  );
+}
+
+/**
+ * "AT Protocol client auth" — lets a client's owner delegate its AT Protocol
+ * OAuth signing key to HappyView, so it can authenticate as a confidential
+ * client to a user's PDS (long-lived sessions) instead of a public one.
+ *
+ * There is no client-side flag for "is this client confidential" — that is
+ * decided by the authorization server reading the published `client_id_url`
+ * document, and this dialog only ever displays what `/auth-key` and
+ * `/auth-key/recheck` report about that document. The `reason` string from
+ * the probe is rendered verbatim; it is authored copy, not something this
+ * component should summarise or reword.
+ */
+function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [authKey, setAuthKey] = useState<ApiClientAuthKey | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [probe, setProbe] = useState<ApiClientAuthProbe | null>(null);
+  const [rechecking, setRechecking] = useState(false);
+  const [recheckFailed, setRecheckFailed] = useState(false);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+
+  const loadAuthKey = useCallback(async () => {
+    setLoading(true);
+    try {
+      const key = await getApiClientAuthKey(client.id);
+      setAuthKey(key);
+    } catch (e: unknown) {
+      // No key provisioned yet is expected, not an error to surface.
+      if (!(e instanceof ApiError && e.status === 404)) {
+        toastError("Failed to load client authentication key", e);
+      }
+      setAuthKey(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [client.id]);
+
+  const runRecheck = useCallback(async () => {
+    setRechecking(true);
+    setRecheckFailed(false);
+    try {
+      const result = await recheckApiClientAuthKey(client.id);
+      setProbe(result);
+    } catch (e: unknown) {
+      // Includes the known "deleted client id returns 500" edge — either
+      // way, this must land as a retryable state, not a stuck spinner.
+      setRecheckFailed(true);
+      toastError("Re-check failed", e);
+    } finally {
+      setRechecking(false);
+    }
+  }, [client.id]);
+
+  function handleOpenChange(nextOpen: boolean) {
+    setOpen(nextOpen);
+    if (nextOpen) {
+      setProbe(null);
+      setRecheckFailed(false);
+      loadAuthKey();
+    }
+  }
+
+  // Once a key exists, run an initial check so the status line reflects the
+  // published document on open rather than sitting blank until the operator
+  // clicks Re-check themselves. The server-side probe is cached for 60s, so
+  // this doesn't hit the developer's site on every open.
+  useEffect(() => {
+    if (open && authKey && probe === null && !rechecking && !recheckFailed) {
+      runRecheck();
+    }
+  }, [open, authKey, probe, rechecking, recheckFailed, runRecheck]);
+
+  async function handleGenerate() {
+    setGenerating(true);
+    try {
+      const key = await provisionApiClientAuthKey(client.id);
+      setAuthKey(key);
+      toast.success("Authentication key generated");
+    } catch (e: unknown) {
+      toastError("Failed to generate authentication key", e);
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  // Copies the exact string the endpoint returned — no trimming, no
+  // formatting, nothing appended. The probe compares jwks_uri as a literal
+  // string, so anything this control adds becomes an unexplained mismatch
+  // later.
+  async function handleCopy(value: string, field: string) {
+    await navigator.clipboard.writeText(value);
+    setCopiedField(field);
+    setTimeout(() => setCopiedField(null), 2000);
+  }
+
+  const snippet = authKey
+    ? JSON.stringify(
+        {
+          token_endpoint_auth_method: "private_key_jwt",
+          token_endpoint_auth_signing_alg: "ES256",
+          jwks_uri: authKey.jwks_uri,
+        },
+        null,
+        2,
+      )
+    : "";
+
+  return (
+    <ResponsiveDialog open={open} onOpenChange={handleOpenChange}>
+      <ResponsiveDialogTrigger asChild>
+        <Button
+          variant="outline"
+          size="icon"
+          className="size-8"
+          title="AT Protocol client auth"
+          aria-label={`AT Protocol client auth for ${client.name}`}
+        >
+          <KeyRound className="size-4" />
+        </Button>
+      </ResponsiveDialogTrigger>
+      <ResponsiveDialogContent>
+        <ResponsiveDialogHeader>
+          <ResponsiveDialogTitle>AT Protocol Client Auth</ResponsiveDialogTitle>
+          <ResponsiveDialogDescription>
+            Let HappyView hold &ldquo;{client.name}&rdquo;&apos;s signing key
+            so it can authenticate as a confidential OAuth client to
+            users&apos; PDSes, instead of a public one.
+          </ResponsiveDialogDescription>
+        </ResponsiveDialogHeader>
+
+        <div className="flex flex-col gap-4 max-h-[60vh] overflow-y-auto">
+          {loading ? (
+            <p className="text-muted-foreground text-sm">Loading…</p>
+          ) : !authKey ? (
+            <div className="flex flex-col gap-3 rounded-lg border p-4 bg-muted/50">
+              <p className="text-sm">
+                No AT Protocol client authentication key has been generated
+                for this client yet.
+              </p>
+              <Button
+                onClick={handleGenerate}
+                disabled={generating}
+                className="w-fit"
+              >
+                {generating ? "Generating..." : "Generate"}
+              </Button>
+            </div>
+          ) : (
+            <>
+              <div className="flex flex-col gap-2">
+                <Label>Key ID</Label>
+                <Input
+                  readOnly
+                  value={authKey.kid}
+                  className="font-mono text-sm"
+                />
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <Label>jwks_uri</Label>
+                <div className="flex gap-2">
+                  <Input
+                    readOnly
+                    value={authKey.jwks_uri}
+                    className="font-mono text-sm"
+                  />
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={() => handleCopy(authKey.jwks_uri, "jwks_uri")}
+                    title="Copy to clipboard"
+                  >
+                    {copiedField === "jwks_uri" ? (
+                      <Check className="size-4" />
+                    ) : (
+                      <Copy className="size-4" />
+                    )}
+                  </Button>
+                </div>
+                <p className="text-muted-foreground text-xs">
+                  Publish this exact value as{" "}
+                  <code className="bg-muted px-1 rounded">jwks_uri</code> in
+                  the client metadata document served at this client&apos;s
+                  Client ID URL.
+                </p>
+              </div>
+
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between">
+                  <Label>Fields to publish</Label>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => handleCopy(snippet, "snippet")}
+                  >
+                    {copiedField === "snippet" ? (
+                      <Check className="size-3.5" />
+                    ) : (
+                      <Copy className="size-3.5" />
+                    )}
+                    Copy
+                  </Button>
+                </div>
+                <pre className="rounded-lg border bg-muted/50 p-3 text-xs font-mono overflow-x-auto">
+                  {snippet}
+                </pre>
+                <p className="text-muted-foreground text-xs break-all">
+                  Add these three fields to the document served at{" "}
+                  <span className="font-mono">{client.client_id_url}</span>.
+                </p>
+              </div>
+
+              <div className="flex flex-col gap-2 rounded-lg border p-4">
+                <div className="flex items-center justify-between">
+                  <Label>Status</Label>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={runRecheck}
+                    disabled={rechecking}
+                  >
+                    <RefreshCw
+                      className={`size-3.5 ${rechecking ? "animate-spin" : ""}`}
+                    />
+                    {rechecking ? "Checking..." : "Re-check"}
+                  </Button>
+                </div>
+                {recheckFailed ? (
+                  <p className="text-destructive text-sm">
+                    Re-check failed — HappyView couldn&apos;t complete the
+                    check. Try again.
+                  </p>
+                ) : rechecking && !probe ? (
+                  <p className="text-muted-foreground text-sm">Checking…</p>
+                ) : probe ? (
+                  <div className="flex flex-col gap-1.5">
+                    <Badge
+                      variant={probe.confidential ? "default" : "outline"}
+                      className="w-fit"
+                    >
+                      {probe.confidential ? "Confidential" : "Not confidential"}
+                    </Badge>
+                    <p className="text-sm whitespace-pre-wrap break-words">
+                      {probe.reason}
+                    </p>
+                    <p className="text-muted-foreground text-xs">
+                      Checked {new Date(probe.checked_at).toLocaleString()}
+                    </p>
+                  </div>
+                ) : (
+                  <p className="text-muted-foreground text-sm">
+                    Not checked yet.
+                  </p>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        <ResponsiveDialogFooter>
+          <ResponsiveDialogClose asChild>
+            <Button variant="outline">Close</Button>
+          </ResponsiveDialogClose>
         </ResponsiveDialogFooter>
       </ResponsiveDialogContent>
     </ResponsiveDialog>

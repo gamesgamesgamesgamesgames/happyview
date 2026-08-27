@@ -9,10 +9,12 @@ use atrium_oauth::{
     OAuthClientConfig, OAuthResolverConfig,
 };
 
+use crate::AppState;
 use crate::HappyViewOAuthClient;
 use crate::auth::oauth_store::{DbSessionStore, DbStateStore};
 use crate::db::{DatabaseBackend, adapt_sql};
 use crate::dns::NativeDnsResolver;
+use crate::error::AppError;
 
 pub fn is_loopback_url(url: &str) -> bool {
     match reqwest::Url::parse(url) {
@@ -252,6 +254,91 @@ impl OAuthClientRegistry {
             }
             Err(e) => Err(format!("failed to create OAuth client: {e}")),
         }
+    }
+
+    /// Re-probe an API client's published metadata document and, if its
+    /// confidentiality verdict differs from what is currently registered,
+    /// re-register it.
+    pub async fn refresh_client_confidentiality(
+        &self,
+        state: &AppState,
+        api_client_id: &str,
+        client_id_url: &str,
+    ) -> Result<bool, AppError> {
+        if is_loopback_url(client_id_url) {
+            return Ok(false);
+        }
+
+        let probe = crate::oauth::client_probe::cached(state, api_client_id, client_id_url).await?;
+
+        let currently_confidential = self.get(client_id_url).is_some_and(|c| {
+            c.client_metadata.token_endpoint_auth_method.as_deref() == Some("private_key_jwt")
+        });
+
+        if probe.confidential == currently_confidential {
+            return Ok(currently_confidential);
+        }
+
+        let sql = adapt_sql(
+            "SELECT client_uri, redirect_uris, scopes FROM happyview_api_clients WHERE id = ?",
+            state.db_backend,
+        );
+        let row: Option<(String, String, String)> = crate::db::query_as(&sql)
+            .bind(api_client_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to look up API client: {e}")))?;
+        let Some((client_uri, redirect_uris_json, scopes)) = row else {
+            // The client row is gone (e.g. deleted concurrently) — nothing to
+            // re-register against. Report what is actually registered, not
+            // what the probe wanted.
+            return Ok(currently_confidential);
+        };
+        let redirect_uris: Vec<String> =
+            serde_json::from_str(&redirect_uris_json).unwrap_or_default();
+
+        let client_keys = if probe.confidential {
+            let keys = crate::oauth::client_keys::load_keys(
+                &state.db,
+                state.db_backend,
+                state.config.token_encryption_key.as_ref(),
+                api_client_id,
+            )
+            .await?;
+            keys.into_iter()
+                .find(|k| k.status == crate::oauth::client_keys::KeyStatus::Current)
+                .map(|k| crate::oauth::client_keys::to_atrium_jwk(&k))
+                .transpose()?
+                .map(|jwk| vec![jwk])
+        } else {
+            None
+        };
+
+        let params = ApiClientOAuthParams {
+            plc_url: state.config.plc_url.clone(),
+            state_store: state.oauth_state_store.clone(),
+            session_store_pool: state.db.clone(),
+            db_backend: state.db_backend,
+            client_keys,
+        };
+
+        self.register_api_client(client_id_url, &client_uri, redirect_uris, &scopes, &params)
+            .map_err(|e| AppError::Internal(format!("failed to re-register API client: {e}")))?;
+
+        let now_confidential = self.get(client_id_url).is_some_and(|c| {
+            c.client_metadata.token_endpoint_auth_method.as_deref() == Some("private_key_jwt")
+        });
+        if now_confidential != probe.confidential {
+            tracing::warn!(
+                client_id = %api_client_id,
+                client_id_url = %client_id_url,
+                probe_confidential = probe.confidential,
+                registered_confidential = now_confidential,
+                "probe verdict and actual registration disagree after re-registration"
+            );
+        }
+
+        Ok(now_confidential)
     }
 
     /// Load all active API clients from the database and register OAuth clients for each.

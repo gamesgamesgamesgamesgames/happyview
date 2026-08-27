@@ -635,6 +635,33 @@ pub async fn dpop_pds_post_blob(
     .await
 }
 
+/// Build the token-endpoint form for a refresh, with client authentication
+/// when the client is confidential.
+///
+/// Used at both the initial attempt and the nonce-retry call site, so the two
+/// cannot drift: a confidential client's assertion must be present either
+/// way, or a nonce retry would silently downgrade to an unauthenticated
+/// refresh.
+fn build_refresh_form(
+    refresh_token: &str,
+    client_id: &str,
+    assertion: Option<String>,
+) -> Vec<(&'static str, String)> {
+    let mut form = vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+        ("client_id", client_id.to_string()),
+    ];
+    if let Some(assertion) = assertion {
+        form.push((
+            "client_assertion_type",
+            super::client_assertion::CLIENT_ASSERTION_TYPE.to_string(),
+        ));
+        form.push(("client_assertion", assertion));
+    }
+    form
+}
+
 /// Refresh an expired access token using the session's refresh_token.
 ///
 /// Discovers the token endpoint from the issuer's OAuth metadata, sends a
@@ -675,17 +702,41 @@ async fn refresh_access_token(
         .get_resolved_client_id(&client_id_url)
         .unwrap_or(client_id_url);
 
+    // A confidential client must authenticate on the refresh grant with the
+    // same key that established the session. Absent one, this stays a public
+    // refresh — which is correct for every client that has not opted in.
+    // Holding a `Current` key is the operative condition; deliberately no
+    // `client_probe` call here (see module docs on why).
+    let assertion = match super::client_keys::load_keys(
+        pool,
+        backend,
+        Some(encryption_key),
+        &creds.session.api_client_id,
+    )
+    .await?
+    .into_iter()
+    .find(|k| k.status == super::client_keys::KeyStatus::Current)
+    {
+        Some(key) => Some(super::client_assertion::build(
+            &key.private_jwk,
+            &key.kid,
+            &client_id,
+            issuer,
+        )?),
+        None => None,
+    };
+
     let proof = generate_dpop_proof_no_ath(&creds.private_jwk, "POST", &token_endpoint, None)?;
 
     let resp = http
         .post(&token_endpoint)
         .header("DPoP", &proof)
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", &client_id),
-        ])
+        .form(&build_refresh_form(
+            refresh_token,
+            &client_id,
+            assertion.clone(),
+        ))
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("token refresh request failed: {e}")))?;
@@ -715,11 +766,7 @@ async fn refresh_access_token(
             .post(&token_endpoint)
             .header("DPoP", &proof)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", &client_id),
-            ])
+            .form(&build_refresh_form(refresh_token, &client_id, assertion))
             .send()
             .await
             .map_err(|e| AppError::Internal(format!("token refresh request failed: {e}")))?;
@@ -839,7 +886,7 @@ async fn discover_token_endpoint(http: &reqwest::Client, issuer: &str) -> Result
 }
 
 /// Look up the client_id_url for an API client by its internal ID.
-async fn lookup_client_id_url(
+pub(crate) async fn lookup_client_id_url(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     api_client_id: &str,
@@ -1067,6 +1114,34 @@ async fn resolve_pds_from_did(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_form_is_unauthenticated_for_a_public_client() {
+        let form = build_refresh_form("tok", "https://app.example.com/meta.json", None);
+        assert_eq!(form.len(), 3);
+        assert!(form.iter().all(|(k, _)| *k != "client_assertion"));
+    }
+
+    #[test]
+    fn refresh_form_carries_the_assertion_for_a_confidential_client() {
+        let form = build_refresh_form(
+            "tok",
+            "https://app.example.com/meta.json",
+            Some("signed.jwt.here".to_string()),
+        );
+        let get = |name: &str| {
+            form.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(get("grant_type"), "refresh_token");
+        assert_eq!(get("client_assertion"), "signed.jwt.here");
+        assert_eq!(
+            get("client_assertion_type"),
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+        );
+    }
 
     #[test]
     fn generate_dpop_proof_produces_valid_jwt() {

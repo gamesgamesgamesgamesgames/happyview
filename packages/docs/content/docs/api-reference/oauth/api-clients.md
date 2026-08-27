@@ -335,6 +335,177 @@ curl -X POST https://happyview.example.com/xrpc/dev.happyview.deleteApiClient \
 
 Returns `404` if the client doesn't exist or isn't owned by the authenticated user. Deleting a client cascades to all its children.
 
+## Confidential client authentication
+
+These two endpoints are unrelated to the third-party (XRPC) CRUD flow above — they belong to any top-level API client that wants to run its own atproto OAuth flow against a user's PDS as a **confidential** client (`private_key_jwt`) instead of a public one. See the [API Clients guide](../../guides/api-clients.md#confidential-clients-attaching-the-client-assertion) for the full flow, or generate and inspect the key from the dashboard's Settings > API Clients > "AT Protocol Client Auth" card.
+
+### Get the client's JWKS
+
+```
+GET /oauth/clients/{id}/jwks.json
+```
+
+Public and unauthenticated — this is the URL your app publishes as `jwks_uri` in its `client_id_url` document, so the user's PDS (a stranger to HappyView) can fetch it during authorization. An id with no provisioned key returns an empty key set rather than a 404, so this endpoint can't be used to enumerate which client ids exist.
+
+```ts tab="TypeScript" tab-group="language"
+const response = await fetch(
+  "https://happyview.example.com/oauth/clients/550e8400-e29b-41d4-a716-446655440000/jwks.json",
+);
+
+const jwks = await response.json();
+```
+```js tab="JavaScript" tab-group="language"
+const response = await fetch(
+  "https://happyview.example.com/oauth/clients/550e8400-e29b-41d4-a716-446655440000/jwks.json",
+);
+
+const jwks = await response.json();
+```
+```rust tab="Rust" tab-group="language"
+let response = client
+    .get("https://happyview.example.com/oauth/clients/550e8400-e29b-41d4-a716-446655440000/jwks.json")
+    .send()
+    .await?;
+
+let jwks: serde_json::Value = response.json().await?;
+```
+```go tab="Go" tab-group="language"
+resp, err := http.Get(
+  "https://happyview.example.com/oauth/clients/550e8400-e29b-41d4-a716-446655440000/jwks.json",
+)
+```
+```sh tab="cURL" tab-group="language"
+curl https://happyview.example.com/oauth/clients/550e8400-e29b-41d4-a716-446655440000/jwks.json
+```
+
+**Response**: `200 OK`
+
+```json
+{
+  "keys": [
+    {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "...",
+      "y": "...",
+      "kid": "b3a1...",
+      "alg": "ES256",
+      "use": "sig"
+    }
+  ]
+}
+```
+
+`keys` is empty until an authentication key has been provisioned for this client (`POST /admin/api-clients/{id}/auth-key`).
+
+### Sign a client assertion
+
+```
+POST /oauth/client-assertion
+```
+
+Mints a `private_key_jwt` assertion for the calling client, for use in an atproto OAuth flow the client is running itself against a user's PDS. Needed **twice per flow** — once for the pushed authorization request (PAR), once for the token exchange — since each assertion expires after 60 seconds and only covers one request.
+
+Authenticate as a confidential client with `X-Client-Key` + `X-Client-Secret`, or as a public client with `X-Client-Key` + an active DPoP-bound session (`Authorization: DPoP <token>` + a `DPoP` proof covering this request).
+
+```ts tab="TypeScript" tab-group="language"
+const CLIENT_KEY = "hvc_...";
+const CLIENT_SECRET = "hvs_...";
+
+interface ClientAssertionResponse {
+  clientAssertion: string;
+  clientAssertionType: string;
+  expiresIn: number;
+}
+
+const response = await fetch(
+  "https://happyview.example.com/oauth/client-assertion",
+  {
+    method: "POST",
+    headers: {
+      "X-Client-Key": CLIENT_KEY,
+      "X-Client-Secret": CLIENT_SECRET,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ issuer: "https://bsky.social" }),
+  },
+);
+
+const data: ClientAssertionResponse = await response.json();
+```
+```js tab="JavaScript" tab-group="language"
+const CLIENT_KEY = "hvc_...";
+const CLIENT_SECRET = "hvs_...";
+
+const response = await fetch(
+  "https://happyview.example.com/oauth/client-assertion",
+  {
+    method: "POST",
+    headers: {
+      "X-Client-Key": CLIENT_KEY,
+      "X-Client-Secret": CLIENT_SECRET,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ issuer: "https://bsky.social" }),
+  },
+);
+
+const data = await response.json();
+```
+```rust tab="Rust" tab-group="language"
+let client_key = "hvc_...";
+let client_secret = "hvs_...";
+
+let response = client
+    .post("https://happyview.example.com/oauth/client-assertion")
+    .header("X-Client-Key", client_key)
+    .header("X-Client-Secret", client_secret)
+    .json(&serde_json::json!({ "issuer": "https://bsky.social" }))
+    .send()
+    .await?;
+
+let data: serde_json::Value = response.json().await?;
+```
+```go tab="Go" tab-group="language"
+clientKey := "hvc_..."
+clientSecret := "hvs_..."
+
+body := bytes.NewBufferString(`{"issuer": "https://bsky.social"}`)
+
+req, _ := http.NewRequest("POST",
+  "https://happyview.example.com/oauth/client-assertion", body)
+req.Header.Set("X-Client-Key", clientKey)
+req.Header.Set("X-Client-Secret", clientSecret)
+req.Header.Set("Content-Type", "application/json")
+
+resp, err := http.DefaultClient.Do(req)
+```
+```sh tab="cURL" tab-group="language"
+curl -X POST https://happyview.example.com/oauth/client-assertion \
+  -H "X-Client-Key: hvc_..." \
+  -H "X-Client-Secret: hvs_..." \
+  -H "Content-Type: application/json" \
+  -d '{"issuer": "https://bsky.social"}'
+```
+
+| Field    | Type   | Required | Description                                                          |
+| -------- | ------ | -------- | ---------------------------------------------------------------------|
+| `issuer` | string | yes      | The `issuer` URL from the target PDS authorization server's metadata |
+
+**Response**: `200 OK`
+
+```json
+{
+  "client_assertion": "eyJhbG...",
+  "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+  "expires_in": 60
+}
+```
+
+Attach `client_assertion` and `client_assertion_type` as form parameters on the PAR request and, separately, on the token exchange request — each needs its own call to this endpoint.
+
+Returns `400` (`this client has no authentication key; provision one first`) if no key has been provisioned yet via `POST /admin/api-clients/{id}/auth-key`.
+
 ## Errors
 
 | Status | Error                                     | Cause                                                            |

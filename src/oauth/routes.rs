@@ -23,6 +23,98 @@ pub fn routes() -> Router<AppState> {
             "/sessions/{did}/devices/{session_id}",
             axum::routing::delete(delete_device_session),
         )
+        .route("/clients/{id}/jwks.json", get(client_jwks))
+        .route("/client-assertion", post(mint_client_assertion))
+}
+
+/// Public JWKS for an API client's authentication key.
+///
+/// Unauthenticated by necessity — the authorization server fetching this is a
+/// stranger's PDS. It is public key material and reveals nothing: an unknown
+/// or keyless client id returns an empty key set rather than a 404, so this
+/// endpoint cannot be used to enumerate which client ids exist.
+async fn client_jwks(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let keys = super::client_keys::load_keys(
+        &state.db,
+        state.db_backend,
+        state.config.token_encryption_key.as_ref(),
+        &id,
+    )
+    .await?;
+    Ok(Json(super::client_keys::render_jwks(&keys)))
+}
+
+#[derive(Deserialize)]
+struct ClientAssertionBody {
+    issuer: String,
+}
+
+/// POST /oauth/client-assertion — mint a `private_key_jwt` assertion for the
+/// calling client.
+///
+/// The app runs its own OAuth flow, so it needs one for PAR and one for the
+/// token exchange. Authentication is the client's existing credentials, so
+/// the blast radius is the client's own identity — which HappyView already
+/// holds the key for.
+async fn mint_client_assertion(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let request_path = original_request_path(&req);
+    let headers = SessionAuthHeaders::from_request(&req);
+    let client = authenticate_request_client(&state, &headers, &request_path, "POST")
+        .await?
+        .resolved;
+
+    let Json(body): Json<ClientAssertionBody> = Json::from_request(req, &state)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("invalid client-assertion request: {e}")))?;
+
+    let key = super::client_keys::load_keys(
+        &state.db,
+        state.db_backend,
+        state.config.token_encryption_key.as_ref(),
+        &client.id,
+    )
+    .await?
+    .into_iter()
+    .find(|k| k.status == super::client_keys::KeyStatus::Current)
+    .ok_or_else(|| {
+        AppError::BadRequest("this client has no authentication key; provision one first".into())
+    })?;
+
+    let client_id_url =
+        super::pds_write::lookup_client_id_url(&state.db, state.db_backend, &client.id).await?;
+
+    // An app asking for an assertion is exactly the moment its
+    // confidentiality matters, so this is one of the two on-demand call
+    // sites for the probe (see `client_registry::refresh_client_confidentiality`).
+    // A failure here (e.g. the app's metadata server is unreachable) must
+    // never stop this client — which already holds a key — from getting its
+    // assertion: the probe informs registration, it does not gate signing.
+    if let Err(e) = state
+        .oauth
+        .refresh_client_confidentiality(&state, &client.id, &client_id_url)
+        .await
+    {
+        tracing::warn!(
+            client_id = %client.id,
+            error = %e,
+            "confidentiality re-probe failed; continuing to mint the assertion"
+        );
+    }
+
+    let assertion =
+        super::client_assertion::build(&key.private_jwk, &key.kid, &client_id_url, &body.issuer)?;
+
+    Ok(Json(serde_json::json!({
+        "client_assertion": assertion,
+        "client_assertion_type": super::client_assertion::CLIENT_ASSERTION_TYPE,
+        "expires_in": super::client_assertion::ASSERTION_TTL_SECS,
+    })))
 }
 
 /// The request path exactly as the client sent it.
@@ -391,18 +483,8 @@ async fn get_session(
     Path(did): Path<String>,
     req: axum::extract::Request,
 ) -> Result<Json<GetSessionResponse>, AppError> {
-    let client_key = req
-        .headers()
-        .get("x-client-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AppError::Auth("X-Client-Key header required".into()))?
-        .to_string();
-
-    let client_secret = req
-        .headers()
-        .get("x-client-secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    let request_path = original_request_path(&req);
+    let headers = SessionAuthHeaders::from_request(&req);
 
     let encryption_key = state
         .config
@@ -410,75 +492,30 @@ async fn get_session(
         .as_ref()
         .ok_or_else(|| AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into()))?;
 
-    let session = if let Some(ref secret) = client_secret {
-        let c = client_auth::authenticate_confidential(
-            &state.db,
-            state.db_backend,
-            &client_key,
-            secret,
-        )
-        .await?;
+    let authenticated = authenticate_request_client(&state, &headers, &request_path, "GET").await?;
+
+    let session = match authenticated.dpop_key_id {
         // Confidential clients: look up by (client, user) — no DPoP proof needed
-        sessions::get_dpop_session_for_user(
-            &state.db,
-            state.db_backend,
-            encryption_key,
-            &c.id,
-            &did,
-        )
-        .await?
-    } else {
-        let resolved =
-            client_auth::resolve_client_by_key(&state.db, state.db_backend, &client_key).await?;
-
-        let auth_header = req
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                AppError::Auth("DPoP auth requires Authorization: DPoP <token>".into())
-            })?;
-        let access_token = auth_header.strip_prefix("DPoP ").ok_or_else(|| {
-            AppError::Auth("DPoP auth requires the DPoP authorization scheme".into())
-        })?;
-        let dpop_proof = req
-            .headers()
-            .get("dpop")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| AppError::Auth("DPoP auth requires a DPoP proof header".into()))?;
-
-        let thumbprint = crate::oauth::dpop_proof::extract_proof_thumbprint(dpop_proof)?;
-        let dpop_key_id = keys::get_dpop_key_id_by_thumbprint(
-            &state.db,
-            state.db_backend,
-            &resolved.id,
-            &thumbprint,
-        )
-        .await?;
-
-        let host = req
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("localhost");
-        let request_url = dpop_htu(&state, host, &original_request_path(&req));
-
-        crate::oauth::dpop_proof::validate_dpop_proof(
-            dpop_proof,
-            "GET",
-            &request_url,
-            access_token,
-            &thumbprint,
-        )?;
-
-        sessions::get_dpop_session_by_key_id(
-            &state.db,
-            state.db_backend,
-            encryption_key,
-            &resolved.id,
-            &dpop_key_id,
-        )
-        .await?
+        None => {
+            sessions::get_dpop_session_for_user(
+                &state.db,
+                state.db_backend,
+                encryption_key,
+                &authenticated.resolved.id,
+                &did,
+            )
+            .await?
+        }
+        Some(dpop_key_id) => {
+            sessions::get_dpop_session_by_key_id(
+                &state.db,
+                state.db_backend,
+                encryption_key,
+                &authenticated.resolved.id,
+                &dpop_key_id,
+            )
+            .await?
+        }
     };
 
     let scopes: Vec<String> = session
@@ -509,108 +546,43 @@ async fn delete_session(
     Path(did): Path<String>,
     req: axum::extract::Request,
 ) -> Result<StatusCode, AppError> {
-    let client_key = req
-        .headers()
-        .get("x-client-key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AppError::Auth("X-Client-Key header required".into()))?
-        .to_string();
+    let request_path = original_request_path(&req);
+    let headers = SessionAuthHeaders::from_request(&req);
 
-    let client_secret = req
-        .headers()
-        .get("x-client-secret")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    let authenticated =
+        authenticate_request_client(&state, &headers, &request_path, "DELETE").await?;
+    let client = authenticated.resolved;
 
-    if let Some(ref secret) = client_secret {
-        let client = client_auth::authenticate_confidential(
-            &state.db,
-            state.db_backend,
-            &client_key,
-            secret,
-        )
-        .await?;
+    match authenticated.dpop_key_id {
         // Confidential clients: delete all sessions for this user+client
-        sessions::delete_all_dpop_sessions(&state.db, state.db_backend, &client.id, &did).await?;
-
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "dpop_session.deleted".to_string(),
-                severity: Severity::Info,
-                actor_did: Some(did),
-                subject: Some(client.client_key),
-                detail: serde_json::json!({}),
-            },
-            state.db_backend,
-        )
-        .await;
-    } else {
-        let resolved =
-            client_auth::resolve_client_by_key(&state.db, state.db_backend, &client_key).await?;
-
-        let auth_header = req
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                AppError::Auth("DPoP auth requires Authorization: DPoP <token>".into())
-            })?;
-        let access_token = auth_header.strip_prefix("DPoP ").ok_or_else(|| {
-            AppError::Auth("DPoP auth requires the DPoP authorization scheme".into())
-        })?;
-        let dpop_proof = req
-            .headers()
-            .get("dpop")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| AppError::Auth("DPoP auth requires a DPoP proof header".into()))?;
-
-        let thumbprint = crate::oauth::dpop_proof::extract_proof_thumbprint(dpop_proof)?;
-        let dpop_key_id = keys::get_dpop_key_id_by_thumbprint(
-            &state.db,
-            state.db_backend,
-            &resolved.id,
-            &thumbprint,
-        )
-        .await?;
-
-        let host = req
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("localhost");
-        let request_url = dpop_htu(&state, host, &original_request_path(&req));
-
-        crate::oauth::dpop_proof::validate_dpop_proof(
-            dpop_proof,
-            "DELETE",
-            &request_url,
-            access_token,
-            &thumbprint,
-        )?;
-
-        sessions::delete_dpop_session(
-            &state.db,
-            state.db_backend,
-            &resolved.id,
-            &did,
-            &dpop_key_id,
-        )
-        .await?;
-
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "dpop_session.deleted".to_string(),
-                severity: Severity::Info,
-                actor_did: Some(did),
-                subject: Some(resolved.client_key),
-                detail: serde_json::json!({}),
-            },
-            state.db_backend,
-        )
-        .await;
+        None => {
+            sessions::delete_all_dpop_sessions(&state.db, state.db_backend, &client.id, &did)
+                .await?;
+        }
+        Some(dpop_key_id) => {
+            sessions::delete_dpop_session(
+                &state.db,
+                state.db_backend,
+                &client.id,
+                &did,
+                &dpop_key_id,
+            )
+            .await?;
+        }
     }
+
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "dpop_session.deleted".to_string(),
+            severity: Severity::Info,
+            actor_did: Some(did),
+            subject: Some(client.client_key),
+            detail: serde_json::json!({}),
+        },
+        state.db_backend,
+    )
+    .await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -666,7 +638,9 @@ async fn list_device_sessions(
 ) -> Result<Json<Vec<DeviceSessionInfo>>, AppError> {
     let request_path = original_request_path(&req);
     let headers = SessionAuthHeaders::from_request(&req);
-    let client = resolve_session_client(&state, &headers, &request_path, "GET").await?;
+    let client = authenticate_request_client(&state, &headers, &request_path, "GET")
+        .await?
+        .resolved;
 
     let sessions =
         sessions::list_dpop_sessions(&state.db, state.db_backend, &client.id, &did).await?;
@@ -693,7 +667,9 @@ async fn delete_device_session(
 ) -> Result<StatusCode, AppError> {
     let request_path = original_request_path(&req);
     let headers = SessionAuthHeaders::from_request(&req);
-    let client = resolve_session_client(&state, &headers, &request_path, "DELETE").await?;
+    let client = authenticate_request_client(&state, &headers, &request_path, "DELETE")
+        .await?
+        .resolved;
 
     sessions::delete_dpop_session_by_id(&state.db, state.db_backend, &session_id, &client.id, &did)
         .await?;
@@ -714,25 +690,49 @@ async fn delete_device_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Shared client authentication for session endpoints.
-async fn resolve_session_client(
+/// The client an OAuth-surface request authenticated as, plus — when
+/// authentication went through a DPoP-bound session rather than a client
+/// secret — the id of the specific device session it authenticated.
+struct AuthenticatedClient {
+    resolved: client_auth::ResolvedClient,
+    /// `Some` only on the DPoP branch. Endpoints scoped to one device
+    /// (`get_session`, `delete_session`) need it; endpoints that act on the
+    /// client as a whole (`list_device_sessions`, `delete_device_session`,
+    /// `mint_client_assertion`) ignore it.
+    dpop_key_id: Option<String>,
+}
+
+/// Authenticate an OAuth-surface request as its calling API client: either a
+/// confidential client's `X-Client-Key`/`X-Client-Secret`, or a public
+/// client's `X-Client-Key` plus proof of an active DPoP-bound session
+/// (`Authorization: DPoP <token>` + a `DPoP` proof covering this request).
+///
+/// Shared by every endpoint that authenticates the *client itself* this way —
+/// as opposed to `provision_dpop_key`/`register_session`, which authenticate
+/// a client that does not yet have a session, via PKCE, and stay separate
+/// because their public-client verification differs at each call site.
+async fn authenticate_request_client(
     state: &AppState,
     headers: &SessionAuthHeaders,
     request_path: &str,
     method: &str,
-) -> Result<client_auth::ResolvedClient, AppError> {
+) -> Result<AuthenticatedClient, AppError> {
     if headers.client_key.is_empty() {
         return Err(AppError::Auth("X-Client-Key header required".into()));
     }
 
     if let Some(ref secret) = headers.client_secret {
-        return client_auth::authenticate_confidential(
+        let resolved = client_auth::authenticate_confidential(
             &state.db,
             state.db_backend,
             &headers.client_key,
             secret,
         )
-        .await;
+        .await?;
+        return Ok(AuthenticatedClient {
+            resolved,
+            dpop_key_id: None,
+        });
     }
 
     let resolved =
@@ -752,7 +752,7 @@ async fn resolve_session_client(
         .ok_or_else(|| AppError::Auth("DPoP auth requires a DPoP proof header".into()))?;
 
     let thumbprint = crate::oauth::dpop_proof::extract_proof_thumbprint(dpop_proof)?;
-    let _dpop_key_id =
+    let dpop_key_id =
         keys::get_dpop_key_id_by_thumbprint(&state.db, state.db_backend, &resolved.id, &thumbprint)
             .await?;
 
@@ -766,5 +766,8 @@ async fn resolve_session_client(
         &thumbprint,
     )?;
 
-    Ok(resolved)
+    Ok(AuthenticatedClient {
+        resolved,
+        dpop_key_id: Some(dpop_key_id),
+    })
 }
