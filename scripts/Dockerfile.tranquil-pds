@@ -1,0 +1,134 @@
+# syntax=docker/dockerfile:1
+#
+# tranquil-pds, built from source with the `native-tls-roots` feature.
+#
+# WHY THIS EXISTS, rather than using atcr.io/tranquil.farm/tranquil-pds:latest.
+#
+# HappyView's primary OAuth client in the e2e stack is confidential (see
+# PUBLIC_URL in docker-compose.e2e.yml). Authenticating it means the PDS must
+# fetch https://happyview.127-0-0-1.sslip.io/oauth-client-metadata.json, which
+# Caddy serves with its internal CA. The published image cannot ever trust that
+# certificate: Tranquil pins `reqwest` with `rustls-tls-webpki-roots`, a
+# COMPILED-IN root list, so `SSL_CERT_FILE` is not read and installing the CA
+# into the system trust store has no effect either. Both were tried.
+#
+# Tranquil's own answer is the `native-tls-roots` cargo feature, which gates
+# `danger_accept_invalid_certs(true)` on exactly the client-metadata HTTP client
+# (crates/tranquil-oauth/src/client.rs). Their published image is built with
+# default features, and no dev-tagged image exists, so we build it ourselves.
+#
+# This build no longer runs in CI directly (that got expensive — ~657 crates
+# plus a pnpm frontend on every cold run). .github/workflows/tranquil-image.yml
+# now runs it nightly and publishes the result to
+# ghcr.io/gamesgamesgamesgamesgames/tranquil-dev, which docker-compose.e2e.yml
+# pulls instead of building. That workflow auto-adopts the newest upstream
+# semver tag, so TRANQUIL_REF and TRANQUIL_SHA both come from the caller —
+# resolved from a single `git ls-remote` so the tag can't move between resolve
+# and clone — rather than being pinned here. This Dockerfile is still usable
+# for a manual/local build; you just have to supply both yourself.
+#
+# The build context is `./scripts` and nothing is copied from it; the source
+# comes from the clone below. Keep it that way so the context stays tiny.
+ARG TRANQUIL_REF
+# No default: unlike TRANQUIL_REF drifting to "whatever's checked out", an
+# unset TRANQUIL_SHA has no safe interpretation at all, so the guard below
+# treats a caller that forgot to pass one as an error rather than quietly
+# building unverified source.
+ARG TRANQUIL_SHA
+# Pinned to a specific digest (multi-arch index digest, so amd64 CI and arm64
+# dev both resolve correctly), independent of whatever TRANQUIL_REF the caller
+# passes. `latest` would make the base image drift on its own schedule, on top
+# of TRANQUIL_REF already auto-adopting upstream — two floating things instead
+# of one. Bump deliberately.
+ARG DISTROLESS_IMAGE=gcr.io/distroless/cc-debian13@sha256:e86cf4f565c8eee2cbb2be073bb107dafb14734b53d5872da20fdf47418a02f4
+
+FROM debian:trixie-slim AS src
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ARG TRANQUIL_REF
+ARG TRANQUIL_SHA
+# `--branch "${TRANQUIL_REF}"` follows a mutable tag: an upstream re-tag would
+# silently change what gets built here. Assert the resolved commit matches the
+# SHA the caller resolved it to before trusting it further, so a moved tag
+# fails the build loudly instead of shipping a different PDS under the same
+# name. The check needs .git, so it runs before that gets stripped.
+RUN set -eu; \
+    if [ -z "${TRANQUIL_REF}" ] || [ -z "${TRANQUIL_SHA}" ]; then \
+      echo "ERROR: TRANQUIL_REF and TRANQUIL_SHA must both be supplied; neither" >&2; \
+      echo "has a default. Resolve them together from a single" >&2; \
+      echo "'git ls-remote --tags --refs https://tangled.org/tranquil.farm/tranquil-pds'" >&2; \
+      echo "so the tag can't move between resolving the SHA and this clone, then" >&2; \
+      echo "pass both via --build-arg." >&2; \
+      exit 1; \
+    fi; \
+    git clone --depth 1 --branch "${TRANQUIL_REF}" \
+      https://tangled.org/tranquil.farm/tranquil-pds /src; \
+    actual="$(git -C /src rev-parse HEAD)"; \
+    if [ "$actual" != "${TRANQUIL_SHA}" ]; then \
+      echo "ERROR: ${TRANQUIL_REF} now resolves to $actual, expected ${TRANQUIL_SHA}." >&2; \
+      echo "The tag was moved since TRANQUIL_SHA was resolved. Review what changed" >&2; \
+      echo "upstream before building against the new commit." >&2; \
+      exit 1; \
+    fi; \
+    rm -rf /src/.git
+
+# GUARD — fail here, loudly and early, if the escape hatch we depend on moves.
+#
+# Cargo already hard-errors if `native-tls-roots` is dropped or renamed ("the
+# package does not contain this feature"), so that case is covered for free.
+# What cargo cannot catch is the feature surviving while no longer gating
+# `danger_accept_invalid_certs`: the build would succeed and produce a PDS that
+# silently cannot fetch our client metadata, resurfacing as the same misleading
+# "unable to obtain client metadata" symptom this image exists to prevent.
+RUN set -eu; \
+    f=/src/crates/tranquil-oauth/src/client.rs; \
+    if ! grep -A3 'cfg(feature = "native-tls-roots")' "$f" \
+         | grep -q 'danger_accept_invalid_certs'; then \
+      echo "ERROR: tranquil-oauth ${TRANQUIL_REF} no longer gates" >&2; \
+      echo "danger_accept_invalid_certs on the native-tls-roots feature." >&2; \
+      echo "This PDS would not trust Caddy's internal CA, and every OAuth e2e" >&2; \
+      echo "spec would fail with 'Failed to fetch client metadata'." >&2; \
+      echo "See the header of scripts/Dockerfile.tranquil-pds." >&2; \
+      exit 1; \
+    fi
+
+FROM node:24-trixie-slim AS frontend
+# Pinned rather than `pnpm@latest` — upstream's own Dockerfile floats it too, but
+# a pnpm major that changes lockfile handling would silently turn this pinned
+# build into a break. Pinned to 11.23.0 rather than a 9.x matching the
+# frontend's `lockfileVersion: '9.0'`: pnpm 9.15.4 actually fails this install
+# with "packages field missing or empty" against `pnpm-workspace.yaml`'s
+# settings-only shape (no `packages:` key) — confirmed by reproducing it
+# locally — while 11.23.0 (what `latest` resolves to as of this pin) installs
+# cleanly. So a version *matching the lockfile format* is not the same as a
+# version that can install it; 11.23.0 is the one actually verified to work.
+RUN corepack enable && corepack prepare pnpm@11.23.0 --activate
+WORKDIR /app
+COPY --from=src /src/frontend/ ./
+RUN pnpm install --frozen-lockfile && pnpm build
+
+FROM rust:1.96-slim-trixie AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates pkg-config libssl-dev mold clang protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /stage/var/lib/tranquil-pds/blobs /stage/var/lib/tranquil-pds/store
+ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"
+WORKDIR /app
+COPY --from=src /src/ ./
+RUN --mount=type=cache,id=tq-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=tq-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=tq-target,target=/app/target,sharing=locked \
+    SQLX_OFFLINE=true cargo build --release -p tranquil-server --features native-tls-roots \
+    && cp target/release/tranquil-server /tmp/tranquil-pds
+
+# No upx step: the published image compresses the binary, which is what makes
+# `strings` on it useless. Skipping it costs disk and buys debuggability.
+FROM ${DISTROLESS_IMAGE}
+COPY --from=builder /tmp/tranquil-pds /usr/local/bin/tranquil-pds
+COPY --from=builder --chown=65532:65532 /stage/var/lib/tranquil-pds /var/lib/tranquil-pds
+COPY --from=frontend --chown=65532:65532 /app/dist /var/lib/tranquil-pds/frontend
+WORKDIR /var/lib/tranquil-pds
+ENV SERVER_HOST=[::]
+ENV SERVER_PORT=3000
+EXPOSE 3000
+ENTRYPOINT ["/usr/local/bin/tranquil-pds"]
