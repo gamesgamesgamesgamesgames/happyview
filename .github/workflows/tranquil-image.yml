@@ -1,0 +1,259 @@
+name: Build Tranquil PDS image
+
+# The e2e stack needs a tranquil-pds build with the `native-tls-roots`
+# feature, which no published image ships (see the header of
+# scripts/Dockerfile.tranquil-pds for the full why). That build compiles
+# ~657 crates plus a pnpm frontend; doing it on every CI run — a cold
+# runner, no layer cache — is what pushed the e2e job's timeout from 10 to
+# 30 minutes. This workflow does that build nightly instead and publishes
+# the result to ghcr.io/gamesgamesgamesgamesgames/tranquil-dev; CI just
+# pulls it (docker-compose.e2e.yml's pds service).
+#
+# Auto-adopt, deliberately: this always resolves and, if it's new, builds
+# whatever the newest semver tag upstream has — not a pin bumped by hand.
+# That means an upstream release can turn CI red overnight; the accepted
+# mitigation is attributability, not re-pinning. ci.yml's e2e job logs the
+# resolved image tag and digest right before the suite runs, so a red run
+# there reads as "upstream bumped" rather than a local regression.
+#
+# ghcr packages are private on first publish regardless of the parent
+# repo's visibility (documented GitHub behavior, not something that can be
+# assumed away). Two independent things follow from that, not one:
+#   - ci.yml's playwright job authenticates to ghcr before pulling, so CI
+#     works whatever the package's visibility turns out to be.
+#   - Someone still has to flip the package to public after its first
+#     `workflow_dispatch` run, or every unauthenticated local
+#     `docker compose up` (nobody's laptop logs in to ghcr) breaks. See the
+#     sequencing list in task-19-report.md.
+on:
+  schedule:
+    # 05:17 UTC — nightly, off the top of the hour to dodge the thundering
+    # herd of scheduled Actions runs.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+# A manual workflow_dispatch landing alongside the nightly cron (or two
+# manual dispatches back to back) would otherwise let two full runs race
+# through `resolve`/`build`/`merge` at once — exactly the kind of overlap
+# the manifest race below is trying to get away from at the job level, not
+# just within one run.
+concurrency:
+  group: tranquil-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/gamesgamesgamesgamesgames/tranquil-dev
+  UPSTREAM: https://tangled.org/tranquil.farm/tranquil-pds
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the newest upstream tag + the commit it currently points at, in one
+  # `ls-remote` call, then check whether ghcr already has it built.
+  # ---------------------------------------------------------------------------
+  resolve:
+    runs-on: depot-ubuntu-24.04
+    permissions:
+      packages: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      skip: ${{ steps.exists.outputs.skip }}
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve highest semver tag from upstream
+        id: resolve
+        run: |
+          set -euo pipefail
+          # `ls-remote --tags --refs` prints "<sha><TAB>refs/tags/<tag>" lines
+          # in whatever order the server feels like, NOT version order — it is
+          # not safe to assume the last line, or a plain `sort`, gives the
+          # newest release. `--refs` already drops annotated-tag `^{}`
+          # dereferences, so what's left is one line per tag. The sed filters
+          # to plain vX.Y.Z tags and flips each surviving line to
+          # "<tag><TAB><sha>"; sorting that on the tag column with `-V`
+          # (version sort: compares digit runs numerically) is what makes
+          # "v0.6.10" correctly land after "v0.6.9" instead of before it under
+          # a plain lexicographic sort. The tab is built with `printf` and
+          # spliced in rather than written as `\t` in the sed script, since
+          # `\t` in a pattern/replacement is a GNU sed extension BSD sed
+          # doesn't share — this way it works on either.
+          tab=$(printf '\t')
+          best_line=$(
+            git ls-remote --tags --refs "$UPSTREAM" \
+              | sed -n "s#^\(.*\)${tab}refs/tags/\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\$#\2${tab}\1#p" \
+              | sort -k1,1 -V \
+              | tail -1
+          )
+          if [ -z "$best_line" ]; then
+            echo "ERROR: no vX.Y.Z tags found at $UPSTREAM" >&2
+            exit 1
+          fi
+          tag=$(printf '%s' "$best_line" | cut -f1)
+          sha=$(printf '%s' "$best_line" | cut -f2)
+          echo "Resolved $UPSTREAM $tag -> $sha"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # Idempotence: a nightly that rebuilds an unchanged tag every night is
+      # runner minutes for nothing, so a non-zero exit from `docker manifest
+      # inspect` skips the build — but only when that exit means the tag
+      # genuinely isn't there yet. A network blip, a rate limit, or an auth
+      # hiccup against ghcr also exits non-zero, and treating those the same
+      # as "not present" would rebuild-and-repush on every such hiccup
+      # (harmless here, since the SHA pin makes any rebuild bit-identical,
+      # but still wasted compute) — or, combined with the manifest race the
+      # `merge` job below exists to close, mask a real outage as routine
+      # nightly churn. So: a recognizably-missing manifest builds; anything
+      # else fails the job loudly instead of silently proceeding as if the
+      # tag were absent.
+      - name: Check whether ghcr already has this tag
+        id: exists
+        run: |
+          set +e
+          inspect_output=$(docker manifest inspect "${IMAGE}:${{ steps.resolve.outputs.tag }}" 2>&1)
+          inspect_status=$?
+          set -e
+          if [ "$inspect_status" -eq 0 ]; then
+            echo "${IMAGE}:${{ steps.resolve.outputs.tag }} already exists, skipping build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$inspect_output" | grep -qiE 'manifest unknown|no such manifest|not found|404'; then
+            echo "${IMAGE}:${{ steps.resolve.outputs.tag }} not found in ghcr, will build."
+            printf '%s\n' "$inspect_output"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: could not determine whether ${IMAGE}:${{ steps.resolve.outputs.tag }} exists in ghcr." >&2
+            echo "docker manifest inspect failed in a way that doesn't look like a missing tag" >&2
+            echo "(network blip, rate limit, or auth problem?) — refusing to guess. Output:" >&2
+            printf '%s\n' "$inspect_output" >&2
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Build + push, per-arch by digest only. Each leg uploads its digest as an
+  # artifact rather than creating the tag itself — see `merge` below for why.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.skip == 'false'
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: depot-ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runs-on: depot-ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./scripts
+          file: ./scripts/Dockerfile.tranquil-pds
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            TRANQUIL_REF=${{ needs.resolve.outputs.tag }}
+            TRANQUIL_SHA=${{ needs.resolve.outputs.sha }}
+          cache-from: type=gha,scope=tranquil-${{ matrix.platform }}
+          cache-to: type=gha,scope=tranquil-${{ matrix.platform }},mode=max,ignore-error=true
+          outputs: type=image,"name=${{ env.IMAGE }}",push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Combine both per-arch digests into one multi-platform manifest, in a job
+  # that runs once after the whole matrix completes.
+  #
+  # This replaces having each matrix leg run its own
+  # `imagetools create --append ... || imagetools create ...`. Two legs
+  # finishing around the same time could both observe "tag doesn't exist
+  # yet", both take the non-append branch, and whichever finished last would
+  # silently push a single-platform manifest — the other platform's digest
+  # built and pushed but never referenced by the tag. Combined with the
+  # idempotence check above, that failure is permanent: `docker manifest
+  # inspect` would then report the tag as present, and no future nightly
+  # would ever retry it. A single job doing one `imagetools create` over
+  # both digests, after both legs have already succeeded, has no such race
+  # because there is nothing left to race against — it runs once.
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [resolve, build]
+    if: needs.resolve.outputs.skip == 'false'
+    runs-on: depot-ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          digest_refs=""
+          for f in *; do
+            digest_refs="$digest_refs ${IMAGE}@sha256:$f"
+          done
+          # shellcheck disable=SC2086 # digest_refs is intentionally word-split
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ needs.resolve.outputs.tag }}" \
+            -t "${IMAGE}:latest" \
+            $digest_refs
+
+      - name: Inspect pushed manifest
+        run: docker buildx imagetools inspect "${IMAGE}:${{ needs.resolve.outputs.tag }}"
