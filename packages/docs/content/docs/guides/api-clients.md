@@ -468,6 +468,8 @@ Content-Type: application/json
 
 `issuer` is the `issuer` field from the PDS authorization server's metadata (step 3 above). Call this endpoint once before submitting the PAR request, attaching `client_assertion` and `client_assertion_type` as form parameters alongside your other PAR fields, and again before the token exchange request, attaching them there too. Public clients skip this entirely — PKCE is their proof of possession.
 
+Using the [`@happyview/oauth-client`](../sdk/oauth-client.md) SDK? `client.getClientAssertion(issuer)` wraps this exact endpoint — see [OAuth Client — Client assertions](../sdk/oauth-client.md#client-assertions).
+
 There is no flag anywhere marking your client confidential — the PDS decides by reading your `client_id_url` document, and `/oauth/client-assertion` will sign for you regardless of whether that document is actually correct yet. If it isn't, the PDS ends up treating your app as public even though you're sending an assertion, which is confusing to debug from the outside. Check the "AT Protocol Client Auth" card in the dashboard (or `POST /admin/api-clients/{id}/auth-key/recheck`) — it reads the same document and reports in plain language exactly what's wrong with it.
 
 #### Phase 3: Register the session

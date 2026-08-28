@@ -4,6 +4,7 @@ import { importJwk } from "./import-jwk";
 import { HappyViewSession } from "./session";
 import { MemoryStorage } from "./storage";
 import type {
+  ClientAssertionResponse,
   GetSessionResponse,
   HappyViewOAuthClientOptions,
   ProvisionKeyResponse,
@@ -62,7 +63,10 @@ export class HappyViewOAuthClient {
     this.clientKey = options.clientKey;
     this.clientSecret = options.clientSecret;
     this.storage = options.storage ?? new MemoryStorage();
-    this._fetch = options.fetch ?? ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, init)) as typeof globalThis.fetch;
+    this._fetch =
+      options.fetch ??
+      (((input: RequestInfo | URL, init?: RequestInit) =>
+        fetch(input, init)) as typeof globalThis.fetch);
     this.sessionHooks = options.sessionHooks ?? {};
   }
 
@@ -115,6 +119,46 @@ export class HappyViewOAuthClient {
       dpopKey,
       rawJwk: data.dpop_key,
       pkceVerifier,
+    };
+  }
+
+  /**
+   * Mint a `private_key_jwt` client assertion for the OAuth flow against a
+   * user's PDS.
+   */
+  async getClientAssertion(
+    issuer: string,
+  ): Promise<{ clientAssertion: string; clientAssertionType: string }> {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-client-key": this.clientKey,
+    };
+    if (this.clientSecret) {
+      headers["x-client-secret"] = this.clientSecret;
+    }
+
+    const resp = await this._fetch(
+      `${this.instanceUrl}/oauth/client-assertion`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ issuer }),
+      },
+    );
+
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new ApiError(
+        `Failed to mint client assertion: ${resp.status} ${(body as any).error ?? (body as any).message ?? resp.statusText}`,
+        resp.status,
+        body,
+      );
+    }
+
+    const data: ClientAssertionResponse = await resp.json();
+    return {
+      clientAssertion: data.client_assertion,
+      clientAssertionType: data.client_assertion_type,
     };
   }
 

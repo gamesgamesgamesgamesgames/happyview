@@ -157,6 +157,75 @@ describe("HappyViewOAuthClient", () => {
     });
   });
 
+  describe("getClientAssertion", () => {
+    test("posts the issuer and returns the assertion", async () => {
+      const { fetchFn, calls } = createMockFetch([
+        {
+          status: 200,
+          body: {
+            client_assertion: "a.b.c",
+            client_assertion_type:
+              "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            expires_in: 60,
+          },
+        },
+      ]);
+
+      const client = createClient({ fetchFn, clientSecret: "hvs_sec" });
+      const result = await client.getClientAssertion(
+        "https://pds.example.com",
+      );
+
+      expect(calls[0].url).toBe(
+        "https://happyview.example.com/oauth/client-assertion",
+      );
+      const headers = new Headers(calls[0].init.headers);
+      expect(headers.get("x-client-key")).toBe("hvc_testkey");
+      expect(headers.get("x-client-secret")).toBe("hvs_sec");
+      expect(JSON.parse(calls[0].init.body as string)).toEqual({
+        issuer: "https://pds.example.com",
+      });
+      expect(result.clientAssertion).toBe("a.b.c");
+      expect(result.clientAssertionType).toBe(
+        "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      );
+    });
+
+    test("omits x-client-secret for a public client", async () => {
+      const { fetchFn, calls } = createMockFetch([
+        {
+          status: 200,
+          body: {
+            client_assertion: "x.y.z",
+            client_assertion_type:
+              "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            expires_in: 60,
+          },
+        },
+      ]);
+
+      const client = createClient({ fetchFn });
+      await client.getClientAssertion("https://pds.example.com");
+
+      const headers = new Headers(calls[0].init.headers);
+      expect(headers.has("x-client-secret")).toBe(false);
+    });
+
+    test("throws ApiError when the client has no key", async () => {
+      const { fetchFn } = createMockFetch([
+        {
+          status: 400,
+          body: { error: "this client has no authentication key" },
+        },
+      ]);
+
+      const client = createClient({ fetchFn });
+      await expect(
+        client.getClientAssertion("https://pds.example.com"),
+      ).rejects.toThrow(/no authentication key/);
+    });
+  });
+
   describe("registerSession", () => {
     test("calls POST /oauth/sessions and returns a HappyViewSession", async () => {
       const testJwk = await generateTestJwk();

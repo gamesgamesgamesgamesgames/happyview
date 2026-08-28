@@ -75,3 +75,9 @@ export interface GetSessionResponse {
   did: string;
   scopes: string[];
 }
+
+export interface ClientAssertionResponse {
+  client_assertion: string;
+  client_assertion_type: string;
+  expires_in: number;
+}

@@ -41,6 +41,25 @@ For public clients, `pkceVerifier` is included and must be passed back when regi
 
 Use the returned `dpopKey` (a private JWK) as your DPoP keypair during your atproto OAuth flow with the user's PDS.
 
+## Client assertions
+
+If your app is a confidential atproto OAuth client — its `client_id_url` document publishes `token_endpoint_auth_method: "private_key_jwt"` and a `jwks_uri` pointing back at HappyView — the PDS requires a signed `private_key_jwt` assertion at two points during the OAuth flow: the pushed authorization request (PAR) and the token exchange. HappyView holds the signing key on your behalf, so ask it to sign each one:
+
+```typescript
+const { clientAssertion, clientAssertionType } =
+  await client.getClientAssertion(pdsIssuer);
+```
+
+`pdsIssuer` is the `issuer` field from the PDS authorization server's metadata. Attach `clientAssertion` and `clientAssertionType` as the `client_assertion` and `client_assertion_type` form parameters on the request.
+
+<Callout type="warn">
+Call this once for the PAR and once more for the token exchange — never reuse a single assertion for both. Each one is valid for only 60 seconds and carries a unique `jti`, so an app that mints one and reuses it fails at whichever call comes second.
+</Callout>
+
+Public clients don't need this — PKCE is their proof of possession, and `pkceVerifier` from `provisionDpopKey` covers it. `getClientAssertion` is unrelated to `isConfidential` on this class, which only describes whether this SDK instance authenticates *to HappyView* with a client secret, not whether your app is a confidential OAuth client to a user's PDS.
+
+See [API Clients — Confidential clients: attaching the client assertion](../../guides/api-clients.md#confidential-clients-attaching-the-client-assertion) for the endpoint this wraps and the full manual flow.
+
 ## Session registration
 
 After completing OAuth authorization with the user's PDS, register the session with HappyView:
