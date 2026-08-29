@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 
 interface RestartContextType {
   reasons: string[];
@@ -17,7 +17,9 @@ const RestartContext = createContext<RestartContextType>({
 export function RestartProvider({ children }: { children: React.ReactNode }) {
   const [reasonMap, setReasonMap] = useState<Record<string, string>>({});
   const reasonMapRef = useRef(reasonMap);
-  reasonMapRef.current = reasonMap;
+  useEffect(() => {
+    reasonMapRef.current = reasonMap;
+  }, [reasonMap]);
 
   const addReason = useCallback((key: string, reason: string) => {
     if (reasonMapRef.current[key] === reason) return;

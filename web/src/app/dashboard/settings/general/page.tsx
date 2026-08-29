@@ -564,8 +564,8 @@ export default function GeneralSettingsPage() {
             <p className="text-muted-foreground text-xs">
               Log every record index, hook execution, and hook skip to the event
               log. Generates high write volume and <em>will</em> cause issues if
-              you're indexing high-traffic collections. Recommended to only use
-              for debugging.
+              you&apos;re indexing high-traffic collections. Recommended to only
+              use for debugging.
             </p>
           </div>
           <Switch

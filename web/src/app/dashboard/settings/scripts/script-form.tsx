@@ -254,7 +254,9 @@ function TriggerComposer({
   const isJob = state.source === JOB_SOURCE;
 
   const stateRef = useRef(state);
-  stateRef.current = state;
+  useEffect(() => {
+    stateRef.current = state;
+  });
 
   useEffect(() => {
     if (actions.length === 0) return;

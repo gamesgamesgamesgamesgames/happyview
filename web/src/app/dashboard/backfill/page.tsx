@@ -184,7 +184,9 @@ function useBackfillSSE(
   onBatch: (events: BackfillEvent[]) => void,
 ) {
   const onBatchRef = useRef(onBatch);
-  onBatchRef.current = onBatch;
+  useEffect(() => {
+    onBatchRef.current = onBatch;
+  }, [onBatch]);
 
   useEffect(() => {
     if (!jobId || !active) return;
@@ -336,9 +338,8 @@ function AnimatedNumber({ value }: { value: number }) {
   const [displayed, setDisplayed] = useState(value);
   const rafRef = useRef<number>(0);
 
-  targetRef.current = value;
-
   useEffect(() => {
+    targetRef.current = value;
     cancelAnimationFrame(rafRef.current);
 
     function tick() {

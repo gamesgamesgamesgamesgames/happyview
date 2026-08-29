@@ -6,20 +6,33 @@ import type { UserSummary } from "@/types/users";
 
 export function useCurrentUser() {
   const { did } = useAuth();
-  const [currentUser, setCurrentUser] = useState<UserSummary | null>(null);
-  const [loading, setLoading] = useState(true);
-
-  const load = useCallback(() => {
-    setLoading(true);
-    getUsers()
-      .then((users) => setCurrentUser(users.find((u) => u.did === did) ?? null))
-      .catch(() => setCurrentUser(null))
-      .finally(() => setLoading(false));
-  }, [did]);
+  const [{ fetchedFor, user }, setResult] = useState<{
+    fetchedFor: string | null | undefined;
+    user: UserSummary | null;
+  }>({ fetchedFor: undefined, user: null });
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    let cancelled = false;
+    getUsers()
+      .then((users) => {
+        if (cancelled) return;
+        setResult({
+          fetchedFor: did,
+          user: users.find((u) => u.did === did) ?? null,
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setResult({ fetchedFor: did, user: null });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [did, refreshKey]);
+
+  const loading = fetchedFor === undefined || fetchedFor !== did;
+  const currentUser = user;
 
   const isSuper = currentUser?.is_super ?? false;
 
@@ -29,5 +42,7 @@ export function useCurrentUser() {
     [currentUser, isSuper],
   );
 
-  return { currentUser, isSuper, hasPermission, loading, reload: load };
+  const reload = useCallback(() => setRefreshKey((k) => k + 1), []);
+
+  return { currentUser, isSuper, hasPermission, loading, reload };
 }

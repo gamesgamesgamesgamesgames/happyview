@@ -159,7 +159,10 @@ function relativeTime(dateStr: string): string {
 export default function JobsPage() {
   const { hasPermission } = useCurrentUser();
   const searchParams = useSearchParams();
-  const [jobs, setJobs] = useState<Job[]>([]);
+  const [{ loadedFilter, jobs }, setJobsState] = useState<{
+    loadedFilter: string | undefined;
+    jobs: Job[];
+  }>({ loadedFilter: undefined, jobs: [] });
   const [statusFilter, setStatusFilter] = useState("all");
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   // Holds a job opened via the `?job=` deep link that may not be present in
@@ -167,23 +170,24 @@ export default function JobsPage() {
   // rather than relying on it showing up in the list.
   const [linkedJob, setLinkedJob] = useState<Job | null>(null);
   const appliedDeepLink = useRef(false);
-  const [loading, setLoading] = useState(true);
+  const loading = loadedFilter !== statusFilter;
 
   const load = useCallback(() => {
     const params = statusFilter !== "all" ? { status: statusFilter } : {};
     getJobs(params)
       .then((resp) => {
-        setJobs(resp.jobs);
-        setLoading(false);
+        setJobsState({ loadedFilter: statusFilter, jobs: resp.jobs });
       })
       .catch((e) => {
         toastError("Failed to load jobs", e);
-        setLoading(false);
+        setJobsState((prev) => ({
+          loadedFilter: statusFilter,
+          jobs: prev.jobs,
+        }));
       });
   }, [statusFilter]);
 
   useEffect(() => {
-    setLoading(true);
     load();
   }, [load]);
 
@@ -456,8 +460,14 @@ function JobDetail({
         )}
 
         <JsonSection title="Input" data={job.input} defaultOpen />
-        <JsonSection title="Progress" data={job.progress} defaultOpen={isActive} />
-        {hasContent(job.result) && <JsonSection title="Result" data={job.result} />}
+        <JsonSection
+          title="Progress"
+          data={job.progress}
+          defaultOpen={isActive}
+        />
+        {hasContent(job.result) && (
+          <JsonSection title="Result" data={job.result} />
+        )}
 
         <JobLogs jobId={job.id} isActive={isActive} />
       </div>
@@ -490,14 +500,10 @@ function JobDetail({
             <Button
               variant="destructive"
               size="sm"
-              disabled={
-                actionLoading !== null || job.status === "cancelling"
-              }
+              disabled={actionLoading !== null || job.status === "cancelling"}
               onClick={handleCancel}
             >
-              {job.status === "cancelling"
-                ? "Cancelling…"
-                : "Cancel Job"}
+              {job.status === "cancelling" ? "Cancelling…" : "Cancel Job"}
             </Button>
           )}
           {job.status === "paused" && (

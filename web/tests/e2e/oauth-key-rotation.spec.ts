@@ -71,15 +71,12 @@ async function completeAttachAccountOAuth(
   await page.locator("button[type='submit']").click();
 
   const authorizeButton = page.getByRole("button", { name: /^authorize$/i });
-  const outcome = await Promise.race([
+  const outcome = await Promise.any([
     page
       .waitForURL(/sslip\.io/, { timeout: 30000 })
       .then(() => "callback" as const),
-    authorizeButton
-      .waitFor({ timeout: 20000 })
-      .then(() => "consent" as const)
-      .catch((e: unknown) => `error: ${e}`),
-  ]);
+    authorizeButton.waitFor({ timeout: 30000 }).then(() => "consent" as const),
+  ]).catch(() => "neither consent nor callback within 30s");
   expect(
     outcome === "consent" || outcome === "callback",
     `expected the PDS consent screen or a redirect back, got ${outcome} at ${page.url()}`,

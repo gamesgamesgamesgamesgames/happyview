@@ -12,7 +12,12 @@ import {
 } from "@/lib/lua-completions";
 import { lexiconJsonSchema, LEXICON_SCHEMA_URI } from "@/lib/lexicon-schema";
 import { resolveCssColor } from "@/lib/css-utils";
-import { parseLuaIdentifiers, parseRecordVariables, parseDbQueryVariables, parseDbQueryRecordIterators } from "@/lib/lua-parser";
+import {
+  parseLuaIdentifiers,
+  parseRecordVariables,
+  parseDbQueryVariables,
+  parseDbQueryRecordIterators,
+} from "@/lib/lua-parser";
 import { HOVER_DOCS } from "@/lib/lua-hover";
 
 const Editor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
@@ -43,9 +48,9 @@ export function MonacoEditor({
   const collectionsRef = useRef(collections);
   const disposablesRef = useRef<{ dispose(): void }[]>([]);
 
-  // Sync refs during render (not in useEffect) so the completion
-  // provider closure always reads the latest values immediately.
+  // eslint-disable-next-line react-hooks/refs Sync refs during render (not in useEffect) so the completion provider closure always reads the latest values immediately.
   completionsRef.current = completions;
+  // eslint-disable-next-line react-hooks/refs -- see comment above
   collectionsRef.current = collections;
 
   useEffect(() => {
@@ -176,10 +181,7 @@ export function MonacoEditor({
             // Provider 3: Hover documentation
             disposablesRef.current.push(
               monaco.languages.registerHoverProvider("lua", {
-                provideHover(
-                  model: editor.ITextModel,
-                  position: Position,
-                ) {
+                provideHover(model: editor.ITextModel, position: Position) {
                   const word = model.getWordAtPosition(position);
                   if (!word) return null;
 
@@ -189,7 +191,10 @@ export function MonacoEditor({
 
                   if (charBefore === "." || charBefore === ":") {
                     // Find the module/object prefix before the dot/colon
-                    const textBefore = lineContent.substring(0, word.startColumn - 2);
+                    const textBefore = lineContent.substring(
+                      0,
+                      word.startColumn - 2,
+                    );
                     const prefixMatch = textBefore.match(/(\w+)$/);
                     if (prefixMatch) {
                       const sep = charBefore === ":" ? ":" : ".";
@@ -227,7 +232,10 @@ export function MonacoEditor({
                   position: Position,
                 ) {
                   const lineContent = model.getLineContent(position.lineNumber);
-                  const textBeforeCursor = lineContent.substring(0, position.column - 1);
+                  const textBeforeCursor = lineContent.substring(
+                    0,
+                    position.column - 1,
+                  );
 
                   // Walk backward to find the opening ( and the function name
                   let depth = 0;
@@ -250,13 +258,20 @@ export function MonacoEditor({
                   if (parenPos < 0) return null;
 
                   // Extract the function name before the (
-                  const textBeforeParen = textBeforeCursor.substring(0, parenPos);
-                  const fnMatch = textBeforeParen.match(/([\w.]+[:.]\w+|\w+)\s*$/);
+                  const textBeforeParen = textBeforeCursor.substring(
+                    0,
+                    parenPos,
+                  );
+                  const fnMatch = textBeforeParen.match(
+                    /([\w.]+[:.]\w+|\w+)\s*$/,
+                  );
                   if (!fnMatch) return null;
 
                   const fnName = fnMatch[1];
                   // Normalize colon to look up both Record:save and Record.save
-                  const entry = HOVER_DOCS.get(fnName) ?? HOVER_DOCS.get(fnName.replace(":", "."));
+                  const entry =
+                    HOVER_DOCS.get(fnName) ??
+                    HOVER_DOCS.get(fnName.replace(":", "."));
                   if (!entry) return null;
 
                   // Parse parameters from the signature: extract content inside parens
@@ -289,7 +304,9 @@ export function MonacoEditor({
                           label: entry.signature,
                           documentation: entry.description,
                           parameters: params.map((p) => ({
-                            label: p.replace(/^\[?\s*/, "").replace(/\s*\]?\s*$/, ""),
+                            label: p
+                              .replace(/^\[?\s*/, "")
+                              .replace(/\s*\]?\s*$/, ""),
                           })),
                         },
                       ],

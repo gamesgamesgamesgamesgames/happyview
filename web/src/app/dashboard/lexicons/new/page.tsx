@@ -40,22 +40,39 @@ export default function AddLexiconPage() {
   // Network state
   const [nsid, setNsid] = useState("");
   const [networkTargetCollection, setNetworkTargetCollection] = useState("");
-  const [networkJson, setNetworkJson] = useState("");
-  const [mainType, setMainType] = useState<string | undefined>();
+  const [resolved, setResolved] = useState<{
+    nsid: string;
+    type: string | undefined;
+    json: string;
+  }>({ nsid: "", type: undefined, json: "" });
   const [resolving, setResolving] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
-  const lastValidType = useRef<string | undefined>(undefined);
+  const mainType = resolved.nsid === nsid ? resolved.type : undefined;
+  const networkJson = resolved.nsid === nsid ? resolved.json : "";
+
+  const [lastValidType, setLastValidType] = useState<string | undefined>(
+    undefined,
+  );
+
   const localMainType = useMemo(() => {
     try {
       const parsed = JSON.parse(json);
-      const type = parsed?.defs?.main?.type as string | undefined;
-      lastValidType.current = type;
-      return type;
+      return parsed?.defs?.main?.type as string | undefined;
     } catch {
-      return lastValidType.current;
+      return lastValidType;
     }
-  }, [json]);
+  }, [json, lastValidType]);
+
+  function handleJsonChange(value: string) {
+    setJson(value);
+    try {
+      const parsed = JSON.parse(value);
+      setLastValidType(parsed?.defs?.main?.type as string | undefined);
+    } catch {
+      // Leave lastValidType as-is; localMainType falls back to it above.
+    }
+  }
 
   const localIdError = useMemo(() => {
     let parsed: unknown;
@@ -83,8 +100,6 @@ export default function AddLexiconPage() {
   // Debounced NSID resolution
   useEffect(() => {
     abortRef.current?.abort();
-    setMainType(undefined);
-    setNetworkJson("");
 
     if (nsid.split(".").length < 3) return;
 
@@ -96,18 +111,18 @@ export default function AddLexiconPage() {
       resolveNetworkLexicon(nsid, controller.signal)
         .then((result) => {
           if (!controller.signal.aborted) {
-            setMainType(result.type ?? undefined);
-            setNetworkJson(
-              result.lexicon_json
+            setResolved({
+              nsid,
+              type: result.type ?? undefined,
+              json: result.lexicon_json
                 ? JSON.stringify(result.lexicon_json, null, 2)
                 : "",
-            );
+            });
           }
         })
         .catch(() => {
           if (!controller.signal.aborted) {
-            setMainType(undefined);
-            setNetworkJson("");
+            setResolved({ nsid, type: undefined, json: "" });
           }
         })
         .finally(() => {
@@ -199,7 +214,7 @@ export default function AddLexiconPage() {
               <CodePanels
                 className="flex-1 min-h-0"
                 jsonValue={json}
-                onJsonChange={setJson}
+                onJsonChange={handleJsonChange}
               />
             </div>
 
