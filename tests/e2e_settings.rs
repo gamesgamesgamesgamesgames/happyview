@@ -55,6 +55,55 @@ fn admin_delete(
         .unwrap()
 }
 
+fn admin_post(
+    uri: &str,
+    cookie: (axum::http::HeaderName, axum::http::HeaderValue),
+    body: &Value,
+) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(cookie.0, cookie.1)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap()
+}
+
+fn get_with_host(uri: &str, host: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("host", host)
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn seed_domain(app: &TestApp, id: &str, url: &str, is_primary: bool) {
+    let now = happyview::db::now_rfc3339();
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_domains (id, url, is_primary, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(id)
+        .bind(url)
+        .bind(if is_primary { 1i32 } else { 0i32 })
+        .bind(&now)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    app.state
+        .domain_cache
+        .insert(happyview::domain::Domain {
+            id: id.into(),
+            url: url.into(),
+            is_primary,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await;
+}
+
 // ---------------------------------------------------------------------------
 // Settings tests
 // ---------------------------------------------------------------------------
@@ -365,5 +414,382 @@ async fn client_metadata_client_uri_overridden_by_setting() {
         json["client_uri"], "https://example.test",
         "expected client_uri override, got {:?}",
         json["client_uri"]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn client_metadata_jwks_includes_current_and_retiring_instance_keys() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+
+    let seed_key = happyview::oauth::client_keys::generate_client_key("test-owner")
+        .expect("generate client key");
+    let seed_jwk =
+        happyview::oauth::client_keys::to_atrium_jwk(&seed_key).expect("convert to atrium jwk");
+    app.state.client_jwks = vec![seed_jwk];
+    app.rebuild_router();
+
+    seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+
+    let domain_url = "https://confidential.task21-fix1-test.invalid";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains",
+            app.admin_cookie(),
+            &json!({ "url": domain_url }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "expected 201 creating confidential domain, got {}",
+        resp.status()
+    );
+
+    let current = happyview::oauth::client_keys::generate_client_key(
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .expect("generate current instance key");
+    happyview::oauth::client_keys::insert_key(
+        &app.state.db,
+        app.state.db_backend,
+        app.state.config.token_encryption_key.as_ref(),
+        &current,
+    )
+    .await
+    .expect("insert current instance key");
+
+    let mut retiring = happyview::oauth::client_keys::generate_client_key(
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .expect("generate retiring instance key");
+    retiring.status = happyview::oauth::client_keys::KeyStatus::Retiring;
+    happyview::oauth::client_keys::insert_key(
+        &app.state.db,
+        app.state.db_backend,
+        app.state.config.token_encryption_key.as_ref(),
+        &retiring,
+    )
+    .await
+    .expect("insert retiring instance key");
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(get_with_host(
+            "/oauth-client-metadata.json",
+            "confidential.task21-fix1-test.invalid",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+
+    let kids: Vec<String> = json["jwks"]["keys"]
+        .as_array()
+        .expect("expected jwks.keys to be an array")
+        .iter()
+        .map(|k| {
+            k["kid"]
+                .as_str()
+                .expect("published key missing kid")
+                .to_string()
+        })
+        .collect();
+
+    assert!(
+        kids.contains(&current.kid),
+        "expected jwks.keys to contain the current instance kid {}, got {:?}",
+        current.kid,
+        kids
+    );
+    assert!(
+        kids.contains(&retiring.kid),
+        "expected jwks.keys to contain the retiring instance kid {}, got {:?}",
+        retiring.kid,
+        kids
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Instance key revoke (Task 22a)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn revoking_a_retiring_instance_key_removes_it_from_published_jwks() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+
+    let seed_key = happyview::oauth::client_keys::generate_client_key("test-owner")
+        .expect("generate client key");
+    let seed_jwk =
+        happyview::oauth::client_keys::to_atrium_jwk(&seed_key).expect("convert to atrium jwk");
+    app.state.client_jwks = vec![seed_jwk];
+    app.rebuild_router();
+
+    seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+
+    let domain_url = "https://confidential.task22a-revoke-test.invalid";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains",
+            app.admin_cookie(),
+            &json!({ "url": domain_url }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "expected 201 creating confidential domain, got {}",
+        resp.status()
+    );
+
+    let current = happyview::oauth::client_keys::generate_client_key(
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .expect("generate current instance key");
+    happyview::oauth::client_keys::insert_key(
+        &app.state.db,
+        app.state.db_backend,
+        app.state.config.token_encryption_key.as_ref(),
+        &current,
+    )
+    .await
+    .expect("insert current instance key");
+
+    let mut retiring = happyview::oauth::client_keys::generate_client_key(
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .expect("generate retiring instance key");
+    retiring.status = happyview::oauth::client_keys::KeyStatus::Retiring;
+    happyview::oauth::client_keys::insert_key(
+        &app.state.db,
+        app.state.db_backend,
+        app.state.config.token_encryption_key.as_ref(),
+        &retiring,
+    )
+    .await
+    .expect("insert retiring instance key");
+
+    // Revoke the retiring key through the real admin route.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/oauth/instance-key/{}", retiring.kid),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "expected 200 revoking a retiring key, got {}",
+        resp.status()
+    );
+    let body = json_body(resp).await;
+    assert_eq!(body["kid"], retiring.kid);
+    assert_eq!(
+        body["sessions_destroyed"], 0,
+        "no sessions were pinned to the retiring key in this test"
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(get_with_host(
+            "/oauth-client-metadata.json",
+            "confidential.task22a-revoke-test.invalid",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let kids: Vec<String> = json["jwks"]["keys"]
+        .as_array()
+        .expect("expected jwks.keys to be an array")
+        .iter()
+        .map(|k| {
+            k["kid"]
+                .as_str()
+                .expect("published key missing kid")
+                .to_string()
+        })
+        .collect();
+    assert!(
+        !kids.contains(&retiring.kid),
+        "revoked key must disappear from the published JWKS, got {:?}",
+        kids
+    );
+    assert!(
+        kids.contains(&current.kid),
+        "the current key must still be published, got {:?}",
+        kids
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/oauth/instance-key", app.admin_cookie()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list = json_body(resp).await;
+    let keys = list["keys"].as_array().expect("expected keys array");
+    let revoked_entry = keys
+        .iter()
+        .find(|k| k["kid"] == retiring.kid)
+        .expect("revoked key must still appear in the listing");
+    assert_eq!(revoked_entry["status"], "revoked");
+}
+
+#[tokio::test]
+#[serial]
+async fn revoking_the_current_instance_key_is_refused_with_400() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let current = happyview::oauth::client_keys::ensure_instance_key(
+        &app.state.db,
+        app.state.db_backend,
+        app.state.config.token_encryption_key.as_ref(),
+    )
+    .await
+    .expect("ensure instance key");
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/oauth/instance-key/{}", current.kid),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "expected 400 refusing to revoke the current key, got {}",
+        resp.status()
+    );
+
+    let keys = happyview::oauth::client_keys::list_keys_for_owner(
+        &app.state.db,
+        app.state.db_backend,
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .await
+    .expect("list instance keys");
+    let row = keys
+        .iter()
+        .find(|k| k.kid == current.kid)
+        .expect("current key must still exist");
+    assert_eq!(
+        row.status,
+        happyview::oauth::client_keys::KeyStatus::Current,
+        "a refused revoke must leave the key's status untouched"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn revoking_an_unknown_instance_key_404s() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            "/admin/oauth/instance-key/not-a-real-kid",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "expected 404 for an unknown kid, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn instance_key_list_reports_per_kid_session_counts_including_zero() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let current = happyview::oauth::client_keys::ensure_instance_key(
+        &app.state.db,
+        app.state.db_backend,
+        app.state.config.token_encryption_key.as_ref(),
+    )
+    .await
+    .expect("ensure instance key");
+
+    let mut retiring = happyview::oauth::client_keys::generate_client_key(
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .expect("generate retiring instance key");
+    retiring.status = happyview::oauth::client_keys::KeyStatus::Retiring;
+    happyview::oauth::client_keys::insert_key(
+        &app.state.db,
+        app.state.db_backend,
+        app.state.config.token_encryption_key.as_ref(),
+        &retiring,
+    )
+    .await
+    .expect("insert retiring instance key");
+
+    // Two sessions pinned to `current`; none pinned to `retiring`.
+    common::insert_oauth_session(
+        &app.state.db,
+        app.state.db_backend,
+        "did:plc:ik-one",
+        Some(&current.kid),
+    )
+    .await;
+    common::insert_oauth_session(
+        &app.state.db,
+        app.state.db_backend,
+        "did:plc:ik-two",
+        Some(&current.kid),
+    )
+    .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/oauth/instance-key", app.admin_cookie()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list = json_body(resp).await;
+    let keys = list["keys"].as_array().expect("expected keys array");
+
+    let current_entry = keys
+        .iter()
+        .find(|k| k["kid"] == current.kid)
+        .expect("current key must appear in the listing");
+    assert_eq!(current_entry["status"], "current");
+    assert_eq!(current_entry["session_count"], 2);
+
+    let retiring_entry = keys
+        .iter()
+        .find(|k| k["kid"] == retiring.kid)
+        .expect("retiring key must appear in the listing");
+    assert_eq!(retiring_entry["status"], "retiring");
+    assert_eq!(
+        retiring_entry["session_count"], 0,
+        "a kid with no sessions must report zero, not be omitted"
     );
 }

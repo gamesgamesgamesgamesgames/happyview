@@ -230,7 +230,7 @@ async fn callback(
     };
 
     // Use the same OAuth client that was used for authorize
-    let oauth_client = state.oauth.get_or_default(client_id.as_deref());
+    let (oauth_client, exchange_kid) = state.oauth.get_or_default_with_kid(client_id.as_deref());
 
     let params = atrium_oauth::CallbackParams {
         code: query.code,
@@ -248,6 +248,23 @@ async fn callback(
         .did()
         .await
         .ok_or_else(|| AppError::Internal("no DID in OAuth session".into()))?;
+
+    if let Err(e) = crate::auth::oauth_store::repin_signing_kid(
+        &state.db,
+        state.db_backend,
+        "happyview_oauth_sessions",
+        "did",
+        did.as_ref(),
+        exchange_kid.as_deref(),
+    )
+    .await
+    {
+        tracing::error!(
+            did = %did.as_ref(),
+            error = %e,
+            "failed to re-pin OAuth session signing_kid after re-authorization"
+        );
+    }
 
     // Check if the user is authorized to access the dashboard.
     // Allow login when no users exist yet (first user will be bootstrapped as admin).
@@ -379,7 +396,7 @@ async fn linked_repo_callback(
         None => return Ok(finish("gone", None)),
     };
 
-    let client = flow::client_for_grant(state, &grant)?;
+    let (client, exchange_kid) = flow::client_and_kid_for_grant(state, &grant).await?;
 
     let params = atrium_oauth::CallbackParams {
         code: query.code,
@@ -402,6 +419,23 @@ async fn linked_repo_callback(
         .ok_or_else(|| AppError::Internal("linked repo session has no DID".into()))?
         .as_ref()
         .to_string();
+
+    if let Err(e) = crate::auth::oauth_store::repin_signing_kid(
+        &state.db,
+        state.db_backend,
+        crate::linked_repos::client::LINKED_SESSIONS_TABLE,
+        "did",
+        &did,
+        exchange_kid.as_deref(),
+    )
+    .await
+    {
+        tracing::error!(
+            %did,
+            error = %e,
+            "failed to re-pin linked-repo session signing_kid after re-authorization"
+        );
+    }
 
     if let Err(e) = flow::complete(state, grant_id, &did).await {
         if let Err(cleanup) = flow::discard_session(state, &did).await {

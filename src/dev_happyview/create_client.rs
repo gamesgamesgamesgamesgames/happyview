@@ -162,6 +162,7 @@ pub async fn create_api_client(
         session_store_pool: state.db.clone(),
         db_backend: state.db_backend,
         client_keys: None,
+        signing_kid: None,
     };
     if let Err(e) = state.oauth.register_api_client(
         &input.client_id_url,

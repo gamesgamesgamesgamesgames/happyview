@@ -88,6 +88,32 @@ Two rules worth knowing before you write one:
 - `putRecord` is an upsert, so it needs **both** `create` and `update` unless the caller supplies `swap_cid`. Passing `swap_cid` is a real no-create guarantee, which narrows the requirement to `update` alone.
 - Repo reads need no scope at all. There is no read permission in the grammar because repo records are public.
 
+## Back up the OAuth client-authentication key
+
+Confidential OAuth clients (the primary instance identity, each registered
+domain, and any API client with `private_key_jwt` authentication configured)
+sign every login and every token refresh with an ES256 key HappyView holds
+in `happyview_oauth_client_keys`. Every session is pinned, at the moment it
+is established, to the exact `kid` that signed it — a refresh is only ever
+attempted with that same key, never with whatever key happens to be current
+later.
+
+Before this pinning existed, losing that key was cheap: generate a new one
+and carry on, since nothing depended on which key had signed a session in
+the past. That is no longer true. **Losing the row for a key that sessions
+are pinned to destroys every one of those sessions permanently** — there is
+no key to sign their next refresh with, and the authorization server has no
+way to accept one signed by a substitute. This applies to a `retiring` key
+just as much as to `current`: rotating a key deliberately keeps the old one
+around specifically so its existing sessions keep working, and that only
+holds if the row survives.
+
+`happyview_oauth_client_keys` therefore needs no special backup procedure of
+its own — it needs the same database backup you already take, taken
+seriously. There is nothing further to configure: it lives in the same
+database as every other table this guide assumes you are backing up, and
+restoring that backup restores it along with everything else.
+
 ## Understand what `atproto-proxy` forwarding means
 
 When a request carries an `atproto-proxy` header, it is asking to be relayed onwards to a named service. HappyView forwards that header to the user's PDS rather than resolving it — the token that accompanies a relayed request is signed by the *user's own identity key*, which only their PDS holds.
@@ -104,6 +130,7 @@ There is no destination allowlist in HappyView for this, and that is deliberate 
 - [ ] XRPC proxy set explicitly — allowlist if you can enumerate your NSIDs, disabled if you serve only your own
 - [ ] Linked-repo grants scoped before the invite goes out, not after
 - [ ] Third-party API clients reviewed: each one can ask the PDS to sign for an audience of its choosing
+- [ ] Database backups cover `happyview_oauth_client_keys` — losing a row there permanently destroys every session pinned to it
 
 ## Related
 

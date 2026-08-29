@@ -5,5 +5,6 @@ pub mod client_probe;
 pub mod dpop_proof;
 pub mod keys;
 pub mod pds_write;
+pub mod rotation;
 pub mod routes;
 pub mod sessions;

@@ -45,12 +45,87 @@ pub async fn resolve_identifier(
     crate::identity::resolve_identifier(input).await
 }
 
-pub fn client_for_grant(
+pub async fn client_for_grant(
     state: &AppState,
     grant: &LinkedRepo,
 ) -> Result<Arc<HappyViewOAuthClient>, AppError> {
+    resolve_grant_client(state, grant, true)
+        .await
+        .map(|(client, _)| client)
+}
+
+pub async fn client_and_kid_for_grant(
+    state: &AppState,
+    grant: &LinkedRepo,
+) -> Result<(Arc<HappyViewOAuthClient>, Option<String>), AppError> {
+    resolve_grant_client(state, grant, true).await
+}
+
+/// The client to use when starting a *new* authorization.
+pub async fn client_for_new_authorization(
+    state: &AppState,
+    grant: &LinkedRepo,
+) -> Result<Arc<HappyViewOAuthClient>, AppError> {
+    resolve_grant_client(state, grant, false)
+        .await
+        .map(|(client, _)| client)
+}
+
+async fn resolve_grant_client(
+    state: &AppState,
+    grant: &LinkedRepo,
+    use_pinned_session_key: bool,
+) -> Result<(Arc<HappyViewOAuthClient>, Option<String>), AppError> {
     if !is_loopback_url(&state.config.public_url) {
-        return Ok(Arc::clone(&state.linked_repos_client));
+        let (default_client, default_kid) =
+            state.oauth.linked_repos_primary().unwrap_or_else(|| {
+                (
+                    Arc::clone(&state.linked_repos_client),
+                    state.linked_repos_client_kid.clone(),
+                )
+            });
+
+        if let Some(did) = &grant.did
+            && use_pinned_session_key
+        {
+            let signing_kid = crate::auth::oauth_store::lookup_signing_kid(
+                &state.db,
+                state.db_backend,
+                super::client::LINKED_SESSIONS_TABLE,
+                did,
+            )
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "failed to look up linked-repo session signing key: {e}"
+                ))
+            })?;
+
+            if let Some(kid) = signing_kid {
+                let client = state.oauth.get_linked_repos_for_kid(&kid).ok_or_else(|| {
+                    AppError::Auth(
+                        "the key this session was established with is no longer available; the linked repo must be reauthorized"
+                            .into(),
+                    )
+                })?;
+                return Ok((client, Some(kid)));
+            }
+
+            if let Some(kid) = &default_kid
+                && let Err(e) = crate::auth::oauth_store::stamp_signing_kid_if_unset(
+                    &state.db,
+                    state.db_backend,
+                    super::client::LINKED_SESSIONS_TABLE,
+                    "did",
+                    did,
+                    kid,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "failed to lazily stamp linked-repo signing_kid");
+            }
+        }
+        return Ok((default_client, default_kid));
     }
 
     let scopes: Vec<Scope> = crate::auth::parse_scope_string(&grant.scopes);
@@ -69,7 +144,7 @@ pub fn client_for_grant(
         state.db_backend,
         None,
     )
-    .map(Arc::new)
+    .map(|client| (Arc::new(client), None))
     .map_err(AppError::Internal)
 }
 
@@ -102,7 +177,7 @@ pub async fn start_authorization(
     origin: AuthOrigin,
 ) -> Result<String, AppError> {
     let scopes = crate::auth::parse_scope_string(&grant.scopes);
-    let client = client_for_grant(state, grant)?;
+    let client = client_for_new_authorization(state, grant).await?;
 
     let guard = state.oauth_state_store.authorize_lock.lock().await;
 

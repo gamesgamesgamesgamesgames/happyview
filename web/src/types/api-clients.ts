@@ -37,3 +37,24 @@ export interface ApiClientAuthProbe {
   reason: string;
   checked_at: string;
 }
+
+export interface KeyRotationResult {
+  kid: string;
+  orphaned_sessions: number;
+}
+
+export interface InstanceOauthKey {
+  kid: string;
+  status: "current" | "retiring" | "revoked";
+  created_at: string;
+  session_count: number;
+}
+
+export interface InstanceOauthKeysResponse {
+  keys: InstanceOauthKey[];
+}
+
+export interface RevokeInstanceKeyResult {
+  kid: string;
+  sessions_destroyed: number;
+}

@@ -43,7 +43,16 @@ pub fn build(
         protected_resource_metadata: Default::default(),
     };
 
-    let session_store = DbSessionStore::new_with_table(pool, backend, LINKED_SESSIONS_TABLE);
+    let signing_kid = if is_loopback {
+        None
+    } else {
+        client_keys
+            .as_ref()
+            .and_then(|keys| keys.first())
+            .and_then(|jwk| jwk.prm.kid.clone())
+    };
+    let session_store = DbSessionStore::new_with_table(pool, backend, LINKED_SESSIONS_TABLE)
+        .with_signing_kid(signing_kid);
 
     let client = if is_loopback {
         atrium_oauth::OAuthClient::new(OAuthClientConfig {

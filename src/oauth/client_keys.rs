@@ -252,6 +252,230 @@ pub async fn revoke_keys_for_owner(
     Ok(())
 }
 
+/// Revoke exactly one key belonging to `owner`.
+pub async fn revoke_key(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    owner: &str,
+    kid: &str,
+) -> Result<bool, AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_oauth_client_keys SET status = 'revoked', retired_at = ? WHERE owner = ? AND kid = ? AND status != 'revoked'",
+        backend,
+    );
+    let result = crate::db::query(&sql)
+        .bind(now_rfc3339())
+        .bind(owner)
+        .bind(kid)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to revoke client key: {e}")))?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// One key's metadata for the admin listing, with no private material.
+pub struct ClientKeySummary {
+    pub kid: String,
+    pub status: KeyStatus,
+    pub created_at: String,
+}
+
+/// List every key an owner holds — `current` first, then `retiring`, then
+/// `revoked` — for the admin listing.
+pub async fn list_keys_for_owner(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    owner: &str,
+) -> Result<Vec<ClientKeySummary>, AppError> {
+    let sql = adapt_sql(
+        "SELECT kid, status, created_at FROM happyview_oauth_client_keys WHERE owner = ? \
+         ORDER BY CASE status WHEN 'current' THEN 0 WHEN 'retiring' THEN 1 ELSE 2 END, created_at",
+        backend,
+    );
+    let rows: Vec<(String, String, String)> = crate::db::query_as(&sql)
+        .bind(owner)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list client keys: {e}")))?;
+
+    rows.into_iter()
+        .map(|(kid, status, created_at)| {
+            Ok(ClientKeySummary {
+                kid,
+                status: KeyStatus::parse(&status).ok_or_else(|| {
+                    AppError::Internal(format!("unknown client key status: {status}"))
+                })?,
+                created_at,
+            })
+        })
+        .collect()
+}
+
+/// Count live sessions pinned to each `kid`, across all three tables that
+/// carry `signing_kid` — `happyview_oauth_sessions`,
+/// `happyview_linked_repo_sessions`, `happyview_dpop_sessions` (see
+/// `migrations/.../20260818000002_add_signing_kid.sql`).
+pub async fn session_counts_by_kid(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Result<std::collections::HashMap<String, u64>, AppError> {
+    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+    for table in [
+        "happyview_oauth_sessions",
+        "happyview_linked_repo_sessions",
+        "happyview_dpop_sessions",
+    ] {
+        let sql = adapt_sql(
+            &format!(
+                "SELECT signing_kid, COUNT(*) FROM {table} WHERE signing_kid IS NOT NULL GROUP BY signing_kid"
+            ),
+            backend,
+        );
+        let rows: Vec<(String, i64)> = crate::db::query_as(&sql)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to count sessions in {table}: {e}")))?;
+        for (kid, n) in rows {
+            *counts.entry(kid).or_insert(0) += n.max(0) as u64;
+        }
+    }
+
+    Ok(counts)
+}
+
+/// Pick the key a session must be signed with.
+pub fn find_by_kid<'a>(keys: &'a [ClientKey], kid: Option<&str>) -> Option<&'a ClientKey> {
+    match kid {
+        Some(kid) => keys.iter().find(|k| k.kid == kid),
+        None => keys.iter().find(|k| k.status == KeyStatus::Current),
+    }
+}
+
+/// Turn `find_by_kid`'s result into the decision a refresh call site must
+/// act on: sign with a key, sign with nothing (a public refresh), or refuse
+/// outright.
+pub fn resolve_signing_key<'a>(
+    keys: &'a [ClientKey],
+    signing_kid: Option<&str>,
+) -> Result<Option<&'a ClientKey>, AppError> {
+    match find_by_kid(keys, signing_kid) {
+        Some(key) => Ok(Some(key)),
+        None if signing_kid.is_some() => Err(AppError::Auth(
+            "the key this session was established with is no longer available; the user must re-authenticate".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Generate a new current key, demoting the existing one to `retiring`.
+pub async fn rotate_key(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    enc: Option<&[u8; 32]>,
+    owner: &str,
+) -> Result<ClientKey, AppError> {
+    let key = generate_client_key(owner)?;
+    let (blob, encrypted) = seal_private_jwk(enc, &key.private_jwk)?;
+    let public = serde_json::to_string(&key.public_jwk)
+        .map_err(|e| AppError::Internal(format!("failed to serialise public JWK: {e}")))?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
+    let demote = adapt_sql(
+        "UPDATE happyview_oauth_client_keys SET status = 'retiring', retired_at = ? WHERE owner = ? AND status = 'current'",
+        backend,
+    );
+    crate::db::query(&demote)
+        .bind(now_rfc3339())
+        .bind(owner)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to demote current key: {e}")))?;
+
+    let insert = adapt_sql(
+        "INSERT INTO happyview_oauth_client_keys (kid, owner, alg, private_jwk, public_jwk, encrypted, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        backend,
+    );
+    crate::db::query(&insert)
+        .bind(&key.kid)
+        .bind(&key.owner)
+        .bind(&key.alg)
+        .bind(&blob)
+        .bind(&public)
+        .bind(i32::from(encrypted))
+        .bind(key.status.as_str())
+        .bind(now_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to store client key: {e}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit key rotation: {e}")))?;
+
+    Ok(key)
+}
+
+/// Revoke `retiring` keys that no session is pinned to.
+pub async fn retire_unused_keys(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Result<u64, AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_oauth_client_keys SET status = 'revoked', retired_at = ? \
+         WHERE status = 'retiring' \
+           AND kid NOT IN (SELECT signing_kid FROM happyview_oauth_sessions WHERE signing_kid IS NOT NULL) \
+           AND kid NOT IN (SELECT signing_kid FROM happyview_linked_repo_sessions WHERE signing_kid IS NOT NULL) \
+           AND kid NOT IN (SELECT signing_kid FROM happyview_dpop_sessions WHERE signing_kid IS NOT NULL)",
+        backend,
+    );
+
+    let result = crate::db::query(&sql)
+        .bind(now_rfc3339())
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to retire client keys: {e}")))?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn count_unstamped_sessions(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    owner: &str,
+) -> Result<u64, AppError> {
+    let count: i64 = if owner == INSTANCE_OWNER {
+        let sql = adapt_sql(
+            "SELECT \
+                (SELECT COUNT(*) FROM happyview_oauth_sessions WHERE signing_kid IS NULL) + \
+                (SELECT COUNT(*) FROM happyview_linked_repo_sessions WHERE signing_kid IS NULL)",
+            backend,
+        );
+        let (n,): (i64,) = crate::db::query_as(&sql)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to count unstamped sessions: {e}")))?;
+        n
+    } else {
+        let sql = adapt_sql(
+            "SELECT COUNT(*) FROM happyview_dpop_sessions WHERE api_client_id = ? AND signing_kid IS NULL",
+            backend,
+        );
+        let (n,): (i64,) = crate::db::query_as(&sql)
+            .bind(owner)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to count unstamped sessions: {e}")))?;
+        n
+    };
+
+    Ok(count.max(0) as u64)
+}
+
 /// Return the instance's current key, generating and storing one on first call.
 pub async fn ensure_instance_key(
     pool: &sqlx::AnyPool,
@@ -362,5 +586,59 @@ mod tests {
             assert_eq!(KeyStatus::parse(s.as_str()), Some(s));
         }
         assert_eq!(KeyStatus::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn find_by_kid_prefers_the_named_key_over_current() {
+        let mut retiring = generate_client_key("client-a").unwrap();
+        retiring.status = KeyStatus::Retiring;
+        let current = generate_client_key("client-a").unwrap();
+        let keys = vec![current.clone(), retiring.clone()];
+
+        let found = find_by_kid(&keys, Some(&retiring.kid)).unwrap();
+        assert_eq!(found.kid, retiring.kid);
+    }
+
+    #[test]
+    fn find_by_kid_falls_back_to_current_when_unpinned() {
+        let mut retiring = generate_client_key("client-a").unwrap();
+        retiring.status = KeyStatus::Retiring;
+        let current = generate_client_key("client-a").unwrap();
+        let keys = vec![current.clone(), retiring.clone()];
+
+        let found = find_by_kid(&keys, None).unwrap();
+        assert_eq!(found.kid, current.kid);
+    }
+
+    #[test]
+    fn find_by_kid_returns_none_for_a_revoked_or_missing_kid() {
+        let current = generate_client_key("client-a").unwrap();
+        assert!(find_by_kid(&[current], Some("gone")).is_none());
+    }
+
+    #[test]
+    fn resolve_signing_key_signs_with_the_pinned_key() {
+        let mut retiring = generate_client_key("client-a").unwrap();
+        retiring.status = KeyStatus::Retiring;
+        let current = generate_client_key("client-a").unwrap();
+        let keys = vec![current, retiring.clone()];
+
+        let resolved = resolve_signing_key(&keys, Some(&retiring.kid)).unwrap();
+        assert_eq!(resolved.unwrap().kid, retiring.kid);
+    }
+
+    #[test]
+    fn resolve_signing_key_stays_public_when_unpinned_and_no_key_exists() {
+        let resolved = resolve_signing_key(&[], None).unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_signing_key_refuses_when_the_pinned_kid_is_gone() {
+        let current = generate_client_key("client-a").unwrap();
+        let keys = vec![current];
+
+        let err = resolve_signing_key(&keys, Some("gone")).unwrap_err();
+        assert!(matches!(err, AppError::Auth(_)));
     }
 }

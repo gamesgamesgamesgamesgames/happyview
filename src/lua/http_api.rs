@@ -196,6 +196,7 @@ mod tests {
                 )
                 .expect("Failed to create test linked-repo OAuth client"),
             ),
+            linked_repos_client_kid: None,
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-for-tests-only-not-production",
             ),

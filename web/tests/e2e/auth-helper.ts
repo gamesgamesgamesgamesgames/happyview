@@ -96,6 +96,82 @@ export async function setServiceIdentityMode(
   }
 }
 
+export async function getOauthSessionSigningKid(
+  did: string,
+): Promise<string | null> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const { rows } = await client.query<{ signing_kid: string | null }>(
+      "SELECT signing_kid FROM happyview_oauth_sessions WHERE did = $1",
+      [did],
+    );
+    return rows[0]?.signing_kid ?? null;
+  } finally {
+    await client.end();
+  }
+}
+
+export async function getOauthSessionTokenState(
+  did: string,
+): Promise<{ accessToken: string; expiresAt: string | null }> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const { rows } = await client.query<{ session_data: string }>(
+      "SELECT session_data FROM happyview_oauth_sessions WHERE did = $1",
+      [did],
+    );
+    if (rows.length === 0) {
+      throw new Error(`no happyview_oauth_sessions row for ${did}`);
+    }
+    const session = JSON.parse(rows[0].session_data);
+    return {
+      accessToken: session.token_set.access_token,
+      expiresAt: session.token_set.expires_at ?? null,
+    };
+  } finally {
+    await client.end();
+  }
+}
+
+export async function waitForRealAccessTokenExpiry(did: string): Promise<void> {
+  const { expiresAt } = await getOauthSessionTokenState(did);
+  if (!expiresAt) {
+    throw new Error(`session for ${did} has no expires_at to wait out`);
+  }
+  const bufferMs = 15_000;
+  const delayMs = new Date(expiresAt).getTime() - Date.now() + bufferMs;
+  if (delayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+}
+
+export async function createFakeOauthSessionPinnedToKid(
+  did: string,
+  kid: string,
+): Promise<void> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const now = new Date().toISOString();
+    const sessionData = JSON.stringify({
+      token_set: {
+        access_token: `e2e-fake-access-token-${did}`,
+        expires_at: new Date(Date.now() + 3600_000).toISOString(),
+      },
+    });
+    await client.query(
+      `INSERT INTO happyview_oauth_sessions (did, session_data, signing_kid, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $4)
+       ON CONFLICT (did) DO UPDATE SET session_data = $2, signing_kid = $3, updated_at = $4`,
+      [did, sessionData, kid, now],
+    );
+  } finally {
+    await client.end();
+  }
+}
+
 export async function loginAsTestAdmin(page: Page): Promise<void> {
   await ensureTestUser(TEST_DID);
 

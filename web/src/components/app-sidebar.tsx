@@ -25,6 +25,7 @@ import {
   IconFingerprint,
   IconPlayerPlay,
   IconLink,
+  IconShieldLock,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -141,6 +142,12 @@ const systemItems: NavItem[] = [
     title: "Service Identity",
     url: "/dashboard/settings/service-identity",
     icon: IconFingerprint,
+    requiredPermissions: ["settings:manage"],
+  },
+  {
+    title: "OAuth Keys",
+    url: "/dashboard/settings/oauth-keys",
+    icon: IconShieldLock,
     requiredPermissions: ["settings:manage"],
   },
   {

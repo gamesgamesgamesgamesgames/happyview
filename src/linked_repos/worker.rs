@@ -20,7 +20,7 @@ pub async fn refresh_grant(state: &AppState, grant: &LinkedRepo) -> Result<(), A
     let did = Did::new(did_str.clone())
         .map_err(|_| AppError::Internal(format!("invalid DID on grant: {did_str}")))?;
 
-    let client = match flow::client_for_grant(state, grant) {
+    let client = match flow::client_for_grant(state, grant).await {
         Ok(client) => client,
         Err(e) => {
             let message = format!("{e}");

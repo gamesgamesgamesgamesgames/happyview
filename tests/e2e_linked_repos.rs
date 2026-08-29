@@ -1347,9 +1347,9 @@ async fn client_for_grant_is_deterministic_and_scope_specific() {
     .await
     .unwrap();
 
-    let at_authorize = flow::client_for_grant(&app.state, &grant).unwrap();
+    let at_authorize = flow::client_for_grant(&app.state, &grant).await.unwrap();
     let reloaded = db::get(&app.state, &grant.id).await.unwrap().unwrap();
-    let at_callback = flow::client_for_grant(&app.state, &reloaded).unwrap();
+    let at_callback = flow::client_for_grant(&app.state, &reloaded).await.unwrap();
     assert_eq!(
         at_authorize.client_metadata.client_id, at_callback.client_metadata.client_id,
         "a grant must derive the same client on both sides of the flow"
@@ -1365,10 +1365,98 @@ async fn client_for_grant_is_deterministic_and_scope_specific() {
     )
     .await
     .unwrap();
-    let other_client = flow::client_for_grant(&app.state, &other).unwrap();
+    let other_client = flow::client_for_grant(&app.state, &other).await.unwrap();
     assert_ne!(
         at_authorize.client_metadata.client_id, other_client.client_metadata.client_id,
         "different scopes must derive different loopback client ids"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn client_for_grant_stamps_the_key_it_actually_signs_with_across_a_rotation() {
+    common::require_db!();
+    use happyview::linked_repos::flow;
+    use happyview::oauth::client_keys;
+
+    let app = TestApp::new().await;
+    let mut state = app.state.clone();
+
+    let key_a = client_keys::ensure_instance_key(&state.db, state.db_backend, None)
+        .await
+        .unwrap();
+    let jwk_a = client_keys::to_atrium_jwk(&key_a).unwrap();
+
+    state.config.public_url = "https://example.happyview.test".to_string();
+    state.linked_repos_client = std::sync::Arc::new(
+        happyview::linked_repos::client::build(
+            "https://plc.directory",
+            "https://example.happyview.test/oauth-client-metadata.json",
+            "https://example.happyview.test",
+            "https://example.happyview.test/auth/callback".to_string(),
+            false,
+            vec![atrium_oauth::Scope::Known(
+                atrium_oauth::KnownScope::Atproto,
+            )],
+            state.oauth_state_store.clone(),
+            state.db.clone(),
+            state.db_backend,
+            Some(vec![jwk_a]),
+        )
+        .expect("failed to build non-loopback linked-repo OAuth client"),
+    );
+    state.linked_repos_client_kid = Some(key_a.kid.clone());
+
+    let did = "did:plc:legacylinkedrepo";
+    let grant = db::create(&state, Some(did), None, None, "atproto", "did:plc:admin")
+        .await
+        .unwrap();
+
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_linked_repo_sessions (did, session_data, signing_kid, updated_at) \
+         VALUES (?, ?, NULL, ?)",
+        state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(did)
+        .bind("{}")
+        .bind(happyview::db::now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let key_b = client_keys::rotate_key(
+        &state.db,
+        state.db_backend,
+        None,
+        client_keys::INSTANCE_OWNER,
+    )
+    .await
+    .unwrap();
+    assert_ne!(key_a.kid, key_b.kid);
+
+    let client = flow::client_for_grant(&state, &grant).await.unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&client, &state.linked_repos_client),
+        "must return the same in-memory client that actually holds key A's private material"
+    );
+
+    let stamped_sql = happyview::db::adapt_sql(
+        "SELECT signing_kid FROM happyview_linked_repo_sessions WHERE did = ?",
+        state.db_backend,
+    );
+    let (stamped,): (Option<String>,) = happyview::db::query_as(&stamped_sql)
+        .bind(did)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        stamped.as_deref(),
+        Some(key_a.kid.as_str()),
+        "must stamp the key the returned client actually signs with (A), not whatever \
+         the database calls `current` after the rotation (B) — a later refresh signed \
+         with B would destroy a session the authorization server pinned to A"
     );
 }
 

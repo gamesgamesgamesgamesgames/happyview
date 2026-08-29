@@ -50,6 +50,9 @@ async fn client_jwks(
 #[derive(Deserialize)]
 struct ClientAssertionBody {
     issuer: String,
+    /// Sign with this specific key rather than whichever is current.
+    #[serde(default)]
+    kid: Option<String>,
 }
 
 /// POST /oauth/client-assertion — mint a `private_key_jwt` assertion for the
@@ -73,18 +76,26 @@ async fn mint_client_assertion(
         .await
         .map_err(|e| AppError::BadRequest(format!("invalid client-assertion request: {e}")))?;
 
-    let key = super::client_keys::load_keys(
+    let keys = super::client_keys::load_keys(
         &state.db,
         state.db_backend,
         state.config.token_encryption_key.as_ref(),
         &client.id,
     )
-    .await?
-    .into_iter()
-    .find(|k| k.status == super::client_keys::KeyStatus::Current)
-    .ok_or_else(|| {
-        AppError::BadRequest("this client has no authentication key; provision one first".into())
-    })?;
+    .await?;
+
+    let key = super::client_keys::find_by_kid(&keys, body.kid.as_deref()).ok_or_else(
+        || match body.kid.as_deref() {
+            Some(kid) => AppError::BadRequest(format!(
+                "no usable authentication key '{kid}' for this client; it may have been revoked, \
+                 in which case any session established under it is gone and the app must run a \
+                 fresh authorization rather than a refresh"
+            )),
+            None => AppError::BadRequest(
+                "this client has no authentication key; provision one first".into(),
+            ),
+        },
+    )?;
 
     let client_id_url =
         super::pds_write::lookup_client_id_url(&state.db, state.db_backend, &client.id).await?;
@@ -114,6 +125,10 @@ async fn mint_client_assertion(
         "client_assertion": assertion,
         "client_assertion_type": super::client_assertion::CLIENT_ASSERTION_TYPE,
         "expires_in": super::client_assertion::ASSERTION_TTL_SECS,
+        // Which key signed this. A caller that stores it alongside the session
+        // can pass it back as `kid` when refreshing, and so keep signing with
+        // the key the session was established under across a rotation.
+        "kid": key.kid,
     })))
 }
 
@@ -400,6 +415,17 @@ async fn register_session(
         ));
     }
 
+    let signing_kid = super::client_keys::load_keys(
+        &state.db,
+        state.db_backend,
+        state.config.token_encryption_key.as_ref(),
+        &client.id,
+    )
+    .await?
+    .into_iter()
+    .find(|k| k.status == super::client_keys::KeyStatus::Current)
+    .map(|k| k.kid);
+
     // Store the session
     let session_id = Uuid::new_v4().to_string();
     sessions::store_dpop_session(
@@ -416,8 +442,27 @@ async fn register_session(
         &body.scopes,
         body.pds_url.as_deref(),
         body.issuer.as_deref(),
+        signing_kid.as_deref(),
     )
     .await?;
+
+    if let Err(e) = sessions::repin_dpop_session_signing_kid(
+        &state.db,
+        state.db_backend,
+        &client.id,
+        &dpop_key_id,
+        &body.did,
+        signing_kid.as_deref(),
+    )
+    .await
+    {
+        tracing::error!(
+            api_client_id = %client.id,
+            did = %body.did,
+            error = %e,
+            "failed to re-pin DPoP session signing_kid after registration"
+        );
+    }
 
     // ⚠ A SESSION WITH NO REFRESH TOKEN CANNOT OUTLIVE ITS ACCESS TOKEN, AND IT
     // USED TO REGISTER IN COMPLETE SILENCE. Everything works until the access

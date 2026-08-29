@@ -401,6 +401,104 @@ async fn assertion_endpoint_signs_for_the_authenticated_client() {
 
 #[tokio::test]
 #[serial]
+async fn assertion_endpoint_signs_with_an_explicitly_requested_kid() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let client_id_url = "https://kidpick.example.com/oauth-client-metadata.json";
+    let (client_id, client_key, client_secret) =
+        create_confidential_api_client(&app, client_id_url).await;
+
+    let provisioned = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            &format!("/admin/api-clients/{client_id}/auth-key"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    let old_kid = json_body(provisioned).await["kid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let rotated = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            &format!("/admin/api-clients/{client_id}/auth-key/rotate"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rotated.status(), StatusCode::OK);
+    let new_kid = json_body(rotated).await["kid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(old_kid, new_kid, "rotation must mint a distinct key");
+
+    // No kid: whatever is current. Correct for an initial authorization.
+    let resp = post_with_client_credentials(
+        &app,
+        "/oauth/client-assertion",
+        &client_key,
+        &client_secret,
+        json!({ "issuer": "https://pds.example.com" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        decode_jwt_part(body["client_assertion"].as_str().unwrap(), 0)["kid"]
+            .as_str()
+            .unwrap(),
+        new_kid
+    );
+    assert_eq!(
+        body["kid"].as_str().unwrap(),
+        new_kid,
+        "the response must name the signing key, or a caller has no way to ask for it again"
+    );
+
+    // Explicit retiring kid: a refresh for a session established before the
+    // rotation. Signing that with the current key would present a kid the
+    // authorization server never bound the session to, and a conforming
+    // server destroys the session rather than refusing the request.
+    let resp = post_with_client_credentials(
+        &app,
+        "/oauth/client-assertion",
+        &client_key,
+        &client_secret,
+        json!({ "issuer": "https://pds.example.com", "kid": old_kid }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        decode_jwt_part(body["client_assertion"].as_str().unwrap(), 0)["kid"]
+            .as_str()
+            .unwrap(),
+        old_kid,
+        "an explicitly requested kid must sign the assertion, not the current key"
+    );
+    assert_eq!(body["kid"].as_str().unwrap(), old_kid);
+
+    // An unknown or revoked kid must fail loudly rather than silently
+    // falling back to the current key.
+    let resp = post_with_client_credentials(
+        &app,
+        "/oauth/client-assertion",
+        &client_key,
+        &client_secret,
+        json!({ "issuer": "https://pds.example.com", "kid": "not-a-real-kid" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[serial]
 async fn assertion_endpoint_refuses_a_client_with_no_key() {
     common::require_db!();
     let app = TestApp::new().await;

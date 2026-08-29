@@ -14,6 +14,14 @@ edition = "2024"
 rust-version = "1.96"
 default-run = "happyview"
 
+# Debug info dominates both codegen and link time on this workspace, and full
+# DWARF buys little for day-to-day work: `line-tables-only` still yields file
+# and line numbers in panics and backtraces, which is all the test suite and
+# normal debugging need. Applies to `cargo test` too, since the test profile
+# inherits dev.
+[profile.dev]
+debug = "line-tables-only"
+
 [dependencies]
 aes-gcm = "0.11"
 anyhow = "1"

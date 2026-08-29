@@ -74,5 +74,15 @@ pub async fn run_expired_state_gc(pool: AnyPool, backend: DatabaseBackend) {
         if removed > 0 {
             tracing::info!(removed, "purged expired OAuth state rows");
         }
+
+        match crate::oauth::client_keys::retire_unused_keys(&pool, backend).await {
+            Ok(revoked) if revoked > 0 => {
+                tracing::info!(revoked, "retired unused OAuth client keys");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to retire unused OAuth client keys");
+            }
+        }
     }
 }

@@ -353,6 +353,73 @@ async fn domain_scoped_route_works_with_known_host() {
 
 #[tokio::test]
 #[serial]
+async fn set_primary_carries_the_promoted_clients_signing_kid() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+
+    let instance_key = happyview::oauth::client_keys::ensure_instance_key(
+        &app.state.db,
+        app.state.db_backend,
+        None,
+    )
+    .await
+    .expect("ensure instance key");
+    let jwk =
+        happyview::oauth::client_keys::to_atrium_jwk(&instance_key).expect("convert to atrium jwk");
+    app.state.client_jwks = vec![jwk];
+    app.rebuild_router();
+
+    seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+
+    let domain_url = "https://promote.e2e-domains-test.invalid";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains",
+            app.admin_cookie(),
+            &json!({ "url": domain_url }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let domain_id = created["id"].as_str().expect("created domain id");
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            &format!("/admin/domains/{domain_id}/primary"),
+            app.admin_cookie(),
+            &json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "expected 204 on set primary, got {}",
+        resp.status()
+    );
+
+    let (_client, kid) = app.state.oauth.primary_client_and_kid();
+    assert_eq!(
+        kid.as_deref(),
+        Some(instance_key.kid.as_str()),
+        "promoting a domain must carry the kid its client signs with. Recording None here \
+         makes the login callback write NULL over every session's pin, and a later rotation \
+         then re-pins those sessions to a key that never established them — which a strict \
+         authorization server answers by destroying them"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn domain_create_registers_domain_specific_client_not_primary() {
     common::require_db!();
     let mut app = TestApp::new().await;
@@ -419,6 +486,7 @@ async fn domain_create_fails_and_rolls_back_on_client_id_collision() {
         colliding_url.to_string(),
         client_id_url.clone(),
         app.state.oauth.primary_client(),
+        None,
     );
 
     let resp = app

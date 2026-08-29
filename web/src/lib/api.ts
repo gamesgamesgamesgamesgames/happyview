@@ -18,13 +18,20 @@ import type { UserSummary } from "@/types/users";
 import type { AdminListRecordsResponse } from "@/types/records";
 import type { EventsListResponse } from "@/types/events";
 import type { ScriptVariableSummary } from "@/types/script-variables";
-import type { Script, UpsertScriptBody, PatchScriptBody } from "@/types/scripts";
+import type {
+  Script,
+  UpsertScriptBody,
+  PatchScriptBody,
+} from "@/types/scripts";
 import type { LabelerSummary } from "@/types/labelers";
 import type {
   ApiClientSummary,
   CreateApiClientResponse,
   ApiClientAuthKey,
   ApiClientAuthProbe,
+  KeyRotationResult,
+  InstanceOauthKeysResponse,
+  RevokeInstanceKeyResult,
 } from "@/types/api-clients";
 import type { SettingEntry } from "@/types/settings";
 import type {
@@ -46,7 +53,15 @@ export type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 export type { CollectionStat, StatsResponse } from "@/types/stats";
 export type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 export type { NetworkLexiconSummary } from "@/types/network-lexicons";
-export type { BackfillJob, BackfillRepoEntry, BackfillReposResponse, PdsSummaryEntry, PdsSummaryResponse, BackfillEvent, BlueskyProfile } from "@/types/backfill";
+export type {
+  BackfillJob,
+  BackfillRepoEntry,
+  BackfillReposResponse,
+  PdsSummaryEntry,
+  PdsSummaryResponse,
+  BackfillEvent,
+  BlueskyProfile,
+} from "@/types/backfill";
 export type {
   LinkedRepo,
   LinkedReposListResponse,
@@ -78,6 +93,10 @@ export type {
   CreateApiClientResponse,
   ApiClientAuthKey,
   ApiClientAuthProbe,
+  KeyRotationResult,
+  InstanceOauthKey,
+  InstanceOauthKeysResponse,
+  RevokeInstanceKeyResult,
 } from "@/types/api-clients";
 export type { SettingEntry, InstanceSettings } from "@/types/settings";
 export { INSTANCE_SETTING_KEYS } from "@/types/settings";
@@ -134,7 +153,9 @@ async function apiFetch<T = unknown>(
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
-    } catch { /* not JSON, use raw text */ }
+    } catch {
+      /* not JSON, use raw text */
+    }
     throw new ApiError(res.status, message);
   }
   if (res.status === 204) return null as T;
@@ -185,10 +206,7 @@ export function getNetworkLexicons() {
   return apiFetch<NetworkLexiconSummary[]>("/admin/network-lexicons");
 }
 
-export function resolveNetworkLexicon(
-  nsid: string,
-  signal?: AbortSignal,
-) {
+export function resolveNetworkLexicon(nsid: string, signal?: AbortSignal) {
   return apiFetch<{
     nsid: string;
     authority_did: string;
@@ -261,9 +279,7 @@ export function getBackfillRepos(
 }
 
 export function getBackfillPdsSummary(jobId: string) {
-  return apiFetch<PdsSummaryResponse>(
-    `/admin/backfill/${jobId}/pds-summary`,
-  );
+  return apiFetch<PdsSummaryResponse>(`/admin/backfill/${jobId}/pds-summary`);
 }
 
 export function flushBackfillDetails(jobId: string) {
@@ -296,7 +312,9 @@ export function retryFailedBackfill(jobId: string, kinds?: string[]) {
 }
 
 // Jobs
-export function getJobs(params: { status?: string; limit?: number; cursor?: string } = {}) {
+export function getJobs(
+  params: { status?: string; limit?: number; cursor?: string } = {},
+) {
   const qs = new URLSearchParams();
   if (params.status) qs.set("status", params.status);
   if (params.limit) qs.set("limit", String(params.limit));
@@ -513,7 +531,9 @@ export async function xrpcQuery<T = unknown>(
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
-    } catch { /* not JSON, use raw text */ }
+    } catch {
+      /* not JSON, use raw text */
+    }
     throw new ApiError(res.status, message);
   }
   return res.json();
@@ -699,7 +719,9 @@ export async function uploadLogo(file: File) {
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
-    } catch { /* not JSON, use raw text */ }
+    } catch {
+      /* not JSON, use raw text */
+    }
     throw new ApiError(res.status, message);
   }
 }
@@ -848,6 +870,30 @@ export function recheckApiClientAuthKey(id: string) {
   return apiFetch<ApiClientAuthProbe>(
     `/admin/api-clients/${encodeURIComponent(id)}/auth-key/recheck`,
     { method: "POST" },
+  );
+}
+
+export function rotateApiClientAuthKey(id: string) {
+  return apiFetch<KeyRotationResult>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-key/rotate`,
+    { method: "POST" },
+  );
+}
+
+export function rotateInstanceOauthKey() {
+  return apiFetch<KeyRotationResult>("/admin/oauth/instance-key/rotate", {
+    method: "POST",
+  });
+}
+
+export function listInstanceOauthKeys() {
+  return apiFetch<InstanceOauthKeysResponse>("/admin/oauth/instance-key");
+}
+
+export function revokeInstanceOauthKey(kid: string) {
+  return apiFetch<RevokeInstanceKeyResult>(
+    `/admin/oauth/instance-key/${encodeURIComponent(kid)}`,
+    { method: "DELETE" },
   );
 }
 
@@ -1100,36 +1146,41 @@ export function getScripts(opts?: { suffix?: string }) {
   const params = new URLSearchParams();
   if (opts?.suffix) params.set("suffix", opts.suffix);
   const qs = params.toString();
-  return apiFetch<Script[]>(`/admin/scripts${qs ? `?${qs}` : ""}`)
+  return apiFetch<Script[]>(`/admin/scripts${qs ? `?${qs}` : ""}`);
 }
 
 export function getScript(id: string) {
-  return apiFetch<Script>(`/admin/scripts/${encodeURIComponent(id)}`)
+  return apiFetch<Script>(`/admin/scripts/${encodeURIComponent(id)}`);
 }
 
 export function upsertScript(body: UpsertScriptBody) {
   return apiFetch<Script>("/admin/scripts", {
     method: "POST",
     body: JSON.stringify(body),
-  })
+  });
 }
 
 export function patchScript(id: string, body: PatchScriptBody) {
   return apiFetch<Script>(`/admin/scripts/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: JSON.stringify(body),
-  })
+  });
 }
 
 export function deleteScript(id: string) {
   return apiFetch(`/admin/scripts/${encodeURIComponent(id)}`, {
     method: "DELETE",
-  })
+  });
 }
 
 // Setup
 export interface SetupStatus {
-  identity_mode: "did_web" | "did_plc" | "attach_account" | "not_exposed" | null;
+  identity_mode:
+    | "did_web"
+    | "did_plc"
+    | "attach_account"
+    | "not_exposed"
+    | null;
   identity_configured: boolean;
   plc_verified: boolean;
   setup_complete: boolean;
@@ -1173,36 +1224,40 @@ export function completeSetup() {
 }
 
 export interface ResolveResult {
-  did: string
-  handle: string | null
-  display_name: string | null
-  avatar: string | null
+  did: string;
+  handle: string | null;
+  display_name: string | null;
+  avatar: string | null;
 }
 
 export function resolveIdentity(q: string) {
-  return apiFetch<ResolveResult[]>(`/api/setup/resolve?q=${encodeURIComponent(q)}`)
+  return apiFetch<ResolveResult[]>(
+    `/api/setup/resolve?q=${encodeURIComponent(q)}`,
+  );
 }
 
 export function confirmAttachAuth(body: { original_did: string }) {
   return apiFetch("/api/setup/attach-auth/confirm", {
     method: "POST",
     body: JSON.stringify(body),
-  })
+  });
 }
 
 export function plcRequest() {
-  return apiFetch("/api/setup/plc/request", { method: "POST" })
+  return apiFetch("/api/setup/plc/request", { method: "POST" });
 }
 
 export function plcSubmit(token: string) {
   return apiFetch("/api/setup/plc/submit", {
     method: "POST",
     body: JSON.stringify({ token }),
-  })
+  });
 }
 
 export function plcRegister() {
-  return apiFetch<{ did: string }>("/api/setup/plc/register", { method: "POST" })
+  return apiFetch<{ did: string }>("/api/setup/plc/register", {
+    method: "POST",
+  });
 }
 
 // Service Identity
@@ -1286,7 +1341,9 @@ export function syncPlc() {
 }
 
 export function syncPlcRequest() {
-  return apiFetch("/admin/service-entries/sync-plc/request", { method: "POST" });
+  return apiFetch("/admin/service-entries/sync-plc/request", {
+    method: "POST",
+  });
 }
 
 export function syncPlcSubmit(token: string) {

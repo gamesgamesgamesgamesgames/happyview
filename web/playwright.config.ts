@@ -61,6 +61,12 @@ export default defineConfig({
       use: { browserName: "chromium" },
     },
     {
+      name: "oauth-key-rotation",
+      testMatch: "oauth-key-rotation.spec.ts",
+      dependencies: ["attach-account"],
+      use: { browserName: "chromium" },
+    },
+    {
       name: "didplc-setup",
       testMatch: "setup-didplc.spec.ts",
       dependencies: ["attach-account"],

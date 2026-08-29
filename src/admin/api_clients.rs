@@ -97,6 +97,7 @@ pub(super) async fn create_api_client(
         session_store_pool: state.db.clone(),
         db_backend: state.db_backend,
         client_keys: None,
+        signing_kid: None,
     };
     if let Err(e) = state.oauth.register_api_client(
         &body.client_id_url,
@@ -391,6 +392,7 @@ pub(super) async fn update_api_client(
         // Third-party client: it publishes its own metadata document, so we
         // must not declare private_key_jwt on its behalf.
         client_keys: None,
+        signing_kid: None,
     };
     if is_active != 0 {
         let redirect_uris: Vec<String> =
@@ -545,6 +547,185 @@ pub(super) async fn get_auth_key(
     Ok(Json(serde_json::json!({
         "kid": key.kid,
         "jwks_uri": jwks_uri_for(&state, &id),
+    })))
+}
+
+/// POST /admin/api-clients/:id/auth-key/rotate — rotate the client's
+/// authentication key, demoting the current one to `retiring` rather than
+/// revoking it, so already-established sessions keep resolving until they
+/// naturally cycle off it (see `client_keys::rotate_key`'s doc comment).
+pub(super) async fn rotate_auth_key(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::ApiClientsEdit).await?;
+
+    let key = crate::oauth::client_keys::rotate_key(
+        &state.db,
+        state.db_backend,
+        state.config.token_encryption_key.as_ref(),
+        &id,
+    )
+    .await?;
+
+    let orphaned_sessions =
+        crate::oauth::client_keys::count_unstamped_sessions(&state.db, state.db_backend, &id)
+            .await?;
+
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "api_client.auth_key_rotated".to_string(),
+            severity: Severity::Info,
+            actor_did: Some(auth.did.clone()),
+            subject: Some(id),
+            detail: serde_json::json!({
+                "kid": key.kid,
+                "orphaned_sessions": orphaned_sessions,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "kid": key.kid,
+        "orphaned_sessions": orphaned_sessions,
+    })))
+}
+
+/// POST /admin/oauth/instance-key/rotate — rotate the instance's own OAuth
+/// client-authentication key and immediately rebuild the OAuth clients
+/// pinned to it (primary + every domain), so the new key takes effect
+/// without a restart. See `oauth::rotation::rotate_instance_key`.
+pub(super) async fn rotate_instance_key(
+    State(state): State<AppState>,
+    auth: UserAuth,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::SettingsManage).await?;
+
+    let (key, orphaned_sessions) = crate::oauth::rotation::rotate_instance_key(&state).await?;
+
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "oauth.instance_key_rotated".to_string(),
+            severity: Severity::Info,
+            actor_did: Some(auth.did.clone()),
+            subject: None,
+            detail: serde_json::json!({
+                "kid": key.kid,
+                "orphaned_sessions": orphaned_sessions,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "kid": key.kid,
+        "orphaned_sessions": orphaned_sessions,
+    })))
+}
+
+/// GET /admin/oauth/instance-key — list the instance's client-authentication
+/// keys, including revoked ones. An operator responding to a leak needs to
+/// see that a key IS revoked; a listing that hides revoked keys makes the
+/// revoke button's effect invisible.
+pub(super) async fn list_instance_keys(
+    State(state): State<AppState>,
+    auth: UserAuth,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::SettingsManage).await?;
+
+    let keys = crate::oauth::client_keys::list_keys_for_owner(
+        &state.db,
+        state.db_backend,
+        crate::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .await?;
+    let session_counts =
+        crate::oauth::client_keys::session_counts_by_kid(&state.db, state.db_backend).await?;
+
+    let keys: Vec<serde_json::Value> = keys
+        .into_iter()
+        .map(|k| {
+            let session_count = session_counts.get(&k.kid).copied().unwrap_or(0);
+            serde_json::json!({
+                "kid": k.kid,
+                "status": k.status.as_str(),
+                "created_at": k.created_at,
+                "session_count": session_count,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "keys": keys })))
+}
+
+/// DELETE /admin/oauth/instance-key/:kid — revoke a single instance key.
+pub(super) async fn revoke_instance_key(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(kid): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::SettingsManage).await?;
+
+    let owner = crate::oauth::client_keys::INSTANCE_OWNER;
+    let keys =
+        crate::oauth::client_keys::list_keys_for_owner(&state.db, state.db_backend, owner).await?;
+    let Some(target) = keys.into_iter().find(|k| k.kid == kid) else {
+        return Err(AppError::NotFound(format!(
+            "instance key '{kid}' not found"
+        )));
+    };
+
+    if target.status == crate::oauth::client_keys::KeyStatus::Current {
+        return Err(AppError::BadRequest(
+            "cannot revoke the current instance key: it is the only key signing new sessions, \
+             and revoking it now would leave the instance unable to authenticate to any PDS. \
+             Rotate the key first (which demotes this one to 'retiring' and mints a new \
+             'current'), then revoke the retiring key."
+                .to_string(),
+        ));
+    }
+
+    let session_counts =
+        crate::oauth::client_keys::session_counts_by_kid(&state.db, state.db_backend).await?;
+    let sessions_destroyed = session_counts.get(&kid).copied().unwrap_or(0);
+
+    let revoked =
+        crate::oauth::client_keys::revoke_key(&state.db, state.db_backend, owner, &kid).await?;
+    if !revoked {
+        // Lost a race with a concurrent revoke between the lookup above and
+        // this update — the key is gone either way.
+        return Err(AppError::NotFound(format!(
+            "instance key '{kid}' not found"
+        )));
+    }
+
+    state.oauth.evict_kid(&kid);
+
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "oauth.instance_key_revoked".to_string(),
+            severity: Severity::Warn,
+            actor_did: Some(auth.did.clone()),
+            subject: None,
+            detail: serde_json::json!({
+                "kid": kid,
+                "sessions_destroyed": sessions_destroyed,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "kid": kid,
+        "sessions_destroyed": sessions_destroyed,
     })))
 }
 

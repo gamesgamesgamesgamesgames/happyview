@@ -100,7 +100,7 @@ pub async fn session_for(
     let did = Did::new(did_str.to_string())
         .map_err(|_| AppError::Internal(format!("invalid DID on grant: {did_str}")))?;
 
-    let client = flow::client_for_grant(state, grant)?;
+    let client = flow::client_for_grant(state, grant).await?;
 
     match client.restore(&did).await {
         Ok(session) => Ok(session),

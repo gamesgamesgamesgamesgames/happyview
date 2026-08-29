@@ -214,6 +214,13 @@ impl Config {
         }
     }
 
+    pub fn instance_client_id_url(&self) -> String {
+        format!(
+            "{}/oauth-client-metadata.json",
+            self.effective_public_url().trim_end_matches('/')
+        )
+    }
+
     pub fn url_with_base_path(&self, domain_url: &str) -> String {
         match &self.base_path {
             Some(bp) => format!("{}{}", domain_url.trim_end_matches('/'), bp),

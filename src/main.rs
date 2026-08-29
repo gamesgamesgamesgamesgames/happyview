@@ -506,6 +506,7 @@ async fn main() {
     ];
 
     let linked_repos_scopes = oauth_scopes.clone();
+    let oauth_scopes_for_by_kid = oauth_scopes.clone();
 
     let instance_key = happyview::oauth::client_keys::ensure_instance_key(
         &db_pool,
@@ -520,6 +521,8 @@ async fn main() {
             .expect("Failed to convert client key to JWK"),
     ];
     info!(kid = %instance_key.kid, "confidential OAuth client key ready");
+
+    let instance_client_id_url = config.instance_client_id_url();
 
     let oauth_client = if is_loopback {
         info!("Using loopback OAuth client metadata (local development)");
@@ -538,10 +541,7 @@ async fn main() {
     } else {
         atrium_oauth::OAuthClient::new(OAuthClientConfig {
             client_metadata: AtprotoClientMetadata {
-                client_id: format!(
-                    "{}/oauth-client-metadata.json",
-                    config.effective_public_url().trim_end_matches('/')
-                ),
+                client_id: instance_client_id_url.clone(),
                 client_uri: Some(config.effective_public_url()),
                 redirect_uris: vec![callback_url.clone()],
                 token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
@@ -552,11 +552,24 @@ async fn main() {
             },
             keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend),
+            session_store: DbSessionStore::new(db_pool.clone(), db_backend)
+                .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: resolver_config,
             http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         })
         .expect("Failed to create OAuth client")
+    };
+
+    // A loopback client never signs at all, so it gets no pin regardless —
+    // same reasoning as `build_instance_client`'s and `linked_repos::client::
+    // build`'s own `signing_kid` computation, which this must keep matching.
+    // Fixed here, once, alongside `linked_repos_client` itself: that client
+    // is never rebuilt live on rotation (see `oauth::rotation`'s module
+    // doc), so this is the one place its actual kid is ever set.
+    let instance_signing_kid = if is_loopback {
+        None
+    } else {
+        Some(instance_key.kid.clone())
     };
 
     let linked_repos_client = Arc::new(
@@ -597,9 +610,10 @@ async fn main() {
 
     // Build the OAuth client registry and load API clients from DB
     let oauth_client_arc = Arc::new(oauth_client);
-    let oauth_registry = Arc::new(happyview::auth::OAuthClientRegistry::new(Arc::clone(
-        &oauth_client_arc,
-    )));
+    let oauth_registry = Arc::new(happyview::auth::OAuthClientRegistry::new_with_kid(
+        Arc::clone(&oauth_client_arc),
+        instance_signing_kid.clone(),
+    ));
     oauth_registry
         .load_from_db(
             &db_pool,
@@ -620,6 +634,7 @@ async fn main() {
             pd.url.clone(),
             primary_client_id_url,
             Arc::clone(&oauth_client_arc),
+            instance_signing_kid.clone(),
         );
     }
 
@@ -668,7 +683,8 @@ async fn main() {
             },
             keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend),
+            session_store: DbSessionStore::new(db_pool.clone(), db_backend)
+                .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: domain_resolver,
             http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         }) {
@@ -678,10 +694,123 @@ async fn main() {
                     domain.url.clone(),
                     domain_client_id,
                     Arc::new(client),
+                    Some(instance_key.kid.clone()),
                 );
             }
             Err(e) => {
                 tracing::error!(domain = %domain.url, error = %e, "Failed to create domain OAuth client");
+            }
+        }
+    }
+
+    // Index every non-revoked instance key by (client_id_url, kid) so a
+    // session pinned to a specific key can be resolved unambiguously — see
+    // `OAuthClientRegistry::register_for_kid`. Each key gets its own,
+    // genuinely single-key `OAuthClient` built fresh here: reusing
+    // `oauth_client_arc` (built from only the *current* key) across every
+    // kid is correct only while exactly one key is ever live. The moment a
+    // `retiring` key coexists with `current` — which rotation makes routine
+    // — that reuse would map the retiring kid to a client that can only
+    // sign with the wrong (current) key, silently, since the lookup itself
+    // succeeds.
+    let instance_keys = happyview::oauth::client_keys::load_keys(
+        &db_pool,
+        db_backend,
+        config.token_encryption_key.as_ref(),
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .await
+    .unwrap_or_default();
+    for key in &instance_keys {
+        match happyview::auth::client_registry::build_instance_client(
+            &config.plc_url,
+            &instance_client_id_url,
+            &config.effective_public_url(),
+            vec![callback_url.clone()],
+            is_loopback,
+            oauth_scopes_for_by_kid.clone(),
+            oauth_state_store.clone(),
+            db_pool.clone(),
+            db_backend,
+            key,
+        ) {
+            Ok(client) => {
+                oauth_registry.register_for_kid(
+                    &instance_client_id_url,
+                    &key.kid,
+                    Arc::new(client),
+                );
+            }
+            Err(e) => {
+                warn!(kid = %key.kid, error = %e, "failed to build per-kid instance OAuth client");
+            }
+        }
+
+        // Same reasoning, nested: each domain's `by_kid` entry must also be
+        // a distinct single-key client, not a reused Arc built for a
+        // different kid.
+        for domain in &all_domains {
+            let domain_base_url = config.url_with_base_path(&domain.url);
+            let domain_callback_url =
+                format!("{}/auth/callback", domain_base_url.trim_end_matches('/'));
+            let domain_client_id = format!(
+                "{}/oauth-client-metadata.json",
+                domain_base_url.trim_end_matches('/')
+            );
+            match happyview::auth::client_registry::build_instance_client(
+                &config.plc_url,
+                &domain_client_id,
+                &domain_base_url,
+                vec![domain_callback_url],
+                false,
+                vec![Scope::Known(KnownScope::Atproto)],
+                oauth_state_store.clone(),
+                db_pool.clone(),
+                db_backend,
+                key,
+            ) {
+                Ok(client) => {
+                    oauth_registry.register_for_kid(&domain_client_id, &key.kid, Arc::new(client));
+                }
+                Err(e) => {
+                    warn!(domain = %domain.url, kid = %key.kid, error = %e, "failed to build per-kid domain OAuth client");
+                }
+            }
+        }
+    }
+
+    // Index the linked-repos client by kid too, in its own namespace kept
+    // separate from the loop above — see `OAuthClientRegistry`'s
+    // `linked_repos_by_kid` field doc for why it cannot share a
+    // `(client_id_url, kid)` entry with the instance/domain clients despite
+    // publishing the same `client_id` text. Same distinct-client-per-kid
+    // reasoning applies here too.
+    for key in &instance_keys {
+        match happyview::oauth::client_keys::to_atrium_jwk(key) {
+            Ok(jwk) => match happyview::linked_repos::client::build(
+                &config.plc_url,
+                &format!(
+                    "{}/oauth-client-metadata.json",
+                    config.effective_public_url().trim_end_matches('/')
+                ),
+                &config.effective_public_url(),
+                callback_url.clone(),
+                is_loopback,
+                oauth_scopes_for_by_kid.clone(),
+                oauth_state_store.clone(),
+                db_pool.clone(),
+                db_backend,
+                Some(vec![jwk]),
+            ) {
+                Ok(client) => {
+                    oauth_registry.register_linked_repos_for_kid(&key.kid, Arc::new(client));
+                }
+                Err(e) => {
+                    warn!(kid = %key.kid, error = %e, "failed to build per-kid linked-repos OAuth client");
+                }
+            },
+            Err(e) => {
+                warn!(kid = %key.kid, error = %e, "failed to convert instance key to JWK for linked-repos registration");
             }
         }
     }
@@ -734,6 +863,7 @@ async fn main() {
         oauth: oauth_registry,
         oauth_state_store,
         linked_repos_client,
+        linked_repos_client_kid: instance_signing_kid,
         cookie_key,
         plugin_registry,
         wasm_runtime,

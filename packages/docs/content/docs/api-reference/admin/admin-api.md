@@ -54,6 +54,7 @@ AUTH="Authorization: Bearer $TOKEN"
 | [Records](records.md) | List and delete indexed records |
 | [Instance Settings](settings.md) | Configure app name, logo, policy URLs, and concurrency settings |
 | [Domains](domains.md) | Manage domains and their OAuth client identities |
+| [OAuth Keys](oauth-keys.md) | Rotate and revoke the instance's OAuth client-assertion signing key |
 | [Scripts](scripts.md) | Create, list, update, and delete Lua scripts |
 | [Script Variables](script-variables.md) | Encrypted key/value pairs for Lua scripts |
 | [API Clients](api-clients.md) | Register and manage third-party XRPC clients |
@@ -137,6 +138,9 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `POST /admin/domains`                    | `settings:manage`          |
 | `DELETE /admin/domains/{id}`             | `settings:manage`          |
 | `POST /admin/domains/{id}/primary`       | `settings:manage`          |
+| `GET /admin/oauth/instance-key`          | `settings:manage`          |
+| `POST /admin/oauth/instance-key/rotate`  | `settings:manage`          |
+| `DELETE /admin/oauth/instance-key/{kid}` | `settings:manage`          |
 | `GET /admin/api-clients`                 | `api-clients:view`         |
 | `POST /admin/api-clients`                | `api-clients:create`       |
 | `GET /admin/api-clients/{id}`            | `api-clients:view`         |

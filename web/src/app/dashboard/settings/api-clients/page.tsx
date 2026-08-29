@@ -26,6 +26,7 @@ import {
   getApiClientAuthKey,
   provisionApiClientAuthKey,
   recheckApiClientAuthKey,
+  rotateApiClientAuthKey,
 } from "@/lib/api";
 import type {
   ApiClientSummary,
@@ -999,6 +1000,8 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
   const [rechecking, setRechecking] = useState(false);
   const [recheckFailed, setRecheckFailed] = useState(false);
   const [copiedField, setCopiedField] = useState<string | null>(null);
+  const [rotating, setRotating] = useState(false);
+  const [rotateConfirmOpen, setRotateConfirmOpen] = useState(false);
 
   const loadAuthKey = useCallback(async () => {
     setLoading(true);
@@ -1064,6 +1067,27 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
     }
   }
 
+  async function handleRotate() {
+    setRotating(true);
+    try {
+      const result = await rotateApiClientAuthKey(client.id);
+      setAuthKey((prev) => (prev ? { ...prev, kid: result.kid } : prev));
+      setProbe(null);
+      setRotateConfirmOpen(false);
+      if (result.orphaned_sessions > 0) {
+        toast.success(`Rotated to a new key (${result.kid.slice(0, 8)}…)`, {
+          description: `${result.orphaned_sessions} session${result.orphaned_sessions === 1 ? "" : "s"} predate key pinning and cannot be protected by this or any future rotation.`,
+        });
+      } else {
+        toast.success("Rotated to a new key");
+      }
+    } catch (e: unknown) {
+      toastError("Failed to rotate authentication key", e);
+    } finally {
+      setRotating(false);
+    }
+  }
+
   // Copies the exact string the endpoint returned — no trimming, no
   // formatting, nothing appended. The probe compares jwks_uri as a literal
   // string, so anything this control adds becomes an unexplained mismatch
@@ -1103,9 +1127,9 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
         <ResponsiveDialogHeader>
           <ResponsiveDialogTitle>AT Protocol Client Auth</ResponsiveDialogTitle>
           <ResponsiveDialogDescription>
-            Let HappyView hold &ldquo;{client.name}&rdquo;&apos;s signing key
-            so it can authenticate as a confidential OAuth client to
-            users&apos; PDSes, instead of a public one.
+            Let HappyView hold &ldquo;{client.name}&rdquo;&apos;s signing key so
+            it can authenticate as a confidential OAuth client to users&apos;
+            PDSes, instead of a public one.
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
 
@@ -1115,8 +1139,8 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
           ) : !authKey ? (
             <div className="flex flex-col gap-3 rounded-lg border p-4 bg-muted/50">
               <p className="text-sm">
-                No AT Protocol client authentication key has been generated
-                for this client yet.
+                No AT Protocol client authentication key has been generated for
+                this client yet.
               </p>
               <Button
                 onClick={handleGenerate}
@@ -1129,7 +1153,52 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
           ) : (
             <>
               <div className="flex flex-col gap-2">
-                <Label>Key ID</Label>
+                <div className="flex items-center justify-between">
+                  <Label>Key ID</Label>
+                  <AlertDialog
+                    open={rotateConfirmOpen}
+                    onOpenChange={setRotateConfirmOpen}
+                  >
+                    <AlertDialogTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        disabled={rotating}
+                      >
+                        <RefreshCw
+                          className={`size-3.5 ${rotating ? "animate-spin" : ""}`}
+                        />
+                        {rotating ? "Rotating..." : "Rotate"}
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle>
+                          Generate a new signing key?
+                        </AlertDialogTitle>
+                        <AlertDialogDescription>
+                          This costs nothing: the current key keeps signing
+                          every session already established with it. New logins
+                          and refreshes for &ldquo;{client.name}&rdquo; will use
+                          the new key from now on. The old key stays published
+                          until nothing references it any longer.
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel disabled={rotating}>
+                          Cancel
+                        </AlertDialogCancel>
+                        <AlertDialogAction
+                          disabled={rotating}
+                          onClick={handleRotate}
+                        >
+                          {rotating ? "Rotating..." : "Generate new key"}
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+                </div>
                 <Input
                   readOnly
                   value={authKey.kid}
@@ -1160,9 +1229,9 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
                 </div>
                 <p className="text-muted-foreground text-xs">
                   Publish this exact value as{" "}
-                  <code className="bg-muted px-1 rounded">jwks_uri</code> in
-                  the client metadata document served at this client&apos;s
-                  Client ID URL.
+                  <code className="bg-muted px-1 rounded">jwks_uri</code> in the
+                  client metadata document served at this client&apos;s Client
+                  ID URL.
                 </p>
               </div>
 

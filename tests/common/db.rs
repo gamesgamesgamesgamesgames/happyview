@@ -15,6 +15,30 @@ pub fn test_backend() -> DatabaseBackend {
     DatabaseBackend::from_url(&url)
 }
 
+/// Insert a minimal `happyview_oauth_sessions` row directly, bypassing
+/// `DbSessionStore::set()`. Rotation tests need to plant a session pinned to
+/// a specific (or absent) `signing_kid` without driving a real OAuth flow —
+/// `session_data` is never read by anything these tests exercise, so an
+/// empty JSON object is enough.
+pub async fn insert_oauth_session(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    did: &str,
+    signing_kid: Option<&str>,
+) {
+    let sql = db::adapt_sql(
+        "INSERT INTO happyview_oauth_sessions (did, session_data, signing_kid) VALUES (?, ?, ?)",
+        backend,
+    );
+    db::query(&sql)
+        .bind(did)
+        .bind("{}")
+        .bind(signing_kid)
+        .execute(pool)
+        .await
+        .expect("failed to insert oauth session fixture");
+}
+
 /// Acquire a cross-process advisory lock via a dedicated Postgres connection pool.
 /// The lock is held on a connection within the returned pool. When the pool is dropped,
 /// the connection closes and the advisory lock is released.

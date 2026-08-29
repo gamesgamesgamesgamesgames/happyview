@@ -88,6 +88,7 @@ pub struct AppState {
     pub oauth: Arc<auth::OAuthClientRegistry>,
     pub oauth_state_store: DbStateStore,
     pub linked_repos_client: Arc<HappyViewOAuthClient>,
+    pub linked_repos_client_kid: Option<String>,
     pub cookie_key: axum_extra::extract::cookie::Key,
     pub plugin_registry: Arc<plugin::PluginRegistry>,
     pub wasm_runtime: Arc<plugin::WasmRuntime>,

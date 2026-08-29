@@ -702,21 +702,36 @@ async fn refresh_access_token(
         .get_resolved_client_id(&client_id_url)
         .unwrap_or(client_id_url);
 
-    // A confidential client must authenticate on the refresh grant with the
-    // same key that established the session. Absent one, this stays a public
-    // refresh — which is correct for every client that has not opted in.
-    // Holding a `Current` key is the operative condition; deliberately no
-    // `client_probe` call here (see module docs on why).
-    let assertion = match super::client_keys::load_keys(
+    let keys = super::client_keys::load_keys(
         pool,
         backend,
         Some(encryption_key),
         &creds.session.api_client_id,
     )
-    .await?
-    .into_iter()
-    .find(|k| k.status == super::client_keys::KeyStatus::Current)
+    .await?;
+    let resolved =
+        super::client_keys::resolve_signing_key(&keys, creds.session.signing_kid.as_deref())?;
+
+    if creds.session.signing_kid.is_none()
+        && let Some(key) = resolved
+        && let Err(e) = crate::auth::oauth_store::stamp_signing_kid_if_unset(
+            pool,
+            backend,
+            "happyview_dpop_sessions",
+            "id",
+            &creds.session.id,
+            &key.kid,
+        )
+        .await
     {
+        tracing::warn!(
+            error = %e,
+            session_id = %creds.session.id,
+            "failed to lazily stamp DPoP session signing_kid"
+        );
+    }
+
+    let assertion = match resolved {
         Some(key) => Some(super::client_assertion::build(
             &key.private_jwk,
             &key.kid,
@@ -817,7 +832,6 @@ async fn apply_refresh_response(
     let new_expires_at = expires_in
         .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
 
-    // Update the stored session
     super::sessions::store_dpop_session(
         pool,
         backend,
@@ -834,6 +848,7 @@ async fn apply_refresh_response(
         &creds.session.scopes,
         creds.session.pds_url.as_deref(),
         creds.session.issuer.as_deref(),
+        creds.session.signing_kid.as_deref(),
     )
     .await?;
 

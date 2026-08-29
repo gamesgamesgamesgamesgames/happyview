@@ -987,6 +987,7 @@ mod tests {
                 )
                 .expect("test linked-repo OAuth client"),
             ),
+            linked_repos_client_kid: None,
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-that-is-at-least-32-bytes-long",
             ),

@@ -100,6 +100,25 @@ pub(super) async fn create(
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_rfc3339();
 
+    let instance_keys = crate::oauth::client_keys::load_keys(
+        &state.db,
+        state.db_backend,
+        state.config.token_encryption_key.as_ref(),
+        crate::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .await?;
+    let (domain_client_keys, domain_signing_kid) = match instance_keys
+        .iter()
+        .find(|k| k.status == crate::oauth::client_keys::KeyStatus::Current)
+    {
+        Some(k) => (
+            Some(vec![crate::oauth::client_keys::to_atrium_jwk(k)?]),
+            Some(k.kid.clone()),
+        ),
+        None if !state.client_jwks.is_empty() => (Some(state.client_jwks.clone()), None),
+        None => (None, None),
+    };
+
     let mut tx = state
         .db
         .begin()
@@ -136,12 +155,15 @@ pub(super) async fn create(
 
     let domain_is_loopback = crate::auth::client_registry::is_loopback_url(&url);
     if domain_is_loopback {
+        let (primary_client, primary_kid) = state.oauth.primary_client_and_kid();
         state.oauth.register_domain_client(
             url.clone(),
             client_id_url.clone(),
-            state.oauth.primary_client(),
+            primary_client,
+            primary_kid,
         );
     } else {
+        let registered_signing_kid = domain_signing_kid.clone();
         let callback = format!("{}/auth/callback", domain_base_url.trim_end_matches('/'));
         match state.oauth.register_api_client(
             &client_id_url,
@@ -153,15 +175,19 @@ pub(super) async fn create(
                 state_store: state.oauth_state_store.clone(),
                 session_store_pool: state.db.clone(),
                 db_backend: state.db_backend,
-                client_keys: Some(state.client_jwks.clone()),
+                client_keys: domain_client_keys,
+                signing_kid: domain_signing_kid.clone(),
             },
         ) {
             Ok(()) => {
                 if let Some(client) = state.oauth.get(&client_id_url) {
                     state.oauth.remove(&client_id_url);
-                    state
-                        .oauth
-                        .register_domain_client(url.clone(), client_id_url.clone(), client);
+                    state.oauth.register_domain_client(
+                        url.clone(),
+                        client_id_url.clone(),
+                        client,
+                        registered_signing_kid.clone(),
+                    );
                 }
             }
             Err(e) => {
@@ -316,9 +342,14 @@ pub(super) async fn set_primary(
         .unwrap_or(&url);
     state.domain_cache.set_primary(host).await;
 
-    // Update OAuth primary client
-    if let Some(client) = state.oauth.get_domain_client(&url) {
-        state.oauth.set_primary_client(client);
+    // Update OAuth primary client.
+    let promoted_base_url = state.config.url_with_base_path(&url);
+    let promoted_client_id_url = format!(
+        "{}/oauth-client-metadata.json",
+        promoted_base_url.trim_end_matches('/')
+    );
+    if let Some((client, kid)) = state.oauth.get_with_kid(&promoted_client_id_url) {
+        state.oauth.set_primary_client_with_kid(client, kid);
     }
 
     log_event(

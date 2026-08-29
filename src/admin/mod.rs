@@ -200,6 +200,19 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/api-clients/{id}/auth-key/recheck",
             post(api_clients::recheck_auth_key),
         )
+        .route(
+            "/api-clients/{id}/auth-key/rotate",
+            post(api_clients::rotate_auth_key),
+        )
+        .route(
+            "/oauth/instance-key/rotate",
+            post(api_clients::rotate_instance_key),
+        )
+        .route("/oauth/instance-key", get(api_clients::list_instance_keys))
+        .route(
+            "/oauth/instance-key/{kid}",
+            delete(api_clients::revoke_instance_key),
+        )
         .route("/domains", post(domains::create).get(domains::list))
         .route("/domains/{id}", delete(domains::delete))
         .route("/domains/{id}/primary", post(domains::set_primary))
