@@ -48,7 +48,7 @@ export function MonacoEditor({
   const collectionsRef = useRef(collections);
   const disposablesRef = useRef<{ dispose(): void }[]>([]);
 
-  // eslint-disable-next-line react-hooks/refs Sync refs during render (not in useEffect) so the completion provider closure always reads the latest values immediately.
+  // eslint-disable-next-line react-hooks/refs -- see comment above
   completionsRef.current = completions;
   // eslint-disable-next-line react-hooks/refs -- see comment above
   collectionsRef.current = collections;

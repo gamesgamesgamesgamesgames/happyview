@@ -7,6 +7,7 @@ import {
   Check,
   KeyRound,
   RefreshCw,
+  ShieldAlert,
   Trash2,
   X,
   ExternalLink,
@@ -27,12 +28,16 @@ import {
   provisionApiClientAuthKey,
   recheckApiClientAuthKey,
   rotateApiClientAuthKey,
+  listApiClientAuthKeys,
+  revokeApiClientAuthKey,
+  revokeAllApiClientAuthKeys,
 } from "@/lib/api";
 import type {
   ApiClientSummary,
   CreateApiClientResponse,
   ApiClientAuthKey,
   ApiClientAuthProbe,
+  ApiClientAuthKeyListEntry,
 } from "@/types/api-clients";
 import { SiteHeader } from "@/components/site-header";
 import {
@@ -1003,6 +1008,35 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
   const [rotating, setRotating] = useState(false);
   const [rotateConfirmOpen, setRotateConfirmOpen] = useState(false);
 
+  const [keys, setKeys] = useState<ApiClientAuthKeyListEntry[]>([]);
+  const [keysLoading, setKeysLoading] = useState(false);
+  const [keysError, setKeysError] = useState<string | null>(null);
+  const [revokeTarget, setRevokeTarget] =
+    useState<ApiClientAuthKeyListEntry | null>(null);
+  const [revoking, setRevoking] = useState(false);
+
+  const [removeAllOpen, setRemoveAllOpen] = useState(false);
+  const [removingAll, setRemovingAll] = useState(false);
+
+  const loadKeys = useCallback(() => {
+    setKeysLoading(true);
+    setKeysError(null);
+    listApiClientAuthKeys(client.id)
+      .then((res) => {
+        setKeys(res.keys);
+        setKeysLoading(false);
+      })
+      .catch((e: unknown) => {
+        setKeysError(
+          e instanceof ApiError && e.status === 403
+            ? "You do not have permission to view this client's signing keys."
+            : "Could not load this client's signing keys.",
+        );
+        setKeysLoading(false);
+        toastError("Failed to load client authentication keys", e);
+      });
+  }, [client.id]);
+
   const loadAuthKey = useCallback(async () => {
     setLoading(true);
     try {
@@ -1041,6 +1075,7 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
       setProbe(null);
       setRecheckFailed(false);
       loadAuthKey();
+      loadKeys();
     }
   }
 
@@ -1081,10 +1116,64 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
       } else {
         toast.success("Rotated to a new key");
       }
+      loadKeys();
     } catch (e: unknown) {
       toastError("Failed to rotate authentication key", e);
     } finally {
       setRotating(false);
+    }
+  }
+
+  async function handleRevoke() {
+    if (!revokeTarget) return;
+    setRevoking(true);
+    try {
+      const result = await revokeApiClientAuthKey(client.id, revokeTarget.kid);
+      setRevokeTarget(null);
+      toast.success("Revoked authentication key", {
+        description:
+          result.sessions_destroyed > 0
+            ? `${result.sessions_destroyed} session${result.sessions_destroyed === 1 ? "" : "s"} pinned to this key ${result.sessions_destroyed === 1 ? "was" : "were"} destroyed.`
+            : "No sessions were pinned to this key.",
+      });
+      loadKeys();
+    } catch (e: unknown) {
+      toastError("Failed to revoke authentication key", e);
+    } finally {
+      setRevoking(false);
+    }
+  }
+
+  async function handleRemoveAll() {
+    setRemovingAll(true);
+    try {
+      const result = await revokeAllApiClientAuthKeys(client.id);
+      setRemoveAllOpen(false);
+      setAuthKey(null);
+      setProbe(null);
+      toast.success("Removed every authentication key", {
+        description:
+          (result.sessions_destroyed > 0
+            ? `${result.sessions_destroyed} session${result.sessions_destroyed === 1 ? "" : "s"} pinned to these keys ${result.sessions_destroyed === 1 ? "was" : "were"} destroyed. `
+            : "No sessions were pinned to these keys. ") +
+          `"${client.name}" is no longer a confidential OAuth client. Remove token_endpoint_auth_method, token_endpoint_auth_signing_alg, and jwks_uri from its published document, or it will fail to authenticate.`,
+      });
+      loadKeys();
+    } catch (e: unknown) {
+      toastError("Failed to remove authentication keys", e);
+    } finally {
+      setRemovingAll(false);
+    }
+  }
+
+  function keyStatusBadge(status: ApiClientAuthKeyListEntry["status"]) {
+    switch (status) {
+      case "current":
+        return <Badge>Current</Badge>;
+      case "retiring":
+        return <Badge variant="secondary">Retiring</Badge>;
+      case "revoked":
+        return <Badge variant="outline">Revoked</Badge>;
     }
   }
 
@@ -1109,6 +1198,13 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
         2,
       )
     : "";
+
+  const liveKeys = keys.filter((k) => k.status !== "revoked");
+  const liveKeyCount = liveKeys.length;
+  const liveSessionCount = liveKeys.reduce(
+    (sum, k) => sum + k.session_count,
+    0,
+  );
 
   return (
     <ResponsiveDialog open={open} onOpenChange={handleOpenChange}>
@@ -1305,6 +1401,241 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
                   </p>
                 )}
               </div>
+
+              <div className="flex flex-col gap-2">
+                <Label>Retiring and revoked keys</Label>
+                <p className="text-muted-foreground text-xs">
+                  To contain a leaked key: rotate first (the leaked one becomes
+                  retiring, so the client keeps working), then revoke the
+                  retiring key below. Revoking is immediate and destroys every
+                  session pinned to that key — it is the correct response to a
+                  leak, not routine cleanup.
+                </p>
+
+                {keysLoading && (
+                  <p className="text-sm text-muted-foreground">
+                    Loading keys...
+                  </p>
+                )}
+
+                {!keysLoading && keysError && (
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-destructive text-sm">{keysError}</p>
+                    <Button variant="outline" size="sm" onClick={loadKeys}>
+                      Retry
+                    </Button>
+                  </div>
+                )}
+
+                {!keysLoading && !keysError && keys.length === 0 && (
+                  <p className="text-sm text-muted-foreground">
+                    No signing keys yet.
+                  </p>
+                )}
+
+                {!keysLoading &&
+                  !keysError &&
+                  keys.map((key) => (
+                    <div
+                      key={key.kid}
+                      className="flex flex-col gap-1.5 rounded-lg border p-3 sm:flex-row sm:items-center sm:justify-between"
+                    >
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex items-center gap-2">
+                          {keyStatusBadge(key.status)}
+                          <span className="font-mono text-sm">{key.kid}</span>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          Created {new Date(key.created_at).toLocaleString()} ·{" "}
+                          {key.status === "revoked" ? (
+                            <>
+                              {key.session_count} session
+                              {key.session_count === 1 ? "" : "s"} destroyed
+                              when this key was revoked
+                            </>
+                          ) : (
+                            <>
+                              {key.session_count} live session
+                              {key.session_count === 1 ? "" : "s"}
+                            </>
+                          )}
+                        </p>
+                      </div>
+
+                      {key.status === "retiring" && (
+                        <AlertDialog
+                          open={revokeTarget?.kid === key.kid}
+                          onOpenChange={(o) => !o && setRevokeTarget(null)}
+                        >
+                          <AlertDialogTrigger asChild>
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              onClick={() => setRevokeTarget(key)}
+                              className="w-fit"
+                            >
+                              <ShieldAlert className="size-4" />
+                              Revoke now
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>
+                                Revoke this key immediately?
+                              </AlertDialogTitle>
+                              <AlertDialogDescription asChild>
+                                <div className="flex flex-col gap-2 text-sm text-muted-foreground">
+                                  <p>
+                                    This is the response to a leaked or
+                                    compromised key, not routine cleanup.
+                                    Revoking removes{" "}
+                                    <span className="font-mono">{key.kid}</span>{" "}
+                                    from the published JWKS immediately.
+                                  </p>
+                                  <p className="font-medium text-foreground">
+                                    {key.session_count > 0
+                                      ? `${key.session_count} live session${key.session_count === 1 ? "" : "s"} pinned to this key will be destroyed and their users signed out.`
+                                      : "No live sessions are pinned to this key, so revoking it is free."}
+                                  </p>
+                                  <p>This cannot be undone.</p>
+                                </div>
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel disabled={revoking}>
+                                Cancel
+                              </AlertDialogCancel>
+                              <AlertDialogAction
+                                variant="destructive"
+                                disabled={revoking}
+                                onClick={handleRevoke}
+                              >
+                                {revoking ? "Revoking..." : "Revoke now"}
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      )}
+                    </div>
+                  ))}
+              </div>
+
+              {liveKeyCount > 0 && (
+                <div className="flex flex-col gap-2 rounded-lg border border-destructive/50 p-4">
+                  <Label className="text-destructive">Remove key</Label>
+                  <p className="text-muted-foreground text-xs">
+                    Un-delegates &ldquo;{client.name}&rdquo; entirely, taking it
+                    back to holding no signing key. Unlike the per-key revoke
+                    above, this also removes the{" "}
+                    <span className="font-mono">current</span> key.
+                  </p>
+                  <p className="text-foreground text-xs">
+                    This does <span className="font-semibold">not</span>{" "}
+                    gracefully downgrade the app to a public client. As long as
+                    its document at{" "}
+                    <span className="font-mono">{client.client_id_url}</span>{" "}
+                    still advertises{" "}
+                    <code className="bg-muted px-1 rounded">
+                      token_endpoint_auth_method
+                    </code>
+                    ,{" "}
+                    <code className="bg-muted px-1 rounded">
+                      token_endpoint_auth_signing_alg
+                    </code>
+                    , and{" "}
+                    <code className="bg-muted px-1 rounded">jwks_uri</code>, an
+                    authorization server will fetch an empty key set and reject
+                    the client outright, and{" "}
+                    <span className="font-mono">/oauth/client-assertion</span>{" "}
+                    will start returning 400. The app will be{" "}
+                    <span className="font-semibold">
+                      broken, not downgraded
+                    </span>
+                    , until those three fields are removed from that document
+                    too.
+                  </p>
+                  <AlertDialog
+                    open={removeAllOpen}
+                    onOpenChange={setRemoveAllOpen}
+                  >
+                    <AlertDialogTrigger asChild>
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        className="w-fit"
+                        disabled={removingAll}
+                      >
+                        <ShieldAlert className="size-4" />
+                        Remove key
+                      </Button>
+                    </AlertDialogTrigger>
+                    <AlertDialogContent>
+                      <AlertDialogHeader>
+                        <AlertDialogTitle>
+                          Remove every signing key?
+                        </AlertDialogTitle>
+                        <AlertDialogDescription asChild>
+                          <div className="flex flex-col gap-2 text-sm text-muted-foreground">
+                            <p>
+                              This removes all {liveKeyCount} key
+                              {liveKeyCount === 1 ? "" : "s"} held by &ldquo;
+                              {client.name}&rdquo; — including the current one —
+                              from the published JWKS immediately. &ldquo;
+                              {client.name}&rdquo; stops being a confidential
+                              OAuth client.
+                            </p>
+                            <p className="font-medium text-foreground">
+                              {liveSessionCount > 0
+                                ? `${liveSessionCount} live session${liveSessionCount === 1 ? "" : "s"} pinned to these keys will be destroyed and their users signed out.`
+                                : "No live sessions are pinned to these keys, so removing them is free."}
+                            </p>
+                            <p className="font-medium text-foreground">
+                              This does not gracefully downgrade the app: if its
+                              published document still advertises{" "}
+                              <code className="bg-muted px-1 rounded">
+                                token_endpoint_auth_method
+                              </code>
+                              ,{" "}
+                              <code className="bg-muted px-1 rounded">
+                                token_endpoint_auth_signing_alg
+                              </code>
+                              , and{" "}
+                              <code className="bg-muted px-1 rounded">
+                                jwks_uri
+                              </code>
+                              , an authorization server will fetch an empty key
+                              set and reject the client outright, and{" "}
+                              <span className="font-mono">
+                                /oauth/client-assertion
+                              </span>{" "}
+                              will start returning 400 until you remove those
+                              three fields from that document too.
+                            </p>
+                            <p>
+                              This cannot be undone. A new key can be
+                              provisioned afterward, but it will be a different
+                              key, and every session pinned to these ones is
+                              gone.
+                            </p>
+                          </div>
+                        </AlertDialogDescription>
+                      </AlertDialogHeader>
+                      <AlertDialogFooter>
+                        <AlertDialogCancel disabled={removingAll}>
+                          Cancel
+                        </AlertDialogCancel>
+                        <AlertDialogAction
+                          variant="destructive"
+                          disabled={removingAll}
+                          onClick={handleRemoveAll}
+                        >
+                          {removingAll ? "Removing..." : "Remove key"}
+                        </AlertDialogAction>
+                      </AlertDialogFooter>
+                    </AlertDialogContent>
+                  </AlertDialog>
+                </div>
+              )}
             </>
           )}
         </div>

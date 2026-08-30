@@ -43,6 +43,28 @@ export interface KeyRotationResult {
   orphaned_sessions: number;
 }
 
+export interface ApiClientAuthKeyListEntry {
+  kid: string;
+  status: "current" | "retiring" | "revoked";
+  created_at: string;
+  session_count: number;
+}
+
+export interface ApiClientAuthKeysResponse {
+  keys: ApiClientAuthKeyListEntry[];
+  jwks_uri: string;
+}
+
+export interface RevokeApiClientAuthKeyResult {
+  kid: string;
+  sessions_destroyed: number;
+}
+
+export interface RevokeAllApiClientAuthKeysResult {
+  revoked: number;
+  sessions_destroyed: number;
+}
+
 export interface InstanceOauthKey {
   kid: string;
   status: "current" | "retiring" | "revoked";

@@ -40,6 +40,7 @@ services:
       DATABASE_URL: postgres://happyview:happyview@postgres:5432/pds
       PLC_DIRECTORY_URL: http://plc:2582
       TRANQUIL_PDS_ALLOW_INSECURE_SECRETS: "1"
+      DISABLE_RATE_LIMITING: "true"
     volumes:
       - ./scripts/e2e-config.toml:/etc/tranquil-pds/config.toml:ro
     ports:

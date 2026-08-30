@@ -491,6 +491,7 @@ curl -X POST https://happyview.example.com/oauth/client-assertion \
 | Field    | Type   | Required | Description                                                          |
 | -------- | ------ | -------- | ---------------------------------------------------------------------|
 | `issuer` | string | yes      | The `issuer` URL from the target PDS authorization server's metadata |
+| `kid`    | string | no       | Sign with this specific key instead of whichever is current. Required when refreshing — see below |
 
 **Response**: `200 OK`
 
@@ -498,13 +499,24 @@ curl -X POST https://happyview.example.com/oauth/client-assertion \
 {
   "client_assertion": "eyJhbG...",
   "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-  "expires_in": 60
+  "expires_in": 60,
+  "kid": "8b41d0aa-..."
 }
 ```
 
 Attach `client_assertion` and `client_assertion_type` as form parameters on the PAR request and, separately, on the token exchange request — each needs its own call to this endpoint.
 
+#### Refreshing a token: store the `kid`
+
+`kid` names the key that signed the assertion. **Store it alongside the session you establish**, and pass it back as the `kid` field whenever you request an assertion to *refresh* that session.
+
+This matters after a key rotation. An authorization server binds a session to the key that established it. If you refresh with an assertion signed by a newer key, the server sees a key it never bound the session to — and a conforming server responds by **destroying the session**, not by refusing the one request. The user is silently signed out, typically hours later, with nothing to connect it to the rotation.
+
+Omit `kid` for an initial authorization, where any currently valid key is correct.
+
 Returns `400` (`this client has no authentication key; provision one first`) if no key has been provisioned yet via `POST /admin/api-clients/{id}/auth-key`.
+
+Returns `400` (`no usable authentication key '<kid>' ...`) if the requested `kid` is unknown or has been revoked. A revoked key means any session established under it is already gone, so run a fresh authorization rather than a refresh.
 
 ## Errors
 

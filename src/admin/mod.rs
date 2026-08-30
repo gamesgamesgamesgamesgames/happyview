@@ -205,6 +205,14 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             post(api_clients::rotate_auth_key),
         )
         .route(
+            "/api-clients/{id}/auth-keys",
+            get(api_clients::list_auth_keys).delete(api_clients::revoke_all_auth_keys),
+        )
+        .route(
+            "/api-clients/{id}/auth-key/{kid}",
+            delete(api_clients::revoke_auth_key),
+        )
+        .route(
             "/oauth/instance-key/rotate",
             post(api_clients::rotate_instance_key),
         )

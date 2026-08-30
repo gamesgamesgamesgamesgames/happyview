@@ -1,7 +1,7 @@
 mod common;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http_body_util::BodyExt;
@@ -397,6 +397,235 @@ async fn assertion_endpoint_signs_for_the_authenticated_client() {
     let iat = claims["iat"].as_u64().unwrap();
     let exp = claims["exp"].as_u64().unwrap();
     assert_eq!(exp - iat, 60);
+}
+
+#[tokio::test]
+#[serial]
+async fn revoking_all_auth_keys_empties_the_jwks_and_un_delegates_the_client() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let client_id_url = "https://undelegate.example.com/oauth-client-metadata.json";
+    let (client_id, client_key, client_secret) =
+        create_confidential_api_client(&app, client_id_url).await;
+
+    app.router
+        .clone()
+        .oneshot(admin_post(
+            &format!("/admin/api-clients/{client_id}/auth-key"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    app.router
+        .clone()
+        .oneshot(admin_post(
+            &format!("/admin/api-clients/{client_id}/auth-key/rotate"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+
+    // Two live keys now: one current, one retiring. Revoking all takes both,
+    // including `current` — which the single-key endpoint refuses.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/api-clients/{client_id}/auth-keys"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["revoked"].as_u64().unwrap(),
+        2,
+        "both the current and the retiring key must be revoked"
+    );
+
+    // The JWKS must now be empty — that is what "un-delegated" means.
+    let jwks = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/oauth/clients/{client_id}/jwks.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let published = json_body(jwks).await;
+    assert_eq!(
+        published["keys"].as_array().unwrap().len(),
+        0,
+        "revoking every key must leave an empty JWKS, got {published}"
+    );
+
+    // And the client can no longer mint assertions.
+    let resp = post_with_client_credentials(
+        &app,
+        "/oauth/client-assertion",
+        &client_key,
+        &client_secret,
+        json!({ "issuer": "https://pds.example.com" }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a client with no keys must not be able to mint an assertion"
+    );
+
+    // Revoking again is a 400, not a silent success on an empty set.
+    let again = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/api-clients/{client_id}/auth-keys"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_retiring_client_auth_key_can_be_revoked_but_the_current_one_cannot() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let client_id_url = "https://revoke.example.com/oauth-client-metadata.json";
+    let (client_id, _client_key, _client_secret) =
+        create_confidential_api_client(&app, client_id_url).await;
+
+    let provisioned = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            &format!("/admin/api-clients/{client_id}/auth-key"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    let old_kid = json_body(provisioned).await["kid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let rotated = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            &format!("/admin/api-clients/{client_id}/auth-key/rotate"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    let new_kid = json_body(rotated).await["kid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(old_kid, new_kid);
+
+    // The listing must expose the retiring key — an operator cannot revoke a
+    // leaked key they cannot see.
+    let listed = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/api-clients/{client_id}/auth-keys"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body = json_body(listed).await;
+    let statuses: Vec<(String, String)> = body["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| {
+            (
+                k["kid"].as_str().unwrap().to_string(),
+                k["status"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(statuses.contains(&(new_kid.clone(), "current".to_string())));
+    assert!(statuses.contains(&(old_kid.clone(), "retiring".to_string())));
+
+    // Revoking the current key must be refused — it would leave the client
+    // unable to authenticate at all.
+    let refused = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/api-clients/{client_id}/auth-key/{new_kid}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_REQUEST,
+        "revoking the current key must be refused, not silently accepted"
+    );
+
+    // An unknown kid is a 404, not a silent success.
+    let unknown = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/api-clients/{client_id}/auth-key/not-a-real-kid"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    // The retiring key can be revoked.
+    let revoked = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/api-clients/{client_id}/auth-key/{old_kid}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let body = json_body(revoked).await;
+    assert_eq!(body["kid"].as_str().unwrap(), old_kid);
+    assert!(body["sessions_destroyed"].as_u64().is_some());
+
+    // And it leaves the published JWKS immediately — that is what revoking
+    // is for. Assert the end state, not just the DB row.
+    let jwks = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/oauth/clients/{client_id}/jwks.json"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let published: Vec<String> = json_body(jwks).await["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["kid"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !published.contains(&old_kid),
+        "a revoked key must disappear from the published JWKS, got {published:?}"
+    );
+    assert!(published.contains(&new_kid));
 }
 
 #[tokio::test]

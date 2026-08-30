@@ -550,6 +550,157 @@ pub(super) async fn get_auth_key(
     })))
 }
 
+/// GET /admin/api-clients/:id/auth-keys — every key this client holds,
+/// with status and live session count.
+pub(super) async fn list_auth_keys(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::ApiClientsView).await?;
+
+    let keys =
+        crate::oauth::client_keys::list_keys_for_owner(&state.db, state.db_backend, &id).await?;
+    let session_counts =
+        crate::oauth::client_keys::session_counts_by_kid(&state.db, state.db_backend).await?;
+
+    let keys: Vec<serde_json::Value> = keys
+        .into_iter()
+        .map(|k| {
+            let session_count = session_counts.get(&k.kid).copied().unwrap_or(0);
+            serde_json::json!({
+                "kid": k.kid,
+                "status": k.status.as_str(),
+                "created_at": k.created_at,
+                "session_count": session_count,
+            })
+        })
+        .collect();
+
+    Ok(Json(
+        serde_json::json!({ "keys": keys, "jwks_uri": jwks_uri_for(&state, &id) }),
+    ))
+}
+
+/// DELETE /admin/api-clients/:id/auth-key/:kid — revoke one of this client's
+/// authentication keys.
+pub(super) async fn revoke_auth_key(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path((id, kid)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::ApiClientsEdit).await?;
+
+    let keys =
+        crate::oauth::client_keys::list_keys_for_owner(&state.db, state.db_backend, &id).await?;
+    let Some(target) = keys.into_iter().find(|k| k.kid == kid) else {
+        return Err(AppError::NotFound(format!(
+            "authentication key '{kid}' not found for this client"
+        )));
+    };
+
+    if target.status == crate::oauth::client_keys::KeyStatus::Current {
+        return Err(AppError::BadRequest(
+            "cannot revoke the current authentication key: it is the only key signing new \
+             sessions for this client, and revoking it would leave the client unable to \
+             authenticate at all. Rotate the key first (which demotes this one to 'retiring' \
+             and mints a new 'current'), then revoke the retiring key."
+                .to_string(),
+        ));
+    }
+
+    let session_counts =
+        crate::oauth::client_keys::session_counts_by_kid(&state.db, state.db_backend).await?;
+    let sessions_destroyed = session_counts.get(&kid).copied().unwrap_or(0);
+
+    let revoked =
+        crate::oauth::client_keys::revoke_key(&state.db, state.db_backend, &id, &kid).await?;
+    if !revoked {
+        return Err(AppError::NotFound(format!(
+            "authentication key '{kid}' not found for this client"
+        )));
+    }
+
+    state.oauth.evict_kid(&kid);
+
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "api_client.auth_key_revoked".to_string(),
+            severity: Severity::Warn,
+            actor_did: Some(auth.did.clone()),
+            subject: Some(id.clone()),
+            detail: serde_json::json!({ "kid": kid, "sessions_destroyed": sessions_destroyed }),
+        },
+        state.db_backend,
+    )
+    .await;
+
+    Ok(Json(
+        serde_json::json!({ "kid": kid, "sessions_destroyed": sessions_destroyed }),
+    ))
+}
+
+/// DELETE /admin/api-clients/:id/auth-keys — revoke EVERY key this client
+/// holds, un-delegating it entirely.
+pub(super) async fn revoke_all_auth_keys(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::ApiClientsEdit).await?;
+
+    let keys =
+        crate::oauth::client_keys::list_keys_for_owner(&state.db, state.db_backend, &id).await?;
+    let live: Vec<_> = keys
+        .into_iter()
+        .filter(|k| k.status != crate::oauth::client_keys::KeyStatus::Revoked)
+        .collect();
+
+    if live.is_empty() {
+        return Err(AppError::BadRequest(
+            "this client holds no authentication key; there is nothing to revoke".into(),
+        ));
+    }
+
+    let session_counts =
+        crate::oauth::client_keys::session_counts_by_kid(&state.db, state.db_backend).await?;
+    let sessions_destroyed: u64 = live
+        .iter()
+        .map(|k| session_counts.get(&k.kid).copied().unwrap_or(0))
+        .sum();
+
+    crate::oauth::client_keys::revoke_keys_for_owner(&state.db, state.db_backend, &id).await?;
+
+    // Every kid, not just the current one — any of them could still be held
+    // by an in-memory client that would otherwise keep signing until restart.
+    for key in &live {
+        state.oauth.evict_kid(&key.kid);
+    }
+
+    let revoked: Vec<&str> = live.iter().map(|k| k.kid.as_str()).collect();
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "api_client.auth_keys_revoked_all".to_string(),
+            severity: Severity::Warn,
+            actor_did: Some(auth.did.clone()),
+            subject: Some(id.clone()),
+            detail: serde_json::json!({
+                "kids": revoked,
+                "sessions_destroyed": sessions_destroyed,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "revoked": live.len(),
+        "sessions_destroyed": sessions_destroyed,
+    })))
+}
+
 /// POST /admin/api-clients/:id/auth-key/rotate — rotate the client's
 /// authentication key, demoting the current one to `retiring` rather than
 /// revoking it, so already-established sessions keep resolving until they

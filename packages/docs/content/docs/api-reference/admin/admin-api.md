@@ -146,6 +146,13 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/api-clients/{id}`            | `api-clients:view`         |
 | `PUT /admin/api-clients/{id}`            | `api-clients:edit`         |
 | `DELETE /admin/api-clients/{id}`         | `api-clients:delete`       |
+| `POST /admin/api-clients/{id}/auth-key`  | `api-clients:edit`         |
+| `GET /admin/api-clients/{id}/auth-key`   | `api-clients:view`         |
+| `GET /admin/api-clients/{id}/auth-keys`  | `api-clients:view`         |
+| `POST /admin/api-clients/{id}/auth-key/recheck` | `api-clients:edit`  |
+| `POST /admin/api-clients/{id}/auth-key/rotate`  | `api-clients:edit`  |
+| `DELETE /admin/api-clients/{id}/auth-key/{kid}` | `api-clients:edit`  |
+| `DELETE /admin/api-clients/{id}/auth-keys` | `api-clients:edit`       |
 | `GET /admin/dead-letters`                | `dead-letters:read`        |
 | `GET /admin/dead-letters/count`          | `dead-letters:read`        |
 | `GET /admin/dead-letters/{id}`           | `dead-letters:read`        |

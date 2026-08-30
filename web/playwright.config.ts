@@ -11,7 +11,7 @@ export default defineConfig({
     baseURL:
       process.env.PLAYWRIGHT_BASE_URL || "https://happyview.127-0-0-1.sslip.io",
     ignoreHTTPSErrors: true,
-    trace: "on-first-retry",
+    trace: "retain-on-failure",
   },
   projects: [
     {

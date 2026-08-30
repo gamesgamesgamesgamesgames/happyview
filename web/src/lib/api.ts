@@ -29,6 +29,9 @@ import type {
   CreateApiClientResponse,
   ApiClientAuthKey,
   ApiClientAuthProbe,
+  ApiClientAuthKeysResponse,
+  RevokeApiClientAuthKeyResult,
+  RevokeAllApiClientAuthKeysResult,
   KeyRotationResult,
   InstanceOauthKeysResponse,
   RevokeInstanceKeyResult,
@@ -93,6 +96,9 @@ export type {
   CreateApiClientResponse,
   ApiClientAuthKey,
   ApiClientAuthProbe,
+  ApiClientAuthKeysResponse,
+  RevokeApiClientAuthKeyResult,
+  RevokeAllApiClientAuthKeysResult,
   KeyRotationResult,
   InstanceOauthKey,
   InstanceOauthKeysResponse,
@@ -877,6 +883,26 @@ export function rotateApiClientAuthKey(id: string) {
   return apiFetch<KeyRotationResult>(
     `/admin/api-clients/${encodeURIComponent(id)}/auth-key/rotate`,
     { method: "POST" },
+  );
+}
+
+export function listApiClientAuthKeys(id: string) {
+  return apiFetch<ApiClientAuthKeysResponse>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-keys`,
+  );
+}
+
+export function revokeApiClientAuthKey(id: string, kid: string) {
+  return apiFetch<RevokeApiClientAuthKeyResult>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-key/${encodeURIComponent(kid)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function revokeAllApiClientAuthKeys(id: string) {
+  return apiFetch<RevokeAllApiClientAuthKeysResult>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-keys`,
+    { method: "DELETE" },
   );
 }
 
