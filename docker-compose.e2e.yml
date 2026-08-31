@@ -41,6 +41,7 @@ services:
       PLC_DIRECTORY_URL: http://plc:2582
       TRANQUIL_PDS_ALLOW_INSECURE_SECRETS: "1"
       DISABLE_RATE_LIMITING: "true"
+      DISABLE_ACCOUNT_VERIFICATION_GATE: "true"
     volumes:
       - ./scripts/e2e-config.toml:/etc/tranquil-pds/config.toml:ro
     ports:

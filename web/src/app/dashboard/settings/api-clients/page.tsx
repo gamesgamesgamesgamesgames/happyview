@@ -58,15 +58,15 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
 import {
-  ResponsiveDialog,
-  ResponsiveDialogClose,
-  ResponsiveDialogContent,
-  ResponsiveDialogDescription,
-  ResponsiveDialogFooter,
-  ResponsiveDialogHeader,
-  ResponsiveDialogTitle,
-  ResponsiveDialogTrigger,
-} from "@/components/ui/responsive-dialog";
+  Sheet,
+  SheetClose,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from "@/components/ui/sheet";
 import {
   Table,
   TableBody,
@@ -381,26 +381,26 @@ function CreateApiClientDialog({ onSuccess }: { onSuccess: () => void }) {
   }
 
   return (
-    <ResponsiveDialog open={open} onOpenChange={handleOpenChange}>
-      <ResponsiveDialogTrigger asChild>
+    <Sheet open={open} onOpenChange={handleOpenChange}>
+      <SheetTrigger asChild>
         <Button>Create API Client</Button>
-      </ResponsiveDialogTrigger>
-      <ResponsiveDialogContent>
-        <ResponsiveDialogHeader>
-          <ResponsiveDialogTitle>
+      </SheetTrigger>
+      <SheetContent className="sm:max-w-xl flex flex-col overflow-hidden">
+        <SheetHeader>
+          <SheetTitle>
             {created ? "API Client Created" : "Create API Client"}
-          </ResponsiveDialogTitle>
-          <ResponsiveDialogDescription>
+          </SheetTitle>
+          <SheetDescription>
             {created
               ? created.client_type === "public"
                 ? "Your public client has been created. Use PKCE for authentication."
                 : "Save the credentials below. The secret will not be shown again."
               : "Register a new application that authenticates through this AppView."}
-          </ResponsiveDialogDescription>
-        </ResponsiveDialogHeader>
+          </SheetDescription>
+        </SheetHeader>
 
         {created ? (
-          <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-4 flex-1 min-h-0 overflow-y-auto px-4 pb-4">
             <div className="flex flex-col gap-2">
               <Label>Client Key</Label>
               <div className="flex gap-2">
@@ -480,7 +480,7 @@ function CreateApiClientDialog({ onSuccess }: { onSuccess: () => void }) {
             )}
           </div>
         ) : (
-          <div className="flex flex-col gap-4 max-h-[60vh] overflow-y-auto">
+          <div className="flex flex-col gap-4 flex-1 min-h-0 overflow-y-auto px-4 pb-4">
             {error && <p className="text-destructive text-sm">{error}</p>}
             <fieldset className="flex flex-col gap-3 rounded-lg border p-4">
               <legend className="text-sm font-medium px-1">Client Type</legend>
@@ -685,20 +685,20 @@ function CreateApiClientDialog({ onSuccess }: { onSuccess: () => void }) {
           </div>
         )}
 
-        <ResponsiveDialogFooter>
-          <ResponsiveDialogClose asChild>
+        <SheetFooter className="border-t flex-row justify-end gap-2">
+          <SheetClose asChild>
             <Button variant={created ? "default" : "outline"}>
               {created ? "Done" : "Cancel"}
             </Button>
-          </ResponsiveDialogClose>
+          </SheetClose>
           {!created && (
             <Button onClick={handleCreate} disabled={!name.trim()}>
               Create
             </Button>
           )}
-        </ResponsiveDialogFooter>
-      </ResponsiveDialogContent>
-    </ResponsiveDialog>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   );
 }
 
@@ -821,20 +821,20 @@ function EditApiClientDialog({
   }
 
   return (
-    <ResponsiveDialog open={open} onOpenChange={handleOpenChange}>
-      <ResponsiveDialogTrigger asChild>
+    <Sheet open={open} onOpenChange={handleOpenChange}>
+      <SheetTrigger asChild>
         <Button variant="outline" size="sm">
           Edit
         </Button>
-      </ResponsiveDialogTrigger>
-      <ResponsiveDialogContent>
-        <ResponsiveDialogHeader>
-          <ResponsiveDialogTitle>Edit API Client</ResponsiveDialogTitle>
-          <ResponsiveDialogDescription>
+      </SheetTrigger>
+      <SheetContent className="sm:max-w-xl flex flex-col overflow-hidden">
+        <SheetHeader>
+          <SheetTitle>Edit API Client</SheetTitle>
+          <SheetDescription>
             Update settings for &ldquo;{client.name}&rdquo;.
-          </ResponsiveDialogDescription>
-        </ResponsiveDialogHeader>
-        <div className="flex flex-col gap-4 max-h-[60vh] overflow-y-auto">
+          </SheetDescription>
+        </SheetHeader>
+        <div className="flex flex-col gap-4 flex-1 min-h-0 overflow-y-auto px-4 pb-4">
           {error && <p className="text-destructive text-sm">{error}</p>}
           <fieldset className="flex flex-col gap-3 rounded-lg border p-4">
             <legend className="text-sm font-medium px-1">Application</legend>
@@ -971,16 +971,16 @@ function EditApiClientDialog({
             </div>
           </fieldset>
         </div>
-        <ResponsiveDialogFooter>
-          <ResponsiveDialogClose asChild>
+        <SheetFooter className="border-t flex-row justify-end gap-2">
+          <SheetClose asChild>
             <Button variant="outline">Cancel</Button>
-          </ResponsiveDialogClose>
+          </SheetClose>
           <Button onClick={handleSave} disabled={saving}>
             {saving ? "Saving..." : "Save"}
           </Button>
-        </ResponsiveDialogFooter>
-      </ResponsiveDialogContent>
-    </ResponsiveDialog>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   );
 }
 
@@ -1094,6 +1094,7 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
     try {
       const key = await provisionApiClientAuthKey(client.id);
       setAuthKey(key);
+      loadKeys();
       toast.success("Authentication key generated");
     } catch (e: unknown) {
       toastError("Failed to generate authentication key", e);
@@ -1207,446 +1208,457 @@ function ApiClientAuthDialog({ client }: { client: ApiClientSummary }) {
   );
 
   return (
-    <ResponsiveDialog open={open} onOpenChange={handleOpenChange}>
-      <ResponsiveDialogTrigger asChild>
-        <Button
-          variant="outline"
-          size="icon"
-          className="size-8"
-          title="AT Protocol client auth"
-          aria-label={`AT Protocol client auth for ${client.name}`}
-        >
-          <KeyRound className="size-4" />
-        </Button>
-      </ResponsiveDialogTrigger>
-      <ResponsiveDialogContent>
-        <ResponsiveDialogHeader>
-          <ResponsiveDialogTitle>AT Protocol Client Auth</ResponsiveDialogTitle>
-          <ResponsiveDialogDescription>
-            Let HappyView hold &ldquo;{client.name}&rdquo;&apos;s signing key so
-            it can authenticate as a confidential OAuth client to users&apos;
-            PDSes, instead of a public one.
-          </ResponsiveDialogDescription>
-        </ResponsiveDialogHeader>
+    <>
+      <Sheet open={open} onOpenChange={handleOpenChange}>
+        <SheetTrigger asChild>
+          <Button
+            variant="outline"
+            size="icon"
+            className="size-8"
+            title="AT Protocol client auth"
+            aria-label={`AT Protocol client auth for ${client.name}`}
+          >
+            <KeyRound className="size-4" />
+          </Button>
+        </SheetTrigger>
+        <SheetContent className="sm:max-w-xl flex flex-col overflow-hidden">
+          <SheetHeader>
+            <SheetTitle>AT Protocol Client Auth</SheetTitle>
+            <SheetDescription>
+              Let HappyView hold &ldquo;{client.name}&rdquo;&apos;s signing key
+              so it can authenticate as a confidential OAuth client to
+              users&apos; PDSes, instead of a public one.
+            </SheetDescription>
+          </SheetHeader>
 
-        <div className="flex flex-col gap-4 max-h-[60vh] overflow-y-auto">
-          {loading ? (
-            <p className="text-muted-foreground text-sm">Loading…</p>
-          ) : !authKey ? (
-            <div className="flex flex-col gap-3 rounded-lg border p-4 bg-muted/50">
-              <p className="text-sm">
-                No AT Protocol client authentication key has been generated for
-                this client yet.
-              </p>
-              <Button
-                onClick={handleGenerate}
-                disabled={generating}
-                className="w-fit"
-              >
-                {generating ? "Generating..." : "Generate"}
-              </Button>
-            </div>
-          ) : (
-            <>
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center justify-between">
-                  <Label>Key ID</Label>
-                  <AlertDialog
-                    open={rotateConfirmOpen}
-                    onOpenChange={setRotateConfirmOpen}
-                  >
-                    <AlertDialogTrigger asChild>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        disabled={rotating}
-                      >
-                        <RefreshCw
-                          className={`size-3.5 ${rotating ? "animate-spin" : ""}`}
-                        />
-                        {rotating ? "Rotating..." : "Rotate"}
-                      </Button>
-                    </AlertDialogTrigger>
-                    <AlertDialogContent>
-                      <AlertDialogHeader>
-                        <AlertDialogTitle>
-                          Generate a new signing key?
-                        </AlertDialogTitle>
-                        <AlertDialogDescription>
-                          This costs nothing: the current key keeps signing
-                          every session already established with it. New logins
-                          and refreshes for &ldquo;{client.name}&rdquo; will use
-                          the new key from now on. The old key stays published
-                          until nothing references it any longer.
-                        </AlertDialogDescription>
-                      </AlertDialogHeader>
-                      <AlertDialogFooter>
-                        <AlertDialogCancel disabled={rotating}>
-                          Cancel
-                        </AlertDialogCancel>
-                        <AlertDialogAction
-                          disabled={rotating}
-                          onClick={handleRotate}
-                        >
-                          {rotating ? "Rotating..." : "Generate new key"}
-                        </AlertDialogAction>
-                      </AlertDialogFooter>
-                    </AlertDialogContent>
-                  </AlertDialog>
-                </div>
-                <Input
-                  readOnly
-                  value={authKey.kid}
-                  className="font-mono text-sm"
-                />
+          <div className="flex flex-col gap-4 flex-1 min-h-0 overflow-y-auto px-4 pb-4">
+            {loading ? (
+              <p className="text-muted-foreground text-sm">Loading…</p>
+            ) : !authKey ? (
+              <div className="flex flex-col gap-3 rounded-lg border p-4 bg-muted/50">
+                <p className="text-sm">
+                  No AT Protocol client authentication key has been generated
+                  for this client yet.
+                </p>
+                <Button
+                  onClick={handleGenerate}
+                  disabled={generating}
+                  className="w-fit"
+                >
+                  {generating ? "Generating..." : "Generate"}
+                </Button>
               </div>
-
-              <div className="flex flex-col gap-2">
-                <Label>jwks_uri</Label>
-                <div className="flex gap-2">
+            ) : (
+              <>
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <Label>Key ID</Label>
+                    <AlertDialog
+                      open={rotateConfirmOpen}
+                      onOpenChange={setRotateConfirmOpen}
+                    >
+                      <AlertDialogTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          disabled={rotating}
+                        >
+                          <RefreshCw
+                            className={`size-3.5 ${rotating ? "animate-spin" : ""}`}
+                          />
+                          {rotating ? "Rotating..." : "Rotate"}
+                        </Button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent>
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>
+                            Generate a new signing key?
+                          </AlertDialogTitle>
+                          <AlertDialogDescription>
+                            This costs nothing: the current key keeps signing
+                            every session already established with it. New
+                            logins and refreshes for &ldquo;{client.name}&rdquo;
+                            will use the new key from now on. The old key stays
+                            published until nothing references it any longer.
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel disabled={rotating}>
+                            Cancel
+                          </AlertDialogCancel>
+                          <AlertDialogAction
+                            disabled={rotating}
+                            onClick={handleRotate}
+                          >
+                            {rotating ? "Rotating..." : "Generate new key"}
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
+                  </div>
                   <Input
                     readOnly
-                    value={authKey.jwks_uri}
+                    value={authKey.kid}
                     className="font-mono text-sm"
                   />
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    onClick={() => handleCopy(authKey.jwks_uri, "jwks_uri")}
-                    title="Copy to clipboard"
-                  >
-                    {copiedField === "jwks_uri" ? (
-                      <Check className="size-4" />
-                    ) : (
-                      <Copy className="size-4" />
-                    )}
-                  </Button>
                 </div>
-                <p className="text-muted-foreground text-xs">
-                  Publish this exact value as{" "}
-                  <code className="bg-muted px-1 rounded">jwks_uri</code> in the
-                  client metadata document served at this client&apos;s Client
-                  ID URL.
-                </p>
-              </div>
 
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center justify-between">
-                  <Label>Fields to publish</Label>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => handleCopy(snippet, "snippet")}
-                  >
-                    {copiedField === "snippet" ? (
-                      <Check className="size-3.5" />
-                    ) : (
-                      <Copy className="size-3.5" />
-                    )}
-                    Copy
-                  </Button>
-                </div>
-                <pre className="rounded-lg border bg-muted/50 p-3 text-xs font-mono overflow-x-auto">
-                  {snippet}
-                </pre>
-                <p className="text-muted-foreground text-xs break-all">
-                  Add these three fields to the document served at{" "}
-                  <span className="font-mono">{client.client_id_url}</span>.
-                </p>
-              </div>
-
-              <div className="flex flex-col gap-2 rounded-lg border p-4">
-                <div className="flex items-center justify-between">
-                  <Label>Status</Label>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={runRecheck}
-                    disabled={rechecking}
-                  >
-                    <RefreshCw
-                      className={`size-3.5 ${rechecking ? "animate-spin" : ""}`}
+                <div className="flex flex-col gap-2">
+                  <Label>jwks_uri</Label>
+                  <div className="flex gap-2">
+                    <Input
+                      readOnly
+                      value={authKey.jwks_uri}
+                      className="font-mono text-sm"
                     />
-                    {rechecking ? "Checking..." : "Re-check"}
-                  </Button>
-                </div>
-                {recheckFailed ? (
-                  <p className="text-destructive text-sm">
-                    Re-check failed — HappyView couldn&apos;t complete the
-                    check. Try again.
-                  </p>
-                ) : rechecking && !probe ? (
-                  <p className="text-muted-foreground text-sm">Checking…</p>
-                ) : probe ? (
-                  <div className="flex flex-col gap-1.5">
-                    <Badge
-                      variant={probe.confidential ? "default" : "outline"}
-                      className="w-fit"
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      onClick={() => handleCopy(authKey.jwks_uri, "jwks_uri")}
+                      title="Copy to clipboard"
                     >
-                      {probe.confidential ? "Confidential" : "Not confidential"}
-                    </Badge>
-                    <p className="text-sm whitespace-pre-wrap break-words">
-                      {probe.reason}
-                    </p>
-                    <p className="text-muted-foreground text-xs">
-                      Checked {new Date(probe.checked_at).toLocaleString()}
-                    </p>
-                  </div>
-                ) : (
-                  <p className="text-muted-foreground text-sm">
-                    Not checked yet.
-                  </p>
-                )}
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <Label>Retiring and revoked keys</Label>
-                <p className="text-muted-foreground text-xs">
-                  To contain a leaked key: rotate first (the leaked one becomes
-                  retiring, so the client keeps working), then revoke the
-                  retiring key below. Revoking is immediate and destroys every
-                  session pinned to that key — it is the correct response to a
-                  leak, not routine cleanup.
-                </p>
-
-                {keysLoading && (
-                  <p className="text-sm text-muted-foreground">
-                    Loading keys...
-                  </p>
-                )}
-
-                {!keysLoading && keysError && (
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="text-destructive text-sm">{keysError}</p>
-                    <Button variant="outline" size="sm" onClick={loadKeys}>
-                      Retry
+                      {copiedField === "jwks_uri" ? (
+                        <Check className="size-4" />
+                      ) : (
+                        <Copy className="size-4" />
+                      )}
                     </Button>
                   </div>
-                )}
-
-                {!keysLoading && !keysError && keys.length === 0 && (
-                  <p className="text-sm text-muted-foreground">
-                    No signing keys yet.
-                  </p>
-                )}
-
-                {!keysLoading &&
-                  !keysError &&
-                  keys.map((key) => (
-                    <div
-                      key={key.kid}
-                      className="flex flex-col gap-1.5 rounded-lg border p-3 sm:flex-row sm:items-center sm:justify-between"
-                    >
-                      <div className="flex flex-col gap-1.5">
-                        <div className="flex items-center gap-2">
-                          {keyStatusBadge(key.status)}
-                          <span className="font-mono text-sm">{key.kid}</span>
-                        </div>
-                        <p className="text-xs text-muted-foreground">
-                          Created {new Date(key.created_at).toLocaleString()} ·{" "}
-                          {key.status === "revoked" ? (
-                            <>
-                              {key.session_count} session
-                              {key.session_count === 1 ? "" : "s"} destroyed
-                              when this key was revoked
-                            </>
-                          ) : (
-                            <>
-                              {key.session_count} live session
-                              {key.session_count === 1 ? "" : "s"}
-                            </>
-                          )}
-                        </p>
-                      </div>
-
-                      {key.status === "retiring" && (
-                        <AlertDialog
-                          open={revokeTarget?.kid === key.kid}
-                          onOpenChange={(o) => !o && setRevokeTarget(null)}
-                        >
-                          <AlertDialogTrigger asChild>
-                            <Button
-                              variant="destructive"
-                              size="sm"
-                              onClick={() => setRevokeTarget(key)}
-                              className="w-fit"
-                            >
-                              <ShieldAlert className="size-4" />
-                              Revoke now
-                            </Button>
-                          </AlertDialogTrigger>
-                          <AlertDialogContent>
-                            <AlertDialogHeader>
-                              <AlertDialogTitle>
-                                Revoke this key immediately?
-                              </AlertDialogTitle>
-                              <AlertDialogDescription asChild>
-                                <div className="flex flex-col gap-2 text-sm text-muted-foreground">
-                                  <p>
-                                    This is the response to a leaked or
-                                    compromised key, not routine cleanup.
-                                    Revoking removes{" "}
-                                    <span className="font-mono">{key.kid}</span>{" "}
-                                    from the published JWKS immediately.
-                                  </p>
-                                  <p className="font-medium text-foreground">
-                                    {key.session_count > 0
-                                      ? `${key.session_count} live session${key.session_count === 1 ? "" : "s"} pinned to this key will be destroyed and their users signed out.`
-                                      : "No live sessions are pinned to this key, so revoking it is free."}
-                                  </p>
-                                  <p>This cannot be undone.</p>
-                                </div>
-                              </AlertDialogDescription>
-                            </AlertDialogHeader>
-                            <AlertDialogFooter>
-                              <AlertDialogCancel disabled={revoking}>
-                                Cancel
-                              </AlertDialogCancel>
-                              <AlertDialogAction
-                                variant="destructive"
-                                disabled={revoking}
-                                onClick={handleRevoke}
-                              >
-                                {revoking ? "Revoking..." : "Revoke now"}
-                              </AlertDialogAction>
-                            </AlertDialogFooter>
-                          </AlertDialogContent>
-                        </AlertDialog>
-                      )}
-                    </div>
-                  ))}
-              </div>
-
-              {liveKeyCount > 0 && (
-                <div className="flex flex-col gap-2 rounded-lg border border-destructive/50 p-4">
-                  <Label className="text-destructive">Remove key</Label>
                   <p className="text-muted-foreground text-xs">
-                    Un-delegates &ldquo;{client.name}&rdquo; entirely, taking it
-                    back to holding no signing key. Unlike the per-key revoke
-                    above, this also removes the{" "}
-                    <span className="font-mono">current</span> key.
+                    Publish this exact value as{" "}
+                    <code className="bg-muted px-1 rounded">jwks_uri</code> in
+                    the client metadata document served at this client&apos;s
+                    Client ID URL.
                   </p>
-                  <p className="text-foreground text-xs">
-                    This does <span className="font-semibold">not</span>{" "}
-                    gracefully downgrade the app to a public client. As long as
-                    its document at{" "}
-                    <span className="font-mono">{client.client_id_url}</span>{" "}
-                    still advertises{" "}
-                    <code className="bg-muted px-1 rounded">
-                      token_endpoint_auth_method
-                    </code>
-                    ,{" "}
-                    <code className="bg-muted px-1 rounded">
-                      token_endpoint_auth_signing_alg
-                    </code>
-                    , and{" "}
-                    <code className="bg-muted px-1 rounded">jwks_uri</code>, an
-                    authorization server will fetch an empty key set and reject
-                    the client outright, and{" "}
-                    <span className="font-mono">/oauth/client-assertion</span>{" "}
-                    will start returning 400. The app will be{" "}
-                    <span className="font-semibold">
-                      broken, not downgraded
-                    </span>
-                    , until those three fields are removed from that document
-                    too.
-                  </p>
-                  <AlertDialog
-                    open={removeAllOpen}
-                    onOpenChange={setRemoveAllOpen}
-                  >
-                    <AlertDialogTrigger asChild>
-                      <Button
-                        variant="destructive"
-                        size="sm"
-                        className="w-fit"
-                        disabled={removingAll}
-                      >
-                        <ShieldAlert className="size-4" />
-                        Remove key
-                      </Button>
-                    </AlertDialogTrigger>
-                    <AlertDialogContent>
-                      <AlertDialogHeader>
-                        <AlertDialogTitle>
-                          Remove every signing key?
-                        </AlertDialogTitle>
-                        <AlertDialogDescription asChild>
-                          <div className="flex flex-col gap-2 text-sm text-muted-foreground">
-                            <p>
-                              This removes all {liveKeyCount} key
-                              {liveKeyCount === 1 ? "" : "s"} held by &ldquo;
-                              {client.name}&rdquo; — including the current one —
-                              from the published JWKS immediately. &ldquo;
-                              {client.name}&rdquo; stops being a confidential
-                              OAuth client.
-                            </p>
-                            <p className="font-medium text-foreground">
-                              {liveSessionCount > 0
-                                ? `${liveSessionCount} live session${liveSessionCount === 1 ? "" : "s"} pinned to these keys will be destroyed and their users signed out.`
-                                : "No live sessions are pinned to these keys, so removing them is free."}
-                            </p>
-                            <p className="font-medium text-foreground">
-                              This does not gracefully downgrade the app: if its
-                              published document still advertises{" "}
-                              <code className="bg-muted px-1 rounded">
-                                token_endpoint_auth_method
-                              </code>
-                              ,{" "}
-                              <code className="bg-muted px-1 rounded">
-                                token_endpoint_auth_signing_alg
-                              </code>
-                              , and{" "}
-                              <code className="bg-muted px-1 rounded">
-                                jwks_uri
-                              </code>
-                              , an authorization server will fetch an empty key
-                              set and reject the client outright, and{" "}
-                              <span className="font-mono">
-                                /oauth/client-assertion
-                              </span>{" "}
-                              will start returning 400 until you remove those
-                              three fields from that document too.
-                            </p>
-                            <p>
-                              This cannot be undone. A new key can be
-                              provisioned afterward, but it will be a different
-                              key, and every session pinned to these ones is
-                              gone.
-                            </p>
-                          </div>
-                        </AlertDialogDescription>
-                      </AlertDialogHeader>
-                      <AlertDialogFooter>
-                        <AlertDialogCancel disabled={removingAll}>
-                          Cancel
-                        </AlertDialogCancel>
-                        <AlertDialogAction
-                          variant="destructive"
-                          disabled={removingAll}
-                          onClick={handleRemoveAll}
-                        >
-                          {removingAll ? "Removing..." : "Remove key"}
-                        </AlertDialogAction>
-                      </AlertDialogFooter>
-                    </AlertDialogContent>
-                  </AlertDialog>
                 </div>
+
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <Label>Fields to publish</Label>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleCopy(snippet, "snippet")}
+                    >
+                      {copiedField === "snippet" ? (
+                        <Check className="size-3.5" />
+                      ) : (
+                        <Copy className="size-3.5" />
+                      )}
+                      Copy
+                    </Button>
+                  </div>
+                  <pre className="rounded-lg border bg-muted/50 p-3 text-xs font-mono overflow-x-auto">
+                    {snippet}
+                  </pre>
+                  <p className="text-muted-foreground text-xs break-all">
+                    Add these three fields to the document served at{" "}
+                    <span className="font-mono">{client.client_id_url}</span>.
+                  </p>
+                </div>
+
+                <div className="flex flex-col gap-2 rounded-lg border p-4">
+                  <div className="flex items-center justify-between">
+                    <Label>Status</Label>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={runRecheck}
+                      disabled={rechecking}
+                    >
+                      <RefreshCw
+                        className={`size-3.5 ${rechecking ? "animate-spin" : ""}`}
+                      />
+                      {rechecking ? "Checking..." : "Re-check"}
+                    </Button>
+                  </div>
+                  {recheckFailed ? (
+                    <p className="text-destructive text-sm">
+                      Re-check failed — HappyView couldn&apos;t complete the
+                      check. Try again.
+                    </p>
+                  ) : rechecking && !probe ? (
+                    <p className="text-muted-foreground text-sm">Checking…</p>
+                  ) : probe ? (
+                    <div className="flex flex-col gap-1.5">
+                      <Badge
+                        variant={probe.confidential ? "default" : "outline"}
+                        className="w-fit"
+                      >
+                        {probe.confidential
+                          ? "Confidential"
+                          : "Not confidential"}
+                      </Badge>
+                      <p className="text-sm whitespace-pre-wrap break-words">
+                        {probe.reason}
+                      </p>
+                      <p className="text-muted-foreground text-xs">
+                        Checked {new Date(probe.checked_at).toLocaleString()}
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="text-muted-foreground text-sm">
+                      Not checked yet.
+                    </p>
+                  )}
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  <Label>Retiring and revoked keys</Label>
+                  <p className="text-muted-foreground text-xs">
+                    To contain a leaked key: rotate first (the leaked one
+                    becomes retiring, so the client keeps working), then revoke
+                    the retiring key below. Revoking is immediate and destroys
+                    every session pinned to that key — it is the correct
+                    response to a leak, not routine cleanup.
+                  </p>
+
+                  {keysLoading && (
+                    <p className="text-sm text-muted-foreground">
+                      Loading keys...
+                    </p>
+                  )}
+
+                  {!keysLoading && keysError && (
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-destructive text-sm">{keysError}</p>
+                      <Button variant="outline" size="sm" onClick={loadKeys}>
+                        Retry
+                      </Button>
+                    </div>
+                  )}
+
+                  {!keysLoading && !keysError && keys.length === 0 && (
+                    <p className="text-sm text-muted-foreground">
+                      No signing keys yet.
+                    </p>
+                  )}
+
+                  {!keysLoading &&
+                    !keysError &&
+                    keys.map((key) => (
+                      <div
+                        key={key.kid}
+                        className="flex flex-col gap-1.5 rounded-lg border p-3 sm:flex-row sm:items-center sm:justify-between"
+                      >
+                        <div className="flex flex-col gap-1.5">
+                          <div className="flex items-center gap-2">
+                            {keyStatusBadge(key.status)}
+                            <span className="font-mono text-sm">{key.kid}</span>
+                          </div>
+                          <p className="text-xs text-muted-foreground">
+                            Created {new Date(key.created_at).toLocaleString()}{" "}
+                            ·{" "}
+                            {key.status === "revoked" ? (
+                              <>
+                                {key.session_count} session
+                                {key.session_count === 1 ? "" : "s"} destroyed
+                                when this key was revoked
+                              </>
+                            ) : (
+                              <>
+                                {key.session_count} live session
+                                {key.session_count === 1 ? "" : "s"}
+                              </>
+                            )}
+                          </p>
+                        </div>
+
+                        {key.status === "retiring" && (
+                          <AlertDialog
+                            open={revokeTarget?.kid === key.kid}
+                            onOpenChange={(o) => !o && setRevokeTarget(null)}
+                          >
+                            <AlertDialogTrigger asChild>
+                              <Button
+                                variant="destructive"
+                                size="sm"
+                                onClick={() => setRevokeTarget(key)}
+                                className="w-fit"
+                              >
+                                <ShieldAlert className="size-4" />
+                                Revoke now
+                              </Button>
+                            </AlertDialogTrigger>
+                            <AlertDialogContent>
+                              <AlertDialogHeader>
+                                <AlertDialogTitle>
+                                  Revoke this key immediately?
+                                </AlertDialogTitle>
+                                <AlertDialogDescription asChild>
+                                  <div className="flex flex-col gap-2 text-sm text-muted-foreground">
+                                    <p>
+                                      This is the response to a leaked or
+                                      compromised key, not routine cleanup.
+                                      Revoking removes{" "}
+                                      <span className="font-mono">
+                                        {key.kid}
+                                      </span>{" "}
+                                      from the published JWKS immediately.
+                                    </p>
+                                    <p className="font-medium text-foreground">
+                                      {key.session_count > 0
+                                        ? `${key.session_count} live session${key.session_count === 1 ? "" : "s"} pinned to this key will be destroyed and their users signed out.`
+                                        : "No live sessions are pinned to this key, so revoking it is free."}
+                                    </p>
+                                    <p>This cannot be undone.</p>
+                                  </div>
+                                </AlertDialogDescription>
+                              </AlertDialogHeader>
+                              <AlertDialogFooter>
+                                <AlertDialogCancel disabled={revoking}>
+                                  Cancel
+                                </AlertDialogCancel>
+                                <AlertDialogAction
+                                  variant="destructive"
+                                  disabled={revoking}
+                                  onClick={handleRevoke}
+                                >
+                                  {revoking ? "Revoking..." : "Revoke now"}
+                                </AlertDialogAction>
+                              </AlertDialogFooter>
+                            </AlertDialogContent>
+                          </AlertDialog>
+                        )}
+                      </div>
+                    ))}
+                </div>
+              </>
+            )}
+          </div>
+
+          <SheetFooter className="border-t flex-row items-center justify-between gap-2">
+            <div>
+              {liveKeyCount > 0 && (
+                <Button
+                  type="button"
+                  variant="destructive"
+                  size="sm"
+                  disabled={removingAll}
+                  onClick={() => setRemoveAllOpen(true)}
+                >
+                  <ShieldAlert className="size-4" />
+                  Remove key
+                </Button>
               )}
-            </>
-          )}
+            </div>
+            <SheetClose asChild>
+              <Button variant="outline">Close</Button>
+            </SheetClose>
+          </SheetFooter>
+        </SheetContent>
+      </Sheet>
+
+      <RemoveKeySheet
+        open={removeAllOpen}
+        onOpenChange={setRemoveAllOpen}
+        client={client}
+        liveKeyCount={liveKeyCount}
+        liveSessionCount={liveSessionCount}
+        removing={removingAll}
+        onConfirm={handleRemoveAll}
+      />
+    </>
+  );
+}
+
+function RemoveKeySheet({
+  open,
+  onOpenChange,
+  client,
+  liveKeyCount,
+  liveSessionCount,
+  removing,
+  onConfirm,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  client: ApiClientSummary;
+  liveKeyCount: number;
+  liveSessionCount: number;
+  removing: boolean;
+  onConfirm: () => void;
+}) {
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent className="sm:max-w-lg flex flex-col overflow-hidden">
+        <SheetHeader>
+          <SheetTitle>Remove every signing key?</SheetTitle>
+          <SheetDescription>
+            This is the response to a leaked or compromised key, not routine
+            cleanup.
+          </SheetDescription>
+        </SheetHeader>
+
+        <div className="flex flex-col gap-4 flex-1 min-h-0 overflow-y-auto px-4 pb-4 text-sm text-muted-foreground">
+          <p>
+            This removes{" "}
+            {liveKeyCount === 1 ? "the only key" : `all ${liveKeyCount} keys`}{" "}
+            held by &ldquo;{client.name}
+            &rdquo; — including the <span className="font-mono">
+              current
+            </span>{" "}
+            one — from the published JWKS immediately. &ldquo;{client.name}
+            &rdquo; stops being a confidential OAuth client.
+          </p>
+
+          <p className="font-medium text-foreground">
+            {liveSessionCount > 0
+              ? `${liveSessionCount} live session${liveSessionCount === 1 ? "" : "s"} pinned to these keys will be destroyed and their users signed out.`
+              : "No live sessions are pinned to these keys, so removing them is free."}
+          </p>
+
+          <div className="flex flex-col gap-2 rounded-lg border p-4">
+            <p className="font-medium text-foreground">
+              This does not gracefully downgrade the app to a public client.
+            </p>
+            <p>
+              As long as the document at{" "}
+              <span className="font-mono break-all">
+                {client.client_id_url}
+              </span>{" "}
+              still advertises
+            </p>
+            <ul className="flex flex-col gap-1 pl-4 list-disc font-mono text-xs">
+              <li>token_endpoint_auth_method</li>
+              <li>token_endpoint_auth_signing_alg</li>
+              <li>jwks_uri</li>
+            </ul>
+            <p>
+              an authorization server will fetch an empty key set and reject the
+              client outright, and{" "}
+              <span className="font-mono">/oauth/client-assertion</span> will
+              start returning 400.
+            </p>
+            <p className="font-semibold text-foreground">
+              The app will be broken, not downgraded, until those three fields
+              are removed from that document too.
+            </p>
+          </div>
+
+          <p>
+            This cannot be undone. A new key can be provisioned afterward, but
+            it will be a different key, and every session pinned to these ones
+            is gone.
+          </p>
         </div>
 
-        <ResponsiveDialogFooter>
-          <ResponsiveDialogClose asChild>
-            <Button variant="outline">Close</Button>
-          </ResponsiveDialogClose>
-        </ResponsiveDialogFooter>
-      </ResponsiveDialogContent>
-    </ResponsiveDialog>
+        <SheetFooter className="border-t flex-row justify-end gap-2">
+          <SheetClose asChild>
+            <Button variant="outline" disabled={removing}>
+              Cancel
+            </Button>
+          </SheetClose>
+          <Button variant="destructive" disabled={removing} onClick={onConfirm}>
+            <ShieldAlert className="size-4" />
+            {removing ? "Removing..." : "Remove key"}
+          </Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   );
 }
 

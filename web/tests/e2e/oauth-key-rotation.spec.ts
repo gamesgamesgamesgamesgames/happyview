@@ -65,18 +65,24 @@ async function completeAttachAccountOAuth(
   const authButton = page.getByRole("button", { name: /authenticate as/i });
   await authButton.click();
 
-  await page.waitForURL(/pds\.localhost/, { timeout: 30000 });
+  await page.waitForURL(/pds\.localhost/, { timeout: 60000 });
   await page.locator("#username").fill(account.handle);
   await page.locator("#password").fill(PDS_PASSWORD);
   await page.locator("button[type='submit']").click();
 
+  // These waits were originally capped at 30s because the test
+  // itself only had Playwright's 30s default. Waiting longer was pointless
+  // because the test would die first. Now the describe allows 180s, so the cap can
+  // reflect what a real OAuth round-trip against a containerised PDS on a
+  // loaded machine actually needs. Nothing here asserts the flow is *fast*;
+  // the assertion is that it completes.
   const authorizeButton = page.getByRole("button", { name: /^authorize$/i });
   const outcome = await Promise.any([
     page
-      .waitForURL(/sslip\.io/, { timeout: 30000 })
+      .waitForURL(/sslip\.io/, { timeout: 90000 })
       .then(() => "callback" as const),
-    authorizeButton.waitFor({ timeout: 30000 }).then(() => "consent" as const),
-  ]).catch(() => "neither consent nor callback within 30s");
+    authorizeButton.waitFor({ timeout: 90000 }).then(() => "consent" as const),
+  ]).catch(() => "neither consent nor callback within 90s");
   expect(
     outcome === "consent" || outcome === "callback",
     `expected the PDS consent screen or a redirect back, got ${outcome} at ${page.url()}`,
@@ -92,6 +98,8 @@ async function completeAttachAccountOAuth(
 }
 
 test.describe("OAuth instance key rotation — live proof against a real PDS", () => {
+  test.describe.configure({ timeout: 180_000 });
+
   let accountA: { did: string; handle: string };
   let accountB: { did: string; handle: string };
   let kidBeforeRotation: string;
@@ -104,7 +112,7 @@ test.describe("OAuth instance key rotation — live proof against a real PDS", (
   test("a session pinned to the retiring key survives a forced refresh after rotation", async ({
     page,
   }) => {
-    test.setTimeout(420_000);
+    test.setTimeout(900_000);
 
     accountA = await createPdsAccount();
     await resetServiceIdentity();
