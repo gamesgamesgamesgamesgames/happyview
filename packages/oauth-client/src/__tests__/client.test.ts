@@ -290,6 +290,102 @@ describe("HappyViewOAuthClient", () => {
     });
   });
 
+  describe("registerSession", () => {
+    const registered = {
+      status: 201,
+      body: {
+        session_id: "sess_new",
+        did: "did:plc:testuser",
+        scopes: ["atproto"],
+      },
+    };
+
+    function newSessionParams(dpopKey: JsonWebKey) {
+      return {
+        provisionId: "hvp_new",
+        did: "did:plc:testuser",
+        accessToken: "at_new",
+        scopes: "atproto",
+        dpopKey,
+      };
+    }
+
+    test("retires this client's previous session for the same account", async () => {
+      const oldJwk = await generateTestJwk();
+      const newJwk = await generateTestJwk();
+      const storage = await storageWithSession(oldJwk);
+      const { fetchFn, calls } = createMockFetch([
+        registered,
+        { status: 204, body: null },
+      ]);
+
+      const client = createClient({ fetchFn, storage });
+      await client.registerSession(newSessionParams(newJwk));
+
+      const del = calls.find((c) => c.init.method === "DELETE");
+      expect(del).toBeDefined();
+      expect(del!.url).toBe(
+        "https://happyview.example.com/oauth/sessions/did:plc:testuser",
+      );
+    });
+
+    test("stores the new session even though the old one was retired", async () => {
+      const oldJwk = await generateTestJwk();
+      const newJwk = await generateTestJwk();
+      const storage = await storageWithSession(oldJwk);
+      const { fetchFn } = createMockFetch([registered, { status: 204, body: null }]);
+
+      const client = createClient({ fetchFn, storage });
+      await client.registerSession(newSessionParams(newJwk));
+
+      const stored = JSON.parse(
+        (await storage.get(`${STORAGE_PREFIX}did:plc:testuser`))!,
+      );
+      expect(stored.accessToken).toBe("at_new");
+      expect(await storage.get(LAST_ACTIVE_KEY)).toBe("did:plc:testuser");
+    });
+
+    test("makes no revocation call when there is no previous session", async () => {
+      const newJwk = await generateTestJwk();
+      const { fetchFn, calls } = createMockFetch([registered]);
+
+      const client = createClient({ fetchFn, storage: new MemoryStorage() });
+      await client.registerSession(newSessionParams(newJwk));
+
+      expect(calls.filter((c) => c.init.method === "DELETE")).toHaveLength(0);
+    });
+
+    test("leaves another account's session alone", async () => {
+      const otherJwk = await generateTestJwk();
+      const newJwk = await generateTestJwk();
+      const storage = await storageWithSession(otherJwk, "did:plc:someoneelse");
+      const { fetchFn, calls } = createMockFetch([registered]);
+
+      const client = createClient({ fetchFn, storage });
+      await client.registerSession(newSessionParams(newJwk));
+
+      expect(calls.filter((c) => c.init.method === "DELETE")).toHaveLength(0);
+      expect(
+        await storage.get(`${STORAGE_PREFIX}did:plc:someoneelse`),
+      ).not.toBeNull();
+    });
+
+    test("a failed retirement does not fail the login", async () => {
+      const oldJwk = await generateTestJwk();
+      const newJwk = await generateTestJwk();
+      const storage = await storageWithSession(oldJwk);
+      const { fetchFn } = createMockFetch([
+        registered,
+        { status: 500, body: { error: "boom" } },
+      ]);
+
+      const client = createClient({ fetchFn, storage });
+      const session = await client.registerSession(newSessionParams(newJwk));
+
+      expect(session.did).toBe("did:plc:testuser");
+    });
+  });
+
   describe("deleteSession", () => {
     test("calls DELETE /oauth/sessions/:did", async () => {
       const testJwk = await generateTestJwk();

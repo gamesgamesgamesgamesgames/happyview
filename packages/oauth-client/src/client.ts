@@ -203,6 +203,9 @@ export class HappyViewOAuthClient {
     }
 
     const data: RegisterSessionResponse = await resp.json();
+
+    await this.retirePreviousSession(data.did, params.dpopKey);
+
     const dpopKey = await importJwk(params.dpopKey);
 
     const storedSession: StoredSession = {
@@ -237,6 +240,39 @@ export class HappyViewOAuthClient {
     this.sessionHooks.onSessionUpdate?.(data.did);
 
     return session;
+  }
+
+  /**
+   * Revoke this client's previous session for `did`, when the login that just
+   * completed replaced it.
+   */
+  private async retirePreviousSession(
+    did: string,
+    newDpopKey: JsonWebKey,
+  ): Promise<void> {
+    try {
+      const raw = await this.storage.get(`${STORAGE_PREFIX}${did}`);
+      if (!raw) return;
+
+      const previous = JSON.parse(raw) as StoredSession;
+
+      if (
+        typeof newDpopKey.x === "string" &&
+        previous.dpopKey?.x === newDpopKey.x &&
+        previous.dpopKey?.y === newDpopKey.y
+      ) {
+        return;
+      }
+
+      const session = await this.restoreSession(did);
+      if (!session) return;
+
+      await session.fetchHandler(`${this.instanceUrl}/oauth/sessions/${did}`, {
+        method: "DELETE",
+      });
+    } catch {
+      // Best effort — see above.
+    }
   }
 
   /**
