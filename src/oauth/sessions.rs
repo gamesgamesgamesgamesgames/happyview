@@ -283,6 +283,48 @@ pub async fn get_dpop_session_by_key_id(
     })
 }
 
+/// Every DPoP key id this user holds a session under with this client.
+pub async fn dpop_key_ids_for_user(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    user_did: &str,
+) -> Result<Vec<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT dpop_key_id FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ?",
+        backend,
+    );
+    let rows: Vec<(String,)> = crate::db::query_as(&sql)
+        .bind(api_client_id)
+        .bind(user_did)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list DPoP session keys: {e}")))?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// The DPoP key id backing one session row, checked against its owner.
+pub async fn dpop_key_id_for_session(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    session_id: &str,
+    api_client_id: &str,
+    user_did: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT dpop_key_id FROM happyview_dpop_sessions WHERE id = ? AND api_client_id = ? AND user_did = ?",
+        backend,
+    );
+    let row: Option<(String,)> = crate::db::query_as(&sql)
+        .bind(session_id)
+        .bind(api_client_id)
+        .bind(user_did)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to look up DPoP session: {e}")))?;
+    Ok(row.map(|(id,)| id))
+}
+
 /// Delete a DPoP session by api_client_id, user_did, and dpop_key_id (device-specific).
 pub async fn delete_dpop_session(
     pool: &sqlx::AnyPool,

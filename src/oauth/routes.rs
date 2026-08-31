@@ -572,6 +572,40 @@ async fn get_session(
     Ok(Json(GetSessionResponse { did, scopes }))
 }
 
+/// Revoke sessions at the user's authorization server, then report nothing.
+async fn revoke_sessions_best_effort(
+    state: &AppState,
+    api_client_id: &str,
+    did: &str,
+    dpop_key_ids: &[String],
+) {
+    let Some(encryption_key) = state.config.token_encryption_key.as_ref() else {
+        return;
+    };
+
+    for dpop_key_id in dpop_key_ids {
+        if let Err(e) = crate::oauth::pds_write::revoke_dpop_session_at_as(
+            &state.http,
+            &state.db,
+            state.db_backend,
+            encryption_key,
+            &state.oauth,
+            api_client_id,
+            did,
+            dpop_key_id,
+        )
+        .await
+        {
+            tracing::warn!(
+                %e,
+                user_did = %did,
+                %api_client_id,
+                "failed to revoke session at authorization server; deleting locally anyway"
+            );
+        }
+    }
+}
+
 /// DELETE /oauth/sessions/:did — logout / revoke a session.
 ///
 /// With `X-Client-Secret`, every session for this user+client is revoked.
@@ -601,10 +635,22 @@ async fn delete_session(
     match authenticated.dpop_key_id {
         // Confidential clients: delete all sessions for this user+client
         None => {
+            let key_ids =
+                sessions::dpop_key_ids_for_user(&state.db, state.db_backend, &client.id, &did)
+                    .await
+                    .unwrap_or_default();
+            revoke_sessions_best_effort(&state, &client.id, &did, &key_ids).await;
             sessions::delete_all_dpop_sessions(&state.db, state.db_backend, &client.id, &did)
                 .await?;
         }
         Some(dpop_key_id) => {
+            revoke_sessions_best_effort(
+                &state,
+                &client.id,
+                &did,
+                std::slice::from_ref(&dpop_key_id),
+            )
+            .await;
             sessions::delete_dpop_session(
                 &state.db,
                 state.db_backend,
@@ -715,6 +761,19 @@ async fn delete_device_session(
     let client = authenticate_request_client(&state, &headers, &request_path, "DELETE")
         .await?
         .resolved;
+
+    if let Ok(Some(dpop_key_id)) = sessions::dpop_key_id_for_session(
+        &state.db,
+        state.db_backend,
+        &session_id,
+        &client.id,
+        &did,
+    )
+    .await
+    {
+        revoke_sessions_best_effort(&state, &client.id, &did, std::slice::from_ref(&dpop_key_id))
+            .await;
+    }
 
     sessions::delete_dpop_session_by_id(&state.db, state.db_backend, &session_id, &client.id, &did)
         .await?;
