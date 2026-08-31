@@ -3,7 +3,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::{SigningKey, signature::Signer};
 use sha2::{Digest, Sha256};
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use crate::auth::OAuthClientRegistry;
 use crate::db::DatabaseBackend;
@@ -284,10 +285,31 @@ async fn send_once(
     BufferedResponse::read(resp).await
 }
 
+/// Serialised refresh slots, keyed by the session a refresh would rewrite.
+static REFRESH_LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The refresh slot for one session, created on first use.
+fn refresh_lock(
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    // Unit separator: it cannot occur in a client id, DID or key id, so no
+    // combination of the three can collide with a different triple.
+    let key = format!("{api_client_id}\u{1f}{user_did}\u{1f}{dpop_key_id}");
+    let mut locks = REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    // Bound memory: drop slots nobody is waiting on once the map grows large.
+    if locks.len() > 10_000 {
+        locks.retain(|_, slot| Arc::strong_count(slot) > 1);
+    }
+    locks
+        .entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Refresh the access token and retry the PDS request.
-///
-/// If the refresh fails with `invalid_grant`, re-reads the session from the
-/// database — a concurrent request may have already refreshed the token.
 #[allow(clippy::too_many_arguments)]
 async fn retry_after_refresh(
     http: &reqwest::Client,
@@ -302,56 +324,78 @@ async fn retry_after_refresh(
     request_builder: &impl Fn(&reqwest::Client, &str, &str) -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, AppError> {
     let stale_access_token = creds.session.access_token.clone();
+    let api_client_id = creds.session.api_client_id.clone();
+    let user_did = creds.session.user_did.clone();
+    let dpop_key_id = creds.session.dpop_key_id.clone();
 
-    if let Err(e) =
-        refresh_access_token(http, pool, backend, encryption_key, oauth_registry, creds).await
+    // Scoped so the slot is released before the retried PDS request goes out —
+    // it guards the refresh, not the work that follows it.
     {
-        // If the refresh token was rejected, check whether a concurrent request
-        // already refreshed the session. Re-read from the database and compare
-        // the access token — if it changed, another refresh succeeded.
-        if is_invalid_grant_error(&e) {
+        let slot = refresh_lock(&api_client_id, &user_did, &dpop_key_id);
+        let _guard = slot.lock().await;
+
+        // Whoever held this slot before us may already have done the work.
+        // Re-reading here is what collapses N concurrent refreshes into one.
+        let fresh_session = super::sessions::get_dpop_session(
+            pool,
+            backend,
+            encryption_key,
+            &api_client_id,
+            &user_did,
+            &dpop_key_id,
+        )
+        .await?;
+
+        if fresh_session.access_token != stale_access_token {
+            tracing::debug!(
+                %user_did,
+                %api_client_id,
+                "another request refreshed this session, using its token"
+            );
+            creds.session = fresh_session;
+        } else if let Err(e) =
+            refresh_access_token(http, pool, backend, encryption_key, oauth_registry, creds).await
+        {
+            if !is_invalid_grant_error(&e) {
+                return Err(e);
+            }
+
+            // We hold the slot, so nothing in this process refreshed behind our
+            // back — but another instance may have. Re-read once before
+            // concluding anything about the grant.
             let fresh_session = super::sessions::get_dpop_session(
                 pool,
                 backend,
                 encryption_key,
-                &creds.session.api_client_id,
-                &creds.session.user_did,
-                &creds.session.dpop_key_id,
+                &api_client_id,
+                &user_did,
+                &dpop_key_id,
             )
             .await?;
 
             if fresh_session.access_token != stale_access_token {
                 tracing::info!(
-                    user_did = %creds.session.user_did,
-                    api_client_id = %creds.session.api_client_id,
+                    %user_did,
+                    %api_client_id,
                     "concurrent refresh detected, using updated token"
                 );
                 creds.session = fresh_session;
             } else {
-                // Session is unrecoverable — clean it up so future requests
-                // fail fast instead of repeating the same doomed refresh.
+                // ⚠ NOTHING IS DELETED HERE, AND THAT IS THE POINT. This used
+                // to call `delete_dpop_session`, which drops the session row
+                // *and* the `happyview_dpop_keys` row it depends on — so a
+                // client holding that key was not logged out, it was wedged:
+                // every later call 401s, including the `DELETE
+                // /oauth/sessions/{did}` that logout itself needs.
                 tracing::warn!(
-                    user_did = %creds.session.user_did,
-                    api_client_id = %creds.session.api_client_id,
-                    "refresh token permanently invalid, deleting broken session"
+                    %user_did,
+                    %api_client_id,
+                    "refresh token rejected and no concurrent refresh found; session left intact for re-authentication"
                 );
-                if let Err(del_err) = super::sessions::delete_dpop_session(
-                    pool,
-                    backend,
-                    &creds.session.api_client_id,
-                    &creds.session.user_did,
-                    &creds.session.dpop_key_id,
-                )
-                .await
-                {
-                    tracing::error!(%del_err, "failed to delete broken DPoP session");
-                }
                 return Err(AppError::Auth(
                     "session expired, please re-authenticate".into(),
                 ));
             }
-        } else {
-            return Err(e);
         }
     }
 
