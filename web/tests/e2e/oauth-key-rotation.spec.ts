@@ -1,7 +1,9 @@
 import { execSync } from "child_process";
 import { test, expect, type Page } from "@playwright/test";
 import {
+  awaitConsentOrCallback,
   loginAsTestAdmin,
+  submitPdsLogin,
   resetServiceIdentity,
   setServiceIdentityMode,
   getOauthSessionSigningKid,
@@ -66,9 +68,7 @@ async function completeAttachAccountOAuth(
   await authButton.click();
 
   await page.waitForURL(/pds\.localhost/, { timeout: 60000 });
-  await page.locator("#username").fill(account.handle);
-  await page.locator("#password").fill(PDS_PASSWORD);
-  await page.locator("button[type='submit']").click();
+  await submitPdsLogin(page, account.handle, PDS_PASSWORD);
 
   // These waits were originally capped at 30s because the test
   // itself only had Playwright's 30s default. Waiting longer was pointless
@@ -77,12 +77,7 @@ async function completeAttachAccountOAuth(
   // loaded machine actually needs. Nothing here asserts the flow is *fast*;
   // the assertion is that it completes.
   const authorizeButton = page.getByRole("button", { name: /^authorize$/i });
-  const outcome = await Promise.any([
-    page
-      .waitForURL(/sslip\.io/, { timeout: 90000 })
-      .then(() => "callback" as const),
-    authorizeButton.waitFor({ timeout: 90000 }).then(() => "consent" as const),
-  ]).catch(() => "neither consent nor callback within 90s");
+  const outcome = await awaitConsentOrCallback(page, 90000);
   expect(
     outcome === "consent" || outcome === "callback",
     `expected the PDS consent screen or a redirect back, got ${outcome} at ${page.url()}`,

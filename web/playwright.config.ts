@@ -44,6 +44,7 @@ export default defineConfig({
         "link-invite-pages.spec.ts",
         "users-add.spec.ts",
         "confidential-client.spec.ts",
+        "dpop-session-revocation.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },

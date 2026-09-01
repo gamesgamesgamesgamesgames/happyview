@@ -1,8 +1,8 @@
-import { test, expect } from "@playwright/test"
-import { loginAsTestAdmin } from "./auth-helper"
+import { test, expect } from "@playwright/test";
+import { loginAsTestAdmin } from "./auth-helper";
 
-const JOB_TYPE = "test.e2e.unloadguard"
-const TRIGGER_ID = `job.run:${JOB_TYPE}`
+const JOB_TYPE = "test.e2e.unloadguard";
+const TRIGGER_ID = `job.run:${JOB_TYPE}`;
 
 /**
  * Asks the page whether its `beforeunload` guard is currently armed, without
@@ -16,66 +16,70 @@ const TRIGGER_ID = `job.run:${JOB_TYPE}`
  */
 async function unloadGuardArmed(page: import("@playwright/test").Page) {
   return page.evaluate(() => {
-    const event = new Event("beforeunload", { cancelable: true })
-    window.dispatchEvent(event)
-    return event.defaultPrevented
-  })
+    const event = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
 }
 
 async function fillNewJobScript(page: import("@playwright/test").Page) {
-  await page.goto("/dashboard/settings/scripts/new")
-  await page.locator("#source-pick").click()
-  await page.getByRole("option", { name: /Job/ }).click()
-  await page.locator("#job-type-input").fill(JOB_TYPE)
+  await page.goto("/dashboard/settings/scripts/new");
+  await page.locator("#source-pick").click();
+  await page.getByRole("option", { name: /Job/ }).click();
+  await page.locator("#job-type-input").fill(JOB_TYPE);
 }
 
 test.describe("New script unload guard", () => {
   test.beforeEach(async ({ page }) => {
-    await loginAsTestAdmin(page)
-  })
+    await loginAsTestAdmin(page);
+  });
 
   test.afterEach(async ({ page }) => {
     await page.request.delete(
       `/admin/scripts/${encodeURIComponent(TRIGGER_ID)}`,
-    )
-  })
+    );
+  });
 
   test("guards unsaved changes against leaving the page", async ({ page }) => {
-    await page.goto("/dashboard/settings/scripts/new")
-    expect(await unloadGuardArmed(page)).toBe(false)
+    await page.goto("/dashboard/settings/scripts/new");
+    expect(await unloadGuardArmed(page)).toBe(false);
 
-    await fillNewJobScript(page)
-    expect(await unloadGuardArmed(page)).toBe(true)
-  })
+    await fillNewJobScript(page);
+    expect(await unloadGuardArmed(page)).toBe(true);
+  });
 
   test("does not warn about losing work while saving it", async ({ page }) => {
-    await fillNewJobScript(page)
+    await fillNewJobScript(page);
 
     // Under `output: "export"` the [id] detail route has no prerendered
-    // payload, so the post-save router.push is a full page load. Holding that
-    // load open (rather than aborting it, which would tear the document down)
-    // keeps this page alive and inspectable — the state an operator is left in
-    // when they answer "Cancel" to the browser's prompt.
+    // payload, so the post-save router.push is a full page load. It has to be
+    // stopped for this page to stay inspectable, and it must be stopped by
+    // *aborting* it — a failed navigation leaves the current document in
+    // place, which is the state an operator is left in when they answer
+    // "Cancel" to the browser's prompt.
     await page.route(
       (url) => url.pathname.includes(encodeURIComponent(TRIGGER_ID)),
       async (route) => {
         if (route.request().isNavigationRequest()) {
-          await new Promise(() => {})
+          await route.abort();
         } else {
-          await route.continue()
+          await route.continue();
         }
       },
-    )
+    );
 
     const saved = page.waitForResponse(
-      (r) => r.url().endsWith("/admin/scripts") && r.request().method() === "POST",
-    )
+      (r) =>
+        r.url().endsWith("/admin/scripts") && r.request().method() === "POST",
+    );
     // Matches the button through its "Creating..." label too, so the assertions
     // below distinguish "still spinning" from "gone".
-    const createButton = page.locator("footer button").filter({ hasText: /Creat/ })
-    await expect(createButton).toBeEnabled({ timeout: 3000 })
-    await createButton.click()
-    expect((await saved).ok()).toBe(true)
+    const createButton = page
+      .locator("footer button")
+      .filter({ hasText: /Creat/ });
+    await expect(createButton).toBeEnabled({ timeout: 3000 });
+    await createButton.click();
+    expect((await saved).ok()).toBe(true);
 
     // Both facts are read in a single round-trip on purpose. The held
     // navigation keeps this document alive but not indefinitely, and two
@@ -84,21 +88,21 @@ test.describe("New script unload guard", () => {
       .poll(
         () =>
           page.evaluate(() => {
-            const event = new Event("beforeunload", { cancelable: true })
-            window.dispatchEvent(event)
+            const event = new Event("beforeunload", { cancelable: true });
+            window.dispatchEvent(event);
             const button = Array.from(
               document.querySelectorAll("footer button"),
-            ).find((b) => /Creat/.test(b.textContent ?? ""))
+            ).find((b) => /Creat/.test(b.textContent ?? ""));
             return {
               // The work is persisted, so nothing is at risk and the browser's
               // "Leave site?" prompt would be warning about nothing.
               warnsOnLeave: event.defaultPrevented,
               // ...and the button must not be left spinning forever.
               stillSaving: button?.textContent?.includes("Creating") ?? null,
-            }
+            };
           }),
         { timeout: 5000 },
       )
-      .toEqual({ warnsOnLeave: false, stillSaving: false })
-  })
-})
+      .toEqual({ warnsOnLeave: false, stillSaving: false });
+  });
+});

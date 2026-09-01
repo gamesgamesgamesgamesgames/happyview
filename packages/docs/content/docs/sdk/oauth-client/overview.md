@@ -135,7 +135,15 @@ Returns `null` if no stored session is found.
 await client.deleteSession("did:plc:abc123");
 ```
 
-This deletes the session from both HappyView and local storage.
+This deletes the session from HappyView and local storage, and revokes it at the user's PDS.
+
+That last part matters: without it the session stays listed under the account's active sessions on their PDS until its refresh token expires — up to two years — even though they logged out. Revocation is best-effort, so a PDS that is unreachable or does not implement RFC 7009 will not make the logout fail.
+
+### Signing in again replaces the previous session
+
+Each login runs a full OAuth authorization and so creates a *new* session on the user's PDS; the DPoP key is minted fresh and the old key is overwritten in storage. Left alone, that means every re-login strands the previous session on their account with no way to reach it.
+
+`registerSession` therefore retires this client's previous session for the same account as part of completing a login — revoking it at the PDS while the credentials to do so still exist. It is scoped to the account being signed into, so sessions for other accounts, and sessions belonging to the same account on other devices, are untouched. No `onSessionDelete` hook fires: the user is signing in, not out.
 
 **The local cleanup always happens.** A `404`, `401`, or `403` from the server is treated as a completed logout — the session is either already gone or the credential is no longer usable, so there is nothing left to revoke. A `5xx` or a network error still throws, because the server may genuinely still hold a live session and you should know that, but it throws *after* the local session has been cleared. Either way the user ends up logged out on this device, and calling `deleteSession` again is safe.
 

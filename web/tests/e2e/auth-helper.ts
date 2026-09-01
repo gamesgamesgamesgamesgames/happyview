@@ -1,4 +1,4 @@
-import { createHmac } from "crypto";
+import crypto, { createHmac } from "crypto";
 import { type Page } from "@playwright/test";
 import pg from "pg";
 
@@ -193,4 +193,200 @@ export async function loginAsTestAdmin(page: Page): Promise<void> {
       secure: url.protocol === "https:",
     },
   ]);
+}
+
+/**
+ * Sign in at the PDS's OAuth login form.
+ */
+export async function submitPdsLogin(
+  page: Page,
+  handle: string,
+  password: string,
+): Promise<void> {
+  await page.locator("#username").fill(handle);
+  await page.locator("#password").fill(password);
+
+  const submit = page.locator("button[type='submit']");
+  await submit.click();
+
+  const submitted = await page
+    .locator("#password")
+    .waitFor({ state: "detached", timeout: 15000 })
+    .then(() => true)
+    .catch(() => false);
+
+  if (!submitted) {
+    await submit.click();
+  }
+}
+
+/**
+ * Wait for the PDS to either show its consent screen or bounce straight back
+ * to HappyView, and say which happened.
+ */
+export async function awaitConsentOrCallback(
+  page: Page,
+  timeout = 60000,
+): Promise<"consent" | "callback" | string> {
+  const authorizeButton = page.getByRole("button", { name: /^authorize$/i });
+
+  return Promise.any([
+    page.waitForURL(/sslip\.io/, { timeout }).then(() => "callback" as const),
+    authorizeButton.waitFor({ timeout }).then(() => "consent" as const),
+  ]).catch(() => `neither consent nor callback within ${timeout}ms`);
+}
+
+// --- DPoP session helpers -------------------------------------------------
+
+const TOKEN_ENCRYPTION_KEY = Buffer.from(
+  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "base64",
+);
+
+function encryptToken(plaintext: string): Buffer {
+  const nonce = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(
+    "aes-256-gcm",
+    TOKEN_ENCRYPTION_KEY,
+    nonce,
+  );
+  const ciphertext = Buffer.concat([
+    cipher.update(plaintext, "utf8"),
+    cipher.final(),
+  ]);
+  return Buffer.concat([nonce, ciphertext, cipher.getAuthTag()]);
+}
+
+export async function dpopKeyIdForProvision(
+  provisionId: string,
+): Promise<string> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const { rows } = await client.query<{ id: string }>(
+      "SELECT id FROM happyview_dpop_keys WHERE provision_id = $1",
+      [provisionId],
+    );
+    if (rows.length === 0) {
+      throw new Error(`no happyview_dpop_keys row for ${provisionId}`);
+    }
+    return rows[0].id;
+  } finally {
+    await client.end();
+  }
+}
+
+export async function insertDpopSession(params: {
+  id: string;
+  apiClientId: string;
+  dpopKeyId: string;
+  userDid: string;
+  accessToken: string;
+  refreshToken: string;
+  issuer: string;
+  pdsUrl: string;
+}): Promise<void> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const now = new Date().toISOString();
+    await client.query(
+      `INSERT INTO happyview_dpop_sessions
+         (id, api_client_id, dpop_key_id, user_did, access_token_enc,
+          refresh_token_enc, token_expires_at, scopes, pds_url, issuer,
+          created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NULL, 'atproto', $7, $8, $9, $9)`,
+      [
+        params.id,
+        params.apiClientId,
+        params.dpopKeyId,
+        params.userDid,
+        encryptToken(params.accessToken),
+        encryptToken(params.refreshToken),
+        params.pdsUrl,
+        params.issuer,
+        now,
+      ],
+    );
+  } finally {
+    await client.end();
+  }
+}
+
+export async function countDpopRows(
+  userDid: string,
+): Promise<{ sessions: number; keys: number }> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const s = await client.query(
+      "SELECT COUNT(*)::int AS n FROM happyview_dpop_sessions WHERE user_did = $1",
+      [userDid],
+    );
+    const k = await client.query(
+      `SELECT COUNT(*)::int AS n FROM happyview_dpop_keys k
+         JOIN happyview_dpop_sessions s ON s.dpop_key_id = k.id
+        WHERE s.user_did = $1`,
+      [userDid],
+    );
+    return { sessions: s.rows[0].n, keys: k.rows[0].n };
+  } finally {
+    await client.end();
+  }
+}
+
+function b64url(input: Buffer): string {
+  return input
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+/**
+ * Build a DPoP proof for `method`/`url`, signed with a provisioned key.
+ */
+export async function makeDpopProof(
+  privateJwk: Record<string, unknown>,
+  method: string,
+  url: string,
+  accessToken?: string,
+): Promise<string> {
+  const key = await crypto.webcrypto.subtle.importKey(
+    "jwk",
+    { ...privateJwk, key_ops: ["sign"] } as JsonWebKey,
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"],
+  );
+
+  const publicJwk = {
+    kty: privateJwk.kty,
+    crv: privateJwk.crv,
+    x: privateJwk.x,
+    y: privateJwk.y,
+  };
+
+  const header = { alg: "ES256", typ: "dpop+jwt", jwk: publicJwk };
+  const payload: Record<string, unknown> = {
+    htm: method,
+    htu: url.split("?")[0],
+    iat: Math.floor(Date.now() / 1000),
+    jti: crypto.randomBytes(16).toString("hex"),
+  };
+  if (accessToken) {
+    payload.ath = b64url(
+      crypto.createHash("sha256").update(accessToken).digest(),
+    );
+  }
+
+  const signingInput = `${b64url(Buffer.from(JSON.stringify(header)))}.${b64url(
+    Buffer.from(JSON.stringify(payload)),
+  )}`;
+  const signature = await crypto.webcrypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    key,
+    Buffer.from(signingInput),
+  );
+  return `${signingInput}.${b64url(Buffer.from(signature))}`;
 }

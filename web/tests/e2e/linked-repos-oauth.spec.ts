@@ -1,5 +1,9 @@
 import { test, expect } from "@playwright/test";
-import { loginAsTestAdmin } from "./auth-helper";
+import {
+  awaitConsentOrCallback,
+  loginAsTestAdmin,
+  submitPdsLogin,
+} from "./auth-helper";
 
 const PDS_URL = "http://localhost:3100";
 const PDS_PASSWORD = "Test-password-e2e-123";
@@ -46,6 +50,7 @@ async function createPdsAccount(): Promise<{ did: string; handle: string }> {
  * first thing a real user does had never been exercised.
  */
 test.describe("Linked Repos — real OAuth authorization", () => {
+  test.describe.configure({ timeout: 180_000 });
   let account: { did: string; handle: string };
   let grantId: string;
   let inviteToken: string;
@@ -111,33 +116,23 @@ test.describe("Linked Repos — real OAuth authorization", () => {
     await page.getByRole("button", { name: /continue/i }).click();
 
     // -> PDS login
-    await page.waitForURL(/pds\.localhost/, { timeout: 30000 });
-    await page.locator("#username").fill(account.handle);
-    await page.locator("#password").fill(PDS_PASSWORD);
-    await page.locator("button[type='submit']").click();
+    await page.waitForURL(/pds\.localhost/, { timeout: 60000 });
+    await submitPdsLogin(page, account.handle, PDS_PASSWORD);
 
     const authorizeButton = page.getByRole("button", { name: /^authorize$/i });
-    const outcome = await Promise.race([
-      page
-        .waitForURL(/sslip\.io/, { timeout: 30000 })
-        .then(() => "callback" as const),
-      authorizeButton
-        .waitFor({ timeout: 20000 })
-        .then(() => "consent" as const)
-        .catch((e: unknown) => `error: ${e}`),
-    ]);
+    const outcome = await awaitConsentOrCallback(page);
     expect(
       outcome === "consent" || outcome === "callback",
       `expected the PDS consent screen or a redirect back, got ${outcome} at ${page.url()}`,
     ).toBeTruthy();
     if (outcome === "consent") {
       await authorizeButton.click();
-      await page.waitForURL(/sslip\.io/, { timeout: 20000 });
+      await page.waitForURL(/sslip\.io/, { timeout: 60000 });
     }
 
     // The invitee lands on the PUBLIC result page — never the admin dashboard,
     // which they cannot view.
-    await page.waitForURL(/\/link\/result/, { timeout: 20000 });
+    await page.waitForURL(/\/link\/result/, { timeout: 60000 });
     const url = new URL(page.url());
     expect(
       url.searchParams.get("status"),
