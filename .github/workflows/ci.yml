@@ -899,7 +899,7 @@ jobs:
       && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
       && needs.test-oauth-client.result == 'success'
     needs: [changes, test-oauth-client]
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
@@ -940,7 +940,7 @@ jobs:
       && needs.test-oauth-client-browser.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
     needs: [changes, test-oauth-client-browser, release-oauth-client]
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
@@ -998,7 +998,7 @@ jobs:
       && needs.test-oauth-client-node.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
     needs: [changes, test-oauth-client-node, release-oauth-client]
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
@@ -1056,7 +1056,7 @@ jobs:
       && needs.test-lex-agent.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
     needs: [changes, test-lex-agent, release-oauth-client]
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
@@ -1113,7 +1113,7 @@ jobs:
       && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
       && needs.test-nsid.result == 'success'
     needs: [changes, test-nsid]
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
