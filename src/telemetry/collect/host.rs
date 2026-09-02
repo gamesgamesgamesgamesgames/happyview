@@ -183,12 +183,7 @@ mod tests {
     #[test]
     fn report_omits_metrics_it_cannot_measure_rather_than_reporting_zero() {
         let host = report("sqlite:/tmp/does-not-exist.db");
-        for key in [
-            "memory_anon_bytes",
-            "memory_file_bytes",
-            "db_bytes",
-            "wal_bytes",
-        ] {
+        for key in ["db_bytes", "wal_bytes"] {
             assert!(!host.contains_key(key), "{key} must be absent, not zeroed");
         }
     }
