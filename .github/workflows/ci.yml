@@ -902,6 +902,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -922,13 +923,12 @@ jobs:
       - name: Build oauth-client
         run: bun run --filter '@happyview/oauth-client' build
 
-      - name: Configure npm auth for bun publish
-        run: echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
 
       - name: Release oauth-client
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: packages/oauth-client
         run: npx semantic-release
 
@@ -943,6 +943,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -980,13 +981,12 @@ jobs:
             }
           "
 
-      - name: Configure npm auth for bun publish
-        run: echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
 
       - name: Release oauth-client-browser
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: packages/oauth-client-browser
         run: npx semantic-release
 
@@ -1001,6 +1001,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -1038,13 +1039,12 @@ jobs:
             }
           "
 
-      - name: Configure npm auth for bun publish
-        run: echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
 
       - name: Release oauth-client-node
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: packages/oauth-client-node
         run: npx semantic-release
 
@@ -1059,6 +1059,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -1096,13 +1097,12 @@ jobs:
             }
           "
 
-      - name: Configure npm auth for bun publish
-        run: echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
 
       - name: Release lex-agent
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: packages/lex-agent
         run: npx semantic-release
 
@@ -1116,6 +1116,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -1136,13 +1137,12 @@ jobs:
       - name: Build nsid
         run: bun run --filter '@happyview/nsid' build
 
-      - name: Configure npm auth for bun publish
-        run: echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
 
       - name: Release nsid
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: packages/nsid
         run: npx semantic-release
 
