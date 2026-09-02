@@ -97,6 +97,7 @@ async fn main() {
         Err(e) => tracing::error!(error = %e, "scheduled vacuum could not be evaluated"),
     }
 
+    happyview::telemetry::collect::health::note_restart(&db_pool, db_backend).await;
     happyview::maintenance::nsid_audit::run(&db_pool, db_backend).await;
     happyview::maintenance::lexicon_ids::run(&db_pool, db_backend).await;
 
@@ -849,6 +850,8 @@ async fn main() {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(enabled))
     };
 
+    let telemetry_counters = std::sync::Arc::new(happyview::telemetry::counters::Counters::new());
+
     let state = AppState {
         config: config.clone(),
         http,
@@ -874,6 +877,7 @@ async fn main() {
         backfill_events_tx,
         verbose_event_logging,
         client_jwks,
+        telemetry_counters,
     };
 
     jetstream::spawn(state.clone(), collections_rx);
@@ -886,6 +890,13 @@ async fn main() {
         let gc_backend = state.db_backend;
         tokio::spawn(async move {
             happyview::auth::state_gc::run_expired_state_gc(gc_db, gc_backend).await;
+        });
+    }
+
+    {
+        let telemetry_state = state.clone();
+        tokio::spawn(async move {
+            happyview::telemetry::reporter::run_reporter(telemetry_state).await;
         });
     }
 

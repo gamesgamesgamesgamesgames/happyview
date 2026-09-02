@@ -1,81 +1,90 @@
-import { test, expect } from "@playwright/test"
-import { loginAsTestAdmin, resetServiceIdentity } from "./auth-helper"
+import { test, expect } from "@playwright/test";
+import { loginAsTestAdmin, resetServiceIdentity } from "./auth-helper";
 
 test.describe("Setup - did:plc", () => {
   test.beforeAll(async () => {
-    await resetServiceIdentity()
-  })
+    await resetServiceIdentity();
+  });
 
   test("did:plc flow completes successfully", async ({ page }) => {
-    await loginAsTestAdmin(page)
-    await page.goto("/setup")
+    await loginAsTestAdmin(page);
+    await page.goto("/setup");
 
     // Select "Create a new network identity"
-    await expect(
-      page.getByText(/set up your service identity/i),
-    ).toBeVisible({ timeout: 10000 })
+    await expect(page.getByText(/set up your service identity/i)).toBeVisible({
+      timeout: 10000,
+    });
 
-    await page.getByText("Create a new network identity").click()
-    await page.getByRole("button", { name: /continue/i }).click()
+    await page.getByText("Create a new network identity").click();
+    await page.getByRole("button", { name: /continue/i }).click();
 
     // Wait for either registration in progress or the result
-    const registeringText = page.getByText("Registering your identity")
-    const saveKeyText = page.getByText("Save your rotation key")
-    const registrationFailed = page.getByText("Registration failed")
+    const registeringText = page.getByText("Registering your identity");
+    const saveKeyText = page.getByText("Save your rotation key");
+    const registrationFailed = page.getByText("Registration failed");
 
     await expect(
       registeringText.or(saveKeyText).or(registrationFailed),
-    ).toBeVisible({ timeout: 10000 })
+    ).toBeVisible({ timeout: 10000 });
 
     // If registration is in progress, wait for it to finish
     if (await registeringText.isVisible().catch(() => false)) {
-      await expect(
-        saveKeyText.or(registrationFailed),
-      ).toBeVisible({ timeout: 30000 })
+      await expect(saveKeyText.or(registrationFailed)).toBeVisible({
+        timeout: 30000,
+      });
     }
 
     // If registration failed, skip the rest of the test
     if (await registrationFailed.isVisible().catch(() => false)) {
-      test.skip(true, "PLC registration failed in test environment")
-      return
+      test.skip(true, "PLC registration failed in test environment");
+      return;
     }
 
     // Download the rotation key (required before Continue is enabled)
-    const downloadButton = page.getByRole("button", { name: /download rotation key/i })
-    await expect(downloadButton).toBeVisible()
+    const downloadButton = page.getByRole("button", {
+      name: /download rotation key/i,
+    });
+    await expect(downloadButton).toBeVisible();
     const [_download] = await Promise.all([
       page.waitForEvent("download"),
       downloadButton.click(),
-    ])
+    ]);
 
     // Click Continue to complete setup
-    const continueButton = page.getByRole("button", { name: /continue/i })
-    await expect(continueButton).toBeEnabled({ timeout: 5000 })
-    await continueButton.click()
+    const continueButton = page.getByRole("button", { name: /continue/i });
+    await expect(continueButton).toBeEnabled({ timeout: 5000 });
+    await continueButton.click();
+
+    await expect(page.getByText(/help us build/i)).toBeVisible({
+      timeout: 5000,
+    });
+    await page.getByRole("button", { name: /continue/i }).click();
 
     // Verify setup completes
-    await expect(page.getByText("Your AppView is ready", { exact: true })).toBeVisible({ timeout: 5000 })
-  })
+    await expect(
+      page.getByText("Your AppView is ready", { exact: true }),
+    ).toBeVisible({ timeout: 5000 });
+  });
 
   // Restore setup state for subsequent tests
   test.afterAll(async ({ browser, baseURL }) => {
-    await resetServiceIdentity()
-    const page = await browser.newPage()
+    await resetServiceIdentity();
+    const page = await browser.newPage();
     try {
-      await loginAsTestAdmin(page)
-      await page.goto(`${baseURL}/setup`)
-      const skipCard = page.getByText(/skip for now/i)
-      if (
-        await skipCard.isVisible({ timeout: 5000 }).catch(() => false)
-      ) {
-        await skipCard.click()
-        await page.getByRole("button", { name: /continue/i }).click()
+      await loginAsTestAdmin(page);
+      await page.goto(`${baseURL}/setup`);
+      const skipCard = page.getByText(/skip for now/i);
+      if (await skipCard.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await skipCard.click();
+        await page.getByRole("button", { name: /continue/i }).click();
+        await page.getByText(/help us build/i).waitFor({ timeout: 5000 });
+        await page.getByRole("button", { name: /continue/i }).click();
         await expect(
           page.getByText("Your AppView is ready", { exact: true }),
-        ).toBeVisible({ timeout: 5000 })
+        ).toBeVisible({ timeout: 5000 });
       }
     } finally {
-      await page.close()
+      await page.close();
     }
-  })
-})
+  });
+});

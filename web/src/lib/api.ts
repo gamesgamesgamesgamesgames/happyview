@@ -663,6 +663,60 @@ export function cancelVacuum() {
   });
 }
 
+// Telemetry
+
+export interface TelemetrySettings {
+  mode: "off" | "manual" | "auto";
+  contact: string | null;
+  lexicon_names: boolean;
+  lexicon_structure: boolean;
+  lexicon_documents: boolean;
+  instance_id: string | null;
+  collector_url: string;
+}
+
+export interface TelemetryBenchmarkEntry {
+  p50: number;
+  value: number;
+  percentile: number;
+}
+
+export interface TelemetryBenchmarks {
+  cohort_size: number;
+  metrics: Record<string, TelemetryBenchmarkEntry>;
+}
+
+/** Every field optional: an omitted field means unchanged. */
+export interface TelemetryUpdate {
+  mode?: "off" | "manual" | "auto";
+  contact?: string;
+  lexicon_names?: boolean;
+  lexicon_structure?: boolean;
+  lexicon_documents?: boolean;
+}
+
+export function getTelemetry() {
+  return apiFetch<TelemetrySettings>("/admin/settings/telemetry");
+}
+
+export function updateTelemetry(body: TelemetryUpdate) {
+  return apiFetch<TelemetrySettings>("/admin/settings/telemetry", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+export function getTelemetryPreview() {
+  return apiFetch<Record<string, unknown>>("/admin/settings/telemetry/preview");
+}
+
+export function sendTelemetry() {
+  return apiFetch<{ sent: boolean; benchmarks: TelemetryBenchmarks | null }>(
+    "/admin/settings/telemetry/send",
+    { method: "POST" },
+  );
+}
+
 // Script Variables
 export function getScriptVariables() {
   return apiFetch<ScriptVariableSummary[]>("/admin/script-variables");

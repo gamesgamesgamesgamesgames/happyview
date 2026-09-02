@@ -405,7 +405,7 @@ async fn cascade_wildcard_runs_when_no_action_specific() {
     )
     .await;
 
-    handle_record_event(
+    let _ = handle_record_event(
         &app.state,
         &RecordEvent {
             did: "did:plc:test".into(),
@@ -448,7 +448,7 @@ async fn cascade_action_specific_wins_over_wildcard() {
     .await;
 
     // Create action — specific should win.
-    handle_record_event(
+    let _ = handle_record_event(
         &app.state,
         &RecordEvent {
             did: "did:plc:test".into(),
@@ -469,7 +469,7 @@ async fn cascade_action_specific_wins_over_wildcard() {
     assert_eq!(body["title"], "CREATE-SPECIFIC");
 
     // Update action — no record.update binding → cascades to wildcard.
-    handle_record_event(
+    let _ = handle_record_event(
         &app.state,
         &RecordEvent {
             did: "did:plc:test".into(),
@@ -497,7 +497,7 @@ async fn no_script_passes_record_through_unchanged() {
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
-    handle_record_event(
+    let _ = handle_record_event(
         &app.state,
         &RecordEvent {
             did: "did:plc:test".into(),
@@ -532,7 +532,7 @@ async fn record_create_returning_nil_skips_indexing() {
     )
     .await;
 
-    handle_record_event(
+    let _ = handle_record_event(
         &app.state,
         &RecordEvent {
             did: "did:plc:test".into(),
@@ -573,7 +573,7 @@ async fn record_event_script_log_writes_event_log_row() {
     )
     .await;
 
-    handle_record_event(
+    let _ = handle_record_event(
         &app.state,
         &RecordEvent {
             did: "did:plc:test".into(),
@@ -839,7 +839,7 @@ async fn record_event_script_can_call_record_delete_local() {
     )
     .await;
 
-    handle_record_event(
+    let _ = handle_record_event(
         &app.state,
         &RecordEvent {
             did: "did:plc:test".into(),

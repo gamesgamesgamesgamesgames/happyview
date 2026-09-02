@@ -95,6 +95,7 @@ pub struct Config {
     pub user_agent: String,
     pub session_secret: String,
     pub jetstream_url: String,
+    pub telemetry_collector_url: String,
     pub relay_url: String,
     pub plc_url: String,
     pub static_dir: String,
@@ -136,6 +137,8 @@ impl Config {
             session_secret: env::var("SESSION_SECRET").unwrap_or_default(),
             jetstream_url: env::var("JETSTREAM_URL")
                 .unwrap_or_else(|_| "wss://jetstream1.us-east.bsky.network".into()),
+            telemetry_collector_url: env::var("TELEMETRY_COLLECTOR_URL")
+                .unwrap_or_else(|_| "https://telemetry.happyview.dev/v1/snapshot".to_string()),
             relay_url: env::var("RELAY_URL").unwrap_or_else(|_| "https://bsky.network".into()),
             plc_url: env::var("PLC_URL").unwrap_or_else(|_| "https://plc.directory".into()),
             static_dir: env::var("STATIC_DIR").unwrap_or_else(|_| "./web/out".into()),
@@ -289,6 +292,7 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         assert_eq!(
             config.listen_addr(),
@@ -618,6 +622,7 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         assert_eq!(config.effective_public_url(), "https://example.com");
     }
@@ -646,6 +651,7 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -674,6 +680,7 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -702,6 +709,7 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),
@@ -763,6 +771,7 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),

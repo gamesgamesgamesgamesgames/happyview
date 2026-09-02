@@ -4,6 +4,7 @@ use mlua::LuaSerdeExt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::AppState;
@@ -13,6 +14,7 @@ use crate::error::{AppError, LUA_AUTH_ERROR_PREFIX, ScriptErrorType, parse_lua_l
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::ParsedLexicon;
 use crate::repo;
+use crate::telemetry::counters::Counters;
 
 use super::atproto_api;
 use super::context;
@@ -20,6 +22,21 @@ use super::db_api;
 use super::http_api;
 use super::record;
 use super::sandbox;
+
+struct ScriptTimingGuard {
+    counters: Arc<Counters>,
+    start: Instant,
+}
+
+impl Drop for ScriptTimingGuard {
+    fn drop(&mut self) {
+        let elapsed_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        crate::telemetry::counters::add_saturating(&self.counters.script_runtime_ms, elapsed_ms);
+        self.counters
+            .script_executions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Load all script variables from the database as a key-value map.
 async fn load_env_vars(db: &sqlx::AnyPool, backend: DatabaseBackend) -> HashMap<String, String> {
@@ -46,6 +63,10 @@ pub async fn execute_procedure_script(
     delegate_did: Option<&str>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
+    let _script_timing = ScriptTimingGuard {
+        counters: state.telemetry_counters.clone(),
+        start,
+    };
     let backend = state.db_backend;
     let span = tracing::info_span!(
         "script.execute",
@@ -666,6 +687,10 @@ pub async fn execute_query_script(
     space_ctx: Option<&context::SpaceContext>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
+    let _script_timing = ScriptTimingGuard {
+        counters: state.telemetry_counters.clone(),
+        start,
+    };
     let backend = state.db_backend;
     let span = tracing::info_span!("script.execute", method = method, script_type = "query",);
     span.in_scope(|| tracing::info!("script execution started"));
@@ -1118,4 +1143,134 @@ pub async fn execute_query_script(
     .await;
 
     Ok(Json(json_value).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexicon::{LexiconType, ProcedureAction};
+    use crate::test_support::{memory_pool, test_state_with_pool};
+
+    fn query_lexicon() -> ParsedLexicon {
+        ParsedLexicon {
+            id: "com.example.probe".to_string(),
+            lexicon_type: LexiconType::Query,
+            record_key: None,
+            parameters: None,
+            input: None,
+            output: None,
+            record_schema: None,
+            raw: serde_json::json!({ "id": "com.example.probe" }),
+            revision: 1,
+            target_collection: Some("com.example.probe".to_string()),
+            action: ProcedureAction::Upsert,
+            token_cost: None,
+            space_type: None,
+            space_name: None,
+            space_collections: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_script_execution_moves_the_script_counters() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+        let counters = state.telemetry_counters.clone();
+
+        let result = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            "function handle() return { ok = true } end",
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "script should have executed: {:?}",
+            result.err()
+        );
+        assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_script_missing_handle_still_moves_the_script_counters() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+        let counters = state.telemetry_counters.clone();
+
+        let result = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            "local unused = 1",
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "script has no handle() function, so this must error"
+        );
+        assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lua_runtime_error_still_moves_the_script_counters() {
+        // `handle()` runs and raises — a different early return than the
+        // "missing handle" case (this one comes from `handle.call_async`
+        // failing, not from `lua.globals().get("handle")` failing).
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+        let counters = state.telemetry_counters.clone();
+
+        let result = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            "function handle() error('boom') end",
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn script_counters_accumulate_across_calls_on_the_same_counters() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+        let counters = state.telemetry_counters.clone();
+
+        for _ in 0..20 {
+            let _ = execute_query_script(
+                &state,
+                "com.example.probe",
+                &params,
+                &lexicon,
+                "function handle() return {} end",
+                None,
+                None,
+            )
+            .await;
+        }
+
+        assert_eq!(counters.script_executions.load(Ordering::Relaxed), 20);
+        assert!(
+            counters.script_runtime_ms.load(Ordering::Relaxed) > 0,
+            "20 script executions should accumulate measurable wall-clock time"
+        );
+    }
 }

@@ -911,6 +911,7 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         let (tx, _) = watch::channel(vec![]);
         let (labeler_tx, _) = watch::channel(());
@@ -1005,6 +1006,7 @@ mod tests {
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
+            telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
         }
     }
 

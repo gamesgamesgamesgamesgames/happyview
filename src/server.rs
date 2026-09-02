@@ -187,6 +187,10 @@ pub fn router(state: AppState) -> Router {
     outer
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(state.clone(), cors))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::telemetry_middleware::count_http_bytes,
+        ))
         .with_state(state)
 }
 

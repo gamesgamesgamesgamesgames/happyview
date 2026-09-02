@@ -170,6 +170,8 @@ test.describe("Setup - Attach Account", () => {
       if (await skipCard.isVisible({ timeout: 3000 }).catch(() => false)) {
         await skipCard.click();
         await page.getByRole("button", { name: /continue/i }).click();
+        await page.getByText(/help us build/i).waitFor({ timeout: 5000 });
+        await page.getByRole("button", { name: /continue/i }).click();
         await expect(
           page.getByText("Your AppView is ready", { exact: true }),
         ).toBeVisible({ timeout: 5000 });

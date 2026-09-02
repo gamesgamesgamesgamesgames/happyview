@@ -75,6 +75,7 @@ impl TestApp {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
 
         let sql = adapt_sql(
@@ -205,6 +206,7 @@ impl TestApp {
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
+            telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
         };
 
         let router = Self::build_router(&state);

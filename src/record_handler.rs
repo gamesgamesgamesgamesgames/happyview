@@ -22,9 +22,22 @@ pub struct RecordEvent {
     pub cid: Option<String>,
 }
 
+/// The outcome of processing one record event, returned so a caller can
+/// account for it in telemetry rather than this function reaching into
+/// `state.telemetry_counters` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum RecordOutcome {
+    Matched,
+    Skipped,
+    SchemaEvent,
+    Errored,
+}
+
 /// Process a record event: upsert/delete the record in the database, run index
-/// hooks, and handle lexicon schema events.
-pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
+/// hooks, and handle lexicon schema events. Returns the outcome so the caller
+/// can account for it in telemetry — see `RecordOutcome`.
+pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> RecordOutcome {
     let db = &state.db;
     let lexicons = &state.lexicons;
 
@@ -33,7 +46,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
     // Handle lexicon schema events for tracked network lexicons.
     if record.collection == LEXICON_SCHEMA_COLLECTION {
         handle_lexicon_schema_event(state, &record.did, record).await;
-        return;
+        return RecordOutcome::SchemaEvent;
     }
 
     // Skip records whose collection is not tracked by a registered record-type lexicon.
@@ -47,14 +60,14 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
             collection = %record.collection,
             "skipping record for untracked collection"
         );
-        return;
+        return RecordOutcome::Skipped;
     }
 
     match record.action.as_str() {
         "create" | "update" => {
             let rec = match &record.record {
                 Some(r) => r,
-                None => return,
+                None => return RecordOutcome::Errored,
             };
             let cid = record.cid.as_deref().unwrap_or_default();
 
@@ -83,7 +96,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                     state.db_backend,
                 )
                 .await;
-                return;
+                return RecordOutcome::Skipped;
             }
 
             // Run record-event script (if any) before storing. The script's
@@ -130,7 +143,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                         )
                         .await;
                     }
-                    return;
+                    return RecordOutcome::Skipped;
                 }
                 RecordHookOutcome::Replace(v) => v,
                 RecordHookOutcome::Proceed => rec.clone(),
@@ -192,6 +205,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                     }
 
                     crate::labeler::backfill_labels_for_uri(Arc::new(state.clone()), uri.clone());
+                    RecordOutcome::Matched
                 }
                 Err(e) => {
                     tracing::warn!(uri = %uri, "failed to upsert record: {e}");
@@ -212,6 +226,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                         backend,
                     )
                     .await;
+                    RecordOutcome::Errored
                 }
             }
         }
@@ -254,7 +269,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                     )
                     .await;
                 }
-                return;
+                return RecordOutcome::Skipped;
             }
 
             let delete_sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
@@ -278,6 +293,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                         )
                         .await;
                     }
+                    RecordOutcome::Matched
                 }
                 Err(e) => {
                     tracing::warn!(uri = %uri, "failed to delete record: {e}");
@@ -298,10 +314,11 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                         backend,
                     )
                     .await;
+                    RecordOutcome::Errored
                 }
             }
         }
-        _ => {}
+        _ => RecordOutcome::Errored,
     }
 }
 
@@ -557,7 +574,7 @@ mod tests {
         let state = tracked_state().await;
         insert_record(&state).await;
 
-        handle_record_event(&state, &delete_event()).await;
+        let _ = handle_record_event(&state, &delete_event()).await;
 
         assert!(
             !record_exists(&state).await,
@@ -579,7 +596,7 @@ mod tests {
         .await;
         insert_record(&state).await;
 
-        handle_record_event(&state, &delete_event()).await;
+        let _ = handle_record_event(&state, &delete_event()).await;
 
         assert!(
             !record_exists(&state).await,
@@ -600,7 +617,7 @@ mod tests {
         .await;
         insert_record(&state).await;
 
-        handle_record_event(&state, &delete_event()).await;
+        let _ = handle_record_event(&state, &delete_event()).await;
 
         assert!(
             record_exists(&state).await,
@@ -614,7 +631,7 @@ mod tests {
     async fn create_without_any_script_indexes_the_record() {
         let state = tracked_state().await;
 
-        handle_record_event(
+        let _ = handle_record_event(
             &state,
             &RecordEvent {
                 did: "did:plc:abc".to_string(),
@@ -648,7 +665,7 @@ mod tests {
         )
         .await;
 
-        handle_record_event(&state, &create_event()).await;
+        let _ = handle_record_event(&state, &create_event()).await;
 
         assert!(
             !record_exists(&state).await,
@@ -672,7 +689,7 @@ mod tests {
         .await;
         insert_record(&state).await;
 
-        handle_record_event(&state, &delete_event()).await;
+        let _ = handle_record_event(&state, &delete_event()).await;
 
         assert!(
             record_exists(&state).await,
@@ -698,7 +715,7 @@ mod tests {
         )
         .await;
 
-        handle_record_event(&state, &create_event()).await;
+        let _ = handle_record_event(&state, &create_event()).await;
 
         assert_eq!(
             skipped_event_count(&state).await,
@@ -719,7 +736,7 @@ mod tests {
         .await;
         insert_record(&state).await;
 
-        handle_record_event(&state, &delete_event()).await;
+        let _ = handle_record_event(&state, &delete_event()).await;
 
         assert_eq!(
             skipped_event_count(&state).await,

@@ -6,6 +6,7 @@ import { SetupIdentityMode } from "./setup-identity-mode";
 import { SetupConfigure } from "./setup-configure";
 import { SetupAttachAuth } from "./setup-attach-auth";
 import { SetupVerify } from "./setup-verify";
+import { SetupTelemetry } from "./setup-telemetry";
 import { SetupComplete } from "./setup-complete";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -19,7 +20,13 @@ import {
   StepperTrigger,
 } from "@/components/ui/stepper";
 
-type SetupStep = "mode" | "configure" | "attach-auth" | "verify" | "complete";
+type SetupStep =
+  | "mode"
+  | "configure"
+  | "attach-auth"
+  | "verify"
+  | "telemetry"
+  | "complete";
 
 export function SetupWizard() {
   const [currentStep, setCurrentStep] = useState<SetupStep>("mode");
@@ -83,7 +90,10 @@ export function SetupWizard() {
     if (mode === "not_exposed") {
       try {
         await setSetupIdentity({ mode: "not_exposed" });
-        setCurrentStep("complete");
+        // Route through telemetry too: the ask is the feature, and skipping
+        // identity setup is no reason to skip the only prompt an operator
+        // will ever see for it.
+        setCurrentStep("telemetry");
       } catch (e) {
         setLastFailedMode(mode);
         setError(
@@ -144,14 +154,18 @@ export function SetupWizard() {
   }, []);
 
   const handleVerifyComplete = useCallback(() => {
+    setCurrentStep("telemetry");
+  }, []);
+
+  const handleTelemetryComplete = useCallback(() => {
     setCurrentStep("complete");
   }, []);
 
   const stepOrder = useMemo<SetupStep[]>(
     () =>
       identityMode === "attach_account"
-        ? ["mode", "configure", "attach-auth", "verify", "complete"]
-        : ["mode", "verify", "complete"],
+        ? ["mode", "configure", "attach-auth", "verify", "telemetry", "complete"]
+        : ["mode", "verify", "telemetry", "complete"],
     [identityMode],
   );
 
@@ -222,6 +236,13 @@ export function SetupWizard() {
           </StepperTrigger>
           <StepperSeparator />
         </StepperItem>
+        <StepperItem value="telemetry">
+          <StepperTrigger>
+            <StepperIndicator />
+            <StepperTitle>Telemetry</StepperTitle>
+          </StepperTrigger>
+          <StepperSeparator />
+        </StepperItem>
         <StepperItem value="complete">
           <StepperTrigger>
             <StepperIndicator />
@@ -276,6 +297,9 @@ export function SetupWizard() {
             onComplete={handleVerifyComplete}
             onBack={handleGoBack}
           />
+        )}
+        {currentStep === "telemetry" && (
+          <SetupTelemetry onNext={handleTelemetryComplete} />
         )}
         {currentStep === "complete" && (
           <SetupComplete identityMode={identityMode} />

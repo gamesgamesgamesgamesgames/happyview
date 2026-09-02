@@ -150,12 +150,21 @@ pub fn register_job_context(
         job_table.set("should_stop", should_stop_fn)?;
     }
 
-    // job.wait(seconds) — yield execution for the given duration
+    // job.wait(seconds) — yield execution for the given duration.
     {
-        let wait_fn = lua.create_async_function(move |_lua, seconds: f64| async move {
-            let duration = std::time::Duration::from_secs_f64(seconds.clamp(0.0, 3600.0));
-            tokio::time::sleep(duration).await;
-            Ok(())
+        let state = state.clone();
+        let wait_fn = lua.create_async_function(move |_lua, seconds: f64| {
+            let state = state.clone();
+            async move {
+                let duration = std::time::Duration::from_secs_f64(seconds.clamp(0.0, 3600.0));
+                tokio::time::sleep(duration).await;
+                let elapsed_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                crate::telemetry::counters::add_saturating(
+                    &state.telemetry_counters.job_wait_ms,
+                    elapsed_ms,
+                );
+                Ok(())
+            }
         })?;
         job_table.set("wait", wait_fn)?;
     }
@@ -245,6 +254,7 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         let (tx, _) = watch::channel(vec![]);
         let (labeler_tx, _) = watch::channel(());
@@ -352,6 +362,7 @@ mod tests {
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
+            telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
         }
     }
 
@@ -511,6 +522,7 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         let (tx, _) = watch::channel(vec![]);
         let (labeler_tx, _) = watch::channel(());
@@ -616,6 +628,7 @@ mod tests {
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
+            telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
         }
     }
 
@@ -740,5 +753,56 @@ mod tests {
         assert_eq!(row.0, "warn-test-job");
         assert_eq!(row.1, "warn");
         assert_eq!(row.2, "something is off");
+    }
+
+    #[tokio::test]
+    async fn job_wait_adds_the_slept_duration_to_job_wait_ms() {
+        let pool = migrated_pool().await;
+        let state = test_state_with_pool(pool);
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_job_context(
+            &lua,
+            Arc::new(state.clone()),
+            "wait-test-job".into(),
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+        lua.load("job.wait(0.05)").exec_async().await.unwrap();
+
+        assert_eq!(
+            state
+                .telemetry_counters
+                .job_wait_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            50
+        );
+    }
+
+    #[tokio::test]
+    async fn job_wait_accumulates_across_multiple_calls() {
+        let pool = migrated_pool().await;
+        let state = test_state_with_pool(pool);
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_job_context(
+            &lua,
+            Arc::new(state.clone()),
+            "wait-test-job-2".into(),
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+        lua.load("job.wait(0.01) job.wait(0.02)")
+            .exec_async()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state
+                .telemetry_counters
+                .job_wait_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            30
+        );
     }
 }

@@ -981,7 +981,7 @@ async fn reindex_single(state: &AppState, id: &str) -> Result<(), AppError> {
         cid,
     };
 
-    crate::record_handler::handle_record_event(state, &event).await;
+    let _ = crate::record_handler::handle_record_event(state, &event).await;
     mark_resolved(state, &dl.id, dl.source).await?;
 
     Ok(())

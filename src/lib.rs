@@ -39,6 +39,8 @@ pub mod service_entries;
 pub mod service_identity;
 pub mod setup;
 pub mod spaces;
+pub mod telemetry;
+pub mod telemetry_middleware;
 #[cfg(test)]
 pub mod test_support;
 pub mod verification_methods;
@@ -99,6 +101,7 @@ pub struct AppState {
     pub backfill_events_tx: tokio::sync::broadcast::Sender<crate::admin::types::BackfillEvent>,
     pub verbose_event_logging: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub client_jwks: Vec<jose_jwk::Jwk>,
+    pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
 }
 
 impl axum::extract::FromRef<AppState> for axum_extra::extract::cookie::Key {

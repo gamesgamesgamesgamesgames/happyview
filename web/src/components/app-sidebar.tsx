@@ -26,6 +26,7 @@ import {
   IconPlayerPlay,
   IconLink,
   IconShieldLock,
+  IconChartBar,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -136,6 +137,12 @@ const systemItems: NavItem[] = [
     title: "Database",
     url: "/dashboard/settings/database",
     icon: IconDatabaseCog,
+    requiredPermissions: ["settings:manage"],
+  },
+  {
+    title: "Telemetry",
+    url: "/dashboard/settings/telemetry",
+    icon: IconChartBar,
     requiredPermissions: ["settings:manage"],
   },
   {

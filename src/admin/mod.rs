@@ -24,6 +24,7 @@ mod service_entries;
 mod service_identity;
 pub mod settings;
 mod stats;
+mod telemetry;
 pub(crate) mod types;
 mod users;
 mod verification_methods;
@@ -168,6 +169,12 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/settings/xrpc-proxy",
             get(proxy_config::get).put(proxy_config::put),
         )
+        .route(
+            "/settings/telemetry",
+            get(telemetry::get).put(telemetry::update),
+        )
+        .route("/settings/telemetry/preview", get(telemetry::preview))
+        .route("/settings/telemetry/send", post(telemetry::send))
         .route(
             "/settings/{key}",
             put(settings::upsert).delete(settings::delete),
