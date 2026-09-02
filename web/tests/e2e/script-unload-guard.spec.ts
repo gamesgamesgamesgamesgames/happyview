@@ -53,15 +53,20 @@ test.describe("New script unload guard", () => {
 
     // Under `output: "export"` the [id] detail route has no prerendered
     // payload, so the post-save router.push is a full page load. It has to be
-    // stopped for this page to stay inspectable, and it must be stopped by
-    // *aborting* it — a failed navigation leaves the current document in
-    // place, which is the state an operator is left in when they answer
-    // "Cancel" to the browser's prompt.
+    // stopped for this page to stay inspectable, and the error code is
+    // load-bearing: `route.abort()` defaults to `failed` (net::ERR_FAILED),
+    // which Chrome answers by committing an error-page document. That replaces
+    // the very document these assertions read, and the race between the commit
+    // and the first probe is what made this test flaky ("Execution context was
+    // destroyed, most likely because of a navigation"). Only `aborted`
+    // (net::ERR_ABORTED) leaves the current document in place — which is also
+    // the state an operator is left in when they answer "Cancel" to the
+    // browser's prompt, so it is the accurate model as well as the stable one.
     await page.route(
       (url) => url.pathname.includes(encodeURIComponent(TRIGGER_ID)),
       async (route) => {
         if (route.request().isNavigationRequest()) {
-          await route.abort();
+          await route.abort("aborted");
         } else {
           await route.continue();
         }
@@ -81,9 +86,10 @@ test.describe("New script unload guard", () => {
     await createButton.click();
     expect((await saved).ok()).toBe(true);
 
-    // Both facts are read in a single round-trip on purpose. The held
-    // navigation keeps this document alive but not indefinitely, and two
-    // separate assertions leave a window for it to go away in between.
+    // Both facts are read in a single round-trip on purpose, so they describe
+    // one moment rather than two. The poll is for `saving`, which the save's
+    // `finally` clears a render after the push, not for the document — the
+    // aborted navigation leaves that in place indefinitely.
     await expect
       .poll(
         () =>
