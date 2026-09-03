@@ -104,16 +104,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build release binary
-        run: |
-          docker run --rm \
-            -v "$PWD:/app" \
-            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
-            -v "$HOME/.cargo/git:/usr/local/cargo/git" \
-            -w /app \
-            -e SQLX_OFFLINE=true \
-            rust:1.96.1-bookworm \
-            cargo build --release
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: binary
+          platforms: linux/amd64
+          cache-from: type=gha,scope=builder-linux/amd64
+          cache-to: type=gha,scope=builder-linux/amd64,mode=max,ignore-error=true
+          outputs: type=local,dest=.
 
       - name: Upload server binary
         uses: actions/upload-artifact@v4
@@ -362,17 +364,19 @@ jobs:
           name: happyview-server
           path: target/release
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build release binary (arm64)
         if: matrix.arch != 'amd64'
-        run: |
-          docker run --rm \
-            -v "$PWD:/app" \
-            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
-            -v "$HOME/.cargo/git:/usr/local/cargo/git" \
-            -w /app \
-            -e SQLX_OFFLINE=true \
-            rust:1.96.1-bookworm \
-            cargo build --release
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: binary
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=builder-${{ matrix.platform }}
+          cache-to: type=gha,scope=builder-${{ matrix.platform }},mode=max,ignore-error=true
+          outputs: type=local,dest=.
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -384,9 +388,6 @@ jobs:
         run: |
           mkdir -p .builder-override/app/target/release
           cp target/release/happyview .builder-override/app/target/release/happyview
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -544,17 +545,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build release binary
-        run: |
-          docker run --rm \
-            -v "$PWD:/app" \
-            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
-            -v "$HOME/.cargo/git:/usr/local/cargo/git" \
-            -w /app \
-            -e SQLX_OFFLINE=true \
-            -e HAPPYVIEW_VERSION="v${{ needs.release.outputs.version }}" \
-            rust:1.96.1-bookworm \
-            cargo build --release
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: binary
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            HAPPYVIEW_VERSION=v${{ needs.release.outputs.version }}
+          cache-from: type=gha,scope=builder-${{ matrix.platform }}
+          cache-to: type=gha,scope=builder-${{ matrix.platform }},mode=max,ignore-error=true
+          outputs: type=local,dest=.
 
       - name: Upload binary to release
         env:
@@ -569,9 +573,6 @@ jobs:
         run: |
           mkdir -p .builder-override/app/target/release
           cp target/release/happyview .builder-override/app/target/release/happyview
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3

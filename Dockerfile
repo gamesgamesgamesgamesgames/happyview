@@ -33,6 +33,9 @@ ARG HAPPYVIEW_VERSION
 ENV HAPPYVIEW_VERSION=$HAPPYVIEW_VERSION
 RUN cargo build --release
 
+FROM scratch AS binary
+COPY --from=builder /app/target/release/happyview /target/release/happyview
+
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
