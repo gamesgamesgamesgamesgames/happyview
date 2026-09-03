@@ -26,7 +26,7 @@ pub struct Counters {
     pub xrpc_requests: AtomicU64,
     pub xrpc_requests_with_credentials: AtomicU64,
     pub script_executions: AtomicU64,
-    pub script_runtime_ms: AtomicU64,
+    pub script_runtime_us: AtomicU64,
     pub job_wait_ms: AtomicU64,
     process_started_at: String,
 }
@@ -48,7 +48,7 @@ impl Counters {
             xrpc_requests: AtomicU64::new(0),
             xrpc_requests_with_credentials: AtomicU64::new(0),
             script_executions: AtomicU64::new(0),
-            script_runtime_ms: AtomicU64::new(0),
+            script_runtime_us: AtomicU64::new(0),
             job_wait_ms: AtomicU64::new(0),
             process_started_at: now_rfc3339(),
         }
@@ -83,7 +83,10 @@ impl Counters {
             read(&self.xrpc_requests_with_credentials),
         );
         out.insert("script_executions".into(), read(&self.script_executions));
-        out.insert("script_runtime_ms".into(), read(&self.script_runtime_ms));
+        out.insert(
+            "script_runtime_ms".into(),
+            read(&self.script_runtime_us) / 1_000,
+        );
         out.insert("job_wait_ms".into(), read(&self.job_wait_ms));
         out
     }
@@ -133,7 +136,7 @@ mod tests {
         c.xrpc_requests_with_credentials
             .fetch_add(2, Ordering::Relaxed);
         c.script_executions.fetch_add(7, Ordering::Relaxed);
-        c.script_runtime_ms.fetch_add(1234, Ordering::Relaxed);
+        c.script_runtime_us.fetch_add(1_234_000, Ordering::Relaxed);
         c.job_wait_ms.fetch_add(9000, Ordering::Relaxed);
 
         let snap = c.snapshot();
@@ -142,6 +145,17 @@ mod tests {
         assert_eq!(snap.get("script_executions"), Some(&7));
         assert_eq!(snap.get("script_runtime_ms"), Some(&1234));
         assert_eq!(snap.get("job_wait_ms"), Some(&9000));
+    }
+
+    #[test]
+    fn sub_millisecond_script_runs_accumulate_instead_of_rounding_to_zero() {
+        let c = Counters::new();
+        for _ in 0..20 {
+            add_saturating(&c.script_runtime_us, 400);
+        }
+
+        assert_eq!(c.script_runtime_us.load(Ordering::Relaxed), 8_000);
+        assert_eq!(c.snapshot().get("script_runtime_ms"), Some(&8));
     }
 
     #[test]

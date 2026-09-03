@@ -30,8 +30,8 @@ struct ScriptTimingGuard {
 
 impl Drop for ScriptTimingGuard {
     fn drop(&mut self) {
-        let elapsed_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        crate::telemetry::counters::add_saturating(&self.counters.script_runtime_ms, elapsed_ms);
+        let elapsed_us = u64::try_from(self.start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        crate::telemetry::counters::add_saturating(&self.counters.script_runtime_us, elapsed_us);
         self.counters
             .script_executions
             .fetch_add(1, Ordering::Relaxed);
@@ -1269,7 +1269,7 @@ mod tests {
 
         assert_eq!(counters.script_executions.load(Ordering::Relaxed), 20);
         assert!(
-            counters.script_runtime_ms.load(Ordering::Relaxed) > 0,
+            counters.script_runtime_us.load(Ordering::Relaxed) > 0,
             "20 script executions should accumulate measurable wall-clock time"
         );
     }
