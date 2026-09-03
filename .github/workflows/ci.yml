@@ -104,17 +104,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-release-amd64-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-release-amd64-
-
       - name: Build release binary
         run: |
           docker run --rm \
@@ -373,18 +362,6 @@ jobs:
           name: happyview-server
           path: target/release
 
-      - name: Cache cargo (arm64)
-        if: matrix.arch != 'amd64'
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-release-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-release-${{ matrix.arch }}-
-
       - name: Build release binary (arm64)
         if: matrix.arch != 'amd64'
         run: |
@@ -566,17 +543,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-release-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-release-${{ matrix.arch }}-
 
       - name: Build release binary
         run: |
