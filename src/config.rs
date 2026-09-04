@@ -56,7 +56,7 @@ pub fn build_user_agent(override_value: Option<String>, public_url: &str) -> Str
             return trimmed.to_string();
         }
     }
-    let version = env!("CARGO_PKG_VERSION");
+    let version = crate::version::version();
     let public_url = public_url.trim().trim_end_matches('/');
     if public_url.is_empty() {
         format!("HappyView/{version}")
@@ -723,17 +723,14 @@ mod tests {
             build_user_agent(None, "https://hv.example.com"),
             format!(
                 "HappyView/{} (+https://hv.example.com)",
-                env!("CARGO_PKG_VERSION")
+                crate::version::version()
             )
         );
     }
 
     #[test]
     fn user_agent_omits_url_when_public_url_is_empty() {
-        assert_eq!(
-            build_user_agent(None, ""),
-            format!("HappyView/{}", env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(build_user_agent(None, ""), crate::version::user_agent());
     }
 
     #[test]

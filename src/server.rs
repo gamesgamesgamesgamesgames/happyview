@@ -334,10 +334,7 @@ async fn config_endpoint(
             .or_else(|| state.config.logo_uri.clone())
     };
 
-    let version: &str = match option_env!("HAPPYVIEW_VERSION") {
-        Some(v) if !v.is_empty() => v.trim_start_matches('v'),
-        _ => env!("CARGO_PKG_VERSION"),
-    };
+    let version: &str = crate::version::version();
 
     let spaces_enabled = crate::feature_flags::is_enabled(
         pool,

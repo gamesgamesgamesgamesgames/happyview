@@ -43,8 +43,7 @@ pub fn init_shared_client(user_agent: &str) -> reqwest::Client {
 /// site can ever silently obtain a client with no timeouts: getting the
 /// configured one must be the path of least resistance.
 pub fn shared_client() -> &'static reqwest::Client {
-    SHARED_CLIENT
-        .get_or_init(|| build_http_client(&format!("HappyView/{}", env!("CARGO_PKG_VERSION"))))
+    SHARED_CLIENT.get_or_init(|| build_http_client(&crate::version::user_agent()))
 }
 
 fn client_with_timeouts(connect: Duration, read: Duration, user_agent: &str) -> reqwest::Client {
@@ -158,7 +157,7 @@ mod tests {
 
         let _ = shared_client().get(format!("http://{addr}/")).send().await;
 
-        let expected_ua = format!("HappyView/{}", env!("CARGO_PKG_VERSION"));
+        let expected_ua = crate::version::user_agent();
         let request = received.lock().await.clone();
         assert!(
             request

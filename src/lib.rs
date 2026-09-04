@@ -44,6 +44,7 @@ pub mod telemetry_middleware;
 #[cfg(test)]
 pub mod test_support;
 pub mod verification_methods;
+pub mod version;
 pub mod xrpc;
 
 use auth::oauth_store::{DbSessionStore, DbStateStore};

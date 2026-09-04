@@ -89,7 +89,7 @@ pub async fn assemble(
     let version_since_fut = async {
         budgeted(
             "version_since",
-            health::time_on_version(pool, backend, env!("CARGO_PKG_VERSION")),
+            health::time_on_version(pool, backend, crate::version::version()),
         )
         .await
         .flatten()
@@ -190,7 +190,7 @@ pub async fn assemble(
         instance_id,
         reported_at: now_rfc3339(),
         report_mode: consent.mode.as_str().to_string(),
-        happyview_version: env!("CARGO_PKG_VERSION").to_string(),
+        happyview_version: crate::version::version().to_string(),
         process_started_at: counters.process_started_at().to_string(),
         contact: consent.contact.clone(),
         totals,
