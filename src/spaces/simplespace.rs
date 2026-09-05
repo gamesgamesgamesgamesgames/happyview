@@ -270,13 +270,8 @@ async fn list_members(
     Query(query): Query<SpaceUriQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let space = resolve_space(&state, &query.space).await?;
-
-    if !space.config.membership_public {
-        let claims = require_auth(&xrpc_claims)?;
-        let member =
-            members::is_member(&state.db, state.db_backend, &space.id, claims.did()).await?;
-        member.ok_or_else(|| AppError::Forbidden("You are not a member of this space".into()))?;
-    }
+    let claims = require_auth(&xrpc_claims)?;
+    require_space_admin(&state, &space, claims.did()).await?;
 
     let resolved = members::resolve_members(&state.db, state.db_backend, &space.id).await?;
 
