@@ -10,7 +10,7 @@ You don't write route handlers or database queries; you upload a lexicon and Hap
 
 | Type          | Effect                                                                                                                                   |
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `record`      | Adds the collection to the Jetstream subscription filter and indexes records into the database. Supports [record scripts](label-scripts) |
+| `record`      | Adds the collection to the Jetstream subscription filter and indexes records into the database. Supports [record scripts](record-scripts) |
 | `query`       | Registers a `GET /xrpc/{nsid}` endpoint that queries indexed records                                                                     |
 | `procedure`   | Registers a `POST /xrpc/{nsid}` endpoint that proxies writes to the user's PDS                                                           |
 | `definitions` | Stored but does not generate routes or subscriptions                                                                                     |
@@ -102,7 +102,7 @@ In short: if you want to serve an XRPC method on your instance, you need a local
 ## Next steps
 
 - [Lua Scripting](./lua-scripting.md): Add custom query and procedure logic to your endpoints
-- [Record & Label Scripts](label-scripts): Run Lua scripts when records are indexed or labels arrive
+- [Record & Label Scripts](record-scripts): Run Lua scripts when records are indexed or labels arrive
 - [XRPC API](../api-reference/xrpc-api.md): Understand how the generated endpoints behave
 - [Backfill](backfill.md): Learn how historical records are indexed
 - [Admin API](../api-reference/admin/admin-api.md): Full reference for lexicon management endpoints

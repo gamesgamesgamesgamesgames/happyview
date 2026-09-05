@@ -109,4 +109,4 @@ The **Last Used** column in the API Keys table shows when each key was last used
 
 - [Admin API reference](../api-reference/admin/admin-api.md) — full endpoint documentation
 - [Scripting](./lua-scripting.md) — automate record processing with Lua scripts
-- [Record & label scripts](./label-scripts) — react to record changes and label events
+- [Record & label scripts](./record-scripts) — react to record changes and label events
