@@ -2,7 +2,7 @@
 title: "JSON API"
 ---
 
-The `json` global provides JSON serialization and deserialization. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts).
+The `json` global provides JSON serialization and deserialization. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/record-scripts).
 
 ## json.encode
 

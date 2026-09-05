@@ -2,7 +2,7 @@
 title: "Database API"
 ---
 
-The `db` table provides access to the database. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts).
+The `db` table provides access to the database. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/record-scripts).
 
 ## db.query
 

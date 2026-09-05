@@ -2,7 +2,7 @@
 title: "HTTP API"
 ---
 
-The `http` table provides async HTTP client functions. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts).
+The `http` table provides async HTTP client functions. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/record-scripts).
 
 ## Methods
 

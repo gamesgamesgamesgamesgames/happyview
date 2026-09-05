@@ -81,7 +81,7 @@ Logged when a user attempts to access an endpoint they don't have permission for
 | `script.executed`      | info     | Trigger ID | `trigger_id`          |
 | `script.dead_lettered` | error    | Trigger ID | `trigger_id`, `error` |
 
-Logged when [record/label scripts](./label-scripts) run. Dead-lettered events indicate a script failed all retry attempts. You can manage dead letters from the **Data > Dead Letters** page in the dashboard — see [Dead Letters](#dead-letters) below.
+Logged when [record/label scripts](./record-scripts) run. Dead-lettered events indicate a script failed all retry attempts. You can manage dead letters from the **Data > Dead Letters** page in the dashboard — see [Dead Letters](#dead-letters) below.
 
 ### Backfill events
 

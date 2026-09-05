@@ -2,7 +2,7 @@
 title: "Utility Globals"
 ---
 
-Global functions available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts). These don't belong to a specific API table — they're available at the top level of any script.
+Global functions available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/record-scripts). These don't belong to a specific API table — they're available at the top level of any script.
 
 ## now
 
