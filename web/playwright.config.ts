@@ -32,6 +32,7 @@ export default defineConfig({
         "lexicon-services.spec.ts",
         "lexicon-delete.spec.ts",
         "lexicon-id-validation.spec.ts",
+        "lexicon-target-collection.spec.ts",
         "lexicon-backfill.spec.ts",
         "script-delete.spec.ts",
         "script-job.spec.ts",

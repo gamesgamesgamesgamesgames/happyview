@@ -144,6 +144,9 @@ export default function AddLexiconPage() {
       await uploadLexicon({
         lexicon_json: lexiconJson,
         backfill: localMainType === "record" && backfill,
+        target_collection: showLocalTargetCollection
+          ? localTargetCollection.trim() || undefined
+          : undefined,
       });
       router.push("/dashboard/lexicons");
     } catch (e: unknown) {
@@ -194,8 +197,8 @@ export default function AddLexiconPage() {
               {error && <p className="text-destructive text-sm">{error}</p>}
 
               {/* Metadata fields */}
-              {/* <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                {showLocalTargetCollection && (
+              {showLocalTargetCollection && (
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                   <div className="flex flex-col gap-2">
                     <Label htmlFor="target-collection">
                       Record Collection (optional)
@@ -205,10 +208,18 @@ export default function AddLexiconPage() {
                       value={localTargetCollection}
                       onChange={(e) => setLocalTargetCollection(e.target.value)}
                       placeholder="com.example.record"
+                      aria-describedby="target-collection-description"
                     />
+                    <p
+                      id="target-collection-description"
+                      className="text-muted-foreground text-xs"
+                    >
+                      Required for native listing. Optional when a Lua handler
+                      selects its own collection.
+                    </p>
                   </div>
-                )}
-              </div> */}
+                </div>
+              )}
 
               {/* Code panels */}
               <CodePanels
