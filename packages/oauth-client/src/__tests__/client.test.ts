@@ -140,6 +140,36 @@ describe("HappyViewOAuthClient", () => {
       expect(result.pkceVerifier).toBeUndefined();
     });
 
+    test("surfaces the confidential flag from the response", async () => {
+      const testJwk = await generateTestJwk();
+      const { fetchFn } = createMockFetch([
+        {
+          status: 201,
+          body: {
+            provision_id: "hvp_conf_flag",
+            dpop_key: testJwk,
+            confidential: true,
+          },
+        },
+      ]);
+
+      const client = createClient({ fetchFn });
+      expect((await client.provisionDpopKey()).confidential).toBe(true);
+    });
+
+    test("defaults confidential to false when the instance omits it", async () => {
+      const testJwk = await generateTestJwk();
+      const { fetchFn } = createMockFetch([
+        {
+          status: 201,
+          body: { provision_id: "hvp_old", dpop_key: testJwk },
+        },
+      ]);
+
+      const client = createClient({ fetchFn });
+      expect((await client.provisionDpopKey()).confidential).toBe(false);
+    });
+
     test("throws ApiError on non-201 response", async () => {
       const { fetchFn } = createMockFetch([
         { status: 400, body: { message: "bad request" } },

@@ -20,14 +20,6 @@ const NAMESPACE = "@happyview/oauth-client-browser";
 const POPUP_CHANNEL_NAME = `${NAMESPACE}(popup-channel)`;
 const POPUP_STATE_PREFIX = `${NAMESPACE}(popup-state):`;
 
-export function isClientAssertionRequired(
-  status: number,
-  body: string,
-): boolean {
-  if (status !== 400 && status !== 401) return false;
-  return body.includes("client_assertion");
-}
-
 export class LoginContinuedInParentWindowError extends Error {
   constructor() {
     super("Login continued in parent window");
@@ -56,6 +48,7 @@ interface PendingAuthState {
   tokenEndpoint: string;
   state: string;
   issuer: string;
+  confidential: boolean;
 }
 
 export interface LoginOptions {
@@ -148,11 +141,14 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
 
     const scopes = options?.scope ?? options?.scopes ?? this.scopes;
 
-    // Provision DPoP key from HappyView
+    // Provision DPoP key from HappyView. The response also says, authoritatively,
+    // whether this client must authenticate to the PDS as a confidential atproto
+    // client — the deterministic signal we attach assertions on, below.
     const {
       provisionId,
       rawJwk,
       pkceVerifier: provisionPkceVerifier,
+      confidential,
     } = await this.provisionDpopKey();
 
     // Separate PKCE for the PDS authorization server
@@ -171,6 +167,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
       tokenEndpoint: authMeta.token_endpoint,
       state,
       issuer: authMeta.issuer,
+      confidential,
     };
     await this.storage.set(
       `pending-auth:${state}`,
@@ -220,46 +217,32 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
         JSON.stringify(options.authorization_details),
       );
 
+    if (confidential) {
+      const { clientAssertion, clientAssertionType } =
+        await this.getClientAssertion(authMeta.issuer, {
+          provisionId,
+          pkceVerifier: provisionPkceVerifier!,
+        });
+      authParams.set("client_assertion", clientAssertion);
+      authParams.set("client_assertion_type", clientAssertionType);
+    }
+
     // ATProto requires Pushed Authorization Requests (PAR)
     const parEndpoint = authMeta.pushed_authorization_request_endpoint;
     if (parEndpoint) {
-      const sendPar = () =>
-        this._fetch(parEndpoint, {
-          method: "POST",
-          headers: {
-            "content-type": "application/x-www-form-urlencoded",
-          },
-          body: authParams,
-        });
+      const parResp = await this._fetch(parEndpoint, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: authParams,
+      });
 
-      let parResp = await sendPar();
-
-      // ⚠ A CONFIDENTIAL CLIENT MUST AUTHENTICATE THE PAR, and it finds that out
-      // by being told. On the assertion-required error, mint one bound to this
-      // provision, add it to `authParams`, and send once more. Public clients
-      // never reach this branch. See `isClientAssertionRequired`.
       if (!parResp.ok) {
-        const errText = await parResp.text();
-        if (isClientAssertionRequired(parResp.status, errText)) {
-          const { clientAssertion, clientAssertionType } =
-            await this.getClientAssertion(authMeta.issuer, {
-              provisionId,
-              pkceVerifier: provisionPkceVerifier!,
-            });
-          authParams.set("client_assertion", clientAssertion);
-          authParams.set("client_assertion_type", clientAssertionType);
-          parResp = await sendPar();
-          if (!parResp.ok) {
-            const retryErr = await parResp.text();
-            throw new ResolutionError(
-              `PAR request failed: ${parResp.status} ${retryErr}`,
-            );
-          }
-        } else {
-          throw new ResolutionError(
-            `PAR request failed: ${parResp.status} ${errText}`,
-          );
-        }
+        const err = await parResp.text();
+        throw new ResolutionError(
+          `PAR request failed: ${parResp.status} ${err}`,
+        );
       }
 
       const parData = (await parResp.json()) as { request_uri: string };
@@ -320,17 +303,9 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
       const { clientId, redirectUri } = this.resolveOAuthEndpoints();
 
       let dpopNonce: string | undefined;
-      let assertion:
-        | { clientAssertion: string; clientAssertionType: string }
-        | undefined;
-      let lastError = "";
       let tokenResp!: Response;
 
-      // Up to three attempts, because two retryable conditions can each fire
-      // once: a `use_dpop_nonce` challenge, and — for a confidential client — an
-      // assertion-required error. Each is handled at most once (its guard stops
-      // a second time round); anything else is final.
-      for (let attempt = 0; attempt < 3; attempt++) {
+      for (let attempt = 0; attempt < 2; attempt++) {
         const proof = await dpopKey.createJwt(
           {
             alg: "ES256",
@@ -353,12 +328,15 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
           client_id: clientId,
           code_verifier: pending.authPkceVerifier,
         });
-        if (assertion) {
-          requestBody.set("client_assertion", assertion.clientAssertion);
-          requestBody.set(
-            "client_assertion_type",
-            assertion.clientAssertionType,
-          );
+
+        if (pending.confidential) {
+          const { clientAssertion, clientAssertionType } =
+            await this.getClientAssertion(pending.issuer, {
+              provisionId: pending.provisionId,
+              pkceVerifier: pending.provisionPkceVerifier,
+            });
+          requestBody.set("client_assertion", clientAssertion);
+          requestBody.set("client_assertion_type", clientAssertionType);
         }
 
         tokenResp = await this._fetch(pending.tokenEndpoint, {
@@ -370,46 +348,31 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
           body: requestBody,
         });
 
-        if (tokenResp.ok) break;
-
-        lastError = await tokenResp.text();
-        const nonceHeader = tokenResp.headers.get("dpop-nonce");
-
-        if (
-          nonceHeader &&
-          nonceHeader !== dpopNonce &&
-          lastError.includes("use_dpop_nonce")
-        ) {
-          dpopNonce = nonceHeader;
-          continue;
+        if (!tokenResp.ok && attempt === 0) {
+          const nonceHeader = tokenResp.headers.get("dpop-nonce");
+          if (nonceHeader) {
+            const errorBody = await tokenResp.text();
+            if (errorBody.includes("use_dpop_nonce")) {
+              dpopNonce = nonceHeader;
+              continue;
+            }
+            throw new TokenExchangeError(
+              `Token exchange failed: ${tokenResp.status} ${errorBody}`,
+              tokenResp.status,
+              errorBody,
+            );
+          }
         }
 
-        // ⚠ CONFIDENTIAL CLIENTS AUTHENTICATE THE TOKEN EXCHANGE TOO. Mint an
-        // assertion bound to this provision, once, and retry with it attached.
-        // Public clients never see this error. See `isClientAssertionRequired`.
-        if (
-          !assertion &&
-          isClientAssertionRequired(tokenResp.status, lastError)
-        ) {
-          assertion = await this.getClientAssertion(pending.issuer, {
-            provisionId: pending.provisionId,
-            pkceVerifier: pending.provisionPkceVerifier,
-          });
-          continue;
-        }
-
-        throw new TokenExchangeError(
-          `Token exchange failed: ${tokenResp.status} ${lastError}`,
-          tokenResp.status,
-          lastError,
-        );
+        break;
       }
 
-      if (!tokenResp.ok) {
+      if (!tokenResp!.ok) {
+        const err = await tokenResp!.text();
         throw new TokenExchangeError(
-          `Token exchange failed: ${tokenResp.status} ${lastError}`,
-          tokenResp.status,
-          lastError,
+          `Token exchange failed: ${tokenResp!.status} ${err}`,
+          tokenResp!.status,
+          err,
         );
       }
 

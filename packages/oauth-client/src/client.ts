@@ -79,6 +79,7 @@ export class HappyViewOAuthClient {
     dpopKey: Key;
     rawJwk: JsonWebKey;
     pkceVerifier?: string;
+    confidential: boolean;
   }> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -119,6 +120,7 @@ export class HappyViewOAuthClient {
       dpopKey,
       rawJwk: data.dpop_key,
       pkceVerifier,
+      confidential: data.confidential ?? false,
     };
   }
 
