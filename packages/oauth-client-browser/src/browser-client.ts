@@ -20,6 +20,14 @@ const NAMESPACE = "@happyview/oauth-client-browser";
 const POPUP_CHANNEL_NAME = `${NAMESPACE}(popup-channel)`;
 const POPUP_STATE_PREFIX = `${NAMESPACE}(popup-state):`;
 
+export function isClientAssertionRequired(
+  status: number,
+  body: string,
+): boolean {
+  if (status !== 400 && status !== 401) return false;
+  return body.includes("client_assertion");
+}
+
 export class LoginContinuedInParentWindowError extends Error {
   constructor() {
     super("Login continued in parent window");
@@ -100,7 +108,10 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
   private readonly redirectUri: string | undefined;
   private readonly scopes: string;
   constructor(options: HappyViewBrowserClientOptions) {
-    const fetchFn = options.fetch ?? (((input: RequestInfo | URL, init?: RequestInit) => fetch(input, init)) as typeof globalThis.fetch);
+    const fetchFn =
+      options.fetch ??
+      (((input: RequestInfo | URL, init?: RequestInit) =>
+        fetch(input, init)) as typeof globalThis.fetch);
     const storageAdapter = options.storage ?? new LocalStorageAdapter();
     super({
       instanceUrl: options.instanceUrl,
@@ -120,7 +131,10 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     this.didResolver = new DidResolverCommon({ fetch: fetchFn });
   }
 
-  async prepareLogin(handle: string, options?: LoginOptions): Promise<PrepareLoginResult> {
+  async prepareLogin(
+    handle: string,
+    options?: LoginOptions,
+  ): Promise<PrepareLoginResult> {
     // Resolve handle → DID → DID document → PDS URL → auth server metadata
     const resolvedDid = await this.handleResolver.resolve(handle);
     if (!resolvedDid) {
@@ -135,8 +149,11 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     const scopes = options?.scope ?? options?.scopes ?? this.scopes;
 
     // Provision DPoP key from HappyView
-    const { provisionId, rawJwk, pkceVerifier: provisionPkceVerifier } =
-      await this.provisionDpopKey();
+    const {
+      provisionId,
+      rawJwk,
+      pkceVerifier: provisionPkceVerifier,
+    } = await this.provisionDpopKey();
 
     // Separate PKCE for the PDS authorization server
     const authPkceVerifier = generatePkceVerifier();
@@ -160,7 +177,8 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
       JSON.stringify(pendingState),
     );
 
-    const { clientId, redirectUri: defaultRedirectUri } = this.resolveOAuthEndpoints();
+    const { clientId, redirectUri: defaultRedirectUri } =
+      this.resolveOAuthEndpoints();
     const redirectUri = options?.redirect_uri ?? defaultRedirectUri;
 
     const authParams = new URLSearchParams({
@@ -177,7 +195,8 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     if (options?.display) authParams.set("display", options.display);
     if (options?.prompt) authParams.set("prompt", options.prompt);
     if (options?.nonce) authParams.set("nonce", options.nonce);
-    if (options?.max_age != null) authParams.set("max_age", String(options.max_age));
+    if (options?.max_age != null)
+      authParams.set("max_age", String(options.max_age));
     if (options?.ui_locales) authParams.set("ui_locales", options.ui_locales);
     // ⚠ THE AUTHORIZATION REQUEST MUST BE BOUND TO THE DPoP KEY, and this client
     // is the only thing that can do it — `provisionDpopKey` above returned the
@@ -187,27 +206,60 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     // (https://atproto.com/blog/oauth-improvements#deprecation-notice) and other
     // implementations reject the request outright. A caller-supplied `dpop_jkt`
     // still wins, for anyone driving the key themselves.
-    authParams.set("dpop_jkt", options?.dpop_jkt ?? (await jwkThumbprint(rawJwk)));
-    if (options?.id_token_hint) authParams.set("id_token_hint", options.id_token_hint);
-    if (options?.claims) authParams.set("claims", JSON.stringify(options.claims));
-    if (options?.authorization_details) authParams.set("authorization_details", JSON.stringify(options.authorization_details));
+    authParams.set(
+      "dpop_jkt",
+      options?.dpop_jkt ?? (await jwkThumbprint(rawJwk)),
+    );
+    if (options?.id_token_hint)
+      authParams.set("id_token_hint", options.id_token_hint);
+    if (options?.claims)
+      authParams.set("claims", JSON.stringify(options.claims));
+    if (options?.authorization_details)
+      authParams.set(
+        "authorization_details",
+        JSON.stringify(options.authorization_details),
+      );
 
     // ATProto requires Pushed Authorization Requests (PAR)
     const parEndpoint = authMeta.pushed_authorization_request_endpoint;
     if (parEndpoint) {
-      const parResp = await this._fetch(parEndpoint, {
-        method: "POST",
-        headers: {
-          "content-type": "application/x-www-form-urlencoded",
-        },
-        body: authParams,
-      });
+      const sendPar = () =>
+        this._fetch(parEndpoint, {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+          },
+          body: authParams,
+        });
 
+      let parResp = await sendPar();
+
+      // ⚠ A CONFIDENTIAL CLIENT MUST AUTHENTICATE THE PAR, and it finds that out
+      // by being told. On the assertion-required error, mint one bound to this
+      // provision, add it to `authParams`, and send once more. Public clients
+      // never reach this branch. See `isClientAssertionRequired`.
       if (!parResp.ok) {
-        const err = await parResp.text();
-        throw new ResolutionError(
-          `PAR request failed: ${parResp.status} ${err}`,
-        );
+        const errText = await parResp.text();
+        if (isClientAssertionRequired(parResp.status, errText)) {
+          const { clientAssertion, clientAssertionType } =
+            await this.getClientAssertion(authMeta.issuer, {
+              provisionId,
+              pkceVerifier: provisionPkceVerifier!,
+            });
+          authParams.set("client_assertion", clientAssertion);
+          authParams.set("client_assertion_type", clientAssertionType);
+          parResp = await sendPar();
+          if (!parResp.ok) {
+            const retryErr = await parResp.text();
+            throw new ResolutionError(
+              `PAR request failed: ${parResp.status} ${retryErr}`,
+            );
+          }
+        } else {
+          throw new ResolutionError(
+            `PAR request failed: ${parResp.status} ${errText}`,
+          );
+        }
       }
 
       const parData = (await parResp.json()) as { request_uri: string };
@@ -256,11 +308,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     }
 
     if (!code) {
-      throw new OAuthCallbackError(
-        params,
-        'Missing "code" parameter',
-        state,
-      );
+      throw new OAuthCallbackError(params, 'Missing "code" parameter', state);
     }
 
     const pending: PendingAuthState = JSON.parse(pendingJson);
@@ -272,9 +320,17 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
       const { clientId, redirectUri } = this.resolveOAuthEndpoints();
 
       let dpopNonce: string | undefined;
+      let assertion:
+        | { clientAssertion: string; clientAssertionType: string }
+        | undefined;
+      let lastError = "";
       let tokenResp!: Response;
 
-      for (let attempt = 0; attempt < 2; attempt++) {
+      // Up to three attempts, because two retryable conditions can each fire
+      // once: a `use_dpop_nonce` challenge, and — for a confidential client — an
+      // assertion-required error. Each is handled at most once (its guard stops
+      // a second time round); anything else is final.
+      for (let attempt = 0; attempt < 3; attempt++) {
         const proof = await dpopKey.createJwt(
           {
             alg: "ES256",
@@ -290,46 +346,70 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
           },
         );
 
+        const requestBody = new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: redirectUri,
+          client_id: clientId,
+          code_verifier: pending.authPkceVerifier,
+        });
+        if (assertion) {
+          requestBody.set("client_assertion", assertion.clientAssertion);
+          requestBody.set(
+            "client_assertion_type",
+            assertion.clientAssertionType,
+          );
+        }
+
         tokenResp = await this._fetch(pending.tokenEndpoint, {
           method: "POST",
           headers: {
             "content-type": "application/x-www-form-urlencoded",
             dpop: proof,
           },
-          body: new URLSearchParams({
-            grant_type: "authorization_code",
-            code,
-            redirect_uri: redirectUri,
-            client_id: clientId,
-            code_verifier: pending.authPkceVerifier,
-          }),
+          body: requestBody,
         });
 
-        if (!tokenResp.ok && attempt === 0) {
-          const nonceHeader = tokenResp.headers.get("dpop-nonce");
-          if (nonceHeader) {
-            const errorBody = await tokenResp.text();
-            if (errorBody.includes("use_dpop_nonce")) {
-              dpopNonce = nonceHeader;
-              continue;
-            }
-            throw new TokenExchangeError(
-              `Token exchange failed: ${tokenResp.status} ${errorBody}`,
-              tokenResp.status,
-              errorBody,
-            );
-          }
+        if (tokenResp.ok) break;
+
+        lastError = await tokenResp.text();
+        const nonceHeader = tokenResp.headers.get("dpop-nonce");
+
+        if (
+          nonceHeader &&
+          nonceHeader !== dpopNonce &&
+          lastError.includes("use_dpop_nonce")
+        ) {
+          dpopNonce = nonceHeader;
+          continue;
         }
 
-        break;
+        // ⚠ CONFIDENTIAL CLIENTS AUTHENTICATE THE TOKEN EXCHANGE TOO. Mint an
+        // assertion bound to this provision, once, and retry with it attached.
+        // Public clients never see this error. See `isClientAssertionRequired`.
+        if (
+          !assertion &&
+          isClientAssertionRequired(tokenResp.status, lastError)
+        ) {
+          assertion = await this.getClientAssertion(pending.issuer, {
+            provisionId: pending.provisionId,
+            pkceVerifier: pending.provisionPkceVerifier,
+          });
+          continue;
+        }
+
+        throw new TokenExchangeError(
+          `Token exchange failed: ${tokenResp.status} ${lastError}`,
+          tokenResp.status,
+          lastError,
+        );
       }
 
-      if (!tokenResp!.ok) {
-        const err = await tokenResp!.text();
+      if (!tokenResp.ok) {
         throw new TokenExchangeError(
-          `Token exchange failed: ${tokenResp!.status} ${err}`,
-          tokenResp!.status,
-          err,
+          `Token exchange failed: ${tokenResp.status} ${lastError}`,
+          tokenResp.status,
+          lastError,
         );
       }
 
@@ -369,7 +449,10 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     return this.logout(did);
   }
 
-  override async restore(did?: string, _refresh?: boolean | "auto"): Promise<HappyViewSession | null> {
+  override async restore(
+    did?: string,
+    _refresh?: boolean | "auto",
+  ): Promise<HappyViewSession | null> {
     if (did) {
       const session = await this.restoreSession(did);
       if (session) {
@@ -381,8 +464,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
   }
 
   async init(): Promise<
-    | { session: HappyViewSession; state?: string | null }
-    | undefined
+    { session: HappyViewSession; state?: string | null } | undefined
   > {
     const params = this.readCallbackParams();
     if (params) {
@@ -434,10 +516,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     return this.signInRedirect(handle, options);
   }
 
-  async signInRedirect(
-    handle: string,
-    options?: LoginOptions,
-  ): Promise<void> {
+  async signInRedirect(handle: string, options?: LoginOptions): Promise<void> {
     return this.login(handle, options);
   }
 
@@ -447,8 +526,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
   ): Promise<HappyViewSession> {
     const popupTarget = options?.popupName ?? "_blank";
     const popupFeatures =
-      options?.popupFeatures ??
-      "width=600,height=600,menubar=no,toolbar=no";
+      options?.popupFeatures ?? "width=600,height=600,menubar=no,toolbar=no";
 
     let popup = window.open("about:blank", popupTarget, popupFeatures);
 
@@ -461,11 +539,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     if (popup) {
       popup.location.href = result.authorizationUrl;
     } else {
-      popup = window.open(
-        result.authorizationUrl,
-        popupTarget,
-        popupFeatures,
-      );
+      popup = window.open(result.authorizationUrl, popupTarget, popupFeatures);
     }
     popup?.focus();
 
@@ -497,11 +571,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
             if (session) {
               resolve(session);
             } else {
-              reject(
-                new Error(
-                  "Failed to restore session after popup login",
-                ),
-              );
+              reject(new Error("Failed to restore session after popup login"));
             }
           } catch (err) {
             reject(err);
@@ -509,9 +579,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
           }
         } else {
           reject(
-            new Error(
-              data.result.reason?.message ?? "Popup login failed",
-            ),
+            new Error(data.result.reason?.message ?? "Popup login failed"),
           );
         }
       };
@@ -522,19 +590,14 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
 
   readCallbackParams(): URLSearchParams | null {
     const params = new URLSearchParams(window.location.search);
-    if (
-      !params.has("state") ||
-      !(params.has("code") || params.has("error"))
-    ) {
+    if (!params.has("state") || !(params.has("code") || params.has("error"))) {
       return null;
     }
     return params;
   }
 
   findRedirectUrl(): string {
-    return (
-      this.redirectUri ?? `${window.location.origin}/oauth/callback`
-    );
+    return this.redirectUri ?? `${window.location.origin}/oauth/callback`;
   }
 
   dispose(): void {
@@ -548,7 +611,8 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
   private resolveOAuthEndpoints(): { clientId: string; redirectUri: string } {
     return {
       clientId: this.clientId,
-      redirectUri: this.redirectUri ?? `${window.location.origin}/oauth/callback`,
+      redirectUri:
+        this.redirectUri ?? `${window.location.origin}/oauth/callback`,
     };
   }
 
