@@ -62,6 +62,7 @@ jobs:
         id: filter
         uses: dorny/paths-filter@v4
         with:
+          base: ${{ github.ref }}
           filters: |
             server:
               - 'src/**'
