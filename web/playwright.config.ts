@@ -45,6 +45,10 @@ export default defineConfig({
         "users-add.spec.ts",
         "confidential-client.spec.ts",
         "dpop-session-revocation.spec.ts",
+        // telemetry-settings was written but never listed here, so it
+        // had never actually run.
+        "telemetry-settings.spec.ts",
+        "telemetry-prompt.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },

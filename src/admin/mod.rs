@@ -173,6 +173,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/settings/telemetry",
             get(telemetry::get).put(telemetry::update),
         )
+        .route("/settings/telemetry/dismiss", post(telemetry::dismiss))
         .route("/settings/telemetry/preview", get(telemetry::preview))
         .route("/settings/telemetry/send", post(telemetry::send))
         .route(

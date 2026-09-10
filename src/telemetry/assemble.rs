@@ -262,6 +262,7 @@ mod tests {
             lexicon_structure: false,
             lexicon_documents: false,
             instance_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            prompted: true,
         }
     }
 
