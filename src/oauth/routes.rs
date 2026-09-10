@@ -241,6 +241,7 @@ struct ProvisionKeyBody {
 struct ProvisionKeyResponse {
     provision_id: String,
     dpop_key: serde_json::Value,
+    confidential: bool,
 }
 
 #[derive(Deserialize)]
@@ -355,6 +356,31 @@ async fn provision_dpop_key(
     )
     .await?;
 
+    let confidential =
+        match super::pds_write::lookup_client_id_url(&state.db, state.db_backend, &client.id).await
+        {
+            Ok(client_id_url) => state
+                .oauth
+                .refresh_client_confidentiality(&state, &client.id, &client_id_url)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        client_id = %client.id,
+                        error = %e,
+                        "confidentiality probe failed at provision; using the registered verdict"
+                    );
+                    state.oauth.is_confidential(&client_id_url)
+                }),
+            Err(e) => {
+                tracing::warn!(
+                    client_id = %client.id,
+                    error = %e,
+                    "could not resolve client_id_url at provision; treating as public"
+                );
+                false
+            }
+        };
+
     log_event(
         &state.db,
         EventLog {
@@ -365,6 +391,7 @@ async fn provision_dpop_key(
             detail: serde_json::json!({
                 "client_key": client.client_key,
                 "thumbprint": keypair.thumbprint,
+                "confidential": confidential,
             }),
         },
         state.db_backend,
@@ -376,6 +403,7 @@ async fn provision_dpop_key(
         Json(ProvisionKeyResponse {
             provision_id,
             dpop_key: keypair.private_jwk,
+            confidential,
         }),
     ))
 }

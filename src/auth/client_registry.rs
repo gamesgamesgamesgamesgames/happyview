@@ -223,6 +223,14 @@ impl OAuthClientRegistry {
             .map(|r| r.value().client.clone())
     }
 
+    /// Whether the client registered under `client_id_url` authenticates to a PDS
+    /// as a confidential atproto client (`private_key_jwt`).
+    pub fn is_confidential(&self, client_id_url: &str) -> bool {
+        self.get(client_id_url).is_some_and(|c| {
+            c.client_metadata.token_endpoint_auth_method.as_deref() == Some("private_key_jwt")
+        })
+    }
+
     pub fn get_with_kid(
         &self,
         client_id_url: &str,
