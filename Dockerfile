@@ -31,6 +31,25 @@ COPY crates/ crates/
 COPY migrations/ migrations/
 ARG HAPPYVIEW_VERSION
 ENV HAPPYVIEW_VERSION=$HAPPYVIEW_VERSION
+
+# Cargo.toml's package version is deliberately not bumped per release, so
+# CARGO_PKG_VERSION reports 0.1.0 unless it is stamped here. Do it before
+# compiling so crate metadata matches the tag this image is built from --
+# telemetry reported 0.1.0 fleet-wide for exactly this reason. Local builds
+# pass no build-arg and keep the repo version. See src/version.rs.
+RUN set -eu; \
+    v="${HAPPYVIEW_VERSION#v}"; \
+    if [ -n "$v" ]; then \
+      test "$(grep -c '^version = ' Cargo.toml)" = 1 \
+        || { echo "Cargo.toml: expected exactly one top-level 'version =' line" >&2; exit 1; }; \
+      sed -i "s|^version = .*|version = \"$v\"|" Cargo.toml; \
+      grep -qx "version = \"$v\"" Cargo.toml \
+        || { echo "Cargo.toml: version stamp failed" >&2; exit 1; }; \
+      echo "stamped Cargo.toml version = $v"; \
+    else \
+      echo "no HAPPYVIEW_VERSION build-arg; keeping repo version"; \
+    fi
+
 RUN cargo build --release
 
 FROM scratch AS binary
