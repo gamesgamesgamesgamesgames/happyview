@@ -1,10 +1,11 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["tests/fixtures/test_plugin", "tests/fixtures/test_library", "plugins"]
+exclude = ["tests/fixtures/test_plugin", "tests/fixtures/test_library", "tests/fixtures/sdk_http"]
 
 [workspace.dependencies]
 happyview-nsid = { path = "crates/happyview-nsid" }
 happyview-plc = { path = "crates/happyview-plc" }
+happyview-plugin-sdk = { path = "crates/happyview-plugin-sdk" }
 happyview-scopes = { path = "crates/happyview-scopes" }
 
 [package]

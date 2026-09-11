@@ -18,9 +18,10 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/happyview-nsid/Cargo.toml crates/happyview-nsid/
 COPY crates/happyview-plc/Cargo.toml crates/happyview-plc/
+COPY crates/happyview-plugin-sdk/Cargo.toml crates/happyview-plugin-sdk/
 COPY crates/happyview-scopes/Cargo.toml crates/happyview-scopes/
-RUN mkdir -p crates/happyview-nsid/src crates/happyview-plc/src crates/happyview-scopes/src \
-    && touch crates/happyview-nsid/src/lib.rs crates/happyview-plc/src/lib.rs crates/happyview-scopes/src/lib.rs
+RUN mkdir -p crates/happyview-nsid/src crates/happyview-plc/src crates/happyview-plugin-sdk/src crates/happyview-scopes/src \
+    && touch crates/happyview-nsid/src/lib.rs crates/happyview-plc/src/lib.rs crates/happyview-plugin-sdk/src/lib.rs crates/happyview-scopes/src/lib.rs
 RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && touch src/lib.rs && echo "fn main() {}" > src/bin/migrate_lua_sql.rs && echo "fn main() {}" > src/bin/migrate_space_cids.rs
 ENV SQLX_OFFLINE=true
 RUN cargo build --release && rm -rf src target/release/.fingerprint/happyview-*

@@ -1,0 +1,12 @@
+{
+  "id": "sdk_http",
+  "name": "SDK HTTP fixture",
+  "version": "1.0.0",
+  "api_version": "2",
+  "plugin_type": "library",
+  "namespace": "http",
+  "capabilities": ["network:request:unrestricted"],
+  "allowed_hosts": [],
+  "dependencies": [],
+  "wasm_file": "target/wasm32-unknown-unknown/release/sdk_http.wasm"
+}

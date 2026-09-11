@@ -1,5 +1,6 @@
-//! The `http` standard library, end to end: loaded from `plugins/http`,
-//! called through the executor, and through Lua `require("http")`.
+//! The SDK-built `http` standard library fixture, end to end: loaded from
+//! `tests/fixtures/sdk_http`, called through the executor, and through Lua
+//! `require("http")`.
 
 use happyview::plugin::library::LibraryCallContext;
 use happyview::plugin::loader;
@@ -8,9 +9,9 @@ use wiremock::matchers::{body_string, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn state_with_http() -> happyview::AppState {
-    let plugin = loader::load_from_file(std::path::Path::new("plugins/http"))
+    let plugin = loader::load_from_file(std::path::Path::new("tests/fixtures/sdk_http"))
         .await
-        .expect("http library not built. Run: cargo build --manifest-path plugins/Cargo.toml --target wasm32-unknown-unknown --release");
+        .expect("sdk_http fixture not built. Run: cargo build --manifest-path tests/fixtures/sdk_http/Cargo.toml --target wasm32-unknown-unknown --release");
     let state = test_state_with_pool(memory_pool().await);
     state.plugin_registry.install(plugin).await.unwrap();
     state
@@ -33,7 +34,7 @@ async fn http_get_through_executor() {
     let out = state
         .plugin_executor()
         .call_library(
-            "http",
+            "sdk_http",
             "get",
             &[serde_json::json!(format!("{}/hello", server.uri()))],
             &LibraryCallContext::default(),
@@ -61,7 +62,7 @@ async fn http_post_sends_headers_and_body() {
     let out = state
         .plugin_executor()
         .call_library(
-            "http",
+            "sdk_http",
             "post",
             &[
                 serde_json::json!(format!("{}/echo", server.uri())),

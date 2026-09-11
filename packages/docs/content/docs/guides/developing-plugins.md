@@ -278,6 +278,18 @@ module '<name>' not found -- is the '<name>' library plugin installed?
 
 An empty Lua table argument (`{}`) is encoded as a JSON object, matching `json.encode`'s convention everywhere else — wrap it in `toarray({})` to send an empty JSON array instead.
 
+### Using the SDK
+
+Everything above — the allocator, the packed-`i64` calling convention, the JSON envelope, and the `env` host imports — is what a plugin would otherwise have to hand-roll behind `extern "C"`. The `happyview-plugin-sdk` crate (`crates/happyview-plugin-sdk` in the HappyView repo) owns all of it, so a plugin crate needs only this one dependency.
+
+- `library_plugin! { info: ..., surface: ..., call: ... }` generates the five ABI exports (`alloc`, `dealloc`, `plugin_info`, `get_api_surface`, `call`) from a `PluginInfo`, an `ApiSurface`-returning function, and a dispatch function — the `export_abi!` macro it builds on is also available directly for lower-level cases.
+- `host::*` gives typed, `Result`-returning wrappers over every host import — `host::http_request`, `host::kv_get`/`kv_set`/`kv_delete`, `host::get_secret`, `host::call_library`, `host::library_surface`, `host::db_query`/`db_execute`, `host::lookup_record`, and `host::log`/`debug`/`info`/`warn`/`error`. A native (non-wasm32) build compiles the whole SDK, so a plugin's own logic is testable with `cargo test`; the host wrappers just report `host::HostError::NotWasm` there instead of calling anything.
+- Only the imports a plugin actually calls end up in its compiled module; an unused `host::*` wrapper is dropped at link time, so the loader's import check sees exactly what the plugin uses.
+
+The `http` plugin (outbound `get`/`post`/`put`/`patch`/`delete`/`head` through `host::http_request`) is the worked example. HappyView's test fixture at `tests/fixtures/sdk_http` is the same source with a different id.
+
+All plugins, including the standard library ones, live in the [plugins repository](https://tangled.org/gamesgamesgamesgames.games/happyview-plugins) and consume `happyview-plugin-sdk` as an ordinary dependency — HappyView itself ships no plugins, only the SDK crate and, for its own tests, a small SDK-built fixture. `tests/fixtures/test_library` is the one exception: it stays hand-rolled against the raw ABI on purpose, as the conformance fixture the SDK itself is checked against.
+
 ## Next steps
 
 - [Official plugins repository](https://tangled.org/gamesgamesgamesgames.games/happyview-plugins) — ready-to-use plugins and the plugin SDK

@@ -1890,6 +1890,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "happyview-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wasmparser 0.236.1",
+]
+
+[[package]]
 name = "happyview-scopes"
 version = "0.1.0"
 dependencies = [

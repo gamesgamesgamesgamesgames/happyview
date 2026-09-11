@@ -190,8 +190,11 @@ jobs:
       - name: Build test library
         run: cargo build --manifest-path tests/fixtures/test_library/Cargo.toml --target wasm32-unknown-unknown --release
 
-      - name: Build standard library plugins
-        run: cargo build --manifest-path plugins/Cargo.toml --target wasm32-unknown-unknown --release
+      - name: Build SDK http fixture
+        run: cargo build --manifest-path tests/fixtures/sdk_http/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Run plugin SDK tests
+        run: cargo test -p happyview-plugin-sdk
 
       # Fast-failing, named gate: verify migrations apply on an *old* (v2.0.0)
       # database — schema + data, both SQLite and Postgres — not just a fresh one.
