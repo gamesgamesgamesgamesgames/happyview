@@ -428,7 +428,7 @@ pub async fn run_record_event_once(
     }
     let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
     let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, &script.id, Some(payload.did))?;
+    register_default_apis(&lua, &state_arc, &script.id, Some(payload.did)).await?;
 
     // Legacy globals (action, uri, did, collection, rkey, record) for
     // convenience / backwards compatibility.
@@ -637,7 +637,7 @@ async fn run_label_lua_once(
     }
     let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
     let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, &script.id, None)?;
+    register_default_apis(&lua, &state_arc, &script.id, None).await?;
 
     use mlua::LuaSerdeExt;
     let globals = lua.globals();
@@ -734,7 +734,7 @@ fn extract_bool(v: &Value, key: &str) -> Option<bool> {
 /// Calling `:save()` / `:delete()` (the PDS-touching variants) errors
 /// clearly with the no-PDS-auth message; the local-only variants
 /// (`:save_local`, `:delete_local`, `Record.delete_local`) work.
-fn register_default_apis(
+async fn register_default_apis(
     lua: &mlua::Lua,
     state: &Arc<AppState>,
     trigger_id: &str,
@@ -763,6 +763,7 @@ fn register_default_apis(
     record::register_record_api_no_auth(lua, state.clone())
         .map_err(|e| format!("record api: {e}"))?;
     register_log_event_api(lua, state, trigger_id, caller_did)?;
+    crate::lua::require_api::register_require(lua, state, caller_did, false).await?;
     Ok(())
 }
 
@@ -1016,6 +1017,7 @@ mod tests {
         let lua = mlua::Lua::new();
 
         register_default_apis(&lua, &state, "record.create:com.example.thing", None)
+            .await
             .expect("default APIs should register");
 
         let (kind, get_kind, list_kind): (String, String, String) = lua
@@ -1035,6 +1037,7 @@ mod tests {
         let lua = mlua::Lua::new();
 
         register_default_apis(&lua, &state, "labeler.apply:app.bsky.feed.post", None)
+            .await
             .expect("default APIs should register");
 
         let ok: bool = lua

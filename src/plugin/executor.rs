@@ -2,13 +2,21 @@
 
 use crate::db::DatabaseBackend;
 use crate::lexicon::LexiconRegistry;
+use crate::plugin::PluginType;
+use crate::plugin::capabilities::{self, PluginCapability};
 use crate::plugin::host::{PluginState, register_host_functions};
+use crate::plugin::library::{
+    ApiSurface, LibraryCallContext, LibraryCallInput, LibraryEntry, MAX_LIBRARY_CALL_DEPTH,
+};
 use crate::plugin::memory::{
     PluginEnvelopeError, PluginResponse, dealloc_guest, read_from_guest, write_to_guest,
 };
 use crate::plugin::runtime::{DEFAULT_FUEL, WasmRuntime};
-use crate::plugin::{ExternalProfile, PluginInfo, PluginRegistry, SyncRecord, TokenSet};
-use std::collections::HashMap;
+use crate::plugin::secrets::load_plugin_secrets;
+use crate::plugin::{
+    ExternalProfile, LoadedPlugin, PluginInfo, PluginRegistry, SyncRecord, TokenSet,
+};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
 use wasmtime::{Instance, Linker, Memory, Store, TypedFunc};
@@ -45,6 +53,12 @@ pub enum ExecutionError {
 
     #[error("Missing export: {0}")]
     MissingExport(String),
+
+    #[error("Plugin is not a library: {0}")]
+    NotALibrary(String),
+
+    #[error("Library call depth limit ({MAX_LIBRARY_CALL_DEPTH}) exceeded")]
+    DepthExceeded,
 }
 
 impl From<PluginEnvelopeError> for ExecutionError {
@@ -68,12 +82,46 @@ pub struct PluginInstance {
 }
 
 impl PluginInstance {
+    /// The capability set this instance was granted at instantiation.
+    pub fn capabilities(&self) -> &HashSet<PluginCapability> {
+        &self.store.data().capabilities
+    }
+
     /// Call plugin_info() - no input required
     pub async fn call_plugin_info(&mut self) -> Result<PluginInfo, ExecutionError> {
+        self.call_no_input_function("plugin_info").await
+    }
+
+    /// Call get_api_surface() on a library plugin.
+    pub async fn call_get_api_surface(&mut self) -> Result<ApiSurface, ExecutionError> {
+        self.call_no_input_function("get_api_surface").await
+    }
+
+    /// Call `call` on a library plugin with `{function, args, context}`.
+    pub async fn call_library_function(
+        &mut self,
+        function: &str,
+        args: &[serde_json::Value],
+        ctx: &LibraryCallContext,
+    ) -> Result<serde_json::Value, ExecutionError> {
+        let input = serde_json::to_value(LibraryCallInput {
+            function,
+            args,
+            context: ctx,
+        })
+        .map_err(|e| ExecutionError::InvalidResponse(e.to_string()))?;
+        self.call_plugin_function("call", &input).await
+    }
+
+    /// Generic helper for `() -> i64` exports returning a JSON envelope.
+    async fn call_no_input_function<T: serde::de::DeserializeOwned>(
+        &mut self,
+        name: &str,
+    ) -> Result<T, ExecutionError> {
         let func = self
             .instance
-            .get_typed_func::<(), i64>(&mut self.store, "plugin_info")
-            .map_err(|_| ExecutionError::MissingExport("plugin_info".into()))?;
+            .get_typed_func::<(), i64>(&mut self.store, name)
+            .map_err(|_| ExecutionError::MissingExport(name.into()))?;
 
         self.store
             .set_fuel(DEFAULT_FUEL)
@@ -84,20 +132,17 @@ impl PluginInstance {
             .await
             .map_err(Self::classify_error)?;
 
-        // Unpack i64: upper 32 bits = ptr, lower 32 bits = len
         let ptr = (packed >> 32) as u32;
         let len = (packed & 0xFFFFFFFF) as u32;
 
         let bytes =
             read_from_guest(&self.store, ptr, len).map_err(|_| ExecutionError::MemoryAllocation)?;
-
         dealloc_guest(&mut self.store, ptr, len)
             .await
             .map_err(|_| ExecutionError::MemoryAllocation)?;
 
-        let response: PluginResponse<PluginInfo> = serde_json::from_slice(&bytes)
+        let response: PluginResponse<T> = serde_json::from_slice(&bytes)
             .map_err(|e| ExecutionError::InvalidResponse(e.to_string()))?;
-
         response.into_result().map_err(ExecutionError::from)
     }
 
@@ -230,6 +275,7 @@ impl PluginInstance {
 }
 
 /// Factory for creating plugin instances
+#[derive(Clone)]
 pub struct PluginExecutor {
     runtime: Arc<WasmRuntime>,
     registry: Arc<PluginRegistry>,
@@ -237,6 +283,7 @@ pub struct PluginExecutor {
     db_backend: DatabaseBackend,
     http_client: reqwest::Client,
     lexicons: Arc<LexiconRegistry>,
+    encryption_key: Option<[u8; 32]>,
 }
 
 impl PluginExecutor {
@@ -255,7 +302,110 @@ impl PluginExecutor {
             db_backend,
             http_client,
             lexicons,
+            encryption_key: None,
         }
+    }
+
+    /// Key for decrypting stored plugin secrets. Without it, library calls
+    /// only see `PLUGIN_<ID>_*` environment variables.
+    pub fn with_encryption_key(mut self, key: Option<[u8; 32]>) -> Self {
+        self.encryption_key = key;
+        self
+    }
+
+    /// Dispatch `function(args)` to library `lib_id` as `ctx`. `depth` is the
+    /// number of `host_call_library` hops already taken.
+    pub async fn call_library(
+        &self,
+        lib_id: &str,
+        function: &str,
+        args: &[serde_json::Value],
+        ctx: &LibraryCallContext,
+        depth: u8,
+    ) -> Result<serde_json::Value, ExecutionError> {
+        if depth >= MAX_LIBRARY_CALL_DEPTH {
+            return Err(ExecutionError::DepthExceeded);
+        }
+        let mut inst = self.instantiate_library(lib_id, ctx, depth).await?;
+        inst.call_library_function(function, args, ctx).await
+    }
+
+    /// A library's API surface, computed once per registration.
+    pub async fn api_surface(&self, lib_id: &str) -> Result<Arc<ApiSurface>, ExecutionError> {
+        if let Some(cached) = self.registry.cached_api_surface(lib_id).await {
+            return Ok(cached);
+        }
+        let mut inst = self
+            .instantiate_library(lib_id, &LibraryCallContext::default(), 0)
+            .await?;
+        let surface = Arc::new(inst.call_get_api_surface().await?);
+        self.registry
+            .cache_api_surface(lib_id, surface.clone())
+            .await;
+        Ok(surface)
+    }
+
+    /// Every installed library with its surface. Libraries whose surface
+    /// cannot be read are logged and skipped rather than failing the script.
+    pub async fn library_index(&self) -> Vec<LibraryEntry> {
+        let mut out = Vec::new();
+        for plugin in self.registry.list_by_type(PluginType::Library).await {
+            let Some(namespace) = plugin.namespace() else {
+                continue;
+            };
+            match self.api_surface(&plugin.info.id).await {
+                Ok(surface) => out.push(LibraryEntry {
+                    id: plugin.info.id.clone(),
+                    namespace: namespace.to_string(),
+                    surface,
+                }),
+                Err(e) => {
+                    tracing::error!(plugin_id = %plugin.info.id, error = %e, "library API surface unavailable")
+                }
+            }
+        }
+        out.sort_by(|a, b| a.namespace.cmp(&b.namespace));
+        out
+    }
+
+    async fn instantiate_library(
+        &self,
+        lib_id: &str,
+        ctx: &LibraryCallContext,
+        depth: u8,
+    ) -> Result<PluginInstance, ExecutionError> {
+        let plugin = self
+            .registry
+            .get(lib_id)
+            .await
+            .ok_or_else(|| ExecutionError::PluginNotFound(lib_id.to_string()))?;
+        if plugin.plugin_type() != PluginType::Library {
+            return Err(ExecutionError::NotALibrary(lib_id.to_string()));
+        }
+        let secrets = load_plugin_secrets(
+            &self.db,
+            self.db_backend,
+            self.encryption_key.as_ref(),
+            lib_id,
+        )
+        .await;
+        let scope = ctx
+            .caller_did
+            .clone()
+            .unwrap_or_else(|| "library".to_string());
+        let mut inst = self
+            .instantiate(lib_id, &scope, secrets, serde_json::Value::Null)
+            .await?;
+        inst.store.data_mut().call_ctx = ctx.clone();
+        inst.store.data_mut().depth = depth;
+        Ok(inst)
+    }
+
+    /// The capability set a plugin will be granted at instantiation.
+    pub fn effective_capabilities(
+        plugin: &LoadedPlugin,
+    ) -> Result<HashSet<PluginCapability>, ExecutionError> {
+        capabilities::effective_set(plugin).map_err(ExecutionError::InvalidResponse)
     }
 
     /// Instantiate a plugin with the given scope
@@ -285,6 +435,9 @@ impl PluginExecutor {
 
         // Create store with initial state (memory/alloc/dealloc set to None)
         // Note: db is Option<sqlx::AnyPool> in PluginState
+        let capabilities = Self::effective_capabilities(&plugin)?;
+        let allowed_hosts = plugin.allowed_hosts().to_vec();
+
         let state = PluginState {
             plugin_id: plugin_id.to_string(),
             scope: scope.to_string(),
@@ -298,6 +451,12 @@ impl PluginExecutor {
             memory: None,
             alloc: None,
             dealloc: None,
+            capabilities,
+            allowed_hosts,
+            plugin_type: plugin.plugin_type(),
+            executor: Some(self.clone()),
+            call_ctx: LibraryCallContext::default(),
+            depth: 0,
         };
 
         let mut store = Store::new(self.runtime.engine(), state);

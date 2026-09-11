@@ -187,6 +187,12 @@ jobs:
       - name: Build test plugin
         run: cargo build --manifest-path tests/fixtures/test_plugin/Cargo.toml --target wasm32-unknown-unknown --release
 
+      - name: Build test library
+        run: cargo build --manifest-path tests/fixtures/test_library/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Build standard library plugins
+        run: cargo build --manifest-path plugins/Cargo.toml --target wasm32-unknown-unknown --release
+
       # Fast-failing, named gate: verify migrations apply on an *old* (v2.0.0)
       # database — schema + data, both SQLite and Postgres — not just a fresh one.
       # (Also included in the full run below; runs here first for a clear signal,

@@ -6,91 +6,10 @@ use std::sync::Arc;
 
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, decode_cursor, encode_cursor};
+use crate::raw_sql_guard::check_raw_sql_tables;
 
 const MAX_FILTER_DEPTH: u8 = 5;
 const ALLOWED_OPS: &[&str] = &["=", "!=", "<", ">", "<=", ">=", "LIKE", "NOT LIKE"];
-
-/// Table-name prefix reserved for HappyView's own internal tables. `db.raw`
-/// blocks these **by default** — so a table added in a future migration is
-/// protected until it is deliberately allowed — except for the data tables in
-/// [`ALLOWED_INTERNAL_TABLES`].
-const PROTECTED_TABLE_PREFIX: &str = "happyview_";
-
-/// Internal tables that don't carry the `happyview_` prefix but are still
-/// off-limits (SQLx's migration bookkeeping).
-const PROTECTED_EXACT_TABLES: &[&str] = &["_sqlx_migrations"];
-
-/// Internal tables `db.raw` is allowed to read and write despite the reserved
-/// prefix: public AppView data and space *data*. Everything else `happyview_*`
-/// stays blocked — secrets and tokens (`happyview_dpop_keys`/`_sessions`,
-/// `happyview_api_keys`, `happyview_oauth_*`, `happyview_script_variables`),
-/// auth/privilege state (`happyview_users`/`_user_permissions`, the delegation
-/// tables), trust config (`happyview_domains`, `happyview_instance_settings`),
-/// and cryptographic material (`happyview_space_credentials`, and
-/// `happyview_space_repo_state` which holds commit-signature key material).
-///
-/// Space membership/records are exposed because a space defines *access*, not
-/// confidentiality — whether to expose otherwise-private space data through the
-/// AppView is left to the admin.
-const ALLOWED_INTERNAL_TABLES: &[&str] = &[
-    // Public AppView data.
-    "happyview_records",
-    "happyview_record_refs",
-    "happyview_labels",
-    "happyview_lexicons",
-    // Background jobs.
-    "happyview_jobs",
-    // Space data (not the credential/key-material tables).
-    "happyview_spaces",
-    "happyview_space_members",
-    "happyview_space_records",
-    "happyview_space_record_oplog",
-    "happyview_space_notify_registrations",
-    "happyview_space_dids",
-];
-
-/// Reject a `db.raw` SQL string that references a protected internal table.
-///
-/// Tokenizes the SQL (so string literals and comments containing the prefix are
-/// ignored, and quoted / schema-qualified identifiers are still caught) and
-/// blocks any `happyview_*` (or `_sqlx_migrations`) identifier that is not in
-/// [`ALLOWED_INTERNAL_TABLES`]. Unicode-escaped identifiers (`U&"…"`) are refused
-/// outright as an evasion vector, and SQL that cannot be tokenized fails closed.
-fn check_raw_sql_tables(sql: &str) -> Result<(), String> {
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::tokenizer::{Token, Tokenizer};
-
-    // `U&'…'` / `U&"…"` unicode-escaped literals could smuggle a protected
-    // identifier past tokenization (the escapes decode to letters); there is no
-    // legitimate need for them in `db.raw`, so refuse them outright.
-    let lowered = sql.to_ascii_lowercase();
-    if lowered.contains("u&\"") || lowered.contains("u&'") {
-        return Err("db.raw does not allow unicode-escaped identifiers".into());
-    }
-
-    // Tokenizing (rather than substring matching) means the prefix inside string
-    // literals or comments is ignored, while quoted and schema-qualified
-    // identifiers are still seen. SQL we cannot tokenize fails closed.
-    let tokens = Tokenizer::new(&GenericDialect {}, sql)
-        .tokenize()
-        .map_err(|e| format!("db.raw could not parse SQL: {e}"))?;
-
-    for token in tokens {
-        if let Token::Word(word) = token {
-            let name = word.value.to_ascii_lowercase();
-            let is_internal = name.starts_with(PROTECTED_TABLE_PREFIX)
-                || PROTECTED_EXACT_TABLES.contains(&name.as_str());
-            if is_internal && !ALLOWED_INTERNAL_TABLES.contains(&name.as_str()) {
-                return Err(format!(
-                    "db.raw cannot reference the protected internal HappyView table '{}'",
-                    word.value
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
 
 fn is_valid_json_field_path(path: &str) -> bool {
     if path.is_empty() {
@@ -970,81 +889,6 @@ mod tests {
                 "should have passed validation but got: {err}"
             );
         }
-    }
-
-    #[test]
-    fn raw_sql_allows_non_protected_tables() {
-        // Admins can get wild with their own tables.
-        assert!(super::check_raw_sql_tables("SELECT * FROM my_table").is_ok());
-        assert!(super::check_raw_sql_tables("CREATE TABLE analytics (id INT)").is_ok());
-        assert!(super::check_raw_sql_tables("INSERT INTO analytics VALUES (1)").is_ok());
-        assert!(super::check_raw_sql_tables("UPDATE analytics SET id = 2").is_ok());
-        assert!(super::check_raw_sql_tables("DELETE FROM analytics WHERE id = 1").is_ok());
-        assert!(super::check_raw_sql_tables("DROP TABLE analytics").is_ok());
-        // A table that merely *contains* the prefix mid-name is fine.
-        assert!(super::check_raw_sql_tables("SELECT * FROM myhappyview_data").is_ok());
-        // The prefix appearing inside a string literal is not a table reference.
-        assert!(
-            super::check_raw_sql_tables("INSERT INTO logs (msg) VALUES ('happyview_started')")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn raw_sql_allows_allowlisted_internal_tables() {
-        // Public AppView data and background jobs are readable/writable.
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_records").is_ok());
-        assert!(
-            super::check_raw_sql_tables("DELETE FROM happyview_records WHERE uri = $1").is_ok()
-        );
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_record_refs").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_labels").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_lexicons").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_jobs").is_ok());
-        // Space data (access, not confidentiality).
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_records").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_members").is_ok());
-    }
-
-    #[test]
-    fn raw_sql_blocks_protected_tables() {
-        // Secrets / tokens / keys.
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_dpop_keys").is_err());
-        assert!(super::check_raw_sql_tables("DROP TABLE happyview_api_keys").is_err());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_script_variables").is_err());
-        // Auth / privilege / trust config.
-        assert!(super::check_raw_sql_tables("UPDATE happyview_users SET is_super = true").is_err());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_domains").is_err());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_instance_settings").is_err());
-        // Space credential / key-material tables stay blocked even though other
-        // space tables are allowed.
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_credentials").is_err());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_repo_state").is_err());
-        // The migration bookkeeping table is off-limits too.
-        assert!(super::check_raw_sql_tables("SELECT * FROM _sqlx_migrations").is_err());
-    }
-
-    #[test]
-    fn raw_sql_blocks_protected_tables_evasion() {
-        // Case-insensitive.
-        assert!(super::check_raw_sql_tables("SELECT * FROM HAPPYVIEW_USERS").is_err());
-        // Double-quoted identifier.
-        assert!(super::check_raw_sql_tables(r#"SELECT * FROM "happyview_api_keys""#).is_err());
-        // Schema-qualified.
-        assert!(
-            super::check_raw_sql_tables("SELECT * FROM public.happyview_dpop_sessions").is_err()
-        );
-        // Second statement in a batch.
-        assert!(super::check_raw_sql_tables("SELECT 1; SELECT * FROM happyview_users").is_err());
-        // JOIN / subquery position.
-        assert!(
-            super::check_raw_sql_tables(
-                "SELECT * FROM my_table JOIN happyview_api_clients USING (id)"
-            )
-            .is_err()
-        );
-        // Unicode-escaped identifier evasion is refused outright.
-        assert!(super::check_raw_sql_tables(r#"SELECT * FROM U&"happyview_dpop_keys""#).is_err());
     }
 
     #[test]

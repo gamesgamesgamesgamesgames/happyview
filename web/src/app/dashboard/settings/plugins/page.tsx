@@ -2,13 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { Plus, Trash2, RefreshCw, ExternalLink, Settings, Loader2, AlertTriangle, CheckCircle2, AlertCircle, ArrowUpCircle, Search } from "lucide-react";
+import { Plus, Trash2, RefreshCw, ExternalLink, Settings, Loader2, AlertTriangle, CheckCircle2, AlertCircle, ArrowUpCircle, Search, ChevronDown } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { useOfficialPlugins } from "@/hooks/use-official-plugins";
 import { getPlugins, addPlugin, removePlugin, reloadPlugin, getPluginSecrets, updatePluginSecrets, previewPlugin, checkPluginUpdate, type PluginPreview } from "@/lib/api";
 import type { PluginSummary } from "@/types/plugins";
 import { PluginUpdateDialog } from "@/components/plugin-update-dialog";
+import { PluginCapabilities, visibleCapabilities } from "@/components/plugin-capabilities";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,6 +26,11 @@ import {
   PopoverAnchor,
   PopoverContent,
 } from "@/components/ui/popover";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   Table,
   TableBody,
@@ -80,6 +86,7 @@ export default function PluginsPage() {
   const [newUrl, setNewUrl] = useState("");
   const [adding, setAdding] = useState(false);
   const [pluginPreview, setPluginPreview] = useState<PluginPreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const [comboboxOpen, setComboboxOpen] = useState<boolean>(false);
   const [selectedManifestUrl, setSelectedManifestUrl] = useState<string | null>(
     null,
@@ -163,18 +170,26 @@ export default function PluginsPage() {
     if (!addOpen) return;
     if (!effectivePreviewUrl) {
       setPluginPreview(null);
+      setPreviewError(null);
       return;
     }
     const controller = new AbortController();
+    setPreviewError(null);
     const timer = setTimeout(async () => {
       try {
         const preview = await previewPlugin(
           effectivePreviewUrl,
           controller.signal,
         );
-        if (!controller.signal.aborted) setPluginPreview(preview);
-      } catch {
-        // fail silently
+        if (!controller.signal.aborted) {
+          setPluginPreview(preview);
+          setPreviewError(null);
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) {
+          setPluginPreview(null);
+          setPreviewError(e instanceof Error ? e.message : String(e));
+        }
       }
     }, 500);
     return () => {
@@ -189,10 +204,16 @@ export default function PluginsPage() {
     setAdding(true);
     setError(null);
     try {
-      await addPlugin({ url: pluginPreview.wasm_url });
+      const capabilities = visibleCapabilities(pluginPreview.capabilities);
+      await addPlugin({
+        url: pluginPreview.wasm_url,
+        sha256: pluginPreview.sha256,
+        accepted_capabilities: capabilities.map((c) => c.name),
+      });
       setAddOpen(false);
       setNewUrl("");
       setPluginPreview(null);
+      setPreviewError(null);
       setSelectedManifestUrl(null);
       load();
     } catch (e) {
@@ -206,6 +227,7 @@ export default function PluginsPage() {
     setAddOpen(false);
     setNewUrl("");
     setPluginPreview(null);
+    setPreviewError(null);
     setSelectedManifestUrl(null);
     setComboboxOpen(false);
     setError(null);
@@ -436,6 +458,10 @@ export default function PluginsPage() {
                     </p>
                   </div>
 
+                  {previewError && (
+                    <p className="text-sm text-destructive">{previewError}</p>
+                  )}
+
                   {pluginPreview && (
                     <div className="grid gap-4 rounded-lg border p-4">
                       <div className="flex items-start gap-4">
@@ -479,6 +505,21 @@ export default function PluginsPage() {
                               ))}
                             </div>
                           </div>
+                        )}
+                      </div>
+
+                      <div className="space-y-2">
+                        <h4 className="text-sm font-medium">This plugin can</h4>
+                        <PluginCapabilities
+                          entries={visibleCapabilities(pluginPreview.capabilities)}
+                          allowedHosts={pluginPreview.allowed_hosts}
+                        />
+                        {visibleCapabilities(pluginPreview.capabilities).some(
+                          (c) => c.risk === "critical" || c.risk === "high",
+                        ) && (
+                          <p className="text-sm text-destructive">
+                            This plugin asks for dangerous permissions. Only install it if you trust its publisher.
+                          </p>
                         )}
                       </div>
                     </div>
@@ -530,14 +571,38 @@ export default function PluginsPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {plugins.map((plugin) => (
+                {plugins.map((plugin) => {
+                  const capabilities = visibleCapabilities(plugin.capabilities);
+                  return (
                   <TableRow key={plugin.id}>
                     <TableCell>
-                      <div className="flex flex-col">
-                        <span className="font-medium">{plugin.name}</span>
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">{plugin.name}</span>
+                          <Badge variant="outline">{plugin.plugin_type}</Badge>
+                        </div>
                         <code className="text-muted-foreground text-xs">
                           {plugin.id}
                         </code>
+                        {capabilities.length > 0 && (
+                          <Collapsible>
+                            <CollapsibleTrigger asChild>
+                              <button
+                                type="button"
+                                className="flex w-fit items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                              >
+                                <ChevronDown className="size-3" />
+                                <span>Permissions</span>
+                              </button>
+                            </CollapsibleTrigger>
+                            <CollapsibleContent className="mt-1 max-w-sm">
+                              <PluginCapabilities
+                                entries={capabilities}
+                                allowedHosts={plugin.allowed_hosts}
+                              />
+                            </CollapsibleContent>
+                          </Collapsible>
+                        )}
                       </div>
                     </TableCell>
                     <TableCell>
@@ -646,7 +711,8 @@ export default function PluginsPage() {
                       </div>
                     </TableCell>
                   </TableRow>
-                ))}
+                  );
+                })}
               </TableBody>
             </Table>
           </div>

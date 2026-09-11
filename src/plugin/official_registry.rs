@@ -335,7 +335,7 @@ mod tests {
             "id": id,
             "name": id.to_string() + " Plugin",
             "version": version,
-            "api_version": "1",
+            "api_version": "2",
             "description": format!("The {id} plugin"),
             "icon_url": format!("https://example.com/{id}.png"),
             "wasm_file": format!("{id}.wasm"),

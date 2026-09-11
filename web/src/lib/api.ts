@@ -1053,6 +1053,9 @@ import type {
   PluginSummary,
   PluginsListResponse,
   OfficialPluginsListResponse,
+  PluginType,
+  PluginDependency,
+  CapabilityReport,
 } from "@/types/plugins";
 export type {
   PluginSummary,
@@ -1066,7 +1069,11 @@ export function getPlugins() {
   return apiFetch<PluginsListResponse>("/admin/plugins");
 }
 
-export function addPlugin(body: { url: string; sha256?: string }) {
+export function addPlugin(body: {
+  url: string;
+  sha256?: string;
+  accepted_capabilities?: string[];
+}) {
   return apiFetch<PluginSummary>("/admin/plugins", {
     method: "POST",
     body: JSON.stringify(body),
@@ -1137,6 +1144,12 @@ export interface PluginPreview {
   required_secrets: SecretDefinition[];
   manifest_url: string;
   wasm_url: string;
+  plugin_type: PluginType;
+  namespace: string | null;
+  dependencies: PluginDependency[];
+  allowed_hosts: string[];
+  capabilities: CapabilityReport;
+  sha256: string;
 }
 
 export function previewPlugin(url: string, signal?: AbortSignal) {

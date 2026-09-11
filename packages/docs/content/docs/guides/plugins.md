@@ -4,7 +4,7 @@ title: "Plugins"
 
 HappyView uses WASM plugins to extend its functionality. Plugins can integrate with external platforms, sync data to users' atproto identities, and more. Auth plugins — the first supported plugin type — enable users to link accounts from platforms like Steam, Xbox, itch.io, and others, then sync data like game libraries.
 
-Official plugins for Steam, Xbox, itch.io, and other platforms are available in the [happyview-plugins](https://tangled.org/gamesgamesgamesgames.games/happyview-plugins) repository.
+Official plugins for Steam, Xbox, itch.io, and other platforms are available in the [happyview-plugins](https://tangled.org/gamesgamesgamesgames.games/happyview-plugins) repository. Releases built before capability declarations, including earlier official plugin releases, are refused at install; pick a release whose manifest has `api_version` `"2"`.
 
 ## Installing Plugins
 

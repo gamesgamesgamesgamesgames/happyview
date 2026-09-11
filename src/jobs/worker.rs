@@ -238,6 +238,7 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         let _ = db::set_error(state, &job.id, &format!("jobs api: {e}")).await;
         return;
     }
+    let has_pds_auth = pds_auth_arc.is_some();
     if let Err(e) =
         crate::lua::record::register_record_api(&lua, state_arc.clone(), claims, pds_auth_arc, None)
     {
@@ -260,6 +261,13 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         job.input.clone(),
     ) {
         let _ = db::set_error(state, &job.id, &format!("job context: {e}")).await;
+        return;
+    }
+    if let Err(e) =
+        crate::lua::require_api::register_require(&lua, state, Some(&job.created_by), has_pds_auth)
+            .await
+    {
+        let _ = db::set_error(state, &job.id, &format!("require api: {e}")).await;
         return;
     }
 

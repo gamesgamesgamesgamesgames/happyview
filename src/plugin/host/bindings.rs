@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use wasmtime::{Linker, Memory, TypedFunc};
 
+use crate::plugin::capabilities::{PluginCapability, requirement_for_import};
+
 /// State stored in wasmtime's Store during plugin execution
 pub struct PluginState {
     pub plugin_id: String,
@@ -16,6 +18,12 @@ pub struct PluginState {
     pub memory: Option<Memory>,
     pub alloc: Option<TypedFunc<u32, u32>>,
     pub dealloc: Option<TypedFunc<(u32, u32), ()>>,
+    pub capabilities: std::collections::HashSet<crate::plugin::capabilities::PluginCapability>,
+    pub allowed_hosts: Vec<String>,
+    pub plugin_type: crate::plugin::PluginType,
+    pub executor: Option<crate::plugin::PluginExecutor>,
+    pub call_ctx: crate::plugin::library::LibraryCallContext,
+    pub depth: u8,
 }
 
 /// Check that a memory access is within bounds
@@ -28,6 +36,32 @@ fn check_bounds(offset: usize, length: usize, mem_size: usize) -> Result<(usize,
         return Err(());
     }
     Ok((offset, end))
+}
+
+/// Every host function except `host_log` starts here.
+pub(super) fn require_capability(
+    state: &PluginState,
+    req: crate::plugin::capabilities::Requirement,
+) -> Result<(), Vec<u8>> {
+    if req.any_of.iter().any(|c| state.capabilities.contains(c)) {
+        return Ok(());
+    }
+    let wanted: Vec<&str> = req.any_of.iter().map(|c| c.as_str()).collect();
+    Err(error_envelope(
+        "FORBIDDEN",
+        format!(
+            "plugin '{}' lacks the {} capability",
+            state.plugin_id,
+            wanted.join(" or ")
+        ),
+    ))
+}
+
+fn error_envelope(code: &str, message: impl std::fmt::Display) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "error": {"code": code, "message": message.to_string(), "retryable": false}
+    }))
+    .unwrap_or_default()
 }
 
 /// Register all host functions with the linker
@@ -87,6 +121,47 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         "host_lookup_record",
         |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
             Box::new(async move { host_lookup_record_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_call_library",
+        |mut caller: wasmtime::Caller<'_, PluginState>,
+         (lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len): (i32, i32, i32, i32, i32, i32)| {
+            Box::new(async move {
+                host_call_library_impl(&mut caller, lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len)
+                    .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_get_api_surface",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (lib_ptr, lib_len): (i32, i32)| {
+            Box::new(async move { host_get_api_surface_impl(&mut caller, lib_ptr, lib_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_db_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>,
+         (sql_ptr, sql_len, params_ptr, params_len): (i32, i32, i32, i32)| {
+            Box::new(async move {
+                host_db_impl(&mut caller, false, sql_ptr, sql_len, params_ptr, params_len).await
+            })
+        },
+    )?;
+    linker.func_wrap_async(
+        "env",
+        "host_db_execute",
+        |mut caller: wasmtime::Caller<'_, PluginState>,
+         (sql_ptr, sql_len, params_ptr, params_len): (i32, i32, i32, i32)| {
+            Box::new(async move {
+                host_db_impl(&mut caller, true, sql_ptr, sql_len, params_ptr, params_len).await
+            })
         },
     )?;
 
@@ -193,6 +268,13 @@ async fn host_get_secret_impl(
     name_ptr: i32,
     name_len: i32,
 ) -> i64 {
+    if let Err(envelope) = require_capability(
+        caller.data(),
+        requirement_for_import("host_get_secret").unwrap(),
+    ) {
+        return write_guest_response(caller, &envelope).await;
+    }
+
     let name = match read_guest_string(caller, name_ptr, name_len) {
         Some(n) => n,
         None => return 0,
@@ -232,6 +314,13 @@ async fn host_http_request_impl(
     req_ptr: i32,
     req_len: i32,
 ) -> i64 {
+    if let Err(envelope) = require_capability(
+        caller.data(),
+        requirement_for_import("host_http_request").unwrap(),
+    ) {
+        return write_guest_response(caller, &envelope).await;
+    }
+
     let req_bytes = match read_guest_bytes(caller, req_ptr, req_len) {
         Some(b) => b,
         None => {
@@ -253,6 +342,33 @@ async fn host_http_request_impl(
     let url = request.url.clone();
     let method = request.method.clone();
 
+    let unrestricted = {
+        let state = caller.data();
+        let unrestricted = state
+            .capabilities
+            .contains(&PluginCapability::NetworkRequestUnrestricted);
+        if !unrestricted {
+            let host = reqwest::Url::parse(&request.url)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from));
+            let ok = host
+                .as_deref()
+                .map(|h| super::host_allowed(&state.allowed_hosts, h))
+                .unwrap_or(false);
+            if !ok {
+                return write_guest_response(
+                    caller,
+                    &error_envelope(
+                        "FORBIDDEN",
+                        format!("host {} is not in allowed_hosts", host.unwrap_or_default()),
+                    ),
+                )
+                .await;
+            }
+        }
+        unrestricted
+    };
+
     let ctx = match build_host_context(caller.data()) {
         Some(c) => c,
         None => {
@@ -263,7 +379,7 @@ async fn host_http_request_impl(
 
     let result = {
         let usage = &mut caller.data_mut().usage;
-        super::http_request(&ctx, usage, request).await
+        super::http_request(&ctx, usage, request, unrestricted).await
     };
 
     let response_bytes = match result {
@@ -295,6 +411,13 @@ async fn host_kv_get_impl(
     key_ptr: i32,
     key_len: i32,
 ) -> i64 {
+    if let Err(envelope) = require_capability(
+        caller.data(),
+        requirement_for_import("host_kv_get").unwrap(),
+    ) {
+        return write_guest_response(caller, &envelope).await;
+    }
+
     let key = match read_guest_string(caller, key_ptr, key_len) {
         Some(k) => k,
         None => return 0,
@@ -321,7 +444,10 @@ async fn host_kv_get_impl(
     write_guest_response(caller, &response_bytes).await
 }
 
-/// Host function: set a value in KV store
+/// Host function: set a value in KV store. Returns `0` on success and `-1`
+/// on any failure, including a missing `kv:write` capability — the `env`
+/// import signature is a bare `i32`, so there's no envelope to carry a
+/// distinct "forbidden" code back to the guest.
 async fn host_kv_set_impl(
     caller: &mut wasmtime::Caller<'_, PluginState>,
     key_ptr: i32,
@@ -330,6 +456,19 @@ async fn host_kv_set_impl(
     val_len: i32,
     ttl: i32,
 ) -> i32 {
+    if require_capability(
+        caller.data(),
+        requirement_for_import("host_kv_set").unwrap(),
+    )
+    .is_err()
+    {
+        tracing::warn!(
+            plugin_id = %caller.data().plugin_id,
+            "host_kv_set: missing kv:write capability"
+        );
+        return -1;
+    }
+
     let key = match read_guest_string(caller, key_ptr, key_len) {
         Some(k) => k,
         None => return -1,
@@ -353,12 +492,28 @@ async fn host_kv_set_impl(
     }
 }
 
-/// Host function: delete a value from KV store
+/// Host function: delete a value from KV store. Returns `0` on success and
+/// `-1` on any failure, including a missing `kv:write` capability — the
+/// `env` import signature is a bare `i32`, so there's no envelope to carry a
+/// distinct "forbidden" code back to the guest.
 async fn host_kv_delete_impl(
     caller: &mut wasmtime::Caller<'_, PluginState>,
     key_ptr: i32,
     key_len: i32,
 ) -> i32 {
+    if require_capability(
+        caller.data(),
+        requirement_for_import("host_kv_delete").unwrap(),
+    )
+    .is_err()
+    {
+        tracing::warn!(
+            plugin_id = %caller.data().plugin_id,
+            "host_kv_delete: missing kv:write capability"
+        );
+        return -1;
+    }
+
     let key = match read_guest_string(caller, key_ptr, key_len) {
         Some(k) => k,
         None => return -1,
@@ -381,6 +536,13 @@ async fn host_lookup_record_impl(
     req_ptr: i32,
     req_len: i32,
 ) -> i64 {
+    if let Err(envelope) = require_capability(
+        caller.data(),
+        requirement_for_import("host_lookup_record").unwrap(),
+    ) {
+        return write_guest_response(caller, &envelope).await;
+    }
+
     let req_bytes = match read_guest_bytes(caller, req_ptr, req_len) {
         Some(b) => b,
         None => return 0,
@@ -407,6 +569,168 @@ async fn host_lookup_record_impl(
     };
 
     write_guest_response(caller, &response_bytes).await
+}
+
+/// Gate on `library:call`, then hand back the executor.
+fn library_access(
+    state: &PluginState,
+    import: &str,
+) -> Result<crate::plugin::PluginExecutor, Vec<u8>> {
+    require_capability(
+        state,
+        crate::plugin::capabilities::requirement_for_import(import).unwrap(),
+    )?;
+    state
+        .executor
+        .clone()
+        .ok_or_else(|| error_envelope("HOST_ERROR", "no executor attached to this instance"))
+}
+
+async fn host_call_library_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    lib_ptr: i32,
+    lib_len: i32,
+    fn_ptr: i32,
+    fn_len: i32,
+    args_ptr: i32,
+    args_len: i32,
+) -> i64 {
+    let (Some(lib), Some(function), Some(args_bytes)) = (
+        read_guest_string(caller, lib_ptr, lib_len),
+        read_guest_string(caller, fn_ptr, fn_len),
+        read_guest_bytes(caller, args_ptr, args_len),
+    ) else {
+        return 0;
+    };
+    let args: Vec<serde_json::Value> = match serde_json::from_slice(&args_bytes) {
+        Ok(serde_json::Value::Array(a)) => a,
+        Ok(_) => {
+            return write_guest_response(
+                caller,
+                &error_envelope("BAD_INPUT", "args must be a JSON array"),
+            )
+            .await;
+        }
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let executor = match library_access(caller.data(), "host_call_library") {
+        Ok(e) => e,
+        Err(envelope) => return write_guest_response(caller, &envelope).await,
+    };
+    let ctx = caller.data().call_ctx.clone();
+    let depth = caller.data().depth + 1;
+    let response = match executor.call_library(&lib, &function, &args, &ctx, depth).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(crate::plugin::ExecutionError::PluginError { code, message, retryable }) => {
+            serde_json::to_vec(&serde_json::json!({"error": {"code": code, "message": message, "retryable": retryable}}))
+                .unwrap_or_default()
+        }
+        Err(e) => error_envelope("LIBRARY_ERROR", e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+async fn host_get_api_surface_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    lib_ptr: i32,
+    lib_len: i32,
+) -> i64 {
+    let Some(lib) = read_guest_string(caller, lib_ptr, lib_len) else {
+        return 0;
+    };
+    let executor = match library_access(caller.data(), "host_get_api_surface") {
+        Ok(e) => e,
+        Err(envelope) => return write_guest_response(caller, &envelope).await,
+    };
+    let response = match executor.api_surface(&lib).await {
+        Ok(surface) => {
+            serde_json::to_vec(&serde_json::json!({"ok": &*surface})).unwrap_or_default()
+        }
+        Err(e) => error_envelope("LIBRARY_ERROR", e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: run raw SQL. `execute` selects `host_db_execute` (needs
+/// `database:write`) vs `host_db_query` (needs either `database:read` or
+/// `database:write`, but read-only capability restricts it to read-only SQL).
+/// SQL is passed through untranslated with backend-native placeholders
+/// (`?` on SQLite, `$1`… on Postgres).
+async fn host_db_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    execute: bool,
+    sql_ptr: i32,
+    sql_len: i32,
+    params_ptr: i32,
+    params_len: i32,
+) -> i64 {
+    let import = if execute {
+        "host_db_execute"
+    } else {
+        "host_db_query"
+    };
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let (Some(sql), Some(params_bytes)) = (
+        read_guest_string(caller, sql_ptr, sql_len),
+        read_guest_bytes(caller, params_ptr, params_len),
+    ) else {
+        return 0;
+    };
+    let params: Vec<serde_json::Value> = if params_bytes.is_empty() {
+        Vec::new()
+    } else {
+        match serde_json::from_slice(&params_bytes) {
+            Ok(serde_json::Value::Array(a)) => a,
+            _ => {
+                return write_guest_response(
+                    caller,
+                    &error_envelope("BAD_INPUT", "params must be a JSON array"),
+                )
+                .await;
+            }
+        }
+    };
+    // database:read alone may only run queries; database:write may run anything through either import.
+    if !caller
+        .data()
+        .capabilities
+        .contains(&PluginCapability::DatabaseWrite)
+    {
+        match crate::raw_sql_guard::is_read_only(&sql) {
+            Ok(true) => {}
+            Ok(false) => {
+                return write_guest_response(
+                    caller,
+                    &error_envelope(
+                        "FORBIDDEN",
+                        "database:read permits only read-only statements; declare database:write to modify data",
+                    ),
+                )
+                .await;
+            }
+            Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+        }
+    }
+    let Some(db) = caller.data().db.clone() else {
+        return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
+    };
+    let response = if execute {
+        match super::run_execute(&db, &sql, &params).await {
+            Ok(n) => serde_json::to_vec(&serde_json::json!({"ok": {"rows_affected": n}}))
+                .unwrap_or_default(),
+            Err(e) => error_envelope("DB_ERROR", e),
+        }
+    } else {
+        match super::run_query(&db, &sql, &params).await {
+            Ok(rows) => serde_json::to_vec(&serde_json::json!({"ok": rows})).unwrap_or_default(),
+            Err(e) => error_envelope("DB_ERROR", e),
+        }
+    };
+    write_guest_response(caller, &response).await
 }
 
 #[cfg(test)]

@@ -380,6 +380,7 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
+    let has_pds_auth = pds_auth_arc.is_some();
     if let Err(e) = record::register_record_api(
         &lua,
         state_arc.clone(),
@@ -419,6 +420,32 @@ pub async fn execute_procedure_script(
         super::scripts::register_log_event_api(&lua, &state_arc, &trigger_id, Some(claims.did()))
     {
         let error_message = format!("failed to register log API: {e}");
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "script.error".to_string(),
+                severity: Severity::Error,
+                actor_did: Some(claims.did().to_string()),
+                subject: Some(method.to_string()),
+                detail: serde_json::json!({
+                    "error": error_message,
+                    "script_source": script_source,
+                    "input": input_json,
+                    "caller_did": claims.did(),
+                    "method": method,
+                    "duration_ms": start.elapsed().as_millis() as u64,
+                }),
+            },
+            backend,
+        )
+        .await;
+        return Err(AppError::Internal(error_message));
+    }
+
+    if let Err(e) =
+        super::require_api::register_require(&lua, state, Some(claims.did()), has_pds_auth).await
+    {
+        let error_message = format!("failed to register require api: {e}");
         log_event(
             &state.db,
             EventLog {
@@ -905,6 +932,30 @@ pub async fn execute_query_script(
         claims.map(|c| c.did()),
     ) {
         let error_message = format!("failed to register log API: {e}");
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "script.error".to_string(),
+                severity: Severity::Error,
+                actor_did: None,
+                subject: Some(method.to_string()),
+                detail: serde_json::json!({
+                    "error": error_message,
+                    "script_source": script_source,
+                    "method": method,
+                    "duration_ms": start.elapsed().as_millis() as u64,
+                }),
+            },
+            backend,
+        )
+        .await;
+        return Err(AppError::Internal(error_message));
+    }
+
+    if let Err(e) =
+        super::require_api::register_require(&lua, state, claims.map(|c| c.did()), false).await
+    {
+        let error_message = format!("failed to register require api: {e}");
         log_event(
             &state.db,
             EventLog {
