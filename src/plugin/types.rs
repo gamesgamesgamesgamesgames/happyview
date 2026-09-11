@@ -173,7 +173,26 @@ pub struct TokenSet {
     pub refresh_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Seconds until expiry, as some providers (Microsoft and Xbox among them)
+    /// return instead of an absolute timestamp; a plugin has no clock to convert
+    /// one to the other. Read expiry through
+    /// [`resolved_expires_at`](Self::resolved_expires_at), since a plugin may
+    /// populate either field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
     pub token_type: String,
+}
+
+impl TokenSet {
+    /// The token's expiry as an absolute instant: `expires_at` when the
+    /// plugin gave one, otherwise `now + expires_in` when it gave a duration
+    /// instead. `None` when the plugin supplied neither.
+    pub fn resolved_expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.expires_at.or_else(|| {
+            self.expires_in
+                .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64))
+        })
+    }
 }
 
 /// Error returned by plugin functions
@@ -205,18 +224,6 @@ pub struct ExternalProfile {
     pub profile_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
-}
-
-/// Record returned by sync_account() - lexicon-aware
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncRecord {
-    pub collection: String,
-    pub record: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dedup_key: Option<String>,
-    /// Whether HappyView should add an attestation signature to this record
-    #[serde(default)]
-    pub sign: bool,
 }
 
 /// Strong reference to an AT Protocol record
@@ -402,5 +409,52 @@ mod tests {
             assert_eq!(PluginType::parse_str(t.as_str()), Some(t));
         }
         assert_eq!(PluginType::parse_str("bogus"), None);
+    }
+
+    fn token_set(
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        expires_in: Option<u64>,
+    ) -> TokenSet {
+        TokenSet {
+            access_token: "a".into(),
+            refresh_token: None,
+            expires_at,
+            expires_in,
+            token_type: "Bearer".into(),
+        }
+    }
+
+    #[test]
+    fn resolved_expires_at_prefers_an_explicit_timestamp_over_a_duration() {
+        let at = chrono::Utc::now();
+        let ts = token_set(Some(at), Some(999));
+        assert_eq!(ts.resolved_expires_at(), Some(at));
+    }
+
+    #[test]
+    fn resolved_expires_at_derives_from_a_duration_when_no_timestamp_is_given() {
+        let ts = token_set(None, Some(3600));
+        let resolved = ts
+            .resolved_expires_at()
+            .expect("expires_in should derive an expiry");
+        let now = chrono::Utc::now();
+        assert!(resolved > now, "derived expiry must be in the future");
+        assert!(
+            resolved <= now + chrono::Duration::seconds(3600),
+            "derived expiry must not exceed now + expires_in"
+        );
+    }
+
+    #[test]
+    fn resolved_expires_at_is_none_when_the_plugin_gave_neither() {
+        let ts = token_set(None, None);
+        assert_eq!(ts.resolved_expires_at(), None);
+    }
+
+    #[test]
+    fn token_set_deserializes_when_expires_in_is_absent() {
+        let ts: TokenSet =
+            serde_json::from_str(r#"{"access_token":"a","token_type":"Bearer"}"#).unwrap();
+        assert_eq!(ts.expires_in, None);
     }
 }

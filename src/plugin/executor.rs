@@ -13,9 +13,7 @@ use crate::plugin::memory::{
 };
 use crate::plugin::runtime::{DEFAULT_FUEL, WasmRuntime};
 use crate::plugin::secrets::load_plugin_secrets;
-use crate::plugin::{
-    ExternalProfile, LoadedPlugin, PluginInfo, PluginRegistry, SyncRecord, TokenSet,
-};
+use crate::plugin::{ExternalProfile, LoadedPlugin, PluginInfo, PluginRegistry, TokenSet};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use thiserror::Error;
@@ -205,19 +203,6 @@ impl PluginInstance {
             "config": config
         });
         self.call_plugin_function("get_profile", &input).await
-    }
-
-    /// Call sync_account(access_token, config)
-    pub async fn call_sync_account(
-        &mut self,
-        access_token: &str,
-        config: &serde_json::Value,
-    ) -> Result<Vec<SyncRecord>, ExecutionError> {
-        let input = serde_json::json!({
-            "access_token": access_token,
-            "config": config
-        });
-        self.call_plugin_function("sync_account", &input).await
     }
 
     /// Generic helper for plugin functions with input and typed output
@@ -632,15 +617,6 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<crate::plugin::ExternalProfile, ExecutionError>> + 'a
         {
             inst.call_get_profile(access_token, config)
-        }
-
-        fn _check_call_sync_account<'a>(
-            inst: &'a mut PluginInstance,
-            access_token: &'a str,
-            config: &'a serde_json::Value,
-        ) -> impl std::future::Future<Output = Result<Vec<crate::plugin::SyncRecord>, ExecutionError>> + 'a
-        {
-            inst.call_sync_account(access_token, config)
         }
     }
 }

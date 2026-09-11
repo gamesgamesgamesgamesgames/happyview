@@ -33,12 +33,6 @@ export interface AuthorizeResponse {
   state: string
 }
 
-export interface SyncResponse {
-  status: string
-  processed: number
-  written: number
-}
-
 export interface UnlinkResponse {
   status: string
   was_linked: boolean

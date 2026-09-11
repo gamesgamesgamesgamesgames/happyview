@@ -11,10 +11,9 @@ use std::sync::Arc;
 use crate::AppState;
 use crate::auth::Claims;
 use crate::error::AppError;
-use crate::external_auth::{pds_write, state, tokens};
+use crate::external_auth::{state, tokens};
 use crate::plugin::PluginExecutor;
 use crate::plugin::secrets::load_plugin_secrets;
-use crate::plugin::sync::SyncProcessor;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -23,7 +22,6 @@ pub fn routes() -> Router<AppState> {
         .route("/{plugin_id}/authorize", get(authorize))
         .route("/{plugin_id}/callback", get(callback))
         .route("/{plugin_id}/connect", post(connect_with_config))
-        .route("/{plugin_id}/sync", post(sync))
         .route("/{plugin_id}/unlink", post(unlink))
 }
 
@@ -249,7 +247,7 @@ async fn callback_inner(
         .call_get_profile(&token_set.access_token, &config)
         .await?;
 
-    let expires_at = token_set.expires_at.map(|dt| dt.to_rfc3339());
+    let expires_at = token_set.resolved_expires_at().map(|dt| dt.to_rfc3339());
 
     tokens::store_tokens(
         &app_state.db,
@@ -335,7 +333,7 @@ async fn connect_with_config(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     // Format expires_at as RFC3339 string
-    let expires_at = token_set.expires_at.map(|dt| dt.to_rfc3339());
+    let expires_at = token_set.resolved_expires_at().map(|dt| dt.to_rfc3339());
 
     // Store encrypted tokens
     tokens::store_tokens(
@@ -358,75 +356,6 @@ async fn connect_with_config(
         "status": "connected",
         "account_id": profile.account_id,
         "display_name": profile.display_name
-    })))
-}
-
-async fn sync(
-    State(app_state): State<AppState>,
-    Path(plugin_id): Path<String>,
-    claims: Claims,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let user_did = claims.did();
-
-    let config = serde_json::Value::Null;
-    let secrets = load_plugin_secrets(
-        &app_state.db,
-        app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
-        &plugin_id,
-    )
-    .await;
-
-    let executor = PluginExecutor::new(
-        app_state.wasm_runtime.clone(),
-        app_state.plugin_registry.clone(),
-        app_state.db.clone(),
-        app_state.db_backend,
-        app_state.http.clone(),
-        Arc::new(app_state.lexicons.clone()),
-    );
-
-    let mut instance = executor
-        .instantiate(&plugin_id, user_did, secrets, config.clone())
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // Get decrypted access token from DB
-    let stored = tokens::get_tokens(
-        &app_state.db,
-        app_state.db_backend,
-        app_state.config.token_encryption_key.as_ref(),
-        user_did,
-        &plugin_id,
-    )
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let mut records = instance
-        .call_sync_account(&stored.access_token, &config)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // Resolve game references from database
-    crate::plugin::sync::resolve_game_references(&app_state.db, app_state.db_backend, &mut records)
-        .await;
-
-    // Process records: sign those with sign=true
-    let signer = app_state.attestation_signer.as_deref();
-    let processor = SyncProcessor::new(signer, user_did.to_string());
-    let processed = processor
-        .process_records(records)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let processed_count = processed.len();
-
-    // Write processed records to user's PDS
-    let write_results = pds_write::write_records_to_pds(&app_state, user_did, processed).await?;
-
-    Ok(Json(serde_json::json!({
-        "status": "ok",
-        "processed": processed_count,
-        "written": write_results.len()
     })))
 }
 

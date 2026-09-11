@@ -10,7 +10,6 @@ pub mod memory;
 pub mod official_registry;
 mod runtime;
 pub mod secrets;
-pub mod sync;
 mod types;
 
 pub use executor::{ExecutionError, PluginExecutor, PluginInstance};

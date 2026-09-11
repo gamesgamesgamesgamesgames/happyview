@@ -44,6 +44,8 @@ Each plugin has a `manifest.json` that describes its metadata:
 | `wasm_file`        | WASM binary filename (default: `plugin.wasm`)         |
 | `required_secrets` | Array of secrets the plugin needs                     |
 
+Each `required_secrets` key is a full environment variable name: `PLUGIN_`, then the plugin's `id` upper-cased with every non-alphanumeric character replaced by `_`, then the secret's own name — so a plugin with the id `auth-steam` asks for `PLUGIN_AUTH_STEAM_API_KEY`. The plugin itself reads the part after that prefix: `host_get_secret("API_KEY")`.
+
 The fields above are the `auth` baseline. [Plugin Types](#plugin-types) below covers the fields a `library` or `interpreter` manifest adds: `plugin_type`, `capabilities`, `allowed_hosts`, `publisher`, `dependencies`, and `namespace`.
 
 ## Plugin Types
@@ -52,7 +54,7 @@ The manifest's `plugin_type` field decides what the host expects the plugin to e
 
 | Type | Description |
 | --- | --- |
-| `auth` (default) | An external-auth plugin: OAuth/OpenID/API-key login plus profile and data sync. The [Plugin Exports](#plugin-exports) and [Host Functions](#host-functions) below are the `auth` contract. |
+| `auth` (default) | An external-auth plugin: OAuth/OpenID/API-key login plus profile lookup. The [Plugin Exports](#plugin-exports) and [Host Functions](#host-functions) below are the `auth` contract. |
 | `library` | A plugin other plugins and Lua scripts call into, via `host_call_library` or `require(namespace)`. See [Library Plugins](#library-plugins) below. |
 | `interpreter` | Reserved for future non-Lua script runtimes. Not yet implemented. |
 
@@ -87,7 +89,6 @@ A `library` plugin may declare other libraries it calls through `host_call_libra
 | `GET /external-auth/accounts`           | List user's linked accounts                    |
 | `GET /external-auth/{plugin}/authorize` | Start OAuth flow                               |
 | `GET /external-auth/{plugin}/callback`  | OAuth callback handler                         |
-| `POST /external-auth/{plugin}/sync`     | Sync data from linked account                  |
 | `POST /external-auth/{plugin}/unlink`   | Unlink account                                 |
 | `POST /external-auth/{plugin}/connect`  | Connect with API key (for `api_key` auth type) |
 
@@ -119,7 +120,6 @@ Plugins must export these functions:
 | `handle_callback`   | `(ptr: u32, len: u32) -> i64` | Handle OAuth callback        |
 | `refresh_tokens`    | `(ptr: u32, len: u32) -> i64` | Refresh expired tokens       |
 | `get_profile`       | `(ptr: u32, len: u32) -> i64` | Get external profile info    |
-| `sync_account`      | `(ptr: u32, len: u32) -> i64` | Sync data and return records |
 
 ## Host Functions
 

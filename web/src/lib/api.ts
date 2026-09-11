@@ -41,7 +41,6 @@ import type {
   ExternalProvider,
   LinkedAccount,
   AuthorizeResponse,
-  SyncResponse,
   UnlinkResponse,
   ConnectResponse,
 } from "@/types/external-accounts";
@@ -110,7 +109,6 @@ export type {
   ExternalProvider,
   LinkedAccount,
   AuthorizeResponse,
-  SyncResponse,
   UnlinkResponse,
   ConnectResponse,
   ConfigSchema,
@@ -1021,13 +1019,6 @@ export function authorizeExternal(pluginId: string, redirectUri: string) {
   const params = new URLSearchParams({ redirect_uri: redirectUri });
   return apiFetch<AuthorizeResponse>(
     `/external-auth/${encodeURIComponent(pluginId)}/authorize?${params}`,
-  );
-}
-
-export function syncExternal(pluginId: string) {
-  return apiFetch<SyncResponse>(
-    `/external-auth/${encodeURIComponent(pluginId)}/sync`,
-    { method: "POST" },
   );
 }
 

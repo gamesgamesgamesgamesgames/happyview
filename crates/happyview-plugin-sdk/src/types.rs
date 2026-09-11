@@ -1,6 +1,8 @@
 //! The structured values a plugin exchanges with the host: its identity, the
-//! call envelope, and the API surface a library advertises to scripts.
+//! call envelope, the API surface a library advertises to scripts, and the
+//! inputs and outputs of an auth plugin's five exports.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -55,7 +57,11 @@ impl PluginInfo {
         self
     }
 
-    /// Environment-variable names the operator must supply, e.g. `PLUGIN_STEAM_API_KEY`.
+    /// Environment-variable names the operator must supply, e.g.
+    /// `PLUGIN_STEAM_API_KEY`. The prefix is `PLUGIN_`, the plugin id
+    /// upper-cased with every non-alphanumeric character replaced by `_`, then
+    /// `_` — so `auth-steam` reads `PLUGIN_AUTH_STEAM_API_KEY`. A plugin asks
+    /// the host for the part after that prefix: `host::get_secret("API_KEY")`.
     pub fn required_secrets<I, S>(mut self, secrets: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -65,6 +71,9 @@ impl PluginInfo {
         self
     }
 
+    /// How this plugin authenticates: `"oauth2"`, `"openid"` or `"api_key"`.
+    /// Only an [`auth_plugin!`](crate::auth_plugin) sets it; a library or an
+    /// interpreter leaves the default alone, because nothing reads it there.
     pub fn auth_type(mut self, auth_type: impl Into<String>) -> Self {
         self.auth_type = auth_type.into();
         self
@@ -221,6 +230,157 @@ pub struct StrongRef {
     pub cid: String,
 }
 
+/// What `get_authorize_url` receives. `config` is the operator's plugin
+/// configuration, passed through untouched.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizeUrlInput {
+    /// Opaque CSRF state the host minted. Put it in the provider's URL
+    /// unchanged — the host matches it when the callback lands.
+    pub state: String,
+    pub redirect_uri: String,
+    #[serde(default)]
+    pub config: Value,
+}
+
+/// What `handle_callback` receives.
+///
+/// The host flattens *every* callback query parameter at the top level beside
+/// `config`, because the shape differs by protocol: OAuth 2.0 sends `code` and
+/// `state`, OpenID 2.0 sends a dozen `openid.*` keys. So the parameters are a
+/// map rather than named fields, and [`param`](Self::param) reads one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CallbackInput {
+    #[serde(default)]
+    pub config: Value,
+    /// Every query parameter the provider sent back. The host sends these as
+    /// strings; the type stays [`Value`] so a non-string value does not fail
+    /// the whole callback.
+    #[serde(flatten)]
+    pub params: BTreeMap<String, Value>,
+}
+
+impl CallbackInput {
+    /// One callback parameter, if it was sent as a string.
+    pub fn param(&self, name: &str) -> Option<&str> {
+        self.params.get(name).and_then(Value::as_str)
+    }
+}
+
+/// What `refresh_tokens` receives.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RefreshInput {
+    pub refresh_token: String,
+    #[serde(default)]
+    pub config: Value,
+}
+
+/// What `get_profile` receives.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TokenInput {
+    pub access_token: String,
+    #[serde(default)]
+    pub config: Value,
+}
+
+/// What `handle_callback` and `refresh_tokens` return.
+///
+/// `expires_at` is an RFC 3339 timestamp: the host parses it into a
+/// `chrono::DateTime<Utc>`, so a string it cannot parse fails the whole call.
+/// Absent fields are omitted rather than sent as null, matching the host.
+///
+/// Prefer [`expires_in`](Self::expires_in): a guest has no clock, so it cannot
+/// turn a provider's duration (what Microsoft and Xbox return) into an absolute
+/// timestamp. Use `expires_at` only when the provider gives an absolute instant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenSet {
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Seconds until expiry. The host computes an absolute expiry from this
+    /// when `expires_at` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<u64>,
+    pub token_type: String,
+}
+
+impl TokenSet {
+    /// A token set with no refresh token and no expiry, e.g.
+    /// `TokenSet::new(access, "Bearer")`.
+    pub fn new(access_token: impl Into<String>, token_type: impl Into<String>) -> Self {
+        Self {
+            access_token: access_token.into(),
+            refresh_token: None,
+            expires_at: None,
+            expires_in: None,
+            token_type: token_type.into(),
+        }
+    }
+
+    pub fn refresh_token(mut self, refresh_token: impl Into<String>) -> Self {
+        self.refresh_token = Some(refresh_token.into());
+        self
+    }
+
+    /// An RFC 3339 instant, e.g. `2026-01-01T00:00:00Z`. Prefer
+    /// [`expires_in`](Self::expires_in) unless the provider itself gives an
+    /// absolute timestamp.
+    pub fn expires_at(mut self, expires_at: impl Into<String>) -> Self {
+        self.expires_at = Some(expires_at.into());
+        self
+    }
+
+    /// Seconds until the token expires, e.g. `TokenSet::new(access,
+    /// "Bearer").expires_in(3600)`. Forward the provider's value as-is; the host
+    /// computes the absolute expiry.
+    pub fn expires_in(mut self, seconds: u64) -> Self {
+        self.expires_in = Some(seconds);
+        self
+    }
+}
+
+/// What `get_profile` returns: who the access token belongs to on the
+/// provider's side.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalProfile {
+    /// The provider's own stable id for the account. HappyView keys the link
+    /// on it, so it must not change between calls.
+    pub account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+}
+
+impl ExternalProfile {
+    pub fn new(account_id: impl Into<String>) -> Self {
+        Self {
+            account_id: account_id.into(),
+            display_name: None,
+            profile_url: None,
+            avatar_url: None,
+        }
+    }
+
+    pub fn display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.display_name = Some(display_name.into());
+        self
+    }
+
+    pub fn profile_url(mut self, profile_url: impl Into<String>) -> Self {
+        self.profile_url = Some(profile_url.into());
+        self
+    }
+
+    pub fn avatar_url(mut self, avatar_url: impl Into<String>) -> Self {
+        self.avatar_url = Some(avatar_url.into());
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +431,110 @@ mod tests {
         assert_eq!(json["exports"][0]["kind"], "function");
         assert_eq!(json["exports"][0]["params"][0]["name"], "url");
         assert_eq!(json["types"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn authorize_url_input_matches_what_the_host_sends() {
+        let input: AuthorizeUrlInput = serde_json::from_str(
+            r#"{"state":"s1","redirect_uri":"https://app.test/cb","config":{"realm":"r"}}"#,
+        )
+        .unwrap();
+        assert_eq!(input.state, "s1");
+        assert_eq!(input.redirect_uri, "https://app.test/cb");
+        assert_eq!(input.config["realm"], "r");
+    }
+
+    #[test]
+    fn a_callback_parameter_is_readable_whatever_the_provider_called_it() {
+        // OpenID 2.0 sends dotted keys; the host flattens them beside `config`.
+        let input: CallbackInput =
+            serde_json::from_str(r#"{"code":"c","state":"s","openid.claimed_id":"x","config":{}}"#)
+                .unwrap();
+        assert_eq!(input.param("code"), Some("c"));
+        assert_eq!(input.param("state"), Some("s"));
+        assert_eq!(input.param("openid.claimed_id"), Some("x"));
+        assert_eq!(input.param("missing"), None);
+        // `config` is a field, not a parameter, so it never shows up as one.
+        assert_eq!(input.params.len(), 3);
+        assert_eq!(input.config, serde_json::json!({}));
+    }
+
+    #[test]
+    fn a_callback_with_no_parameters_and_no_config_still_decodes() {
+        let input: CallbackInput = serde_json::from_str("{}").unwrap();
+        assert!(input.params.is_empty());
+        assert_eq!(input.config, Value::Null);
+        assert_eq!(input.param("code"), None);
+    }
+
+    #[test]
+    fn a_non_string_callback_parameter_is_kept_but_not_returned_as_text() {
+        let input: CallbackInput = serde_json::from_str(r#"{"code":7}"#).unwrap();
+        assert_eq!(input.param("code"), None);
+        assert_eq!(input.params["code"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn refresh_and_token_inputs_default_their_config() {
+        let refresh: RefreshInput = serde_json::from_str(r#"{"refresh_token":"r"}"#).unwrap();
+        assert_eq!(refresh.refresh_token, "r");
+        assert_eq!(refresh.config, Value::Null);
+
+        let token: TokenInput =
+            serde_json::from_str(r#"{"access_token":"a","config":{"k":1}}"#).unwrap();
+        assert_eq!(token.access_token, "a");
+        assert_eq!(token.config["k"], 1);
+    }
+
+    #[test]
+    fn token_set_omits_absent_fields_rather_than_sending_null() {
+        let json = serde_json::to_string(&TokenSet::new("a", "Bearer")).unwrap();
+        assert_eq!(json, r#"{"access_token":"a","token_type":"Bearer"}"#);
+
+        let full = TokenSet::new("a", "Bearer")
+            .refresh_token("r")
+            .expires_at("2026-01-01T00:00:00Z");
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["refresh_token"], "r");
+        assert_eq!(value["expires_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(value.get("expires_in"), None);
+        assert_eq!(serde_json::from_value::<TokenSet>(value).unwrap(), full);
+    }
+
+    #[test]
+    fn token_set_expires_in_is_the_preferred_duration_field() {
+        let json = serde_json::to_string(&TokenSet::new("a", "Bearer").expires_in(3600)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"access_token":"a","expires_in":3600,"token_type":"Bearer"}"#
+        );
+
+        let round_tripped: TokenSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.expires_in, Some(3600));
+        assert_eq!(round_tripped.expires_at, None);
+    }
+
+    #[test]
+    fn token_set_without_expires_in_deserializes_with_it_absent() {
+        let ts: TokenSet =
+            serde_json::from_str(r#"{"access_token":"a","token_type":"Bearer"}"#).unwrap();
+        assert_eq!(ts.expires_in, None);
+    }
+
+    #[test]
+    fn external_profile_round_trips_with_only_an_account_id() {
+        let json = serde_json::to_string(&ExternalProfile::new("76561198000000000")).unwrap();
+        assert_eq!(json, r#"{"account_id":"76561198000000000"}"#);
+
+        let full = ExternalProfile::new("id")
+            .display_name("Name")
+            .profile_url("https://example.test/u/id")
+            .avatar_url("https://example.test/a/id.png");
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["display_name"], "Name");
+        assert_eq!(
+            serde_json::from_value::<ExternalProfile>(value).unwrap(),
+            full
+        );
     }
 }

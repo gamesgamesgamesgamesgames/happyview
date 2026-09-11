@@ -4,6 +4,26 @@
 
 use std::collections::HashMap;
 
+/// The environment-variable prefix a plugin's secrets live under.
+///
+/// `PLUGIN_`, the id upper-cased, `_`. Every byte that is not ASCII
+/// alphanumeric becomes `_`: a plugin id may contain characters an env var
+/// name may not, and `auth-steam` would otherwise derive `PLUGIN_AUTH-STEAM_`,
+/// which no shell can export, so every secret would read as unset.
+pub fn secret_env_prefix(plugin_id: &str) -> String {
+    let mut prefix = String::with_capacity(plugin_id.len() + 8);
+    prefix.push_str("PLUGIN_");
+    for byte in plugin_id.bytes() {
+        prefix.push(if byte.is_ascii_alphanumeric() {
+            byte.to_ascii_uppercase() as char
+        } else {
+            '_'
+        });
+    }
+    prefix.push('_');
+    prefix
+}
+
 /// Load a plugin's secrets: from the encrypted DB config if an encryption
 /// key is available, falling back to `PLUGIN_<ID>_*` environment variables.
 pub async fn load_plugin_secrets(
@@ -31,7 +51,7 @@ pub async fn load_plugin_secrets(
         {
             // DB keys are full env var names (e.g., PLUGIN_STEAM_API_KEY)
             // Strip prefix to get short names for plugin (e.g., API_KEY)
-            let prefix = format!("PLUGIN_{}_", plugin_id.to_uppercase());
+            let prefix = secret_env_prefix(plugin_id);
             let db_secrets: HashMap<String, String> = secrets_obj
                 .iter()
                 .filter_map(|(k, v)| {
@@ -54,8 +74,33 @@ pub async fn load_plugin_secrets(
     }
 
     // Fall back to environment variables
-    let prefix = format!("PLUGIN_{}_", plugin_id.to_uppercase());
+    let prefix = secret_env_prefix(plugin_id);
     std::env::vars()
         .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|name| (name.to_string(), v)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::secret_env_prefix;
+
+    #[test]
+    fn a_plain_id_is_simply_upper_cased() {
+        assert_eq!(secret_env_prefix("steam"), "PLUGIN_STEAM_");
+        assert_eq!(secret_env_prefix("xbox360"), "PLUGIN_XBOX360_");
+    }
+
+    #[test]
+    fn punctuation_a_plugin_id_allows_but_an_env_var_does_not_becomes_an_underscore() {
+        assert_eq!(secret_env_prefix("auth-steam"), "PLUGIN_AUTH_STEAM_");
+        assert_eq!(secret_env_prefix("a.b"), "PLUGIN_A_B_");
+        assert_eq!(secret_env_prefix("a b"), "PLUGIN_A_B_");
+        // Already-underscored ids are unchanged, so existing secrets keep working.
+        assert_eq!(secret_env_prefix("sdk_auth"), "PLUGIN_SDK_AUTH_");
+    }
+
+    #[test]
+    fn an_empty_id_still_produces_a_prefix_rather_than_matching_everything() {
+        assert_eq!(secret_env_prefix(""), "PLUGIN__");
+    }
 }

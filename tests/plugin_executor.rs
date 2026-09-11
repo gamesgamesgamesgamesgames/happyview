@@ -196,30 +196,6 @@ async fn test_get_profile() {
 }
 
 #[tokio::test]
-async fn test_sync_account() {
-    let (executor, registry) = create_test_executor().await;
-    let plugin = load_test_plugin();
-    registry.register(plugin).await;
-
-    let mut instance = executor
-        .instantiate(
-            "test",
-            "user:did:plc:test",
-            Secrets::new(),
-            serde_json::Value::Null,
-        )
-        .await
-        .expect("Failed to instantiate");
-
-    let records = instance
-        .call_sync_account("test-token", &serde_json::Value::Null)
-        .await
-        .expect("Failed to sync account");
-
-    assert!(records.is_empty()); // Test plugin returns empty array
-}
-
-#[tokio::test]
 async fn test_plugin_not_found() {
     let (executor, _registry) = create_test_executor().await;
 

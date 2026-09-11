@@ -35,6 +35,13 @@ pub enum LoadError {
     InvalidCapabilities(String),
     #[error("Missing required secret: {0}")]
     MissingSecret(String),
+    #[error(
+        "required secret key '{key}' must start with '{expected_prefix}' (the id's derived secret prefix)"
+    )]
+    InvalidSecretKey {
+        key: String,
+        expected_prefix: String,
+    },
     #[error("WASM validation failed: {0}")]
     WasmValidation(String),
     #[error("Manifest not found at {0}")]
@@ -295,6 +302,17 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), LoadError> {
             )));
         }
     }
+
+    let expected_prefix = crate::plugin::secrets::secret_env_prefix(&manifest.id);
+    for secret in &manifest.required_secrets {
+        if !secret.key.starts_with(&expected_prefix) {
+            return Err(LoadError::InvalidSecretKey {
+                key: secret.key.clone(),
+                expected_prefix,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -508,6 +526,28 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn validate_manifest_accepts_a_secret_key_under_the_plugin_s_prefix() {
+        let m = manifest(
+            r#"{"id":"auth-steam","name":"Steam","version":"1.0.0","api_version":"2",
+                "required_secrets":[{"key":"PLUGIN_AUTH_STEAM_API_KEY","name":"API key"}]}"#,
+        );
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_a_secret_key_outside_the_plugin_s_prefix() {
+        let m = manifest(
+            r#"{"id":"auth-steam","name":"Steam","version":"1.0.0","api_version":"2",
+                "required_secrets":[{"key":"PLUGIN_STEAM_API_KEY","name":"API key"}]}"#,
+        );
+        let err = validate_manifest(&m).unwrap_err();
+        assert!(matches!(err, LoadError::InvalidSecretKey { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("PLUGIN_STEAM_API_KEY"), "{msg}");
+        assert!(msg.contains("PLUGIN_AUTH_STEAM_"), "{msg}");
     }
 
     /// Smallest module importing `host_kv_get` from `env`.

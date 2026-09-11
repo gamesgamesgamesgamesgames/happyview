@@ -28,6 +28,11 @@
 //! }
 //! ```
 //!
+//! An auth plugin uses [`auth_plugin!`] instead, which emits the four exports
+//! the external-auth flow calls — `get_authorize_url`, `handle_callback`,
+//! `refresh_tokens` and `get_profile` — each with its own typed input and
+//! output.
+//!
 //! Native builds compile the whole SDK, so a plugin's own logic is testable
 //! with `cargo test`; the host wrappers report [`host::HostError::NotWasm`]
 //! there rather than calling anything.
@@ -43,7 +48,18 @@ mod macros;
 pub mod types;
 
 pub use envelope::{PluginError, Response};
-pub use types::{ApiExport, ApiSurface, CallContext, CallInput, PluginInfo, StrongRef};
+pub use types::{
+    ApiExport, ApiSurface, AuthorizeUrlInput, CallContext, CallInput, CallbackInput,
+    ExternalProfile, PluginInfo, RefreshInput, StrongRef, TokenInput, TokenSet,
+};
+
+/// Items the macros name in their expansion. Not a public API: a plugin crate
+/// compiles with `no_std`, so the macros cannot assume `String` is in scope
+/// where they land.
+#[doc(hidden)]
+pub mod __private {
+    pub use alloc::string::String;
+}
 
 pub use serde_json;
 /// Re-exported so a plugin needs only this crate as a dependency.

@@ -171,6 +171,27 @@ pub fn dispatch_call(
     }
 }
 
+/// The body of an export that takes one JSON object and returns one value:
+/// decode, dispatch, wrap. `auth_plugin!` uses it for its four input-taking exports.
+/// Input it cannot decode becomes a `BAD_INPUT` envelope, never a panic.
+pub fn dispatch_input<I, O>(ptr: u32, len: u32, handler: fn(&I) -> Result<O, PluginError>) -> i64
+where
+    I: DeserializeOwned,
+    O: Serialize,
+{
+    // SAFETY: the host wrote this region through our `alloc` immediately
+    // before calling us and keeps it alive for the duration of the call.
+    let bytes = unsafe { read_input(ptr, len) };
+    let input: I = match serde_json::from_slice(bytes) {
+        Ok(input) => input,
+        Err(err) => return return_err(&PluginError::from(err)),
+    };
+    match handler(&input) {
+        Ok(value) => return_ok(&value),
+        Err(err) => return_err(&err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,8 +9,8 @@
 /// Emit the guest allocator and the `alloc`/`dealloc` exports the host calls
 /// to place data in this module's memory, plus the wasm `#[panic_handler]`.
 ///
-/// Use it directly only for a plugin that does not use [`library_plugin!`],
-/// which emits it already. Exactly one call per crate.
+/// Use it directly only for a plugin that uses neither [`library_plugin!`] nor
+/// [`auth_plugin!`], both of which emit it already. Exactly one call per crate.
 ///
 /// ```ignore
 /// happyview_plugin_sdk::export_abi!();            // 512 KiB heap
@@ -128,6 +128,109 @@ macro_rules! library_plugin {
                 &$crate::CallContext,
             ) -> core::result::Result<$crate::Value, $crate::PluginError> = $call;
             $crate::abi::dispatch_call(ptr, len, handler)
+        }
+    };
+}
+
+/// Emit every export an auth plugin needs: `alloc`, `dealloc`, `plugin_info`,
+/// `get_authorize_url`, `handle_callback`, `refresh_tokens` and `get_profile`,
+/// plus the allocator and panic handler.
+///
+/// Each export decodes its own input struct and wraps whatever the handler
+/// returns. Input it cannot parse becomes a `BAD_INPUT` error envelope — it
+/// never panics and never traps.
+///
+/// An auth plugin's `info` should set
+/// [`auth_type`](crate::PluginInfo::auth_type) — `"oauth2"`, `"openid"` or
+/// `"api_key"` — and list the env-var names it needs in
+/// [`required_secrets`](crate::PluginInfo::required_secrets).
+///
+/// ```ignore
+/// happyview_plugin_sdk::auth_plugin! {
+///     info: PluginInfo::new("auth-steam", "Steam", "1.0.0")
+///         .auth_type("openid")
+///         .required_secrets(["PLUGIN_AUTH_STEAM_API_KEY"]),
+///     authorize_url: authorize_url,
+///     callback: callback,
+///     refresh: refresh,
+///     profile: profile,
+/// }
+///
+/// fn authorize_url(input: &AuthorizeUrlInput) -> Result<String, PluginError> { todo!() }
+/// fn callback(input: &CallbackInput) -> Result<TokenSet, PluginError> { todo!() }
+/// fn refresh(input: &RefreshInput) -> Result<TokenSet, PluginError> { todo!() }
+/// fn profile(input: &TokenInput) -> Result<ExternalProfile, PluginError> { todo!() }
+/// ```
+///
+/// Pass `heap = <bytes>` as the first field to size the guest heap.
+#[macro_export]
+macro_rules! auth_plugin {
+    (
+        info: $info:expr,
+        authorize_url: $authorize_url:expr,
+        callback: $callback:expr,
+        refresh: $refresh:expr,
+        profile: $profile:expr $(,)?
+    ) => {
+        $crate::auth_plugin! {
+            heap = $crate::abi::DEFAULT_HEAP_SIZE,
+            info: $info,
+            authorize_url: $authorize_url,
+            callback: $callback,
+            refresh: $refresh,
+            profile: $profile,
+        }
+    };
+    (
+        heap = $heap:expr,
+        info: $info:expr,
+        authorize_url: $authorize_url:expr,
+        callback: $callback:expr,
+        refresh: $refresh:expr,
+        profile: $profile:expr $(,)?
+    ) => {
+        $crate::export_abi!(heap = $heap);
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn plugin_info() -> i64 {
+            let info: $crate::PluginInfo = $info;
+            $crate::abi::return_ok(&info)
+        }
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn get_authorize_url(ptr: u32, len: u32) -> i64 {
+            let handler: fn(
+                &$crate::AuthorizeUrlInput,
+            ) -> core::result::Result<
+                $crate::__private::String,
+                $crate::PluginError,
+            > = $authorize_url;
+            $crate::abi::dispatch_input(ptr, len, handler)
+        }
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn handle_callback(ptr: u32, len: u32) -> i64 {
+            let handler: fn(
+                &$crate::CallbackInput,
+            ) -> core::result::Result<$crate::TokenSet, $crate::PluginError> = $callback;
+            $crate::abi::dispatch_input(ptr, len, handler)
+        }
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn refresh_tokens(ptr: u32, len: u32) -> i64 {
+            let handler: fn(
+                &$crate::RefreshInput,
+            ) -> core::result::Result<$crate::TokenSet, $crate::PluginError> = $refresh;
+            $crate::abi::dispatch_input(ptr, len, handler)
+        }
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn get_profile(ptr: u32, len: u32) -> i64 {
+            let handler: fn(
+                &$crate::TokenInput,
+            )
+                -> core::result::Result<$crate::ExternalProfile, $crate::PluginError> = $profile;
+            $crate::abi::dispatch_input(ptr, len, handler)
         }
     };
 }

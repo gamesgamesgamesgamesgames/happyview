@@ -1,12 +1,13 @@
-//! Checks the built module, not the source: that `library_plugin!`'s
-//! `#[no_mangle]` items survive into the cdylib as wasm exports, and that no
-//! unused host import comes along with the SDK. Both are only observable in
-//! the artefact, so this reads the SDK-based `http` fixture at
-//! `tests/fixtures/sdk_http`. A test cannot drive the wasm build itself, so it
-//! skips when the fixture is absent; CI builds the fixture first.
+//! Checks the built modules, not the source: that the `#[no_mangle]` items
+//! `library_plugin!` and `auth_plugin!` emit survive into a cdylib as wasm
+//! exports, and that no unused host import comes along with the SDK. Both are
+//! only observable in the artefact, so this reads the SDK-based fixtures at
+//! `tests/fixtures/sdk_http` and `tests/fixtures/sdk_auth`. A test cannot drive
+//! the wasm build itself, so each skips when its fixture is absent; CI builds
+//! them first.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use wasmparser::{ExternalKind, Parser, Payload};
 
@@ -17,7 +18,7 @@ use wasmparser::{ExternalKind, Parser, Payload};
 /// cdylib, ours and the hand-rolled plugins alike. Those are layout constants,
 /// not an entry point, so the assertion below covers functions and memories
 /// exactly and separately requires that everything else be a global.
-const EXPECTED_EXPORTS: &[&str] = &[
+const EXPECTED_LIBRARY_EXPORTS: &[&str] = &[
     "alloc",
     "call",
     "dealloc",
@@ -30,28 +31,43 @@ const EXPECTED_EXPORTS: &[&str] = &[
 /// also shows the unused ten are dropped at link time; a plugin that imported
 /// them all would need capabilities it never declared, and the loader would
 /// refuse it.
-const EXPECTED_IMPORTS: &[&str] = &["env::host_http_request"];
+const EXPECTED_LIBRARY_IMPORTS: &[&str] = &["env::host_http_request"];
 
-fn wasm_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/sdk_http/target/wasm32-unknown-unknown/release/sdk_http.wasm")
+/// The host resolves an auth plugin by these four names plus `plugin_info`;
+/// `auth_plugin!` emits every one of them.
+const EXPECTED_AUTH_EXPORTS: &[&str] = &[
+    "alloc",
+    "dealloc",
+    "get_authorize_url",
+    "get_profile",
+    "handle_callback",
+    "memory",
+    "plugin_info",
+    "refresh_tokens",
+];
+
+/// The `auth` fixture reads a secret and makes one request, which is exactly
+/// what its manifest declares `secrets:read` and `network:request:unrestricted`
+/// for.
+const EXPECTED_AUTH_IMPORTS: &[&str] = &["env::host_get_secret", "env::host_http_request"];
+
+fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "../../tests/fixtures/{name}/target/wasm32-unknown-unknown/release/{name}.wasm"
+    ))
 }
 
-#[test]
-fn the_http_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
-    let path = wasm_path();
-    let Ok(bytes) = std::fs::read(&path) else {
-        eprintln!(
-            "skipping: {} not built. Run `cargo build --manifest-path tests/fixtures/sdk_http/Cargo.toml --target wasm32-unknown-unknown --release` first.",
-            path.display()
-        );
-        return;
+/// The function/memory exports and the host imports of a built module, or
+/// `None` when it has not been built.
+fn module_interface(path: &Path) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return None;
     };
 
     let mut exports = BTreeSet::new();
     let mut imports = BTreeSet::new();
     for payload in Parser::new(0).parse_all(&bytes) {
-        match payload.expect("sdk_http.wasm should be a valid module") {
+        match payload.expect("fixture should be a valid wasm module") {
             Payload::ExportSection(reader) => {
                 for export in reader {
                     let export = export.expect("valid export");
@@ -73,18 +89,42 @@ fn the_http_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
             _ => {}
         }
     }
+    Some((exports, imports))
+}
 
-    let expected_exports: BTreeSet<String> =
-        EXPECTED_EXPORTS.iter().map(|s| s.to_string()).collect();
+fn check_fixture(name: &str, expected_exports: &[&str], expected_imports: &[&str]) {
+    let path = fixture_path(name);
+    let Some((exports, imports)) = module_interface(&path) else {
+        eprintln!(
+            "skipping: {} not built. Run `cargo build --manifest-path tests/fixtures/{name}/Cargo.toml --target wasm32-unknown-unknown --release` first.",
+            path.display()
+        );
+        return;
+    };
+
+    let expected: BTreeSet<String> = expected_exports.iter().map(|s| s.to_string()).collect();
     assert_eq!(
-        exports, expected_exports,
-        "export set drifted; the host resolves these by name"
+        exports, expected,
+        "{name} export set drifted; the host resolves these by name"
     );
 
-    let expected_imports: BTreeSet<String> =
-        EXPECTED_IMPORTS.iter().map(|s| s.to_string()).collect();
+    let expected: BTreeSet<String> = expected_imports.iter().map(|s| s.to_string()).collect();
     assert_eq!(
-        imports, expected_imports,
-        "import set drifted; an unused SDK host import leaked into the module"
+        imports, expected,
+        "{name} import set drifted; an unused SDK host import leaked into the module"
     );
+}
+
+#[test]
+fn the_http_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
+    check_fixture(
+        "sdk_http",
+        EXPECTED_LIBRARY_EXPORTS,
+        EXPECTED_LIBRARY_IMPORTS,
+    );
+}
+
+#[test]
+fn the_auth_fixture_exports_the_auth_abi_and_imports_only_what_it_uses() {
+    check_fixture("sdk_auth", EXPECTED_AUTH_EXPORTS, EXPECTED_AUTH_IMPORTS);
 }
