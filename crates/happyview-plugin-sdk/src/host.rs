@@ -12,20 +12,24 @@
 //! Outside wasm32 every wrapper returns [`HostError::NotWasm`], which keeps a
 //! plugin's pure logic unit-testable natively.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 #[cfg(any(target_arch = "wasm32", test))]
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+#[cfg(target_arch = "wasm32")]
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::abi::read_packed;
-use crate::envelope::PluginError;
 #[cfg(any(target_arch = "wasm32", test))]
-use crate::envelope::Response;
-use crate::types::{ApiSurface, StrongRef};
+use crate::wire::Response;
+use crate::wire::{ApiSurface, PluginError, StrongRef};
+
+/// The wire types these wrappers send and receive. Defined in [`crate::wire`],
+/// which the host imports too; re-exported here as the import path plugins use.
+pub use crate::wire::{HttpRequest, HttpResponse, Level, LookupRequest, ParseLevelError};
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
@@ -90,26 +94,6 @@ impl core::fmt::Display for HostError {
     }
 }
 
-/// Severity for [`log`]. The host parses these exact strings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Level {
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl Level {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Level::Debug => "debug",
-            Level::Info => "info",
-            Level::Warn => "warn",
-            Level::Error => "error",
-        }
-    }
-}
-
 /// Write a line to the plugin's log. Needs no capability, and cannot fail —
 /// a message the host cannot read is dropped.
 pub fn log(level: Level, message: &str) {
@@ -166,103 +150,6 @@ pub fn get_secret(name: &str) -> Result<Option<String>, HostError> {
         let _ = name;
         Err(HostError::NotWasm)
     }
-}
-
-/// An outbound HTTP request. `headers` are sent as the host expects them,
-/// `[[name, value], ...]`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HttpRequest {
-    pub method: String,
-    pub url: String,
-    #[serde(default)]
-    pub headers: Vec<(String, String)>,
-    #[serde(default)]
-    pub body: Option<String>,
-}
-
-impl HttpRequest {
-    /// A request with no headers and no body.
-    pub fn new(method: impl Into<String>, url: impl Into<String>) -> Self {
-        Self {
-            method: method.into(),
-            url: url.into(),
-            headers: Vec::new(),
-            body: None,
-        }
-    }
-
-    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((name.into(), value.into()));
-        self
-    }
-
-    pub fn body(mut self, body: impl Into<String>) -> Self {
-        self.body = Some(body.into());
-        self
-    }
-}
-
-/// A response from [`http_request`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HttpResponse {
-    pub status: u16,
-    #[serde(default)]
-    pub headers: Vec<(String, String)>,
-    /// The host sends this as a string when the body is valid UTF-8 and as a
-    /// byte array when it is not; a non-UTF-8 body arrives lossily converted.
-    #[serde(default, deserialize_with = "deserialize_body")]
-    pub body: String,
-}
-
-impl HttpResponse {
-    /// Look up a response header, ignoring case. The host does not normalise
-    /// header names, so a case-sensitive match would miss most of them.
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    }
-}
-
-fn deserialize_body<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    struct BodyVisitor;
-
-    impl<'de> serde::de::Visitor<'de> for BodyVisitor {
-        type Value = String;
-
-        fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-            f.write_str("a string, a byte array, or null")
-        }
-
-        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<String, E> {
-            Ok(v.to_string())
-        }
-
-        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<String, E> {
-            Ok(v)
-        }
-
-        fn visit_unit<E: serde::de::Error>(self) -> Result<String, E> {
-            Ok(String::new())
-        }
-
-        fn visit_none<E: serde::de::Error>(self) -> Result<String, E> {
-            Ok(String::new())
-        }
-
-        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<String, D::Error> {
-            d.deserialize_any(BodyVisitor)
-        }
-
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<String, A::Error> {
-            let bytes: Vec<u8> =
-                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
-        }
-    }
-
-    deserializer.deserialize_any(BodyVisitor)
 }
 
 /// Send an outbound HTTP request. Needs `network:request` (limited to the
@@ -340,29 +227,6 @@ pub fn kv_delete(key: &str) -> Result<(), HostError> {
     {
         let _ = key;
         Err(HostError::NotWasm)
-    }
-}
-
-/// Which indexed record to look for, by a value nested inside it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LookupRequest {
-    pub collection: String,
-    /// Dotted path into the record, e.g. `externalIds.steam`.
-    pub external_id_field: String,
-    pub external_id_value: String,
-}
-
-impl LookupRequest {
-    pub fn new(
-        collection: impl Into<String>,
-        external_id_field: impl Into<String>,
-        external_id_value: impl Into<String>,
-    ) -> Self {
-        Self {
-            collection: collection.into(),
-            external_id_field: external_id_field.into(),
-            external_id_value: external_id_value.into(),
-        }
     }
 }
 
@@ -516,36 +380,6 @@ fn decode_status(code: i32, import: &str) -> Result<(), HostError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn response_header_lookup_ignores_case() {
-        let response = HttpResponse {
-            status: 200,
-            headers: alloc::vec![
-                ("Content-Type".to_string(), "application/json".to_string()),
-                ("X-Rate-Limit".to_string(), "60".to_string()),
-            ],
-            body: String::new(),
-        };
-        assert_eq!(response.header("content-type"), Some("application/json"));
-        assert_eq!(response.header("CONTENT-TYPE"), Some("application/json"));
-        assert_eq!(response.header("x-rate-limit"), Some("60"));
-        assert_eq!(response.header("accept"), None);
-    }
-
-    #[test]
-    fn response_body_accepts_a_string_or_a_byte_array() {
-        let text: HttpResponse =
-            serde_json::from_str(r#"{"status":200,"headers":[],"body":"hi"}"#).unwrap();
-        assert_eq!(text.body, "hi");
-
-        let bytes: HttpResponse =
-            serde_json::from_str(r#"{"status":204,"headers":[],"body":[104,105]}"#).unwrap();
-        assert_eq!(bytes.body, "hi");
-
-        let missing: HttpResponse = serde_json::from_str(r#"{"status":204,"headers":[]}"#).unwrap();
-        assert_eq!(missing.body, "");
-    }
 
     #[test]
     fn every_wrapper_reports_not_wasm_off_target() {

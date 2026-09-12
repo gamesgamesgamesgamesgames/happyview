@@ -46,6 +46,7 @@ data-encoding = "2"
 dotenvy = "0.15"
 happyview-nsid = { workspace = true }
 happyview-plc = { workspace = true }
+happyview-plugin-sdk = { workspace = true }
 happyview-scopes = { workspace = true }
 hex = "0.4"
 futures-util = "0.3"

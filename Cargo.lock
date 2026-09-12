@@ -1821,6 +1821,7 @@ dependencies = [
  "futures-util",
  "happyview-nsid",
  "happyview-plc",
+ "happyview-plugin-sdk",
  "happyview-scopes",
  "hex",
  "hickory-resolver",

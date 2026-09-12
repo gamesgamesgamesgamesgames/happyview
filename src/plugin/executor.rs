@@ -102,10 +102,13 @@ impl PluginInstance {
         args: &[serde_json::Value],
         ctx: &LibraryCallContext,
     ) -> Result<serde_json::Value, ExecutionError> {
+        // `LibraryCallInput` is the SDK's owned `CallInput`, so the args are
+        // cloned here rather than borrowed; a call's argument list is small and
+        // this runs once per call.
         let input = serde_json::to_value(LibraryCallInput {
-            function,
-            args,
-            context: ctx,
+            function: function.to_string(),
+            args: args.to_vec(),
+            context: ctx.clone(),
         })
         .map_err(|e| ExecutionError::InvalidResponse(e.to_string()))?;
         self.call_plugin_function("call", &input).await

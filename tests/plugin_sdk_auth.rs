@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use happyview::plugin::TokenSetExt;
 use happyview::plugin::loader;
 use happyview::test_support::{memory_pool, test_state_with_pool};
 use wiremock::matchers::{header, method, path};
@@ -105,6 +106,7 @@ async fn refresh_tokens_round_trips_the_refresh_token() {
     // ...but the host can still derive an absolute, future instant from it.
     let resolved = tokens
         .resolved_expires_at()
+        .expect("a duration should parse")
         .expect("expires_in should derive an expiry");
     assert!(
         resolved > chrono::Utc::now(),

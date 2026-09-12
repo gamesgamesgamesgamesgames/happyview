@@ -12,8 +12,8 @@ use crate::AppState;
 use crate::auth::Claims;
 use crate::error::AppError;
 use crate::external_auth::{state, tokens};
-use crate::plugin::PluginExecutor;
 use crate::plugin::secrets::load_plugin_secrets;
+use crate::plugin::{PluginExecutor, TokenSetExt};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -247,7 +247,8 @@ async fn callback_inner(
         .call_get_profile(&token_set.access_token, &config)
         .await?;
 
-    let expires_at = token_set.resolved_expires_at().map(|dt| dt.to_rfc3339());
+    // An `expires_at` in any format but RFC 3339 fails the call here.
+    let expires_at = token_set.resolved_expires_at()?.map(|dt| dt.to_rfc3339());
 
     tokens::store_tokens(
         &app_state.db,
@@ -333,7 +334,10 @@ async fn connect_with_config(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     // Format expires_at as RFC3339 string
-    let expires_at = token_set.resolved_expires_at().map(|dt| dt.to_rfc3339());
+    let expires_at = token_set
+        .resolved_expires_at()
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map(|dt| dt.to_rfc3339());
 
     // Store encrypted tokens
     tokens::store_tokens(

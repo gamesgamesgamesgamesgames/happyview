@@ -60,8 +60,8 @@ fn request(method: &str, args: &[Value]) -> Result<Value, PluginError> {
     // A body is meaningless on get/head, so it is dropped rather than sent.
     let body = match (method, &opts["body"]) {
         ("get" | "head", _) | (_, Value::Null) => None,
-        (_, Value::String(text)) => Some(text.clone()),
-        (_, value) => Some(value.to_string()),
+        (_, Value::String(text)) => Some(text.clone().into_bytes()),
+        (_, value) => Some(value.to_string().into_bytes()),
     };
     let response = host::http_request(&HttpRequest {
         method: method.to_uppercase(),
@@ -80,7 +80,7 @@ fn request(method: &str, args: &[Value]) -> Result<Value, PluginError> {
     let body = if method == "head" {
         String::new()
     } else {
-        response.body
+        response.text().into_owned()
     };
     Ok(json!({"status": response.status, "body": body, "headers": headers}))
 }

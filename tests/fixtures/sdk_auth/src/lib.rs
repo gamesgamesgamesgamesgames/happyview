@@ -58,5 +58,5 @@ fn profile(input: &TokenInput) -> Result<ExternalProfile, PluginError> {
             .header("Authorization", format!("Bearer {}", input.access_token))
             .header("X-Api-Key", api_key),
     )?;
-    Ok(ExternalProfile::new(response.body).display_name("SDK Auth fixture"))
+    Ok(ExternalProfile::new(response.text()).display_name("SDK Auth fixture"))
 }

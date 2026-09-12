@@ -69,24 +69,9 @@ fn default_wasm_file() -> String {
     "plugin.wasm".to_string()
 }
 
-/// Plugin metadata returned by plugin_info() - kept for backward compatibility
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginInfo {
-    pub id: String,
-    pub name: String,
-    pub version: String,
-    pub api_version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub icon_url: Option<String>,
-    #[serde(default)]
-    pub required_secrets: Vec<String>,
-    /// Authentication type: "oauth2", "openid", "api_key"
-    #[serde(default = "default_auth_type")]
-    pub auth_type: String,
-    /// JSON Schema describing user-provided configuration (e.g., API keys)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_schema: Option<serde_json::Value>,
-}
+/// What a plugin's `plugin_info()` export returns, and the SDK's definition of
+/// it — the host never redefines a type that crosses the WASM boundary.
+pub use happyview_plugin_sdk::wire::PluginInfo;
 
 impl From<PluginManifest> for PluginInfo {
     fn from(manifest: PluginManifest) -> Self {
@@ -155,82 +140,36 @@ fn default_version_req() -> String {
     "*".to_string()
 }
 
-/// OAuth callback parameters passed to handle_callback()
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CallbackParams {
-    pub code: Option<String>,
-    pub state: Option<String>,
-    pub error: Option<String>,
-    #[serde(flatten)]
-    pub extra: std::collections::HashMap<String, String>,
+/// The tokens `handle_callback()` and `refresh_tokens()` return, and the
+/// profile `get_profile()` returns. Read a token's expiry through
+/// [`TokenSetExt::resolved_expires_at`], since a plugin may give either an
+/// absolute instant or a duration.
+pub use happyview_plugin_sdk::wire::{ExternalProfile, StrongRef, TokenSet};
+
+/// The host-side half of [`TokenSet`]: turning what a plugin reported into an
+/// absolute instant needs a clock, which a guest does not have.
+pub trait TokenSetExt {
+    /// `expires_at` when the plugin gave one, otherwise `now + expires_in` when
+    /// it gave a duration instead, otherwise `None`. An `expires_at` that is
+    /// not RFC 3339 is an error.
+    fn resolved_expires_at(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, chrono::ParseError>;
 }
 
-/// Tokens returned by handle_callback() and refresh_tokens()
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenSet {
-    pub access_token: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Seconds until expiry, as some providers (Microsoft and Xbox among them)
-    /// return instead of an absolute timestamp; a plugin has no clock to convert
-    /// one to the other. Read expiry through
-    /// [`resolved_expires_at`](Self::resolved_expires_at), since a plugin may
-    /// populate either field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_in: Option<u64>,
-    pub token_type: String,
-}
-
-impl TokenSet {
-    /// The token's expiry as an absolute instant: `expires_at` when the
-    /// plugin gave one, otherwise `now + expires_in` when it gave a duration
-    /// instead. `None` when the plugin supplied neither.
-    pub fn resolved_expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.expires_at.or_else(|| {
-            self.expires_in
-                .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64))
-        })
+impl TokenSetExt for TokenSet {
+    fn resolved_expires_at(
+        &self,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, chrono::ParseError> {
+        if let Some(at) = &self.expires_at {
+            return Ok(Some(
+                chrono::DateTime::parse_from_rfc3339(at)?.with_timezone(&chrono::Utc),
+            ));
+        }
+        Ok(self
+            .expires_in
+            .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64)))
     }
-}
-
-/// Error returned by plugin functions
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginError {
-    pub code: PluginErrorCode,
-    pub message: String,
-    #[serde(default)]
-    pub retryable: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginErrorCode {
-    UserDenied,
-    InvalidToken,
-    ServiceUnavailable,
-    InvalidResponse,
-    Unknown,
-}
-
-/// External profile returned by get_profile()
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExternalProfile {
-    pub account_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avatar_url: Option<String>,
-}
-
-/// Strong reference to an AT Protocol record
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StrongRef {
-    pub uri: String,
-    pub cid: String,
 }
 
 /// Plugin source - file or URL
@@ -411,14 +350,11 @@ mod tests {
         assert_eq!(PluginType::parse_str("bogus"), None);
     }
 
-    fn token_set(
-        expires_at: Option<chrono::DateTime<chrono::Utc>>,
-        expires_in: Option<u64>,
-    ) -> TokenSet {
+    fn token_set(expires_at: Option<&str>, expires_in: Option<u64>) -> TokenSet {
         TokenSet {
             access_token: "a".into(),
             refresh_token: None,
-            expires_at,
+            expires_at: expires_at.map(str::to_string),
             expires_in,
             token_type: "Bearer".into(),
         }
@@ -426,9 +362,31 @@ mod tests {
 
     #[test]
     fn resolved_expires_at_prefers_an_explicit_timestamp_over_a_duration() {
-        let at = chrono::Utc::now();
-        let ts = token_set(Some(at), Some(999));
-        assert_eq!(ts.resolved_expires_at(), Some(at));
+        let ts = token_set(Some("2026-01-01T00:00:00Z"), Some(999));
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(ts.resolved_expires_at(), Ok(Some(at)));
+    }
+
+    #[test]
+    fn resolved_expires_at_reads_an_offset_timestamp_as_the_instant_it_names() {
+        let ts = token_set(Some("2025-12-31T19:00:00-05:00"), None);
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(ts.resolved_expires_at(), Ok(Some(at)));
+    }
+
+    /// An unparseable `expires_at` is refused here, not at deserialisation:
+    /// the wire type keeps it as a string so the SDK needs no clock or parser.
+    #[test]
+    fn resolved_expires_at_refuses_a_timestamp_it_cannot_parse() {
+        assert!(
+            token_set(Some("next tuesday"), Some(3600))
+                .resolved_expires_at()
+                .is_err()
+        );
     }
 
     #[test]
@@ -436,6 +394,7 @@ mod tests {
         let ts = token_set(None, Some(3600));
         let resolved = ts
             .resolved_expires_at()
+            .expect("a duration should parse")
             .expect("expires_in should derive an expiry");
         let now = chrono::Utc::now();
         assert!(resolved > now, "derived expiry must be in the future");
@@ -448,7 +407,7 @@ mod tests {
     #[test]
     fn resolved_expires_at_is_none_when_the_plugin_gave_neither() {
         let ts = token_set(None, None);
-        assert_eq!(ts.resolved_expires_at(), None);
+        assert_eq!(ts.resolved_expires_at(), Ok(None));
     }
 
     #[test]

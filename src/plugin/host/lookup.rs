@@ -1,8 +1,9 @@
-use serde::Deserialize;
-
 use super::HostContext;
 use crate::db::adapt_sql;
 use crate::plugin::StrongRef;
+
+/// Which record a plugin asked for. The SDK's type, as the guest built it.
+pub use happyview_plugin_sdk::wire::LookupRequest;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LookupError {
@@ -10,13 +11,6 @@ pub enum LookupError {
     Database(#[from] sqlx::Error),
     #[error("Invalid external ID field path")]
     InvalidFieldPath,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LookupRequest {
-    pub collection: String,
-    pub external_id_field: String,
-    pub external_id_value: String,
 }
 
 /// Look up a record by external ID
