@@ -91,6 +91,11 @@ A `library` plugin may declare other libraries it calls through `host_call_libra
 | `GET /external-auth/{plugin}/callback`  | OAuth callback handler                         |
 | `POST /external-auth/{plugin}/unlink`   | Unlink account                                 |
 | `POST /external-auth/{plugin}/connect`  | Connect with API key (for `api_key` auth type) |
+| `POST /external-auth/{plugin}/refresh`  | Refresh the caller's tokens if they have expired |
+
+`GET /external-auth/accounts` includes each link's `expires_at` (RFC 3339, or `null` for a token that never expires).
+
+`POST /external-auth/{plugin}/refresh` returns `{"refreshed": bool, "expires_at": string|null}`. Tokens are never returned. It answers `404` when the caller has no link to that plugin, `409` when the token has expired and the provider issued no refresh token (the account must be relinked), and `502` when the plugin's `refresh_tokens` call fails.
 
 ### Admin Endpoints
 
@@ -120,6 +125,8 @@ Plugins must export these functions:
 | `handle_callback`   | `(ptr: u32, len: u32) -> i64` | Handle OAuth callback        |
 | `refresh_tokens`    | `(ptr: u32, len: u32) -> i64` | Refresh expired tokens       |
 | `get_profile`       | `(ptr: u32, len: u32) -> i64` | Get external profile info    |
+
+The host calls `refresh_tokens` on demand, when a stored token is within 60 seconds of its `expires_at`. A token stored without an expiry is never refreshed. The response may omit `refresh_token`; the host then keeps the previous one.
 
 ## Host Functions
 

@@ -105,7 +105,7 @@ impl PluginRegistry {
         let now = now_rfc3339();
         let sql = adapt_sql(
             "INSERT INTO happyview_plugins (id, source, url, sha256, enabled, loaded_at, api_version, manifest)
-             VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+             VALUES (?, ?, ?, ?, TRUE, ?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET
                 source = excluded.source,
                 url = excluded.url,
@@ -347,5 +347,57 @@ impl PluginRegistry {
             .values()
             .find(|p| p.namespace() == Some(namespace))
             .cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::memory_pool;
+
+    /// `enabled` is BOOLEAN on Postgres and INTEGER on SQLite, so the persist
+    /// statement has to use a literal both backends accept.
+    #[tokio::test]
+    async fn register_persists_an_enabled_row() {
+        let pool = memory_pool().await;
+        crate::db::query(
+            "CREATE TABLE happyview_plugins (
+                id TEXT PRIMARY KEY, source TEXT NOT NULL, url TEXT, sha256 TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1, loaded_at TEXT,
+                api_version TEXT NOT NULL, manifest TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let registry = PluginRegistry::with_db(pool.clone(), DatabaseBackend::Sqlite);
+        registry
+            .register(LoadedPlugin {
+                info: PluginInfo {
+                    id: "p".into(),
+                    name: "p".into(),
+                    version: "1.0.0".into(),
+                    api_version: "2".into(),
+                    icon_url: None,
+                    required_secrets: vec![],
+                    auth_type: "openid".into(),
+                    config_schema: None,
+                },
+                source: PluginSource::Url {
+                    url: "https://example.test/p.wasm".into(),
+                    sha256: None,
+                },
+                wasm_bytes: vec![],
+                manifest: None,
+            })
+            .await;
+
+        let (enabled,): (i64,) =
+            crate::db::query_as("SELECT enabled FROM happyview_plugins WHERE id = 'p'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(enabled, 1);
     }
 }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::AppState;
 use crate::auth::Claims;
 use crate::error::AppError;
+use crate::external_auth::refresh::{RefreshError, RefreshOutcome, ensure_fresh_tokens};
 use crate::external_auth::{state, tokens};
 use crate::plugin::secrets::load_plugin_secrets;
 use crate::plugin::{PluginExecutor, TokenSetExt};
@@ -23,6 +24,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{plugin_id}/callback", get(callback))
         .route("/{plugin_id}/connect", post(connect_with_config))
         .route("/{plugin_id}/unlink", post(unlink))
+        .route("/{plugin_id}/refresh", post(refresh))
 }
 
 #[derive(Serialize)]
@@ -380,5 +382,31 @@ async fn unlink(
     Ok(Json(serde_json::json!({
         "status": "ok",
         "was_linked": deleted
+    })))
+}
+
+/// Refresh the caller's own link on demand. The tokens themselves never leave
+/// the server; the response says whether an exchange happened and when the
+/// stored token now expires.
+async fn refresh(
+    State(app_state): State<AppState>,
+    Path(plugin_id): Path<String>,
+    claims: Claims,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let outcome = ensure_fresh_tokens(&app_state, claims.did(), &plugin_id)
+        .await
+        .map_err(|e| match e {
+            RefreshError::NotLinked => {
+                AppError::NotFound(format!("No linked account for plugin: {plugin_id}"))
+            }
+            RefreshError::NoRefreshToken => AppError::Conflict(e.to_string()),
+            RefreshError::Plugin(err) => AppError::BadGateway(err.to_string()),
+            RefreshError::Token(err) => AppError::Internal(err.to_string()),
+        })?;
+
+    let refreshed = matches!(outcome, RefreshOutcome::Refreshed(_));
+    Ok(Json(serde_json::json!({
+        "refreshed": refreshed,
+        "expires_at": outcome.tokens().expires_at,
     })))
 }

@@ -43,6 +43,7 @@ import type {
   AuthorizeResponse,
   UnlinkResponse,
   ConnectResponse,
+  RefreshResponse,
 } from "@/types/external-accounts";
 import type {
   DeadLettersListResponse,
@@ -111,6 +112,7 @@ export type {
   AuthorizeResponse,
   UnlinkResponse,
   ConnectResponse,
+  RefreshResponse,
   ConfigSchema,
   ConfigProperty,
 } from "@/types/external-accounts";
@@ -1025,6 +1027,13 @@ export function authorizeExternal(pluginId: string, redirectUri: string) {
 export function unlinkExternal(pluginId: string) {
   return apiFetch<UnlinkResponse>(
     `/external-auth/${encodeURIComponent(pluginId)}/unlink`,
+    { method: "POST" },
+  );
+}
+
+export function refreshExternalAccount(pluginId: string) {
+  return apiFetch<RefreshResponse>(
+    `/external-auth/${encodeURIComponent(pluginId)}/refresh`,
     { method: "POST" },
   );
 }
