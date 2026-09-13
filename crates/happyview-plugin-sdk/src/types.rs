@@ -6,6 +6,8 @@
 //! is the import path plugins use.
 
 pub use crate::wire::{
-    ApiExport, ApiSurface, AuthorizeUrlInput, CallContext, CallInput, CallbackInput,
-    ExternalProfile, PluginInfo, RefreshInput, StrongRef, TokenInput, TokenSet,
+    ApiExport, ApiMethod, ApiSurface, AuthorizeUrlInput, BacklinksQuery, CallContext, CallInput,
+    CallbackInput, Condition, ExternalProfile, Filter, MethodCall, ObjectCall, PluginInfo,
+    RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, RefreshInput, Sort, Step, StrongRef,
+    TableQuery, TokenInput, TokenSet,
 };

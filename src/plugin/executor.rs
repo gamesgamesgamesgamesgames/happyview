@@ -105,10 +105,24 @@ impl PluginInstance {
         // `LibraryCallInput` is the SDK's owned `CallInput`, so the args are
         // cloned here rather than borrowed; a call's argument list is small and
         // this runs once per call.
+        //
+        // `db_backend` is filled in here rather than required of every caller:
+        // a script runner has no reason to know which backend is live, but a
+        // plugin reading `ctx.db_backend` to pick a placeholder style does.
+        let mut context = ctx.clone();
+        if context.db_backend.is_none() {
+            context.db_backend = Some(
+                match self.store.data().db_backend {
+                    DatabaseBackend::Sqlite => "sqlite",
+                    DatabaseBackend::Postgres => "postgres",
+                }
+                .to_string(),
+            );
+        }
         let input = serde_json::to_value(LibraryCallInput {
             function: function.to_string(),
             args: args.to_vec(),
-            context: ctx.clone(),
+            context,
         })
         .map_err(|e| ExecutionError::InvalidResponse(e.to_string()))?;
         self.call_plugin_function("call", &input).await

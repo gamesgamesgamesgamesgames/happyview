@@ -25,7 +25,10 @@ use serde_json::{Map, Value};
 use crate::abi::read_packed;
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::wire::Response;
-use crate::wire::{ApiSurface, PluginError, StrongRef};
+use crate::wire::{
+    ApiSurface, BacklinksQuery, PluginError, RecordsCount, RecordsPage, RecordsQuery,
+    RecordsSearch, StrongRef, TableQuery,
+};
 
 /// The wire types these wrappers send and receive. Defined in [`crate::wire`],
 /// which the host imports too; re-exported here as the import path plugins use.
@@ -52,6 +55,12 @@ extern "C" {
     fn host_get_api_surface(lib_ptr: i32, lib_len: i32) -> i64;
     fn host_db_query(sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32) -> i64;
     fn host_db_execute(sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32) -> i64;
+    fn host_records_query(req_ptr: i32, req_len: i32) -> i64;
+    fn host_records_count(req_ptr: i32, req_len: i32) -> i64;
+    fn host_records_get(req_ptr: i32, req_len: i32) -> i64;
+    fn host_records_search(req_ptr: i32, req_len: i32) -> i64;
+    fn host_table_query(req_ptr: i32, req_len: i32) -> i64;
+    fn host_backlinks_query(req_ptr: i32, req_len: i32) -> i64;
 }
 
 /// Why a host call did not produce a value.
@@ -244,6 +253,101 @@ pub fn lookup_record(request: &LookupRequest) -> Result<Option<StrongRef>, HostE
     {
         let _ = request;
         Err(HostError::NotWasm)
+    }
+}
+
+/// Send a spec to a record/table query import and decode its typed result.
+/// Every import here shares one envelope shape, so this is the one place that
+/// serializes the request and decodes the response.
+#[cfg(target_arch = "wasm32")]
+fn call_spec<S: serde::Serialize, R: serde::de::DeserializeOwned>(
+    import: unsafe extern "C" fn(i32, i32) -> i64,
+    spec: &S,
+) -> Result<R, PluginError> {
+    let bytes = serde_json::to_vec(spec).map_err(PluginError::from)?;
+    // SAFETY: `bytes` is live for the duration of the call.
+    let packed = unsafe { import(bytes.as_ptr() as i32, bytes.len() as i32) };
+    decode_required::<R>(packed).map_err(PluginError::from)
+}
+
+/// Page through indexed records matching a filter. Needs `records:read`.
+pub fn records_query(spec: &RecordsQuery) -> Result<RecordsPage, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_records_query, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Count indexed records matching a filter. Needs `records:read`.
+pub fn records_count(spec: &RecordsCount) -> Result<i64, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_records_count, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Fetch one indexed record by its `at://` URI. `Ok(None)` means it is not
+/// indexed. Needs `records:read`.
+pub fn records_get(uri: &str) -> Result<Option<Value>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_records_get, &serde_json::json!({"uri": uri}))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = uri;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Substring-search one JSON field across a collection's records. Needs
+/// `records:read`.
+pub fn records_search(spec: &RecordsSearch) -> Result<Vec<Value>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_records_search, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Run a structured query against an arbitrary table, guarded the same way as
+/// `db_query`. Needs `database:read` (or `database:write`).
+pub fn table_query(spec: &TableQuery) -> Result<Value, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_table_query, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Page through records that reference a given URI. Needs `records:read`.
+pub fn backlinks_query(spec: &BacklinksQuery) -> Result<RecordsPage, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_backlinks_query, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
     }
 }
 

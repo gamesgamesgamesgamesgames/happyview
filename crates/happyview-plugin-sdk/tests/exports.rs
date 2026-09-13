@@ -51,6 +51,26 @@ const EXPECTED_AUTH_EXPORTS: &[&str] = &[
 /// for.
 const EXPECTED_AUTH_IMPORTS: &[&str] = &["env::host_get_secret", "env::host_http_request"];
 
+/// The `objects` fixture uses the object-model constructor/method plumbing
+/// (no host import of its own) plus every record/table query import.
+const EXPECTED_OBJECTS_EXPORTS: &[&str] = &[
+    "alloc",
+    "call",
+    "dealloc",
+    "get_api_surface",
+    "memory",
+    "plugin_info",
+];
+
+const EXPECTED_OBJECTS_IMPORTS: &[&str] = &[
+    "env::host_backlinks_query",
+    "env::host_records_count",
+    "env::host_records_get",
+    "env::host_records_query",
+    "env::host_records_search",
+    "env::host_table_query",
+];
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
         "../../tests/fixtures/{name}/target/wasm32-unknown-unknown/release/{name}.wasm"
@@ -127,4 +147,13 @@ fn the_http_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
 #[test]
 fn the_auth_fixture_exports_the_auth_abi_and_imports_only_what_it_uses() {
     check_fixture("sdk_auth", EXPECTED_AUTH_EXPORTS, EXPECTED_AUTH_IMPORTS);
+}
+
+#[test]
+fn the_objects_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
+    check_fixture(
+        "sdk_objects",
+        EXPECTED_OBJECTS_EXPORTS,
+        EXPECTED_OBJECTS_IMPORTS,
+    );
 }

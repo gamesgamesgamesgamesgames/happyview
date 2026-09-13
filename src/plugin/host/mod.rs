@@ -4,6 +4,7 @@ mod http;
 mod kv;
 mod logging;
 mod lookup;
+mod records;
 mod secrets;
 
 pub use bindings::{PluginState, register_host_functions};
@@ -12,6 +13,7 @@ pub use http::*;
 pub use kv::*;
 pub use logging::*;
 pub use lookup::*;
+pub use records::*;
 pub use secrets::*;
 
 use std::collections::HashMap;

@@ -50,8 +50,10 @@ pub mod wire;
 
 pub use envelope::{PluginError, Response};
 pub use types::{
-    ApiExport, ApiSurface, AuthorizeUrlInput, CallContext, CallInput, CallbackInput,
-    ExternalProfile, PluginInfo, RefreshInput, StrongRef, TokenInput, TokenSet,
+    ApiExport, ApiMethod, ApiSurface, AuthorizeUrlInput, BacklinksQuery, CallContext, CallInput,
+    CallbackInput, Condition, ExternalProfile, Filter, MethodCall, ObjectCall, PluginInfo,
+    RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, RefreshInput, Sort, Step, StrongRef,
+    TableQuery, TokenInput, TokenSet,
 };
 
 /// Items the macros name in their expansion. Not a public API: a plugin crate

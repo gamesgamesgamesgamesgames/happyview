@@ -62,6 +62,8 @@ Every plugin, `auth` included, needs `api_version` `"2"` and a `capabilities` li
 
 A `library` plugin may declare `namespace` — the name scripts use in `require(namespace)`. It defaults to `id` when omitted.
 
+Namespaces are dotted `publisher.name` (`happyview.db`); ids are hyphenated (`happyview-db`). A script's `require("happyview.db")` names the implementation it depends on, since a script is often read without the instance that runs it.
+
 ### Dependencies
 
 A `library` plugin may declare other libraries it calls through `host_call_library`:
@@ -211,7 +213,56 @@ A `library` plugin exports a callable API surface instead of the `auth` contract
 }
 ```
 
-`kind` defaults to `"function"`, the only kind `require()` renders; other kinds are skipped. `types` holds named types referenced by `params`/`returns`; the host treats it as opaque.
+`types` holds named types referenced by `params`/`returns`; the host treats it as opaque.
+
+#### Kinds and objects
+
+An export's `kind` is `function`, `constant`, or `constructor`, and defaults to `function`.
+
+`require()` renders `function` exports (as shown above) and `constructor` exports. `constant` is reserved for future interpreters and is not rendered by `require()`. A `constructor` export returns an object. The surface lists the object's `methods`, each `{name, mode}` with mode `lazy` or `immediate`:
+
+| Method mode | Calling it |
+| --- | --- |
+| `lazy` | Appends `{name: args}` to the object's accumulated steps and returns the object, so calls chain. |
+| `immediate` | Makes one library call named after the constructor, sending `{"args": [...], "steps": [...], "call": {"name": ..., "args": [...]}}` as its single argument, and returns the result. |
+
+Here is `happyview.db`'s `records` export:
+
+```json
+{
+  "name": "records",
+  "kind": "constructor",
+  "description": "Build a query against one collection",
+  "params": [{ "name": "collection", "type": "string" }],
+  "methods": [
+    { "name": "where", "mode": "lazy" },
+    { "name": "sort", "mode": "lazy" },
+    { "name": "limit", "mode": "lazy" },
+    { "name": "cursor", "mode": "lazy" },
+    { "name": "did", "mode": "lazy" },
+    { "name": "run", "mode": "immediate" },
+    { "name": "count", "mode": "immediate" },
+    { "name": "first", "mode": "immediate" }
+  ]
+}
+```
+
+Calling `run()` after a chain of `where`/`sort`/`limit` sends this document as the library call's single argument:
+
+```json
+{
+  "args": ["app.bsky.feed.post"],
+  "steps": [
+    { "where": ["author", "=", "did:plc:abc"] },
+    { "where": ["text", "like", "%happyview%"] },
+    { "sort": ["createdAt", "desc"] },
+    { "limit": [20] }
+  ],
+  "call": { "name": "run", "args": [] }
+}
+```
+
+Two limits follow from JSON in, JSON out. An object holds no guest memory between calls, so a library cannot hold an open resource, such as a transaction, across calls. A script cannot hand a library a function, so there are no callbacks, comparators, or subscriptions.
 
 ### Host imports for libraries
 
@@ -231,9 +282,22 @@ A plugin declaring `database:read` or `database:write` can import:
 
 `host_call_library` calls nest; a library calling a library that calls a third is normal. Depth is capped at **8**: the ninth hop fails with a depth-exceeded error. Every hop, whether from WASM through `host_call_library` or from Lua through `require()`, goes through the same dispatch path (`PluginExecutor::call_library`), so mixing the two does not bypass the limit.
 
+A plugin declaring the listed capability can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope, with error codes `INVALID_SPEC`, `DB_ERROR`, `BAD_INPUT`, or `FORBIDDEN`:
+
+| Import | Capability | Spec |
+| --------------------------- | ----------------------------------- | ------------------------------------------------------------------------------- |
+| `host_records_query`        | `records:read`                      | `{collection, did?, filter?, sort?, limit?, cursor?}` → `{records, cursor?}`     |
+| `host_records_count`        | `records:read`                      | `{collection, did?, filter?}` → integer                                         |
+| `host_records_get`          | `records:read`                      | `{uri}` → record or null                                                        |
+| `host_records_search`       | `records:read`                      | `{collection, field, query, limit?}` → records                                  |
+| `host_backlinks_query`      | `records:read`                      | `{uri, collection, did?, limit?, cursor?}` → `{records, cursor?}`                |
+| `host_table_query`          | `database:read` or `database:write` | `{table, filter?, sort?, limit?, count?}` → rows, or an integer when `count` is set |
+
+`filter`, on `host_records_query`, `host_records_count`, and `host_table_query`, is `{field, op, value}` or `{combine: "and"|"or", conditions: [...]}`, nesting capped at 5.
+
 #### Database access
 
-`host_db_query` and `host_db_execute` run SQL **untranslated** against whichever backend HappyView is running on — placeholders are backend-native (`?` on SQLite, `$1`, `$2`, … on Postgres), the same rule as Lua's [`db.raw`](../api-reference/lua/database-api.md#protected-tables). A plugin that supports both backends has to branch on placeholder syntax itself; there is no plugin equivalent of Lua's `db.backend()`.
+`host_db_query` and `host_db_execute` run SQL **untranslated** against whichever backend HappyView is running on — placeholders are backend-native (`?` on SQLite, `$1`, `$2`, … on Postgres), the same rule as Lua's [`db.raw`](../api-reference/lua/database-api.md#protected-tables). A plugin that supports both backends has to branch on placeholder syntax itself; there is no plugin equivalent of Lua's `db.backend()`. Record and table queries go through the imports above; `host_db_query`/`host_db_execute` are for raw SQL only.
 
 - `database:read` permits `host_db_query` only, and only read-only statements: every statement must be a query whose body and every CTE are `SELECT`s. `WITH … INSERT/UPDATE/DELETE` and a data-modifying CTE (`WITH x AS (DELETE FROM t RETURNING uri) SELECT * FROM x`) count as writes and are rejected before they run.
 - `database:write` permits both imports for any statement, including `INSERT`, `UPDATE`, `DELETE`, and `DROP`.
@@ -266,16 +330,27 @@ Every host function except `host_log` is gated by a capability. The loader reads
 
 ### Using a library from Lua
 
-Installed libraries are available to scripts via `require(namespace)`. Each function export becomes an async Lua function:
+Installed libraries are available to scripts via `require(namespace)`. Each `function` export becomes an async Lua function, and each `constructor` export becomes a function returning a chainable object:
 
 ```lua
-local http = require("http")
+local db = require("happyview.db")
 
 function handle()
-  local response = http.get("https://api.example.com/status", { headers = { Accept = "application/json" } })
-  return response.body
+  local page = db.records("app.bsky.feed.post")
+    :where("author", "=", "did:plc:abc")
+    :where("text", "like", "%happyview%")
+    :sort("createdAt", "desc")
+    :limit(20)
+    :run()
+
+  local total = db.records("app.bsky.feed.post"):where("author", "=", "did:plc:abc"):count()
+  local newest = db.records("app.bsky.feed.post"):sort("createdAt", "desc"):first()
+
+  return page.records
 end
 ```
+
+`where`, `sort`, `limit`, `cursor`, and `did` are lazy: each returns the same object, which is why they chain. `run`, `count`, and `first` are immediate: each makes the library call and returns its result.
 
 `require` resolves `namespace` against every installed `library` plugin's manifest `namespace` (or `id`, if `namespace` is unset), and caches the result for the rest of the script run. Requiring a name with no matching installed library plugin fails with:
 

@@ -126,6 +126,110 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
 
     linker.func_wrap_async(
         "env",
+        "host_records_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_query",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::records_query(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_records_count",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_count",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::records_count(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_records_get",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_get",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec: GetSpec| async move {
+                        super::records_get(&db, backend, &spec.uri).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_records_search",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_search",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::records_search(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_table_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_table_query",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::table_query(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_backlinks_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_backlinks_query",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::backlinks_query(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
         "host_call_library",
         |mut caller: wasmtime::Caller<'_, PluginState>,
          (lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len): (i32, i32, i32, i32, i32, i32)| {
@@ -569,6 +673,56 @@ async fn host_lookup_record_impl(
     };
 
     write_guest_response(caller, &response_bytes).await
+}
+
+/// One entry point for every spec-taking record/table query import: gate on
+/// the import's capability, decode the spec, run it against the database, and
+/// wrap the result in the standard envelope. `RecordsError::InvalidSpec`
+/// becomes `INVALID_SPEC` rather than `DB_ERROR` so a plugin can tell a bad
+/// query from a database failure.
+async fn host_spec_impl<S, R, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    F: FnOnce(sqlx::AnyPool, crate::db::DatabaseBackend, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, super::RecordsError>>,
+{
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: S = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(db) = caller.data().db.clone() else {
+        return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
+    };
+    let backend = caller.data().db_backend;
+    let response = match run(db, backend, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(super::RecordsError::InvalidSpec(msg)) => error_envelope("INVALID_SPEC", msg),
+        Err(e) => error_envelope("DB_ERROR", e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// The host-side input to `host_records_get`: the SDK wrapper sends
+/// `{"uri": ...}` rather than a bare string so it shares `host_spec_impl`'s
+/// JSON-spec envelope with every other record/table import.
+#[derive(serde::Deserialize)]
+struct GetSpec {
+    uri: String,
 }
 
 /// Gate on `library:call`, then hand back the executor.

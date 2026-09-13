@@ -170,6 +170,33 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
         import: "host_db_execute",
         any_of: &[PluginCapability::DatabaseWrite],
     },
+    Requirement {
+        import: "host_records_query",
+        any_of: &[PluginCapability::RecordsRead],
+    },
+    Requirement {
+        import: "host_records_count",
+        any_of: &[PluginCapability::RecordsRead],
+    },
+    Requirement {
+        import: "host_records_get",
+        any_of: &[PluginCapability::RecordsRead],
+    },
+    Requirement {
+        import: "host_records_search",
+        any_of: &[PluginCapability::RecordsRead],
+    },
+    Requirement {
+        import: "host_backlinks_query",
+        any_of: &[PluginCapability::RecordsRead],
+    },
+    Requirement {
+        import: "host_table_query",
+        any_of: &[
+            PluginCapability::DatabaseRead,
+            PluginCapability::DatabaseWrite,
+        ],
+    },
 ];
 
 const FREE_IMPORTS: &[&str] = &["host_log"];
@@ -322,6 +349,12 @@ mod tests {
             "host_get_api_surface",
             "host_db_query",
             "host_db_execute",
+            "host_records_query",
+            "host_records_count",
+            "host_records_get",
+            "host_records_search",
+            "host_backlinks_query",
+            "host_table_query",
         ] {
             // `None` is only right for host_log.
             assert_eq!(

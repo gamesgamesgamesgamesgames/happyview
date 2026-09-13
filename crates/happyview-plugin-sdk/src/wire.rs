@@ -190,6 +190,10 @@ pub struct CallContext {
     pub caller_did: Option<String>,
     #[serde(default)]
     pub has_pds_auth: bool,
+    /// `"sqlite"` or `"postgres"`. A guest has no other way to learn which
+    /// placeholder syntax raw SQL needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_backend: Option<String>,
 }
 
 /// The `call` export's input. Every field but `function` defaults, so an
@@ -270,6 +274,12 @@ pub struct ApiExport {
     pub params: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returns: Option<Value>,
+    /// Present on a `constructor` export: the methods of the object it
+    /// returns. A `lazy` method accumulates a step; an `immediate` method
+    /// sends the object's arguments, its steps and the call in one library
+    /// call named after the constructor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<ApiMethod>,
     /// Everything else the library said about the export, preserved for
     /// interpreters. A builder leaves it empty.
     #[serde(flatten)]
@@ -288,6 +298,7 @@ impl ApiExport {
             description: None,
             params: Vec::new(),
             returns: None,
+            methods: Vec::new(),
             extra: Map::new(),
         }
     }
@@ -295,6 +306,13 @@ impl ApiExport {
     pub fn constant(name: impl Into<String>) -> Self {
         Self {
             kind: String::from("constant"),
+            ..Self::function(name)
+        }
+    }
+
+    pub fn constructor(name: impl Into<String>) -> Self {
+        Self {
+            kind: String::from("constructor"),
             ..Self::function(name)
         }
     }
@@ -325,9 +343,215 @@ impl ApiExport {
         self
     }
 
+    pub fn lazy(mut self, name: impl Into<String>) -> Self {
+        self.methods.push(ApiMethod::lazy(name));
+        self
+    }
+
+    pub fn immediate(mut self, name: impl Into<String>) -> Self {
+        self.methods.push(ApiMethod::immediate(name));
+        self
+    }
+
     pub fn is_function(&self) -> bool {
         self.kind == "function"
     }
+
+    pub fn is_constructor(&self) -> bool {
+        self.kind == "constructor"
+    }
+}
+
+/// A method on the object a `constructor` export returns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiMethod {
+    pub name: String,
+    /// `"lazy"` or `"immediate"`.
+    pub mode: String,
+}
+
+impl ApiMethod {
+    pub fn lazy(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            mode: String::from("lazy"),
+        }
+    }
+
+    pub fn immediate(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            mode: String::from("immediate"),
+        }
+    }
+
+    pub fn is_lazy(&self) -> bool {
+        self.mode == "lazy"
+    }
+
+    pub fn is_immediate(&self) -> bool {
+        self.mode == "immediate"
+    }
+}
+
+/// One accumulated lazy call, on the wire as a one-key object such as
+/// `{"where": ["a", "=", "1"]}`, so a document reads as the chain that
+/// produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Step {
+    pub name: String,
+    pub args: Vec<Value>,
+}
+
+impl Serialize for Step {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(&self.name, &self.args)?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Step {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let map = Map::<String, Value>::deserialize(deserializer)?;
+        if map.len() != 1 {
+            return Err(serde::de::Error::custom(
+                "a step is an object with exactly one key",
+            ));
+        }
+        let (name, args) = map.into_iter().next().expect("length checked");
+        let args = match args {
+            Value::Array(a) => a,
+            _ => return Err(serde::de::Error::custom("step arguments must be an array")),
+        };
+        Ok(Step { name, args })
+    }
+}
+
+/// The immediate method that ended a chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MethodCall {
+    pub name: String,
+    #[serde(default)]
+    pub args: Vec<Value>,
+}
+
+/// What an immediate method sends: the constructor's arguments, every lazy
+/// step since, and the call itself. Objects have no guest memory between
+/// calls, so this document is the whole object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectCall {
+    #[serde(default)]
+    pub args: Vec<Value>,
+    #[serde(default)]
+    pub steps: Vec<Step>,
+    pub call: MethodCall,
+}
+
+impl ObjectCall {
+    /// The single argument a constructor-named library call receives.
+    pub fn from_args(args: &[Value]) -> Result<Self, PluginError> {
+        let [doc] = args else {
+            return Err(PluginError::bad_input(
+                "expected exactly one object document",
+            ));
+        };
+        serde_json::from_value(doc.clone())
+            .map_err(|e| PluginError::bad_input(format!("invalid object document: {e}")))
+    }
+}
+
+/// One comparison in a record or table filter. `value` is always a string;
+/// the host binds it as text on both backends.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Condition {
+    pub field: String,
+    pub op: String,
+    pub value: String,
+}
+
+/// A filter tree. Untagged so a bare condition and a group both read
+/// naturally; a group's `conditions` may nest further groups.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Filter {
+    Condition(Condition),
+    Group {
+        combine: String,
+        conditions: Vec<Filter>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Sort {
+    pub field: String,
+    pub direction: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordsQuery {
+    pub collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Filter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<Sort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordsCount {
+    pub collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Filter>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordsSearch {
+    pub collection: String,
+    pub field: String,
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableQuery {
+    pub table: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Filter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<Sort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub count: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BacklinksQuery {
+    pub uri: String,
+    pub collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordsPage {
+    pub records: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// A strong reference to an AT Protocol record, as `host_lookup_record` returns it.
@@ -851,6 +1075,7 @@ mod tests {
             context: CallContext {
                 caller_did: Some("did:plc:abc".to_string()),
                 has_pds_auth: true,
+                db_backend: None,
             },
         };
         let json = serde_json::to_value(&input).unwrap();
@@ -1157,5 +1382,146 @@ mod tests {
             assert_eq!(Level::from_str(level.as_str()), Ok(level));
             assert_eq!(alloc::format!("{level}"), level.as_str());
         }
+    }
+}
+
+#[cfg(test)]
+mod object_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn constructor_export_carries_methods() {
+        let export = ApiExport::constructor("records")
+            .lazy("where")
+            .immediate("run");
+        assert!(export.is_constructor());
+        assert!(!export.is_function());
+        let json = serde_json::to_value(&export).unwrap();
+        assert_eq!(json["kind"], "constructor");
+        assert_eq!(
+            json["methods"],
+            json!([
+                {"name": "where", "mode": "lazy"},
+                {"name": "run", "mode": "immediate"}
+            ])
+        );
+    }
+
+    #[test]
+    fn function_export_omits_methods() {
+        let json = serde_json::to_value(ApiExport::function("get")).unwrap();
+        assert!(json.get("methods").is_none());
+        let back: ApiExport = serde_json::from_value(json).unwrap();
+        assert!(back.methods.is_empty());
+    }
+
+    #[test]
+    fn step_is_a_one_key_object() {
+        let step = Step {
+            name: "where".into(),
+            args: vec![json!("a"), json!("="), json!(1)],
+        };
+        assert_eq!(
+            serde_json::to_value(&step).unwrap(),
+            json!({"where": ["a", "=", 1]})
+        );
+        let back: Step = serde_json::from_value(json!({"limit": [20]})).unwrap();
+        assert_eq!(back.name, "limit");
+        assert_eq!(back.args, vec![json!(20)]);
+    }
+
+    #[test]
+    fn step_rejects_zero_or_two_keys() {
+        assert!(serde_json::from_value::<Step>(json!({})).is_err());
+        assert!(serde_json::from_value::<Step>(json!({"a": [], "b": []})).is_err());
+        assert!(serde_json::from_value::<Step>(json!({"a": "not an array"})).is_err());
+    }
+
+    #[test]
+    fn object_call_round_trips() {
+        let doc = json!({
+            "args": ["app.bsky.feed.post"],
+            "steps": [{"where": ["author", "=", "did:plc:abc"]}, {"limit": [20]}],
+            "call": {"name": "run", "args": []}
+        });
+        let call = ObjectCall::from_args(&[doc.clone()]).unwrap();
+        assert_eq!(call.args, vec![json!("app.bsky.feed.post")]);
+        assert_eq!(call.steps.len(), 2);
+        assert_eq!(call.call.name, "run");
+        assert_eq!(serde_json::to_value(&call).unwrap(), doc);
+    }
+
+    #[test]
+    fn object_call_needs_exactly_one_document() {
+        let err = ObjectCall::from_args(&[]).unwrap_err();
+        assert_eq!(err.code, "BAD_INPUT");
+        let err = ObjectCall::from_args(&[json!({}), json!({})]).unwrap_err();
+        assert_eq!(err.code, "BAD_INPUT");
+        let err = ObjectCall::from_args(&[json!({"args": []})]).unwrap_err();
+        assert_eq!(err.code, "BAD_INPUT");
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn filter_deserialises_conditions_and_groups() {
+        let f: Filter = serde_json::from_value(json!({
+            "combine": "and",
+            "conditions": [
+                {"field": "a", "op": "=", "value": "1"},
+                {"combine": "or", "conditions": [{"field": "b", "op": "LIKE", "value": "%x%"}]}
+            ]
+        }))
+        .unwrap();
+        match f {
+            Filter::Group {
+                combine,
+                conditions,
+            } => {
+                assert_eq!(combine, "and");
+                assert_eq!(conditions.len(), 2);
+                assert!(matches!(conditions[0], Filter::Condition(_)));
+                assert!(matches!(conditions[1], Filter::Group { .. }));
+            }
+            Filter::Condition(_) => panic!("expected a group"),
+        }
+    }
+
+    #[test]
+    fn records_query_defaults() {
+        let q: RecordsQuery = serde_json::from_value(json!({"collection": "c"})).unwrap();
+        assert_eq!(q.collection, "c");
+        assert!(q.did.is_none() && q.filter.is_none() && q.sort.is_none());
+        assert!(q.limit.is_none() && q.cursor.is_none());
+    }
+
+    #[test]
+    fn table_query_count_defaults_false() {
+        let q: TableQuery = serde_json::from_value(json!({"table": "t"})).unwrap();
+        assert!(!q.count);
+    }
+
+    #[test]
+    fn call_context_backend_defaults_to_none() {
+        let ctx: CallContext = serde_json::from_value(json!({})).unwrap();
+        assert!(ctx.db_backend.is_none());
+        let ctx: CallContext = serde_json::from_value(json!({"db_backend": "sqlite"})).unwrap();
+        assert_eq!(ctx.db_backend.as_deref(), Some("sqlite"));
+    }
+
+    #[test]
+    fn records_page_omits_absent_cursor() {
+        let page = RecordsPage {
+            records: vec![json!({"uri": "at://x"})],
+            cursor: None,
+        };
+        let json = serde_json::to_value(&page).unwrap();
+        assert!(json.get("cursor").is_none());
+        assert_eq!(json["records"][0]["uri"], "at://x");
     }
 }

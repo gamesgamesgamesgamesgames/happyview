@@ -115,6 +115,7 @@ async fn call_dispatches_function_with_args_and_context() {
     let ctx = LibraryCallContext {
         caller_did: Some("did:plc:me".into()),
         has_pds_auth: false,
+        db_backend: None,
     };
 
     let echoed = inst
@@ -190,6 +191,7 @@ async fn libraries_compose_through_host_call_library() {
     let ctx = LibraryCallContext {
         caller_did: Some("did:plc:me".into()),
         has_pds_auth: true,
+        db_backend: None,
     };
     // libb.call_other("liba", "whoami", []) — context must survive the hop.
     let out = executor

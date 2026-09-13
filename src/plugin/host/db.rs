@@ -24,7 +24,7 @@ fn bind_params<'q>(
     Ok(query)
 }
 
-fn row_to_json(row: &sqlx::any::AnyRow) -> Map<String, Value> {
+pub(super) fn row_to_json(row: &sqlx::any::AnyRow) -> Map<String, Value> {
     let mut out = Map::new();
     for col in row.columns() {
         let name = col.name();
