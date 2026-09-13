@@ -1,5 +1,6 @@
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
+use serde_json::Value as JsonValue;
 use sqlx::{Column, Row};
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use happyview_plugin_sdk::wire::{
 /// shape into the SDK's wire `Filter`. This grammar is Lua-specific: a plain
 /// Lua value in the `value` field rather than a pre-stringified one, and `op`
 /// defaulting to `=`.
-pub fn parse_filter_node(table: &mlua::Table, depth: u8) -> LuaResult<Filter> {
+fn parse_filter_node(table: &mlua::Table, depth: u8) -> LuaResult<Filter> {
     if depth >= MAX_FILTER_DEPTH {
         return Err(mlua::Error::runtime(format!(
             "filter nesting too deep (max {MAX_FILTER_DEPTH} levels)",
@@ -50,7 +51,11 @@ pub fn parse_filter_node(table: &mlua::Table, depth: u8) -> LuaResult<Filter> {
             }
         };
 
-        return Ok(Filter::Condition(Condition { field, op, value }));
+        return Ok(Filter::Condition(Condition {
+            field,
+            op,
+            value: JsonValue::String(value),
+        }));
     }
 
     let combine: String = table
@@ -336,6 +341,7 @@ mod tests {
     use crate::config::Config;
     use crate::db::DatabaseBackend;
     use crate::lexicon::LexiconRegistry;
+    use serde_json::json;
     use tokio::sync::watch;
 
     fn test_state() -> AppState {
@@ -635,7 +641,7 @@ mod tests {
             Filter::Condition(Condition {
                 field: "name".into(),
                 op: "=".into(),
-                value: "alice".into()
+                value: json!("alice")
             })
         );
     }
@@ -652,7 +658,7 @@ mod tests {
             Filter::Condition(Condition {
                 field: "status".into(),
                 op: "=".into(),
-                value: "active".into()
+                value: json!("active")
             })
         );
     }
@@ -683,12 +689,12 @@ mod tests {
                     Filter::Condition(Condition {
                         field: "status".into(),
                         op: "=".into(),
-                        value: "active".into()
+                        value: json!("active")
                     }),
                     Filter::Condition(Condition {
                         field: "age".into(),
                         op: ">".into(),
-                        value: "18".into()
+                        value: json!("18")
                     }),
                 ],
             }
@@ -725,7 +731,7 @@ mod tests {
             Filter::Condition(Condition {
                 field: "count".into(),
                 op: ">".into(),
-                value: "42".into()
+                value: json!("42")
             })
         );
     }
@@ -742,7 +748,7 @@ mod tests {
             Filter::Condition(Condition {
                 field: "active".into(),
                 op: "=".into(),
-                value: "true".into()
+                value: json!("true")
             })
         );
     }
@@ -757,7 +763,7 @@ mod tests {
             Filter::Condition(Condition {
                 field: "author.websites[0].url".into(),
                 op: "=".into(),
-                value: "https://example.com".into(),
+                value: json!("https://example.com"),
             })
         );
     }

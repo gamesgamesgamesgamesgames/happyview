@@ -71,8 +71,8 @@ A `library` plugin may declare other libraries it calls through `host_call_libra
 ```json
 {
   "dependencies": [
-    { "id": "db", "version": ">=1.0.0" },
-    { "id": "http" }
+    { "id": "happyview-db", "version": ">=1.0.0" },
+    { "id": "happyview-http" }
   ]
 }
 ```
@@ -165,22 +165,23 @@ A `library` plugin exports a callable API surface instead of the `auth` contract
   "args": ["https://api.example.com/status", { "headers": { "Accept": "application/json" } }],
   "context": {
     "caller_did": "did:plc:abc123",
-    "has_pds_auth": false
+    "has_pds_auth": false,
+    "db_backend": "sqlite"
   }
 }
 ```
 
 - `function` — the export name being invoked
 - `args` — a JSON array of positional arguments
-- `context` — who the call is acting as: `caller_did` (nullable; absent for anonymous scripts) and `has_pds_auth` (whether the caller currently holds a PDS session). `context` is threaded unchanged through every nested `host_call_library` hop, so a library can never widen who it's acting as.
+- `context` — who the call is acting as: `caller_did` (nullable; absent for anonymous scripts), `has_pds_auth` (whether the caller currently holds a PDS session), and `db_backend` (`"sqlite"` or `"postgres"`, filled by the host on every call — see [Database access](#database-access)). `context` is threaded unchanged through every nested `host_call_library` hop, so a library can never widen who it's acting as.
 
 ### API surface format
 
-`get_api_surface` describes the library's callable functions as data, so `require()` and other interpreters can render them. Here is the `http` plugin's surface, trimmed to one export:
+`get_api_surface` describes the library's callable functions as data, so `require()` and other interpreters can render them. Here is the `happyview-http` plugin's surface, trimmed to one export:
 
 ```json
 {
-  "namespace": "http",
+  "namespace": "happyview.http",
   "description": "Outbound HTTP requests",
   "exports": [
     {
@@ -297,7 +298,7 @@ A plugin declaring the listed capability can import the matching function below.
 
 #### Database access
 
-`host_db_query` and `host_db_execute` run SQL **untranslated** against whichever backend HappyView is running on — placeholders are backend-native (`?` on SQLite, `$1`, `$2`, … on Postgres), the same rule as Lua's [`db.raw`](../api-reference/lua/database-api.md#protected-tables). A plugin that supports both backends has to branch on placeholder syntax itself; there is no plugin equivalent of Lua's `db.backend()`. Record and table queries go through the imports above; `host_db_query`/`host_db_execute` are for raw SQL only.
+`host_db_query` and `host_db_execute` run SQL **untranslated** against whichever backend HappyView is running on — placeholders are backend-native (`?` on SQLite, `$1`, `$2`, … on Postgres), the same rule as Lua's [`db.raw`](../api-reference/lua/database-api.md#protected-tables). A plugin that supports both backends branches on placeholder syntax itself, using `ctx.db_backend` from the [call envelope](#library-plugins) — the plugin equivalent of Lua's `db.backend()`. Record and table queries go through the imports above; `host_db_query`/`host_db_execute` are for raw SQL only.
 
 - `database:read` permits `host_db_query` only, and only read-only statements: every statement must be a query whose body and every CTE are `SELECT`s. `WITH … INSERT/UPDATE/DELETE` and a data-modifying CTE (`WITH x AS (DELETE FROM t RETURNING uri) SELECT * FROM x`) count as writes and are rejected before they run.
 - `database:write` permits both imports for any statement, including `INSERT`, `UPDATE`, `DELETE`, and `DROP`.
@@ -338,19 +339,15 @@ local db = require("happyview.db")
 function handle()
   local page = db.records("app.bsky.feed.post")
     :where("author", "=", "did:plc:abc")
-    :where("text", "like", "%happyview%")
     :sort("createdAt", "desc")
     :limit(20)
     :run()
-
-  local total = db.records("app.bsky.feed.post"):where("author", "=", "did:plc:abc"):count()
-  local newest = db.records("app.bsky.feed.post"):sort("createdAt", "desc"):first()
 
   return page.records
 end
 ```
 
-`where`, `sort`, `limit`, `cursor`, and `did` are lazy: each returns the same object, which is why they chain. `run`, `count`, and `first` are immediate: each makes the library call and returns its result.
+`where`, `sort`, and `limit` are lazy: each returns the same object, which is why they chain. `run` is immediate: it makes the library call and returns the result. See the library's own README for its full set of methods — `happyview-db`'s, for this example.
 
 `require` resolves `namespace` against every installed `library` plugin's manifest `namespace` (or `id`, if `namespace` is unset), and caches the result for the rest of the script run. Requiring a name with no matching installed library plugin fails with:
 

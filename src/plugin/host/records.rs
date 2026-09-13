@@ -111,7 +111,7 @@ pub fn filter_sql(
     backend: DatabaseBackend,
     field_sql: &dyn Fn(&str) -> Result<String, RecordsError>,
     depth: u8,
-    binds: &mut Vec<String>,
+    binds: &mut Vec<Value>,
 ) -> Result<String, RecordsError> {
     if depth >= MAX_FILTER_DEPTH {
         return Err(invalid(format!(
@@ -184,6 +184,41 @@ fn clamp_limit(limit: Option<u32>) -> i64 {
     i64::from(limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT))
 }
 
+/// Record filters bind as text; the rationale is on the SDK's `Condition`.
+fn bind_as_text(value: Value) -> String {
+    match value {
+        Value::String(s) => s,
+        other => other.to_string(),
+    }
+}
+
+type AnyQuery<'q> = sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments>;
+type AnyCountQuery<'q> = sqlx::query::QueryAs<'q, sqlx::Any, (i64,), sqlx::any::AnyArguments>;
+
+/// Table filters bind by JSON type: a number as `i64`, or `f64` when it does
+/// not fit; a boolean as `bool`; a string as text. The rationale is on the
+/// SDK's `Condition`.
+fn bind_value<'q>(query: AnyQuery<'q>, value: &Value) -> AnyQuery<'q> {
+    match value {
+        Value::Number(n) if n.is_i64() => query.bind(n.as_i64().expect("checked is_i64")),
+        Value::Number(n) => query.bind(n.as_f64().unwrap_or_default()),
+        Value::Bool(b) => query.bind(*b),
+        Value::String(s) => query.bind(s.clone()),
+        other => query.bind(other.to_string()),
+    }
+}
+
+/// As [`bind_value`], for the `COUNT(*)` query shape.
+fn bind_count_value<'q>(query: AnyCountQuery<'q>, value: &Value) -> AnyCountQuery<'q> {
+    match value {
+        Value::Number(n) if n.is_i64() => query.bind(n.as_i64().expect("checked is_i64")),
+        Value::Number(n) => query.bind(n.as_f64().unwrap_or_default()),
+        Value::Bool(b) => query.bind(*b),
+        Value::String(s) => query.bind(s.clone()),
+        other => query.bind(other.to_string()),
+    }
+}
+
 fn record_with_uri(uri: String, record_str: &str) -> Value {
     let mut record: Value = serde_json::from_str(record_str).unwrap_or(json!({}));
     if let Some(obj) = record.as_object_mut() {
@@ -200,11 +235,11 @@ pub fn records_query_sql(
     spec: &RecordsQuery,
     backend: DatabaseBackend,
 ) -> Result<(String, Vec<String>), RecordsError> {
-    let mut binds = vec![spec.collection.clone()];
+    let mut binds = vec![Value::String(spec.collection.clone())];
     let mut where_clause = String::from("WHERE collection = ?");
     if let Some(did) = &spec.did {
         where_clause.push_str(" AND did = ?");
-        binds.push(did.clone());
+        binds.push(Value::String(did.clone()));
     }
 
     let sql = if let Some(Sort { field, direction }) = &spec.sort {
@@ -226,9 +261,9 @@ pub fn records_query_sql(
         let cursor_parts = spec.cursor.as_ref().and_then(|c| decode_cursor(c));
         if let Some((cursor_ts, cursor_uri)) = &cursor_parts {
             where_clause.push_str(" AND (created_at < ? OR (created_at = ? AND uri < ?))");
-            binds.push(cursor_ts.clone());
-            binds.push(cursor_ts.clone());
-            binds.push(cursor_uri.clone());
+            binds.push(Value::String(cursor_ts.clone()));
+            binds.push(Value::String(cursor_ts.clone()));
+            binds.push(Value::String(cursor_uri.clone()));
         }
         if let Some(filter) = &spec.filter {
             let clause = filter_sql(filter, backend, &record_field_sql, 0, &mut binds)?;
@@ -240,6 +275,7 @@ pub fn records_query_sql(
         )
     };
 
+    let binds = binds.into_iter().map(bind_as_text).collect();
     Ok((adapt_sql(&sql, backend), binds))
 }
 
@@ -299,11 +335,11 @@ pub async fn records_count(
     backend: DatabaseBackend,
     spec: RecordsCount,
 ) -> Result<i64, RecordsError> {
-    let mut binds = vec![spec.collection.clone()];
+    let mut binds = vec![Value::String(spec.collection.clone())];
     let mut sql = String::from("SELECT COUNT(*) FROM happyview_records WHERE collection = ?");
     if let Some(did) = &spec.did {
         sql.push_str(" AND did = ?");
-        binds.push(did.clone());
+        binds.push(Value::String(did.clone()));
     }
     if let Some(filter) = &spec.filter {
         let clause = filter_sql(filter, backend, &record_field_sql, 0, &mut binds)?;
@@ -311,6 +347,7 @@ pub async fn records_count(
         sql.push_str(&clause);
     }
     let sql = adapt_sql(&sql, backend);
+    let binds: Vec<String> = binds.into_iter().map(bind_as_text).collect();
     let mut q = crate::db::query_as::<(i64,)>(&sql);
     for bind in &binds {
         q = q.bind(bind);
@@ -463,11 +500,11 @@ pub async fn backlinks_query(
 pub fn table_query_sql(
     spec: &TableQuery,
     backend: DatabaseBackend,
-) -> Result<(String, Vec<String>), RecordsError> {
+) -> Result<(String, Vec<Value>), RecordsError> {
     if !is_valid_identifier(&spec.table) {
         return Err(invalid(format!("invalid table name '{}'", spec.table)));
     }
-    let mut binds = Vec::new();
+    let mut binds: Vec<Value> = Vec::new();
     let mut sql = if spec.count {
         format!("SELECT COUNT(*) FROM {}", spec.table)
     } else {
@@ -503,14 +540,14 @@ pub async fn table_query(
     if count {
         let mut q = crate::db::query_as::<(i64,)>(&sql);
         for bind in &binds {
-            q = q.bind(bind);
+            q = bind_count_value(q, bind);
         }
         let (n,) = q.fetch_one(db).await?;
         Ok(json!(n))
     } else {
         let mut q = crate::db::query(&sql);
         for bind in &binds {
-            q = q.bind(bind);
+            q = bind_value(q, bind);
         }
         let rows = q.bind(clamp_limit(spec.limit)).fetch_all(db).await?;
         Ok(json!(rows.iter().map(row_to_json).collect::<Vec<_>>()))
@@ -526,11 +563,11 @@ mod tests {
         TableQuery,
     };
 
-    fn cond(field: &str, op: &str, value: &str) -> Filter {
+    fn cond(field: &str, op: &str, value: Value) -> Filter {
         Filter::Condition(Condition {
             field: field.into(),
             op: op.into(),
-            value: value.into(),
+            value,
         })
     }
 
@@ -585,7 +622,7 @@ mod tests {
         let spec = RecordsQuery {
             collection: "c".into(),
             did: Some("did:plc:a".into()),
-            filter: Some(cond("status", "=", "active")),
+            filter: Some(cond("status", "=", json!("active"))),
             sort: None,
             limit: Some(10),
             cursor: Some(crate::db::encode_cursor("2026-01-01T00:00:00Z", "at://x")),
@@ -695,10 +732,10 @@ mod tests {
         let f = Filter::Group {
             combine: "or".into(),
             conditions: vec![
-                cond("a", "=", "1"),
+                cond("a", "=", json!("1")),
                 Filter::Group {
                     combine: "and".into(),
-                    conditions: vec![cond("b", ">", "2"), cond("c", "like", "%x%")],
+                    conditions: vec![cond("b", ">", json!("2")), cond("c", "like", json!("%x%"))],
                 },
             ],
         };
@@ -714,9 +751,9 @@ mod tests {
             sql,
             "(json_extract(record, '$.a') = ? OR (json_extract(record, '$.b') > ? AND json_extract(record, '$.c') LIKE ?))"
         );
-        assert_eq!(binds, vec!["1", "2", "%x%"]);
+        assert_eq!(binds, vec![json!("1"), json!("2"), json!("%x%")]);
 
-        let mut deep = cond("a", "=", "1");
+        let mut deep = cond("a", "=", json!("1"));
         for _ in 0..MAX_FILTER_DEPTH {
             deep = Filter::Group {
                 combine: "and".into(),
@@ -732,7 +769,7 @@ mod tests {
     fn filter_rejects_bad_combine_and_empty_group() {
         let bad = Filter::Group {
             combine: "xor".into(),
-            conditions: vec![cond("a", "=", "1")],
+            conditions: vec![cond("a", "=", json!("1"))],
         };
         assert!(filter_sql(&bad, Sqlite, &|p| Ok(p.to_string()), 0, &mut Vec::new()).is_err());
         let empty = Filter::Group {
@@ -746,7 +783,7 @@ mod tests {
     fn table_sql_quotes_nothing_and_validates_identifiers() {
         let spec = TableQuery {
             table: "leaderboard".into(),
-            filter: Some(cond("score", ">", "100")),
+            filter: Some(cond("score", ">", json!("100"))),
             sort: Some(Sort {
                 field: "score".into(),
                 direction: "desc".into(),
@@ -759,7 +796,7 @@ mod tests {
             sql,
             "SELECT * FROM leaderboard WHERE score > ? ORDER BY score DESC LIMIT ?"
         );
-        assert_eq!(binds, vec!["100"]);
+        assert_eq!(binds, vec![json!("100")]);
 
         let count = TableQuery {
             table: "leaderboard".into(),
@@ -784,7 +821,7 @@ mod tests {
         ));
         let bad_col = TableQuery {
             table: "t".into(),
-            filter: Some(cond("a b", "=", "1")),
+            filter: Some(cond("a b", "=", json!("1"))),
             sort: None,
             limit: None,
             count: false,
@@ -819,6 +856,8 @@ mod tests {
             "INSERT INTO happyview_record_refs VALUES ('at://a/c/2', 'at://a/c/1', 'c')",
             "CREATE TABLE leaderboard (name TEXT, score INTEGER)",
             "INSERT INTO leaderboard VALUES ('x', 50), ('y', 150)",
+            "CREATE TABLE flags (name TEXT, active INTEGER)",
+            "INSERT INTO flags VALUES ('a', 1), ('b', 0)",
         ] {
             crate::db::query(sql).execute(&pool).await.unwrap();
         }
@@ -873,7 +912,7 @@ mod tests {
             RecordsQuery {
                 collection: "c".into(),
                 did: Some("did:plc:a".into()),
-                filter: Some(cond("n", "ilike", "T%")),
+                filter: Some(cond("n", "ilike", json!("T%"))),
                 sort: Some(Sort {
                     field: "score".into(),
                     direction: "asc".into(),
@@ -953,7 +992,7 @@ mod tests {
             Sqlite,
             TableQuery {
                 table: "leaderboard".into(),
-                filter: Some(cond("score", ">", "100")),
+                filter: Some(cond("score", ">", json!("100"))),
                 sort: None,
                 limit: None,
                 count: false,
@@ -977,5 +1016,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn table_query_binds_a_json_number_typed() {
+        let pool = seeded_pool().await;
+        let rows = table_query(
+            &pool,
+            Sqlite,
+            TableQuery {
+                table: "leaderboard".into(),
+                filter: Some(cond("score", ">", json!(100))),
+                sort: None,
+                limit: None,
+                count: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["name"], "y");
+        assert_eq!(rows[0]["score"], 150);
+    }
+
+    #[tokio::test]
+    async fn table_query_binds_a_json_boolean_typed() {
+        let pool = seeded_pool().await;
+        let rows = table_query(
+            &pool,
+            Sqlite,
+            TableQuery {
+                table: "flags".into(),
+                filter: Some(cond("active", "=", json!(true))),
+                sort: None,
+                limit: None,
+                count: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["name"], "a");
     }
 }

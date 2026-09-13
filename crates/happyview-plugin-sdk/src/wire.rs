@@ -265,7 +265,8 @@ impl ApiSurface {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiExport {
     pub name: String,
-    /// `"function"` or `"constant"`; interpreters may agree on others.
+    /// `"function"`, `"constant"` or `"constructor"`; interpreters may agree
+    /// on others.
     #[serde(default = "default_export_kind")]
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -462,13 +463,14 @@ impl ObjectCall {
     }
 }
 
-/// One comparison in a record or table filter. `value` is always a string;
-/// the host binds it as text on both backends.
+/// One comparison in a record or table filter. `value` is the JSON value the
+/// script passed — a string, number or boolean. A record filter binds it as
+/// text; a table filter binds it by JSON type against the column.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Condition {
     pub field: String,
     pub op: String,
-    pub value: String,
+    pub value: Value,
 }
 
 /// A filter tree. Untagged so a bare condition and a group both read
