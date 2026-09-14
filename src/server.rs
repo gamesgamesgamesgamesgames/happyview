@@ -68,6 +68,9 @@ pub fn router(state: AppState) -> Router {
                 crate::feature_middleware::require_spaces,
             )),
         )
+        // Public and unauthenticated: detection happens before authorization,
+        // and must also answer on a build with spaces disabled.
+        .merge(crate::spaces::describe::describe_routes())
         .merge(crate::spaces::simplespace::simplespace_routes().layer(
             axum::middleware::from_fn_with_state(
                 state.clone(),

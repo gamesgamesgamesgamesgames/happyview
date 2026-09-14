@@ -70,9 +70,9 @@ async fn create_space(app: &TestApp, authority: &str, skey: &str) -> (String, St
         skey: skey.to_string(),
         display_name: None,
         description: None,
-        mint_policy: MintPolicy::MemberList,
+        read_policy: Policy::MemberList,
+        write_policy: Policy::MemberList,
         app_access: AppAccess::Open,
-        managing_app_did: None,
         config: SpaceConfig::default(),
         revision: None,
         created_at: now.clone(),
@@ -85,7 +85,7 @@ async fn create_space(app: &TestApp, authority: &str, skey: &str) -> (String, St
     (id, uri)
 }
 
-async fn add_member(app: &TestApp, space_id: &str, did: &str, access: SpaceAccess) {
+async fn add_member(app: &TestApp, space_id: &str, did: &str, access: MemberAccess) {
     spaces_db::add_member(
         &app.state.db,
         app.state.db_backend,
@@ -108,7 +108,7 @@ async fn setup(label: &str) -> (TestApp, String, String, String) {
     enable_spaces(&app).await;
     let authority = rand_did(label);
     let (space_id, space_uri) = create_space(&app, &authority, &rand_skey(label)).await;
-    add_member(&app, &space_id, &authority, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &authority, MemberAccess::WRITE).await;
     (app, space_id, space_uri, authority)
 }
 
@@ -189,26 +189,41 @@ async fn write_populates_commit() {
     let commit = &after["commit"];
     assert!(!commit.is_null(), "commit must exist after a write");
     assert_eq!(commit["ver"], 1);
-    assert!(commit["hash"].as_str().is_some(), "hash must be set");
-    assert!(commit["ikm"].as_str().is_some(), "ikm must be set");
-    assert!(commit["mac"].as_str().is_some(), "mac must be set");
+    // Byte fields are lexicon `bytes`: {"$bytes": "<standard base64>"}, not
+    // bare strings, which other implementations cannot parse.
+    for field in ["hash", "ikm", "sig", "mac"] {
+        assert!(
+            commit[field]["$bytes"].as_str().is_some(),
+            "{field} must be a lexicon bytes value, got {}",
+            commit[field]
+        );
+    }
     assert!(commit["rev"].as_str().is_some(), "rev must be set");
     assert!(after["rev"].as_str().is_some());
 }
 
 #[tokio::test]
 #[serial]
-async fn commit_has_no_asymmetric_signature() {
+async fn commit_carries_a_deniable_signature() {
     common::require_db!();
-    let (app, _space_id, space_uri, did) = setup("nosig").await;
+    let (app, _space_id, space_uri, did) = setup("sig").await;
     create_record(&app, &space_uri, &did, json!({ "text": "hi" })).await;
 
     let state = get_repo_state(&app, &space_uri, &did).await;
     let commit = state["commit"].as_object().expect("commit must exist");
+
+    // See `SignedCommit::sig` for what the signature covers and why.
     assert!(
-        !commit.contains_key("sig"),
-        "commits must not expose an asymmetric signature, got {commit:?}"
+        commit.contains_key("sig"),
+        "commits must carry a signature, got {commit:?}"
     );
+    for field in ["ver", "hash", "ikm", "sig", "mac", "rev"] {
+        assert!(
+            commit.contains_key(field),
+            "signedCommit is missing {field}: {commit:?}"
+        );
+    }
+    assert_eq!(commit["ver"], json!(1));
 }
 
 #[tokio::test]
@@ -248,13 +263,13 @@ async fn lthash_remove_undoes_add() {
 
     // Record A stays put; record B is the one we add then remove.
     create_record(&app, &space_uri, &did, json!({ "text": "keeper" })).await;
-    let hash_a = get_repo_state(&app, &space_uri, &did).await["commit"]["hash"]
+    let hash_a = get_repo_state(&app, &space_uri, &did).await["commit"]["hash"]["$bytes"]
         .as_str()
         .expect("hash")
         .to_string();
 
     let b = create_record(&app, &space_uri, &did, json!({ "text": "transient" })).await;
-    let hash_ab = get_repo_state(&app, &space_uri, &did).await["commit"]["hash"]
+    let hash_ab = get_repo_state(&app, &space_uri, &did).await["commit"]["hash"]["$bytes"]
         .as_str()
         .expect("hash")
         .to_string();
@@ -264,10 +279,11 @@ async fn lthash_remove_undoes_add() {
     );
 
     delete(&app, &space_uri, &did, &rkey_of(&b)).await;
-    let hash_after_delete = get_repo_state(&app, &space_uri, &did).await["commit"]["hash"]
-        .as_str()
-        .expect("hash")
-        .to_string();
+    let hash_after_delete =
+        get_repo_state(&app, &space_uri, &did).await["commit"]["hash"]["$bytes"]
+            .as_str()
+            .expect("hash")
+            .to_string();
 
     assert_eq!(
         hash_a, hash_after_delete,

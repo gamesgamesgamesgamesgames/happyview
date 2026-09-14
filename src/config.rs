@@ -69,7 +69,7 @@ pub fn build_user_agent(override_value: Option<String>, public_url: &str) -> Str
 /// (`Ok(None)` — encryption-dependent features are simply off) from "set but
 /// invalid" (`Err`), so a botched key is reported loudly at startup instead of
 /// being silently discarded and failing per-call later (M12).
-fn parse_token_encryption_key(raw: Option<&str>) -> Result<Option<[u8; 32]>, String> {
+pub fn parse_token_encryption_key(raw: Option<&str>) -> Result<Option<[u8; 32]>, String> {
     use base64::Engine;
     let raw = match raw {
         None | Some("") => return Ok(None),

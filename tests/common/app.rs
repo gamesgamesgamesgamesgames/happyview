@@ -72,7 +72,8 @@ impl TestApp {
             logo_uri: None,
             tos_uri: None,
             policy_uri: None,
-            token_encryption_key: None,
+            // Space writes need this to decrypt the `#atproto_space` signing key.
+            token_encryption_key: Some(db::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -209,6 +210,10 @@ impl TestApp {
             telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
         };
 
+        if let Some(key) = state.config.token_encryption_key.as_ref() {
+            db::provision_space_signing_key(&state.db, state.db_backend, key).await;
+        }
+
         let router = Self::build_router(&state);
 
         Self {
@@ -246,7 +251,7 @@ impl TestApp {
 
     pub async fn new_with_encryption() -> Self {
         let mut app = Self::new().await;
-        app.state.config.token_encryption_key = Some([0x42u8; 32]);
+        app.state.config.token_encryption_key = Some(db::TEST_ENCRYPTION_KEY);
         app.rebuild_router();
         app
     }

@@ -93,9 +93,9 @@ async fn create_space_with_config(
         skey: skey.to_string(),
         display_name: None,
         description: None,
-        mint_policy: MintPolicy::MemberList,
+        read_policy: Policy::MemberList,
+        write_policy: Policy::MemberList,
         app_access: AppAccess::Open,
-        managing_app_did: None,
         config,
         revision: None,
         created_at: now.clone(),
@@ -118,7 +118,7 @@ fn config_with_allowed_collections(allowed: &[&str]) -> SpaceConfig {
     config
 }
 
-async fn add_member(app: &TestApp, space_id: &str, did: &str, access: SpaceAccess) {
+async fn add_member(app: &TestApp, space_id: &str, did: &str, access: MemberAccess) {
     spaces_db::add_member(
         &app.state.db,
         app.state.db_backend,
@@ -250,7 +250,7 @@ async fn create_record_succeeds_for_write_member_and_is_retrievable() {
     let writer = rand_did("writer");
     let skey = rand_skey("space");
     let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
-    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
 
     let collection = "com.example.item";
     let record = json!({ "$type": collection, "text": "hello from writer" });
@@ -365,7 +365,7 @@ async fn create_record_legacy_alias_works() {
     let writer = rand_did("writer");
     let skey = rand_skey("space");
     let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
-    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
 
     let req = Request::builder()
         .method("POST")
@@ -403,7 +403,7 @@ async fn put_record_creates_updates_and_rejects_stale_swap() {
     let writer = rand_did("writer");
     let skey = rand_skey("space");
     let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
-    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
 
     let collection = "com.example.doc";
     let rkey = "fixed-rkey-1";
@@ -594,7 +594,7 @@ async fn delete_record_author_can_delete_own_record() {
     let writer = rand_did("writer");
     let skey = rand_skey("space");
     let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
-    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
 
     let collection = "com.example.item";
     let create_resp = app
@@ -657,7 +657,7 @@ async fn delete_record_missing_returns_not_found() {
     let writer = rand_did("writer");
     let skey = rand_skey("space");
     let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
-    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
 
     let resp = app
         .router
@@ -704,8 +704,8 @@ async fn delete_record_forbidden_when_uri_and_stored_author_diverge() {
     let member_b = rand_did("memberb");
     let skey = rand_skey("space");
     let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
-    add_member(&app, &space_id, &member_a, SpaceAccess::Write).await;
-    add_member(&app, &space_id, &member_b, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &member_a, MemberAccess::WRITE).await;
+    add_member(&app, &space_id, &member_b, MemberAccess::WRITE).await;
 
     let collection = "com.example.item";
     let rkey = "fixed-rkey-ownership";
@@ -850,7 +850,7 @@ async fn apply_writes_batch_create_update_delete_succeeds_for_write_member() {
     let writer = rand_did("writer");
     let skey = rand_skey("space");
     let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
-    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
 
     let collection = "com.example.item";
 
@@ -1092,7 +1092,7 @@ async fn apply_writes_rejects_read_only_member_and_writes_nothing() {
     let reader = rand_did("reader");
     let skey = rand_skey("space");
     let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
-    add_member(&app, &space_id, &reader, SpaceAccess::Read).await;
+    add_member(&app, &space_id, &reader, MemberAccess::READ).await;
 
     let collection = "com.example.item";
     let writes = json!([write_op_create(
@@ -1156,8 +1156,8 @@ async fn apply_writes_delete_rejects_author_mismatch() {
     let member_b = rand_did("memberb");
     let skey = rand_skey("space");
     let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
-    add_member(&app, &space_id, &member_a, SpaceAccess::Write).await;
-    add_member(&app, &space_id, &member_b, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &member_a, MemberAccess::WRITE).await;
+    add_member(&app, &space_id, &member_b, MemberAccess::WRITE).await;
 
     let collection = "com.example.item";
     let rkey = "fixed-rkey-ownership-applywrites";
@@ -1215,7 +1215,7 @@ async fn apply_writes_delete_of_nonexistent_record_returns_not_found() {
     let writer = rand_did("writer");
     let skey = rand_skey("space");
     let (space_id, space_uri) = create_space(&app, &authority, &skey).await;
-    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
 
     let writes = json!([write_op_delete("com.example.item", "never-existed", None)]);
     let resp = app
@@ -1253,7 +1253,7 @@ async fn apply_writes_rejects_create_op_with_disallowed_collection() {
         config_with_allowed_collections(&["com.example.allowed"]),
     )
     .await;
-    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
 
     let writes = json!([write_op_create(
         "com.example.denied",
@@ -1307,7 +1307,7 @@ async fn apply_writes_rejects_update_op_with_disallowed_collection() {
         config_with_allowed_collections(&["com.example.allowed"]),
     )
     .await;
-    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
 
     let writes = json!([write_op_update(
         "com.example.denied",
@@ -1352,7 +1352,7 @@ async fn apply_writes_delete_op_ignores_disallowed_collection() {
         config_with_allowed_collections(&["com.example.allowed"]),
     )
     .await;
-    add_member(&app, &space_id, &writer, SpaceAccess::Write).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
 
     let collection = "com.example.denied";
     let rkey = "predates-the-restriction";

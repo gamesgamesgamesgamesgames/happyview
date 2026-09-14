@@ -4,7 +4,7 @@ use crate::db::DatabaseBackend;
 use crate::error::AppError;
 use crate::spaces::SpaceUri;
 use crate::spaces::db;
-use crate::spaces::types::{ResolvedMember, SpaceAccess, SpaceMember};
+use crate::spaces::types::{MemberAccess, ResolvedMember, SpaceMember};
 
 const MAX_DELEGATION_DEPTH: usize = 10;
 
@@ -19,7 +19,7 @@ pub async fn resolve_members(
     backend: DatabaseBackend,
     space_id: &str,
 ) -> Result<Vec<ResolvedMember>, AppError> {
-    let mut resolved: HashMap<String, SpaceAccess> = HashMap::new();
+    let mut resolved: HashMap<String, MemberAccess> = HashMap::new();
     let mut visited: HashSet<String> = HashSet::new();
 
     resolve_members_recursive(pool, backend, space_id, &mut resolved, &mut visited, 0).await?;
@@ -38,7 +38,7 @@ pub async fn is_member(
     backend: DatabaseBackend,
     space_id: &str,
     did: &str,
-) -> Result<Option<SpaceAccess>, AppError> {
+) -> Result<Option<MemberAccess>, AppError> {
     let members = resolve_members(pool, backend, space_id).await?;
     Ok(members.into_iter().find(|m| m.did == did).map(|m| m.access))
 }
@@ -47,7 +47,7 @@ fn resolve_members_recursive<'a>(
     pool: &'a sqlx::AnyPool,
     backend: DatabaseBackend,
     space_id: &'a str,
-    resolved: &'a mut HashMap<String, SpaceAccess>,
+    resolved: &'a mut HashMap<String, MemberAccess>,
     visited: &'a mut HashSet<String>,
     depth: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AppError>> + Send + 'a>> {
@@ -104,14 +104,14 @@ async fn resolve_delegation_target(
     }
 }
 
-fn merge_access(resolved: &mut HashMap<String, SpaceAccess>, did: &str, access: SpaceAccess) {
-    // Seed with the member's real level (so `read_self` survives), then only
-    // ever upgrade to a higher privilege — never downgrade. Seeding at `Read`
-    // here would silently promote `read_self` members to full `read`.
-    let entry = resolved.entry(did.to_string()).or_insert(access);
-    if access.rank() > entry.rank() {
-        *entry = access;
-    }
+fn merge_access(resolved: &mut HashMap<String, MemberAccess>, did: &str, access: MemberAccess) {
+    // Seed with the member's own access rather than a plain read, so a
+    // `read_self` member is not promoted to whole-space reads. Later paths merge
+    // in with `MemberAccess::union`.
+    resolved
+        .entry(did.to_string())
+        .and_modify(|entry| *entry = entry.union(access))
+        .or_insert(access);
 }
 
 #[cfg(test)]
@@ -121,53 +121,53 @@ mod tests {
     #[test]
     fn merge_access_write_wins() {
         let mut map = HashMap::new();
-        merge_access(&mut map, "did:plc:user1", SpaceAccess::Read);
-        assert_eq!(map["did:plc:user1"], SpaceAccess::Read);
+        merge_access(&mut map, "did:plc:user1", MemberAccess::READ);
+        assert_eq!(map["did:plc:user1"], MemberAccess::READ);
 
-        merge_access(&mut map, "did:plc:user1", SpaceAccess::Write);
-        assert_eq!(map["did:plc:user1"], SpaceAccess::Write);
+        merge_access(&mut map, "did:plc:user1", MemberAccess::WRITE);
+        assert_eq!(map["did:plc:user1"], MemberAccess::WRITE);
 
         // Write should not be downgraded to Read
-        merge_access(&mut map, "did:plc:user1", SpaceAccess::Read);
-        assert_eq!(map["did:plc:user1"], SpaceAccess::Write);
+        merge_access(&mut map, "did:plc:user1", MemberAccess::READ);
+        assert_eq!(map["did:plc:user1"], MemberAccess::WRITE);
     }
 
     #[test]
     fn merge_access_preserves_read_self() {
         // A read_self member must NOT be silently promoted to full read.
         let mut map = HashMap::new();
-        merge_access(&mut map, "did:plc:user", SpaceAccess::ReadSelf);
-        assert_eq!(map["did:plc:user"], SpaceAccess::ReadSelf);
+        merge_access(&mut map, "did:plc:user", MemberAccess::READ_SELF);
+        assert_eq!(map["did:plc:user"], MemberAccess::READ_SELF);
     }
 
     #[test]
     fn merge_access_upgrades_but_never_downgrades() {
         // read_self upgraded by a higher grant on another path.
         let mut map = HashMap::new();
-        merge_access(&mut map, "u", SpaceAccess::ReadSelf);
-        merge_access(&mut map, "u", SpaceAccess::Read);
-        assert_eq!(map["u"], SpaceAccess::Read);
-        merge_access(&mut map, "u", SpaceAccess::Write);
-        assert_eq!(map["u"], SpaceAccess::Write);
+        merge_access(&mut map, "u", MemberAccess::READ_SELF);
+        merge_access(&mut map, "u", MemberAccess::READ);
+        assert_eq!(map["u"], MemberAccess::READ);
+        merge_access(&mut map, "u", MemberAccess::WRITE);
+        assert_eq!(map["u"], MemberAccess::WRITE);
 
         // A lower grant on another path never downgrades.
         let mut map2 = HashMap::new();
-        merge_access(&mut map2, "v", SpaceAccess::Read);
-        merge_access(&mut map2, "v", SpaceAccess::ReadSelf);
-        assert_eq!(map2["v"], SpaceAccess::Read);
+        merge_access(&mut map2, "v", MemberAccess::READ);
+        merge_access(&mut map2, "v", MemberAccess::READ_SELF);
+        assert_eq!(map2["v"], MemberAccess::READ);
 
-        merge_access(&mut map2, "v", SpaceAccess::Write);
-        merge_access(&mut map2, "v", SpaceAccess::ReadSelf);
-        assert_eq!(map2["v"], SpaceAccess::Write);
+        merge_access(&mut map2, "v", MemberAccess::WRITE);
+        merge_access(&mut map2, "v", MemberAccess::READ_SELF);
+        assert_eq!(map2["v"], MemberAccess::WRITE);
     }
 
     #[test]
     fn merge_access_multiple_users() {
         let mut map = HashMap::new();
-        merge_access(&mut map, "did:plc:alice", SpaceAccess::Write);
-        merge_access(&mut map, "did:plc:bob", SpaceAccess::Read);
+        merge_access(&mut map, "did:plc:alice", MemberAccess::WRITE);
+        merge_access(&mut map, "did:plc:bob", MemberAccess::READ);
         assert_eq!(map.len(), 2);
-        assert_eq!(map["did:plc:alice"], SpaceAccess::Write);
-        assert_eq!(map["did:plc:bob"], SpaceAccess::Read);
+        assert_eq!(map["did:plc:alice"], MemberAccess::WRITE);
+        assert_eq!(map["did:plc:bob"], MemberAccess::READ);
     }
 }

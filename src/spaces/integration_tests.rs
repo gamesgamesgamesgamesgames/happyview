@@ -7,8 +7,17 @@ mod tests {
     // 1. LtHash + commit integration
     // -----------------------------------------------------------------------
 
-    use crate::spaces::commit::{sign_commit, verify_commit};
+    use crate::spaces::commit::{SpaceVerifyingKey, sign_commit, verify_commit};
     use crate::spaces::lthash::{LtHashState, record_element};
+
+    /// Fixed signing key so commit failures here are reproducible.
+    fn it_key() -> p256::ecdsa::SigningKey {
+        p256::ecdsa::SigningKey::from_slice(&[0x7fu8; 32]).expect("valid test key")
+    }
+
+    fn it_verifier() -> SpaceVerifyingKey {
+        SpaceVerifyingKey::P256(*it_key().verifying_key())
+    }
 
     /// Add two records, generate a commit over the hash, verify it.
     #[test]
@@ -35,10 +44,17 @@ mod tests {
         let space_uri = "at://did:plc:abc/space/com.example.forum/main";
         let rev = "3k2rev1";
 
-        let commit = sign_commit(&hash_after_ab, space_uri, "did:plc:testuser", rev).unwrap();
+        let commit = sign_commit(
+            &hash_after_ab,
+            space_uri,
+            "did:plc:testuser",
+            rev,
+            &it_key(),
+        )
+        .unwrap();
         assert_eq!(commit.hash, hash_after_ab);
         assert_eq!(commit.rev, rev);
-        assert!(verify_commit(&commit, space_uri, "did:plc:testuser").is_ok());
+        assert!(verify_commit(&commit, space_uri, "did:plc:testuser", &it_verifier()).is_ok());
     }
 
     /// Remove a record — hash must change back toward the previous state.
@@ -66,8 +82,15 @@ mod tests {
         );
 
         let space_uri = "at://did:plc:abc/space/com.example.forum/main";
-        let commit = sign_commit(&hash_one, space_uri, "did:plc:testuser", "3k2rev2").unwrap();
-        assert!(verify_commit(&commit, space_uri, "did:plc:testuser").is_ok());
+        let commit = sign_commit(
+            &hash_one,
+            space_uri,
+            "did:plc:testuser",
+            "3k2rev2",
+            &it_key(),
+        )
+        .unwrap();
+        assert!(verify_commit(&commit, space_uri, "did:plc:testuser", &it_verifier()).is_ok());
     }
 
     /// Commit signed for one hash must not verify against a different hash.
@@ -83,11 +106,12 @@ mod tests {
 
         let space_uri = "at://did:plc:abc/space/com.example.forum/main";
 
-        let commit_a = sign_commit(&hash_a, space_uri, "did:plc:testuser", "rev1").unwrap();
+        let commit_a =
+            sign_commit(&hash_a, space_uri, "did:plc:testuser", "rev1", &it_key()).unwrap();
         // Tamper: swap in hash_b
         let mut tampered = commit_a;
         tampered.hash = hash_b;
-        assert!(verify_commit(&tampered, space_uri, "did:plc:testuser").is_err());
+        assert!(verify_commit(&tampered, space_uri, "did:plc:testuser", &it_verifier()).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -137,7 +161,8 @@ mod tests {
         assert_eq!(peek_jwt_typ(&token).as_deref(), Some(DELEGATION_TOKEN_TYP));
 
         // Step 2: space host verifies delegation token
-        let verified_delegation = verify_delegation_token(&token, &vk, &delegation.aud).unwrap();
+        let verified_delegation =
+            verify_delegation_token(&token, &vk, &[delegation.aud.as_str()]).unwrap();
         assert_eq!(verified_delegation.iss, "did:plc:member");
         assert_eq!(
             verified_delegation.sub,
@@ -190,7 +215,7 @@ mod tests {
             jti: make_jti(),
         };
         let token = sign_delegation_token(&delegation, &sk).unwrap();
-        let result = verify_delegation_token(&token, &vk, &delegation.aud);
+        let result = verify_delegation_token(&token, &vk, &[delegation.aud.as_str()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expired"));
     }
@@ -268,19 +293,31 @@ mod tests {
     // 4. Simplespace config types
     // -----------------------------------------------------------------------
 
-    use crate::spaces::types::{AppAccess, MintPolicy, SpaceConfig};
+    use crate::spaces::types::{AppAccess, Policy, SpaceConfig};
 
     #[test]
-    fn mint_policy_serde_roundtrip() {
+    fn policy_serde_roundtrip() {
+        // Policies are lexicon open unions tagged by `$type`, not enum strings.
         let cases = [
-            (MintPolicy::MemberList, "\"member-list\""),
-            (MintPolicy::Public, "\"public\""),
-            (MintPolicy::ManagingApp, "\"managing-app\""),
+            (
+                Policy::MemberList,
+                r#"{"$type":"com.atproto.simplespace.defs#memberListPolicy"}"#,
+            ),
+            (
+                Policy::Public,
+                r#"{"$type":"com.atproto.simplespace.defs#publicPolicy"}"#,
+            ),
+            (
+                Policy::ManagingApp {
+                    managing_app: "did:web:app#forum".into(),
+                },
+                r#"{"$type":"com.atproto.simplespace.defs#managingAppPolicy","managingApp":"did:web:app#forum"}"#,
+            ),
         ];
         for (policy, expected_json) in cases {
             let json = serde_json::to_string(&policy).unwrap();
             assert_eq!(json, expected_json);
-            let parsed: MintPolicy = serde_json::from_str(&json).unwrap();
+            let parsed: Policy = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, policy);
         }
     }
@@ -290,7 +327,7 @@ mod tests {
         let access = AppAccess::default();
         assert!(matches!(access, AppAccess::Open));
         let json = serde_json::to_string(&access).unwrap();
-        assert_eq!(json, r#"{"type":"open"}"#);
+        assert_eq!(json, r#"{"$type":"com.atproto.simplespace.defs#open"}"#);
     }
 
     #[test]
@@ -371,8 +408,8 @@ mod tests {
     // 6. Read scope validation — cross-module
     // -----------------------------------------------------------------------
 
-    use crate::spaces::scope::{SpaceReadAccess, check_delegation_token_access, check_read_access};
-    use crate::spaces::types::SpaceAccess;
+    use crate::spaces::scope::{check_delegation_token_access, check_read_access};
+    use crate::spaces::types::MemberAccess;
 
     /// read_self member reads own record → ok
     #[test]
@@ -380,7 +417,7 @@ mod tests {
         let result = check_read_access(
             "did:plc:alice",
             "did:plc:alice",
-            SpaceReadAccess::ReadSelf,
+            MemberAccess::READ_SELF,
             false,
         );
         assert!(result.is_ok());
@@ -392,7 +429,7 @@ mod tests {
         let result = check_read_access(
             "did:plc:alice",
             "did:plc:bob",
-            SpaceReadAccess::ReadSelf,
+            MemberAccess::READ_SELF,
             false,
         );
         assert!(result.is_err());
@@ -401,7 +438,7 @@ mod tests {
     /// read_self member tries getDelegationToken → error
     #[test]
     fn read_self_member_cannot_get_delegation_token() {
-        let result = check_delegation_token_access(SpaceReadAccess::ReadSelf, false);
+        let result = check_delegation_token_access(MemberAccess::READ_SELF, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("delegation"));
     }
@@ -410,13 +447,7 @@ mod tests {
     #[test]
     fn full_read_member_reads_own_record_ok() {
         assert!(
-            check_read_access(
-                "did:plc:alice",
-                "did:plc:alice",
-                SpaceReadAccess::Read,
-                false
-            )
-            .is_ok()
+            check_read_access("did:plc:alice", "did:plc:alice", MemberAccess::READ, false).is_ok()
         );
     }
 
@@ -424,14 +455,14 @@ mod tests {
     #[test]
     fn full_read_member_reads_others_record_ok() {
         assert!(
-            check_read_access("did:plc:alice", "did:plc:bob", SpaceReadAccess::Read, false).is_ok()
+            check_read_access("did:plc:alice", "did:plc:bob", MemberAccess::READ, false).is_ok()
         );
     }
 
     /// Full read member: can get delegation token
     #[test]
     fn full_read_member_can_get_delegation_token() {
-        assert!(check_delegation_token_access(SpaceReadAccess::Read, false).is_ok());
+        assert!(check_delegation_token_access(MemberAccess::READ, false).is_ok());
     }
 
     /// space_credential bypasses read_self restriction on reads
@@ -441,7 +472,7 @@ mod tests {
             check_read_access(
                 "did:plc:alice",
                 "did:plc:bob",
-                SpaceReadAccess::ReadSelf,
+                MemberAccess::READ_SELF,
                 true
             )
             .is_ok()
@@ -451,24 +482,7 @@ mod tests {
     /// space_credential bypasses read_self restriction on delegation token
     #[test]
     fn space_credential_bypasses_read_self_on_delegation() {
-        assert!(check_delegation_token_access(SpaceReadAccess::ReadSelf, true).is_ok());
-    }
-
-    /// SpaceReadAccess::from_space_access maps access levels correctly
-    #[test]
-    fn space_access_to_read_access_mapping() {
-        assert_eq!(
-            SpaceReadAccess::from_space_access(SpaceAccess::ReadSelf),
-            SpaceReadAccess::ReadSelf
-        );
-        assert_eq!(
-            SpaceReadAccess::from_space_access(SpaceAccess::Read),
-            SpaceReadAccess::Read
-        );
-        assert_eq!(
-            SpaceReadAccess::from_space_access(SpaceAccess::Write),
-            SpaceReadAccess::Read
-        );
+        assert!(check_delegation_token_access(MemberAccess::READ_SELF, true).is_ok());
     }
 
     // -----------------------------------------------------------------------

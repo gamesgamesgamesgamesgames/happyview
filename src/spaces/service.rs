@@ -74,7 +74,7 @@ pub(crate) async fn require_membership(
     did: &str,
     require_write: bool,
     space_credential: Option<&str>,
-) -> Result<SpaceAccess, AppError> {
+) -> Result<MemberAccess, AppError> {
     if let Some(token) = space_credential {
         let space_uri = format!(
             "at://{}/space/{}/{}",
@@ -95,7 +95,7 @@ pub(crate) async fn require_membership(
                         "Write access is required for this action".into(),
                     ));
                 } else {
-                    return Ok(SpaceAccess::Read);
+                    return Ok(MemberAccess::READ);
                 }
             }
             Ok(_) => {}
@@ -121,6 +121,72 @@ pub(crate) struct AppliedOp {
     pub old_cid: Option<String>,
 }
 
+// HappyView signs polyfilled commits with its own `#atproto_space` key.
+//
+// In polyfill mode HappyView is the repo host but holds no per-user signing
+// key, so it cannot produce a signature that verifies against the author's DID
+// document. Polyfilled repos are therefore host-attested, not author-attested.
+// In native mode the user's PDS signs commits, so this path applies only to
+// polyfill mode.
+
+/// Provision the `#atproto_space` key if absent, then load it.
+///
+/// Writes, so it belongs on cold paths only: startup, space creation, and the
+/// offline backfill binaries. The write path uses [`service_signing_key`].
+pub async fn signing_key_from_pool(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+) -> Result<p256::ecdsa::SigningKey, AppError> {
+    crate::verification_methods::ensure_atproto_space_method(pool, backend, encryption_key).await?;
+    load_signing_key(pool, backend, encryption_key).await
+}
+
+/// Load the `#atproto_space` key. Read-only.
+pub async fn load_signing_key(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+) -> Result<p256::ecdsa::SigningKey, AppError> {
+    let key_bytes = crate::verification_methods::get_private_key_bytes(
+        pool,
+        backend,
+        "#atproto_space",
+        encryption_key,
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::Internal(
+            "#atproto_space signing key is missing; it is provisioned at startup and on space creation"
+                .into(),
+        )
+    })?;
+
+    crate::verification_methods::private_key_bytes_to_signing_key(&key_bytes)
+}
+
+/// The signing key for a space write.
+///
+/// Read-only because this runs on every write: provisioning here would issue an
+/// INSERT per write, which wastes a round trip and contends with the caller's
+/// own transaction. Provisioning happens on the cold paths, startup and
+/// `create_space`.
+///
+/// Call it before opening the write transaction. It queries through the pool,
+/// not the transaction's connection, and on SQLite a second connection used
+/// while a write transaction is open can deadlock.
+pub(crate) async fn service_signing_key(
+    state: &AppState,
+) -> Result<p256::ecdsa::SigningKey, AppError> {
+    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+        AppError::Internal(
+            "spaces require a token encryption key to sign commits; set TOKEN_ENCRYPTION_KEY"
+                .into(),
+        )
+    })?;
+    load_signing_key(&state.db, state.db_backend, encryption_key).await
+}
+
 pub(crate) async fn commit_write(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
@@ -128,6 +194,7 @@ pub(crate) async fn commit_write(
     author_did: &str,
     rev: &str,
     ops: &[AppliedOp],
+    signing_key: &p256::ecdsa::SigningKey,
 ) -> Result<(), AppError> {
     let mut repo_state =
         db::get_or_create_repo_state(&mut *conn, backend, &space.id, author_did).await?;
@@ -170,12 +237,13 @@ pub(crate) async fn commit_write(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    let signed = commit::sign_commit(&set_hash.hash(), &space_uri, author_did, rev)?;
+    let signed = commit::sign_commit(&set_hash.hash(), &space_uri, author_did, rev, signing_key)?;
 
     repo_state.lthash_state = set_hash.as_bytes().to_vec();
     repo_state.rev = Some(signed.rev);
     repo_state.hash = Some(signed.hash.to_vec());
     repo_state.ikm = Some(signed.ikm.to_vec());
+    repo_state.sig = Some(signed.sig);
     repo_state.mac = Some(signed.mac.to_vec());
     db::update_repo_state(&mut *conn, backend, &repo_state).await?;
 
@@ -242,13 +310,25 @@ pub(crate) async fn create_record(
         old_cid: None,
     }];
 
+    // Before the transaction; see `service_signing_key`.
+    let signing_key = service_signing_key(state).await?;
+
     let mut tx = state
         .db
         .begin()
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
     db::insert_space_record(&mut *tx, state.db_backend, &rec).await?;
-    commit_write(&mut tx, state.db_backend, &space, did, &rev, &ops).await?;
+    commit_write(
+        &mut tx,
+        state.db_backend,
+        &space,
+        did,
+        &rev,
+        &ops,
+        &signing_key,
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
@@ -289,6 +369,9 @@ pub(crate) async fn put_record(
         indexed_at: now_rfc3339(),
     };
     let rev = generate_tid();
+    // Before the transaction; see `service_signing_key`.
+    let signing_key = service_signing_key(state).await?;
+
     let mut tx = state
         .db
         .begin()
@@ -320,7 +403,16 @@ pub(crate) async fn put_record(
         new_cid: Some(cid.clone()),
         old_cid,
     }];
-    commit_write(&mut tx, state.db_backend, &space, did, &rev, &ops).await?;
+    commit_write(
+        &mut tx,
+        state.db_backend,
+        &space,
+        did,
+        &rev,
+        &ops,
+        &signing_key,
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
@@ -346,6 +438,9 @@ pub(crate) async fn delete_record(
         space.did, space.type_nsid, space.skey, did, collection, rkey
     );
     let rev = generate_tid();
+    // Before the transaction; see `service_signing_key`.
+    let signing_key = service_signing_key(state).await?;
+
     let mut tx = state
         .db
         .begin()
@@ -377,7 +472,16 @@ pub(crate) async fn delete_record(
         new_cid: None,
         old_cid: Some(old_cid),
     }];
-    commit_write(&mut tx, state.db_backend, &space, did, &rev, &ops).await?;
+    commit_write(
+        &mut tx,
+        state.db_backend,
+        &space,
+        did,
+        &rev,
+        &ops,
+        &signing_key,
+    )
+    .await?;
     tx.commit()
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
@@ -395,9 +499,9 @@ pub(crate) async fn create_space(
     skey: &str,
     display_name: Option<String>,
     description: Option<String>,
-    mint_policy: Option<MintPolicy>,
+    read_policy: Option<Policy>,
+    write_policy: Option<Policy>,
     app_access: Option<AppAccess>,
-    managing_app_did: Option<String>,
     config: Option<SpaceConfig>,
 ) -> Result<Space, AppError> {
     if type_nsid.is_empty() || skey.is_empty() {
@@ -435,9 +539,9 @@ pub(crate) async fn create_space(
         skey: skey.to_string(),
         display_name,
         description,
-        mint_policy: mint_policy.unwrap_or(MintPolicy::MemberList),
+        read_policy: read_policy.unwrap_or_default(),
+        write_policy: write_policy.unwrap_or_default(),
         app_access: app_access.unwrap_or_default(),
-        managing_app_did,
         config,
         revision: None,
         created_at: now_rfc3339(),
@@ -458,7 +562,7 @@ pub(crate) async fn create_space(
         id: uuid::Uuid::new_v4().to_string(),
         space_id: space.id.clone(),
         did: did.to_string(),
-        access: SpaceAccess::Write,
+        access: MemberAccess::WRITE,
         is_delegation: false,
         granted_by: Some(did.to_string()),
         created_at: now_rfc3339(),
@@ -467,12 +571,50 @@ pub(crate) async fn create_space(
     Ok(space)
 }
 
+/// Add a member, or replace their read and write access if they already exist.
+///
+/// `putMember` semantics: a repeat call updates the member rather than
+/// conflicting. The upsert preserves `read_self` instead of resetting it.
+/// `read_self` is HappyView-local and never sent over the wire, so a caller
+/// replacing read/write access has not asked to lift an own-records-only
+/// restriction.
+pub(crate) async fn put_member(
+    state: &AppState,
+    actor_did: &str,
+    space_ref: &str,
+    member_did: &str,
+    access: MemberAccess,
+    is_delegation: Option<bool>,
+) -> Result<SpaceMember, AppError> {
+    let space = resolve_space(state, space_ref).await?;
+    require_space_admin(state, &space, actor_did).await?;
+
+    let existing = db::get_member(&state.db, state.db_backend, &space.id, member_did).await?;
+    let member = SpaceMember {
+        id: existing
+            .as_ref()
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        space_id: space.id,
+        did: member_did.to_string(),
+        access: MemberAccess {
+            read_self: existing.map(|m| m.access.read_self).unwrap_or(false),
+            ..access
+        },
+        is_delegation: is_delegation.unwrap_or(false),
+        granted_by: Some(actor_did.to_string()),
+        created_at: now_rfc3339(),
+    };
+    db::add_member(&state.db, state.db_backend, &member).await?;
+    Ok(member)
+}
+
 pub(crate) async fn add_member(
     state: &AppState,
     actor_did: &str,
     space_ref: &str,
     member_did: &str,
-    access: Option<SpaceAccess>,
+    access: Option<MemberAccess>,
     is_delegation: Option<bool>,
 ) -> Result<SpaceMember, AppError> {
     let space = resolve_space(state, space_ref).await?;
@@ -489,7 +631,7 @@ pub(crate) async fn add_member(
         id: uuid::Uuid::new_v4().to_string(),
         space_id: space.id,
         did: member_did.to_string(),
-        access: access.unwrap_or(SpaceAccess::Read),
+        access: access.unwrap_or(MemberAccess::READ),
         is_delegation: is_delegation.unwrap_or(false),
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
@@ -505,9 +647,9 @@ pub(crate) async fn update_space(
     space_ref: &str,
     display_name: Option<Option<String>>,
     description: Option<Option<String>>,
-    mint_policy: Option<MintPolicy>,
+    read_policy: Option<Policy>,
+    write_policy: Option<Policy>,
     app_access: Option<AppAccess>,
-    managing_app_did: Option<Option<String>>,
     config: Option<SpaceConfig>,
 ) -> Result<Space, AppError> {
     let mut space = resolve_space(state, space_ref).await?;
@@ -518,14 +660,15 @@ pub(crate) async fn update_space(
     if let Some(desc) = description {
         space.description = desc;
     }
-    if let Some(policy) = mint_policy {
-        space.mint_policy = policy;
+    // Each supplied policy replaces the current one wholesale, per the lexicon.
+    if let Some(policy) = read_policy {
+        space.read_policy = policy;
+    }
+    if let Some(policy) = write_policy {
+        space.write_policy = policy;
     }
     if let Some(access) = app_access {
         space.app_access = access;
-    }
-    if let Some(did) = managing_app_did {
-        space.managing_app_did = did;
     }
     if let Some(cfg) = config {
         space.config = cfg;
@@ -566,7 +709,7 @@ pub(crate) async fn create_invite(
     state: &AppState,
     actor_did: &str,
     space_ref: &str,
-    access: Option<SpaceAccess>,
+    access: Option<MemberAccess>,
     max_uses: Option<i64>,
     expires_at: Option<String>,
 ) -> Result<(SpaceInvite, String), AppError> {
@@ -581,7 +724,7 @@ pub(crate) async fn create_invite(
         space_id: space.id,
         token_hash,
         created_by: actor_did.to_string(),
-        access: access.unwrap_or(SpaceAccess::Read),
+        access: access.unwrap_or(MemberAccess::READ),
         max_uses,
         uses: 0,
         expires_at,
@@ -596,7 +739,7 @@ pub(crate) async fn accept_invite(
     state: &AppState,
     did: &str,
     token: &str,
-) -> Result<(String, SpaceAccess), AppError> {
+) -> Result<(String, MemberAccess), AppError> {
     let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
     let invite = db::get_invite_by_token_hash(&state.db, state.db_backend, &token_hash)
         .await?
@@ -684,7 +827,8 @@ mod tests {
             logo_uri: None,
             tos_uri: None,
             policy_uri: None,
-            token_encryption_key: None,
+            // Space writes need this to decrypt the `#atproto_space` signing key.
+            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -725,7 +869,7 @@ mod tests {
         })
         .expect("Failed to create test OAuth client");
 
-        AppState {
+        let state = AppState {
             config,
             http: reqwest::Client::new(),
             db: pool.clone(),
@@ -784,7 +928,11 @@ mod tests {
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
-        }
+        };
+
+        crate::test_support::provision_space_signing_key(&state).await;
+
+        state
     }
 
     async fn service_test_db() -> (AppState, String, String) {
@@ -810,9 +958,9 @@ mod tests {
             skey: skey.clone(),
             display_name: None,
             description: None,
-            mint_policy: MintPolicy::MemberList,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
             app_access: AppAccess::default(),
-            managing_app_did: None,
             config,
             revision: None,
             created_at: now_rfc3339(),
@@ -826,7 +974,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             space_id: space_id.clone(),
             did: member_did.clone(),
-            access: SpaceAccess::Write,
+            access: MemberAccess::WRITE,
             is_delegation: false,
             granted_by: None,
             created_at: now_rfc3339(),
@@ -863,9 +1011,9 @@ mod tests {
             skey: "main".into(),
             display_name: None,
             description: None,
-            mint_policy: MintPolicy::MemberList,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
             app_access: AppAccess::default(),
-            managing_app_did: None,
             config,
             revision: None,
             created_at: now_rfc3339(),
@@ -916,7 +1064,7 @@ mod tests {
             &member_a,
             &space_uri,
             &member_b,
-            Some(SpaceAccess::Write),
+            Some(MemberAccess::WRITE),
             None,
         )
         .await
@@ -1436,7 +1584,7 @@ mod tests {
             crate::spaces::members::is_member(&state.db, state.db_backend, &space.id, &creator_did)
                 .await
                 .unwrap();
-        assert_eq!(access, Some(crate::spaces::types::SpaceAccess::Write));
+        assert_eq!(access, Some(crate::spaces::types::MemberAccess::WRITE));
     }
 
     #[tokio::test]
@@ -1463,7 +1611,7 @@ mod tests {
             &authority,
             &space_uri,
             "did:plc:newbie",
-            Some(crate::spaces::types::SpaceAccess::Write),
+            Some(crate::spaces::types::MemberAccess::WRITE),
             None,
         )
         .await
@@ -1490,7 +1638,7 @@ mod tests {
             &state,
             &authority,
             &space_uri,
-            Some(crate::spaces::types::SpaceAccess::Write),
+            Some(crate::spaces::types::MemberAccess::WRITE),
             None,
             None,
         )
@@ -1500,7 +1648,7 @@ mod tests {
             .await
             .expect("joiner redeems invite");
         assert_eq!(joined_uri, space_uri);
-        assert_eq!(access, crate::spaces::types::SpaceAccess::Write);
+        assert_eq!(access, crate::spaces::types::MemberAccess::WRITE);
         // now a member with write access
         let space = super::resolve_space(&state, &space_uri).await.unwrap();
         let acc = crate::spaces::members::is_member(
@@ -1511,6 +1659,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(acc, Some(crate::spaces::types::SpaceAccess::Write));
+        assert_eq!(acc, Some(crate::spaces::types::MemberAccess::WRITE));
     }
 }

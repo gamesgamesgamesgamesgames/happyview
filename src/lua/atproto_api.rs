@@ -428,7 +428,7 @@ pub fn register_atproto_api(
                         .map_err(|e| {
                             mlua::Error::runtime(format!("membership check failed: {e}"))
                         })?;
-                Ok(access.map(|a| a.as_str().to_string()))
+                Ok(access.map(|a| a.as_wire_str().to_string()))
             }
         })?;
     spaces_table.set("get_access", get_access_fn)?;
@@ -473,7 +473,7 @@ pub fn register_atproto_api(
             for (i, member) in members.iter().enumerate() {
                 let entry = lua.create_table()?;
                 entry.set("did", member.did.as_str())?;
-                entry.set("access", member.access.as_str())?;
+                entry.set("access", member.access.as_wire_str())?;
                 result.set(i + 1, entry)?;
             }
             Ok(mlua::Value::Table(result))
@@ -708,7 +708,9 @@ mod tests {
             logo_uri: None,
             tos_uri: None,
             policy_uri: None,
-            token_encryption_key: None,
+            // Spaces sign every commit with the `#atproto_space` key, which
+            // is stored encrypted, so space writes need this set.
+            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),

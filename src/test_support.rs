@@ -24,6 +24,69 @@ pub async fn memory_pool() -> sqlx::AnyPool {
         .expect("connect to in-memory sqlite")
 }
 
+/// An in-memory SQLite pool with migrations applied.
+///
+/// `memory_pool` gives an empty database; anything touching real tables needs
+/// this instead.
+pub async fn migrated_memory_pool() -> sqlx::AnyPool {
+    let pool = memory_pool().await;
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite");
+    sqlx::migrate::Migrator::new(dir)
+        .await
+        .expect("load sqlite migrations")
+        .run(&pool)
+        .await
+        .expect("run migrations");
+    pool
+}
+
+/// The encryption key every test uses.
+///
+/// One value across the whole suite: DB-backed tests share a database, and a
+/// `#atproto_space` key written under one encryption key cannot be decrypted
+/// under another. Differing keys surface later as an opaque "failed to decrypt
+/// verification key" on the first space write.
+pub const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42u8; 32];
+
+/// Provision the `#atproto_space` signing key for a test.
+///
+/// Idempotent, and safe to race: every test uses [`TEST_ENCRYPTION_KEY`], so an
+/// existing row is always one this state can decrypt.
+pub async fn provision_space_signing_key(state: &AppState) {
+    let Some(key) = state.config.token_encryption_key.as_ref() else {
+        return;
+    };
+
+    // A row written under a different encryption key cannot be decrypted, and
+    // `ensure_atproto_space_method` returns an existing row as is. Replace it
+    // so space writes do not fail with a decryption error.
+    let usable = crate::verification_methods::get_private_key_bytes(
+        &state.db,
+        state.db_backend,
+        "#atproto_space",
+        key,
+    )
+    .await
+    .ok()
+    .flatten()
+    .is_some();
+
+    if !usable {
+        let sql = crate::db::adapt_sql(
+            "DELETE FROM happyview_verification_methods WHERE fragment_id = ?",
+            state.db_backend,
+        );
+        let _ = crate::db::query(&sql)
+            .bind("#atproto_space")
+            .execute(&state.db)
+            .await;
+    }
+
+    crate::verification_methods::ensure_atproto_space_method(&state.db, state.db_backend, key)
+        .await
+        .expect("provision #atproto_space key");
+}
+
 /// Build an `AppState` backed by `pool`, wired for SQLite with no network
 /// dependencies reachable (PLC and OAuth point at unroutable local ports).
 pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
@@ -46,7 +109,9 @@ pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
         logo_uri: None,
         tos_uri: None,
         policy_uri: None,
-        token_encryption_key: None,
+        // Spaces sign every commit with the `#atproto_space` key, which is
+        // stored encrypted, so space writes need this set.
+        token_encryption_key: Some(TEST_ENCRYPTION_KEY),
         default_rate_limit_capacity: 100,
         default_rate_limit_refill_rate: 2.0,
         telemetry_collector_url: String::new(),

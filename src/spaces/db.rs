@@ -14,11 +14,15 @@ pub async fn create_space(
     let now = now_rfc3339();
     let config_json = serde_json::to_string(&space.config)
         .map_err(|e| AppError::Internal(format!("failed to serialize space config: {e}")))?;
+    let read_policy_json = serde_json::to_string(&space.read_policy)
+        .map_err(|e| AppError::Internal(format!("failed to serialize read_policy: {e}")))?;
+    let write_policy_json = serde_json::to_string(&space.write_policy)
+        .map_err(|e| AppError::Internal(format!("failed to serialize write_policy: {e}")))?;
     let app_access_json = serde_json::to_string(&space.app_access)
         .map_err(|e| AppError::Internal(format!("failed to serialize app_access: {e}")))?;
 
     let sql = adapt_sql(
-        "INSERT INTO happyview_spaces (id, did, authority_did, creator_did, type_nsid, skey, display_name, description, mint_policy, app_access, managing_app_did, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_spaces (id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -31,9 +35,9 @@ pub async fn create_space(
         .bind(&space.skey)
         .bind(&space.display_name)
         .bind(&space.description)
-        .bind(space.mint_policy.as_str())
+        .bind(&read_policy_json)
+        .bind(&write_policy_json)
         .bind(&app_access_json)
-        .bind(&space.managing_app_did)
         .bind(&config_json)
         .bind(&now)
         .bind(&now)
@@ -50,7 +54,7 @@ pub async fn get_space(
     id: &str,
 ) -> Result<Option<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, mint_policy, app_access, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE id = ?",
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE id = ?",
         backend,
     );
 
@@ -71,7 +75,7 @@ pub async fn get_space_by_address(
     skey: &str,
 ) -> Result<Option<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, mint_policy, app_access, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE did = ? AND type_nsid = ? AND skey = ?",
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE did = ? AND type_nsid = ? AND skey = ?",
         backend,
     );
 
@@ -92,7 +96,7 @@ pub async fn list_spaces_by_owner(
     authority_did: &str,
 ) -> Result<Vec<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, mint_policy, app_access, managing_app_did, config, revision, created_at, updated_at FROM happyview_spaces WHERE authority_did = ? ORDER BY created_at DESC",
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE authority_did = ? ORDER BY created_at DESC",
         backend,
     );
 
@@ -171,20 +175,24 @@ pub async fn update_space(
     let now = now_rfc3339();
     let config_json = serde_json::to_string(&space.config)
         .map_err(|e| AppError::Internal(format!("failed to serialize space config: {e}")))?;
+    let read_policy_json = serde_json::to_string(&space.read_policy)
+        .map_err(|e| AppError::Internal(format!("failed to serialize read_policy: {e}")))?;
+    let write_policy_json = serde_json::to_string(&space.write_policy)
+        .map_err(|e| AppError::Internal(format!("failed to serialize write_policy: {e}")))?;
     let app_access_json = serde_json::to_string(&space.app_access)
         .map_err(|e| AppError::Internal(format!("failed to serialize app_access: {e}")))?;
 
     let sql = adapt_sql(
-        "UPDATE happyview_spaces SET display_name = ?, description = ?, mint_policy = ?, app_access = ?, managing_app_did = ?, config = ?, updated_at = ? WHERE id = ?",
+        "UPDATE happyview_spaces SET display_name = ?, description = ?, read_policy = ?, write_policy = ?, app_access = ?, config = ?, updated_at = ? WHERE id = ?",
         backend,
     );
 
     let result = crate::db::query(&sql)
         .bind(&space.display_name)
         .bind(&space.description)
-        .bind(space.mint_policy.as_str())
+        .bind(&read_policy_json)
+        .bind(&write_policy_json)
         .bind(&app_access_json)
-        .bind(&space.managing_app_did)
         .bind(&config_json)
         .bind(&now)
         .bind(&space.id)
@@ -212,27 +220,47 @@ pub async fn delete_space(
 }
 
 type SpaceRow = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    String,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
+    String,         // id
+    String,         // did
+    String,         // authority_did
+    String,         // creator_did
+    String,         // type_nsid
+    String,         // skey
+    Option<String>, // display_name
+    Option<String>, // description
+    Option<String>, // read_policy  (nullable: added by migration)
+    Option<String>, // write_policy (nullable: added by migration)
+    String,         // app_access
+    String,         // config
+    Option<String>, // revision
     String,
     String,
 );
 
+/// Read a stored policy, falling back to the most restrictive default.
+///
+/// An unreadable or absent policy reads as member-list rather than failing the
+/// query: a corrupt row should not make a space unreadable, and it must not make
+/// the space public.
+fn parse_policy_column(raw: Option<&str>, space_id: &str, which: &str) -> Policy {
+    match raw {
+        Some(json) => serde_json::from_str(json).unwrap_or_else(|e| {
+            tracing::warn!(
+                space_id,
+                which,
+                error = %e,
+                "unreadable space policy; falling back to member-list"
+            );
+            Policy::default()
+        }),
+        None => Policy::default(),
+    }
+}
+
 fn parse_space_row(r: SpaceRow) -> Result<Space, AppError> {
-    let mint_policy = MintPolicy::parse(&r.8)
-        .ok_or_else(|| AppError::Internal(format!("invalid mint_policy: {}", r.8)))?;
-    let app_access: AppAccess = serde_json::from_str(&r.9)
+    let read_policy = parse_policy_column(r.8.as_deref(), &r.0, "read_policy");
+    let write_policy = parse_policy_column(r.9.as_deref(), &r.0, "write_policy");
+    let app_access: AppAccess = serde_json::from_str(&r.10)
         .map_err(|e| AppError::Internal(format!("invalid app_access: {e}")))?;
     let config: SpaceConfig = serde_json::from_str(&r.11)
         .map_err(|e| AppError::Internal(format!("invalid space config: {e}")))?;
@@ -246,9 +274,9 @@ fn parse_space_row(r: SpaceRow) -> Result<Space, AppError> {
         skey: r.5,
         display_name: r.6,
         description: r.7,
-        mint_policy,
+        read_policy,
+        write_policy,
         app_access,
-        managing_app_did: r.10,
         config,
         revision: r.12,
         created_at: r.13,
@@ -267,7 +295,17 @@ pub async fn add_member(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO happyview_space_members (id, space_id, member_did, access, is_delegation, granted_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        // Upsert: putMember is defined as "add a member or replace their read
+        // and write access", so a second call for the same DID must update
+        // rather than conflict. read_self is not overwritten: it is
+        // HappyView-local and never supplied over the wire, so a putMember must
+        // not lift an existing own-records-only restriction.
+        "INSERT INTO happyview_space_members (id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (space_id, member_did) DO UPDATE SET \
+             can_read = excluded.can_read, \
+             can_write = excluded.can_write, \
+             is_delegation = excluded.is_delegation",
         backend,
     );
 
@@ -275,7 +313,9 @@ pub async fn add_member(
         .bind(&member.id)
         .bind(&member.space_id)
         .bind(&member.did)
-        .bind(member.access.as_str())
+        .bind(member.access.read as i32)
+        .bind(member.access.write as i32)
+        .bind(member.access.read_self as i32)
         .bind(member.is_delegation as i32)
         .bind(&member.granted_by)
         .bind(&now)
@@ -354,7 +394,7 @@ pub async fn get_member(
     did: &str,
 ) -> Result<Option<SpaceMember>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, member_did, access, is_delegation, granted_by, created_at FROM happyview_space_members WHERE space_id = ? AND member_did = ?",
+        "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE space_id = ? AND member_did = ?",
         backend,
     );
 
@@ -374,7 +414,7 @@ pub async fn list_direct_members(
     space_id: &str,
 ) -> Result<Vec<SpaceMember>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, member_did, access, is_delegation, granted_by, created_at FROM happyview_space_members WHERE space_id = ? ORDER BY created_at ASC",
+        "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE space_id = ? ORDER BY created_at ASC",
         backend,
     );
 
@@ -393,7 +433,7 @@ pub async fn list_spaces_for_member(
     did: &str,
 ) -> Result<Vec<SpaceMember>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, member_did, access, is_delegation, granted_by, created_at FROM happyview_space_members WHERE member_did = ? ORDER BY created_at ASC",
+        "SELECT id, space_id, member_did, can_read, can_write, read_self, is_delegation, granted_by, created_at FROM happyview_space_members WHERE member_did = ? ORDER BY created_at ASC",
         backend,
     );
 
@@ -406,20 +446,31 @@ pub async fn list_spaces_for_member(
     rows.into_iter().map(parse_member_row).collect()
 }
 
-type MemberRow = (String, String, String, String, i32, Option<String>, String);
+type MemberRow = (
+    String,         // id
+    String,         // space_id
+    String,         // member_did
+    i32,            // can_read
+    i32,            // can_write
+    i32,            // read_self
+    i32,            // is_delegation
+    Option<String>, // granted_by
+    String,         // created_at
+);
 
 fn parse_member_row(r: MemberRow) -> Result<SpaceMember, AppError> {
-    let access = SpaceAccess::parse(&r.3)
-        .ok_or_else(|| AppError::Internal(format!("invalid access: {}", r.3)))?;
-
     Ok(SpaceMember {
         id: r.0,
         space_id: r.1,
         did: r.2,
-        access,
-        is_delegation: r.4 != 0,
-        granted_by: r.5,
-        created_at: r.6,
+        access: MemberAccess {
+            read: r.3 != 0,
+            write: r.4 != 0,
+            read_self: r.5 != 0,
+        },
+        is_delegation: r.6 != 0,
+        granted_by: r.7,
+        created_at: r.8,
     })
 }
 
@@ -742,7 +793,7 @@ pub async fn get_or_create_repo_state(
     author_did: &str,
 ) -> Result<RepoState, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, author_did, lthash_state, rev, hash, ikm, mac, updated_at FROM happyview_space_repo_state WHERE space_id = ? AND author_did = ?",
+        "SELECT id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, updated_at FROM happyview_space_repo_state WHERE space_id = ? AND author_did = ?",
         backend,
     );
 
@@ -761,7 +812,7 @@ pub async fn get_or_create_repo_state(
     let now = now_rfc3339();
     let default_lthash = vec![0u8; 2048];
     let insert_sql = adapt_sql(
-        "INSERT INTO happyview_space_repo_state (id, space_id, author_did, lthash_state, rev, hash, ikm, mac, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)",
+        "INSERT INTO happyview_space_repo_state (id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?)",
         backend,
     );
     crate::db::query(&insert_sql)
@@ -782,6 +833,7 @@ pub async fn get_or_create_repo_state(
         rev: None,
         hash: None,
         ikm: None,
+        sig: None,
         mac: None,
         updated_at: now,
     })
@@ -794,7 +846,7 @@ pub async fn update_repo_state(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE happyview_space_repo_state SET lthash_state = ?, rev = ?, hash = ?, ikm = ?, mac = ?, updated_at = ? WHERE id = ?",
+        "UPDATE happyview_space_repo_state SET lthash_state = ?, rev = ?, hash = ?, ikm = ?, sig = ?, mac = ?, updated_at = ? WHERE id = ?",
         backend,
     );
 
@@ -803,6 +855,7 @@ pub async fn update_repo_state(
         .bind(&state.rev)
         .bind(&state.hash)
         .bind(&state.ikm)
+        .bind(&state.sig)
         .bind(&state.mac)
         .bind(&now)
         .bind(&state.id)
@@ -814,15 +867,16 @@ pub async fn update_repo_state(
 }
 
 type RepoStateRow = (
-    String,
-    String,
-    String,
-    Vec<u8>,
-    Option<String>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    String,
+    String,          // id
+    String,          // space_id
+    String,          // author_did
+    Vec<u8>,         // lthash_state
+    Option<String>,  // rev
+    Option<Vec<u8>>, // hash
+    Option<Vec<u8>>, // ikm
+    Option<Vec<u8>>, // sig
+    Option<Vec<u8>>, // mac
+    String,          // updated_at
 );
 
 fn parse_repo_state_row(r: RepoStateRow) -> Result<RepoState, AppError> {
@@ -834,14 +888,39 @@ fn parse_repo_state_row(r: RepoStateRow) -> Result<RepoState, AppError> {
         rev: r.4,
         hash: r.5,
         ikm: r.6,
-        mac: r.7,
-        updated_at: r.8,
+        sig: r.7,
+        mac: r.8,
+        updated_at: r.9,
     })
 }
 
 // ---------------------------------------------------------------------------
 // Notification Registrations
 // ---------------------------------------------------------------------------
+
+/// Remove every registration a service holds for a space.
+///
+/// Idempotent: the lexicon says unregisterNotify "succeeds whether or not a
+/// matching registration existed", so the row count is informational rather
+/// than a not-found signal.
+pub async fn delete_notify_registrations_for_service(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    service: &str,
+) -> Result<u64, AppError> {
+    let sql = adapt_sql(
+        "DELETE FROM happyview_space_notify_registrations WHERE space_id = ? AND registered_by = ?",
+        backend,
+    );
+    let result = crate::db::query(&sql)
+        .bind(space_id)
+        .bind(service)
+        .execute(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to delete notify registrations: {e}")))?;
+    Ok(result.rows_affected())
+}
 
 pub async fn register_notify(
     pool: &sqlx::AnyPool,
@@ -1039,7 +1118,7 @@ pub async fn create_invite(
         .bind(&invite.space_id)
         .bind(&invite.token_hash)
         .bind(&invite.created_by)
-        .bind(invite.access.as_str())
+        .bind(invite.access.as_wire_str())
         .bind(invite.max_uses)
         .bind(invite.uses)
         .bind(&invite.expires_at)
@@ -1142,7 +1221,7 @@ type InviteRow = (
 );
 
 fn parse_invite_row(r: InviteRow) -> Result<SpaceInvite, AppError> {
-    let access = SpaceAccess::parse(&r.4)
+    let access = MemberAccess::parse_wire(&r.4)
         .ok_or_else(|| AppError::Internal(format!("invalid invite access: {}", r.4)))?;
 
     Ok(SpaceInvite {
