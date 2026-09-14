@@ -1,0 +1,23 @@
+{
+  "_comment": "Which suite checks which happyproto/pds-test target. Keys are pds-test target names; env is the variable its compose file reads the image from, and the line in images.env that pins it.",
+  "zds": {
+    "compose": "docker-compose.zds.yml",
+    "test": "spaces_zds_interop",
+    "env": "ZDS_IMAGE"
+  },
+  "pdsjs": {
+    "compose": "docker-compose.pdsjs.yml",
+    "test": "spaces_pdsjs_interop",
+    "env": "PDSJS_IMAGE"
+  },
+  "atproto-pds": {
+    "compose": "docker-compose.atproto-pds.yml",
+    "test": "spaces_atproto_pds_interop",
+    "env": "ATPROTO_PDS_IMAGE"
+  },
+  "pds-spaces-alpha": {
+    "compose": "docker-compose.spaces-alpha.yml",
+    "test": "spaces_reference_interop",
+    "env": "PDS_SPACES_ALPHA_IMAGE"
+  }
+}

@@ -306,7 +306,7 @@ jobs:
 
       - name: Log resolved Tranquil PDS image
         run: |
-          docker image inspect ghcr.io/gamesgamesgamesgamesgames/tranquil-dev:latest \
+          docker image inspect ghcr.io/happyproto/pds-test/tranquil:latest \
             --format 'tranquil-pds resolved to {{.RepoTags}} digest {{.RepoDigests}}'
 
       - name: Run Playwright tests

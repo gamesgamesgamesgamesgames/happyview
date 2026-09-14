@@ -20,6 +20,9 @@ services:
       start_period: 5s
 
   plc:
+    # Built nightly by happyproto/pds-test; built from source only when it
+    # cannot be pulled.
+    image: ghcr.io/happyproto/pds-test/plc:latest
     build:
       context: https://github.com/did-method-plc/did-method-plc.git
       dockerfile: packages/server/Dockerfile
@@ -35,7 +38,10 @@ services:
         condition: service_healthy
 
   pds:
-    image: ghcr.io/gamesgamesgamesgamesgames/tranquil-dev:latest
+    # Built nightly by happyproto/pds-test from the newest tranquil-pds tag, with
+    # the native-tls-roots feature this stack's OAuth flow needs. See
+    # dockerfiles/tranquil-pds.Dockerfile there for why upstream's image is not used.
+    image: ghcr.io/happyproto/pds-test/tranquil:latest
     environment:
       DATABASE_URL: postgres://happyview:happyview@postgres:5432/pds
       PLC_DIRECTORY_URL: http://plc:2582
