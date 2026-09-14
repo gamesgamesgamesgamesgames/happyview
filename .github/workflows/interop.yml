@@ -60,7 +60,7 @@ jobs:
       suites: ${{ steps.plan.outputs.suites }}
       candidate: ${{ steps.plan.outputs.candidate }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Dispatch payloads come from outside this repository. Everything in one
       # is checked against a strict shape before it reaches a shell or a file.
@@ -136,7 +136,7 @@ jobs:
       # debuginfo keeps target/ inside the runner's disk.
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Free disk space
         run: |
@@ -177,7 +177,7 @@ jobs:
           docker compose --env-file interop/images.env -f "$COMPOSE" logs >interop-logs/containers.log 2>&1 || true
           tail -n 200 interop-logs/containers.log
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: interop-${{ matrix.suite.target }}
@@ -200,7 +200,7 @@ jobs:
       UPSTREAM_REF: ${{ github.event.client_payload.ref }}
       BUILD_RUN: ${{ github.event.client_payload.run }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Move the pin
         id: pin
@@ -222,7 +222,7 @@ jobs:
             echo "image=$image"
           } >>"$GITHUB_OUTPUT"
 
-      - uses: peter-evans/create-pull-request@v7
+      - uses: peter-evans/create-pull-request@v8
         with:
           # INTEROP_PR_TOKEN so CI runs on the pull request: GitHub does not
           # trigger workflows from events GITHUB_TOKEN creates. A classic token
@@ -272,7 +272,7 @@ jobs:
       BUILD_RUN: ${{ github.event.client_payload.run }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           pattern: interop-*
