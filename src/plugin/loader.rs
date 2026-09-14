@@ -50,6 +50,8 @@ pub enum LoadError {
     CapabilityMismatch(String),
     #[error("Unknown host import: {0}")]
     UnknownImport(String),
+    #[error("namespace '{0}' is reserved for built-in modules")]
+    ReservedNamespace(String),
 }
 
 /// Preview result with manifest and derived WASM URL
@@ -237,6 +239,7 @@ pub fn is_valid_host_pattern(pattern: &str) -> bool {
 
 /// Structural checks that do not need the WASM bytes.
 pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), LoadError> {
+    use crate::lua::builtins::BUILTIN_PREFIX;
     use crate::plugin::PluginType;
     use crate::plugin::capabilities::PluginCapability;
 
@@ -251,6 +254,12 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), LoadError> {
             plugin_type: manifest.plugin_type.as_str(),
             api_version: manifest.api_version.clone(),
         });
+    }
+    if manifest.plugin_type == PluginType::Library {
+        let namespace = manifest.namespace.as_deref().unwrap_or(&manifest.id);
+        if namespace.starts_with(BUILTIN_PREFIX) {
+            return Err(LoadError::ReservedNamespace(namespace.to_string()));
+        }
     }
     if manifest.plugin_type == PluginType::Auth && !manifest.dependencies.is_empty() {
         return Err(LoadError::InvalidDependency(format!(
@@ -576,5 +585,30 @@ mod tests {
                 "capabilities":["kv:read"]}"#,
         );
         assert!(validate_capabilities(&m, &module_importing_kv_get()).is_ok());
+    }
+
+    #[test]
+    fn internal_namespace_is_reserved() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "acme-time", "name": "Time", "version": "1.0.0", "api_version": "2",
+            "plugin_type": "library", "namespace": "internal.time", "capabilities": [],
+        }))
+        .unwrap();
+        let err = validate_manifest(&manifest).unwrap_err();
+        assert!(
+            matches!(err, LoadError::ReservedNamespace(ref ns) if ns == "internal.time"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("reserved for built-in modules"));
+    }
+
+    #[test]
+    fn internal_prefix_without_dot_is_allowed() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "internals", "name": "I", "version": "1.0.0", "api_version": "2",
+            "plugin_type": "library", "namespace": "internals", "capabilities": [],
+        }))
+        .unwrap();
+        assert!(validate_manifest(&manifest).is_ok());
     }
 }

@@ -106,7 +106,7 @@ pub fn register_job_context(
     state: Arc<AppState>,
     job_id: String,
     input: serde_json::Value,
-) -> LuaResult<()> {
+) -> LuaResult<mlua::Table> {
     let job_table = lua.create_table()?;
 
     // job.input — the JSONB input passed to jobs.create()
@@ -219,8 +219,8 @@ pub fn register_job_context(
         job_table.set("warn", warn_fn)?;
     }
 
-    lua.globals().set("job", job_table)?;
-    Ok(())
+    lua.globals().set("job", job_table.clone())?;
+    Ok(job_table)
 }
 
 #[cfg(test)]

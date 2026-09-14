@@ -1,11 +1,17 @@
 //! `require(name)` for native Lua: resolves an installed library plugin by
-//! namespace and renders its API surface as a table whose function exports
-//! dispatch through `PluginExecutor::call_library` and whose constructor
-//! exports produce chainable objects. Additive — existing globals stay.
+//! namespace and builds its API surface as a table under the surface's
+//! canonical names (the SDK's `naming` module says why those are what Lua
+//! sees), whose function exports dispatch through
+//! `PluginExecutor::call_library` and whose constructor exports produce
+//! chainable objects. Additive — existing globals stay.
+//!
+//! `internal.*` built-ins resolve before any library lookup and share the
+//! same cache slot, so a script uses a built-in and a plugin the same way.
 
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
 
 use crate::AppState;
+use crate::lua::builtins::{self, ScriptIdentity};
 use crate::plugin::PluginExecutor;
 use crate::plugin::library::{LibraryCallContext, LibraryEntry};
 
@@ -17,21 +23,24 @@ const LOADED_KEY: &str = "happyview.require.loaded";
 pub async fn register_require(
     lua: &Lua,
     state: &AppState,
-    caller_did: Option<&str>,
+    identity: &ScriptIdentity,
     has_pds_auth: bool,
 ) -> Result<(), String> {
     let executor = state.plugin_executor();
     let index = executor.library_index().await;
     let ctx = LibraryCallContext {
-        caller_did: caller_did.map(String::from),
+        caller_did: identity.caller_did.clone(),
         has_pds_auth,
         db_backend: None,
     };
-    install(lua, executor, index, ctx).map_err(|e| format!("require api: {e}"))
+    install(lua, state.clone(), identity.clone(), executor, index, ctx)
+        .map_err(|e| format!("require api: {e}"))
 }
 
 fn install(
     lua: &Lua,
+    state: AppState,
+    identity: ScriptIdentity,
     executor: PluginExecutor,
     index: Vec<LibraryEntry>,
     ctx: LibraryCallContext,
@@ -42,6 +51,16 @@ fn install(
         let loaded: mlua::Table = lua.named_registry_value(LOADED_KEY)?;
         if let Ok(existing) = loaded.get::<mlua::Table>(name.as_str()) {
             return Ok(existing);
+        }
+        if let Some(module) = builtins::builtin_module(lua, &state, &identity, &name)? {
+            loaded.set(name.as_str(), module.clone())?;
+            return Ok(module);
+        }
+        if name.starts_with(builtins::BUILTIN_PREFIX) {
+            return Err(mlua::Error::runtime(format!(
+                "module '{name}' not found -- built-in modules are: {}",
+                builtins::BUILTIN_MODULES.join(", ")
+            )));
         }
         let entry = index.iter().find(|e| e.namespace == name).ok_or_else(|| {
             mlua::Error::runtime(format!(
@@ -55,8 +74,10 @@ fn install(
     lua.globals().set("require", require)
 }
 
-/// Render one library's surface as a Lua table. Each function export becomes
-/// an async function that JSON-encodes its arguments and dispatches.
+/// Build one library's surface as a Lua table. Each function export becomes
+/// an async function that JSON-encodes its arguments and dispatches. Table
+/// keys are the surface's canonical names, the same names every document
+/// sent over the wire carries.
 fn build_module(
     lua: &Lua,
     executor: &PluginExecutor,
@@ -64,6 +85,7 @@ fn build_module(
     ctx: &LibraryCallContext,
 ) -> LuaResult<mlua::Table> {
     let module = lua.create_table()?;
+
     for export in entry.surface.exports.iter().filter(|e| e.is_function()) {
         let executor = executor.clone();
         let ctx = ctx.clone();
@@ -102,20 +124,24 @@ fn build_module(
                 object.set("__args", args_table)?;
                 object.set("__steps", lua.create_table()?)?;
                 let index = lua.create_table()?;
+                // Keyed by each method's own canonical name, never by
+                // position: a surface can carry a method in a mode this
+                // host doesn't recognise (`ApiMethod.mode` is an
+                // unvalidated string from the plugin), and that method is
+                // skipped here rather than shifting a later one.
                 for method in &methods {
-                    let name = method.name.clone();
                     if method.is_lazy() {
-                        index.set(name.as_str(), lazy_method(lua, name.clone())?)?;
+                        index.set(method.name.as_str(), lazy_method(lua, method.name.clone())?)?;
                     } else if method.is_immediate() {
                         index.set(
-                            name.as_str(),
+                            method.name.as_str(),
                             immediate_method(
                                 lua,
                                 executor.clone(),
                                 ctx.clone(),
                                 lib_id.clone(),
                                 ctor_name.clone(),
-                                name.clone(),
+                                method.name.clone(),
                             )?,
                         )?;
                     }
@@ -134,6 +160,8 @@ fn build_module(
 
 /// Appends `{name = args}` to the object's step list and returns the object,
 /// so a chain reads left to right and the document reads the same way.
+/// `name` is always the canonical name, so the document is portable across
+/// interpreters that render it differently.
 fn lazy_method(lua: &Lua, name: String) -> LuaResult<mlua::Function> {
     lua.create_function(
         move |lua, (object, args): (mlua::Table, mlua::MultiValue)| {
@@ -150,6 +178,8 @@ fn lazy_method(lua: &Lua, name: String) -> LuaResult<mlua::Function> {
 /// Serialises the object and the call into one document and dispatches it
 /// as a library call named after the constructor. Building the JSON here
 /// rather than through `to_value` keeps empty argument lists as `[]`.
+/// `ctor_name` and `name` are canonical names — what the document and the
+/// dispatched call carry, independent of how a script typed them.
 fn immediate_method(
     lua: &Lua,
     executor: PluginExecutor,
@@ -232,6 +262,7 @@ fn stub_table(lua: &Lua) -> LuaResult<mlua::Table> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::library::{ApiExport, ApiSurface};
     use crate::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource};
     use crate::test_support::{memory_pool, test_state_with_pool};
 
@@ -273,11 +304,19 @@ mod tests {
         state
     }
 
+    fn identity_with(caller_did: Option<&str>) -> ScriptIdentity {
+        ScriptIdentity {
+            trigger_id: "test".into(),
+            caller_did: caller_did.map(String::from),
+            job_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn require_returns_table_with_library_functions() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, Some("did:plc:me"), false)
+        register_require(&lua, &state, &identity_with(Some("did:plc:me")), false)
             .await
             .unwrap();
 
@@ -304,7 +343,9 @@ mod tests {
     async fn require_unknown_library_names_the_plugin() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, None, false).await.unwrap();
+        register_require(&lua, &state, &identity_with(None), false)
+            .await
+            .unwrap();
         let err = lua.load(r#"local x = require("nope")"#).exec().unwrap_err();
         assert!(
             err.to_string()
@@ -314,10 +355,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_builtin_names_the_builtins() {
+        let state = state_with_library().await;
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_require(&lua, &state, &identity_with(None), false)
+            .await
+            .unwrap();
+        let err = lua
+            .load(r#"local x = require("internal.loging")"#)
+            .exec()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "module 'internal.loging' not found -- built-in modules are: internal.logging, internal.time, internal.tids"
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn require_is_cached_per_vm() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, None, false).await.unwrap();
+        register_require(&lua, &state, &identity_with(None), false)
+            .await
+            .unwrap();
         let same: bool = lua
             .load(r#"return require("liba") == require("liba")"#)
             .eval()
@@ -329,7 +391,9 @@ mod tests {
     async fn library_errors_surface_as_lua_errors() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, None, false).await.unwrap();
+        register_require(&lua, &state, &identity_with(None), false)
+            .await
+            .unwrap();
         lua.load(r#"local lib = require("liba"); function handle() return lib.call_other("liba", "nope", toarray({})) end"#)
             .exec()
             .unwrap();
@@ -345,7 +409,9 @@ mod tests {
     async fn empty_table_argument_stays_an_object() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, None, false).await.unwrap();
+        register_require(&lua, &state, &identity_with(None), false)
+            .await
+            .unwrap();
         lua.load(
             r#"
             local lib = require("liba")
@@ -406,7 +472,9 @@ mod tests {
         let state = test_state_with_pool(memory_pool().await);
         state.plugin_registry.register(objects_library()).await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, None, false).await.unwrap();
+        register_require(&lua, &state, &identity_with(None), false)
+            .await
+            .unwrap();
         lua.load(
             r#"
             local o = require("objects")
@@ -438,7 +506,9 @@ mod tests {
         let state = test_state_with_pool(memory_pool().await);
         state.plugin_registry.register(objects_library()).await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, None, false).await.unwrap();
+        register_require(&lua, &state, &identity_with(None), false)
+            .await
+            .unwrap();
         lua.load(
             r#"
             local o = require("objects")
@@ -463,5 +533,75 @@ mod tests {
         lua.load(r#"local db = require("happyview.db"); local q = db.records("c"):where("a", "=", 1):limit(5)"#)
             .exec()
             .unwrap();
+    }
+
+    /// A method in a mode this host doesn't recognise (the "odd"-mode
+    /// `weird`, sitting between the lazy `add` and the immediate `run_it`)
+    /// must not shift any later method's binding onto the wrong name. Uses
+    /// the real `sdk_objects` plugin (registered under `objects_library()`)
+    /// as the dispatch target but a synthetic surface, since `build_module`
+    /// never validates that the surface it's given matches what the plugin
+    /// itself declares.
+    #[tokio::test]
+    async fn unknown_mode_method_does_not_shift_a_later_methods_binding() {
+        use happyview_plugin_sdk::wire::ApiMethod;
+
+        let state = test_state_with_pool(memory_pool().await);
+        state.plugin_registry.register(objects_library()).await;
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+
+        let mut export = ApiExport::constructor("chain").lazy("add");
+        export.methods.push(ApiMethod {
+            name: "weird".into(),
+            mode: "odd".into(),
+        });
+        export.methods.push(ApiMethod::immediate("run_it"));
+        let surface = ApiSurface::new("objects").export(export);
+        let entry = LibraryEntry {
+            id: "sdk_objects".into(),
+            namespace: "objects".into(),
+            surface: std::sync::Arc::new(surface),
+        };
+
+        let executor = state.plugin_executor();
+        let module = build_module(&lua, &executor, &entry, &LibraryCallContext::default())
+            .expect("build module");
+        lua.globals().set("o", module).unwrap();
+        lua.load(
+            r#"
+            function handle()
+                local c = o.chain(1):add(2)
+                return c:run_it()
+            end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let handle: mlua::Function = lua.globals().get("handle").unwrap();
+        let err = handle.call_async::<mlua::Value>(()).await.unwrap_err();
+        // The wasm fixture's `chain` only recognises a call named `doc`, so
+        // this errors; what matters is that the error names `run_it`, which
+        // proves `run_it` was bound and `weird` was skipped rather than
+        // shifting `run_it` onto the wrong key.
+        assert!(err.to_string().contains("chain:run_it"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn builtins_resolve_before_libraries_and_are_cached() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_require(&lua, &state, &identity_with(None), false)
+            .await
+            .unwrap();
+        let same: bool = lua
+            .load(r#"return require("internal.time") == require("internal.time")"#)
+            .eval()
+            .unwrap();
+        assert!(same);
+        let ms: i64 = lua
+            .load(r#"return require("internal.time").now()"#)
+            .eval()
+            .unwrap();
+        assert!(ms > 0);
     }
 }

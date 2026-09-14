@@ -216,6 +216,10 @@ A `library` plugin exports a callable API surface instead of the `auth` contract
 
 `types` holds named types referenced by `params`/`returns`; the host treats it as opaque.
 
+#### Naming
+
+Names are snake_case on the wire and in Lua — `namespace`, export `name`, method names, `library:call`, and documents like the one above all carry the canonical snake_case name a script typed. A JavaScript interpreter renders export and method names to camelCase, mapping back to the canonical name when it builds a call document: `save_local` becomes `saveLocal`. `namespace` is never rendered in any language — `require` resolves it by exact match, so a library published as `happyview.linked_repos` is loaded as `require("happyview.linked_repos")`.
+
 #### Kinds and objects
 
 An export's `kind` is `function`, `constant`, or `constructor`, and defaults to `function`.

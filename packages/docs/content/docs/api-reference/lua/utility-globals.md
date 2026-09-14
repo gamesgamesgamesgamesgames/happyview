@@ -4,6 +4,10 @@ title: "Utility Globals"
 
 Global functions available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts). These don't belong to a specific API table — they're available at the top level of any script.
 
+<Callout type="info">
+`log`, `now`, and `TID` are replaced by the [built-in modules](built-in-modules.md) (`internal.logging`, `internal.time`, `internal.tids`) and will be removed in v3.
+</Callout>
+
 ## now
 
 ```lua

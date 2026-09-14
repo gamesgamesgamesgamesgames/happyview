@@ -1,4 +1,5 @@
 pub(crate) mod atproto_api;
+pub(crate) mod builtins;
 pub(crate) mod context;
 pub mod db_api;
 mod execute;
@@ -33,7 +34,12 @@ pub fn sandbox_for_tests() -> mlua::Lua {
 
 #[doc(hidden)]
 pub async fn require_api_for_tests(lua: &mlua::Lua, state: &crate::AppState) {
-    require_api::register_require(lua, state, Some("did:plc:test"), false)
+    let identity = builtins::ScriptIdentity {
+        trigger_id: "test".into(),
+        caller_did: Some("did:plc:test".into()),
+        job_id: None,
+    };
+    require_api::register_require(lua, state, &identity, false)
         .await
         .expect("require api");
 }

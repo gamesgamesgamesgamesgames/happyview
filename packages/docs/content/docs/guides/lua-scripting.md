@@ -10,28 +10,30 @@ Without Lua scripts, HappyView's query endpoints return raw records and procedur
 - Compose multi-record operations
 - Build entirely custom behavior
 
-Scripts run in a sandboxed Lua VM with access to the [Record API](#record-api), a [database API](#database-api), an [HTTP client API](#http-api), a [JSON API](#json-api), and a set of [context globals](#context-globals).
+Scripts run in a sandboxed Lua VM with access to the [Record API](#record-api), a [database API](#database-api), an [HTTP client API](#http-api), a [JSON API](#json-api), and the [`handle(input, ctx)` contract](#the-handleinput-ctx-contract).
 
 For scripts that react to record changes or label events (rather than XRPC requests), see [Record & Label Scripts](label-scripts).
 
 ## Script structure
 
-Every script must define a `handle()` function. HappyView calls it when the XRPC endpoint is hit and returns its result as JSON to the client.
+Every script must define a `handle(input, ctx)` function. HappyView calls it when the trigger fires and, for XRPC endpoints, returns its result as JSON to the client.
 
 ```lua
-function handle()
+function handle(input, ctx)
   -- your logic here
   return { key = "value" }
 end
 ```
 
-You can define helper functions and variables outside `handle()`. They're evaluated once when the script loads, then `handle()` is called per request.
+You can define helper functions and variables outside `handle(input, ctx)`. They're evaluated once when the script loads, then `handle(input, ctx)` is called per request.
 
 ## Sandbox
 
 Scripts run in a restricted environment. The following standard Lua modules are **removed** and unavailable:
 
-`io`, `debug`, `package`, `require`, `dofile`, `loadfile`, `load`, `collectgarbage`
+`io`, `debug`, `package`, `dofile`, `loadfile`, `load`, `collectgarbage`
+
+Lua's own `require` is removed too, but HappyView installs its own in its place: it loads installed library plugins and the `internal.*` built-ins — see [Built-in Modules](../api-reference/lua/built-in-modules.md).
 
 The `os` module is replaced with a safe subset exposing only `os.time`, `os.date`, `os.difftime`, and `os.clock`. Dangerous functions like `os.execute`, `os.remove`, `os.rename`, and `os.exit` are not available.
 
@@ -39,53 +41,45 @@ An instruction limit of 1,000,000 prevents infinite loops. Exceeding it terminat
 
 See the [Standard Libraries](../api-reference/lua/standard-libraries.md) reference for the full list of available Lua modules and builtins.
 
-## Context globals
+## The `handle(input, ctx)` contract
 
-These globals are set automatically before `handle()` is called.
+`input` is the trigger's payload. `ctx` is everything the runtime knows about this invocation — who's calling, what triggered it, and trigger-specific context like a job or a space. Both are plain tables, and `handle` may still be called with no arguments by a script that ignores them; the runtime always passes both.
 
-### Procedure globals
+| Trigger | `input` | `ctx` fields beyond the common ones |
+| --- | --- | --- |
+| XRPC query | the query parameters | |
+| XRPC procedure | the procedure input | |
+| Record event | `{ action, uri, did, collection, rkey, record }` | |
+| Label | the label event: `{ src, uri, val, neg, cts, exp }` | |
+| Job | the job input | `job = { id, progress(data), should_stop(), wait(seconds) }` |
+| Space hook (reserved; no runner passes a space today) | the record | `space = { uri, id, did, authority_did, type_nsid, skey }` |
 
-| Global         | Type    | Description                                             |
-| -------------- | ------- | ------------------------------------------------------- |
-| `method`       | string  | The XRPC method name (e.g. `xyz.statusphere.setStatus`) |
-| `input`        | table   | Parsed JSON request body                                |
-| `params`       | table   | Query string parameters                                 |
-| `caller_did`   | string  | DID of the authenticated user                           |
-| `collection`   | string  | Target collection NSID                                  |
-| `delegate_did` | string? | DID of the delegated account, if using write delegation |
-| `env`          | table   | Script variables configured in the dashboard            |
+Common `ctx` fields, present on every invocation (`nil` when not applicable to the current trigger):
 
-### Query globals
-
-| Global       | Type    | Description                                            |
-| ------------ | ------- | ------------------------------------------------------ |
-| `method`     | string  | The XRPC method name                                   |
-| `params`     | table   | Query string parameters (all values are strings)       |
-| `collection` | string  | Target collection NSID                                 |
-| `caller_did` | string? | DID of the authenticated user (nil if unauthenticated) |
-| `env`        | table   | Script variables configured in the dashboard           |
-
-### Space globals
-
-When a script handles a space-scoped request, the `space` global is set to a table with the space's metadata. For non-space requests, `space` is `nil`.
-
-| Field           | Type   | Description                 |
-| --------------- | ------ | --------------------------- |
-| `space`         | string | The full `at://` space URI  |
-| `space_id`      | string | Internal space identifier   |
-| `did`           | string | The space's DID             |
-| `authority_did` | string | The space authority's DID   |
-| `type_nsid`     | string | Space type NSID             |
-| `skey`          | string | Space key                   |
+| Field | Description |
+| --- | --- |
+| `trigger` | The trigger id, for logs and diagnostics |
+| `caller_did` | DID of the authenticated caller; `nil` when anonymous |
+| `has_pds_auth` | Whether the caller currently holds a PDS session |
+| `env` | Script variables configured in the dashboard |
+| `method` | The XRPC method name (e.g. `xyz.statusphere.setStatus`) |
+| `collection` | Target collection NSID |
+| `params` | A procedure's query string parameters |
+| `delegate_did` | DID of the delegated account, if using write delegation |
 
 ```lua
-function handle()
-  if space then
-    log("handling request for space: " .. space.space)
-    log("space type: " .. space.type_nsid)
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  if ctx.space then
+    log.info("handling request for space", { space = ctx.space.uri, space_type = ctx.space.type_nsid })
   end
 end
 ```
+
+<Callout type="info">
+The old per-trigger globals (`input`, `params`, `caller_did`, `method`, `collection`, `delegate_did`, `space`, `job`) still work. They're scheduled for removal in v3 — write new scripts against `handle(input, ctx)`.
+</Callout>
 
 ## Utility globals
 
@@ -119,8 +113,8 @@ See the full [Record API reference](../api-reference/lua/record-api.md) for cons
 Quick example:
 
 ```lua
-function handle()
-  local r = Record(collection, input)
+function handle(input, ctx)
+  local r = Record(ctx.collection, input)
   r:save()
   return { uri = r._uri, cid = r._cid }
 end
@@ -135,8 +129,8 @@ See the full [Database API reference](../api-reference/lua/database-api.md) for 
 Quick example:
 
 ```lua
-function handle()
-  local result = db.query({ collection = collection, limit = 20 })
+function handle(input, ctx)
+  local result = db.query({ collection = ctx.collection, limit = 20 })
   return { records = result.records, cursor = result.cursor }
 end
 ```
@@ -201,9 +195,9 @@ For the full guide on background jobs, see [Background Jobs](background-jobs.md)
 Use `log()` to trace script execution. Output appears in the server logs at **debug** level with the field `lua_log`, and is also recorded as a `script.log` event in the [event logs](../api-reference/admin/events.md) (accessible via `GET /admin/events`):
 
 ```lua
-function handle()
-  log("handle called with params: " .. tostring(params.limit))
-  local result = db.query({ collection = collection, limit = params.limit })
+function handle(input, ctx)
+  log("handle called with params: " .. tostring(input.limit))
+  local result = db.query({ collection = ctx.collection, limit = input.limit })
   log("query returned " .. #result.records .. " records")
   return result
 end

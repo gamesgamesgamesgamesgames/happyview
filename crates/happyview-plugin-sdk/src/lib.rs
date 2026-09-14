@@ -45,6 +45,8 @@ pub mod abi;
 pub mod envelope;
 pub mod host;
 mod macros;
+pub mod naming;
+pub mod tid;
 pub mod types;
 pub mod wire;
 

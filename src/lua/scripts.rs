@@ -455,16 +455,15 @@ pub async fn run_record_event_once(
         "rkey": payload.rkey,
         "record": payload.record,
     });
+    let event_lua = lua
+        .to_value(&event_value)
+        .map_err(|e| format!("event lua-conv: {e}"))?;
     lua.globals()
-        .set(
-            "event",
-            lua.to_value(&event_value)
-                .map_err(|e| format!("event lua-conv: {e}"))?,
-        )
+        .set("event", event_lua.clone())
         .map_err(|e| format!("set event global: {e}"))?;
 
-    context::set_env_context(&lua, &load_env_vars(&state.db, state.db_backend).await)
-        .map_err(|e| format!("set env: {e}"))?;
+    let env_vars = load_env_vars(&state.db, state.db_backend).await;
+    context::set_env_context(&lua, &env_vars).map_err(|e| format!("set env: {e}"))?;
 
     lua.load(script.body.as_str())
         .exec()
@@ -473,8 +472,24 @@ pub async fn run_record_event_once(
         .globals()
         .get("handle")
         .map_err(|e| format!("missing handle(): {e}"))?;
+    let ctx = context::build_ctx(
+        &lua,
+        &context::Invocation {
+            trigger_id: &script.id,
+            caller_did: Some(payload.did),
+            has_pds_auth: false,
+            env: &env_vars,
+            method: None,
+            collection: Some(payload.nsid),
+            params: None,
+            delegate_did: None,
+            space: None,
+            job: None,
+        },
+    )
+    .map_err(|e| format!("build ctx: {e}"))?;
     let result: mlua::Value = handle
-        .call_async::<mlua::Value>(())
+        .call_async::<mlua::Value>((event_lua, ctx))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -662,15 +677,14 @@ async fn run_label_lua_once(
     }
     .map_err(|e| format!("set exp: {e}"))?;
     let event_value = serde_json::to_value(event).map_err(|e| format!("encode event: {e}"))?;
+    let event_lua = lua
+        .to_value(&event_value)
+        .map_err(|e| format!("event lua-conv: {e}"))?;
     globals
-        .set(
-            "event",
-            lua.to_value(&event_value)
-                .map_err(|e| format!("event lua-conv: {e}"))?,
-        )
+        .set("event", event_lua.clone())
         .map_err(|e| format!("set event: {e}"))?;
-    context::set_env_context(&lua, &load_env_vars(&state.db, state.db_backend).await)
-        .map_err(|e| format!("set env: {e}"))?;
+    let env_vars = load_env_vars(&state.db, state.db_backend).await;
+    context::set_env_context(&lua, &env_vars).map_err(|e| format!("set env: {e}"))?;
 
     lua.load(script.body.as_str())
         .exec()
@@ -679,8 +693,24 @@ async fn run_label_lua_once(
         .globals()
         .get("handle")
         .map_err(|e| format!("missing handle(): {e}"))?;
+    let ctx = context::build_ctx(
+        &lua,
+        &context::Invocation {
+            trigger_id: &script.id,
+            caller_did: None,
+            has_pds_auth: false,
+            env: &env_vars,
+            method: None,
+            collection: None,
+            params: None,
+            delegate_did: None,
+            space: None,
+            job: None,
+        },
+    )
+    .map_err(|e| format!("build ctx: {e}"))?;
     let result: mlua::Value = handle
-        .call_async::<mlua::Value>(())
+        .call_async::<mlua::Value>((event_lua, ctx))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -763,7 +793,12 @@ async fn register_default_apis(
     record::register_record_api_no_auth(lua, state.clone())
         .map_err(|e| format!("record api: {e}"))?;
     register_log_event_api(lua, state, trigger_id, caller_did)?;
-    crate::lua::require_api::register_require(lua, state, caller_did, false).await?;
+    let identity = crate::lua::builtins::ScriptIdentity {
+        trigger_id: trigger_id.to_string(),
+        caller_did: caller_did.map(String::from),
+        job_id: None,
+    };
+    crate::lua::require_api::register_require(lua, state, &identity, false).await?;
     Ok(())
 }
 
