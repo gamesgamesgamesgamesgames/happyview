@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use wasmtime::{Linker, Memory, TypedFunc};
 
-use crate::plugin::capabilities::{PluginCapability, requirement_for_import};
+use crate::plugin::caller::CallerSession;
+use crate::plugin::capabilities::{PluginCapability, is_free_import, requirement_for_import};
 
 /// State stored in wasmtime's Store during plugin execution
 pub struct PluginState {
@@ -24,6 +25,17 @@ pub struct PluginState {
     pub executor: Option<crate::plugin::PluginExecutor>,
     pub call_ctx: crate::plugin::library::LibraryCallContext,
     pub depth: u8,
+    /// The credentials of the user whose script is running, when there are
+    /// any. Every `host_caller_*` import refuses without it, except
+    /// `host_caller_xrpc_query`, which a session-less query, record-event or
+    /// label script can also reach.
+    pub caller: Option<Arc<crate::plugin::caller::CallerSession>>,
+    /// The full instance, carried from `PluginExecutor::app_state` so a
+    /// caller-acting import can run without a `CallerSession` to source it
+    /// from. `Some` for every real instantiation; `None` only for the
+    /// direct-construction test and external-auth call sites that never
+    /// reach such an import.
+    pub app_state: Option<crate::AppState>,
 }
 
 /// Check that a memory access is within bounds
@@ -225,6 +237,145 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
                 )
                 .await
             })
+        },
+    )?;
+
+    // Async functions - acting as the calling user
+    linker.func_wrap_async(
+        "env",
+        "host_caller_create_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_caller_impl(
+                    &mut caller,
+                    "host_caller_create_record",
+                    req_ptr,
+                    req_len,
+                    |session, spec| async move { super::create_record(&session, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_caller_put_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_caller_impl(
+                    &mut caller,
+                    "host_caller_put_record",
+                    req_ptr,
+                    req_len,
+                    |session, spec| async move { super::put_record(&session, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_caller_delete_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_caller_impl(
+                    &mut caller,
+                    "host_caller_delete_record",
+                    req_ptr,
+                    req_len,
+                    |session, spec| async move { super::delete_record(&session, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_caller_upload_blob",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_caller_impl(
+                    &mut caller,
+                    "host_caller_upload_blob",
+                    req_ptr,
+                    req_len,
+                    |session, spec| async move { super::upload_blob(&session, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_caller_xrpc_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_caller_query_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_caller_xrpc_procedure",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_caller_impl(
+                    &mut caller,
+                    "host_caller_xrpc_procedure",
+                    req_ptr,
+                    req_len,
+                    |session, spec| async move { super::xrpc_procedure(&session, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    // Async functions - local index writes and lexicon reads
+    linker.func_wrap_async(
+        "env",
+        "host_records_index_put",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_index_put",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::index_put(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_records_index_delete",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_index_delete",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec: happyview_plugin_sdk::wire::IndexDelete| async move {
+                        super::index_delete(&db, backend, &spec.uri).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_lexicon_get",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_lexicon_get_impl(&mut caller, req_ptr, req_len).await })
         },
     )?;
 
@@ -675,6 +826,27 @@ async fn host_lookup_record_impl(
     write_guest_response(caller, &response_bytes).await
 }
 
+/// `host_lexicon_get` reads the in-memory lexicon registry, not the database,
+/// so it can't go through `host_spec_impl` — that refuses instances with no
+/// pool, which a lexicon lookup never needed in the first place.
+async fn host_lexicon_get_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::LexiconGet = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let lexicons = caller.data().lexicons.clone();
+    let value = super::lexicon_get(&lexicons, &spec.nsid).await;
+    let response = serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default();
+    write_guest_response(caller, &response).await
+}
+
 /// One entry point for every spec-taking record/table query import: gate on
 /// the import's capability, decode the spec, run it against the database, and
 /// wrap the result in the standard envelope. `RecordsError::InvalidSpec`
@@ -693,8 +865,11 @@ where
     F: FnOnce(sqlx::AnyPool, crate::db::DatabaseBackend, S) -> Fut,
     Fut: std::future::Future<Output = Result<R, super::RecordsError>>,
 {
-    if let Err(envelope) =
-        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    // A free import has no row in the requirements table and nothing to gate
+    // on; anything else missing one is a programming error, not a grant.
+    if !is_free_import(import)
+        && let Err(envelope) =
+            require_capability(caller.data(), requirement_for_import(import).unwrap())
     {
         return write_guest_response(caller, &envelope).await;
     }
@@ -715,6 +890,115 @@ where
         Err(e) => error_envelope("DB_ERROR", e),
     };
     write_guest_response(caller, &response).await
+}
+
+/// One entry point for every import that acts as the calling user: gate on
+/// the import's capability, then on there being a user at all, then decode the
+/// spec and run it. The session comes off the instance rather than the spec,
+/// so a library cannot name a user it was not lent.
+async fn host_caller_impl<S, R, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    F: FnOnce(Arc<CallerSession>, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, super::CallerError>>,
+{
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(session) = caller.data().caller.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "NO_SESSION",
+                "this script context has no caller session, so nothing can be done as a user here",
+            ),
+        )
+        .await;
+    };
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: S = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let response = match run(session, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(e.code(), caller_error_message(&e)),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// `host_caller_xrpc_query` on its own: gate on the capability, decode the
+/// spec, and run it, but — unlike [`host_caller_impl`] — never refuse for
+/// lacking a session. A query needs no PDS auth to run: the Lua `xrpc.query`
+/// global has never required one, and a query, record-event or label script
+/// has no session to lend. The session, when the runner has one, still
+/// supplies its claims; otherwise the call context's `caller_did` stands in,
+/// exactly as `xrpc.query` falls back to it today.
+async fn host_caller_query_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_caller_xrpc_query";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::CallerXrpcQuery = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(app_state) = caller.data().app_state.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "HOST_ERROR",
+                "this instance has no app state to query against",
+            ),
+        )
+        .await;
+    };
+    let session = caller.data().caller.clone();
+    let caller_did = caller.data().call_ctx.caller_did.clone();
+    let response = match super::xrpc_query(
+        &app_state,
+        session.as_deref(),
+        caller_did.as_deref(),
+        spec,
+    )
+    .await
+    {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(e.code(), caller_error_message(&e)),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// A dead session has to survive the trip out through the guest and the Lua
+/// bridge, which flatten everything into one error string. The prefix is what
+/// the script executor recognises there to answer 401 rather than 500.
+fn caller_error_message(e: &super::CallerError) -> String {
+    match e {
+        super::CallerError::Auth(_) => {
+            format!("{}{e}", crate::error::LUA_AUTH_ERROR_PREFIX)
+        }
+        other => other.to_string(),
+    }
 }
 
 /// The host-side input to `host_records_get`: the SDK wrapper sends
@@ -773,7 +1057,13 @@ async fn host_call_library_impl(
     };
     let ctx = caller.data().call_ctx.clone();
     let depth = caller.data().depth + 1;
-    let response = match executor.call_library(&lib, &function, &args, &ctx, depth).await {
+    // A library reached through another library acts as the same user, so the
+    // session travels the whole chain rather than stopping at the first hop.
+    let session = caller.data().caller.clone();
+    let response = match executor
+        .call_library_as(&lib, &function, &args, &ctx, session, depth)
+        .await
+    {
         Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
         Err(crate::plugin::ExecutionError::PluginError { code, message, retryable }) => {
             serde_json::to_vec(&serde_json::json!({"error": {"code": code, "message": message, "retryable": retryable}}))
@@ -903,6 +1193,38 @@ mod tests {
             let _ = &state.alloc;
             let _ = &state.dealloc;
         }
+    }
+
+    /// The executor recovers a 401 by finding the prefix anywhere in the
+    /// error string, so the envelope has to carry it out of the guest.
+    #[test]
+    fn an_auth_failure_leaves_with_the_prefix_the_executor_looks_for() {
+        let envelope = error_envelope(
+            super::super::CallerError::Auth("expired".into()).code(),
+            caller_error_message(&super::super::CallerError::Auth("expired".into())),
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        assert_eq!(parsed["error"]["code"], "AUTH_REQUIRED");
+        let message = parsed["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(crate::error::LUA_AUTH_ERROR_PREFIX),
+            "{message}"
+        );
+        assert!(message.contains("expired"), "{message}");
+    }
+
+    /// Only an auth failure gets the prefix; anything else wearing it would
+    /// turn an unrelated error into a spurious logout.
+    #[test]
+    fn other_failures_are_not_dressed_as_auth_failures() {
+        let message = caller_error_message(&super::super::CallerError::Pds {
+            status: 400,
+            body: "InvalidSwap".into(),
+        });
+        assert!(
+            !message.contains(crate::error::LUA_AUTH_ERROR_PREFIX),
+            "{message}"
+        );
     }
 
     #[test]

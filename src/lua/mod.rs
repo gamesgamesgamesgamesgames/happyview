@@ -39,7 +39,7 @@ pub async fn require_api_for_tests(lua: &mlua::Lua, state: &crate::AppState) {
         caller_did: Some("did:plc:test".into()),
         job_id: None,
     };
-    require_api::register_require(lua, state, &identity, false)
+    require_api::register_require(lua, state, &identity, None)
         .await
         .expect("require api");
 }

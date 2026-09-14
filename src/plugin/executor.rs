@@ -3,6 +3,7 @@
 use crate::db::DatabaseBackend;
 use crate::lexicon::LexiconRegistry;
 use crate::plugin::PluginType;
+use crate::plugin::caller::CallerSession;
 use crate::plugin::capabilities::{self, PluginCapability};
 use crate::plugin::host::{PluginState, register_host_functions};
 use crate::plugin::library::{
@@ -286,6 +287,16 @@ pub struct PluginExecutor {
     http_client: reqwest::Client,
     lexicons: Arc<LexiconRegistry>,
     encryption_key: Option<[u8; 32]>,
+    /// Set only by [`AppState::plugin_executor`](crate::AppState::plugin_executor).
+    /// A library reaching a host import that speaks to the wider instance —
+    /// today, `host_caller_xrpc_query` run with no session — needs this; the
+    /// component handles above are not enough to build a query response on
+    /// their own. Everything else on `PluginExecutor` stays a bare handle, so
+    /// this is optional rather than a required constructor argument: the
+    /// direct-construction call sites (external auth, and the lower-level
+    /// tests under `tests/`) have no full `AppState` to give it and don't
+    /// exercise that import.
+    app_state: Option<crate::AppState>,
 }
 
 impl PluginExecutor {
@@ -305,6 +316,7 @@ impl PluginExecutor {
             http_client,
             lexicons,
             encryption_key: None,
+            app_state: None,
         }
     }
 
@@ -312,6 +324,13 @@ impl PluginExecutor {
     /// only see `PLUGIN_<ID>_*` environment variables.
     pub fn with_encryption_key(mut self, key: Option<[u8; 32]>) -> Self {
         self.encryption_key = key;
+        self
+    }
+
+    /// The full instance state, for the host imports that need more than a
+    /// database pool and a lexicon registry.
+    pub fn with_app_state(mut self, app_state: crate::AppState) -> Self {
+        self.app_state = Some(app_state);
         self
     }
 
@@ -325,10 +344,27 @@ impl PluginExecutor {
         ctx: &LibraryCallContext,
         depth: u8,
     ) -> Result<serde_json::Value, ExecutionError> {
+        self.call_library_as(lib_id, function, args, ctx, None, depth)
+            .await
+    }
+
+    /// As [`call_library`](Self::call_library), lending the library the
+    /// caller's credentials. The session rides on the instance rather than on
+    /// the arguments, so a library cannot forge one or pass a different user's
+    /// along to a library it calls in turn.
+    pub async fn call_library_as(
+        &self,
+        lib_id: &str,
+        function: &str,
+        args: &[serde_json::Value],
+        ctx: &LibraryCallContext,
+        caller: Option<Arc<CallerSession>>,
+        depth: u8,
+    ) -> Result<serde_json::Value, ExecutionError> {
         if depth >= MAX_LIBRARY_CALL_DEPTH {
             return Err(ExecutionError::DepthExceeded);
         }
-        let mut inst = self.instantiate_library(lib_id, ctx, depth).await?;
+        let mut inst = self.instantiate_library(lib_id, ctx, caller, depth).await?;
         inst.call_library_function(function, args, ctx).await
     }
 
@@ -338,7 +374,7 @@ impl PluginExecutor {
             return Ok(cached);
         }
         let mut inst = self
-            .instantiate_library(lib_id, &LibraryCallContext::default(), 0)
+            .instantiate_library(lib_id, &LibraryCallContext::default(), None, 0)
             .await?;
         let surface = Arc::new(inst.call_get_api_surface().await?);
         self.registry
@@ -374,6 +410,7 @@ impl PluginExecutor {
         &self,
         lib_id: &str,
         ctx: &LibraryCallContext,
+        caller: Option<Arc<CallerSession>>,
         depth: u8,
     ) -> Result<PluginInstance, ExecutionError> {
         let plugin = self
@@ -400,6 +437,7 @@ impl PluginExecutor {
             .await?;
         inst.store.data_mut().call_ctx = ctx.clone();
         inst.store.data_mut().depth = depth;
+        inst.store.data_mut().caller = caller;
         Ok(inst)
     }
 
@@ -459,6 +497,8 @@ impl PluginExecutor {
             executor: Some(self.clone()),
             call_ctx: LibraryCallContext::default(),
             depth: 0,
+            caller: None,
+            app_state: self.app_state.clone(),
         };
 
         let mut store = Store::new(self.runtime.engine(), state);

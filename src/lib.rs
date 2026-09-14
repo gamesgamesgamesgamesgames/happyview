@@ -119,6 +119,7 @@ impl AppState {
             Arc::new(self.lexicons.clone()),
         )
         .with_encryption_key(self.config.token_encryption_key)
+        .with_app_state(self.clone())
     }
 }
 

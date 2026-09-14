@@ -323,6 +323,10 @@ Every host function except `host_log` is gated by a capability. The loader reads
 | `library:call` | Medium | Call other installed library plugins, which run with their own permissions (not this plugin's). |
 | `database:read` | High | Run arbitrary read-only SQL against indexed records, labels, lexicons, jobs and space data. Internal auth, secret and key tables are blocked. |
 | `database:write` | Critical | Run arbitrary SQL, including `INSERT`, `UPDATE`, `DELETE` and `DROP`, against indexed records, labels, lexicons, jobs and space data. This can destroy your index. |
+| `caller:read` | Medium | Read from the AT Protocol network as the user who ran the script. |
+| `caller:write` | High | Create, update and delete records in the user's own repository and upload blobs to it. |
+| `caller:call` | Critical | Call any XRPC procedure as the user, including ones that change their account. A procedure this instance does not serve is forwarded to the NSID's authority without the user's credentials. |
+| `records:write` | High | Write to this instance's record index directly, bypassing the network. This can replace the body of a record that arrived from the network while its CID and indexed time stay as the network set them. |
 
 `network:request` and `network:request:unrestricted` are mutually exclusive — declare one or the other, never both. `network:request` requires a non-empty `allowed_hosts`; `network:request:unrestricted` requires `allowed_hosts` to be empty. `allowed_hosts` entries are bare hostnames, optionally prefixed `*.` to allow subdomains — no scheme, path, port, or whitespace:
 
@@ -332,6 +336,32 @@ Every host function except `host_log` is gated by a capability. The loader reads
   "allowed_hosts": ["api.example.com", "*.cdn.example.com"]
 }
 ```
+
+### Acting as the caller
+
+A plugin declaring `caller:read`, `caller:write`, `caller:call`, or `records:write` can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope:
+
+| Import | Capability | Spec → result |
+| --------------------------- | ------------ | ------------------------------------------------------------------------------- |
+| `host_caller_xrpc_query`    | `caller:read`  | `{method, params?}` → the response body |
+| `host_caller_create_record` | `caller:write` | `{collection, rkey?, repo?, record, validate}` → `{uri, cid}` |
+| `host_caller_put_record`    | `caller:write` | `{uri, record, swap_cid?, validate}` → `{uri, cid}` |
+| `host_caller_delete_record` | `caller:write` | `{uri}` → nothing |
+| `host_caller_upload_blob`   | `caller:write` | `{bytes, mime_type}` → the PDS's blob reference |
+| `host_caller_xrpc_procedure`| `caller:call`  | `{method, input, params?}` → the response body |
+| `host_records_index_put`    | `records:write`| `{collection, rkey, did?, record, cid?}` → `{uri, cid}` |
+| `host_records_index_delete` | `records:write`| `{uri}` → whether a row was removed |
+| `host_lexicon_get`          | none           | `{nsid}` → the lexicon's stored JSON, or null if none is uploaded |
+
+`host_records_index_put`'s `did` is optional on the wire but required to succeed — the host has no default author for a row and rejects a spec without one.
+
+A library receives the script's session only when the script runner that made the call holds the user's PDS session — a procedure script running with PDS auth, or a job created with `{ auth = true }`. A query, record-event, or label script has no session, and a declared-capability call from one fails with `NO_SESSION` — except `host_caller_xrpc_query`, which needs no session at all, the same as the Lua `xrpc.query` global it mirrors.
+
+A record write, put, or delete targets the caller's own repo, or the repo of the account the script is delegated to act for. Any other repo fails with `WRITABLE_REPO`, since a caller-acting write can never succeed against a repo the instance holds no credentials for.
+
+Every import checks the plugin's declared capability first. Five of the six `host_caller_*` imports then check for a session before decoding the spec; `host_caller_xrpc_query` needs no session — it decodes and runs on the capability check alone, falling back to the call context's `caller_did` for claims when there is no session to take them from. The two `host_records_index_*` imports also need no session and go straight from the capability check to decoding, and `host_lexicon_get` needs no capability at all. Errors reaching the guest use the codes `FORBIDDEN` (the capability isn't declared), `NO_SESSION`, `WRITABLE_REPO`, `AUTH_REQUIRED` (the session died), `PDS_ERROR` (the PDS rejected the write), `XRPC_ERROR` (the local handler or proxy rejected the call), `HOST_ERROR` (a failure with no PDS or XRPC status to report), and `BAD_INPUT`.
+
+`caller:call` is Critical because an arbitrary procedure carries the same power as the user's whole session, including ones that change their account. `caller:write` is High because it is bounded to repo writes the PDS's own scope check still governs.
 
 ### Using a library from Lua
 

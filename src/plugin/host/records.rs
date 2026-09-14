@@ -10,8 +10,8 @@ use crate::db::{DatabaseBackend, adapt_sql, decode_cursor, encode_cursor};
 use crate::raw_sql_guard::check_raw_sql_tables;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use happyview_plugin_sdk::wire::{
-    BacklinksQuery, Filter, RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, Sort,
-    TableQuery,
+    BacklinksQuery, Filter, IndexPut, RecordRef, RecordsCount, RecordsPage, RecordsQuery,
+    RecordsSearch, Sort, TableQuery,
 };
 
 pub const MAX_FILTER_DEPTH: u8 = 5;
@@ -554,6 +554,83 @@ pub async fn table_query(
     }
 }
 
+/// Upsert one record into the local index, bypassing the network.
+///
+/// `indexed_at` and `cid` describe what arrived from the network, so an update
+/// leaves both alone: the stored CID describes the version the PDS holds and is
+/// what strongRefs point at, and a local edit does not change either. An insert
+/// may record a CID the caller was given by the network, and otherwise stores
+/// an empty one rather than NULL — the column is NOT NULL on both backends, and
+/// `cid_verify` already reads an empty CID as "nothing to check".
+pub async fn index_put(
+    db: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    spec: IndexPut,
+) -> Result<RecordRef, RecordsError> {
+    let IndexPut {
+        collection,
+        rkey,
+        did,
+        record,
+        cid,
+    } = spec;
+    let did = did.ok_or_else(|| invalid("index_put needs a did: pass the record's author"))?;
+    let uri = format!("at://{did}/{collection}/{rkey}");
+    let record_str = serde_json::to_string(&record).unwrap_or_default();
+    let now = crate::db::now_rfc3339();
+
+    let upsert_sql = adapt_sql(
+        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (uri) DO UPDATE
+               SET record = EXCLUDED.record"#,
+        backend,
+    );
+    crate::db::query(&upsert_sql)
+        .bind(&uri)
+        .bind(&did)
+        .bind(&collection)
+        .bind(&rkey)
+        .bind(&record_str)
+        .bind(cid.unwrap_or_default())
+        .bind(crate::db::NO_INDEXED_AT)
+        .bind(&now)
+        .execute(db)
+        .await?;
+
+    let _ = crate::record_refs::sync_refs(db, &uri, &collection, &record, backend).await;
+
+    // Read the CID back rather than assume one: an update leaves whatever the
+    // network last stored, which is the value a caller building a strongRef
+    // needs.
+    let cid_sql = adapt_sql("SELECT cid FROM happyview_records WHERE uri = ?", backend);
+    let row: Option<(Option<String>,)> = crate::db::query_as(&cid_sql)
+        .bind(&uri)
+        .fetch_optional(db)
+        .await?;
+    let cid = row.and_then(|(cid,)| cid).unwrap_or_default();
+
+    Ok(RecordRef { uri, cid })
+}
+
+/// Drop one record from the local index. Idempotent; the bool says whether a
+/// row was actually there.
+pub async fn index_delete(
+    db: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    uri: &str,
+) -> Result<bool, RecordsError> {
+    let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
+    let result = crate::db::query(&sql).bind(uri).execute(db).await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// The raw JSON of an uploaded lexicon, or `None` when this instance holds no
+/// lexicon under that NSID.
+pub async fn lexicon_get(lexicons: &crate::lexicon::LexiconRegistry, nsid: &str) -> Option<Value> {
+    lexicons.get(nsid).await.map(|lexicon| lexicon.raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,5 +1134,175 @@ mod tests {
         .unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 1);
         assert_eq!(rows[0]["name"], "a");
+    }
+
+    fn index_put_spec(did: &str, rkey: &str, record: Value) -> IndexPut {
+        IndexPut {
+            collection: "c".into(),
+            rkey: rkey.into(),
+            did: Some(did.into()),
+            record,
+            cid: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn index_put_inserts_then_updates() {
+        let pool = seeded_pool().await;
+        let inserted = index_put(
+            &pool,
+            Sqlite,
+            index_put_spec("did:plc:a", "new", json!({"n": "first"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(inserted.uri, "at://did:plc:a/c/new");
+        assert_eq!(inserted.cid, "");
+
+        let updated = index_put(
+            &pool,
+            Sqlite,
+            index_put_spec("did:plc:a", "new", json!({"n": "second"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.uri, inserted.uri);
+
+        let stored = records_get(&pool, Sqlite, "at://did:plc:a/c/new")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored["n"], "second");
+
+        let rows: Vec<(i64,)> =
+            crate::db::query_as("SELECT COUNT(*) FROM happyview_records WHERE uri = ?")
+                .bind("at://did:plc:a/c/new")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows[0].0, 1, "an upsert, not a second row");
+    }
+
+    /// A caller who just wrote the record to a PDS knows its CID, and a brand
+    /// new row is the one moment recording it invents nothing.
+    #[tokio::test]
+    async fn index_put_records_a_supplied_cid_on_insert() {
+        let pool = seeded_pool().await;
+        let inserted = index_put(
+            &pool,
+            Sqlite,
+            IndexPut {
+                collection: "c".into(),
+                rkey: "fresh".into(),
+                did: Some("did:plc:a".into()),
+                record: json!({"n": "first"}),
+                cid: Some("bafyfromthepds".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(inserted.cid, "bafyfromthepds");
+    }
+
+    /// The row's CID describes the version a PDS holds. A later index write
+    /// carrying a different one is describing something it cannot know about
+    /// the network, so the stored value wins.
+    #[tokio::test]
+    async fn index_put_never_overwrites_an_existing_cid() {
+        let pool = seeded_pool().await;
+        let updated = index_put(
+            &pool,
+            Sqlite,
+            IndexPut {
+                collection: "c".into(),
+                rkey: "1".into(),
+                did: Some("a".into()),
+                record: json!({"n": "edited"}),
+                cid: Some("bafysomethingelse".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.cid, "cid1");
+
+        let row: (Option<String>,) =
+            crate::db::query_as("SELECT cid FROM happyview_records WHERE uri = ?")
+                .bind("at://a/c/1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0.as_deref(), Some("cid1"));
+    }
+
+    /// A local edit says nothing about what the network holds, so neither
+    /// column may be disturbed by one.
+    #[tokio::test]
+    async fn index_put_leaves_network_provenance_alone() {
+        let pool = seeded_pool().await;
+        crate::db::query(
+            "UPDATE happyview_records SET indexed_at = ?, cid = ? WHERE uri = 'at://a/c/1'",
+        )
+        .bind("2026-01-01T00:00:00Z")
+        .bind("bafyoriginal")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let put = index_put(
+            &pool,
+            Sqlite,
+            IndexPut {
+                collection: "c".into(),
+                rkey: "1".into(),
+                did: Some("a".into()),
+                record: json!({"n": "edited"}),
+                cid: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(put.cid, "bafyoriginal");
+
+        let row: (Option<String>, Option<String>) =
+            crate::db::query_as("SELECT indexed_at, cid FROM happyview_records WHERE uri = ?")
+                .bind("at://a/c/1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(row.1.as_deref(), Some("bafyoriginal"));
+    }
+
+    #[tokio::test]
+    async fn index_put_without_a_did_says_so() {
+        let pool = seeded_pool().await;
+        let err = index_put(
+            &pool,
+            Sqlite,
+            IndexPut {
+                collection: "c".into(),
+                rkey: "1".into(),
+                did: None,
+                record: json!({}),
+                cid: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RecordsError::InvalidSpec(_)), "{err}");
+        assert!(err.to_string().contains("did"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn index_delete_reports_whether_a_row_went() {
+        let pool = seeded_pool().await;
+        assert!(index_delete(&pool, Sqlite, "at://a/c/1").await.unwrap());
+        assert!(!index_delete(&pool, Sqlite, "at://a/c/1").await.unwrap());
+        assert!(
+            records_get(&pool, Sqlite, "at://a/c/1")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -23,11 +23,14 @@ use serde_json::{Map, Value};
 
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::abi::read_packed;
+#[cfg(target_arch = "wasm32")]
+use crate::wire::LexiconGet;
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::wire::Response;
 use crate::wire::{
-    ApiSurface, BacklinksQuery, PluginError, RecordsCount, RecordsPage, RecordsQuery,
-    RecordsSearch, StrongRef, TableQuery,
+    ApiSurface, BacklinksQuery, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete,
+    CallerRecordPut, CallerXrpcProcedure, CallerXrpcQuery, IndexDelete, IndexPut, PluginError,
+    RecordRef, RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, StrongRef, TableQuery,
 };
 
 /// The wire types these wrappers send and receive. Defined in [`crate::wire`],
@@ -61,6 +64,15 @@ extern "C" {
     fn host_records_search(req_ptr: i32, req_len: i32) -> i64;
     fn host_table_query(req_ptr: i32, req_len: i32) -> i64;
     fn host_backlinks_query(req_ptr: i32, req_len: i32) -> i64;
+    fn host_caller_create_record(req_ptr: i32, req_len: i32) -> i64;
+    fn host_caller_put_record(req_ptr: i32, req_len: i32) -> i64;
+    fn host_caller_delete_record(req_ptr: i32, req_len: i32) -> i64;
+    fn host_caller_upload_blob(req_ptr: i32, req_len: i32) -> i64;
+    fn host_caller_xrpc_query(req_ptr: i32, req_len: i32) -> i64;
+    fn host_caller_xrpc_procedure(req_ptr: i32, req_len: i32) -> i64;
+    fn host_records_index_put(req_ptr: i32, req_len: i32) -> i64;
+    fn host_records_index_delete(req_ptr: i32, req_len: i32) -> i64;
+    fn host_lexicon_get(req_ptr: i32, req_len: i32) -> i64;
 }
 
 /// Why a host call did not produce a value.
@@ -347,6 +359,132 @@ pub fn backlinks_query(spec: &BacklinksQuery) -> Result<RecordsPage, PluginError
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Create a record on the calling script's own repo, as them. Needs
+/// `caller:write`.
+pub fn caller_create_record(spec: &CallerRecordCreate) -> Result<RecordRef, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_caller_create_record, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Put (create-or-update) a record on the calling script's own repo, as them.
+/// Needs `caller:write`.
+pub fn caller_put_record(spec: &CallerRecordPut) -> Result<RecordRef, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_caller_put_record, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Delete a record from the calling script's own repo, as them. Needs
+/// `caller:write`.
+pub fn caller_delete_record(spec: &CallerRecordDelete) -> Result<(), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // The host sends `{"ok": null}`; discard whatever comes back rather
+        // than fail on a shape a future host might vary.
+        call_spec::<_, Option<Value>>(host_caller_delete_record, spec).map(|_| ())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Upload a blob to the calling script's own repo, as them. Returns the PDS's
+/// blob ref as-is. Needs `caller:write`.
+pub fn caller_upload_blob(spec: &CallerBlobUpload) -> Result<Value, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_caller_upload_blob, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Send an XRPC query as the calling script's user. Needs `caller:read`.
+pub fn caller_xrpc_query(spec: &CallerXrpcQuery) -> Result<Value, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_caller_xrpc_query, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Send an XRPC procedure as the calling script's user. Needs `caller:call`.
+pub fn caller_xrpc_procedure(spec: &CallerXrpcProcedure) -> Result<Value, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_caller_xrpc_procedure, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Write a record straight into the local index, bypassing the PDS. `cid` on
+/// the result is whatever the index computed. Needs `records:write`.
+pub fn records_index_put(spec: &IndexPut) -> Result<RecordRef, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_records_index_put, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Remove a record from the local index, bypassing the PDS. Returns whether a
+/// row was actually removed. Needs `records:write`.
+pub fn records_index_delete(spec: &IndexDelete) -> Result<bool, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_records_index_delete, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Look up an uploaded lexicon's raw JSON by NSID. `Ok(None)` means no lexicon
+/// is registered for it. Needs no capability.
+pub fn lexicon_get(nsid: &str) -> Result<Option<Value>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_lexicon_get, &LexiconGet { nsid: nsid.into() })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = nsid;
         Err(HostError::NotWasm.into())
     }
 }

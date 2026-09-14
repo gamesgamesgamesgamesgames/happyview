@@ -238,7 +238,21 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         let _ = db::set_error(state, &job.id, &format!("jobs api: {e}")).await;
         return;
     }
-    let has_pds_auth = pds_auth_arc.is_some();
+    // A job that did not inherit its creator's auth has nothing to act as, so
+    // its library calls carry no session at all.
+    let caller_session = claims
+        .clone()
+        .zip(pds_auth_arc.clone())
+        .map(|(claims, pds_auth)| {
+            Arc::new(crate::plugin::caller::CallerSession {
+                did: job.created_by.clone(),
+                delegate_did: None,
+                claims,
+                pds_auth,
+                app_state: state.clone(),
+            })
+        });
+    let has_pds_auth = caller_session.is_some();
     if let Err(e) =
         crate::lua::record::register_record_api(&lua, state_arc.clone(), claims, pds_auth_arc, None)
     {
@@ -272,7 +286,7 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         job_id: Some(job.id.clone()),
     };
     if let Err(e) =
-        crate::lua::require_api::register_require(&lua, state, &identity, has_pds_auth).await
+        crate::lua::require_api::register_require(&lua, state, &identity, caller_session).await
     {
         let _ = db::set_error(state, &job.id, &format!("require api: {e}")).await;
         return;

@@ -71,6 +71,29 @@ const EXPECTED_OBJECTS_IMPORTS: &[&str] = &[
     "env::host_table_query",
 ];
 
+/// The `caller` fixture is a bare pass-through over every caller-acting and
+/// local-index host import — nothing else.
+const EXPECTED_CALLER_EXPORTS: &[&str] = &[
+    "alloc",
+    "call",
+    "dealloc",
+    "get_api_surface",
+    "memory",
+    "plugin_info",
+];
+
+const EXPECTED_CALLER_IMPORTS: &[&str] = &[
+    "env::host_caller_create_record",
+    "env::host_caller_delete_record",
+    "env::host_caller_put_record",
+    "env::host_caller_upload_blob",
+    "env::host_caller_xrpc_procedure",
+    "env::host_caller_xrpc_query",
+    "env::host_lexicon_get",
+    "env::host_records_index_delete",
+    "env::host_records_index_put",
+];
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
         "../../tests/fixtures/{name}/target/wasm32-unknown-unknown/release/{name}.wasm"
@@ -155,5 +178,14 @@ fn the_objects_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
         "sdk_objects",
         EXPECTED_OBJECTS_EXPORTS,
         EXPECTED_OBJECTS_IMPORTS,
+    );
+}
+
+#[test]
+fn the_caller_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
+    check_fixture(
+        "sdk_caller",
+        EXPECTED_CALLER_EXPORTS,
+        EXPECTED_CALLER_IMPORTS,
     );
 }

@@ -53,9 +53,11 @@ pub mod wire;
 pub use envelope::{PluginError, Response};
 pub use types::{
     ApiExport, ApiMethod, ApiSurface, AuthorizeUrlInput, BacklinksQuery, CallContext, CallInput,
-    CallbackInput, Condition, ExternalProfile, Filter, MethodCall, ObjectCall, PluginInfo,
-    RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, RefreshInput, Sort, Step, StrongRef,
-    TableQuery, TokenInput, TokenSet,
+    CallbackInput, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
+    CallerXrpcProcedure, CallerXrpcQuery, Condition, ExternalProfile, Filter, IndexDelete,
+    IndexPut, LexiconGet, MethodCall, ObjectCall, PluginInfo, RecordRef, RecordsCount, RecordsPage,
+    RecordsQuery, RecordsSearch, RefreshInput, Sort, Step, StrongRef, TableQuery, TokenInput,
+    TokenSet,
 };
 
 /// Items the macros name in their expansion. Not a public API: a plugin crate

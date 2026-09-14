@@ -40,6 +40,14 @@ pub enum PluginCapability {
     DatabaseRead,
     #[serde(rename = "database:write")]
     DatabaseWrite,
+    #[serde(rename = "caller:read")]
+    CallerRead,
+    #[serde(rename = "caller:write")]
+    CallerWrite,
+    #[serde(rename = "caller:call")]
+    CallerCall,
+    #[serde(rename = "records:write")]
+    RecordsWrite,
 }
 
 impl PluginCapability {
@@ -55,6 +63,10 @@ impl PluginCapability {
             LibraryCall,
             DatabaseRead,
             DatabaseWrite,
+            CallerRead,
+            CallerWrite,
+            CallerCall,
+            RecordsWrite,
         ]
     }
 
@@ -70,6 +82,10 @@ impl PluginCapability {
             LibraryCall => "library:call",
             DatabaseRead => "database:read",
             DatabaseWrite => "database:write",
+            CallerRead => "caller:read",
+            CallerWrite => "caller:write",
+            CallerCall => "caller:call",
+            RecordsWrite => "records:write",
         }
     }
 
@@ -81,9 +97,9 @@ impl PluginCapability {
         use PluginCapability::*;
         match self {
             SecretsRead | KvRead | KvWrite => Risk::Low,
-            RecordsRead | NetworkRequest | LibraryCall => Risk::Medium,
-            NetworkRequestUnrestricted | DatabaseRead => Risk::High,
-            DatabaseWrite => Risk::Critical,
+            RecordsRead | NetworkRequest | LibraryCall | CallerRead => Risk::Medium,
+            NetworkRequestUnrestricted | DatabaseRead | CallerWrite | RecordsWrite => Risk::High,
+            DatabaseWrite | CallerCall => Risk::Critical,
         }
     }
 
@@ -109,6 +125,16 @@ impl PluginCapability {
             }
             DatabaseWrite => {
                 "Run arbitrary SQL, including INSERT, UPDATE, DELETE and DROP, against indexed records, labels, lexicons, jobs and space data. This can destroy your index."
+            }
+            CallerRead => "Read from the AT Protocol network as the user who ran the script.",
+            CallerWrite => {
+                "Create, update and delete records in the user's own repository and upload blobs to it."
+            }
+            CallerCall => {
+                "Call any XRPC procedure as the user, including ones that change their account. A procedure this instance does not serve is forwarded to the NSID's authority without the user's credentials."
+            }
+            RecordsWrite => {
+                "Write to this instance's record index directly, bypassing the network. This can replace the body of a record that arrived from the network while its CID and indexed time stay as the network set them."
             }
         }
     }
@@ -197,9 +223,47 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
             PluginCapability::DatabaseWrite,
         ],
     },
+    Requirement {
+        import: "host_caller_xrpc_query",
+        any_of: &[PluginCapability::CallerRead],
+    },
+    Requirement {
+        import: "host_caller_create_record",
+        any_of: &[PluginCapability::CallerWrite],
+    },
+    Requirement {
+        import: "host_caller_put_record",
+        any_of: &[PluginCapability::CallerWrite],
+    },
+    Requirement {
+        import: "host_caller_delete_record",
+        any_of: &[PluginCapability::CallerWrite],
+    },
+    Requirement {
+        import: "host_caller_upload_blob",
+        any_of: &[PluginCapability::CallerWrite],
+    },
+    Requirement {
+        import: "host_caller_xrpc_procedure",
+        any_of: &[PluginCapability::CallerCall],
+    },
+    Requirement {
+        import: "host_records_index_put",
+        any_of: &[PluginCapability::RecordsWrite],
+    },
+    Requirement {
+        import: "host_records_index_delete",
+        any_of: &[PluginCapability::RecordsWrite],
+    },
 ];
 
-const FREE_IMPORTS: &[&str] = &["host_log"];
+/// Imports that cost a plugin nothing to declare: logging, and reading a
+/// lexicon, which is published schema rather than anybody's data.
+const FREE_IMPORTS: &[&str] = &["host_log", "host_lexicon_get"];
+
+pub fn is_free_import(name: &str) -> bool {
+    FREE_IMPORTS.contains(&name)
+}
 
 pub fn requirement_for_import(name: &str) -> Option<Requirement> {
     IMPORT_REQUIREMENTS
@@ -355,15 +419,50 @@ mod tests {
             "host_records_search",
             "host_backlinks_query",
             "host_table_query",
+            "host_caller_create_record",
+            "host_caller_put_record",
+            "host_caller_delete_record",
+            "host_caller_upload_blob",
+            "host_caller_xrpc_query",
+            "host_caller_xrpc_procedure",
+            "host_records_index_put",
+            "host_records_index_delete",
+            "host_lexicon_get",
         ] {
-            // `None` is only right for host_log.
+            // `None` is only right for the free imports.
             assert_eq!(
                 requirement_for_import(name).is_none(),
-                name == "host_log",
+                is_free_import(name),
                 "{name}"
             );
         }
         assert_eq!(requirement_for_import("host_teleport"), None);
+    }
+
+    #[test]
+    fn caller_imports_map_to_their_capability() {
+        for (import, expected) in [
+            ("host_caller_xrpc_query", PluginCapability::CallerRead),
+            ("host_caller_create_record", PluginCapability::CallerWrite),
+            ("host_caller_put_record", PluginCapability::CallerWrite),
+            ("host_caller_delete_record", PluginCapability::CallerWrite),
+            ("host_caller_upload_blob", PluginCapability::CallerWrite),
+            ("host_caller_xrpc_procedure", PluginCapability::CallerCall),
+            ("host_records_index_put", PluginCapability::RecordsWrite),
+            ("host_records_index_delete", PluginCapability::RecordsWrite),
+        ] {
+            let req = requirement_for_import(import).expect(import);
+            assert_eq!(req.any_of, &[expected], "{import}");
+        }
+    }
+
+    /// A lexicon is public schema, so reading one costs a plugin nothing —
+    /// and `analyze_imports` must not demand a declaration for it.
+    #[test]
+    fn lexicon_get_is_free() {
+        assert!(is_free_import("host_lexicon_get"));
+        let reqs = analyze_imports(&module_importing(&["host_lexicon_get"])).unwrap();
+        assert!(reqs.is_empty());
     }
 
     #[test]
@@ -489,5 +588,32 @@ mod tests {
             serde_json::to_string(&Risk::Critical).unwrap(),
             "\"critical\""
         );
+    }
+
+    /// Reading as the user, writing their repo, and running any procedure as
+    /// them are three different sizes of trust, and the consent dialog sorts
+    /// on exactly this.
+    #[test]
+    fn caller_tiers_rise_with_consequence() {
+        assert_eq!(PluginCapability::CallerRead.risk(), Risk::Medium);
+        assert_eq!(PluginCapability::CallerWrite.risk(), Risk::High);
+        assert_eq!(PluginCapability::CallerCall.risk(), Risk::Critical);
+        assert_eq!(PluginCapability::RecordsWrite.risk(), Risk::High);
+        assert!(PluginCapability::CallerRead.risk() < PluginCapability::CallerWrite.risk());
+        assert!(PluginCapability::CallerWrite.risk() < PluginCapability::CallerCall.risk());
+    }
+
+    #[test]
+    fn caller_capabilities_parse_by_their_wire_names() {
+        for (name, cap) in [
+            ("caller:read", PluginCapability::CallerRead),
+            ("caller:write", PluginCapability::CallerWrite),
+            ("caller:call", PluginCapability::CallerCall),
+            ("records:write", PluginCapability::RecordsWrite),
+        ] {
+            assert_eq!(PluginCapability::parse_str(name), Some(cap));
+            assert_eq!(cap.as_str(), name);
+            assert_eq!(serde_json::to_string(&cap).unwrap(), format!("\"{name}\""));
+        }
     }
 }

@@ -1,4 +1,5 @@
 mod bindings;
+mod caller;
 mod db;
 mod http;
 mod kv;
@@ -8,6 +9,7 @@ mod records;
 mod secrets;
 
 pub use bindings::{PluginState, register_host_functions};
+pub use caller::*;
 pub use db::*;
 pub use http::*;
 pub use kv::*;

@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod caller;
 pub mod capabilities;
 pub mod encryption;
 pub mod executor;

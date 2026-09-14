@@ -9,10 +9,12 @@
 //! same cache slot, so a script uses a built-in and a plugin the same way.
 
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
+use std::sync::Arc;
 
 use crate::AppState;
 use crate::lua::builtins::{self, ScriptIdentity};
 use crate::plugin::PluginExecutor;
+use crate::plugin::caller::CallerSession;
 use crate::plugin::library::{LibraryCallContext, LibraryEntry};
 
 const LOADED_KEY: &str = "happyview.require.loaded";
@@ -20,23 +22,36 @@ const LOADED_KEY: &str = "happyview.require.loaded";
 /// Install `require` for a script run. Resolves the library index up front
 /// (it is cached in the registry) so `require` itself can be synchronous —
 /// scripts call it at top level, outside any coroutine.
+///
+/// `caller` is the credentials of the user running the script, when the runner
+/// holds any. It is what a library's caller-acting imports use, and what a
+/// library reads as `has_pds_auth` — the two cannot disagree.
 pub async fn register_require(
     lua: &Lua,
     state: &AppState,
     identity: &ScriptIdentity,
-    has_pds_auth: bool,
+    caller: Option<Arc<CallerSession>>,
 ) -> Result<(), String> {
     let executor = state.plugin_executor();
     let index = executor.library_index().await;
     let ctx = LibraryCallContext {
         caller_did: identity.caller_did.clone(),
-        has_pds_auth,
+        has_pds_auth: caller.is_some(),
         db_backend: None,
     };
-    install(lua, state.clone(), identity.clone(), executor, index, ctx)
-        .map_err(|e| format!("require api: {e}"))
+    install(
+        lua,
+        state.clone(),
+        identity.clone(),
+        executor,
+        index,
+        ctx,
+        caller,
+    )
+    .map_err(|e| format!("require api: {e}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install(
     lua: &Lua,
     state: AppState,
@@ -44,6 +59,7 @@ fn install(
     executor: PluginExecutor,
     index: Vec<LibraryEntry>,
     ctx: LibraryCallContext,
+    caller: Option<Arc<CallerSession>>,
 ) -> LuaResult<()> {
     lua.set_named_registry_value(LOADED_KEY, lua.create_table()?)?;
 
@@ -67,7 +83,7 @@ fn install(
                 "module '{name}' not found -- is the '{name}' library plugin installed?"
             ))
         })?;
-        let module = build_module(lua, &executor, entry, &ctx)?;
+        let module = build_module(lua, &executor, entry, &ctx, &caller)?;
         loaded.set(name.as_str(), module.clone())?;
         Ok(module)
     })?;
@@ -83,17 +99,20 @@ fn build_module(
     executor: &PluginExecutor,
     entry: &LibraryEntry,
     ctx: &LibraryCallContext,
+    caller: &Option<Arc<CallerSession>>,
 ) -> LuaResult<mlua::Table> {
     let module = lua.create_table()?;
 
     for export in entry.surface.exports.iter().filter(|e| e.is_function()) {
         let executor = executor.clone();
         let ctx = ctx.clone();
+        let caller = caller.clone();
         let lib_id = entry.id.clone();
         let fn_name = export.name.clone();
         let func = lua.create_async_function(move |lua, args: mlua::MultiValue| {
             let executor = executor.clone();
             let ctx = ctx.clone();
+            let caller = caller.clone();
             let lib_id = lib_id.clone();
             let fn_name = fn_name.clone();
             async move {
@@ -102,7 +121,7 @@ fn build_module(
                     .map(|v| lua.from_value(v))
                     .collect::<LuaResult<_>>()?;
                 let result = executor
-                    .call_library(&lib_id, &fn_name, &args, &ctx, 0)
+                    .call_library_as(&lib_id, &fn_name, &args, &ctx, caller, 0)
                     .await
                     .map_err(|e| mlua::Error::runtime(format!("{lib_id}.{fn_name}: {e}")))?;
                 lua.to_value(&result)
@@ -115,6 +134,7 @@ fn build_module(
         let ctor = lua.create_function({
             let executor = executor.clone();
             let ctx = ctx.clone();
+            let caller = caller.clone();
             let lib_id = entry.id.clone();
             let ctor_name = export.name.clone();
             let methods = export.methods.clone();
@@ -139,6 +159,7 @@ fn build_module(
                                 lua,
                                 executor.clone(),
                                 ctx.clone(),
+                                caller.clone(),
                                 lib_id.clone(),
                                 ctor_name.clone(),
                                 method.name.clone(),
@@ -180,10 +201,12 @@ fn lazy_method(lua: &Lua, name: String) -> LuaResult<mlua::Function> {
 /// rather than through `to_value` keeps empty argument lists as `[]`.
 /// `ctor_name` and `name` are canonical names — what the document and the
 /// dispatched call carry, independent of how a script typed them.
+#[allow(clippy::too_many_arguments)]
 fn immediate_method(
     lua: &Lua,
     executor: PluginExecutor,
     ctx: LibraryCallContext,
+    caller: Option<Arc<CallerSession>>,
     lib_id: String,
     ctor_name: String,
     name: String,
@@ -192,6 +215,7 @@ fn immediate_method(
         move |lua, (object, args): (mlua::Table, mlua::MultiValue)| {
             let executor = executor.clone();
             let ctx = ctx.clone();
+            let caller = caller.clone();
             let lib_id = lib_id.clone();
             let ctor_name = ctor_name.clone();
             let name = name.clone();
@@ -217,7 +241,7 @@ fn immediate_method(
                     "call": { "name": name, "args": call_args },
                 });
                 let result = executor
-                    .call_library(&lib_id, &ctor_name, &[document], &ctx, 0)
+                    .call_library_as(&lib_id, &ctor_name, &[document], &ctx, caller, 0)
                     .await
                     .map_err(|e| {
                         mlua::Error::runtime(format!("{lib_id}.{ctor_name}:{name}: {e}"))
@@ -316,7 +340,7 @@ mod tests {
     async fn require_returns_table_with_library_functions() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, &identity_with(Some("did:plc:me")), false)
+        register_require(&lua, &state, &identity_with(Some("did:plc:me")), None)
             .await
             .unwrap();
 
@@ -343,7 +367,7 @@ mod tests {
     async fn require_unknown_library_names_the_plugin() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, &identity_with(None), false)
+        register_require(&lua, &state, &identity_with(None), None)
             .await
             .unwrap();
         let err = lua.load(r#"local x = require("nope")"#).exec().unwrap_err();
@@ -358,7 +382,7 @@ mod tests {
     async fn unknown_builtin_names_the_builtins() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, &identity_with(None), false)
+        register_require(&lua, &state, &identity_with(None), None)
             .await
             .unwrap();
         let err = lua
@@ -377,7 +401,7 @@ mod tests {
     async fn require_is_cached_per_vm() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, &identity_with(None), false)
+        register_require(&lua, &state, &identity_with(None), None)
             .await
             .unwrap();
         let same: bool = lua
@@ -391,7 +415,7 @@ mod tests {
     async fn library_errors_surface_as_lua_errors() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, &identity_with(None), false)
+        register_require(&lua, &state, &identity_with(None), None)
             .await
             .unwrap();
         lua.load(r#"local lib = require("liba"); function handle() return lib.call_other("liba", "nope", toarray({})) end"#)
@@ -409,7 +433,7 @@ mod tests {
     async fn empty_table_argument_stays_an_object() {
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, &identity_with(None), false)
+        register_require(&lua, &state, &identity_with(None), None)
             .await
             .unwrap();
         lua.load(
@@ -472,7 +496,7 @@ mod tests {
         let state = test_state_with_pool(memory_pool().await);
         state.plugin_registry.register(objects_library()).await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, &identity_with(None), false)
+        register_require(&lua, &state, &identity_with(None), None)
             .await
             .unwrap();
         lua.load(
@@ -506,7 +530,7 @@ mod tests {
         let state = test_state_with_pool(memory_pool().await);
         state.plugin_registry.register(objects_library()).await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, &identity_with(None), false)
+        register_require(&lua, &state, &identity_with(None), None)
             .await
             .unwrap();
         lua.load(
@@ -564,8 +588,14 @@ mod tests {
         };
 
         let executor = state.plugin_executor();
-        let module = build_module(&lua, &executor, &entry, &LibraryCallContext::default())
-            .expect("build module");
+        let module = build_module(
+            &lua,
+            &executor,
+            &entry,
+            &LibraryCallContext::default(),
+            &None,
+        )
+        .expect("build module");
         lua.globals().set("o", module).unwrap();
         lua.load(
             r#"
@@ -590,7 +620,7 @@ mod tests {
     async fn builtins_resolve_before_libraries_and_are_cached() {
         let state = test_state_with_pool(memory_pool().await);
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
-        register_require(&lua, &state, &identity_with(None), false)
+        register_require(&lua, &state, &identity_with(None), None)
             .await
             .unwrap();
         let same: bool = lua

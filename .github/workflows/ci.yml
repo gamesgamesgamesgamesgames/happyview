@@ -199,6 +199,9 @@ jobs:
       - name: Build SDK objects fixture
         run: cargo build --manifest-path tests/fixtures/sdk_objects/Cargo.toml --target wasm32-unknown-unknown --release
 
+      - name: Build SDK caller fixture
+        run: cargo build --manifest-path tests/fixtures/sdk_caller/Cargo.toml --target wasm32-unknown-unknown --release
+
       - name: Run plugin SDK tests
         run: cargo test -p happyview-plugin-sdk
 

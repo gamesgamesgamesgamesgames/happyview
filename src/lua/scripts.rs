@@ -798,7 +798,7 @@ async fn register_default_apis(
         caller_did: caller_did.map(String::from),
         job_id: None,
     };
-    crate::lua::require_api::register_require(lua, state, &identity, false).await?;
+    crate::lua::require_api::register_require(lua, state, &identity, None).await?;
     Ok(())
 }
 

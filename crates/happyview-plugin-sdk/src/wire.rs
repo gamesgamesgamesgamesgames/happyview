@@ -564,6 +564,122 @@ pub struct StrongRef {
 }
 
 // ---------------------------------------------------------------------------
+// Caller-acting writes, index writes, and lexicon lookup
+// ---------------------------------------------------------------------------
+
+fn default_true() -> bool {
+    true
+}
+
+/// What a successful create or put on the caller's own repo returns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordRef {
+    pub uri: String,
+    pub cid: String,
+}
+
+/// A record create issued as the calling script's user. Needs `caller:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerRecordCreate {
+    pub collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkey: Option<String>,
+    /// The repo to write to. Absent means the caller's own repo — the only
+    /// repo a caller-acting write can ever target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    pub record: Value,
+    /// Whether the PDS should validate the record against its lexicon.
+    /// Defaults to `true`, matching `com.atproto.repo.createRecord`.
+    #[serde(default = "default_true")]
+    pub validate: bool,
+}
+
+/// A record put (upsert) issued as the calling script's user. Needs
+/// `caller:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerRecordPut {
+    pub uri: String,
+    pub record: Value,
+    /// A no-create guarantee when set: the PDS refuses unless this CID is the
+    /// record's current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_cid: Option<String>,
+    #[serde(default = "default_true")]
+    pub validate: bool,
+}
+
+/// A record delete issued as the calling script's user. Needs `caller:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerRecordDelete {
+    pub uri: String,
+}
+
+/// A blob upload issued as the calling script's user. Needs `caller:write`.
+///
+/// `bytes` travels the same way an [`HttpRequest`] body does: a JSON string
+/// when it is valid UTF-8, a byte array otherwise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerBlobUpload {
+    #[serde(
+        serialize_with = "serialize_body",
+        deserialize_with = "deserialize_body_flexible_required"
+    )]
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+}
+
+/// An XRPC query issued as the calling script's user. Needs `caller:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerXrpcQuery {
+    pub method: String,
+    #[serde(default)]
+    pub params: Map<String, Value>,
+}
+
+/// An XRPC procedure issued as the calling script's user. Needs `caller:call`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallerXrpcProcedure {
+    pub method: String,
+    pub input: Value,
+    #[serde(default)]
+    pub params: Map<String, Value>,
+}
+
+/// A write to the local record index, bypassing the PDS. Needs
+/// `records:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexPut {
+    pub collection: String,
+    pub rkey: String,
+    /// The record's author, and half of the URI the row is keyed by. The host
+    /// has no default for it and refuses a spec without one; pass the DID from
+    /// the call context, or the repo the record was written to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    pub record: Value,
+    /// The CID the network assigned this version, when the caller has one —
+    /// from a PDS create, say. It is recorded only when the row is new: a CID
+    /// describes what a PDS holds, so an index write may introduce one but
+    /// never overwrite one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+}
+
+/// An index removal, bypassing the PDS. Needs `records:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexDelete {
+    pub uri: String,
+}
+
+/// A lookup of an uploaded lexicon's raw JSON, by NSID. Needs no capability —
+/// a lexicon is public schema, not user data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LexiconGet {
+    pub nsid: String,
+}
+
+// ---------------------------------------------------------------------------
 // Auth plugin inputs and outputs
 // ---------------------------------------------------------------------------
 
@@ -1525,5 +1641,220 @@ mod spec_tests {
         let json = serde_json::to_value(&page).unwrap();
         assert!(json.get("cursor").is_none());
         assert_eq!(json["records"][0]["uri"], "at://x");
+    }
+}
+
+#[cfg(test)]
+mod caller_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use serde_json::json;
+
+    #[test]
+    fn record_ref_round_trips() {
+        let r = RecordRef {
+            uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+            cid: "bafy123".to_string(),
+        };
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(value["uri"], "at://did:plc:abc/app.bsky.feed.post/1");
+        assert_eq!(value["cid"], "bafy123");
+        assert_eq!(serde_json::from_value::<RecordRef>(value).unwrap(), r);
+    }
+
+    #[test]
+    fn caller_record_create_defaults_validate_true_and_omits_optionals() {
+        let create: CallerRecordCreate = serde_json::from_value(json!({
+            "collection": "app.bsky.feed.post",
+            "record": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(create.collection, "app.bsky.feed.post");
+        assert_eq!(create.rkey, None);
+        assert_eq!(create.repo, None);
+        assert_eq!(create.record, json!({"text": "hi"}));
+        assert!(create.validate);
+
+        let value = serde_json::to_value(&create).unwrap();
+        assert!(value.get("rkey").is_none());
+        assert!(value.get("repo").is_none());
+        assert_eq!(value["validate"], true);
+    }
+
+    #[test]
+    fn caller_record_create_round_trips_with_every_field_set() {
+        let create = CallerRecordCreate {
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: Some("abc123".to_string()),
+            repo: Some("did:plc:abc".to_string()),
+            record: json!({"text": "hi"}),
+            validate: false,
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["rkey"], "abc123");
+        assert_eq!(value["repo"], "did:plc:abc");
+        assert_eq!(value["validate"], false);
+        assert_eq!(
+            serde_json::from_value::<CallerRecordCreate>(value).unwrap(),
+            create
+        );
+    }
+
+    #[test]
+    fn caller_record_put_defaults_validate_true_and_omits_swap_cid() {
+        let put: CallerRecordPut = serde_json::from_value(json!({
+            "uri": "at://did:plc:abc/app.bsky.feed.post/1",
+            "record": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(put.swap_cid, None);
+        assert!(put.validate);
+
+        let value = serde_json::to_value(&put).unwrap();
+        assert!(value.get("swap_cid").is_none());
+        assert_eq!(value["validate"], true);
+    }
+
+    #[test]
+    fn caller_record_put_round_trips_with_swap_cid_and_validate_false() {
+        let put = CallerRecordPut {
+            uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+            record: json!({"text": "hi"}),
+            swap_cid: Some("bafy123".to_string()),
+            validate: false,
+        };
+        let value = serde_json::to_value(&put).unwrap();
+        assert_eq!(value["swap_cid"], "bafy123");
+        assert_eq!(value["validate"], false);
+        assert_eq!(
+            serde_json::from_value::<CallerRecordPut>(value).unwrap(),
+            put
+        );
+    }
+
+    #[test]
+    fn caller_record_delete_round_trips() {
+        let delete = CallerRecordDelete {
+            uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(value["uri"], "at://did:plc:abc/app.bsky.feed.post/1");
+        assert_eq!(
+            serde_json::from_value::<CallerRecordDelete>(value).unwrap(),
+            delete
+        );
+    }
+
+    #[test]
+    fn caller_blob_upload_bytes_travel_like_an_http_body() {
+        // A UTF-8 payload serializes as a JSON string...
+        let text = CallerBlobUpload {
+            bytes: b"hello".to_vec(),
+            mime_type: "text/plain".to_string(),
+        };
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(value["bytes"], json!("hello"));
+        assert_eq!(
+            serde_json::from_value::<CallerBlobUpload>(value).unwrap(),
+            text
+        );
+
+        // ...and a non-UTF-8 payload serializes as a byte array, both ways.
+        let binary = CallerBlobUpload {
+            bytes: vec![0xff, 0xfe],
+            mime_type: "image/png".to_string(),
+        };
+        let value = serde_json::to_value(&binary).unwrap();
+        assert_eq!(value["bytes"], json!([255, 254]));
+        assert_eq!(
+            serde_json::from_value::<CallerBlobUpload>(value).unwrap(),
+            binary
+        );
+
+        // A caller may also send a byte array for text content.
+        let from_array: CallerBlobUpload = serde_json::from_value(json!({
+            "bytes": [104, 105],
+            "mime_type": "text/plain",
+        }))
+        .unwrap();
+        assert_eq!(from_array.bytes, b"hi");
+    }
+
+    #[test]
+    fn caller_xrpc_query_defaults_params_to_empty() {
+        let query: CallerXrpcQuery = serde_json::from_value(json!({
+            "method": "app.bsky.feed.getPosts",
+        }))
+        .unwrap();
+        assert_eq!(query.method, "app.bsky.feed.getPosts");
+        assert!(query.params.is_empty());
+
+        let with_params: CallerXrpcQuery = serde_json::from_value(json!({
+            "method": "app.bsky.feed.getPosts",
+            "params": {"uris": ["at://x"]},
+        }))
+        .unwrap();
+        assert_eq!(with_params.params["uris"], json!(["at://x"]));
+    }
+
+    #[test]
+    fn caller_xrpc_procedure_defaults_params_to_empty() {
+        let procedure: CallerXrpcProcedure = serde_json::from_value(json!({
+            "method": "com.atproto.repo.createRecord",
+            "input": {"collection": "app.bsky.feed.post"},
+        }))
+        .unwrap();
+        assert!(procedure.params.is_empty());
+        assert_eq!(procedure.input["collection"], "app.bsky.feed.post");
+    }
+
+    #[test]
+    fn index_put_defaults_did_and_cid_to_none() {
+        let put: IndexPut = serde_json::from_value(json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "abc123",
+            "record": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(put.did, None);
+        assert_eq!(put.cid, None);
+
+        let value = serde_json::to_value(&put).unwrap();
+        assert!(value.get("did").is_none());
+        assert!(value.get("cid").is_none());
+
+        let full = IndexPut {
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: "abc123".to_string(),
+            did: Some("did:plc:abc".to_string()),
+            record: json!({"text": "hi"}),
+            cid: Some("bafy123".to_string()),
+        };
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["did"], "did:plc:abc");
+        assert_eq!(value["cid"], "bafy123");
+        assert_eq!(serde_json::from_value::<IndexPut>(value).unwrap(), full);
+    }
+
+    #[test]
+    fn index_delete_round_trips() {
+        let delete = IndexDelete {
+            uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(
+            serde_json::from_value::<IndexDelete>(value).unwrap(),
+            delete
+        );
+    }
+
+    #[test]
+    fn lexicon_get_round_trips() {
+        let get = LexiconGet {
+            nsid: "app.bsky.feed.post".to_string(),
+        };
+        let value = serde_json::to_value(&get).unwrap();
+        assert_eq!(value["nsid"], "app.bsky.feed.post");
+        assert_eq!(serde_json::from_value::<LexiconGet>(value).unwrap(), get);
     }
 }

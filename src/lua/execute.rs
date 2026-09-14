@@ -38,6 +38,18 @@ impl Drop for ScriptTimingGuard {
     }
 }
 
+/// The text after the auth-error prefix, wherever it sits in the message.
+/// `mlua` wraps a raised error in its own context (`runtime error: ...`), so
+/// the prefix mlua's `Display` produces is no longer guaranteed to lead the
+/// string — `strip_prefix` would then miss it and the whole wrapped message,
+/// prefix included, would leak into the 401 body.
+fn auth_message_after_prefix(msg: &str) -> String {
+    match msg.find(LUA_AUTH_ERROR_PREFIX) {
+        Some(i) => msg[i + LUA_AUTH_ERROR_PREFIX.len()..].to_string(),
+        None => msg.to_string(),
+    }
+}
+
 /// Load all script variables from the database as a key-value map.
 async fn load_env_vars(db: &sqlx::AnyPool, backend: DatabaseBackend) -> HashMap<String, String> {
     let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
@@ -380,7 +392,16 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
-    let has_pds_auth = pds_auth_arc.is_some();
+    let caller_session = pds_auth_arc.clone().map(|pds_auth| {
+        Arc::new(crate::plugin::caller::CallerSession {
+            did: claims.did().to_string(),
+            delegate_did: delegate_did.map(|s| s.to_string()),
+            claims: claims_arc.clone(),
+            pds_auth,
+            app_state: state.clone(),
+        })
+    });
+    let has_pds_auth = caller_session.is_some();
     if let Err(e) = record::register_record_api(
         &lua,
         state_arc.clone(),
@@ -447,7 +468,8 @@ pub async fn execute_procedure_script(
         caller_did: Some(claims.did().to_string()),
         job_id: None,
     };
-    if let Err(e) = super::require_api::register_require(&lua, state, &identity, has_pds_auth).await
+    if let Err(e) =
+        super::require_api::register_require(&lua, state, &identity, caller_session).await
     {
         let error_message = format!("failed to register require api: {e}");
         log_event(
@@ -632,10 +654,7 @@ pub async fn execute_procedure_script(
             let app_error = if msg.contains(LUA_AUTH_ERROR_PREFIX)
                 || clean_msg.contains(LUA_AUTH_ERROR_PREFIX)
             {
-                let auth_msg = clean_msg
-                    .strip_prefix(LUA_AUTH_ERROR_PREFIX)
-                    .unwrap_or(&clean_msg)
-                    .to_string();
+                let auth_msg = auth_message_after_prefix(&clean_msg);
                 AppError::Auth(auth_msg)
             } else if msg.contains("execution limit") {
                 AppError::ScriptError {
@@ -991,7 +1010,7 @@ pub async fn execute_query_script(
         caller_did: claims.map(|c| c.did().to_string()),
         job_id: None,
     };
-    if let Err(e) = super::require_api::register_require(&lua, state, &identity, false).await {
+    if let Err(e) = super::require_api::register_require(&lua, state, &identity, None).await {
         let error_message = format!("failed to register require api: {e}");
         log_event(
             &state.db,
@@ -1163,10 +1182,7 @@ pub async fn execute_query_script(
             let app_error = if msg.contains(LUA_AUTH_ERROR_PREFIX)
                 || clean_msg.contains(LUA_AUTH_ERROR_PREFIX)
             {
-                let auth_msg = clean_msg
-                    .strip_prefix(LUA_AUTH_ERROR_PREFIX)
-                    .unwrap_or(&clean_msg)
-                    .to_string();
+                let auth_msg = auth_message_after_prefix(&clean_msg);
                 AppError::Auth(auth_msg)
             } else if msg.contains("execution limit") {
                 AppError::ScriptError {
@@ -1287,6 +1303,26 @@ mod tests {
             space_name: None,
             space_collections: None,
         }
+    }
+
+    #[test]
+    fn auth_message_survives_a_prefix_that_is_not_leading() {
+        let wrapped = format!(
+            "runtime error: caller.create_record: Plugin returned error: AUTH_REQUIRED - {}DPoP session not found",
+            LUA_AUTH_ERROR_PREFIX
+        );
+        assert_eq!(
+            auth_message_after_prefix(&wrapped),
+            "DPoP session not found"
+        );
+    }
+
+    #[test]
+    fn auth_message_falls_back_to_the_whole_string_without_a_prefix() {
+        assert_eq!(
+            auth_message_after_prefix("no prefix here"),
+            "no prefix here"
+        );
     }
 
     #[tokio::test]

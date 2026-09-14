@@ -594,7 +594,17 @@ pub(crate) fn register_atproto_blob_api(
                 let result =
                     upload_blob_to_pds(&state, claims.did(), &pds_auth, &content_type, blob_bytes)
                         .await
-                        .map_err(|e| mlua::Error::runtime(format!("blob_upload: {e}")))?;
+                        .map_err(|e| match e {
+                            // The PDS's body names the reason (`BlobTooLarge`, a bad MIME
+                            // type), which a script needs to act on.
+                            crate::error::AppError::PdsError(status, body) => {
+                                mlua::Error::runtime(format!(
+                                    "blob_upload: PDS uploadBlob returned {status}: {}",
+                                    String::from_utf8_lossy(&body)
+                                ))
+                            }
+                            other => mlua::Error::runtime(format!("blob_upload: {other}")),
+                        })?;
 
                 lua.to_value(&result)
             }
@@ -605,7 +615,7 @@ pub(crate) fn register_atproto_blob_api(
     Ok(())
 }
 
-async fn upload_blob_to_pds(
+pub(crate) async fn upload_blob_to_pds(
     state: &AppState,
     caller_did: &str,
     pds_auth: &crate::repo::PdsAuth,
@@ -638,6 +648,16 @@ async fn upload_blob_to_pds(
                 Ok(OutputDataOrBytes::Data(data)) => Ok(data),
                 Ok(OutputDataOrBytes::Bytes(bytes)) => serde_json::from_slice(&bytes)
                     .map_err(|e| AppError::Internal(format!("invalid uploadBlob response: {e}"))),
+                Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => {
+                    let status = axum::http::StatusCode::from_u16(xrpc_err.status.as_u16())
+                        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                    let body = xrpc_err
+                        .error
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    Err(AppError::PdsError(status, Bytes::from(body)))
+                }
                 Err(e) => Err(AppError::Internal(format!("PDS uploadBlob failed: {e}"))),
             }
         }
@@ -668,10 +688,9 @@ async fn upload_blob_to_pds(
                 .map_err(|e| AppError::Internal(format!("failed to read upload response: {e}")))?;
 
             if !status.is_success() {
-                let body_str = String::from_utf8_lossy(&body);
-                return Err(AppError::Internal(format!(
-                    "PDS uploadBlob returned {status}: {body_str}"
-                )));
+                let axum_status = axum::http::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                return Err(AppError::PdsError(axum_status, body));
             }
 
             serde_json::from_slice(&body)
