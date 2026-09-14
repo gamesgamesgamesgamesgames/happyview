@@ -206,6 +206,11 @@ pub struct RepoState {
     /// without a signature; the rebuild re-mints those.
     pub sig: Option<Vec<u8>>,
     pub mac: Option<Vec<u8>>,
+    /// Which host is authoritative for this repo.
+    pub host_mode: crate::spaces::host_mode::HostMode,
+    /// Last rev consumed from the PDS in native mode, for incremental
+    /// `listRepoOps`.
+    pub sync_cursor: Option<String>,
     pub updated_at: String,
 }
 

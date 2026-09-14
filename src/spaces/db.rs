@@ -793,7 +793,7 @@ pub async fn get_or_create_repo_state(
     author_did: &str,
 ) -> Result<RepoState, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, updated_at FROM happyview_space_repo_state WHERE space_id = ? AND author_did = ?",
+        "SELECT id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, host_mode, sync_cursor, updated_at FROM happyview_space_repo_state WHERE space_id = ? AND author_did = ?",
         backend,
     );
 
@@ -812,7 +812,7 @@ pub async fn get_or_create_repo_state(
     let now = now_rfc3339();
     let default_lthash = vec![0u8; 2048];
     let insert_sql = adapt_sql(
-        "INSERT INTO happyview_space_repo_state (id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, ?)",
+        "INSERT INTO happyview_space_repo_state (id, space_id, author_did, lthash_state, rev, hash, ikm, sig, mac, host_mode, sync_cursor, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 'polyfill', NULL, ?)",
         backend,
     );
     crate::db::query(&insert_sql)
@@ -835,6 +835,8 @@ pub async fn get_or_create_repo_state(
         ikm: None,
         sig: None,
         mac: None,
+        host_mode: crate::spaces::host_mode::HostMode::Polyfill,
+        sync_cursor: None,
         updated_at: now,
     })
 }
@@ -846,7 +848,7 @@ pub async fn update_repo_state(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "UPDATE happyview_space_repo_state SET lthash_state = ?, rev = ?, hash = ?, ikm = ?, sig = ?, mac = ?, updated_at = ? WHERE id = ?",
+        "UPDATE happyview_space_repo_state SET lthash_state = ?, rev = ?, hash = ?, ikm = ?, sig = ?, mac = ?, host_mode = ?, sync_cursor = ?, updated_at = ? WHERE id = ?",
         backend,
     );
 
@@ -857,6 +859,8 @@ pub async fn update_repo_state(
         .bind(&state.ikm)
         .bind(&state.sig)
         .bind(&state.mac)
+        .bind(state.host_mode.as_str())
+        .bind(&state.sync_cursor)
         .bind(&now)
         .bind(&state.id)
         .execute(executor)
@@ -876,6 +880,8 @@ type RepoStateRow = (
     Option<Vec<u8>>, // ikm
     Option<Vec<u8>>, // sig
     Option<Vec<u8>>, // mac
+    String,          // host_mode
+    Option<String>,  // sync_cursor
     String,          // updated_at
 );
 
@@ -890,7 +896,9 @@ fn parse_repo_state_row(r: RepoStateRow) -> Result<RepoState, AppError> {
         ikm: r.6,
         sig: r.7,
         mac: r.8,
-        updated_at: r.9,
+        host_mode: crate::spaces::host_mode::HostMode::parse_or_default(&r.9),
+        sync_cursor: r.10,
+        updated_at: r.11,
     })
 }
 
@@ -920,6 +928,24 @@ pub async fn delete_notify_registrations_for_service(
         .await
         .map_err(|e| AppError::Internal(format!("failed to delete notify registrations: {e}")))?;
     Ok(result.rows_affected())
+}
+
+/// Every `(space_id, author_did)` this DID owns that still lives on HappyView.
+pub async fn list_polyfill_repos_for_author(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    author_did: &str,
+) -> Result<Vec<(String, String)>, AppError> {
+    let sql = adapt_sql(
+        "SELECT space_id, author_did FROM happyview_space_repo_state \
+         WHERE author_did = ? AND host_mode = 'polyfill'",
+        backend,
+    );
+    crate::db::query_as(&sql)
+        .bind(author_did)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list polyfill repos: {e}")))
 }
 
 pub async fn register_notify(

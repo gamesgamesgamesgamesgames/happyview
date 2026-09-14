@@ -23,6 +23,7 @@ mod scripts;
 mod service_entries;
 mod service_identity;
 pub mod settings;
+pub mod spaces_migration;
 mod stats;
 mod telemetry;
 pub(crate) mod types;
@@ -72,6 +73,10 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route(
             "/backfill/{id}/details",
             delete(backfill::flush_backfill_details),
+        )
+        .route(
+            "/spaces/migration-status",
+            get(spaces_migration::migration_status),
         )
         .route("/jobs", get(jobs::list_jobs))
         .route("/jobs/{id}", get(jobs::get_job))

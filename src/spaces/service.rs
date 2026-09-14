@@ -273,6 +273,72 @@ pub(crate) async fn notify_ops(
     }
 }
 
+/// Whether this repo's writes still belong to HappyView, and if not, forward them.
+///
+/// The AppView does not belong in the write path:
+/// `createRecord`/`putRecord`/`deleteRecord`/`applyWrites` are `pds`-role
+/// methods, and a client holding the user's session should write to their PDS
+/// directly while HappyView only indexes.
+///
+/// This bridge is deprecated. It keeps existing clients working once their
+/// repos migrate. Remove it once clients write to PDSes directly.
+async fn forward_write_if_native(
+    state: &AppState,
+    space: &Space,
+    author_did: &str,
+    method: &str,
+    body: serde_json::Value,
+) -> Result<Option<serde_json::Value>, AppError> {
+    let mut conn = state
+        .db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+    let repo_state =
+        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, author_did).await?;
+    drop(conn);
+
+    if repo_state.host_mode.is_authoritative_here() {
+        return Ok(None);
+    }
+
+    tracing::warn!(
+        space_id = %space.id,
+        author_did,
+        method,
+        "forwarding a space write to the user's PDS; this bridge is deprecated and \
+         clients should write to the PDS directly"
+    );
+
+    // Without a usable session the write cannot reach the PDS, which is the
+    // source of truth. Writing locally instead would fork the two copies, and
+    // the next sync would drop the record.
+    let session = crate::repo::get_oauth_session(state, author_did)
+        .await
+        .map_err(|e| {
+            AppError::Forbidden(format!(
+                "this space lives on your PDS and HappyView cannot write to it for you; \
+             re-authenticate to continue writing ({e})"
+            ))
+        })?;
+
+    let resp = crate::repo::pds::pds_post_json_raw(state, &session, method, &body).await?;
+    if !resp.status().is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(AppError::BadGateway(format!(
+            "the user's PDS rejected {method}: {detail}"
+        )));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| AppError::Internal(format!("PDS returned invalid JSON: {e}")))?;
+    Ok(Some(value))
+}
+
 pub(crate) async fn create_record(
     state: &AppState,
     did: &str,
@@ -284,6 +350,36 @@ pub(crate) async fn create_record(
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
     check_collection_allowed(&space, collection)?;
+
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if let Some(forwarded) = forward_write_if_native(
+        state,
+        &space,
+        did,
+        "com.atproto.space.createRecord",
+        serde_json::json!({
+            "space": space_uri,
+            "collection": collection,
+            "record": record,
+        }),
+    )
+    .await?
+    {
+        let uri = forwarded
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let cid = forwarded
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        return Ok((uri, cid));
+    }
 
     let rkey = generate_tid();
     let cid = content_cid(&record)?;
@@ -352,6 +448,38 @@ pub(crate) async fn put_record(
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, space_credential).await?;
     check_collection_allowed(&space, collection)?;
+
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if let Some(forwarded) = forward_write_if_native(
+        state,
+        &space,
+        did,
+        "com.atproto.space.putRecord",
+        serde_json::json!({
+            "space": space_uri,
+            "collection": collection,
+            "rkey": rkey,
+            "record": record,
+            "swapRecord": swap_cid,
+        }),
+    )
+    .await?
+    {
+        let uri = forwarded
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let cid = forwarded
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        return Ok((uri, cid));
+    }
 
     let cid = content_cid(&record)?;
     let record_uri = format!(
@@ -432,6 +560,28 @@ pub(crate) async fn delete_record(
 ) -> Result<(), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, None).await?;
+
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if forward_write_if_native(
+        state,
+        &space,
+        did,
+        "com.atproto.space.deleteRecord",
+        serde_json::json!({
+            "space": space_uri,
+            "collection": collection,
+            "rkey": rkey,
+            "swapRecord": swap_cid,
+        }),
+    )
+    .await?
+    .is_some()
+    {
+        return Ok(());
+    }
 
     let record_uri = format!(
         "at://{}/space/{}/{}/{}/{}/{}",
@@ -1660,5 +1810,103 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(acc, Some(crate::spaces::types::MemberAccess::WRITE));
+    }
+}
+
+#[cfg(test)]
+mod native_write_bridge_tests {
+    use super::*;
+    use crate::spaces::host_mode::HostMode;
+
+    const USER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+
+    async fn state_with_space(mode: HostMode) -> (AppState, Space) {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let state = crate::test_support::test_state_with_pool(pool);
+
+        let space = Space {
+            id: "sp-bridge".into(),
+            did: USER.into(),
+            authority_did: USER.into(),
+            creator_did: USER.into(),
+            type_nsid: "com.example.forum".into(),
+            skey: "main".into(),
+            display_name: None,
+            description: None,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
+            app_access: AppAccess::Open,
+            config: SpaceConfig::default(),
+            revision: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+        db::create_space(&state.db, state.db_backend, &space)
+            .await
+            .expect("seed space");
+
+        let mut conn = state.db.acquire().await.unwrap();
+        let mut repo_state =
+            db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, USER)
+                .await
+                .unwrap();
+        repo_state.host_mode = mode;
+        db::update_repo_state(&mut *conn, state.db_backend, &repo_state)
+            .await
+            .unwrap();
+
+        (state, space)
+    }
+
+    #[tokio::test]
+    async fn a_polyfill_write_stays_local() {
+        let (state, space) = state_with_space(HostMode::Polyfill).await;
+        let forwarded = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("no error");
+        assert!(forwarded.is_none(), "polyfill writes must not be forwarded");
+    }
+
+    #[tokio::test]
+    async fn a_migrating_write_stays_local() {
+        // HappyView is still authoritative until the handoff verifies, so a
+        // write mid-migration belongs here, not on the PDS.
+        let (state, space) = state_with_space(HostMode::Migrating).await;
+        let forwarded = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("no error");
+        assert!(forwarded.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_native_write_without_a_session_fails() {
+        let (state, space) = state_with_space(HostMode::Native).await;
+        let err = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("a native write with no session must not write locally");
+
+        assert!(matches!(err, AppError::Forbidden(_)), "got {err:?}");
+        assert!(
+            format!("{err}").contains("re-authenticate"),
+            "the error should tell the user what to do: {err}"
+        );
     }
 }

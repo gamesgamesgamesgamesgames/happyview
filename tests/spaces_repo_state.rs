@@ -448,3 +448,98 @@ async fn list_repo_ops_paginates_within_a_batch_rev() {
         "every op in the batch must be visited exactly once, in order"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Host mode
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn a_new_repo_starts_in_polyfill_mode() {
+    common::require_db!();
+    let (app, space_id, space_uri, did) = setup("hostmode").await;
+    create_record(&app, &space_uri, &did, json!({ "text": "hi" })).await;
+
+    let mut conn = app.state.db.acquire().await.unwrap();
+    let state = happyview::spaces::db::get_or_create_repo_state(
+        &mut conn,
+        app.state.db_backend,
+        &space_id,
+        &did,
+    )
+    .await
+    .unwrap();
+
+    // Every repo starts where HappyView is authoritative; nothing is native
+    // until a migration has verified the handoff.
+    assert_eq!(
+        state.host_mode,
+        happyview::spaces::host_mode::HostMode::Polyfill
+    );
+    assert!(state.sync_cursor.is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn a_native_repo_refuses_local_writes_and_keeps_its_mode() {
+    common::require_db!();
+    let (app, space_id, space_uri, did) = setup("hostmode2").await;
+    create_record(&app, &space_uri, &did, json!({ "text": "one" })).await;
+
+    let mut conn = app.state.db.acquire().await.unwrap();
+    let mut state = happyview::spaces::db::get_or_create_repo_state(
+        &mut conn,
+        app.state.db_backend,
+        &space_id,
+        &did,
+    )
+    .await
+    .unwrap();
+    state.host_mode = happyview::spaces::host_mode::HostMode::Native;
+    state.sync_cursor = Some("3kcursor".into());
+    happyview::spaces::db::update_repo_state(&mut *conn, app.state.db_backend, &state)
+        .await
+        .unwrap();
+    drop(conn);
+
+    // Once the PDS is the source of truth, HappyView must not accept a local
+    // write; see `forward_write_if_native`.
+    let (name, value) = cookie_for(&app, &did);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.createRecord")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "space": space_uri,
+                "collection": "com.example.item",
+                "record": { "text": "two" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a native repo with no PDS session must refuse the write"
+    );
+
+    // The refusal must not change where the repo lives.
+    let mut conn = app.state.db.acquire().await.unwrap();
+    let after = happyview::spaces::db::get_or_create_repo_state(
+        &mut conn,
+        app.state.db_backend,
+        &space_id,
+        &did,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        after.host_mode,
+        happyview::spaces::host_mode::HostMode::Native
+    );
+    assert_eq!(after.sync_cursor.as_deref(), Some("3kcursor"));
+}

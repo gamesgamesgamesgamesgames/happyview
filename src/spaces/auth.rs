@@ -307,7 +307,11 @@ async fn check_user_access_with_managing_app(
         .unwrap_or(false))
 }
 
-async fn resolve_did_service_endpoint(
+/// Resolve a DID's `#atproto_pds` service endpoint from its DID document.
+///
+/// Shared with the login flow, which needs a PDS endpoint before it can ask
+/// whether that PDS serves spaces.
+pub(crate) async fn resolve_did_service_endpoint(
     http: &reqwest::Client,
     did: &str,
 ) -> Result<String, AppError> {

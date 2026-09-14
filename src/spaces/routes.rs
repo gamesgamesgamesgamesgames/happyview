@@ -1620,6 +1620,32 @@ async fn notify_write(
     let space = service::resolve_space(&state, &input.space).await?;
     service::require_space_admin(&state, &space, &did).await?;
 
+    // A notification for a repo hosted on the author's own PDS is our cue to
+    // pull: the write happened there, and our index has not seen it yet. This
+    // is a no-op for polyfill repos, where HappyView is the source of truth and
+    // there is nothing upstream.
+    match crate::spaces::native_sync::sync_repo(&state, &space, &input.did).await {
+        Ok(crate::spaces::native_sync::SyncOutcome::Diverged { expected, ours }) => {
+            // Incremental sync closed no gap. The sender did nothing wrong, so
+            // the notification still succeeds, and the divergence is logged as
+            // an error.
+            tracing::error!(
+                space_id = %space.id,
+                author_did = %input.did,
+                expected,
+                ours,
+                "native repo diverged after sync; full recovery needed"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            space_id = %space.id,
+            author_did = %input.did,
+            error = %e,
+            "failed to sync a native repo after a write notification"
+        ),
+    }
+
     notifications::dispatch_write_notification(
         &state.db,
         state.db_backend,

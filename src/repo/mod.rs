@@ -1,4 +1,4 @@
-mod pds;
+pub(crate) mod pds;
 pub(crate) mod session;
 mod upload_blob;
 

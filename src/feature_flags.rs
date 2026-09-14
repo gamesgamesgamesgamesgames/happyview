@@ -7,6 +7,10 @@ pub struct FeatureFlag;
 
 impl FeatureFlag {
     pub const SPACES_ENABLED: &str = "feature.spaces_enabled";
+    /// Opt-in, separate from `SPACES_ENABLED`: moving a user's data to their
+    /// PDS is a bigger step than serving spaces, so operators enable it
+    /// explicitly.
+    pub const SPACES_PDS_MIGRATION: &str = "feature.spaces_pds_migration";
 }
 
 pub async fn is_enabled(pool: &AnyPool, key: &str, backend: DatabaseBackend) -> bool {
