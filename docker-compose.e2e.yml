@@ -96,6 +96,9 @@ services:
       SESSION_SECRET: e2e-test-secret-that-is-at-least-32-bytes
       TOKEN_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
       JETSTREAM_URL: wss://jetstream1.us-east.bsky.network
+      # A closed port, so e2e runs never send snapshots to the production
+      # collector and the telemetry test sees a send fail.
+      TELEMETRY_COLLECTOR_URL: http://127.0.0.1:9/v1/snapshot
     ports:
       - "3200:3000"
     volumes:
