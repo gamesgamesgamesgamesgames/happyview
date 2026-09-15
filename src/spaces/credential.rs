@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::profile;
+use crate::spaces::commit::SpaceVerifyingKey;
 
 pub const DEFAULT_CREDENTIAL_TTL_SECS: u64 = 2 * 60 * 60; // 2 hours
 pub const DELEGATION_TOKEN_TTL_SECS: u64 = 60; // 60 seconds
@@ -77,10 +78,15 @@ pub fn sign_delegation_token(
     Ok(format!("{}.{}.{}", header_b64, payload_b64, sig_b64))
 }
 
+/// Verify a delegation token, accepting any of `accepted_aud`.
+///
+/// Callers pass both `{did}#atproto_space_host` and `{did}#atproto_pds`: proposal
+/// 0016 makes the dedicated service entry optional, and an authority that
+/// publishes none is addressed at its PDS endpoint instead.
 pub fn verify_delegation_token(
     token: &str,
     verifying_key: &K256VerifyingKey,
-    expected_aud: &str,
+    accepted_aud: &[&str],
 ) -> Result<DelegationTokenClaims, AppError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -142,7 +148,7 @@ pub fn verify_delegation_token(
         return Err(AppError::Auth("delegation token has expired".into()));
     }
 
-    if claims.aud != expected_aud {
+    if !accepted_aud.iter().any(|a| *a == claims.aud) {
         return Err(AppError::Auth(
             "delegation token audience does not match this host".into(),
         ));
@@ -189,6 +195,66 @@ pub fn sign_credential(
     let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     Ok(format!("{}.{}.{}", header_b64, payload_b64, sig_b64))
+}
+
+/// Verify a space credential against a key resolved from a DID document.
+///
+/// Accepts `ES256` or `ES256K` according to the curve of the key. An authority
+/// on a stock PDS signs with its secp256k1 `#atproto` key, so accepting only
+/// `ES256` would reject every such credential.
+pub fn verify_credential_with_key(
+    token: &str,
+    key: &SpaceVerifyingKey,
+) -> Result<SpaceCredentialClaims, AppError> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(AppError::Auth("invalid credential format".into()));
+    }
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| AppError::Auth("invalid credential header encoding".into()))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|_| AppError::Auth("invalid credential header".into()))?;
+
+    let expected_alg = match key {
+        SpaceVerifyingKey::P256(_) => "ES256",
+        SpaceVerifyingKey::K256(_) => "ES256K",
+    };
+    if header["alg"].as_str() != Some(expected_alg) {
+        return Err(AppError::Auth(format!(
+            "credential alg must be {expected_alg} for the issuer's signing key"
+        )));
+    }
+
+    if header["typ"].as_str() != Some(SPACE_CREDENTIAL_TYP) {
+        return Err(AppError::Auth(format!(
+            "credential typ must be {SPACE_CREDENTIAL_TYP}"
+        )));
+    }
+
+    let message = format!("{}.{}", parts[0], parts[1]);
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|_| AppError::Auth("invalid credential signature encoding".into()))?;
+    key.verify(message.as_bytes(), &sig_bytes)
+        .map_err(|_| AppError::Auth("credential signature verification failed".into()))?;
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| AppError::Auth("invalid credential payload encoding".into()))?;
+    let claims: SpaceCredentialClaims = serde_json::from_slice(&payload_bytes)
+        .map_err(|_| AppError::Auth("invalid credential payload".into()))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    if now >= claims.exp {
+        return Err(AppError::Auth("credential has expired".into()));
+    }
+
+    Ok(claims)
 }
 
 pub fn verify_credential(
@@ -272,6 +338,72 @@ pub fn p256_jwk_to_verifying_key(jwk: &serde_json::Value) -> Result<VerifyingKey
         .map_err(|_| AppError::Auth("invalid P-256 public key".into()))
 }
 
+/// Decode a `publicKeyMultibase` into a verifying key, accepting both curves
+/// atproto accounts use.
+///
+/// Multicodec prefixes: P-256 is `0x1200` (varint `80 24`), secp256k1 is `0xe7`
+/// (varint `e7 01`).
+pub fn multikey_to_space_key(public_key_multibase: &str) -> Result<SpaceVerifyingKey, AppError> {
+    let (_base, key_bytes) = multibase::decode(public_key_multibase)
+        .map_err(|e| AppError::Auth(format!("invalid multibase encoding: {e}")))?;
+
+    if key_bytes.len() < 2 {
+        return Err(AppError::Auth("multikey is too short".into()));
+    }
+
+    match (key_bytes[0], key_bytes[1]) {
+        (0x80, 0x24) => {
+            let key = VerifyingKey::from_sec1_bytes(&key_bytes[2..])
+                .map_err(|_| AppError::Auth("invalid P-256 public key bytes".into()))?;
+            Ok(SpaceVerifyingKey::P256(key))
+        }
+        (0xe7, 0x01) => {
+            let key = K256VerifyingKey::from_sec1_bytes(&key_bytes[2..])
+                .map_err(|_| AppError::Auth("invalid secp256k1 public key bytes".into()))?;
+            Ok(SpaceVerifyingKey::K256(key))
+        }
+        _ => Err(AppError::Auth(
+            "public key is neither a P-256 nor a secp256k1 multicodec key".into(),
+        )),
+    }
+}
+
+/// Resolve the key a space authority's credentials verify against.
+///
+/// Proposal 0016 makes `#atproto_space` optional: when it is absent the space
+/// signing key is the account's `#atproto` key, which is the case for every
+/// authority hosted on a stock PDS. A dedicated entry that is present but
+/// malformed is an error, not a reason to fall back, so a misconfigured
+/// authority is never verified against a key it did not nominate.
+pub fn resolve_space_key(did_doc: &profile::DidDocument) -> Result<SpaceVerifyingKey, AppError> {
+    // `ends_with("#atproto")` cannot match "#atproto_space", so these are disjoint.
+    if let Some(vm) = did_doc
+        .verification_method
+        .iter()
+        .find(|v| v.id.ends_with("#atproto_space"))
+    {
+        let mb = vm.public_key_multibase.as_deref().ok_or_else(|| {
+            AppError::Auth("#atproto_space verification method missing publicKeyMultibase".into())
+        })?;
+        return multikey_to_space_key(mb);
+    }
+
+    let vm = did_doc
+        .verification_method
+        .iter()
+        .find(|v| v.id.ends_with("#atproto"))
+        .ok_or_else(|| {
+            AppError::Auth(
+                "issuer DID has neither an #atproto_space nor an #atproto verification method"
+                    .into(),
+            )
+        })?;
+    let mb = vm.public_key_multibase.as_deref().ok_or_else(|| {
+        AppError::Auth("#atproto verification method missing publicKeyMultibase".into())
+    })?;
+    multikey_to_space_key(mb)
+}
+
 /// Convert a multibase-encoded P-256 public key (from a DID doc `publicKeyMultibase`)
 /// into a JWK suitable for `verify_credential`.
 pub fn multikey_to_p256_jwk(public_key_multibase: &str) -> Result<serde_json::Value, AppError> {
@@ -327,21 +459,8 @@ pub async fn verify_external_credential(
 
     let did_doc = profile::resolve_did_document(http, plc_url, &peek.iss).await?;
 
-    let vm = did_doc
-        .verification_method
-        .iter()
-        .find(|v| v.id.ends_with("#atproto_space"))
-        .ok_or_else(|| {
-            AppError::Auth("issuer DID has no #atproto_space verification method".into())
-        })?;
-
-    let multibase = vm
-        .public_key_multibase
-        .as_deref()
-        .ok_or_else(|| AppError::Auth("verification method missing publicKeyMultibase".into()))?;
-
-    let jwk = multikey_to_p256_jwk(multibase)?;
-    verify_credential(token, &jwk)
+    let key = resolve_space_key(&did_doc)?;
+    verify_credential_with_key(token, &key)
 }
 
 pub fn make_jti() -> String {
@@ -464,7 +583,8 @@ mod tests {
         let claims = make_delegation_claims();
 
         let token = sign_delegation_token(&claims, &signing_key).unwrap();
-        let verified = verify_delegation_token(&token, &verifying_key, &claims.aud).unwrap();
+        let verified =
+            verify_delegation_token(&token, &verifying_key, &[claims.aud.as_str()]).unwrap();
 
         assert_eq!(verified.iss, claims.iss);
         assert_eq!(verified.sub, claims.sub);
@@ -480,7 +600,7 @@ mod tests {
         let claims = make_delegation_claims();
 
         let token = sign_delegation_token(&claims, &signing_key).unwrap();
-        let result = verify_delegation_token(&token, &verifying_key, &claims.aud);
+        let result = verify_delegation_token(&token, &verifying_key, &[claims.aud.as_str()]);
         assert!(result.is_err());
     }
 
@@ -491,8 +611,11 @@ mod tests {
         let claims = make_delegation_claims();
 
         let token = sign_delegation_token(&claims, &signing_key).unwrap();
-        let result =
-            verify_delegation_token(&token, &verifying_key, "did:plc:wrong#atproto_space_host");
+        let result = verify_delegation_token(
+            &token,
+            &verifying_key,
+            &["did:plc:wrong#atproto_space_host"],
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("audience"));
     }
@@ -515,7 +638,7 @@ mod tests {
         };
 
         let token = sign_delegation_token(&claims, &signing_key).unwrap();
-        let result = verify_delegation_token(&token, &verifying_key, &claims.aud);
+        let result = verify_delegation_token(&token, &verifying_key, &[claims.aud.as_str()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expired"));
     }
@@ -539,7 +662,7 @@ mod tests {
             URL_SAFE_NO_PAD.encode(sig.to_bytes())
         );
 
-        let result = verify_delegation_token(&token, &verifying_key, &claims.aud);
+        let result = verify_delegation_token(&token, &verifying_key, &[claims.aud.as_str()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("typ"));
     }
@@ -624,5 +747,137 @@ mod tests {
         let result = multikey_to_p256_jwk(&encoded);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("P-256"));
+    }
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+
+    fn signed(aud: &str) -> (String, K256VerifyingKey) {
+        let sk = K256SigningKey::from_slice(&[0x55u8; 32]).unwrap();
+        let vk = *sk.verifying_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = DelegationTokenClaims {
+            iss: "did:plc:user".into(),
+            sub: "at://did:plc:auth/space/com.example.forum/main".into(),
+            aud: aud.to_string(),
+            iat: now,
+            exp: now + 60,
+            jti: "nonce".into(),
+        };
+        (sign_delegation_token(&claims, &sk).unwrap(), vk)
+    }
+
+    const ACCEPTED: [&str; 2] = [
+        "did:plc:auth#atproto_space_host",
+        "did:plc:auth#atproto_pds",
+    ];
+
+    #[test]
+    fn accepts_the_dedicated_space_host_audience() {
+        let (token, vk) = signed("did:plc:auth#atproto_space_host");
+        assert!(verify_delegation_token(&token, &vk, &ACCEPTED).is_ok());
+    }
+
+    #[test]
+    fn accepts_the_pds_audience_when_no_space_host_is_published() {
+        // See `verify_delegation_token` for why the PDS audience is accepted.
+        let (token, vk) = signed("did:plc:auth#atproto_pds");
+        assert!(verify_delegation_token(&token, &vk, &ACCEPTED).is_ok());
+    }
+
+    #[test]
+    fn still_rejects_an_audience_for_a_different_host() {
+        let (token, vk) = signed("did:plc:someoneelse#atproto_space_host");
+        assert!(verify_delegation_token(&token, &vk, &ACCEPTED).is_err());
+    }
+}
+
+#[cfg(test)]
+mod key_resolution_tests {
+    use super::*;
+
+    fn doc_with(methods: &[(&str, &str)]) -> profile::DidDocument {
+        profile::DidDocument {
+            also_known_as: vec![],
+            verification_method: methods
+                .iter()
+                .map(|(id, mb)| profile::DidVerificationMethod {
+                    id: (*id).to_string(),
+                    method_type: "Multikey".into(),
+                    public_key_multibase: Some((*mb).to_string()),
+                })
+                .collect(),
+            service: vec![],
+        }
+    }
+
+    /// Real multibase keys, generated below, so the decoder is exercised rather
+    /// than mocked.
+    fn p256_multibase() -> String {
+        let sk = SigningKey::from_slice(&[0x22u8; 32]).unwrap();
+        let point = sk.verifying_key().to_sec1_point(true);
+        let mut bytes = vec![0x80, 0x24];
+        bytes.extend_from_slice(point.as_bytes());
+        multibase::encode(multibase::Base::Base58Btc, bytes)
+    }
+
+    fn k256_multibase() -> String {
+        let sk = K256SigningKey::from_slice(&[0x11u8; 32]).unwrap();
+        let point = sk.verifying_key().to_sec1_point(true);
+        let mut bytes = vec![0xe7, 0x01];
+        bytes.extend_from_slice(point.as_bytes());
+        multibase::encode(multibase::Base::Base58Btc, bytes)
+    }
+
+    #[test]
+    fn prefers_the_dedicated_space_key_when_present() {
+        let doc = doc_with(&[
+            ("did:plc:test#atproto", &k256_multibase()),
+            ("did:plc:test#atproto_space", &p256_multibase()),
+        ]);
+        assert!(matches!(
+            resolve_space_key(&doc).expect("resolves"),
+            SpaceVerifyingKey::P256(_)
+        ));
+    }
+
+    #[test]
+    fn falls_back_to_the_atproto_key_when_the_space_key_is_absent() {
+        // The shape of every authority hosted on a stock PDS.
+        let doc = doc_with(&[("did:plc:test#atproto", &k256_multibase())]);
+        assert!(matches!(
+            resolve_space_key(&doc).expect("falls back"),
+            SpaceVerifyingKey::K256(_)
+        ));
+    }
+
+    #[test]
+    fn errors_when_the_dedicated_key_is_present_but_malformed() {
+        let doc = doc_with(&[
+            ("did:plc:test#atproto", &k256_multibase()),
+            ("did:plc:test#atproto_space", "zNOTAVALIDMULTIBASE!!"),
+        ]);
+        assert!(resolve_space_key(&doc).is_err());
+    }
+
+    #[test]
+    fn errors_when_no_usable_key_exists() {
+        assert!(resolve_space_key(&doc_with(&[])).is_err());
+    }
+
+    #[test]
+    fn atproto_suffix_match_does_not_capture_the_space_key() {
+        // "...#atproto_space".ends_with("#atproto") is false, so a document with
+        // only a space key must not be found by the fallback branch.
+        let doc = doc_with(&[("did:plc:test#atproto_space", &p256_multibase())]);
+        assert!(matches!(
+            resolve_space_key(&doc).expect("resolves via the dedicated branch"),
+            SpaceVerifyingKey::P256(_)
+        ));
     }
 }

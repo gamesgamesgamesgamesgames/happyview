@@ -255,6 +255,29 @@ async fn expand_permission_set(
                     out.push(format!("rpc:{lxm}?aud={}", urlencoding::encode(&p.aud)));
                 }
             }
+            happyview_scopes::IncludedPermission::Space(p) => {
+                // Emitted as one scope carrying every parameter, rather than
+                // one per action: a space grant's action set is not separable
+                // the way a repo collection's is, since `read` covers the whole
+                // space while writes are collection-scoped.
+                let mut scope = format!("space:{}", p.space_type);
+                let mut params: Vec<String> = vec![
+                    format!("authority={}", urlencoding::encode(&p.authority)),
+                    format!("skey={}", urlencoding::encode(&p.skey)),
+                ];
+                for collection in &p.collection {
+                    params.push(format!("collection={}", urlencoding::encode(collection)));
+                }
+                for action in &p.action {
+                    params.push(format!("action={}", action.as_str()));
+                }
+                for op in &p.manage {
+                    params.push(format!("manage={}", op.as_str()));
+                }
+                scope.push('?');
+                scope.push_str(&params.join("&"));
+                out.push(scope);
+            }
         }
     }
 }

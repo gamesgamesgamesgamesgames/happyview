@@ -9,7 +9,7 @@
 pub use happyview_scopes::RepoAction;
 use happyview_scopes::{
     AccountPermission, BlobPermission, IdentityPermission, IncludeScope, RepoPermission,
-    RpcPermission, ScopePermissions,
+    RpcPermission, ScopePermissions, SpacePermission,
 };
 
 /// The legacy `transition:` values that mean anything. An authorization server
@@ -60,6 +60,14 @@ pub fn validate(scope: &str) -> Result<(), String> {
                      like did:web:example.com%23service, and rpc:*?aud=* is not allowed"
                 )
             }
+        }),
+        "space" => SpacePermission::parse(scope).map(|_| ()).ok_or_else(|| {
+            format!(
+                "invalid space scope: {scope} — expected space:<spaceType> with optional \
+                 ?authority=<did|self|*>&skey=<key|*>&collection=<nsid|*>&action=<read|read_self|\
+                 create|update|delete>&manage=<create|update|delete>, repeating a key rather than \
+                 comma-joining its values"
+            )
         }),
         "identity" => IdentityPermission::parse(scope)
             .map(|_| ())
@@ -185,6 +193,35 @@ pub fn allows_blob(scopes: &[String], mime: &str) -> bool {
         .collect();
 
     ScopePermissions::from_scopes(canonical).allows_blob(&mime)
+}
+
+#[cfg(test)]
+mod space_scope_validation_tests {
+    use super::validate;
+
+    #[test]
+    fn space_scopes_validate_for_operators() {
+        assert!(validate("space:com.example.forum").is_ok());
+        assert!(validate("space:com.example.forum?action=read_self").is_ok());
+        assert!(validate("space:*?authority=*&collection=*").is_ok());
+        assert!(validate("space:com.example.forum?manage=create&manage=update").is_ok());
+    }
+
+    #[test]
+    fn an_invalid_space_scope_names_the_fix() {
+        // Without a `space` arm these read as "unknown scope", which tells an
+        // operator nothing about what is wrong.
+        let err = validate("space:com.example.forum?bogus=1").unwrap_err();
+        assert!(
+            err.contains("space:") && !err.contains("unknown scope"),
+            "message should explain the space grammar, got: {err}"
+        );
+
+        // Comma-joined values are the most common mistake, since every other
+        // list-ish syntax accepts them.
+        let err = validate("space:com.example.forum?action=read,create").unwrap_err();
+        assert!(err.contains("repeating a key"), "got: {err}");
+    }
 }
 
 #[cfg(test)]

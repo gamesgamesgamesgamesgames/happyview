@@ -48,7 +48,20 @@ async fn main() {
         "connected to database"
     );
 
-    match happyview::spaces::cid_backfill::run_if_needed(&db_pool, db_backend).await {
+    // The backfill re-mints commits, so it needs the space signing key.
+    let space_signing_key = match config.token_encryption_key.as_ref() {
+        Some(key) => happyview::spaces::service::signing_key_from_pool(&db_pool, db_backend, key)
+            .await
+            .ok(),
+        None => None,
+    };
+
+    match match space_signing_key.as_ref() {
+        Some(key) => {
+            happyview::spaces::cid_backfill::run_if_needed(&db_pool, db_backend, key).await
+        }
+        None => Ok(None),
+    } {
         Ok(Some(report)) if report.is_noop() => {
             info!("space CID backfill: nothing to repair");
         }
@@ -71,6 +84,27 @@ async fn main() {
         Err(e) => tracing::error!(
             error = %e,
             "space CID backfill failed; will retry on next startup"
+        ),
+    }
+
+    // One-time re-mint of every existing commit in the current commit format
+    // (HKDF-Expand-only MAC derivation, plus a signature). Commits are derived
+    // from records, which are not touched, so this recomputes rather than
+    // migrates. Each repo keeps its revision, since the record set is unchanged.
+    match match space_signing_key.as_ref() {
+        Some(key) => {
+            happyview::spaces::rebuild::run_commit_format_rebuild(&db_pool, db_backend, key).await
+        }
+        None => Ok(None),
+    } {
+        Ok(Some(rebuilt)) => info!(
+            repos = rebuilt,
+            "re-minted space commits in the current format"
+        ),
+        Ok(None) => { /* already completed */ }
+        Err(e) => tracing::error!(
+            error = %e,
+            "space commit format rebuild failed; will retry on next startup"
         ),
     }
 

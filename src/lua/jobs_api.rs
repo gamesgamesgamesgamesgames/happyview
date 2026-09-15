@@ -235,7 +235,9 @@ mod tests {
             logo_uri: None,
             tos_uri: None,
             policy_uri: None,
-            token_encryption_key: None,
+            // Spaces sign every commit with the `#atproto_space` key, which
+            // is stored encrypted, so space writes need this set.
+            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),

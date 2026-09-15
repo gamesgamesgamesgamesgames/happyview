@@ -8,6 +8,7 @@
 //! performs. Only internal Rust callers may enqueue these.
 
 pub mod delete_collection;
+pub mod migrate_space_repo;
 pub mod purge_event_logs;
 
 use crate::AppState;
@@ -19,7 +20,11 @@ use super::Job;
 pub const RESERVED_PREFIX: &str = "happyview.";
 
 /// Every implemented native job type.
-const NATIVE_TYPES: &[&str] = &["happyview.delete-collection", "happyview.purge-event-logs"];
+const NATIVE_TYPES: &[&str] = &[
+    "happyview.delete-collection",
+    "happyview.purge-event-logs",
+    migrate_space_repo::JOB_TYPE,
+];
 
 /// Whether a job type is reserved. Reserved-but-unimplemented types are still
 /// refused, so adding a handler later can never be shadowed by a user script
@@ -44,6 +49,7 @@ pub async fn execute(state: &AppState, job: &Job) -> NativeOutcome {
     match job.job_type.as_str() {
         "happyview.delete-collection" => delete_collection::run(state, job).await,
         "happyview.purge-event-logs" => purge_event_logs::run(state, job).await,
+        migrate_space_repo::JOB_TYPE => migrate_space_repo::run(state, job).await,
         other => NativeOutcome::Failed(format!("no native handler for job type '{other}'")),
     }
 }
@@ -71,6 +77,15 @@ mod tests {
         // Reserved but unimplemented: still refused to callers, but not dispatched.
         assert!(!is_native("happyview.not-a-real-job"));
         assert!(!is_native("pet.trezy.reset-account"));
+    }
+
+    #[test]
+    fn the_migration_job_is_native_and_reserved() {
+        // Both lists must agree: missing from NATIVE_TYPES and the job is
+        // refused at enqueue; missing from `execute` and it is accepted then
+        // never dispatched.
+        assert!(is_native(migrate_space_repo::JOB_TYPE));
+        assert!(is_reserved(migrate_space_repo::JOB_TYPE));
     }
 
     #[test]

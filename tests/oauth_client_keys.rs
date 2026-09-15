@@ -646,10 +646,11 @@ async fn rotation_survives_for_a_session_pinned_to_the_old_key() {
     // A session established after rotation, pinned to the new current key.
     common::insert_oauth_session(pool, backend, "did:plc:post-rotation", Some(&key_b.kid)).await;
 
+    // Rotation encrypts with the app's key, so loading must use the same one.
     let keys = happyview::oauth::client_keys::load_keys(
         pool,
         backend,
-        None,
+        app.state.config.token_encryption_key.as_ref(),
         happyview::oauth::client_keys::INSTANCE_OWNER,
     )
     .await

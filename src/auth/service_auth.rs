@@ -291,6 +291,117 @@ pub struct PublicJwtPayload {
     pub exp: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Outbound service auth
+// ---------------------------------------------------------------------------
+
+/// Default lifetime for a minted service-auth token.
+///
+/// A service-auth token authorizes one call to one method on one audience, so
+/// it needs only enough life to cross the network.
+pub const OUTBOUND_SERVICE_JWT_TTL_SECS: u64 = 60;
+
+/// The DID this instance signs as.
+///
+/// `did:web` derives from the public URL rather than a request Host header,
+/// because outbound calls have no inbound request to read one from.
+pub async fn instance_did(
+    pool: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    public_url: &str,
+) -> Result<String, AppError> {
+    let identity = crate::service_identity::get_identity(pool, backend)
+        .await?
+        .ok_or_else(|| AppError::Internal("no service identity configured".into()))?;
+
+    if identity.mode == crate::service_identity::IdentityMode::NotExposed {
+        return Err(AppError::Internal(
+            "service identity is not exposed, so this instance cannot sign service auth".into(),
+        ));
+    }
+
+    match identity.mode {
+        crate::service_identity::IdentityMode::DidWeb => {
+            let trimmed = public_url.trim().trim_end_matches('/');
+            let host = trimmed
+                .rsplit("://")
+                .next()
+                .filter(|h| !h.is_empty())
+                .ok_or_else(|| {
+                    AppError::Internal("PUBLIC_URL is required to derive a did:web".into())
+                })?;
+            Ok(format!("did:web:{}", host.replace(':', "%3A")))
+        }
+        _ => identity
+            .did
+            .ok_or_else(|| AppError::Internal("service identity has no DID".into())),
+    }
+}
+
+/// Mint a service-auth JWT signed by this instance's `#atproto` key.
+///
+/// The instance key is P-256 (see `generate_encrypted_signing_key`), and the DID
+/// document publishes it under `#atproto`, so the token is `ES256`. Delegation
+/// tokens are `ES256K` because an account key signs them.
+///
+/// `lxm` binds the token to a single method, so a captured token cannot be
+/// replayed against a different endpoint on the same audience.
+pub async fn mint_service_auth(
+    pool: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    encryption_key: &[u8; 32],
+    public_url: &str,
+    aud: &str,
+    lxm: &str,
+) -> Result<String, AppError> {
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+
+    let iss = instance_did(pool, backend, public_url).await?;
+
+    let identity = crate::service_identity::get_identity(pool, backend)
+        .await?
+        .ok_or_else(|| AppError::Internal("no service identity configured".into()))?;
+    let enc_b64 = identity
+        .signing_key_enc
+        .ok_or_else(|| AppError::Internal("service identity has no signing key".into()))?;
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(&enc_b64)
+        .map_err(|e| AppError::Internal(format!("invalid signing key encoding: {e}")))?;
+    let private_bytes = crate::plugin::encryption::decrypt(encryption_key, &encrypted)
+        .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
+    let signing_key = SigningKey::from_slice(&private_bytes)
+        .map_err(|e| AppError::Internal(format!("invalid service signing key: {e}")))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| AppError::Internal(format!("clock error: {e}")))?
+        .as_secs();
+
+    let header = serde_json::json!({
+        "alg": "ES256",
+        "typ": "JWT",
+        "kid": format!("{iss}#atproto"),
+    });
+    let payload = serde_json::json!({
+        "iss": iss,
+        "aud": aud,
+        "lxm": lxm,
+        "iat": now,
+        "exp": now + OUTBOUND_SERVICE_JWT_TTL_SECS,
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let message = format!("{header_b64}.{payload_b64}");
+    let sig: Signature = signing_key.sign(message.as_bytes());
+
+    Ok(format!(
+        "{message}.{}",
+        URL_SAFE_NO_PAD.encode(sig.to_bytes())
+    ))
+}
+
 /// Decode the JWT payload without verification.
 ///
 /// Call this *after* `ServiceAuth::from_bearer` has already validated the
@@ -451,5 +562,148 @@ mod tests {
         let encoded = multibase::encode(multibase::Base::Base58Btc, &bytes);
         let result = decode_multibase_key(&encoded, "Multikey").unwrap();
         assert_eq!(result, vec![0xAA, 0xBB, 0xCC]);
+    }
+}
+
+#[cfg(test)]
+mod outbound_tests {
+    use super::*;
+
+    fn decode_part(part: &str) -> serde_json::Value {
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(part).expect("b64")).expect("json")
+    }
+
+    async fn seeded_pool() -> (sqlx::AnyPool, crate::db::DatabaseBackend, [u8; 32]) {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = crate::db::DatabaseBackend::Sqlite;
+        let key = crate::test_support::TEST_ENCRYPTION_KEY;
+
+        // Store a P-256 key the way setup does: encrypted, base64 STANDARD.
+        let private = [0x33u8; 32];
+        let encrypted = crate::plugin::encryption::encrypt(&key, &private).expect("encrypt");
+        let enc_b64 = base64::engine::general_purpose::STANDARD.encode(&encrypted);
+
+        crate::service_identity::upsert_identity(
+            &pool,
+            backend,
+            &crate::service_identity::IdentityMode::DidPlc,
+            Some("did:plc:instance"),
+            Some(&enc_b64),
+            None,
+            None,
+        )
+        .await
+        .expect("seed identity");
+
+        (pool, backend, key)
+    }
+
+    #[tokio::test]
+    async fn minted_token_is_es256_and_binds_aud_and_lxm() {
+        let (pool, backend, key) = seeded_pool().await;
+
+        let token = mint_service_auth(
+            &pool,
+            backend,
+            &key,
+            "https://hv.example",
+            "did:web:app.example.com#forum",
+            "com.atproto.simplespace.checkUserAccess",
+        )
+        .await
+        .expect("mint");
+
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        let header = decode_part(parts[0]);
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["kid"], "did:plc:instance#atproto");
+
+        let payload = decode_part(parts[1]);
+        assert_eq!(payload["iss"], "did:plc:instance");
+        assert_eq!(payload["aud"], "did:web:app.example.com#forum");
+        assert_eq!(payload["lxm"], "com.atproto.simplespace.checkUserAccess");
+        assert!(payload["exp"].as_u64().unwrap() > payload["iat"].as_u64().unwrap());
+        assert!(!payload["jti"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn minted_signature_verifies_against_the_published_key() {
+        let (pool, backend, key) = seeded_pool().await;
+
+        let token = mint_service_auth(
+            &pool,
+            backend,
+            &key,
+            "https://hv.example",
+            "did:web:app#f",
+            "com.atproto.simplespace.checkUserAccess",
+        )
+        .await
+        .expect("mint");
+
+        let parts: Vec<&str> = token.split('.').collect();
+        let message = format!("{}.{}", parts[0], parts[1]);
+        let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).expect("sig b64");
+
+        let signing = p256::ecdsa::SigningKey::from_slice(&[0x33u8; 32]).unwrap();
+        let verifying = signing.verifying_key();
+        let sig = P256Signature::from_slice(&sig_bytes).expect("sig");
+        verifying
+            .verify(message.as_bytes(), &sig)
+            .expect("a managing app must be able to verify this against our DID doc key");
+    }
+
+    #[tokio::test]
+    async fn did_web_instances_derive_their_did_from_the_public_url() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = crate::db::DatabaseBackend::Sqlite;
+        crate::service_identity::upsert_identity(
+            &pool,
+            backend,
+            &crate::service_identity::IdentityMode::DidWeb,
+            None,
+            Some("x"),
+            None,
+            None,
+        )
+        .await
+        .expect("seed");
+
+        let did = instance_did(&pool, backend, "https://hv.example.com/")
+            .await
+            .unwrap();
+        assert_eq!(did, "did:web:hv.example.com");
+
+        let did = instance_did(&pool, backend, "https://hv.example.com:8443")
+            .await
+            .unwrap();
+        assert_eq!(did, "did:web:hv.example.com%3A8443");
+    }
+
+    #[tokio::test]
+    async fn a_not_exposed_identity_refuses_to_sign() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = crate::db::DatabaseBackend::Sqlite;
+        crate::service_identity::upsert_identity(
+            &pool,
+            backend,
+            &crate::service_identity::IdentityMode::NotExposed,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed");
+
+        // An instance with no published DID document has no key anyone could
+        // verify a token against.
+        assert!(
+            instance_did(&pool, backend, "https://hv.example")
+                .await
+                .is_err()
+        );
     }
 }

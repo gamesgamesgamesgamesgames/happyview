@@ -2,9 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::lua::tid::generate_tid;
-use crate::spaces::lthash::{LtHashState, record_element};
-use crate::spaces::{commit, db};
+use crate::spaces::rebuild;
 
 type RecordVersion = (String, String, String, String, String);
 
@@ -48,17 +46,19 @@ async fn read_marker(
 pub async fn run_if_needed(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
+    signing_key: &p256::ecdsa::SigningKey,
 ) -> Result<Option<BackfillReport>, AppError> {
     if read_marker(pool, backend).await?.is_some() {
         return Ok(None);
     }
-    Ok(Some(run(pool, backend, false).await?))
+    Ok(Some(run(pool, backend, false, signing_key).await?))
 }
 
 pub async fn run(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     dry_run: bool,
+    signing_key: &p256::ecdsa::SigningKey,
 ) -> Result<BackfillReport, AppError> {
     let mut report = BackfillReport::default();
 
@@ -202,45 +202,18 @@ pub async fn run(
     repos.extend(existing);
 
     for (space_id, author_did) in repos {
-        let Some(space) = db::get_space(&mut *tx, backend, &space_id).await? else {
-            tracing::warn!(space_id, "repo state references a missing space; skipping");
-            continue;
-        };
-
-        let sql = adapt_sql(
-            "SELECT collection, rkey, cid FROM happyview_space_records WHERE space_id = ? AND author_did = ?",
+        if rebuild::rebuild_repo_state(
+            &mut tx,
             backend,
-        );
-        let records: Vec<(String, String, String)> = crate::db::query_as(&sql)
-            .bind(&space_id)
-            .bind(&author_did)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to load records for rebuild: {e}")))?;
-
-        let mut set_hash = LtHashState::new();
-        for (collection, rkey, cid) in &records {
-            set_hash.add(&record_element(collection, rkey, cid));
+            &space_id,
+            &author_did,
+            signing_key,
+            rebuild::RevPolicy::Advance,
+        )
+        .await?
+        {
+            report.repos_rebuilt += 1;
         }
-
-        let space_uri = format!(
-            "at://{}/space/{}/{}",
-            space.did, space.type_nsid, space.skey
-        );
-        let rev = generate_tid();
-        let signed = commit::sign_commit(&set_hash.hash(), &space_uri, &author_did, &rev)?;
-
-        let mut repo_state =
-            db::get_or_create_repo_state(&mut tx, backend, &space_id, &author_did).await?;
-        repo_state.lthash_state = set_hash.as_bytes().to_vec();
-        repo_state.rev = Some(signed.rev);
-        repo_state.hash = Some(signed.hash.to_vec());
-        repo_state.ikm = Some(signed.ikm.to_vec());
-        repo_state.mac = Some(signed.mac.to_vec());
-        db::update_repo_state(&mut *tx, backend, &repo_state).await?;
-
-        db::update_space_revision(&mut *tx, backend, &space_id, &rev).await?;
-        report.repos_rebuilt += 1;
     }
 
     let now = now_rfc3339();

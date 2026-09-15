@@ -354,6 +354,40 @@ pub(crate) async fn forward_pds_response(resp: reqwest::Response) -> Result<Resp
     }
 }
 
+/// GET an XRPC query on the user's PDS with their OAuth session.
+///
+/// The counterpart to [`pds_post_json_raw`], for reads: every space read method
+/// is a query.
+pub(crate) async fn pds_get_json(
+    _state: &AppState,
+    session: &HappyViewOAuthSession,
+    xrpc_method: &str,
+    params: &[(&str, String)],
+) -> Result<Value, AppError> {
+    let request = XrpcRequest {
+        method: Method::GET,
+        nsid: xrpc_method.to_string(),
+        parameters: Some(
+            params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect::<std::collections::BTreeMap<String, String>>(),
+        ),
+        input: None::<InputDataOrBytes<()>>,
+        encoding: None,
+    };
+
+    let result: Result<OutputDataOrBytes<Value>, atrium_xrpc::Error<Value>> =
+        session.send_xrpc(&request).await;
+
+    match result {
+        Ok(OutputDataOrBytes::Data(data)) => Ok(data),
+        Ok(OutputDataOrBytes::Bytes(bytes)) => serde_json::from_slice(&bytes)
+            .map_err(|e| AppError::Internal(format!("PDS returned invalid JSON: {e}"))),
+        Err(e) => Err(AppError::Internal(format!("PDS query failed: {e}"))),
+    }
+}
+
 /// POST JSON to a PDS XRPC endpoint using the OAuth session.
 /// Uses `send_xrpc` so the OAuthSession attaches DPoP proof and Bearer token.
 pub(crate) async fn pds_post_json_raw(
