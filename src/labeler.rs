@@ -501,45 +501,10 @@ pub async fn spawn_label_gc(db: sqlx::AnyPool, backend: DatabaseBackend) {
 
     let interval = tokio::time::Duration::from_secs(3600); // 1 hour
 
-    // Build database-specific cleanup query for expired labels
-    let expired_sql = match backend {
-        DatabaseBackend::Sqlite => {
-            "DELETE FROM happyview_labels WHERE exp IS NOT NULL AND exp < datetime('now')"
-                .to_string()
-        }
-        DatabaseBackend::Postgres => {
-            "DELETE FROM happyview_labels WHERE exp IS NOT NULL AND exp < NOW()".to_string()
-        }
-    };
-
     loop {
         tokio::time::sleep(interval).await;
 
-        // Delete expired labels.
-        let expired = crate::db::query(&expired_sql).execute(&db).await;
-
-        let expired_count = match expired {
-            Ok(r) => r.rows_affected(),
-            Err(e) => {
-                tracing::warn!("failed to clean up expired labels: {e}");
-                0
-            }
-        };
-
-        // Delete orphaned labels (no matching record).
-        let orphaned = crate::db::query(
-            "DELETE FROM happyview_labels WHERE NOT EXISTS (SELECT 1 FROM happyview_records WHERE happyview_records.uri = happyview_labels.uri)",
-        )
-        .execute(&db)
-        .await;
-
-        let orphaned_count = match orphaned {
-            Ok(r) => r.rows_affected(),
-            Err(e) => {
-                tracing::warn!("failed to clean up orphaned labels: {e}");
-                0
-            }
-        };
+        let (expired_count, orphaned_count) = run_label_gc(&db, backend).await;
 
         let total = expired_count + orphaned_count;
         if total > 0 {
@@ -550,4 +515,44 @@ pub async fn spawn_label_gc(db: sqlx::AnyPool, backend: DatabaseBackend) {
             );
         }
     }
+}
+
+/// Run one garbage collection pass. Returns `(expired, orphaned)` row counts.
+///
+/// Only record labels (`at://` subjects) can be orphaned. Account labels have
+/// a bare DID subject that never matches a record URI, so they are kept until
+/// they expire or are negated.
+pub async fn run_label_gc(db: &sqlx::AnyPool, backend: DatabaseBackend) -> (u64, u64) {
+    let expired_sql = match backend {
+        DatabaseBackend::Sqlite => {
+            "DELETE FROM happyview_labels WHERE exp IS NOT NULL AND exp < datetime('now')"
+        }
+        DatabaseBackend::Postgres => {
+            "DELETE FROM happyview_labels WHERE exp IS NOT NULL AND exp < NOW()"
+        }
+    };
+
+    let expired_count = match crate::db::query(expired_sql).execute(db).await {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            tracing::warn!("failed to clean up expired labels: {e}");
+            0
+        }
+    };
+
+    let orphaned = crate::db::query(
+        "DELETE FROM happyview_labels WHERE uri LIKE 'at://%' AND NOT EXISTS (SELECT 1 FROM happyview_records WHERE happyview_records.uri = happyview_labels.uri)",
+    )
+    .execute(db)
+    .await;
+
+    let orphaned_count = match orphaned {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            tracing::warn!("failed to clean up orphaned labels: {e}");
+            0
+        }
+    };
+
+    (expired_count, orphaned_count)
 }
