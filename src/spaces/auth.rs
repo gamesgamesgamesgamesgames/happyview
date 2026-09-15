@@ -18,16 +18,17 @@ pub struct IssuedCredential {
     pub expires_at: String,
 }
 
-/// What the managing-app call needs in order to authenticate itself.
+/// What the managing-app call needs: the PLC directory to find the app's
+/// endpoint, and what it takes to mint the service-auth token the app requires.
 ///
-/// Bundled rather than threaded as four more parameters: everything here exists
-/// only to mint the service-auth token the managing app requires.
+/// Bundled rather than threaded through as separate parameters.
 #[derive(Clone, Copy)]
 pub struct ServiceAuthCtx<'a> {
     pub pool: &'a sqlx::AnyPool,
     pub backend: DatabaseBackend,
     pub encryption_key: &'a [u8; 32],
     pub public_url: &'a str,
+    pub plc_url: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -37,6 +38,7 @@ pub async fn issue_credential(
     http: &reqwest::Client,
     encryption_key: &[u8; 32],
     public_url: &str,
+    plc_url: &str,
     space: &Space,
     subject_did: &str,
     client_id: Option<&str>,
@@ -47,6 +49,7 @@ pub async fn issue_credential(
         backend,
         encryption_key,
         public_url,
+        plc_url,
     };
     check_app_access(space, client_id)?;
     check_mint_policy(http, auth_ctx, space, subject_did, client_id, authority_did).await?;
@@ -229,7 +232,7 @@ async fn check_user_access_with_managing_app(
     }
 
     // Resolve the managing app's PDS/service endpoint from its DID document.
-    let endpoint = resolve_did_service_endpoint(http, did).await?;
+    let endpoint = resolve_did_service_endpoint(http, auth_ctx.plc_url, did).await?;
 
     let url = format!(
         "{}/xrpc/com.atproto.simplespace.checkUserAccess",
@@ -313,10 +316,11 @@ async fn check_user_access_with_managing_app(
 /// whether that PDS serves spaces.
 pub(crate) async fn resolve_did_service_endpoint(
     http: &reqwest::Client,
+    plc_url: &str,
     did: &str,
 ) -> Result<String, AppError> {
     let url = if did.starts_with("did:plc:") {
-        format!("https://plc.directory/{did}")
+        format!("{}/{did}", plc_url.trim_end_matches('/'))
     } else if did.starts_with("did:web:") {
         let identifier = did.strip_prefix("did:web:").unwrap();
         let mut segments = identifier.split(':');
@@ -571,8 +575,32 @@ mod tests {
         assert!(check_app_access(&space, Some("any-client")).is_err());
     }
 
-    // resolve_did_service_endpoint is async and makes HTTP calls to resolve DID
-    // documents, so it cannot be unit-tested without a mock HTTP server.
+    #[tokio::test]
+    async fn a_did_plc_endpoint_is_resolved_through_the_configured_directory() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let plc = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/did:plc:resolveme"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "did:plc:resolveme",
+                "service": [{
+                    "id": "#atproto_pds",
+                    "type": "AtprotoPersonalDataServer",
+                    "serviceEndpoint": "http://pds.test",
+                }],
+            })))
+            .expect(1)
+            .mount(&plc)
+            .await;
+
+        let endpoint =
+            resolve_did_service_endpoint(&reqwest::Client::new(), &plc.uri(), "did:plc:resolveme")
+                .await
+                .expect("resolves");
+        assert_eq!(endpoint, "http://pds.test");
+    }
 
     #[test]
     fn generate_keypair_produces_valid_jwk() {

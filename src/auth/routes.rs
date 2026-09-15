@@ -129,8 +129,12 @@ async fn space_support_for_handle(state: &AppState, handle: &str) -> bool {
     let Ok(resolved) = crate::identity::resolve_identifier(handle).await else {
         return false;
     };
-    let Ok(endpoint) =
-        crate::spaces::auth::resolve_did_service_endpoint(&state.http, &resolved.did).await
+    let Ok(endpoint) = crate::spaces::auth::resolve_did_service_endpoint(
+        &state.http,
+        &state.config.plc_url,
+        &resolved.did,
+    )
+    .await
     else {
         return false;
     };

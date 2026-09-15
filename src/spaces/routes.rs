@@ -1743,6 +1743,7 @@ async fn get_space_credential(
         &state.http,
         encryption_key,
         &state.config.public_url,
+        &state.config.plc_url,
         &space,
         &delegation_claims.iss,
         client_id.as_deref(),
