@@ -1,3 +1,5 @@
+import { Suspense } from "react";
+
 import ScriptDetail from "./script-detail";
 
 // https://github.com/vercel/next.js/issues/71862
@@ -7,5 +9,9 @@ export async function generateStaticParams() {
 }
 
 export default function ScriptDetailPage() {
-  return <ScriptDetail />;
+  return (
+    <Suspense>
+      <ScriptDetail />
+    </Suspense>
+  );
 }

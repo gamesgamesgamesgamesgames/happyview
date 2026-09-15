@@ -32,6 +32,7 @@ import {
   type ScriptFormState,
   composeTriggerId,
   isValidJobType,
+  scriptsReturnHref,
 } from "../script-form";
 
 function NewScriptInner() {
@@ -48,6 +49,7 @@ function NewScriptInner() {
   const [lexiconsLoading, setLexiconsLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const returnHref = scriptsReturnHref(searchParams);
 
   // If the URL changes (e.g. user navigates with new ?id=...), refresh state.
   useEffect(() => {
@@ -109,7 +111,11 @@ function NewScriptInner() {
         description: state.description.trim() || null,
       });
       savedRef.current = true;
-      router.push(`/dashboard/settings/scripts/${encodeURIComponent(id)}`);
+      router.push(
+        searchParams.has("lexicon")
+          ? returnHref
+          : `/dashboard/settings/scripts/${encodeURIComponent(id)}`,
+      );
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -119,7 +125,7 @@ function NewScriptInner() {
       // the way out strands the form with no way back.
       setSaving(false);
     }
-  }, [canSave, state, router]);
+  }, [canSave, state, router, searchParams, returnHref]);
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -135,7 +141,7 @@ function NewScriptInner() {
   if (!hasPermission("scripts:manage")) {
     return (
       <>
-        <SiteHeader title="New script" backHref="/dashboard/settings/scripts" />
+        <SiteHeader title="New script" backHref={returnHref} />
         <div className="p-4 md:p-6">
           <p className="text-destructive text-sm">
             You don&apos;t have permission to create scripts.
@@ -147,7 +153,7 @@ function NewScriptInner() {
 
   return (
     <>
-      <SiteHeader title="New script" backHref="/dashboard/settings/scripts" />
+      <SiteHeader title="New script" backHref={returnHref} />
       <div className="flex flex-col flex-1 min-h-0">
         <div className="flex flex-col flex-1 min-h-0 gap-6 p-4 md:p-6">
           {error && <p className="text-destructive text-sm">{error}</p>}
@@ -170,7 +176,7 @@ function NewScriptInner() {
                   <AlertDialogCancel>Keep editing</AlertDialogCancel>
                   <AlertDialogAction
                     variant="destructive"
-                    onClick={() => router.push("/dashboard/settings/scripts")}
+                    onClick={() => router.push(returnHref)}
                   >
                     Discard
                   </AlertDialogAction>
@@ -180,7 +186,7 @@ function NewScriptInner() {
           ) : (
             <Button
               variant="outline"
-              onClick={() => router.push("/dashboard/settings/scripts")}
+              onClick={() => router.push(returnHref)}
             >
               Cancel
             </Button>

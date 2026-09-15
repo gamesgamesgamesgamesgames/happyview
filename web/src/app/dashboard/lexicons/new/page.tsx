@@ -180,11 +180,11 @@ export default function AddLexiconPage() {
     setSubmitting(true);
     try {
       const lexiconJson = JSON.parse(json);
-      await uploadLexicon({
+      const { id } = await uploadLexicon({
         lexicon_json: lexiconJson,
         backfill: localMainType === "record" && backfill,
       });
-      router.push("/dashboard/lexicons");
+      router.push(`/dashboard/lexicons/${encodeURIComponent(id)}`);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
       setSubmitting(false);
@@ -195,13 +195,13 @@ export default function AddLexiconPage() {
     setError(null);
     setSubmitting(true);
     try {
-      await addNetworkLexicon({
+      const added = await addNetworkLexicon({
         nsid,
         target_collection: showNetworkTargetCollection
           ? networkTargetCollection || undefined
           : undefined,
       });
-      router.push("/dashboard/lexicons");
+      router.push(`/dashboard/lexicons/${encodeURIComponent(added.nsid)}`);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
       setSubmitting(false);
