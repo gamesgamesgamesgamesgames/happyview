@@ -339,6 +339,17 @@ async fn forward_write_if_native(
     Ok(Some(value))
 }
 
+/// Add `swapRecord` to a forwarded write only when the caller gave one.
+///
+/// `"swapRecord": null` is not the same as leaving it out: it asks the PDS to
+/// write only if no record exists, so an unconditional update would fail.
+fn with_swap_record(mut body: serde_json::Value, swap_cid: Option<&str>) -> serde_json::Value {
+    if let Some(swap) = swap_cid {
+        body["swapRecord"] = serde_json::json!(swap);
+    }
+    body
+}
+
 pub(crate) async fn create_record(
     state: &AppState,
     did: &str,
@@ -362,6 +373,7 @@ pub(crate) async fn create_record(
         "com.atproto.space.createRecord",
         serde_json::json!({
             "space": space_uri,
+            "repo": did,
             "collection": collection,
             "record": record,
         }),
@@ -458,13 +470,16 @@ pub(crate) async fn put_record(
         &space,
         did,
         "com.atproto.space.putRecord",
-        serde_json::json!({
-            "space": space_uri,
-            "collection": collection,
-            "rkey": rkey,
-            "record": record,
-            "swapRecord": swap_cid,
-        }),
+        with_swap_record(
+            serde_json::json!({
+                "space": space_uri,
+                "repo": did,
+                "collection": collection,
+                "rkey": rkey,
+                "record": record,
+            }),
+            swap_cid.as_deref(),
+        ),
     )
     .await?
     {
@@ -570,12 +585,15 @@ pub(crate) async fn delete_record(
         &space,
         did,
         "com.atproto.space.deleteRecord",
-        serde_json::json!({
-            "space": space_uri,
-            "collection": collection,
-            "rkey": rkey,
-            "swapRecord": swap_cid,
-        }),
+        with_swap_record(
+            serde_json::json!({
+                "space": space_uri,
+                "repo": did,
+                "collection": collection,
+                "rkey": rkey,
+            }),
+            swap_cid.as_deref(),
+        ),
     )
     .await?
     .is_some()
@@ -1816,6 +1834,15 @@ mod tests {
 #[cfg(test)]
 mod native_write_bridge_tests {
     use super::*;
+
+    #[test]
+    fn swap_record_is_left_out_unless_given() {
+        let body = with_swap_record(serde_json::json!({ "rkey": "a" }), None);
+        assert!(body.get("swapRecord").is_none(), "{body}");
+
+        let body = with_swap_record(serde_json::json!({ "rkey": "a" }), Some("bafyold"));
+        assert_eq!(body["swapRecord"], "bafyold");
+    }
     use crate::spaces::host_mode::HostMode;
 
     const USER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
