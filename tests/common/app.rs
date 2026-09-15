@@ -249,6 +249,61 @@ impl TestApp {
         app
     }
 
+    /// Point this app at a real PLC directory and the PDSes registered in it,
+    /// with a loopback OAuth client that may request `scopes`.
+    ///
+    /// For end-to-end tests against a live stack: OAuth, DID resolution and
+    /// PDS calls all go to real servers instead of the mock.
+    pub fn point_at_real_identity(&mut self, plc_url: &str, scopes: &[&str]) {
+        let backend = self.state.db_backend;
+        let http = std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
+        // One store, shared: `/auth/login` reads back the state key the client
+        // just stored through `oauth_state_store`.
+        let state_store =
+            happyview::auth::oauth_store::DbStateStore::new(self.state.db.clone(), backend);
+        let scopes: Vec<Scope> = scopes
+            .iter()
+            .map(|s| match *s {
+                "atproto" => Scope::Known(KnownScope::Atproto),
+                other => Scope::Unknown(other.to_string()),
+            })
+            .collect();
+
+        let oauth = atrium_oauth::OAuthClient::new(OAuthClientConfig {
+            client_metadata: AtprotoLocalhostClientMetadata {
+                redirect_uris: Some(vec!["http://127.0.0.1/auth/callback".into()]),
+                scopes: Some(scopes),
+            },
+            keys: None,
+            state_store: state_store.clone(),
+            session_store: happyview::auth::oauth_store::DbSessionStore::new(
+                self.state.db.clone(),
+                backend,
+            ),
+            resolver: OAuthResolverConfig {
+                did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
+                    plc_directory_url: plc_url.to_string(),
+                    http_client: std::sync::Arc::clone(&http),
+                }),
+                handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
+                    dns_txt_resolver: happyview::dns::NativeDnsResolver::new(),
+                    http_client: http,
+                }),
+                authorization_server_metadata: Default::default(),
+                protected_resource_metadata: Default::default(),
+            },
+            http_client: happyview::http_retry::HappyViewHttpClient::default(),
+        })
+        .expect("failed to create loopback OAuth client");
+
+        self.state.config.plc_url = plc_url.to_string();
+        self.state.oauth = std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
+            std::sync::Arc::new(oauth),
+        ));
+        self.state.oauth_state_store = state_store;
+        self.rebuild_router();
+    }
+
     pub async fn new_with_encryption() -> Self {
         let mut app = Self::new().await;
         app.state.config.token_encryption_key = Some(db::TEST_ENCRYPTION_KEY);

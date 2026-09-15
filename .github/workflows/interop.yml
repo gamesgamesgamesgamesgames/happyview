@@ -34,7 +34,11 @@ on:
       - "crates/happyview-plc/**"
       - "tests/spaces_*_interop.rs"
       - "tests/spaces_reference_interop.rs"
+      - "tests/spaces_migration_e2e.rs"
       - "tests/interop_support/**"
+      - "tests/common/**"
+      - "src/auth/routes.rs"
+      - "crates/happyview-scopes/**"
       - "docker-compose.zds.yml"
       - "docker-compose.spaces-alpha.yml"
       - "docker-compose.pdsjs.yml"
@@ -124,9 +128,26 @@ jobs:
     name: ${{ matrix.suite.target }}
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 45
+    # The migration end-to-end test runs HappyView itself, which needs a
+    # database. The interop suites ignore it.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: happyview
+          POSTGRES_PASSWORD: happyview
+          POSTGRES_DB: happyview_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U happyview -d happyview_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
     env:
       COMPOSE: ${{ matrix.suite.compose }}
-      SUITE: ${{ matrix.suite.test }}
+      TESTS: ${{ join(matrix.suite.tests, ' ') }}
+      TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
       IMAGE_ENV: ${{ matrix.suite.env }}
       IMAGE: ${{ matrix.suite.image }}
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -146,13 +167,17 @@ jobs:
       # Compiled before the stack starts, so a slow build doesn't eat into the
       # time the containers have been up.
       - name: Build the suite
-        run: cargo test --test "$SUITE" --no-run
+        run: |
+          set -euo pipefail
+          targets=()
+          for t in $TESTS; do targets+=(--test "$t"); done
+          cargo test "${targets[@]}" --no-run
 
       - name: Start the stack
         run: |
           set -euo pipefail
           export "$IMAGE_ENV=$IMAGE"
-          echo "testing $SUITE against $IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "testing $TESTS against $IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
           # Pulled explicitly: the image under test must come from the registry,
           # never from the build fallback the compose files keep for local use.
           docker pull "$IMAGE"
@@ -163,7 +188,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p interop-logs
-          cargo test --test "$SUITE" -- --ignored 2>&1 | tee interop-logs/suite.log
+          targets=()
+          for t in $TESTS; do targets+=(--test "$t"); done
+          cargo test "${targets[@]}" -- --ignored 2>&1 | tee interop-logs/suite.log
 
       - name: Container logs
         if: failure()
