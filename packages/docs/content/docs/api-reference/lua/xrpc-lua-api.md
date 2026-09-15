@@ -2,7 +2,7 @@
 title: "XRPC Lua API"
 ---
 
-The `xrpc` table provides cross-endpoint XRPC calls. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts).
+The `xrpc` table provides cross-endpoint XRPC calls. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/record-scripts).
 
 ## xrpc.query
 

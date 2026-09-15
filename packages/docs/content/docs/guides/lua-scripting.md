@@ -2,7 +2,7 @@
 title: "Lua Scripting"
 ---
 
-Without Lua scripts, HappyView's query endpoints return raw records and procedure endpoints proxy simple creates and updates. To attach a script to an XRPC endpoint, create a script with trigger `xrpc.query:<nsid>` or `xrpc.procedure:<nsid>` — see [trigger grammar](label-scripts#trigger-grammar). Lua scripts let you go much further:
+Without Lua scripts, HappyView's query endpoints return raw records and procedure endpoints proxy simple creates and updates. To attach a script to an XRPC endpoint, create a script with trigger `xrpc.query:<nsid>` or `xrpc.procedure:<nsid>` — see [trigger grammar](record-scripts#trigger-grammar). Lua scripts let you go much further:
 
 - Add filtering logic
 - Transform responses
@@ -12,7 +12,7 @@ Without Lua scripts, HappyView's query endpoints return raw records and procedur
 
 Scripts run in a sandboxed Lua VM with access to the [Record API](#record-api), a [database API](#database-api), an [HTTP client API](#http-api), a [JSON API](#json-api), and a set of [context globals](#context-globals).
 
-For scripts that react to record changes or label events (rather than XRPC requests), see [Record & Label Scripts](label-scripts).
+For scripts that react to record changes or label events (rather than XRPC requests), see [Record & Label Scripts](record-scripts).
 
 ## Script structure
 
@@ -256,7 +256,7 @@ See the example script references for complete, ready-to-use scripts:
 
 ## Next steps
 
-- [Record & Label Scripts](label-scripts): React to record changes and label events in real time
+- [Record & Label Scripts](record-scripts): React to record changes and label events in real time
 - [Lexicons](lexicons.md): Understand how record, query, and procedure lexicons work together
 - [Admin API — Scripts](../api-reference/admin/scripts.md): Manage scripts via the API
 - [XRPC API](../api-reference/xrpc-api.md): See how endpoints behave with and without Lua scripts
