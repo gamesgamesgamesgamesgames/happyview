@@ -226,27 +226,31 @@ function hoistRepoActions(
   return { rest: target, actions: orderActions(actions) };
 }
 
+/** One scope token as an editable row; `atproto` has no row of its own. */
+function tokenToRow(token: string): ScopeRow | null {
+  if (token === BASE_SCOPE) return null;
+  const sep = token.indexOf(":");
+  if (sep === -1) return { ...EMPTY_ROW, prefix: token };
+  const prefix = token.slice(0, sep);
+  const rest = token.slice(sep + 1);
+  const hoisted = prefix === "repo" ? hoistRepoActions(rest) : null;
+  return hoisted
+    ? { prefix, rest: hoisted.rest, actions: hoisted.actions }
+    : { ...EMPTY_ROW, prefix, rest };
+}
+
+/** The rows a scope string spells out, in order. */
+function tokensToRows(value: string): ScopeRow[] {
+  return value
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(tokenToRow)
+    .filter((row): row is ScopeRow => row !== null);
+}
+
 /** Split a stored scope string back into editable rows, dropping `atproto`. */
 function parseInitialRows(value: string): ScopeRow[] {
-  const rows: ScopeRow[] = [];
-  for (const token of value.split(/\s+/).filter(Boolean)) {
-    if (token === BASE_SCOPE) continue;
-    const sep = token.indexOf(":");
-    if (sep === -1) {
-      rows.push({ ...EMPTY_ROW, prefix: token });
-      continue;
-    }
-    const prefix = token.slice(0, sep);
-    const rest = token.slice(sep + 1);
-    const hoisted = prefix === "repo" ? hoistRepoActions(rest) : null;
-    rows.push(
-      hoisted
-        ? { prefix, rest: hoisted.rest, actions: hoisted.actions }
-        : { ...EMPTY_ROW, prefix, rest },
-    );
-  }
-  rows.push({ ...EMPTY_ROW });
-  return rows;
+  return [...tokensToRows(value), { ...EMPTY_ROW }];
 }
 
 function rowToToken(row: ScopeRow): string {
@@ -372,6 +376,18 @@ export function ScopeBuilder({
     setRow(index, { rest: raw });
   }
 
+  // A pasted scope string becomes rows, one per token, in place of the row it
+  // landed on: a grant's scopes are copied from another grant or a client's
+  // settings far more often than typed one token at a time.
+  function pasteRows(index: number, e: React.ClipboardEvent<HTMLInputElement>) {
+    const text = e.clipboardData.getData("text");
+    if (!/\s/.test(text.trim())) return;
+    const pasted = tokensToRows(text);
+    if (pasted.length === 0) return;
+    e.preventDefault();
+    update([...rows.slice(0, index), ...pasted, ...rows.slice(index + 1)]);
+  }
+
   function toggleAction(index: number, action: RepoAction, checked: boolean) {
     const current = rows[index]?.actions ?? [];
     setRow(index, {
@@ -465,6 +481,7 @@ export function ScopeBuilder({
                     <InputGroupInput
                       value={row.rest}
                       onChange={(e) => setRest(index, e.target.value)}
+                      onPaste={(e) => pasteRows(index, e)}
                       placeholder={known?.hint ?? "value"}
                       aria-label={`Scope ${index + 1} value`}
                       className="font-mono text-sm"
@@ -514,6 +531,7 @@ export function ScopeBuilder({
                   <Input
                     value={row.rest}
                     onChange={(e) => setRest(index, e.target.value)}
+                    onPaste={(e) => pasteRows(index, e)}
                     placeholder={known?.hint ?? "value"}
                     aria-label={`Scope ${index + 1} value`}
                     className="font-mono text-sm"
