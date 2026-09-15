@@ -126,6 +126,7 @@ struct ListRecordsQuery {
     limit: Option<i64>,
     cursor: Option<String>,
     reverse: Option<bool>,
+    include_values: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -834,14 +835,19 @@ async fn list_records(
     )
     .await?;
 
+    let include_values = query.include_values.unwrap_or(false);
     let records_json: Vec<serde_json::Value> = records
         .into_iter()
         .map(|r| {
-            serde_json::json!({
+            let mut rec = serde_json::json!({
                 "collection": r.collection,
                 "rkey": r.rkey,
                 "cid": r.cid,
-            })
+            });
+            if include_values {
+                rec["value"] = r.record;
+            }
+            rec
         })
         .collect();
 
