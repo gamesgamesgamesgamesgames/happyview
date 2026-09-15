@@ -79,6 +79,7 @@ pub async fn granted_scope(state: &AppState, did: &str) -> Result<Option<String>
 /// collection under the space's type.
 pub fn scope_permits_migration(
     scope: &str,
+    author_did: &str,
     space: &crate::spaces::types::Space,
     collections: &[String],
 ) -> bool {
@@ -86,7 +87,8 @@ pub fn scope_permits_migration(
     // An empty repo has no collection to test, so a covering read grant is
     // enough to establish the app was given this space at all.
     if collections.is_empty() {
-        return granted.allows_space(
+        return granted.allows_space_for_user(
+            author_did,
             &space.type_nsid,
             &space.authority_did,
             &space.skey,
@@ -94,7 +96,8 @@ pub fn scope_permits_migration(
         );
     }
     collections.iter().all(|collection| {
-        granted.allows_space(
+        granted.allows_space_for_user(
+            author_did,
             &space.type_nsid,
             &space.authority_did,
             &space.skey,
@@ -226,7 +229,7 @@ async fn migrate(state: &AppState, job: &Job, input: &Input) -> Result<NativeOut
             "no OAuth session is held for this account",
         ));
     };
-    if !scope_permits_migration(&scope, &space, &collections) {
+    if !scope_permits_migration(&scope, &input.author_did, &space, &collections) {
         return Ok(skipped(
             "awaiting_authorization",
             "the account's session does not grant space: access for this space",
@@ -400,12 +403,36 @@ mod tests {
     }
 
     #[test]
+    fn a_self_grant_permits_migrating_the_users_own_space() {
+        // No `authority`: it defaults to `self`, the form a PDS stores.
+        let scope = "space:com.example.forum?collection=com.example.a";
+        let collections = vec!["com.example.a".to_string()];
+        assert!(scope_permits_migration(
+            scope,
+            USER,
+            &a_space(),
+            &collections
+        ));
+        assert!(!scope_permits_migration(
+            scope,
+            "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+            &a_space(),
+            &collections
+        ));
+    }
+
+    #[test]
     fn a_grant_covering_every_collection_permits_migration() {
         let scope = format!(
             "space:com.example.forum?authority={USER}&collection=com.example.a&collection=com.example.b"
         );
         let collections = vec!["com.example.a".to_string(), "com.example.b".to_string()];
-        assert!(scope_permits_migration(&scope, &a_space(), &collections));
+        assert!(scope_permits_migration(
+            &scope,
+            USER,
+            &a_space(),
+            &collections
+        ));
     }
 
     #[test]
@@ -414,7 +441,12 @@ mod tests {
         // verification rejects. Skipping first avoids the wasted writes.
         let scope = format!("space:com.example.forum?authority={USER}&collection=com.example.a");
         let collections = vec!["com.example.a".to_string(), "com.example.b".to_string()];
-        assert!(!scope_permits_migration(&scope, &a_space(), &collections));
+        assert!(!scope_permits_migration(
+            &scope,
+            USER,
+            &a_space(),
+            &collections
+        ));
     }
 
     #[test]
@@ -423,22 +455,32 @@ mod tests {
             "space:com.example.forum?authority={USER}&collection=com.example.a&action=read"
         );
         let collections = vec!["com.example.a".to_string()];
-        assert!(!scope_permits_migration(&scope, &a_space(), &collections));
+        assert!(!scope_permits_migration(
+            &scope,
+            USER,
+            &a_space(),
+            &collections
+        ));
     }
 
     #[test]
     fn an_empty_repo_needs_only_a_covering_grant() {
         let scope = format!("space:com.example.forum?authority={USER}");
-        assert!(scope_permits_migration(&scope, &a_space(), &[]));
+        assert!(scope_permits_migration(&scope, USER, &a_space(), &[]));
 
         let other = format!("space:com.example.other?authority={USER}");
-        assert!(!scope_permits_migration(&other, &a_space(), &[]));
+        assert!(!scope_permits_migration(&other, USER, &a_space(), &[]));
     }
 
     #[test]
     fn a_grant_for_another_authority_does_not_permit_migration() {
         let scope = "space:com.example.forum?authority=did:plc:bbbbbbbbbbbbbbbbbbbbbbbb&collection=com.example.a";
         let collections = vec!["com.example.a".to_string()];
-        assert!(!scope_permits_migration(scope, &a_space(), &collections));
+        assert!(!scope_permits_migration(
+            scope,
+            USER,
+            &a_space(),
+            &collections
+        ));
     }
 }

@@ -199,3 +199,76 @@ pub async fn cid_disagreements(
 pub fn migration_expects(records: &[SpaceRecord]) -> [u8; 32] {
     expected_commit_hash(records)
 }
+
+/// The DID of a pds.js server's one account, registering it on first use.
+///
+/// pds.js has no createAccount: an operator registers a did:plc and hands the
+/// server its key through `/init`, which is what its own `scripts/setup.js`
+/// does. Doing the same here, with HappyView's PLC code, keeps the harness free
+/// of a pds.js checkout, so CI can run it against a published image.
+///
+/// Skipped when the server already has an account, from a kept volume or an
+/// earlier test.
+pub async fn ensure_pdsjs_account(pds_url: &str, plc_url: &str, password: &str) -> String {
+    let http = reqwest::Client::new();
+    let existing = http
+        .get(format!("{pds_url}/.well-known/atproto-did"))
+        .send()
+        .await
+        .expect("request to pds.js failed; is it running?");
+    if existing.status().is_success() {
+        return existing.text().await.unwrap();
+    }
+
+    // Throwaway keys: nothing outside this stack ever sees the identity.
+    let mut raw = [0u8; 32];
+    raw[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    raw[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let key = p256::ecdsa::SigningKey::from_slice(&raw).expect("a valid P-256 scalar");
+    let did_key = happyview_plc::private_key_to_did_key(&raw).unwrap();
+
+    let handle = "alice.localhost";
+    let mut genesis = happyview_plc::build_unsigned_genesis(&happyview_plc::PlcGenesisParams {
+        rotation_key_did_key: did_key.clone(),
+        signing_key_did_key: did_key,
+        service_entries: vec![(
+            "atproto_pds".into(),
+            "AtprotoPersonalDataServer".into(),
+            pds_url.into(),
+        )],
+    });
+    genesis["alsoKnownAs"] = json!([format!("at://{handle}")]);
+    let signed = happyview_plc::sign_operation(&genesis, &key).unwrap();
+    let did = happyview_plc::derive_did(&signed).unwrap();
+
+    let resp = http
+        .post(format!("{plc_url}/{did}"))
+        .json(&signed)
+        .send()
+        .await
+        .expect("PLC request failed");
+    assert!(
+        resp.status().is_success(),
+        "PLC refused the genesis operation: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let resp = http
+        .post(format!("{pds_url}/init"))
+        .json(&json!({
+            "did": did,
+            "privateKey": raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            "handle": handle,
+            "curve": "p256",
+            "password": password,
+        }))
+        .send()
+        .await
+        .expect("init request failed");
+    assert!(
+        resp.status().is_success(),
+        "pds.js refused /init: {}",
+        resp.text().await.unwrap_or_default()
+    );
+    did
+}

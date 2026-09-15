@@ -52,82 +52,6 @@ async fn status_of(base: &str, method: &str) -> u16 {
 /// Matches `PDS_PASSWORD` in docker-compose.pdsjs.yml.
 const PASSWORD: &str = "password123";
 
-/// The DID of the PDS's one account, registering it on first use.
-///
-/// pds.js has no createAccount: an operator registers a did:plc and hands the
-/// server its key through `/init`, which is what its own `scripts/setup.js`
-/// does. Doing the same here, with HappyView's PLC code, keeps the harness free
-/// of a pds.js checkout, so CI can run it against a published image.
-///
-/// Once per process, since the server takes one account, and skipped
-/// when the PDS already has one from a kept volume.
-async fn ensure_account() -> &'static str {
-    static DID: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
-    DID.get_or_init(|| async {
-        let existing = client()
-            .get(format!("{PDSJS}/.well-known/atproto-did"))
-            .send()
-            .await
-            .expect("request to pds.js failed; is it running?");
-        if existing.status().is_success() {
-            return existing.text().await.unwrap();
-        }
-
-        // Throwaway keys: nothing outside this stack ever sees the identity.
-        let mut raw = [0u8; 32];
-        raw[..16].copy_from_slice(Uuid::new_v4().as_bytes());
-        raw[16..].copy_from_slice(Uuid::new_v4().as_bytes());
-        let key = p256::ecdsa::SigningKey::from_slice(&raw).expect("a valid P-256 scalar");
-        let did_key = happyview_plc::private_key_to_did_key(&raw).unwrap();
-
-        let handle = "alice.localhost";
-        let mut genesis = happyview_plc::build_unsigned_genesis(&happyview_plc::PlcGenesisParams {
-            rotation_key_did_key: did_key.clone(),
-            signing_key_did_key: did_key,
-            service_entries: vec![(
-                "atproto_pds".into(),
-                "AtprotoPersonalDataServer".into(),
-                PDSJS.into(),
-            )],
-        });
-        genesis["alsoKnownAs"] = json!([format!("at://{handle}")]);
-        let signed = happyview_plc::sign_operation(&genesis, &key).unwrap();
-        let did = happyview_plc::derive_did(&signed).unwrap();
-
-        let resp = client()
-            .post(format!("{PLC}/{did}"))
-            .json(&signed)
-            .send()
-            .await
-            .expect("PLC request failed");
-        assert!(
-            resp.status().is_success(),
-            "PLC refused the genesis operation: {}",
-            resp.text().await.unwrap_or_default()
-        );
-
-        let resp = client()
-            .post(format!("{PDSJS}/init"))
-            .json(&json!({
-                "did": did,
-                "privateKey": raw.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                "handle": handle,
-                "curve": "p256",
-                "password": PASSWORD,
-            }))
-            .send()
-            .await
-            .expect("init request failed");
-        assert!(
-            resp.status().is_success(),
-            "pds.js refused /init: {}",
-            resp.text().await.unwrap_or_default()
-        );
-        did
-    })
-    .await
-}
-
 /// The PDS's one account, signed in.
 struct Account {
     did: String,
@@ -136,7 +60,7 @@ struct Account {
 
 impl Account {
     async fn sign_in() -> Self {
-        let did = ensure_account().await.to_string();
+        let did = interop_support::ensure_pdsjs_account(PDSJS, PLC, PASSWORD).await;
         let (status, body) = self::post(
             None,
             "com.atproto.server.createSession",

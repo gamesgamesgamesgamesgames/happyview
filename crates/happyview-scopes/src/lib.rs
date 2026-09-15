@@ -134,10 +134,8 @@ impl ScopePermissions {
     /// treating it as blanket space access would hand every pre-existing token
     /// permissioned data it was never granted.
     ///
-    /// Grants are matched as held. Resolve `self` authorities and materialise
-    /// default collections at issuance; see
-    /// [`SpacePermission::with_resolved_authority`] and
-    /// [`SpacePermission::with_default_collections`].
+    /// Grants are matched as held, so a `self` authority matches nothing. For a
+    /// scope string as a PDS returns it, use [`Self::allows_space_for_user`].
     pub fn allows_space(
         &self,
         space_type: &str,
@@ -148,6 +146,27 @@ impl ScopePermissions {
         self.scopes
             .iter()
             .filter_map(|s| SpacePermission::parse(s))
+            .any(|p| p.matches(space_type, authority, skey, target))
+    }
+
+    /// [`Self::allows_space`] for grants held by `user_did`, reading a `self`
+    /// authority as that user.
+    ///
+    /// `authority` defaults to `self`, and a PDS returns granted scopes as the
+    /// client requested them, so `self` arrives unresolved in every session a
+    /// PDS issued.
+    pub fn allows_space_for_user(
+        &self,
+        user_did: &str,
+        space_type: &str,
+        authority: &str,
+        skey: &str,
+        target: SpaceTarget<'_>,
+    ) -> bool {
+        self.scopes
+            .iter()
+            .filter_map(|s| SpacePermission::parse(s))
+            .map(|p| p.with_resolved_authority(user_did))
             .any(|p| p.matches(space_type, authority, skey, target))
     }
 
@@ -351,6 +370,28 @@ mod space_scope_set_tests {
         let perms = ScopePermissions::parse("atproto space:com.example.forum?authority=*");
         assert!(perms.allows_space("com.example.forum", DID, "main", SpaceTarget::Read));
         assert!(!perms.allows_space("com.example.other", DID, "main", SpaceTarget::Read));
+    }
+
+    #[test]
+    fn a_self_grant_covers_only_the_holders_own_spaces() {
+        // `authority` defaults to `self`, and a PDS stores the grant that way.
+        let perms =
+            ScopePermissions::parse("atproto space:com.example.forum?collection=com.example.a");
+        let write = SpaceTarget::Write {
+            action: SpaceAction::Create,
+            collection: "com.example.a",
+        };
+
+        assert!(perms.allows_space_for_user(DID, "com.example.forum", DID, "main", write));
+        assert!(!perms.allows_space_for_user(
+            DID,
+            "com.example.forum",
+            "did:plc:someoneelse",
+            "main",
+            write
+        ));
+        // Unresolved, `self` names no authority at all.
+        assert!(!perms.allows_space("com.example.forum", DID, "main", write));
     }
 
     #[test]
