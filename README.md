@@ -28,16 +28,7 @@ Building an AppView from scratch means wiring up real-time event streams, record
 
 ## Contributing
 
-Point git at the tracked hooks once per clone:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-`core.hooksPath` is local config, so it does not travel with a clone — each contributor runs this themselves.
-
-- **pre-commit** — `cargo fmt --check` plus `cargo clippy` over the lib and bins.
-- **pre-push** — `cargo clippy --all-targets`, which additionally type-checks and lints the `#[cfg(test)]` modules in `src/` and the `tests/` binaries. That is ~45 extra compilation units, almost all link steps, so it runs once per push rather than once per commit.
+See [CONTRIBUTING.md](CONTRIBUTING.md). In short: open PRs against `dev`, sign off your commits with `git commit -s`, and run `git config core.hooksPath .githooks` once per clone.
 
 ## Documentation
 
