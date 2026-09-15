@@ -164,7 +164,13 @@ pub async fn require_space_scope(
     };
 
     let granted = ScopePermissions::parse(&scopes);
-    if granted.allows_space(&space.type_nsid, &space.authority_did, &space.skey, target) {
+    if granted.allows_space_for_user(
+        claims.did(),
+        &space.type_nsid,
+        &space.authority_did,
+        &space.skey,
+        target,
+    ) {
         return Ok(());
     }
 
@@ -275,6 +281,18 @@ mod space_scope_gate_tests {
         require_space_scope(&state, &claims, &a_space(), SpaceTarget::Read)
             .await
             .expect("a covering grant must pass");
+    }
+
+    #[tokio::test]
+    async fn a_self_grant_covers_the_callers_own_space() {
+        // `authority` defaults to `self`, which is how an app asks for its user's
+        // own spaces and how the PDS stores the grant.
+        let state = test_state().await;
+        let claims = session_with_scopes(&state, "atproto space:com.example.forum").await;
+
+        require_space_scope(&state, &claims, &a_space(), SpaceTarget::Read)
+            .await
+            .expect("a self grant must cover a space whose authority is the caller");
     }
 
     #[tokio::test]
