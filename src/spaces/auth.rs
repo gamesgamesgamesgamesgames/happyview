@@ -11,11 +11,23 @@ use crate::plugin::encryption::{decrypt, encrypt};
 use crate::spaces::credential::{
     DEFAULT_CREDENTIAL_TTL_SECS, SpaceCredentialClaims, make_jti, sign_credential,
 };
-use crate::spaces::types::{AppAccess, MintPolicy, Space};
+use crate::spaces::types::{AppAccess, Policy, Space};
 
 pub struct IssuedCredential {
     pub token: String,
     pub expires_at: String,
+}
+
+/// What the managing-app call needs in order to authenticate itself.
+///
+/// Bundled rather than threaded as four more parameters: everything here exists
+/// only to mint the service-auth token the managing app requires.
+#[derive(Clone, Copy)]
+pub struct ServiceAuthCtx<'a> {
+    pub pool: &'a sqlx::AnyPool,
+    pub backend: DatabaseBackend,
+    pub encryption_key: &'a [u8; 32],
+    pub public_url: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -24,13 +36,20 @@ pub async fn issue_credential(
     backend: DatabaseBackend,
     http: &reqwest::Client,
     encryption_key: &[u8; 32],
+    public_url: &str,
     space: &Space,
     subject_did: &str,
     client_id: Option<&str>,
     authority_did: &str,
 ) -> Result<IssuedCredential, AppError> {
+    let auth_ctx = ServiceAuthCtx {
+        pool,
+        backend,
+        encryption_key,
+        public_url,
+    };
     check_app_access(space, client_id)?;
-    check_mint_policy(http, space, subject_did, client_id, authority_did).await?;
+    check_mint_policy(http, auth_ctx, space, subject_did, client_id, authority_did).await?;
 
     let private_jwk = get_or_create_signing_key(pool, backend, encryption_key, space).await?;
 
@@ -63,57 +82,135 @@ pub async fn issue_credential(
     Ok(IssuedCredential { token, expires_at })
 }
 
-async fn check_mint_policy(
+/// The method a managing-app service-auth token is scoped to.
+const CHECK_USER_ACCESS_LXM: &str = "com.atproto.simplespace.checkUserAccess";
+
+/// Build the query parameters for a `checkUserAccess` call.
+///
+/// A query, not a procedure: the lexicon defines GET with `space`, `user` and a
+/// required `access`. Extracted so the wire shape can be asserted without
+/// standing up DID resolution.
+fn check_user_access_params(
+    space_uri: &str,
+    user_did: &str,
+    client_id: Option<&str>,
+    access: AccessKind,
+) -> Vec<(&'static str, String)> {
+    let mut params = vec![
+        ("space", space_uri.to_string()),
+        ("user", user_did.to_string()),
+        ("access", access.as_str().to_string()),
+    ];
+
+    // Omitted for write checks: notifyWrite does not identify the application
+    // that originated the write, so there is no client to name.
+    if access == AccessKind::Read
+        && let Some(cid) = client_id
+    {
+        params.push(("clientId", cid.to_string()));
+    }
+
+    params
+}
+
+/// Which permission a policy check is about.
+///
+/// `read_policy` and `write_policy` are independent and are never substituted
+/// for one another: read gates whether a credential is minted, write gates
+/// whether the authority tracks a writer and forwards their notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessKind {
+    Read,
+    Write,
+}
+
+impl AccessKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessKind::Read => "read",
+            AccessKind::Write => "write",
+        }
+    }
+}
+
+/// Evaluate one policy for one user.
+#[allow(clippy::too_many_arguments)]
+async fn policy_allows(
     http: &reqwest::Client,
+    auth_ctx: ServiceAuthCtx<'_>,
+    policy: &Policy,
     space: &Space,
     subject_did: &str,
     client_id: Option<&str>,
     authority_did: &str,
-) -> Result<(), AppError> {
-    match space.mint_policy {
-        MintPolicy::Public => Ok(()),
-        MintPolicy::MemberList => {
+    access: AccessKind,
+) -> Result<bool, AppError> {
+    match policy {
+        Policy::Public => Ok(true),
+        Policy::MemberList => {
             // Caller must already be a member; verified upstream by the credential issuance route.
             // We trust that the delegation token proves membership was checked.
-            Ok(())
+            Ok(true)
         }
-        MintPolicy::ManagingApp => {
-            let managing_app = space.managing_app_did.as_deref().ok_or_else(|| {
-                AppError::Internal(
-                    "space mint_policy is managing-app but managing_app_did is not set".into(),
-                )
-            })?;
+        Policy::ManagingApp { managing_app } => {
             let space_uri = format!(
                 "at://{}/space/{}/{}",
                 space.did, space.type_nsid, space.skey
             );
-            let granted = check_user_access_with_managing_app(
+            check_user_access_with_managing_app(
                 http,
+                auth_ctx,
                 managing_app,
                 &space_uri,
                 subject_did,
                 client_id,
                 authority_did,
+                access,
             )
-            .await?;
-            if granted {
-                Ok(())
-            } else {
-                Err(AppError::Forbidden(
-                    "managing app denied access to this space".into(),
-                ))
-            }
+            .await
         }
     }
 }
 
+/// Whether a space credential may be minted for this user, per `read_policy`.
+async fn check_mint_policy(
+    http: &reqwest::Client,
+    auth_ctx: ServiceAuthCtx<'_>,
+    space: &Space,
+    subject_did: &str,
+    client_id: Option<&str>,
+    authority_did: &str,
+) -> Result<(), AppError> {
+    let granted = policy_allows(
+        http,
+        auth_ctx,
+        &space.read_policy,
+        space,
+        subject_did,
+        client_id,
+        authority_did,
+        AccessKind::Read,
+    )
+    .await?;
+    if granted {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "managing app denied access to this space".into(),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn check_user_access_with_managing_app(
     http: &reqwest::Client,
+    auth_ctx: ServiceAuthCtx<'_>,
     managing_app: &str,
     space_uri: &str,
     user_did: &str,
     client_id: Option<&str>,
     authority_did: &str,
+    access: AccessKind,
 ) -> Result<bool, AppError> {
     // Parse DID#fragment — the fragment identifies the service endpoint in the DID doc.
     // For outbound callback we derive the endpoint from the DID.
@@ -139,28 +236,56 @@ async fn check_user_access_with_managing_app(
         endpoint.trim_end_matches('/')
     );
 
-    let mut body = serde_json::json!({
-        "space": space_uri,
-        "did": user_did,
-    });
-    if let Some(cid) = client_id {
-        body["clientId"] = serde_json::Value::String(cid.to_string());
+    let params = check_user_access_params(space_uri, user_did, client_id, access);
+
+    // The lexicon requires service auth from the authority, and the reference
+    // managing app verifies it and rejects anything without one. `aud` is the
+    // managing app's service identifier and `lxm` pins the token to this single
+    // method.
+    let token = crate::auth::service_auth::mint_service_auth(
+        auth_ctx.pool,
+        auth_ctx.backend,
+        auth_ctx.encryption_key,
+        auth_ctx.public_url,
+        managing_app,
+        CHECK_USER_ACCESS_LXM,
+    )
+    .await?;
+
+    // The managing app expects the space authority as `iss`. When the authority
+    // is not this instance we cannot sign for it, so fail here rather than send
+    // a token the app will reject as the wrong issuer.
+    let instance_did = crate::auth::service_auth::instance_did(
+        auth_ctx.pool,
+        auth_ctx.backend,
+        auth_ctx.public_url,
+    )
+    .await?;
+    if instance_did != authority_did {
+        return Err(AppError::Internal(format!(
+            "cannot authenticate a managing-app check for authority {authority_did}: \
+             this instance signs as {instance_did}"
+        )));
     }
 
-    // Service auth: iss = authority_did, aud = managing_app DID.
-    // We use a simple unsigned assertion here; a full implementation would sign with the space key.
-    // For now we send the request without service auth and rely on the managing app to trust HappyView.
     let resp = http
-        .post(&url)
-        .json(&body)
-        .header("X-Authority-Did", authority_did)
+        .get(&url)
+        .query(&params)
+        .bearer_auth(&token)
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("checkUserAccess request failed: {e}")))?;
 
+    // A managing app refusing is a denial, not an error. This also covers our
+    // own auth being rejected, hence the warn.
     if resp.status() == reqwest::StatusCode::FORBIDDEN
         || resp.status() == reqwest::StatusCode::UNAUTHORIZED
     {
+        tracing::warn!(
+            status = %resp.status(),
+            managing_app,
+            "managing app refused the access check; this is a denial, but check service auth"
+        );
         return Ok(false);
     }
 
@@ -177,12 +302,16 @@ async fn check_user_access_with_managing_app(
         .map_err(|e| AppError::Internal(format!("checkUserAccess response parse failed: {e}")))?;
 
     Ok(json
-        .get("granted")
+        .get("authorized")
         .and_then(|v| v.as_bool())
         .unwrap_or(false))
 }
 
-async fn resolve_did_service_endpoint(
+/// Resolve a DID's `#atproto_pds` service endpoint from its DID document.
+///
+/// Shared with the login flow, which needs a PDS endpoint before it can ask
+/// whether that PDS serves spaces.
+pub(crate) async fn resolve_did_service_endpoint(
     http: &reqwest::Client,
     did: &str,
 ) -> Result<String, AppError> {
@@ -387,7 +516,7 @@ async fn store_credential_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spaces::types::{AppAccess, MintPolicy, Space, SpaceConfig};
+    use crate::spaces::types::{AppAccess, Policy, Space, SpaceConfig};
 
     fn test_space(app_access: AppAccess) -> Space {
         Space {
@@ -399,9 +528,9 @@ mod tests {
             skey: "main".into(),
             display_name: None,
             description: None,
-            mint_policy: MintPolicy::MemberList,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
             app_access,
-            managing_app_did: None,
             config: SpaceConfig::default(),
             revision: None,
             created_at: String::new(),
@@ -453,5 +582,65 @@ mod tests {
         assert!(kp.private_jwk["d"].is_string());
         assert!(kp.private_jwk["x"].is_string());
         assert!(kp.private_jwk["y"].is_string());
+    }
+}
+
+#[cfg(test)]
+mod managing_app_tests {
+    use super::*;
+
+    fn get(params: &[(&str, String)], key: &str) -> Option<String> {
+        params
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    const SPACE: &str = "at://did:plc:auth/space/com.example.forum/main";
+
+    #[test]
+    fn read_checks_carry_space_user_access_and_client() {
+        let params =
+            check_user_access_params(SPACE, "did:plc:user", Some("https://app"), AccessKind::Read);
+
+        assert_eq!(get(&params, "space").as_deref(), Some(SPACE));
+        // The lexicon names this parameter `user`, and the reference managing
+        // app reads that key.
+        assert_eq!(get(&params, "user").as_deref(), Some("did:plc:user"));
+        assert_eq!(get(&params, "access").as_deref(), Some("read"));
+        assert_eq!(get(&params, "clientId").as_deref(), Some("https://app"));
+        assert!(
+            get(&params, "did").is_none(),
+            "the lexicon parameter is `user`, not `did`"
+        );
+    }
+
+    #[test]
+    fn access_is_always_present() {
+        // Required by the lexicon: bulletin 400s without it, so omitting it
+        // makes every managing-app check fail regardless of policy.
+        for access in [AccessKind::Read, AccessKind::Write] {
+            let params = check_user_access_params(SPACE, "did:plc:user", None, access);
+            assert!(get(&params, "access").is_some());
+        }
+    }
+
+    #[test]
+    fn write_checks_omit_the_client_id() {
+        let params = check_user_access_params(
+            SPACE,
+            "did:plc:user",
+            Some("https://app"),
+            AccessKind::Write,
+        );
+
+        assert_eq!(get(&params, "access").as_deref(), Some("write"));
+        assert!(get(&params, "clientId").is_none());
+    }
+
+    #[test]
+    fn access_kind_uses_the_lexicon_known_values() {
+        assert_eq!(AccessKind::Read.as_str(), "read");
+        assert_eq!(AccessKind::Write.as_str(), "write");
     }
 }

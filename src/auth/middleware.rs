@@ -26,6 +26,17 @@ pub struct Claims {
 const COOKIE_SEP: char = '\n';
 
 impl Claims {
+    /// Construct claims directly, for tests that need a specific session shape
+    /// without standing up a full DPoP handshake.
+    #[cfg(test)]
+    pub fn for_test(did: &str, client_key: Option<&str>, dpop_key_id: Option<&str>) -> Self {
+        Self {
+            did: did.to_string(),
+            client_key: client_key.map(str::to_string),
+            dpop_key_id: dpop_key_id.map(str::to_string),
+        }
+    }
+
     /// The authenticated user's DID.
     pub fn did(&self) -> &str {
         &self.did

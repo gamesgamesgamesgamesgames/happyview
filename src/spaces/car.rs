@@ -150,6 +150,7 @@ mod tests {
 
     fn test_commit() -> SignedCommit {
         SignedCommit {
+            sig: vec![0u8; 64],
             ver: 1,
             hash: [0u8; 32],
             ikm: [0u8; 32],
@@ -170,6 +171,7 @@ mod tests {
     #[test]
     fn serialize_repo_with_records() {
         let commit = SignedCommit {
+            sig: vec![0u8; 64],
             ver: 1,
             hash: [0xAA; 32],
             ikm: [0xBB; 32],

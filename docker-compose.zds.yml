@@ -1,0 +1,114 @@
+# ZDS, a PDS that serves atproto spaces, for interop testing. What it covers is
+# described in tests/spaces_zds_interop.rs.
+#
+#   docker compose -f docker-compose.zds.yml up -d --wait
+#   cargo test --test spaces_zds_interop -- --ignored --nocapture
+#   docker compose -f docker-compose.zds.yml down -v
+#
+# Isolated from the dev, test and e2e stacks — see the note in docker-compose.yml.
+name: happyview-zds
+
+x-zds-common: &zds-common
+  # Built for amd64 and arm64 by happyproto/pds-test. CI runs the image pinned in
+  # interop/images.env.
+  #
+  # No build-from-source fallback: `zig build` fetches its packages from
+  # tangled.org, which rate-limits (429) often enough that the build is not a
+  # dependable fallback.
+  image: ${ZDS_IMAGE:-ghcr.io/happyproto/pds-test/zds:latest}
+  environment: &zds-env
+    ZDS_HOST: 0.0.0.0
+    ZDS_PORT: "3000"
+    ZDS_DB: /data/zds.sqlite3
+    ZDS_BLOBSTORE_PATH: /data/blobs
+    ZDS_JWT_SECRET: zds-interop-jwt-secret
+    ZDS_ADMIN_TOKEN: zds-interop-admin-token
+    ZDS_HANDLE_DOMAINS: .test
+    ZDS_SERVER_DID: did:web:localhost
+    ZDS_LOG_LEVEL: info
+    # Throwaway; account creation mints a did:plc and needs a rotation
+    # authority. Regenerate with `openssl rand -hex 32`.
+    ZDS_PLC_ROTATION_KEY: "b96741c5e37c0cbc0e1d9a9e8d0424af4b1d064f754d9d6f87215cb0827dfe1b"
+  healthcheck:
+    # The pds-test image has no wget or curl, so bash's /dev/tcp makes the
+    # request. It passes only on an HTTP 200 from the health endpoint.
+    test:
+      - CMD
+      - bash
+      - -c
+      - "exec 3<>/dev/tcp/127.0.0.1/3000 && printf 'GET /xrpc/_health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"
+    interval: 2s
+    timeout: 3s
+    retries: 40
+    start_period: 2s
+
+services:
+  # Accounts are did:plc, and a commit is verified against the author's key from
+  # their DID document, so each interop stack runs a PLC directory. Without one,
+  # ZDS mints DIDs it never registers and no key is resolvable.
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: plc
+      POSTGRES_PASSWORD: plc
+      POSTGRES_DB: plc
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plc -d plc"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  plc:
+    # Built nightly by happyproto/pds-test; built from source only when it
+    # cannot be pulled.
+    image: ${PLC_IMAGE:-ghcr.io/happyproto/pds-test/plc:latest}
+    build:
+      context: https://github.com/did-method-plc/did-method-plc.git
+      dockerfile: packages/server/Dockerfile
+    environment:
+      DB_CREDS_JSON: '{"username":"plc","password":"plc","host":"postgres","port":"5432","database":"plc"}'
+      ENABLE_MIGRATIONS: "true"
+      DB_MIGRATE_CREDS_JSON: '{"username":"plc","password":"plc","host":"postgres","port":"5432","database":"plc"}'
+      PORT: "2582"
+    ports:
+      - "2582:2582"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Spaces on: the host under test.
+  zds:
+    <<: *zds-common
+    environment:
+      <<: *zds-env
+      ZDS_PERMISSIONED_DATA: "true"
+      ZDS_PUBLIC_URL: http://localhost:2586
+      ZDS_PLC_DIRECTORY: http://plc:2582
+    ports:
+      - "2586:3000"
+    volumes:
+      - zds-data:/data
+    depends_on:
+      plc:
+        condition: service_started
+
+  # The same build with spaces off, so detection's negative answer is checked
+  # against a real server rather than a mock.
+  zds-no-spaces:
+    <<: *zds-common
+    environment:
+      <<: *zds-env
+      ZDS_PERMISSIONED_DATA: "false"
+      ZDS_PUBLIC_URL: http://localhost:2587
+      ZDS_PLC_DIRECTORY: http://plc:2582
+    ports:
+      - "2587:3000"
+    volumes:
+      - zds-no-spaces-data:/data
+    depends_on:
+      plc:
+        condition: service_started
+
+volumes:
+  zds-data:
+  zds-no-spaces-data:

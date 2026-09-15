@@ -55,7 +55,31 @@ async fn main() {
         println!("Dry run — no changes will be committed.\n");
     }
 
-    match cid_backfill::run(&pool, backend, dry_run).await {
+    let raw_key = std::env::var("TOKEN_ENCRYPTION_KEY").ok();
+    let encryption_key = match happyview::config::parse_token_encryption_key(raw_key.as_deref()) {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            eprintln!("TOKEN_ENCRYPTION_KEY must be set: the backfill re-mints signed commits");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("invalid TOKEN_ENCRYPTION_KEY: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let signing_key =
+        match happyview::spaces::service::signing_key_from_pool(&pool, backend, &encryption_key)
+            .await
+        {
+            Ok(key) => key,
+            Err(e) => {
+                eprintln!("could not load the #atproto_space signing key: {e}");
+                std::process::exit(1);
+            }
+        };
+
+    match cid_backfill::run(&pool, backend, dry_run, &signing_key).await {
         Ok(report) => {
             println!("Records scanned:        {}", report.records_scanned);
             println!("Records re-CID'd:       {}", report.records_updated);

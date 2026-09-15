@@ -30,8 +30,8 @@ pub mod syntax;
 pub use include::{IncludeScope, IncludedPermission, LexPermission, LexPermissionSet, LexValue};
 pub use resources::{
     ACCOUNT_ATTRIBUTES, AccountAction, AccountPermission, BlobPermission, IDENTITY_ATTRIBUTES,
-    IdentityPermission, RepoAction, RepoPermission, RpcPermission, accept_covers,
-    is_absolute_did_ref, is_accept, is_mime,
+    IdentityPermission, ManageOp, RepoAction, RepoPermission, RpcPermission, SpaceAction,
+    SpacePermission, SpaceTarget, accept_covers, is_absolute_did_ref, is_accept, is_mime,
 };
 pub use syntax::ScopeSyntax;
 
@@ -128,6 +128,29 @@ impl ScopePermissions {
             .any(|p| p.matches(mime))
     }
 
+    /// Whether any held `space:` grant authorizes `target` in the named space.
+    ///
+    /// Not covered by `transition:generic`: that grant predates spaces, so
+    /// treating it as blanket space access would hand every pre-existing token
+    /// permissioned data it was never granted.
+    ///
+    /// Grants are matched as held. Resolve `self` authorities and materialise
+    /// default collections at issuance; see
+    /// [`SpacePermission::with_resolved_authority`] and
+    /// [`SpacePermission::with_default_collections`].
+    pub fn allows_space(
+        &self,
+        space_type: &str,
+        authority: &str,
+        skey: &str,
+        target: SpaceTarget<'_>,
+    ) -> bool {
+        self.scopes
+            .iter()
+            .filter_map(|s| SpacePermission::parse(s))
+            .any(|p| p.matches(space_type, authority, skey, target))
+    }
+
     pub fn allows_identity(&self, attr: &str) -> bool {
         self.scopes
             .iter()
@@ -184,6 +207,43 @@ impl ScopePermissions {
             "identity" => {
                 IdentityPermission::parse(scope).is_some_and(|p| self.allows_identity(&p.attr))
             }
+            "space" => SpacePermission::parse(scope).is_some_and(|p| {
+                // Covered only when every grant it makes is covered: reads,
+                // each write against each collection, and each manage op.
+                let reads = p.action.iter().all(|action| {
+                    let target = match action {
+                        SpaceAction::Read => SpaceTarget::Read,
+                        SpaceAction::ReadSelf => SpaceTarget::ReadSelf,
+                        _ => return true,
+                    };
+                    self.allows_space(&p.space_type, &p.authority, &p.skey, target)
+                });
+                let writes = p.action.iter().all(|action| {
+                    if matches!(action, SpaceAction::Read | SpaceAction::ReadSelf) {
+                        return true;
+                    }
+                    p.collection.iter().all(|collection| {
+                        self.allows_space(
+                            &p.space_type,
+                            &p.authority,
+                            &p.skey,
+                            SpaceTarget::Write {
+                                action: *action,
+                                collection,
+                            },
+                        )
+                    })
+                });
+                let manages = p.manage.iter().all(|op| {
+                    self.allows_space(
+                        &p.space_type,
+                        &p.authority,
+                        &p.skey,
+                        SpaceTarget::Manage(*op),
+                    )
+                });
+                reads && writes && manages
+            }),
             "account" => AccountPermission::parse(scope).is_some_and(|p| {
                 p.action
                     .iter()
@@ -277,5 +337,46 @@ mod tests {
         let p = ScopePermissions::parse("atproto rpc:com.example.a repo:com.example.post");
         assert!(!p.allows_rpc("com.example.a", "did:web:x.com#svc"));
         assert!(p.allows_repo("com.example.post", RepoAction::Create));
+    }
+}
+
+#[cfg(test)]
+mod space_scope_set_tests {
+    use super::*;
+
+    const DID: &str = "did:plc:abc123xyz";
+
+    #[test]
+    fn a_held_grant_authorizes_a_matching_target() {
+        let perms = ScopePermissions::parse("atproto space:com.example.forum?authority=*");
+        assert!(perms.allows_space("com.example.forum", DID, "main", SpaceTarget::Read));
+        assert!(!perms.allows_space("com.example.other", DID, "main", SpaceTarget::Read));
+    }
+
+    #[test]
+    fn transition_generic_does_not_confer_space_access() {
+        let perms = ScopePermissions::parse("transition:generic");
+        assert!(!perms.allows_space("com.example.forum", DID, "main", SpaceTarget::Read));
+    }
+
+    #[test]
+    fn covers_scope_requires_every_grant_to_be_covered() {
+        let held = ScopePermissions::parse("space:com.example.forum?authority=*&action=read");
+        assert!(held.covers_scope("space:com.example.forum?authority=*&action=read"));
+
+        // Asking for writes is not satisfied by a read-only grant.
+        assert!(!held.covers_scope(
+            "space:com.example.forum?authority=*&action=create&collection=com.example.a"
+        ));
+        // Nor is management.
+        assert!(!held.covers_scope("space:com.example.forum?authority=*&manage=update"));
+    }
+
+    #[test]
+    fn covers_scope_honours_wildcards_in_the_held_grant() {
+        let held = ScopePermissions::parse("space:*?authority=*&collection=*");
+        assert!(held.covers_scope(
+            "space:com.example.forum?authority=*&collection=com.example.a&action=create"
+        ));
     }
 }

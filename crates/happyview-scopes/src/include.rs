@@ -5,7 +5,7 @@
 //! only the caller has a lexicon registry. That split is deliberate — the parts
 //! that need I/O are trivial, and the parts that are security-critical are not.
 
-use crate::resources::{RepoPermission, RpcPermission, is_absolute_did_ref};
+use crate::resources::{RepoPermission, RpcPermission, SpacePermission, is_absolute_did_ref};
 use crate::syntax::ScopeSyntax;
 
 /// One value in a lexicon permission: the arity matters, because a scalar
@@ -68,6 +68,7 @@ pub struct LexPermissionSet {
 pub enum IncludedPermission {
     Repo(RepoPermission),
     Rpc(RpcPermission),
+    Space(SpacePermission),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +135,33 @@ impl IncludeScope {
                 let action = permission.list("action");
                 RepoPermission::from_parts(collection, action).map(IncludedPermission::Repo)
             }
+            "space" => {
+                if !permission.keys().iter().all(|k| {
+                    [
+                        "spaceType",
+                        "authority",
+                        "skey",
+                        "collection",
+                        "action",
+                        "manage",
+                    ]
+                    .contains(k)
+                }) {
+                    return None;
+                }
+                // The lexicon spells the positional `spaceType`; the scope
+                // grammar calls it `type`.
+                let space_type = permission.scalar("spaceType")?;
+                SpacePermission::from_parts(
+                    space_type,
+                    permission.scalar("authority"),
+                    permission.scalar("skey"),
+                    permission.list("collection"),
+                    permission.list("action"),
+                    permission.list("manage"),
+                )
+                .map(IncludedPermission::Space)
+            }
             "rpc" => {
                 let declared_aud = permission.scalar("aud");
 
@@ -182,6 +210,11 @@ impl IncludeScope {
                 p.collection.iter().all(|c| self.is_parent_authority_of(c))
             }
             IncludedPermission::Rpc(p) => p.lxm.iter().all(|l| self.is_parent_authority_of(l)),
+            // Only the space type is authority-checked. A space type
+            // declaration may list collections from any NSID domain, so
+            // requiring collections to sit under the set's authority would
+            // reject legitimate cross-domain record types.
+            IncludedPermission::Space(p) => self.is_parent_authority_of(&p.space_type),
         }
     }
 
@@ -374,5 +407,129 @@ mod tests {
             }],
         };
         assert!(inc.expand(&set).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod space_include_tests {
+    use super::*;
+    use crate::resources::SpaceAction;
+
+    /// Bulletin's real permission set, from
+    /// `bulletin/lexicons/my/bulletin.permissions.json`.
+    fn bulletin_set() -> LexPermissionSet {
+        LexPermissionSet {
+            permissions: vec![LexPermission {
+                resource: "space".into(),
+                params: [
+                    (
+                        "spaceType".to_string(),
+                        LexValue::Scalar("my.bulletin.board".into()),
+                    ),
+                    ("authority".to_string(), LexValue::Scalar("*".into())),
+                    ("skey".to_string(), LexValue::Scalar("self".into())),
+                    (
+                        "collection".to_string(),
+                        LexValue::List(vec![
+                            "my.bulletin.post".into(),
+                            "my.bulletin.removal".into(),
+                            "my.bulletin.position".into(),
+                        ]),
+                    ),
+                    (
+                        "action".to_string(),
+                        LexValue::List(vec![
+                            "read".into(),
+                            "create".into(),
+                            "update".into(),
+                            "delete".into(),
+                        ]),
+                    ),
+                    (
+                        "manage".to_string(),
+                        LexValue::List(vec!["create".into(), "update".into(), "delete".into()]),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_real_permission_set_expands_to_a_space_grant() {
+        let include = IncludeScope::parse("include:my.bulletin.permissions").unwrap();
+        let expanded = include.expand(&bulletin_set());
+
+        assert_eq!(expanded.len(), 1, "expected one space permission");
+        let IncludedPermission::Space(p) = &expanded[0] else {
+            panic!("expected a space permission, got {:?}", expanded[0]);
+        };
+        assert_eq!(p.space_type, "my.bulletin.board");
+        assert_eq!(p.authority, "*");
+        assert_eq!(p.skey, "self");
+        assert_eq!(p.action, SpaceAction::DEFAULT.to_vec());
+        assert_eq!(p.manage.len(), 3);
+    }
+
+    #[test]
+    fn a_space_type_outside_the_sets_authority_is_dropped() {
+        // A permission set may not grant access to another domain's space type.
+        let include = IncludeScope::parse("include:my.bulletin.permissions").unwrap();
+        let set = LexPermissionSet {
+            permissions: vec![LexPermission {
+                resource: "space".into(),
+                params: [(
+                    "spaceType".to_string(),
+                    LexValue::Scalar("com.someoneelse.forum".into()),
+                )]
+                .into_iter()
+                .collect(),
+            }],
+        };
+        assert!(include.expand(&set).is_empty());
+    }
+
+    #[test]
+    fn collections_may_sit_under_a_different_authority() {
+        let include = IncludeScope::parse("include:my.bulletin.permissions").unwrap();
+        let set = LexPermissionSet {
+            permissions: vec![LexPermission {
+                resource: "space".into(),
+                params: [
+                    (
+                        "spaceType".to_string(),
+                        LexValue::Scalar("my.bulletin.board".into()),
+                    ),
+                    (
+                        "collection".to_string(),
+                        LexValue::List(vec!["org.example.reaction".into()]),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+        };
+        assert_eq!(include.expand(&set).len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_parameter_drops_the_permission() {
+        let include = IncludeScope::parse("include:my.bulletin.permissions").unwrap();
+        let set = LexPermissionSet {
+            permissions: vec![LexPermission {
+                resource: "space".into(),
+                params: [
+                    (
+                        "spaceType".to_string(),
+                        LexValue::Scalar("my.bulletin.board".into()),
+                    ),
+                    ("bogus".to_string(), LexValue::Scalar("x".into())),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+        };
+        assert!(include.expand(&set).is_empty());
     }
 }
