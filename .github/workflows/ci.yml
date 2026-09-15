@@ -187,6 +187,30 @@ jobs:
       - name: Build test plugin
         run: cargo build --manifest-path tests/fixtures/test_plugin/Cargo.toml --target wasm32-unknown-unknown --release
 
+      - name: Build test library
+        run: cargo build --manifest-path tests/fixtures/test_library/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Build SDK http fixture
+        run: cargo build --manifest-path tests/fixtures/sdk_http/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Build SDK auth fixture
+        run: cargo build --manifest-path tests/fixtures/sdk_auth/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Build SDK objects fixture
+        run: cargo build --manifest-path tests/fixtures/sdk_objects/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Build SDK caller fixture
+        run: cargo build --manifest-path tests/fixtures/sdk_caller/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Build SDK atproto fixture
+        run: cargo build --manifest-path tests/fixtures/sdk_atproto/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Build SDK linked repos fixture
+        run: cargo build --manifest-path tests/fixtures/sdk_linked_repos/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Run plugin SDK tests
+        run: cargo test -p happyview-plugin-sdk
+
       # Fast-failing, named gate: verify migrations apply on an *old* (v2.0.0)
       # database — schema + data, both SQLite and Postgres — not just a fresh one.
       # (Also included in the full run below; runs here first for a clear signal,

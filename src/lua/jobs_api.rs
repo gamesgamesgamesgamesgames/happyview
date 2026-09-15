@@ -1,12 +1,8 @@
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
-use regex::Regex;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use crate::AppState;
 use crate::jobs;
-
-static JOB_TYPE_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9._-]*$").unwrap());
 
 /// Caller identity for the jobs API — carries the DID and optional DPoP
 /// session identifiers so `inherit_auth` jobs can restore PDS credentials.
@@ -44,20 +40,8 @@ pub fn register_jobs_api(
                     .unwrap_or(false);
 
                 async move {
-                    if job_type.is_empty()
-                        || job_type.len() > 128
-                        || !JOB_TYPE_PATTERN.is_match(&job_type)
-                    {
-                        return Err(mlua::Error::runtime(
-                            "job_type must be 1-128 characters matching /^[a-z0-9][a-z0-9._-]*$/",
-                        ));
-                    }
-
-                    if crate::jobs::native::is_reserved(&job_type) {
-                        return Err(mlua::Error::runtime(format!(
-                            "job_type prefix '{}' is reserved for built-in jobs",
-                            crate::jobs::native::RESERVED_PREFIX
-                        )));
+                    if let Err(msg) = crate::jobs::validate_job_type(&job_type) {
+                        return Err(mlua::Error::runtime(msg));
                     }
 
                     let caller = caller.as_ref().ok_or_else(|| {
@@ -106,7 +90,7 @@ pub fn register_job_context(
     state: Arc<AppState>,
     job_id: String,
     input: serde_json::Value,
-) -> LuaResult<()> {
+) -> LuaResult<mlua::Table> {
     let job_table = lua.create_table()?;
 
     // job.input — the JSONB input passed to jobs.create()
@@ -219,8 +203,8 @@ pub fn register_job_context(
         job_table.set("warn", warn_fn)?;
     }
 
-    lua.globals().set("job", job_table)?;
-    Ok(())
+    lua.globals().set("job", job_table.clone())?;
+    Ok(job_table)
 }
 
 #[cfg(test)]
@@ -458,49 +442,6 @@ mod tests {
         }
     }
 
-    async fn migrated_pool() -> sqlx::AnyPool {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect to in-memory sqlite");
-        crate::db::query(
-            "CREATE TABLE happyview_jobs (
-                id TEXT PRIMARY KEY,
-                job_type TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                input TEXT NOT NULL DEFAULT '{}',
-                progress TEXT NOT NULL DEFAULT '{}',
-                result TEXT,
-                error TEXT,
-                created_by TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                created_at TEXT NOT NULL,
-                inherit_auth INTEGER NOT NULL DEFAULT 0,
-                api_client_id TEXT,
-                dpop_key_id TEXT
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create happyview_jobs table");
-        crate::db::query(
-            "CREATE TABLE happyview_job_logs (
-                id TEXT PRIMARY KEY,
-                job_id TEXT NOT NULL,
-                level TEXT NOT NULL DEFAULT 'info',
-                message TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create happyview_job_logs table");
-        pool
-    }
-
     fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
         let config = Config {
             host: "127.0.0.1".into(),
@@ -636,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn jobs_create_with_auth_persists_dpop_context() {
-        let pool = migrated_pool().await;
+        let pool = crate::test_support::migrated_memory_pool().await;
         let state = test_state_with_pool(pool);
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         let caller = JobsCaller {
@@ -652,8 +593,11 @@ mod tests {
             .await
             .unwrap();
 
+        // `sqlx::Any`'s SQLite bridge cannot decode the real `inherit_auth
+        // BOOLEAN` column at all — the same reason `jobs::db`'s own queries
+        // cast it to `INTEGER` first.
         let row: (String, i32, Option<String>, Option<String>) = crate::db::query_as(
-            "SELECT created_by, inherit_auth, api_client_id, dpop_key_id FROM happyview_jobs WHERE id = ?",
+            "SELECT created_by, CAST(inherit_auth AS INTEGER), api_client_id, dpop_key_id FROM happyview_jobs WHERE id = ?",
         )
         .bind(&job_id)
         .fetch_one(&state.db)
@@ -668,7 +612,7 @@ mod tests {
 
     #[tokio::test]
     async fn jobs_create_without_auth_omits_dpop_context() {
-        let pool = migrated_pool().await;
+        let pool = crate::test_support::migrated_memory_pool().await;
         let state = test_state_with_pool(pool);
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         let caller = JobsCaller {
@@ -685,7 +629,7 @@ mod tests {
             .unwrap();
 
         let row: (i32, Option<String>, Option<String>) = crate::db::query_as(
-            "SELECT inherit_auth, api_client_id, dpop_key_id FROM happyview_jobs WHERE id = ?",
+            "SELECT CAST(inherit_auth AS INTEGER), api_client_id, dpop_key_id FROM happyview_jobs WHERE id = ?",
         )
         .bind(&job_id)
         .fetch_one(&state.db)
@@ -699,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_log_inserts_info_row() {
-        let pool = migrated_pool().await;
+        let pool = crate::test_support::migrated_memory_pool().await;
         let state = test_state_with_pool(pool);
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_job_context(
@@ -729,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_warn_inserts_warn_row() {
-        let pool = migrated_pool().await;
+        let pool = crate::test_support::migrated_memory_pool().await;
         let state = test_state_with_pool(pool);
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_job_context(
@@ -759,7 +703,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_wait_adds_the_slept_duration_to_job_wait_ms() {
-        let pool = migrated_pool().await;
+        let pool = crate::test_support::migrated_memory_pool().await;
         let state = test_state_with_pool(pool);
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_job_context(
@@ -783,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_wait_accumulates_across_multiple_calls() {
-        let pool = migrated_pool().await;
+        let pool = crate::test_support::migrated_memory_pool().await;
         let state = test_state_with_pool(pool);
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_job_context(

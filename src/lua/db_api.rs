@@ -1,143 +1,25 @@
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
-use serde_json::{Value, json};
+use serde_json::Value as JsonValue;
 use sqlx::{Column, Row};
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::db::{DatabaseBackend, adapt_sql, decode_cursor, encode_cursor};
+use crate::db::DatabaseBackend;
+use crate::plugin::host::{
+    MAX_FILTER_DEPTH, RecordsError, backlinks_query, is_valid_json_field_path, records_count,
+    records_get, records_query, records_search,
+};
+use crate::raw_sql_guard::check_raw_sql_tables;
+use happyview_plugin_sdk::wire::{
+    BacklinksQuery, Condition, Filter, RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, Sort,
+};
 
-const MAX_FILTER_DEPTH: u8 = 5;
-const ALLOWED_OPS: &[&str] = &["=", "!=", "<", ">", "<=", ">=", "LIKE", "NOT LIKE"];
-
-/// Table-name prefix reserved for HappyView's own internal tables. `db.raw`
-/// blocks these **by default** — so a table added in a future migration is
-/// protected until it is deliberately allowed — except for the data tables in
-/// [`ALLOWED_INTERNAL_TABLES`].
-const PROTECTED_TABLE_PREFIX: &str = "happyview_";
-
-/// Internal tables that don't carry the `happyview_` prefix but are still
-/// off-limits (SQLx's migration bookkeeping).
-const PROTECTED_EXACT_TABLES: &[&str] = &["_sqlx_migrations"];
-
-/// Internal tables `db.raw` is allowed to read and write despite the reserved
-/// prefix: public AppView data and space *data*. Everything else `happyview_*`
-/// stays blocked — secrets and tokens (`happyview_dpop_keys`/`_sessions`,
-/// `happyview_api_keys`, `happyview_oauth_*`, `happyview_script_variables`),
-/// auth/privilege state (`happyview_users`/`_user_permissions`, the delegation
-/// tables), trust config (`happyview_domains`, `happyview_instance_settings`),
-/// and cryptographic material (`happyview_space_credentials`, and
-/// `happyview_space_repo_state` which holds commit-signature key material).
-///
-/// Space membership/records are exposed because a space defines *access*, not
-/// confidentiality — whether to expose otherwise-private space data through the
-/// AppView is left to the admin.
-const ALLOWED_INTERNAL_TABLES: &[&str] = &[
-    // Public AppView data.
-    "happyview_records",
-    "happyview_record_refs",
-    "happyview_labels",
-    "happyview_lexicons",
-    // Background jobs.
-    "happyview_jobs",
-    // Space data (not the credential/key-material tables).
-    "happyview_spaces",
-    "happyview_space_members",
-    "happyview_space_records",
-    "happyview_space_record_oplog",
-    "happyview_space_notify_registrations",
-    "happyview_space_dids",
-];
-
-/// Reject a `db.raw` SQL string that references a protected internal table.
-///
-/// Tokenizes the SQL (so string literals and comments containing the prefix are
-/// ignored, and quoted / schema-qualified identifiers are still caught) and
-/// blocks any `happyview_*` (or `_sqlx_migrations`) identifier that is not in
-/// [`ALLOWED_INTERNAL_TABLES`]. Unicode-escaped identifiers (`U&"…"`) are refused
-/// outright as an evasion vector, and SQL that cannot be tokenized fails closed.
-fn check_raw_sql_tables(sql: &str) -> Result<(), String> {
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::tokenizer::{Token, Tokenizer};
-
-    // `U&'…'` / `U&"…"` unicode-escaped literals could smuggle a protected
-    // identifier past tokenization (the escapes decode to letters); there is no
-    // legitimate need for them in `db.raw`, so refuse them outright.
-    let lowered = sql.to_ascii_lowercase();
-    if lowered.contains("u&\"") || lowered.contains("u&'") {
-        return Err("db.raw does not allow unicode-escaped identifiers".into());
-    }
-
-    // Tokenizing (rather than substring matching) means the prefix inside string
-    // literals or comments is ignored, while quoted and schema-qualified
-    // identifiers are still seen. SQL we cannot tokenize fails closed.
-    let tokens = Tokenizer::new(&GenericDialect {}, sql)
-        .tokenize()
-        .map_err(|e| format!("db.raw could not parse SQL: {e}"))?;
-
-    for token in tokens {
-        if let Token::Word(word) = token {
-            let name = word.value.to_ascii_lowercase();
-            let is_internal = name.starts_with(PROTECTED_TABLE_PREFIX)
-                || PROTECTED_EXACT_TABLES.contains(&name.as_str());
-            if is_internal && !ALLOWED_INTERNAL_TABLES.contains(&name.as_str()) {
-                return Err(format!(
-                    "db.raw cannot reference the protected internal HappyView table '{}'",
-                    word.value
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn is_valid_json_field_path(path: &str) -> bool {
-    if path.is_empty() {
-        return false;
-    }
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            return false;
-        }
-        let bracket_start = segment.find('[').unwrap_or(segment.len());
-        let ident = &segment[..bracket_start];
-        if ident.is_empty() || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return false;
-        }
-        let mut rest = &segment[bracket_start..];
-        while !rest.is_empty() {
-            if !rest.starts_with('[') {
-                return false;
-            }
-            let close = match rest.find(']') {
-                Some(i) => i,
-                None => return false,
-            };
-            let idx = &rest[1..close];
-            if idx.is_empty() || !idx.chars().all(|c| c.is_ascii_digit()) {
-                return false;
-            }
-            rest = &rest[close + 1..];
-        }
-    }
-    true
-}
-
-#[derive(Debug)]
-enum FilterNode {
-    Condition {
-        field: String,
-        op: String,
-        value: String,
-    },
-    Group {
-        combine: String,
-        children: Vec<FilterNode>,
-    },
-}
-
-fn parse_filter_node(table: &mlua::Table, depth: u8) -> LuaResult<FilterNode> {
+/// Parse Lua's `{field, op, value}` / `{combine, child, child}` filter table
+/// shape into the SDK's wire `Filter`. This grammar is Lua-specific: a plain
+/// Lua value in the `value` field rather than a pre-stringified one, and `op`
+/// defaulting to `=`.
+fn parse_filter_node(table: &mlua::Table, depth: u8) -> LuaResult<Filter> {
     if depth >= MAX_FILTER_DEPTH {
         return Err(mlua::Error::runtime(format!(
             "filter nesting too deep (max {MAX_FILTER_DEPTH} levels)",
@@ -154,12 +36,6 @@ fn parse_filter_node(table: &mlua::Table, depth: u8) -> LuaResult<FilterNode> {
         let op: String = table
             .get::<String>("op")
             .unwrap_or_else(|_| "=".to_string());
-        let op_upper = op.to_uppercase();
-        if !ALLOWED_OPS.contains(&op_upper.as_str()) {
-            return Err(mlua::Error::runtime(format!(
-                "invalid filter op '{op}': must be one of {ALLOWED_OPS:?}",
-            )));
-        }
 
         let val: mlua::Value = table.get("value")?;
         let value = match val {
@@ -175,53 +51,53 @@ fn parse_filter_node(table: &mlua::Table, depth: u8) -> LuaResult<FilterNode> {
             }
         };
 
-        return Ok(FilterNode::Condition {
+        return Ok(Filter::Condition(Condition {
             field,
-            op: op_upper,
-            value,
-        });
+            op,
+            value: JsonValue::String(value),
+        }));
     }
 
     let combine: String = table
         .get::<String>("combine")
-        .unwrap_or_else(|_| "AND".to_string())
-        .to_uppercase();
-    if combine != "AND" && combine != "OR" {
-        return Err(mlua::Error::runtime(format!(
-            "invalid filter combine '{combine}': must be 'AND' or 'OR'",
-        )));
-    }
+        .unwrap_or_else(|_| "AND".to_string());
 
-    let mut children = Vec::new();
+    let mut conditions = Vec::new();
     for child in table.sequence_values::<mlua::Table>() {
-        children.push(parse_filter_node(&child?, depth + 1)?);
+        conditions.push(parse_filter_node(&child?, depth + 1)?);
     }
 
-    if children.is_empty() {
+    if conditions.is_empty() {
         return Err(mlua::Error::runtime("filter group has no conditions"));
     }
 
-    Ok(FilterNode::Group { combine, children })
+    Ok(Filter::Group {
+        combine,
+        conditions,
+    })
 }
 
-fn build_filter_sql(node: &FilterNode, binds: &mut Vec<String>) -> String {
-    match node {
-        FilterNode::Condition { field, op, value } => {
-            binds.push(value.clone());
-            format!("json_extract(record, '$.{field}') {op} ?")
-        }
-        FilterNode::Group { combine, children } => {
-            let parts: Vec<String> = children
-                .iter()
-                .map(|c| build_filter_sql(c, binds))
-                .collect();
-            if parts.len() == 1 {
-                parts.into_iter().next().unwrap()
-            } else {
-                format!("({})", parts.join(&format!(" {combine} ")))
-            }
-        }
+fn lua_err(e: RecordsError) -> mlua::Error {
+    match e {
+        RecordsError::InvalidSpec(msg) => mlua::Error::runtime(msg),
+        RecordsError::Database(e) => mlua::Error::runtime(format!("DB query failed: {e}")),
     }
+}
+
+fn page_to_lua(lua: &Lua, page: RecordsPage) -> LuaResult<mlua::Value> {
+    let result = lua.create_table()?;
+    if let Some(cursor) = page.cursor {
+        result.set("cursor", cursor)?;
+    }
+    let values: Vec<mlua::Value> = page
+        .records
+        .iter()
+        .map(|r| lua.to_value(r))
+        .collect::<LuaResult<_>>()?;
+    let records = lua.create_sequence_from(values)?;
+    records.set_metatable(Some(lua.array_metatable()))?;
+    result.set("records", records)?;
+    Ok(mlua::Value::Table(result))
 }
 
 /// Register the `db` table with database query functions.
@@ -233,166 +109,51 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
     let query_fn = lua.create_async_function(move |lua, opts: mlua::Table| {
         let state = state_query.clone();
         async move {
-            let backend = state.db_backend;
-            let collection: String = opts.get("collection")?;
-            let did: Option<String> = opts.get("did").ok();
-            let limit: i64 = opts.get::<i64>("limit").unwrap_or(20).min(100);
-            let sort: Option<String> = opts.get("sort").ok();
-            let sort_direction: Option<String> = opts.get("sortDirection").ok();
-            let cursor_str: Option<String> = opts.get("cursor").ok();
-
-            if let Some(ref field) = sort
-                && !is_valid_json_field_path(field)
+            let filter = match opts.get::<Option<mlua::Table>>("filter")? {
+                Some(t) => Some(parse_filter_node(&t, 0)?),
+                None => None,
+            };
+            // Validated independent of whether `sort` is given: a caller who
+            // passes a bogus `sortDirection` gets told so even though it would
+            // otherwise be silently unused.
+            let sort_direction: Option<String> = opts.get("sortDirection")?;
+            if let Some(ref direction) = sort_direction
+                && direction != "asc"
+                && direction != "desc"
             {
-                return Err(mlua::Error::runtime(
-                    "invalid sort field: use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]')",
-                ));
+                return Err(mlua::Error::runtime(format!(
+                    "invalid sortDirection '{direction}': must be 'asc' or 'desc'"
+                )));
             }
-
-            let direction = match sort_direction.as_deref() {
-                Some("asc") => "ASC",
-                Some("desc") => "DESC",
-                None => "DESC",
-                Some(other) => {
-                    return Err(mlua::Error::runtime(format!(
-                        "invalid sortDirection '{other}': must be 'asc' or 'desc'"
-                    )));
-                }
+            let sort = opts.get::<Option<String>>("sort")?.map(|field| Sort {
+                field,
+                direction: sort_direction.unwrap_or_else(|| "desc".into()),
+            });
+            // A bare `offset` is accepted for custom sorts by turning it into
+            // the same cursor the previous page would have returned.
+            let cursor = match (
+                opts.get::<Option<String>>("cursor")?,
+                opts.get::<Option<i64>>("offset")?,
+            ) {
+                (Some(c), _) => Some(c),
+                (None, Some(off)) if sort.is_some() => Some(BASE64.encode(off.to_string())),
+                _ => None,
             };
-
-            let filter_table: Option<mlua::Table> = opts.get("filter").ok();
-            let mut filter_binds: Vec<String> = Vec::new();
-            let filter_clause = if let Some(ref tbl) = filter_table {
-                let node = parse_filter_node(tbl, 0)?;
-                let sql = build_filter_sql(&node, &mut filter_binds);
-                format!(" AND {sql}")
-            } else {
-                String::new()
-            };
-
-            let result_table = lua.create_table()?;
-
-            if let Some(ref sort_field) = sort {
-                // Custom sort: use OFFSET/LIMIT with base64-encoded offset cursor
-                let offset: i64 = if let Some(ref cursor) = cursor_str {
-                    BASE64.decode(cursor).ok()
-                        .and_then(|b| String::from_utf8(b).ok())
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .unwrap_or(0)
-                } else {
-                    opts.get::<i64>("offset").unwrap_or(0)
-                };
-
-                let top_level_columns = ["indexed_at", "did", "uri"];
-                let order_expr = if top_level_columns.contains(&sort_field.as_str()) {
-                    format!("{sort_field} {direction}")
-                } else {
-                    format!("json_extract(record, '$.{sort_field}') {direction}")
-                };
-
-                let did_clause = if did.is_some() { " AND did = ?" } else { "" };
-                let sql = adapt_sql(
-                    &format!("SELECT uri, did, record FROM happyview_records WHERE collection = ?{did_clause}{filter_clause} ORDER BY {order_expr} LIMIT ? OFFSET ?"),
-                    backend,
-                );
-                let mut q = crate::db::query_as(&sql).bind(&collection);
-                if let Some(ref did) = did { q = q.bind(did); }
-                for val in &filter_binds { q = q.bind(val); }
-                let rows: Vec<(String, String, String)> = q
-                    .bind(limit)
-                    .bind(offset)
-                    .fetch_all(&state.db)
-                    .await
-                    .map_err(|e| mlua::Error::runtime(format!("DB query failed: {e}")))?;
-
-                let has_next = rows.len() as i64 == limit;
-
-                if has_next {
-                    let next_offset = offset + limit;
-                    result_table.set("cursor", BASE64.encode(next_offset.to_string()))?;
-                }
-
-                let records: Vec<Value> = rows
-                    .into_iter()
-                    .map(|(uri, _did, record_str)| {
-                        let mut record: Value = serde_json::from_str(&record_str).unwrap_or(json!({}));
-                        if let Some(obj) = record.as_object_mut() {
-                            obj.insert("uri".to_string(), json!(uri));
-                        }
-                        record
-                    })
-                    .collect();
-
-                let record_values: Vec<mlua::Value> = records
-                    .iter()
-                    .map(|r| lua.to_value(r))
-                    .collect::<LuaResult<_>>()?;
-                let records_table = lua.create_sequence_from(record_values)?;
-                records_table.set_metatable(Some(lua.array_metatable()))?;
-                result_table.set("records", records_table)?;
-            } else {
-                // Cursor-based pagination on (created_at, uri)
-                let cursor_parts = cursor_str.as_ref().and_then(|c| decode_cursor(c));
-
-                type RowType = (String, String, String, String);
-
-                let did_clause = if did.is_some() { " AND did = ?" } else { "" };
-                let cursor_clause = if cursor_parts.is_some() {
-                    " AND (created_at < ? OR (created_at = ? AND uri < ?))"
-                } else {
-                    ""
-                };
-                let sql = adapt_sql(
-                    &format!(
-                        "SELECT uri, did, record, created_at FROM happyview_records \
-                         WHERE collection = ?{did_clause}{cursor_clause}{filter_clause} \
-                         ORDER BY created_at DESC, uri DESC \
-                         LIMIT ?"
-                    ),
-                    backend,
-                );
-                let mut q = crate::db::query_as::<RowType>(&sql).bind(&collection);
-                if let Some(ref did) = did { q = q.bind(did); }
-                if let Some((cursor_ts, cursor_uri)) = &cursor_parts {
-                    q = q.bind(cursor_ts).bind(cursor_ts).bind(cursor_uri);
-                }
-                for val in &filter_binds { q = q.bind(val); }
-                let rows_raw: Vec<RowType> = q
-                    .bind(limit)
-                    .fetch_all(&state.db)
-                    .await
-                    .map_err(|e| mlua::Error::runtime(format!("DB query failed: {e}")))?;
-
-                let has_next = rows_raw.len() as i64 == limit;
-
-                if has_next
-                    && let Some((last_uri, _, _, last_created_at)) = rows_raw.last()
-                {
-                    let cursor = encode_cursor(last_created_at, last_uri);
-                    result_table.set("cursor", cursor)?;
-                }
-
-                let records: Vec<Value> = rows_raw
-                    .into_iter()
-                    .map(|(uri, _did, record_str, _created_at)| {
-                        let mut record: Value = serde_json::from_str(&record_str).unwrap_or(json!({}));
-                        if let Some(obj) = record.as_object_mut() {
-                            obj.insert("uri".to_string(), json!(uri));
-                        }
-                        record
-                    })
-                    .collect();
-
-                let record_values: Vec<mlua::Value> = records
-                    .iter()
-                    .map(|r| lua.to_value(r))
-                    .collect::<LuaResult<_>>()?;
-                let records_table = lua.create_sequence_from(record_values)?;
-                records_table.set_metatable(Some(lua.array_metatable()))?;
-                result_table.set("records", records_table)?;
-            }
-
-            Ok(mlua::Value::Table(result_table))
+            let page = records_query(
+                &state.db,
+                state.db_backend,
+                RecordsQuery {
+                    collection: opts.get("collection")?,
+                    did: opts.get("did").ok(),
+                    filter,
+                    sort,
+                    limit: opts.get::<Option<u32>>("limit")?,
+                    cursor,
+                },
+            )
+            .await
+            .map_err(lua_err)?;
+            page_to_lua(&lua, page)
         }
     })?;
     db_table.set("query", query_fn)?;
@@ -402,25 +163,11 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
     let get_fn = lua.create_async_function(move |lua, uri: String| {
         let state = state_get.clone();
         async move {
-            let backend = state.db_backend;
-            let sql = adapt_sql(
-                "SELECT record FROM happyview_records WHERE uri = ?",
-                backend,
-            );
-            let row: Option<(String,)> = crate::db::query_as(&sql)
-                .bind(&uri)
-                .fetch_optional(&state.db)
+            let record = records_get(&state.db, state.db_backend, &uri)
                 .await
-                .map_err(|e| mlua::Error::runtime(format!("DB query failed: {e}")))?;
-
-            match row {
-                Some((record_str,)) => {
-                    let mut record: Value = serde_json::from_str(&record_str).unwrap_or(json!({}));
-                    if let Some(obj) = record.as_object_mut() {
-                        obj.insert("uri".to_string(), json!(uri));
-                    }
-                    lua.to_value(&record)
-                }
+                .map_err(lua_err)?;
+            match record {
+                Some(record) => lua.to_value(&record),
                 None => Ok(mlua::Value::Nil),
             }
         }
@@ -432,82 +179,18 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
     let search_fn = lua.create_async_function(move |lua, opts: mlua::Table| {
         let state = state_search.clone();
         async move {
-            let backend = state.db_backend;
-            let collection: String = opts.get("collection")?;
-            let field: String = opts.get("field")?;
-            let query: String = opts.get("query")?;
-            let limit: i64 = opts.get::<i64>("limit").unwrap_or(10).min(100);
-
-            if !is_valid_json_field_path(&field) {
-                return Err(mlua::Error::runtime(
-                    "invalid search field: use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]')",
-                ));
-            }
-
-            let like_pattern = format!("%{query}%");
-
-            // Cannot use adapt_sql: Postgres reuses $3 for two bind positions,
-            // while SQLite needs separate ? for each. Different bind counts.
-            let rows: Vec<(String, String, String)> = match backend {
-                DatabaseBackend::Sqlite => {
-                    let sql = format!(
-                        "SELECT uri, did, record FROM happyview_records \
-                         WHERE collection = ? \
-                           AND json_extract(record, '$.{field}') LIKE ? COLLATE NOCASE \
-                         ORDER BY \
-                           CASE \
-                             WHEN LOWER(json_extract(record, '$.{field}')) = LOWER(?) THEN 0 \
-                             WHEN LOWER(json_extract(record, '$.{field}')) LIKE LOWER(?) || '%' THEN 1 \
-                             ELSE 2 \
-                           END, \
-                           json_extract(record, '$.{field}') \
-                         LIMIT ?"
-                    );
-                    crate::db::query_as(&sql)
-                    .bind(&collection)
-                    .bind(&like_pattern)
-                    .bind(&query)
-                    .bind(&query)
-                    .bind(limit)
-                    .fetch_all(&state.db)
-                    .await
-                    .map_err(|e| mlua::Error::runtime(format!("DB search failed: {e}")))?
-                }
-                DatabaseBackend::Postgres => {
-                    let sql = format!(
-                        "SELECT uri, did, record FROM happyview_records \
-                         WHERE collection = $1 \
-                           AND record::jsonb->>'{field}' ILIKE $2 \
-                         ORDER BY \
-                           CASE \
-                             WHEN LOWER(record::jsonb->>'{field}') = LOWER($3) THEN 0 \
-                             WHEN LOWER(record::jsonb->>'{field}') LIKE LOWER($3) || '%' THEN 1 \
-                             ELSE 2 \
-                           END, \
-                           record::jsonb->>'{field}' \
-                         LIMIT $4"
-                    );
-                    crate::db::query_as(&sql)
-                    .bind(&collection)
-                    .bind(&like_pattern)
-                    .bind(&query)
-                    .bind(limit)
-                    .fetch_all(&state.db)
-                    .await
-                    .map_err(|e| mlua::Error::runtime(format!("DB search failed: {e}")))?
-                }
-            };
-
-            let records: Vec<Value> = rows
-                .into_iter()
-                .map(|(uri, _did, record_str)| {
-                    let mut record: Value = serde_json::from_str(&record_str).unwrap_or(json!({}));
-                    if let Some(obj) = record.as_object_mut() {
-                        obj.insert("uri".to_string(), json!(uri));
-                    }
-                    record
-                })
-                .collect();
+            let records = records_search(
+                &state.db,
+                state.db_backend,
+                RecordsSearch {
+                    collection: opts.get("collection")?,
+                    field: opts.get("field")?,
+                    query: opts.get("query")?,
+                    limit: opts.get::<Option<u32>>("limit")?,
+                },
+            )
+            .await
+            .map_err(lua_err)?;
 
             let record_values: Vec<mlua::Value> = records
                 .iter()
@@ -530,30 +213,17 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
         lua.create_async_function(move |_, (collection, did): (String, Option<String>)| {
             let state = state_count.clone();
             async move {
-                let backend = state.db_backend;
-                let count: (i64,) = if let Some(ref did) = did {
-                    let sql = adapt_sql(
-                        "SELECT COUNT(*) FROM happyview_records WHERE collection = ? AND did = ?",
-                        backend,
-                    );
-                    crate::db::query_as(&sql)
-                        .bind(&collection)
-                        .bind(did)
-                        .fetch_one(&state.db)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(format!("DB count failed: {e}")))?
-                } else {
-                    let sql = adapt_sql(
-                        "SELECT COUNT(*) FROM happyview_records WHERE collection = ?",
-                        backend,
-                    );
-                    crate::db::query_as(&sql)
-                        .bind(&collection)
-                        .fetch_one(&state.db)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(format!("DB count failed: {e}")))?
-                };
-                Ok(count.0)
+                records_count(
+                    &state.db,
+                    state.db_backend,
+                    RecordsCount {
+                        collection,
+                        did,
+                        filter: None,
+                    },
+                )
+                .await
+                .map_err(lua_err)
             }
         })?;
     db_table.set("count", count_fn)?;
@@ -564,127 +234,20 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
     let backlinks_fn = lua.create_async_function(move |lua, opts: mlua::Table| {
         let state = state_backlinks.clone();
         async move {
-            let backend = state.db_backend;
-            let collection: String = opts.get("collection")?;
-            let uri: String = opts.get("uri")?;
-            let did: Option<String> = opts.get("did").ok();
-            let limit: i64 = opts.get::<i64>("limit").unwrap_or(20).min(100);
-            let cursor_str: Option<String> = opts.get("cursor").ok();
-
-            let cursor_parts = cursor_str.as_ref().and_then(|c| decode_cursor(c));
-
-            type RowType = (String, String, String, String);
-
-            let rows_raw: Vec<RowType> = match (&did, &cursor_parts) {
-                (Some(did), Some((cursor_ts, cursor_uri))) => {
-                    let sql = adapt_sql(
-                        "SELECT r.uri, r.did, r.record, r.created_at FROM happyview_records r \
-                         INNER JOIN happyview_record_refs ref ON ref.source_uri = r.uri \
-                         WHERE ref.target_uri = ? AND ref.collection = ? AND r.did = ? \
-                         AND (r.created_at < ? OR (r.created_at = ? AND r.uri < ?)) \
-                         ORDER BY r.created_at DESC, r.uri DESC \
-                         LIMIT ?",
-                        backend,
-                    );
-                    crate::db::query_as(&sql)
-                        .bind(&uri)
-                        .bind(&collection)
-                        .bind(did)
-                        .bind(cursor_ts)
-                        .bind(cursor_ts)
-                        .bind(cursor_uri)
-                        .bind(limit)
-                        .fetch_all(&state.db)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(format!("DB backlinks failed: {e}")))?
-                }
-                (Some(did), None) => {
-                    let sql = adapt_sql(
-                        "SELECT r.uri, r.did, r.record, r.created_at FROM happyview_records r \
-                         INNER JOIN happyview_record_refs ref ON ref.source_uri = r.uri \
-                         WHERE ref.target_uri = ? AND ref.collection = ? AND r.did = ? \
-                         ORDER BY r.created_at DESC, r.uri DESC \
-                         LIMIT ?",
-                        backend,
-                    );
-                    crate::db::query_as(&sql)
-                        .bind(&uri)
-                        .bind(&collection)
-                        .bind(did)
-                        .bind(limit)
-                        .fetch_all(&state.db)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(format!("DB backlinks failed: {e}")))?
-                }
-                (None, Some((cursor_ts, cursor_uri))) => {
-                    let sql = adapt_sql(
-                        "SELECT r.uri, r.did, r.record, r.created_at FROM happyview_records r \
-                         INNER JOIN happyview_record_refs ref ON ref.source_uri = r.uri \
-                         WHERE ref.target_uri = ? AND ref.collection = ? \
-                         AND (r.created_at < ? OR (r.created_at = ? AND r.uri < ?)) \
-                         ORDER BY r.created_at DESC, r.uri DESC \
-                         LIMIT ?",
-                        backend,
-                    );
-                    crate::db::query_as(&sql)
-                        .bind(&uri)
-                        .bind(&collection)
-                        .bind(cursor_ts)
-                        .bind(cursor_ts)
-                        .bind(cursor_uri)
-                        .bind(limit)
-                        .fetch_all(&state.db)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(format!("DB backlinks failed: {e}")))?
-                }
-                (None, None) => {
-                    let sql = adapt_sql(
-                        "SELECT r.uri, r.did, r.record, r.created_at FROM happyview_records r \
-                         INNER JOIN happyview_record_refs ref ON ref.source_uri = r.uri \
-                         WHERE ref.target_uri = ? AND ref.collection = ? \
-                         ORDER BY r.created_at DESC, r.uri DESC \
-                         LIMIT ?",
-                        backend,
-                    );
-                    crate::db::query_as(&sql)
-                        .bind(&uri)
-                        .bind(&collection)
-                        .bind(limit)
-                        .fetch_all(&state.db)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(format!("DB backlinks failed: {e}")))?
-                }
-            };
-
-            let has_next = rows_raw.len() as i64 == limit;
-
-            let result_table = lua.create_table()?;
-
-            if has_next && let Some((last_uri, _, _, last_created_at)) = rows_raw.last() {
-                let cursor = encode_cursor(last_created_at, last_uri);
-                result_table.set("cursor", cursor)?;
-            }
-
-            let records: Vec<Value> = rows_raw
-                .into_iter()
-                .map(|(uri, _did, record_str, _created_at)| {
-                    let mut record: Value = serde_json::from_str(&record_str).unwrap_or(json!({}));
-                    if let Some(obj) = record.as_object_mut() {
-                        obj.insert("uri".to_string(), json!(uri));
-                    }
-                    record
-                })
-                .collect();
-
-            let record_values: Vec<mlua::Value> = records
-                .iter()
-                .map(|r| lua.to_value(r))
-                .collect::<LuaResult<_>>()?;
-            let records_table = lua.create_sequence_from(record_values)?;
-            records_table.set_metatable(Some(lua.array_metatable()))?;
-            result_table.set("records", records_table)?;
-
-            Ok(mlua::Value::Table(result_table))
+            let page = backlinks_query(
+                &state.db,
+                state.db_backend,
+                BacklinksQuery {
+                    collection: opts.get("collection")?,
+                    uri: opts.get("uri")?,
+                    did: opts.get("did").ok(),
+                    limit: opts.get::<Option<u32>>("limit")?,
+                    cursor: opts.get("cursor").ok(),
+                },
+            )
+            .await
+            .map_err(lua_err)?;
+            page_to_lua(&lua, page)
         }
     })?;
     db_table.set("backlinks", backlinks_fn)?;
@@ -778,6 +341,7 @@ mod tests {
     use crate::config::Config;
     use crate::db::DatabaseBackend;
     use crate::lexicon::LexiconRegistry;
+    use serde_json::json;
     use tokio::sync::watch;
 
     fn test_state() -> AppState {
@@ -972,106 +536,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn raw_sql_allows_non_protected_tables() {
-        // Admins can get wild with their own tables.
-        assert!(super::check_raw_sql_tables("SELECT * FROM my_table").is_ok());
-        assert!(super::check_raw_sql_tables("CREATE TABLE analytics (id INT)").is_ok());
-        assert!(super::check_raw_sql_tables("INSERT INTO analytics VALUES (1)").is_ok());
-        assert!(super::check_raw_sql_tables("UPDATE analytics SET id = 2").is_ok());
-        assert!(super::check_raw_sql_tables("DELETE FROM analytics WHERE id = 1").is_ok());
-        assert!(super::check_raw_sql_tables("DROP TABLE analytics").is_ok());
-        // A table that merely *contains* the prefix mid-name is fine.
-        assert!(super::check_raw_sql_tables("SELECT * FROM myhappyview_data").is_ok());
-        // The prefix appearing inside a string literal is not a table reference.
-        assert!(
-            super::check_raw_sql_tables("INSERT INTO logs (msg) VALUES ('happyview_started')")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn raw_sql_allows_allowlisted_internal_tables() {
-        // Public AppView data and background jobs are readable/writable.
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_records").is_ok());
-        assert!(
-            super::check_raw_sql_tables("DELETE FROM happyview_records WHERE uri = $1").is_ok()
-        );
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_record_refs").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_labels").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_lexicons").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_jobs").is_ok());
-        // Space data (access, not confidentiality).
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_records").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_members").is_ok());
-    }
-
-    #[test]
-    fn raw_sql_blocks_protected_tables() {
-        // Secrets / tokens / keys.
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_dpop_keys").is_err());
-        assert!(super::check_raw_sql_tables("DROP TABLE happyview_api_keys").is_err());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_script_variables").is_err());
-        // Auth / privilege / trust config.
-        assert!(super::check_raw_sql_tables("UPDATE happyview_users SET is_super = true").is_err());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_domains").is_err());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_instance_settings").is_err());
-        // Space credential / key-material tables stay blocked even though other
-        // space tables are allowed.
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_credentials").is_err());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_repo_state").is_err());
-        // The migration bookkeeping table is off-limits too.
-        assert!(super::check_raw_sql_tables("SELECT * FROM _sqlx_migrations").is_err());
-    }
-
-    #[test]
-    fn raw_sql_blocks_protected_tables_evasion() {
-        // Case-insensitive.
-        assert!(super::check_raw_sql_tables("SELECT * FROM HAPPYVIEW_USERS").is_err());
-        // Double-quoted identifier.
-        assert!(super::check_raw_sql_tables(r#"SELECT * FROM "happyview_api_keys""#).is_err());
-        // Schema-qualified.
-        assert!(
-            super::check_raw_sql_tables("SELECT * FROM public.happyview_dpop_sessions").is_err()
-        );
-        // Second statement in a batch.
-        assert!(super::check_raw_sql_tables("SELECT 1; SELECT * FROM happyview_users").is_err());
-        // JOIN / subquery position.
-        assert!(
-            super::check_raw_sql_tables(
-                "SELECT * FROM my_table JOIN happyview_api_clients USING (id)"
-            )
-            .is_err()
-        );
-        // Unicode-escaped identifier evasion is refused outright.
-        assert!(super::check_raw_sql_tables(r#"SELECT * FROM U&"happyview_dpop_keys""#).is_err());
-    }
-
-    #[test]
-    fn valid_json_field_paths() {
-        assert!(super::is_valid_json_field_path("name"));
-        assert!(super::is_valid_json_field_path("author_name"));
-        assert!(super::is_valid_json_field_path("author.handle"));
-        assert!(super::is_valid_json_field_path("tags[0]"));
-        assert!(super::is_valid_json_field_path("data[0][1]"));
-        assert!(super::is_valid_json_field_path("author.websites[0].url"));
-        assert!(super::is_valid_json_field_path("a.b.c.d.e"));
-    }
-
-    #[test]
-    fn invalid_json_field_paths() {
-        assert!(!super::is_valid_json_field_path(""));
-        assert!(!super::is_valid_json_field_path(".name"));
-        assert!(!super::is_valid_json_field_path("name."));
-        assert!(!super::is_valid_json_field_path("name..foo"));
-        assert!(!super::is_valid_json_field_path("[0]"));
-        assert!(!super::is_valid_json_field_path("name[]"));
-        assert!(!super::is_valid_json_field_path("name[abc]"));
-        assert!(!super::is_valid_json_field_path("name; DROP TABLE"));
-        assert!(!super::is_valid_json_field_path("name'OR 1=1"));
-        assert!(!super::is_valid_json_field_path("na-me"));
-    }
-
     #[tokio::test]
     async fn query_accepts_nested_sort_field() {
         let state = test_state();
@@ -1115,7 +579,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("invalid sort field"),
+            err.contains("invalid field"),
             "expected sort field error, got: {err}"
         );
     }
@@ -1138,26 +602,25 @@ mod tests {
 
     #[test]
     fn cursor_round_trip() {
-        let encoded = super::encode_cursor("2026-03-12T10:00:00Z", "at://did:plc:abc/col/rkey");
-        let (ts, uri) = super::decode_cursor(&encoded).unwrap();
+        let encoded = crate::db::encode_cursor("2026-03-12T10:00:00Z", "at://did:plc:abc/col/rkey");
+        let (ts, uri) = crate::db::decode_cursor(&encoded).unwrap();
         assert_eq!(ts, "2026-03-12T10:00:00Z");
         assert_eq!(uri, "at://did:plc:abc/col/rkey");
     }
 
     #[test]
     fn decode_invalid_cursor_returns_none() {
-        assert!(super::decode_cursor("not-valid-base64!!!").is_none());
+        assert!(crate::db::decode_cursor("not-valid-base64!!!").is_none());
     }
 
     #[test]
     fn decode_cursor_missing_pipe_returns_none() {
-        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
         let encoded = BASE64.encode("no-pipe-here");
-        assert!(super::decode_cursor(&encoded).is_none());
+        assert!(crate::db::decode_cursor(&encoded).is_none());
     }
 
     // -----------------------------------------------------------------------
-    // parse_filter_node / build_filter_sql
+    // parse_filter_node
     // -----------------------------------------------------------------------
 
     fn make_condition_table(lua: &Lua, field: &str, op: &str, value: &str) -> mlua::Table {
@@ -1173,10 +636,14 @@ mod tests {
         let lua = Lua::new();
         let t = make_condition_table(&lua, "name", "=", "alice");
         let node = parse_filter_node(&t, 0).unwrap();
-        let mut binds = Vec::new();
-        let sql = build_filter_sql(&node, &mut binds);
-        assert_eq!(sql, "json_extract(record, '$.name') = ?");
-        assert_eq!(binds, vec!["alice"]);
+        assert_eq!(
+            node,
+            Filter::Condition(Condition {
+                field: "name".into(),
+                op: "=".into(),
+                value: json!("alice")
+            })
+        );
     }
 
     #[test]
@@ -1186,17 +653,14 @@ mod tests {
         t.set("field", "status").unwrap();
         t.set("value", "active").unwrap();
         let node = parse_filter_node(&t, 0).unwrap();
-        let mut binds = Vec::new();
-        let sql = build_filter_sql(&node, &mut binds);
-        assert_eq!(sql, "json_extract(record, '$.status') = ?");
-    }
-
-    #[test]
-    fn filter_rejects_invalid_op() {
-        let lua = Lua::new();
-        let t = make_condition_table(&lua, "name", "DROP", "x");
-        let err = parse_filter_node(&t, 0).unwrap_err();
-        assert!(err.to_string().contains("invalid filter op"));
+        assert_eq!(
+            node,
+            Filter::Condition(Condition {
+                field: "status".into(),
+                op: "=".into(),
+                value: json!("active")
+            })
+        );
     }
 
     #[test]
@@ -1217,56 +681,24 @@ mod tests {
         group.set(1, c1).unwrap();
         group.set(2, c2).unwrap();
         let node = parse_filter_node(&group, 0).unwrap();
-        let mut binds = Vec::new();
-        let sql = build_filter_sql(&node, &mut binds);
         assert_eq!(
-            sql,
-            "(json_extract(record, '$.status') = ? AND json_extract(record, '$.age') > ?)"
+            node,
+            Filter::Group {
+                combine: "AND".into(),
+                conditions: vec![
+                    Filter::Condition(Condition {
+                        field: "status".into(),
+                        op: "=".into(),
+                        value: json!("active")
+                    }),
+                    Filter::Condition(Condition {
+                        field: "age".into(),
+                        op: ">".into(),
+                        value: json!("18")
+                    }),
+                ],
+            }
         );
-        assert_eq!(binds, vec!["active", "18"]);
-    }
-
-    #[test]
-    fn filter_or_group() {
-        let lua = Lua::new();
-        let group = lua.create_table().unwrap();
-        group.set("combine", "OR").unwrap();
-        let c1 = make_condition_table(&lua, "role", "=", "admin");
-        let c2 = make_condition_table(&lua, "role", "=", "mod");
-        group.set(1, c1).unwrap();
-        group.set(2, c2).unwrap();
-        let node = parse_filter_node(&group, 0).unwrap();
-        let mut binds = Vec::new();
-        let sql = build_filter_sql(&node, &mut binds);
-        assert_eq!(
-            sql,
-            "(json_extract(record, '$.role') = ? OR json_extract(record, '$.role') = ?)"
-        );
-        assert_eq!(binds, vec!["admin", "mod"]);
-    }
-
-    #[test]
-    fn filter_single_child_group_unwraps() {
-        let lua = Lua::new();
-        let group = lua.create_table().unwrap();
-        group.set("combine", "AND").unwrap();
-        let c1 = make_condition_table(&lua, "x", "=", "1");
-        group.set(1, c1).unwrap();
-        let node = parse_filter_node(&group, 0).unwrap();
-        let mut binds = Vec::new();
-        let sql = build_filter_sql(&node, &mut binds);
-        assert_eq!(sql, "json_extract(record, '$.x') = ?");
-    }
-
-    #[test]
-    fn filter_rejects_invalid_combine() {
-        let lua = Lua::new();
-        let group = lua.create_table().unwrap();
-        group.set("combine", "XOR").unwrap();
-        let c1 = make_condition_table(&lua, "x", "=", "1");
-        group.set(1, c1).unwrap();
-        let err = parse_filter_node(&group, 0).unwrap_err();
-        assert!(err.to_string().contains("invalid filter combine"));
     }
 
     #[test]
@@ -1287,28 +719,6 @@ mod tests {
     }
 
     #[test]
-    fn filter_accepts_all_ops() {
-        let lua = Lua::new();
-        for op in ALLOWED_OPS {
-            let t = make_condition_table(&lua, "field", op, "val");
-            assert!(
-                parse_filter_node(&t, 0).is_ok(),
-                "op '{op}' should be accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn filter_op_case_insensitive() {
-        let lua = Lua::new();
-        let t = make_condition_table(&lua, "name", "like", "alice%");
-        let node = parse_filter_node(&t, 0).unwrap();
-        let mut binds = Vec::new();
-        let sql = build_filter_sql(&node, &mut binds);
-        assert_eq!(sql, "json_extract(record, '$.name') LIKE ?");
-    }
-
-    #[test]
     fn filter_integer_value() {
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
@@ -1316,9 +726,14 @@ mod tests {
         t.set("op", ">").unwrap();
         t.set("value", 42).unwrap();
         let node = parse_filter_node(&t, 0).unwrap();
-        let mut binds = Vec::new();
-        build_filter_sql(&node, &mut binds);
-        assert_eq!(binds, vec!["42"]);
+        assert_eq!(
+            node,
+            Filter::Condition(Condition {
+                field: "count".into(),
+                op: ">".into(),
+                value: json!("42")
+            })
+        );
     }
 
     #[test]
@@ -1328,9 +743,14 @@ mod tests {
         t.set("field", "active").unwrap();
         t.set("value", true).unwrap();
         let node = parse_filter_node(&t, 0).unwrap();
-        let mut binds = Vec::new();
-        build_filter_sql(&node, &mut binds);
-        assert_eq!(binds, vec!["true"]);
+        assert_eq!(
+            node,
+            Filter::Condition(Condition {
+                field: "active".into(),
+                op: "=".into(),
+                value: json!("true")
+            })
+        );
     }
 
     #[test]
@@ -1338,9 +758,14 @@ mod tests {
         let lua = Lua::new();
         let t = make_condition_table(&lua, "author.websites[0].url", "=", "https://example.com");
         let node = parse_filter_node(&t, 0).unwrap();
-        let mut binds = Vec::new();
-        let sql = build_filter_sql(&node, &mut binds);
-        assert_eq!(sql, "json_extract(record, '$.author.websites[0].url') = ?");
+        assert_eq!(
+            node,
+            Filter::Condition(Condition {
+                field: "author.websites[0].url".into(),
+                op: "=".into(),
+                value: json!("https://example.com"),
+            })
+        );
     }
 
     // -----------------------------------------------------------------------

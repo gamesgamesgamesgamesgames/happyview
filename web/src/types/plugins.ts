@@ -4,6 +4,27 @@ export interface SecretDefinition {
   description: string | null;
 }
 
+export type CapabilityRisk = "low" | "medium" | "high" | "critical";
+
+export interface CapabilityEntry {
+  name: string;
+  risk: CapabilityRisk;
+  description: string;
+}
+
+export interface CapabilityReport {
+  declared: CapabilityEntry[];
+  required_by_imports: CapabilityEntry[];
+  undeclared: string[];
+}
+
+export interface PluginDependency {
+  id: string;
+  version: string;
+}
+
+export type PluginType = "auth" | "interpreter" | "library";
+
 export interface ReleaseEntry {
   version: string;
   name: string;
@@ -26,6 +47,11 @@ export interface PluginSummary {
   update_available: boolean;
   latest_version: string | null;
   pending_releases: ReleaseEntry[];
+  plugin_type: PluginType;
+  namespace: string | null;
+  dependencies: PluginDependency[];
+  allowed_hosts: string[];
+  capabilities: CapabilityReport;
 }
 
 export interface PluginsListResponse {

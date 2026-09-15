@@ -294,7 +294,12 @@ async fn main() {
         }
     };
 
-    // Load plugins from PLUGIN_URLS env var
+    // Load plugins from PLUGIN_URLS env var and from the local plugin
+    // directory, collecting both into a batch installed in dependency
+    // order below — a library must land before anything that depends on it,
+    // regardless of which of these two sources it came from.
+    let mut boot_plugins: Vec<happyview::plugin::LoadedPlugin> = Vec::new();
+
     if let Ok(urls) = std::env::var("PLUGIN_URLS") {
         for (id, url, sha256) in happyview::plugin::loader::parse_plugin_urls(&urls) {
             match happyview::plugin::loader::fetch_manifest(&http, &url).await {
@@ -308,7 +313,7 @@ async fn main() {
                     {
                         Ok(plugin) => {
                             tracing::info!(id = %id, "Loaded plugin from URL");
-                            plugin_registry.register(plugin).await;
+                            boot_plugins.push(plugin);
                         }
                         Err(e) => {
                             tracing::error!(id = %id, error = %e, "Failed to load plugin WASM");
@@ -330,10 +335,13 @@ async fn main() {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                if !path.join("manifest.json").exists() {
+                    continue;
+                }
                 match happyview::plugin::loader::load_from_file(&path).await {
                     Ok(plugin) => {
                         tracing::info!(id = %plugin.info.id, "Loaded plugin from file");
-                        plugin_registry.register(plugin).await;
+                        boot_plugins.push(plugin);
                     }
                     Err(e) => {
                         tracing::error!(path = %path.display(), error = %e, "Failed to load plugin");
@@ -341,6 +349,10 @@ async fn main() {
                 }
             }
         }
+    }
+
+    for (id, err) in plugin_registry.register_all(boot_plugins).await {
+        tracing::error!(plugin_id = %id, error = %err, "Failed to install plugin at boot");
     }
 
     // Load plugins from database (added via admin UI)

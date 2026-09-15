@@ -2,6 +2,10 @@
 title: "XRPC Lua API"
 ---
 
+<Callout type="info">
+Use the `happyview.xrpc` library instead. This global is scheduled for removal in v3.
+</Callout>
+
 The `xrpc` table provides cross-endpoint XRPC calls. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts).
 
 ## xrpc.query

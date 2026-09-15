@@ -1,16 +1,31 @@
+mod atproto;
 mod bindings;
+mod caller;
+mod db;
 mod http;
+mod jobs;
 mod kv;
+mod linked_repos;
 mod logging;
 mod lookup;
+mod records;
 mod secrets;
 
+pub use atproto::*;
 pub use bindings::{PluginState, register_host_functions};
+pub use caller::*;
+pub use db::*;
 pub use http::*;
 pub use kv::*;
 pub use logging::*;
 pub use lookup::*;
+pub use records::*;
 pub use secrets::*;
+
+// `jobs` and `linked_repos` are deliberately not glob-exported: both define
+// functions sharing a name with `caller`'s (`create_record`, `put_record`,
+// `delete_record`, `upload_blob`) for the same operation on a different
+// account's repo. `bindings.rs` reaches them by their full module path.
 
 use std::collections::HashMap;
 use std::sync::Arc;

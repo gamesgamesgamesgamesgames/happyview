@@ -1821,6 +1821,7 @@ dependencies = [
  "futures-util",
  "happyview-nsid",
  "happyview-plc",
+ "happyview-plugin-sdk",
  "happyview-scopes",
  "hex",
  "hickory-resolver",
@@ -1859,7 +1860,9 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid",
+ "wasmparser 0.236.1",
  "wasmtime",
+ "wat",
  "webpki-roots 1.0.8",
  "wiremock",
 ]
@@ -1885,6 +1888,15 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "happyview-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wasmparser 0.236.1",
 ]
 
 [[package]]

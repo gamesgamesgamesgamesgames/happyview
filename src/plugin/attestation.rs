@@ -58,8 +58,11 @@ impl AttestationSigner {
         })
     }
 
-    /// Create a new signer with a test key (for testing only)
-    #[cfg(test)]
+    /// Create a new signer with a fixed test key. Not gated behind
+    /// `#[cfg(test)]`: an integration test under `tests/` compiles this crate
+    /// as an ordinary dependency, not with `cfg(test)`, so a unit-test-only
+    /// constructor is unreachable there — the same reason `test_support`
+    /// stays ungated. For testing only; the key is fixed and public.
     pub fn for_testing(key_id: String, sig_type: String) -> Self {
         // Fixed test key (32 bytes of 0x01) - DO NOT USE IN PRODUCTION
         let test_key_bytes = [0x01u8; 32];

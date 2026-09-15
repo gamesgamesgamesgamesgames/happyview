@@ -4,6 +4,10 @@ title: "Database API"
 
 The `db` table provides access to the database. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts).
 
+<Callout type="info">
+The `db` global is scheduled for removal in v3 in favor of `require("happyview.db")`. See [Using a library from Lua](../../guides/developing-plugins.md#using-a-library-from-lua).
+</Callout>
+
 ## db.query
 
 ```lua

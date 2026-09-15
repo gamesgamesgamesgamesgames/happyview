@@ -30,6 +30,7 @@ pub mod plugin;
 pub mod profile;
 pub mod proxy_config;
 pub mod rate_limit;
+pub mod raw_sql_guard;
 pub mod record_handler;
 pub mod record_refs;
 pub mod repo;
@@ -41,7 +42,6 @@ pub mod setup;
 pub mod spaces;
 pub mod telemetry;
 pub mod telemetry_middleware;
-#[cfg(test)]
 pub mod test_support;
 pub mod verification_methods;
 pub mod version;
@@ -103,6 +103,24 @@ pub struct AppState {
     pub verbose_event_logging: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
+}
+
+impl AppState {
+    /// A dispatcher over this instance's plugin registry. Cheap: every field
+    /// is a handle. Built per use rather than stored so the registry, key,
+    /// and pools stay the single source of truth.
+    pub fn plugin_executor(&self) -> plugin::PluginExecutor {
+        plugin::PluginExecutor::new(
+            self.wasm_runtime.clone(),
+            self.plugin_registry.clone(),
+            self.db.clone(),
+            self.db_backend,
+            self.http.clone(),
+            Arc::new(self.lexicons.clone()),
+        )
+        .with_encryption_key(self.config.token_encryption_key)
+        .with_app_state(self.clone())
+    }
 }
 
 impl axum::extract::FromRef<AppState> for axum_extra::extract::cookie::Key {
