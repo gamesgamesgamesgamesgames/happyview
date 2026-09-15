@@ -11,9 +11,23 @@ import {
 } from "@/lib/api";
 import { isValidNsid } from "@happyview/nsid";
 import { LEXICON_TEMPLATE } from "@/lib/lua-templates";
+import {
+  type LexiconSuggestion,
+  SUGGEST_MIN_QUERY_LENGTH,
+  suggestLexicons,
+} from "@/lib/lexicon-garden";
 import { CodePanels } from "@/components/code-panels";
 import { SiteHeader } from "@/components/site-header";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Combobox,
+  ComboboxContent,
+  ComboboxEmpty,
+  ComboboxInput,
+  ComboboxItem,
+  ComboboxList,
+} from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -47,6 +61,11 @@ export default function AddLexiconPage() {
   }>({ nsid: "", type: undefined, json: "" });
   const [resolving, setResolving] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const [fetchedSuggestions, setFetchedSuggestions] = useState<
+    LexiconSuggestion[]
+  >([]);
+  const canSuggest = nsid.length >= SUGGEST_MIN_QUERY_LENGTH;
+  const suggestions = canSuggest ? fetchedSuggestions : [];
 
   const mainType = resolved.nsid === nsid ? resolved.type : undefined;
   const networkJson = resolved.nsid === nsid ? resolved.json : "";
@@ -132,6 +151,26 @@ export default function AddLexiconPage() {
 
     return () => clearTimeout(debounce);
   }, [nsid]);
+
+  // Debounced NSID typeahead. Failures just leave the list empty; typing a
+  // full NSID still resolves without suggestions.
+  useEffect(() => {
+    if (!canSuggest) return;
+
+    const controller = new AbortController();
+    const debounce = setTimeout(() => {
+      suggestLexicons(nsid, controller.signal)
+        .then(setFetchedSuggestions)
+        .catch(() => {
+          if (!controller.signal.aborted) setFetchedSuggestions([]);
+        });
+    }, 200);
+
+    return () => {
+      clearTimeout(debounce);
+      controller.abort();
+    };
+  }, [nsid, canSuggest]);
 
   const showNetworkTargetCollection =
     mainType === "query" || mainType === "procedure";
@@ -253,12 +292,41 @@ export default function AddLexiconPage() {
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                 <div className="flex flex-col gap-2">
                   <Label htmlFor="nsid">NSID</Label>
-                  <Input
-                    id="nsid"
-                    value={nsid}
-                    onChange={(e) => setNsid(e.target.value)}
-                    placeholder="com.example.record"
-                  />
+                  <Combobox
+                    items={suggestions}
+                    filter={null}
+                    inputValue={nsid}
+                    onInputValueChange={setNsid}
+                    onValueChange={(suggestion: LexiconSuggestion | null) => {
+                      if (suggestion) setNsid(suggestion.nsid);
+                    }}
+                    itemToStringLabel={(suggestion: LexiconSuggestion) =>
+                      suggestion.nsid
+                    }
+                    isItemEqualToValue={(a, b) => a.uri === b.uri}
+                  >
+                    <ComboboxInput
+                      id="nsid"
+                      className="w-full"
+                      placeholder="com.example.record"
+                      showTrigger={false}
+                    />
+                    <ComboboxContent className="min-w-(--anchor-width)">
+                      <ComboboxEmpty>No matching lexicons.</ComboboxEmpty>
+                      <ComboboxList>
+                        {(suggestion: LexiconSuggestion) => (
+                          <ComboboxItem key={suggestion.uri} value={suggestion}>
+                            <span className="truncate">{suggestion.nsid}</span>
+                            {suggestion.lexiconType && (
+                              <Badge variant="outline" className="ms-auto">
+                                {suggestion.lexiconType}
+                              </Badge>
+                            )}
+                          </ComboboxItem>
+                        )}
+                      </ComboboxList>
+                    </ComboboxContent>
+                  </Combobox>
                 </div>
 
                 {showNetworkTargetCollection && (
