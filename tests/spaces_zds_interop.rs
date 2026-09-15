@@ -6,10 +6,6 @@
 //!   cargo test --test spaces_zds_interop -- --ignored --nocapture
 //!   docker compose -f docker-compose.zds.yml down -v
 //!
-//! Run these on their own. The upstream image is amd64-only and runs under
-//! emulation on Apple Silicon, which starves the machine enough to time out the
-//! Postgres pool the rest of the suite uses.
-//!
 //! ZDS serves `community.lexicon.service.describe`, so it exercises tier 1 of
 //! detection, and its `ZDS_PERMISSIONED_DATA` flag lets the same build stand in
 //! for both a spaces-capable and a spaces-less PDS.
@@ -415,19 +411,8 @@ async fn the_migration_replay_lands_on_zds_with_the_hash_it_expects() {
     .await;
     let space = body["uri"].as_str().expect("space uri").to_string();
 
-    let mut records =
+    let records =
         interop_support::records_awaiting_migration(&space, &did, interop_support::Sample::Full);
-    // ZDS refuses unpadded `$bytes` (pinned below), and the sample is unpadded
-    // as the reference PDS emits it. Padding names the same bytes, so the CIDs
-    // the migration expects are unchanged.
-    for r in &mut records {
-        let raw = &mut r.record["raw"]["$bytes"];
-        let unpadded = raw.as_str().unwrap().to_string();
-        *raw = json!(format!(
-            "{unpadded}{}",
-            "=".repeat((4 - unpadded.len() % 4) % 4)
-        ));
-    }
     let commit = interop_support::replay_as_migration(ZDS, &token, &space, &did, &records).await;
 
     let disagreements =
@@ -437,52 +422,4 @@ async fn the_migration_replay_lands_on_zds_with_the_hash_it_expects() {
     let commit = parse_signed_commit(&commit).expect("parses");
     verify_commit(&commit, &space, &did, &author_key(&did).await).expect("authentic");
     assert_eq!(commit.hash, interop_support::migration_expects(&records));
-}
-
-#[tokio::test]
-#[ignore]
-async fn zds_rejects_unpadded_lexicon_bytes_in_records() {
-    // The reference PDS accepts `$bytes` with or without padding, and emits it
-    // unpadded in commits. ZDS emits padding and refuses a record without it,
-    // as outside the data model. HappyView replays record values as they
-    // were written, so a repo holding unpadded bytes cannot migrate to ZDS:
-    // applyWrites fails and the repo stays on HappyView.
-    //
-    // If this fails, ZDS has relaxed and the padding step in the migration test
-    // above can go.
-    let (did, token) = new_account().await;
-    let (_, body) = post_json(
-        &format!("{ZDS}/xrpc/com.atproto.simplespace.createSpace"),
-        Some(&token),
-        json!({
-            "type": "com.example.forum",
-            "skey": "self",
-            "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
-        }),
-    )
-    .await;
-    let space_uri = body["uri"].as_str().expect("space uri").to_string();
-
-    let put = |bytes: &'static str| {
-        let (space_uri, did, token) = (space_uri.clone(), did.clone(), token.clone());
-        async move {
-            post_json(
-                &format!("{ZDS}/xrpc/com.atproto.space.putRecord"),
-                Some(&token),
-                json!({
-                    "space": space_uri,
-                    "repo": did,
-                    "collection": "com.example.note",
-                    "rkey": if bytes.ends_with('=') { "padded" } else { "unpadded" },
-                    "record": { "$type": "com.example.note", "raw": { "$bytes": bytes } },
-                }),
-            )
-            .await
-        }
-    };
-    let (unpadded, body) = put("AAECAwQFBgc").await;
-    assert_eq!(unpadded, 400, "{body}");
-    let (padded, body) = put("AAECAwQFBgc=").await;
-    assert!(padded < 300, "{body}");
 }

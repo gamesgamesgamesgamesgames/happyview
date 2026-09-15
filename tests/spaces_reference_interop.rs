@@ -6,8 +6,9 @@
 //!   cargo test --test spaces_reference_interop -- --ignored --nocapture
 //!   docker compose -f docker-compose.spaces-alpha.yml down -v
 //!
-//! Run these on their own. Like ZDS, the image is amd64-only; see
-//! `spaces_zds_interop` for why that matters.
+//! Run these on their own. The image is amd64-only and runs under emulation on
+//! Apple Silicon, which starves the machine enough to time out the Postgres pool
+//! the rest of the suite uses.
 //!
 //! This image is the spec-current reference, so it is where HappyView's own
 //! wire shapes (split policies, `putMember`, the oplog) are checked. The other
