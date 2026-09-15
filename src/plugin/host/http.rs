@@ -104,6 +104,24 @@ pub(crate) fn no_redirect_client() -> Result<reqwest::Client, reqwest::Error> {
     ))
 }
 
+/// The refusal message for a restricted request `host_allowed` rejected.
+///
+/// `network:request:defined` with nothing configured yet gets a distinct
+/// message: an empty list there means an operator hasn't listed any hosts,
+/// not that this particular host was excluded from one — "no hosts are
+/// configured" is the true state, and "is not in allowed_hosts" would
+/// wrongly imply a list exists that this host just isn't on. `network:request`
+/// can never have an empty list (the loader refuses that at load time), so
+/// `defined` is the only capability where the distinction can arise.
+pub fn allowed_hosts_denial(allowed_hosts: &[String], defined: bool, host: Option<&str>) -> String {
+    if defined && allowed_hosts.is_empty() {
+        "no hosts are configured for this plugin; an admin lists them under the plugin's settings"
+            .to_string()
+    } else {
+        format!("host {} is not in allowed_hosts", host.unwrap_or_default())
+    }
+}
+
 /// `*.example.com` matches `a.example.com` and `a.b.example.com` but not `example.com`.
 pub fn host_allowed(allowed_hosts: &[String], host: &str) -> bool {
     let host = host.to_ascii_lowercase();
@@ -142,6 +160,32 @@ mod tests {
     fn host_allowed_wildcard_does_not_match_apex() {
         let allowed = vec!["*.example.com".to_string()];
         assert!(!host_allowed(&allowed, "example.com"));
+    }
+
+    #[test]
+    fn allowed_hosts_denial_reports_not_configured_when_defined_and_empty() {
+        let msg = allowed_hosts_denial(&[], true, Some("api.example.com"));
+        assert!(msg.contains("no hosts are configured"), "{msg}");
+    }
+
+    #[test]
+    fn allowed_hosts_denial_reports_the_host_for_a_non_empty_list() {
+        let allowed = vec!["api.example.com".to_string()];
+        let msg = allowed_hosts_denial(&allowed, true, Some("evil.example.com"));
+        assert!(msg.contains("evil.example.com"), "{msg}");
+        assert!(msg.contains("is not in allowed_hosts"), "{msg}");
+    }
+
+    /// `network:request` can never have an empty `allowed_hosts` (the loader
+    /// refuses that at load time), so the non-`defined` path always reports
+    /// the host, matching pre-existing behavior.
+    #[test]
+    fn allowed_hosts_denial_is_unaffected_by_defined_when_the_list_is_non_empty() {
+        let allowed = vec!["api.example.com".to_string()];
+        assert_eq!(
+            allowed_hosts_denial(&allowed, false, Some("evil.example.com")),
+            allowed_hosts_denial(&allowed, true, Some("evil.example.com")),
+        );
     }
 
     #[test]
@@ -205,6 +249,11 @@ mod tests {
         }
     }
 
+    // Covers every restricted capability alike: `http_request`'s
+    // `follow_redirects` flag has no notion of which capability chose the
+    // restricted path, so this exercises `network:request:defined` too —
+    // `bindings.rs` passes `false` for it exactly as it does for
+    // `network:request`.
     #[tokio::test]
     async fn restricted_request_does_not_follow_redirects() {
         use wiremock::matchers::{method, path};

@@ -1,8 +1,12 @@
 mod common;
 
+use axum::body::Body;
+use axum::http::Request;
 use happyview::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource};
-use serde_json::json;
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
 use serial_test::serial;
+use tower::ServiceExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -11,13 +15,25 @@ use common::app::TestApp;
 /// Duplicated from `tests/plugin_integration.rs`'s `graph_registry` module —
 /// the smallest library `LoadedPlugin` with a set of dependencies.
 fn library(id: &str, version: &str, deps: &[(&str, &str)]) -> LoadedPlugin {
+    library_with_capabilities(id, version, deps, &[])
+}
+
+/// As `library`, but with a declared capability set — for the
+/// `network:request:defined` allowed-hosts endpoint tests, which check what
+/// a plugin declares rather than instantiate it.
+fn library_with_capabilities(
+    id: &str,
+    version: &str,
+    deps: &[(&str, &str)],
+    capabilities: &[&str],
+) -> LoadedPlugin {
     let deps_json: Vec<serde_json::Value> = deps
         .iter()
         .map(|(id, v)| serde_json::json!({"id": id, "version": v}))
         .collect();
     let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
         "id": id, "name": id, "version": version, "api_version": "2",
-        "plugin_type": "library", "dependencies": deps_json,
+        "plugin_type": "library", "dependencies": deps_json, "capabilities": capabilities,
     }))
     .unwrap();
     LoadedPlugin {
@@ -293,4 +309,269 @@ async fn reload_requires_consent_to_cover_new_capabilities() {
         )
         .await;
     assert_eq!(status, 200);
+}
+
+// ---------------------------------------------------------------------------
+// `network:request:defined` allowed-hosts endpoints
+// ---------------------------------------------------------------------------
+
+async fn json_body(resp: axum::response::Response) -> Value {
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap()
+    }
+}
+
+fn admin_get(
+    uri: &str,
+    cookie: (axum::http::HeaderName, axum::http::HeaderValue),
+) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(cookie.0, cookie.1)
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn admin_put(
+    uri: &str,
+    cookie: (axum::http::HeaderName, axum::http::HeaderValue),
+    body: &Value,
+) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header(cookie.0, cookie.1)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(body).unwrap()))
+        .unwrap()
+}
+
+/// `happyview_plugin_configs.plugin_id` is a foreign key into
+/// `happyview_plugins` (see `src/plugin/config.rs`'s own test helper of the
+/// same shape) — a plugin installed directly into the in-memory registry,
+/// bypassing the admin install endpoint, needs a matching row before the PUT
+/// endpoint can store anything for it. An upsert, not a plain insert: `id`
+/// is this test's identifier and the harness's Postgres truncation list
+/// (`tests/common/db.rs`) does not reset `happyview_plugins` between test
+/// binary runs, so a plain `INSERT` would only succeed once.
+async fn insert_plugin_row(app: &TestApp, id: &str) {
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_plugins (id, source, api_version) VALUES (?, 'file', '2')
+         ON CONFLICT (id) DO UPDATE SET source = excluded.source",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(id)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn allowed_hosts_round_trips_through_put_and_get() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .install(library_with_capabilities(
+            "netdefined",
+            "1.0.0",
+            &[],
+            &["network:request:defined"],
+        ))
+        .await
+        .unwrap();
+    insert_plugin_row(&app, "netdefined").await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/plugins/netdefined/allowed-hosts",
+            app.admin_cookie(),
+            &json!({"hosts": ["api.example.com", "*.cdn.example.com"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["hosts"],
+        json!(["api.example.com", "*.cdn.example.com"])
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            "/admin/plugins/netdefined/allowed-hosts",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = json_body(resp).await;
+    assert_eq!(
+        body["hosts"],
+        json!(["api.example.com", "*.cdn.example.com"])
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn allowed_hosts_put_rejects_an_invalid_host_by_name() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .install(library_with_capabilities(
+            "netdefined2",
+            "1.0.0",
+            &[],
+            &["network:request:defined"],
+        ))
+        .await
+        .unwrap();
+    insert_plugin_row(&app, "netdefined2").await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/plugins/netdefined2/allowed-hosts",
+            app.admin_cookie(),
+            &json!({"hosts": ["http://not-a-host"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = json_body(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("http://not-a-host"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn allowed_hosts_refused_for_a_plugin_that_does_not_declare_the_capability() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .install(library("plain", "1.0.0", &[]))
+        .await
+        .unwrap();
+    insert_plugin_row(&app, "plain").await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/plugins/plain/allowed-hosts",
+            app.admin_cookie(),
+            &json!({"hosts": ["api.example.com"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = json_body(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("network:request:defined"),
+        "{body}"
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            "/admin/plugins/plain/allowed-hosts",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
+#[tokio::test]
+#[serial]
+async fn allowed_hosts_unknown_plugin_returns_404() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            "/admin/plugins/does-not-exist/allowed-hosts",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/plugins/does-not-exist/allowed-hosts",
+            app.admin_cookie(),
+            &json!({"hosts": []}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+#[serial]
+async fn allowed_hosts_requires_permission() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .install(library_with_capabilities(
+            "netdefined3",
+            "1.0.0",
+            &[],
+            &["network:request:defined"],
+        ))
+        .await
+        .unwrap();
+    insert_plugin_row(&app, "netdefined3").await;
+
+    let non_admin = common::auth::admin_cookie_header("did:plc:notadmin", &app.state.cookie_key);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            "/admin/plugins/netdefined3/allowed-hosts",
+            non_admin.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/plugins/netdefined3/allowed-hosts",
+            non_admin,
+            &json!({"hosts": ["api.example.com"]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
 }

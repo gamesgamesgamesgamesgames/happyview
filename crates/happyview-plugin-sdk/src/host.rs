@@ -47,6 +47,7 @@ extern "C" {
     fn host_log(level_ptr: i32, level_len: i32, msg_ptr: i32, msg_len: i32);
     fn host_get_secret(name_ptr: i32, name_len: i32) -> i64;
     fn host_http_request(req_ptr: i32, req_len: i32) -> i64;
+    fn host_allowed_hosts(req_ptr: i32, req_len: i32) -> i64;
     fn host_kv_get(key_ptr: i32, key_len: i32) -> i64;
     fn host_kv_set(key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32, ttl_secs: i32) -> i32;
     fn host_kv_delete(key_ptr: i32, key_len: i32) -> i32;
@@ -202,6 +203,25 @@ pub fn http_request(request: &HttpRequest) -> Result<HttpResponse, HostError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = request;
+        Err(HostError::NotWasm)
+    }
+}
+
+/// The plugin's effective allowed-hosts list: the operator-configured list
+/// under `network:request:defined`, the manifest's `allowed_hosts` under
+/// `network:request`, or empty under `network:request:unrestricted` (which
+/// needs no list) or with no network capability declared at all. Needs no
+/// capability.
+pub fn allowed_hosts() -> Result<Vec<String>, HostError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let bytes = serde_json::to_vec(&serde_json::json!({})).map_err(PluginError::from)?;
+        // SAFETY: `bytes` is live for the duration of the call.
+        let packed = unsafe { host_allowed_hosts(bytes.as_ptr() as i32, bytes.len() as i32) };
+        decode_required(packed)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
         Err(HostError::NotWasm)
     }
 }
@@ -818,6 +838,7 @@ mod tests {
             http_request(&HttpRequest::new("GET", "https://example.com")),
             Err(HostError::NotWasm)
         );
+        assert_eq!(allowed_hosts(), Err(HostError::NotWasm));
         assert_eq!(
             lookup_record(&LookupRequest::new("c", "f", "v")),
             Err(HostError::NotWasm)

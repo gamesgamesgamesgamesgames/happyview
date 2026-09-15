@@ -285,12 +285,20 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), LoadError> {
     let restricted = manifest
         .capabilities
         .contains(&PluginCapability::NetworkRequest);
+    let defined = manifest
+        .capabilities
+        .contains(&PluginCapability::NetworkRequestDefined);
     let unrestricted = manifest
         .capabilities
         .contains(&PluginCapability::NetworkRequestUnrestricted);
-    if restricted && unrestricted {
+    if [restricted, defined, unrestricted]
+        .into_iter()
+        .filter(|&declared| declared)
+        .count()
+        > 1
+    {
         return Err(LoadError::InvalidCapabilities(
-            "declare either network:request or network:request:unrestricted, not both".into(),
+            "network:request, network:request:defined and network:request:unrestricted are mutually exclusive; declare at most one".into(),
         ));
     }
     if restricted && manifest.allowed_hosts.is_empty() {
@@ -302,6 +310,11 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), LoadError> {
         return Err(LoadError::InvalidCapabilities(
             "network:request:unrestricted already grants every host; allowed_hosts must be empty"
                 .into(),
+        ));
+    }
+    if defined && !manifest.allowed_hosts.is_empty() {
+        return Err(LoadError::InvalidCapabilities(
+            "network:request:defined takes its hosts from the plugin's settings, not the manifest; allowed_hosts must be empty".into(),
         ));
     }
     for host in &manifest.allowed_hosts {
@@ -518,6 +531,50 @@ mod tests {
             validate_manifest(&m),
             Err(LoadError::InvalidCapabilities(_))
         ));
+    }
+
+    #[test]
+    fn validate_manifest_defined_network_forbids_manifest_hosts() {
+        let m = manifest(
+            r#"{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                "capabilities":["network:request:defined"],"allowed_hosts":["a.example"]}"#,
+        );
+        let err = validate_manifest(&m).unwrap_err();
+        assert!(matches!(err, LoadError::InvalidCapabilities(_)), "{err}");
+        assert!(err.to_string().contains("allowed_hosts"));
+    }
+
+    #[test]
+    fn validate_manifest_defined_with_network_request_refused() {
+        let m = manifest(
+            r#"{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                "capabilities":["network:request:defined","network:request"],"allowed_hosts":["a.example"]}"#,
+        );
+        assert!(matches!(
+            validate_manifest(&m),
+            Err(LoadError::InvalidCapabilities(_))
+        ));
+    }
+
+    #[test]
+    fn validate_manifest_defined_with_unrestricted_refused() {
+        let m = manifest(
+            r#"{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                "capabilities":["network:request:defined","network:request:unrestricted"]}"#,
+        );
+        assert!(matches!(
+            validate_manifest(&m),
+            Err(LoadError::InvalidCapabilities(_))
+        ));
+    }
+
+    #[test]
+    fn validate_manifest_defined_with_empty_hosts_loads() {
+        let m = manifest(
+            r#"{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                "capabilities":["network:request:defined"]}"#,
+        );
+        assert!(validate_manifest(&m).is_ok());
     }
 
     #[test]

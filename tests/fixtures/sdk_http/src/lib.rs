@@ -1,5 +1,6 @@
 //! `http` standard library plugin: outbound HTTP requests through the host.
-//! Exports `get`, `post`, `put`, `patch`, `delete` and `head`.
+//! Exports `get`, `post`, `put`, `patch`, `delete`, `head` and
+//! `allowed_hosts` (the SDK conformance fixture for `host::allowed_hosts()`).
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
@@ -41,9 +42,18 @@ fn surface() -> ApiSurface {
                 .param_json(opts.clone())
                 .returns(returns.clone())
         }))
+        .export(
+            ApiExport::function("allowed_hosts")
+                .describe("The plugin's effective allowed-hosts list")
+                .returns(json!({"type": "array", "items": {"type": "string"}})),
+        )
 }
 
 fn dispatch(function: &str, args: &[Value], _ctx: &CallContext) -> Result<Value, PluginError> {
+    if function == "allowed_hosts" {
+        let hosts = host::allowed_hosts()?;
+        return Ok(json!(hosts));
+    }
     if !METHODS.contains(&function) {
         return Err(PluginError::unknown_function(function));
     }

@@ -6,7 +6,7 @@ import { Plus, Trash2, RefreshCw, ExternalLink, Settings, Loader2, AlertTriangle
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { useOfficialPlugins } from "@/hooks/use-official-plugins";
-import { getPlugins, addPlugin, removePlugin, reloadPlugin, getPluginSecrets, updatePluginSecrets, previewPlugin, checkPluginUpdate, type PluginPreview } from "@/lib/api";
+import { getPlugins, addPlugin, removePlugin, reloadPlugin, getPluginSecrets, updatePluginSecrets, getPluginAllowedHosts, updatePluginAllowedHosts, previewPlugin, checkPluginUpdate, type PluginPreview } from "@/lib/api";
 import type { PluginSummary } from "@/types/plugins";
 import { PluginUpdateDialog } from "@/components/plugin-update-dialog";
 import { PluginCapabilities, visibleCapabilities } from "@/components/plugin-capabilities";
@@ -39,6 +39,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { MultiInput } from "@/components/ui/multi-input";
 import {
   ResponsiveDialog,
   ResponsiveDialogClose,
@@ -66,6 +67,12 @@ function formatAuthType(authType: string): string {
     api_key: "API Key",
   };
   return formats[authType] || authType;
+}
+
+function hasDefinedHostsCapability(plugin: PluginSummary): boolean {
+  return visibleCapabilities(plugin.capabilities).some(
+    (c) => c.name === "network:request:defined",
+  );
 }
 
 export default function PluginsPage() {
@@ -113,6 +120,8 @@ export default function PluginsPage() {
   const [configPlugin, setConfigPlugin] = useState<PluginSummary | null>(null);
   const [secretValues, setSecretValues] = useState<Record<string, string>>({});
   const [savingSecrets, setSavingSecrets] = useState(false);
+  const [allowedHosts, setAllowedHosts] = useState<string[]>([""]);
+  const [configuredHosts, setConfiguredHosts] = useState<Record<string, string[]>>({});
 
   const canCreate = hasPermission("plugins:create");
   const canDelete = hasPermission("plugins:delete");
@@ -270,6 +279,13 @@ export default function PluginsPage() {
         initial[secret.key] = response.secrets[secret.key] || "";
       }
       setSecretValues(initial);
+      if (hasDefinedHostsCapability(plugin)) {
+        const hostsResponse = await getPluginAllowedHosts(plugin.id);
+        setAllowedHosts([...hostsResponse.hosts, ""]);
+        setConfiguredHosts((prev) => ({ ...prev, [plugin.id]: hostsResponse.hosts }));
+      } else {
+        setAllowedHosts([""]);
+      }
       setConfigOpen(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -282,9 +298,15 @@ export default function PluginsPage() {
     setError(null);
     try {
       await updatePluginSecrets(configPlugin.id, secretValues);
+      if (hasDefinedHostsCapability(configPlugin)) {
+        const hosts = allowedHosts.map((host) => host.trim()).filter(Boolean);
+        const hostsResponse = await updatePluginAllowedHosts(configPlugin.id, hosts);
+        setConfiguredHosts((prev) => ({ ...prev, [configPlugin.id]: hostsResponse.hosts }));
+      }
       setConfigOpen(false);
       setConfigPlugin(null);
       setSecretValues({});
+      setAllowedHosts([""]);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -598,7 +620,11 @@ export default function PluginsPage() {
                             <CollapsibleContent className="mt-1 max-w-sm">
                               <PluginCapabilities
                                 entries={capabilities}
-                                allowedHosts={plugin.allowed_hosts}
+                                allowedHosts={
+                                  hasDefinedHostsCapability(plugin)
+                                    ? configuredHosts[plugin.id]
+                                    : plugin.allowed_hosts
+                                }
                               />
                             </CollapsibleContent>
                           </Collapsible>
@@ -670,18 +696,24 @@ export default function PluginsPage() {
                             />
                           </Button>
                         )}
-                        {canCreate && plugin.required_secrets?.length > 0 && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-8"
-                            title={encryptionConfigured ? "Configure secrets" : "Encryption not configured"}
-                            onClick={() => handleOpenConfig(plugin)}
-                            disabled={!encryptionConfigured}
-                          >
-                            <Settings className="size-4" />
-                          </Button>
-                        )}
+                        {canCreate &&
+                          (plugin.required_secrets?.length > 0 ||
+                            hasDefinedHostsCapability(plugin)) && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="size-8"
+                              title={
+                                plugin.required_secrets?.length > 0 && !encryptionConfigured
+                                  ? "Encryption not configured"
+                                  : "Configure plugin"
+                              }
+                              onClick={() => handleOpenConfig(plugin)}
+                              disabled={plugin.required_secrets?.length > 0 && !encryptionConfigured}
+                            >
+                              <Settings className="size-4" />
+                            </Button>
+                          )}
                         {canCreate && plugin.source === "url" && (
                           <Button
                             variant="ghost"
@@ -726,7 +758,9 @@ export default function PluginsPage() {
                 Configure {configPlugin?.name}
               </ResponsiveDialogTitle>
               <ResponsiveDialogDescription>
-                Enter the required secrets for this plugin. Leave empty to use environment variables.
+                {configPlugin && configPlugin.required_secrets.length > 0
+                  ? "Enter the required secrets for this plugin. Leave empty to use environment variables."
+                  : "Configure this plugin's settings."}
               </ResponsiveDialogDescription>
             </ResponsiveDialogHeader>
             <div className="grid gap-4 py-4">
@@ -750,6 +784,20 @@ export default function PluginsPage() {
                   />
                 </div>
               ))}
+              {configPlugin && hasDefinedHostsCapability(configPlugin) && (
+                <div className="grid gap-2">
+                  <Label htmlFor="allowed-hosts">Allowed hosts</Label>
+                  <p className="text-xs text-muted-foreground">
+                    This plugin can only make requests to hosts listed here.
+                  </p>
+                  <MultiInput
+                    id="allowed-hosts"
+                    values={allowedHosts}
+                    onChange={setAllowedHosts}
+                    placeholder="api.example.com"
+                  />
+                </div>
+              )}
             </div>
             <ResponsiveDialogFooter>
               <ResponsiveDialogClose asChild>
@@ -758,7 +806,7 @@ export default function PluginsPage() {
                 </Button>
               </ResponsiveDialogClose>
               <Button onClick={handleSaveSecrets} disabled={savingSecrets}>
-                {savingSecrets ? "Saving..." : "Save Secrets"}
+                {savingSecrets ? "Saving..." : "Save"}
               </Button>
             </ResponsiveDialogFooter>
           </ResponsiveDialogContent>

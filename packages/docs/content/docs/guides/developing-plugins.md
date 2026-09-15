@@ -319,6 +319,7 @@ Every host function except `host_log` is gated by a capability. The loader reads
 | `kv:write` | Low | Write to its own key-value storage (1 MB per scope). |
 | `records:read` | Medium | Look up indexed AT Protocol records. |
 | `network:request` | Medium | Make HTTP requests, only to the hosts it lists. Redirects are not followed. |
+| `network:request:defined` | Medium | Make HTTP requests only to the hosts you list for this plugin in its settings. Redirects are not followed. |
 | `network:request:unrestricted` | High | Make HTTP requests to any host on the internet, including internal services this server can reach. |
 | `library:call` | Medium | Call other installed library plugins, which run with their own permissions (not this plugin's). |
 | `database:read` | High | Run arbitrary read-only SQL against indexed records, labels, lexicons, jobs and space data. Internal auth, secret and key tables are blocked. |
@@ -332,7 +333,7 @@ Every host function except `host_log` is gated by a capability. The loader reads
 | `linked_repos:use` | High | Write records and upload blobs through any repo an admin has linked to this instance, within the scopes that admin granted, and call any XRPC method through it, which only that repo's PDS constrains. |
 | `jobs:create` | Medium | Enqueue background jobs as the user who ran the script, optionally carrying that user's PDS session into the job. |
 
-`network:request` and `network:request:unrestricted` are mutually exclusive — declare one or the other, never both. `network:request` requires a non-empty `allowed_hosts`; `network:request:unrestricted` requires `allowed_hosts` to be empty. `allowed_hosts` entries are bare hostnames, optionally prefixed `*.` to allow subdomains — no scheme, path, port, or whitespace:
+`network:request`, `network:request:defined`, and `network:request:unrestricted` are mutually exclusive — declare exactly one. `network:request` requires a non-empty `allowed_hosts`; `network:request:unrestricted` requires `allowed_hosts` to be empty; `network:request:defined` also requires `allowed_hosts` to be empty, because its hosts come from the operator's plugin settings instead of the manifest. `allowed_hosts` entries, wherever they come from, are bare hostnames, optionally prefixed `*.` to allow subdomains — no scheme, path, port, or whitespace:
 
 ```json
 {
@@ -340,6 +341,8 @@ Every host function except `host_log` is gated by a capability. The loader reads
   "allowed_hosts": ["api.example.com", "*.cdn.example.com"]
 }
 ```
+
+Choose `network:request:defined` over `network:request` when the plugin talks to a self-hosted backend whose address belongs to the operator, not to you as the plugin's author — a URL you can't know at publish time and shouldn't have to declare. It's also the better choice over `network:request:unrestricted` in that case: declaring unrestricted network access to reach one operator-chosen server asks for far more than the plugin needs. Until an admin lists hosts for the plugin under its settings, every request fails with "no hosts are configured for this plugin; an admin lists them under the plugin's settings". A plugin reads its own effective list back with `host::allowed_hosts()`: the operator-configured list under `network:request:defined`, the manifest's `allowed_hosts` under `network:request`, or an empty list under `network:request:unrestricted`.
 
 ### Acting as the caller
 
@@ -432,7 +435,7 @@ An empty Lua table argument (`{}`) is encoded as a JSON object, matching `json.e
 Everything above — the allocator, the packed-`i64` calling convention, the JSON envelope, and the `env` host imports — is what a plugin would otherwise have to hand-roll behind `extern "C"`. The `happyview-plugin-sdk` crate (`crates/happyview-plugin-sdk` in the HappyView repo) owns all of it, so a plugin crate needs only this one dependency.
 
 - `library_plugin! { info: ..., surface: ..., call: ... }` generates the five ABI exports (`alloc`, `dealloc`, `plugin_info`, `get_api_surface`, `call`) from a `PluginInfo`, an `ApiSurface`-returning function, and a dispatch function — the `export_abi!` macro it builds on is also available directly for lower-level cases.
-- `host::*` gives typed, `Result`-returning wrappers over every host import — `host::http_request`, `host::kv_get`/`kv_set`/`kv_delete`, `host::get_secret`, `host::call_library`, `host::library_surface`, `host::db_query`/`db_execute`, `host::lookup_record`, and `host::log`/`debug`/`info`/`warn`/`error`. A native (non-wasm32) build compiles the whole SDK, so a plugin's own logic is testable with `cargo test`; the host wrappers just report `host::HostError::NotWasm` there instead of calling anything.
+- `host::*` gives typed, `Result`-returning wrappers over every host import — `host::http_request`, `host::allowed_hosts`, `host::kv_get`/`kv_set`/`kv_delete`, `host::get_secret`, `host::call_library`, `host::library_surface`, `host::db_query`/`db_execute`, `host::lookup_record`, and `host::log`/`debug`/`info`/`warn`/`error`. A native (non-wasm32) build compiles the whole SDK, so a plugin's own logic is testable with `cargo test`; the host wrappers just report `host::HostError::NotWasm` there instead of calling anything.
 - Only the imports a plugin actually calls end up in its compiled module; an unused `host::*` wrapper is dropped at link time, so the loader's import check sees exactly what the plugin uses.
 - `happyview_plugin_sdk::wire` holds every type that crosses the WASM boundary (`PluginInfo`, `ApiSurface`, `CallInput`, `HttpRequest`/`HttpResponse`, `TokenSet` and the rest). The host re-exports these rather than redefining them, so the two sides cannot drift. Plugins import them from `happyview_plugin_sdk::{PluginInfo, ...}` or `host::HttpRequest`.
 

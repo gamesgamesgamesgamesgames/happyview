@@ -1,6 +1,7 @@
 pub mod attestation;
 pub mod caller;
 pub mod capabilities;
+pub mod config;
 pub mod encryption;
 pub mod executor;
 pub mod graph;

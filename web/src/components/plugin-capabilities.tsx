@@ -39,6 +39,13 @@ export function PluginCapabilities({ entries, allowedHosts }: { entries: Capabil
           {entry.name === "network:request" && allowedHosts && allowedHosts.length > 0 && (
             <p className="text-xs text-muted-foreground">Hosts: {allowedHosts.join(", ")}</p>
           )}
+          {entry.name === "network:request:defined" && (
+            <p className="text-xs text-muted-foreground">
+              {allowedHosts && allowedHosts.length > 0
+                ? `Hosts: ${allowedHosts.join(", ")}`
+                : "no hosts configured yet"}
+            </p>
+          )}
         </li>
       ))}
     </ul>

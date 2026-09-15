@@ -32,6 +32,8 @@ pub enum PluginCapability {
     RecordsRead,
     #[serde(rename = "network:request")]
     NetworkRequest,
+    #[serde(rename = "network:request:defined")]
+    NetworkRequestDefined,
     #[serde(rename = "network:request:unrestricted")]
     NetworkRequestUnrestricted,
     #[serde(rename = "library:call")]
@@ -67,6 +69,7 @@ impl PluginCapability {
             KvWrite,
             RecordsRead,
             NetworkRequest,
+            NetworkRequestDefined,
             NetworkRequestUnrestricted,
             LibraryCall,
             DatabaseRead,
@@ -90,6 +93,7 @@ impl PluginCapability {
             KvWrite => "kv:write",
             RecordsRead => "records:read",
             NetworkRequest => "network:request",
+            NetworkRequestDefined => "network:request:defined",
             NetworkRequestUnrestricted => "network:request:unrestricted",
             LibraryCall => "library:call",
             DatabaseRead => "database:read",
@@ -113,9 +117,13 @@ impl PluginCapability {
         use PluginCapability::*;
         match self {
             SecretsRead | KvRead | KvWrite => Risk::Low,
-            RecordsRead | NetworkRequest | LibraryCall | CallerRead | AtprotoRead | JobsCreate => {
-                Risk::Medium
-            }
+            RecordsRead
+            | NetworkRequest
+            | NetworkRequestDefined
+            | LibraryCall
+            | CallerRead
+            | AtprotoRead
+            | JobsCreate => Risk::Medium,
             NetworkRequestUnrestricted
             | DatabaseRead
             | CallerWrite
@@ -136,6 +144,9 @@ impl PluginCapability {
             RecordsRead => "Look up indexed AT Protocol records.",
             NetworkRequest => {
                 "Make HTTP requests, only to the hosts it lists. Redirects are not followed."
+            }
+            NetworkRequestDefined => {
+                "Make HTTP requests only to the hosts you list for this plugin in its settings. Redirects are not followed."
             }
             NetworkRequestUnrestricted => {
                 "Make HTTP requests to any host on the internet, including internal services this server can reach."
@@ -193,6 +204,7 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
         import: "host_http_request",
         any_of: &[
             PluginCapability::NetworkRequest,
+            PluginCapability::NetworkRequestDefined,
             PluginCapability::NetworkRequestUnrestricted,
         ],
     },
@@ -340,9 +352,12 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
     },
 ];
 
-/// Imports that cost a plugin nothing to declare: logging, and reading a
-/// lexicon, which is published schema rather than anybody's data.
-const FREE_IMPORTS: &[&str] = &["host_log", "host_lexicon_get"];
+/// Imports that cost a plugin nothing to declare: logging, reading a
+/// lexicon (published schema rather than anybody's data), and reading back
+/// the plugin's own effective allowed-hosts list, which a plugin needs to
+/// behave sensibly regardless of which of the three network capabilities (or
+/// none) it holds, and which carries nothing secret.
+const FREE_IMPORTS: &[&str] = &["host_log", "host_lexicon_get", "host_allowed_hosts"];
 
 pub fn is_free_import(name: &str) -> bool {
     FREE_IMPORTS.contains(&name)
@@ -523,6 +538,7 @@ mod tests {
             "host_linked_repo_upload_blob",
             "host_linked_repo_call",
             "host_jobs_create",
+            "host_allowed_hosts",
         ] {
             // `None` is only right for the free imports.
             assert_eq!(
@@ -582,9 +598,19 @@ mod tests {
     fn check_declared_accepts_either_network_capability() {
         let reqs = analyze_imports(&module_importing(&["host_http_request"])).unwrap();
         assert!(check_declared(&[PluginCapability::NetworkRequest], &reqs).is_ok());
+        assert!(check_declared(&[PluginCapability::NetworkRequestDefined], &reqs).is_ok());
         assert!(check_declared(&[PluginCapability::NetworkRequestUnrestricted], &reqs).is_ok());
         let missing = check_declared(&[PluginCapability::KvRead], &reqs).unwrap_err();
         assert_eq!(missing.len(), 1);
+    }
+
+    /// A lexicon and a plugin's own resolved allowed-hosts list are the two
+    /// free imports beyond logging — neither needs a declared capability.
+    #[test]
+    fn allowed_hosts_is_free() {
+        assert!(is_free_import("host_allowed_hosts"));
+        let reqs = analyze_imports(&module_importing(&["host_allowed_hosts"])).unwrap();
+        assert!(reqs.is_empty());
     }
 
     #[test]
@@ -673,8 +699,16 @@ mod tests {
     #[test]
     fn risk_tiers_order_the_dangerous_ones_last() {
         assert!(PluginCapability::SecretsRead.risk() < PluginCapability::NetworkRequest.risk());
+        assert_eq!(
+            PluginCapability::NetworkRequestDefined.risk(),
+            PluginCapability::NetworkRequest.risk()
+        );
         assert!(
             PluginCapability::NetworkRequest.risk()
+                < PluginCapability::NetworkRequestUnrestricted.risk()
+        );
+        assert!(
+            PluginCapability::NetworkRequestDefined.risk()
                 < PluginCapability::NetworkRequestUnrestricted.risk()
         );
         assert!(PluginCapability::DatabaseRead.risk() < PluginCapability::DatabaseWrite.risk());

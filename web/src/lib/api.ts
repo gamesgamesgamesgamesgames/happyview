@@ -1128,6 +1128,23 @@ export function updatePluginSecrets(
   });
 }
 
+export interface PluginAllowedHostsResponse {
+  hosts: string[];
+}
+
+export function getPluginAllowedHosts(id: string) {
+  return apiFetch<PluginAllowedHostsResponse>(
+    `/admin/plugins/${encodeURIComponent(id)}/allowed-hosts`,
+  );
+}
+
+export function updatePluginAllowedHosts(id: string, hosts: string[]) {
+  return apiFetch<PluginAllowedHostsResponse>(
+    `/admin/plugins/${encodeURIComponent(id)}/allowed-hosts`,
+    { method: "PUT", body: JSON.stringify({ hosts }) },
+  );
+}
+
 export interface SecretDefinition {
   key: string;
   name: string;

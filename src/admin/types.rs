@@ -477,6 +477,16 @@ pub(super) struct UpdatePluginSecretsBody {
     pub(super) secrets: std::collections::HashMap<String, String>,
 }
 
+#[derive(Serialize)]
+pub(super) struct PluginAllowedHostsResponse {
+    pub(super) hosts: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct UpdatePluginAllowedHostsBody {
+    pub(super) hosts: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Domain types
 // ---------------------------------------------------------------------------

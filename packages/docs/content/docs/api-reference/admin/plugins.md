@@ -551,3 +551,89 @@ Special handling:
 - Empty string values are not stored — use them to clear a secret.
 
 **Response**: `204 No Content`
+
+## Get plugin allowed hosts
+
+```
+GET /admin/plugins/{id}/allowed-hosts
+```
+
+Requires `plugins:read`. Returns the hosts an operator has listed for a plugin declaring `network:request:defined`. This is separate from a plugin's manifest `allowed_hosts`, which `network:request:defined` requires to be empty.
+
+**Response**: `200 OK`
+
+```json
+{
+  "hosts": ["api.example.com"]
+}
+```
+
+## Update plugin allowed hosts
+
+```
+PUT /admin/plugins/{id}/allowed-hosts
+```
+
+Requires `plugins:create`. Replaces the plugin's allowed hosts list. Entries are bare hostnames, optionally prefixed `*.` to allow subdomains — no scheme, path, port, or whitespace.
+
+```ts tab="TypeScript" tab-group="language"
+const response = await fetch("http://127.0.0.1:3000/admin/plugins/steam/allowed-hosts", {
+  method: "PUT",
+  headers: {
+    ...headers,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    hosts: ["api.steampowered.com"],
+  }),
+});
+```
+```js tab="JavaScript" tab-group="language"
+const response = await fetch("http://127.0.0.1:3000/admin/plugins/steam/allowed-hosts", {
+  method: "PUT",
+  headers: {
+    ...headers,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    hosts: ["api.steampowered.com"],
+  }),
+});
+```
+```rust tab="Rust" tab-group="language"
+let response = client
+    .put("http://127.0.0.1:3000/admin/plugins/steam/allowed-hosts")
+    .bearer_auth(token)
+    .json(&serde_json::json!({
+        "hosts": ["api.steampowered.com"]
+    }))
+    .send()
+    .await?;
+```
+```go tab="Go" tab-group="language"
+body := bytes.NewBufferString(`{
+  "hosts": ["api.steampowered.com"]
+}`)
+req, _ := http.NewRequest("PUT", "http://127.0.0.1:3000/admin/plugins/steam/allowed-hosts", body)
+req.Header.Set("Authorization", "Bearer "+token)
+req.Header.Set("Content-Type", "application/json")
+resp, err := http.DefaultClient.Do(req)
+```
+```sh tab="cURL" tab-group="language"
+curl -X PUT http://127.0.0.1:3000/admin/plugins/steam/allowed-hosts \
+  -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hosts": ["api.steampowered.com"]
+  }'
+```
+
+Returns `400 Bad Request` for an invalid host entry, or if the plugin does not declare `network:request:defined`. Returns `404 Not Found` for an unknown plugin.
+
+**Response**: `200 OK`
+
+```json
+{
+  "hosts": ["api.steampowered.com"]
+}
+```

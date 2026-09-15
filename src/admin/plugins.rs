@@ -79,8 +79,9 @@ fn compute_update_info(
 use super::auth::UserAuth;
 use super::permissions::Permission;
 use super::types::{
-    AddPluginBody, ListPluginsQuery, PluginPreviewResponse, PluginSecretsResponse, PluginSummary,
-    PluginsListResponse, PreviewPluginBody, RemovePluginQuery, UpdatePluginSecretsBody,
+    AddPluginBody, ListPluginsQuery, PluginAllowedHostsResponse, PluginPreviewResponse,
+    PluginSecretsResponse, PluginSummary, PluginsListResponse, PreviewPluginBody,
+    RemovePluginQuery, UpdatePluginAllowedHostsBody, UpdatePluginSecretsBody,
 };
 
 /// The type/namespace/dependency/host/capability fields shared by every
@@ -801,6 +802,90 @@ pub(super) async fn update_secrets(
     .await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A plugin's `allowed_hosts` only means anything under
+/// `network:request:defined` — the operator has nowhere else to point it,
+/// since `network:request` takes its list from the manifest and
+/// `network:request:unrestricted` needs none. Both allowed-hosts endpoints
+/// refuse a plugin that hasn't declared it, the same way they refuse one
+/// that doesn't exist.
+fn require_network_request_defined(plugin: &LoadedPlugin) -> Result<(), AppError> {
+    if plugin
+        .declared_capabilities()
+        .contains(&capabilities::PluginCapability::NetworkRequestDefined)
+    {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "plugin '{}' does not declare network:request:defined",
+            plugin.info.id
+        )))
+    }
+}
+
+/// GET /admin/plugins/{id}/allowed-hosts - operator-configured hosts for a
+/// `network:request:defined` plugin
+pub(super) async fn get_allowed_hosts(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<PluginAllowedHostsResponse>, AppError> {
+    auth.require(Permission::PluginsRead).await?;
+
+    let plugin = state
+        .plugin_registry
+        .get(&plugin_id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Plugin '{}' not found", plugin_id)))?;
+    require_network_request_defined(&plugin)?;
+
+    let hosts = crate::plugin::config::load_allowed_hosts(&state.db, state.db_backend, &plugin_id)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to fetch config: {}", e)))?;
+
+    Ok(Json(PluginAllowedHostsResponse { hosts }))
+}
+
+/// PUT /admin/plugins/{id}/allowed-hosts - replace the operator-configured
+/// hosts for a `network:request:defined` plugin, returning the stored list
+pub(super) async fn update_allowed_hosts(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(plugin_id): Path<String>,
+    Json(body): Json<UpdatePluginAllowedHostsBody>,
+) -> Result<Json<PluginAllowedHostsResponse>, AppError> {
+    auth.require(Permission::PluginsCreate).await?;
+
+    let plugin = state
+        .plugin_registry
+        .get(&plugin_id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Plugin '{}' not found", plugin_id)))?;
+    require_network_request_defined(&plugin)?;
+
+    crate::plugin::config::store_allowed_hosts(
+        &state.db,
+        state.db_backend,
+        &plugin_id,
+        &body.hosts,
+    )
+    .await?;
+
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "plugin.allowed_hosts_updated".to_string(),
+            severity: Severity::Info,
+            actor_did: Some(auth.did.clone()),
+            subject: Some(plugin_id),
+            detail: serde_json::json!({ "allowed_hosts": &body.hosts }),
+        },
+        state.db_backend,
+    )
+    .await;
+
+    Ok(Json(PluginAllowedHostsResponse { hosts: body.hosts }))
 }
 
 /// POST /admin/plugins/{id}/check-update — force a cache refresh for one plugin

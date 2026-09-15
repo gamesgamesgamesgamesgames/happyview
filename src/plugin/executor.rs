@@ -476,7 +476,18 @@ impl PluginExecutor {
         // Create store with initial state (memory/alloc/dealloc set to None)
         // Note: db is Option<sqlx::AnyPool> in PluginState
         let capabilities = Self::effective_capabilities(&plugin)?;
-        let allowed_hosts = plugin.allowed_hosts().to_vec();
+        // `network:request:defined` sources its hosts from the operator's
+        // plugin settings, not the manifest — the two capabilities are
+        // mutually exclusive, so only one of these ever applies.
+        let allowed_hosts = if capabilities.contains(&PluginCapability::NetworkRequestDefined) {
+            crate::plugin::config::load_allowed_hosts(&self.db, self.db_backend, plugin_id)
+                .await
+                .map_err(|e| ExecutionError::Instantiation(e.into()))?
+        } else if capabilities.contains(&PluginCapability::NetworkRequest) {
+            plugin.allowed_hosts().to_vec()
+        } else {
+            Vec::new()
+        };
 
         let state = PluginState {
             plugin_id: plugin_id.to_string(),

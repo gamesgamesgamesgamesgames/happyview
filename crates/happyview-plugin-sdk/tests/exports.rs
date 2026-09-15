@@ -27,11 +27,12 @@ const EXPECTED_LIBRARY_EXPORTS: &[&str] = &[
     "plugin_info",
 ];
 
-/// The `http` fixture uses one host function. The SDK declares eleven, so this
-/// also shows the unused ten are dropped at link time; a plugin that imported
-/// them all would need capabilities it never declared, and the loader would
-/// refuse it.
-const EXPECTED_LIBRARY_IMPORTS: &[&str] = &["env::host_http_request"];
+/// The `http` fixture uses two host functions (`host_http_request` and the
+/// free `host_allowed_hosts`, exercised through its own `allowed_hosts`
+/// export). The SDK declares eleven, so this also shows the unused nine are
+/// dropped at link time; a plugin that imported them all would need
+/// capabilities it never declared, and the loader would refuse it.
+const EXPECTED_LIBRARY_IMPORTS: &[&str] = &["env::host_allowed_hosts", "env::host_http_request"];
 
 /// The host resolves an auth plugin by these four names plus `plugin_info`;
 /// `auth_plugin!` emits every one of them.

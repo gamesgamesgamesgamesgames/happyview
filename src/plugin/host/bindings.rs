@@ -523,6 +523,14 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
 
     linker.func_wrap_async(
         "env",
+        "host_allowed_hosts",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_allowed_hosts_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
         "host_call_library",
         |mut caller: wasmtime::Caller<'_, PluginState>,
          (lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len): (i32, i32, i32, i32, i32, i32)| {
@@ -798,14 +806,12 @@ async fn host_http_request_impl(
                 .map(|h| super::host_allowed(&state.allowed_hosts, h))
                 .unwrap_or(false);
             if !ok {
-                return write_guest_response(
-                    caller,
-                    &error_envelope(
-                        "FORBIDDEN",
-                        format!("host {} is not in allowed_hosts", host.unwrap_or_default()),
-                    ),
-                )
-                .await;
+                let defined = state
+                    .capabilities
+                    .contains(&PluginCapability::NetworkRequestDefined);
+                let message =
+                    super::allowed_hosts_denial(&state.allowed_hosts, defined, host.as_deref());
+                return write_guest_response(caller, &error_envelope("FORBIDDEN", message)).await;
             }
         }
         unrestricted
@@ -1031,6 +1037,29 @@ async fn host_lexicon_get_impl(
     let lexicons = caller.data().lexicons.clone();
     let value = super::lexicon_get(&lexicons, &spec.nsid).await;
     let response = serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default();
+    write_guest_response(caller, &response).await
+}
+
+/// The plugin's effective allowed-hosts list, resolved once at instantiation
+/// and carried on `PluginState`: the operator's list under
+/// `network:request:defined`, the manifest's under `network:request`, or
+/// empty otherwise. A plugin reads this to behave sensibly no matter which
+/// of the three network capabilities it holds.
+fn resolved_allowed_hosts(state: &PluginState) -> Vec<String> {
+    state.allowed_hosts.clone()
+}
+
+/// `host_allowed_hosts` is a free import: the list itself carries nothing
+/// secret, and a plugin needs to be able to read it regardless of which
+/// capability (if any) it holds. The request is always `{}`; nothing to
+/// decode.
+async fn host_allowed_hosts_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    _req_ptr: i32,
+    _req_len: i32,
+) -> i64 {
+    let hosts = resolved_allowed_hosts(caller.data());
+    let response = serde_json::to_vec(&serde_json::json!({"ok": hosts})).unwrap_or_default();
     write_guest_response(caller, &response).await
 }
 
@@ -1761,6 +1790,56 @@ mod tests {
             let _ = &state.alloc;
             let _ = &state.dealloc;
         }
+    }
+
+    /// Every field filled by hand, the way `PluginExecutor::instantiate`
+    /// does — no `Default` impl exists for `PluginState`, since a real
+    /// instance is never built any other way. Tests that only care about one
+    /// or two fields (here, `allowed_hosts`) use this rather than each
+    /// re-deriving the rest.
+    fn test_plugin_state(allowed_hosts: Vec<String>) -> PluginState {
+        sqlx::any::install_default_drivers();
+        PluginState {
+            plugin_id: "test-plugin".into(),
+            scope: "did:example:test".into(),
+            secrets: HashMap::new(),
+            config: serde_json::json!({}),
+            db: None,
+            db_backend: crate::db::DatabaseBackend::Sqlite,
+            http_client: reqwest::Client::new(),
+            lexicons: Arc::new(crate::lexicon::LexiconRegistry::new()),
+            usage: Default::default(),
+            memory: None,
+            alloc: None,
+            dealloc: None,
+            capabilities: std::collections::HashSet::new(),
+            allowed_hosts,
+            plugin_type: crate::plugin::PluginType::Library,
+            executor: None,
+            call_ctx: crate::plugin::library::LibraryCallContext::default(),
+            depth: 0,
+            caller: None,
+            app_state: None,
+        }
+    }
+
+    /// Direct construction with no hosts set — the default a plugin sees
+    /// before an operator has configured `network:request:defined`, or under
+    /// any capability that grants none.
+    #[test]
+    fn resolved_allowed_hosts_defaults_to_empty() {
+        let state = test_plugin_state(Vec::new());
+        assert!(resolved_allowed_hosts(&state).is_empty());
+    }
+
+    #[test]
+    fn resolved_allowed_hosts_returns_the_resolved_list() {
+        let hosts = vec![
+            "api.example.com".to_string(),
+            "*.cdn.example.com".to_string(),
+        ];
+        let state = test_plugin_state(hosts.clone());
+        assert_eq!(resolved_allowed_hosts(&state), hosts);
     }
 
     /// The executor recovers a 401 by finding the prefix anywhere in the
