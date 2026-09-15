@@ -40,11 +40,8 @@ pub async fn http_request(
         // follows up to 10 redirects, so a 3xx from an allowed host could carry a
         // restricted plugin to one it may not reach. The restricted path therefore
         // sends through a client that follows nothing, and the plugin sees the 3xx
-        // itself. The client is built per call; caching one on `PluginState` is
-        // the fix if that ever shows up in a profile.
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        // itself.
+        let client = no_redirect_client()?;
         client.request(method, &req.url)
     };
 
@@ -93,6 +90,18 @@ pub async fn http_request(
         headers,
         body: body.to_vec(),
     })
+}
+
+/// A client that follows no redirects, shared by every restricted fetch path:
+/// the unrestricted `host_http_request` branch above, and `blob_download`'s
+/// SSRF guard (`src/plugin/host/atproto.rs`), which likewise checks a host it
+/// doesn't fully trust and then must not let a redirect carry the request
+/// somewhere that check never saw. Built per call; caching one on
+/// `PluginState` is the fix if that ever shows up in a profile.
+pub(crate) fn no_redirect_client() -> Result<reqwest::Client, reqwest::Error> {
+    Ok(crate::http_retry::build_no_redirect_client(
+        &crate::version::user_agent(),
+    ))
 }
 
 /// `*.example.com` matches `a.example.com` and `a.b.example.com` but not `example.com`.

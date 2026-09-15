@@ -48,6 +48,10 @@ pub enum PluginCapability {
     CallerCall,
     #[serde(rename = "records:write")]
     RecordsWrite,
+    #[serde(rename = "atproto:read")]
+    AtprotoRead,
+    #[serde(rename = "attest:sign")]
+    AttestSign,
 }
 
 impl PluginCapability {
@@ -67,6 +71,8 @@ impl PluginCapability {
             CallerWrite,
             CallerCall,
             RecordsWrite,
+            AtprotoRead,
+            AttestSign,
         ]
     }
 
@@ -86,6 +92,8 @@ impl PluginCapability {
             CallerWrite => "caller:write",
             CallerCall => "caller:call",
             RecordsWrite => "records:write",
+            AtprotoRead => "atproto:read",
+            AttestSign => "attest:sign",
         }
     }
 
@@ -97,8 +105,10 @@ impl PluginCapability {
         use PluginCapability::*;
         match self {
             SecretsRead | KvRead | KvWrite => Risk::Low,
-            RecordsRead | NetworkRequest | LibraryCall | CallerRead => Risk::Medium,
-            NetworkRequestUnrestricted | DatabaseRead | CallerWrite | RecordsWrite => Risk::High,
+            RecordsRead | NetworkRequest | LibraryCall | CallerRead | AtprotoRead => Risk::Medium,
+            NetworkRequestUnrestricted | DatabaseRead | CallerWrite | RecordsWrite | AttestSign => {
+                Risk::High
+            }
             DatabaseWrite | CallerCall => Risk::Critical,
         }
     }
@@ -135,6 +145,12 @@ impl PluginCapability {
             }
             RecordsWrite => {
                 "Write to this instance's record index directly, bypassing the network. This can replace the body of a record that arrived from the network while its CID and indexed time stay as the network set them."
+            }
+            AtprotoRead => {
+                "Resolve any DID's service endpoints, download blobs from any repo on the network, look up labels applied to any URI, and verify this instance's attestation signatures."
+            }
+            AttestSign => {
+                "Sign records with this instance's attestation key, producing a signature that asserts this instance vouches for the content."
             }
         }
     }
@@ -254,6 +270,26 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
     Requirement {
         import: "host_records_index_delete",
         any_of: &[PluginCapability::RecordsWrite],
+    },
+    Requirement {
+        import: "host_atproto_resolve_service",
+        any_of: &[PluginCapability::AtprotoRead],
+    },
+    Requirement {
+        import: "host_atproto_blob_download",
+        any_of: &[PluginCapability::AtprotoRead],
+    },
+    Requirement {
+        import: "host_labels_get",
+        any_of: &[PluginCapability::AtprotoRead],
+    },
+    Requirement {
+        import: "host_attest_sign",
+        any_of: &[PluginCapability::AttestSign],
+    },
+    Requirement {
+        import: "host_attest_verify",
+        any_of: &[PluginCapability::AtprotoRead],
     },
 ];
 
@@ -428,6 +464,11 @@ mod tests {
             "host_records_index_put",
             "host_records_index_delete",
             "host_lexicon_get",
+            "host_atproto_resolve_service",
+            "host_atproto_blob_download",
+            "host_labels_get",
+            "host_attest_sign",
+            "host_attest_verify",
         ] {
             // `None` is only right for the free imports.
             assert_eq!(
@@ -601,6 +642,26 @@ mod tests {
         assert_eq!(PluginCapability::RecordsWrite.risk(), Risk::High);
         assert!(PluginCapability::CallerRead.risk() < PluginCapability::CallerWrite.risk());
         assert!(PluginCapability::CallerWrite.risk() < PluginCapability::CallerCall.risk());
+    }
+
+    /// The five AT Protocol/attestation imports: all but signing read the
+    /// network or the label/record tables, so they share `atproto:read`;
+    /// only producing a signature needs the stronger `attest:sign`.
+    #[test]
+    fn atproto_imports_map_to_their_capability() {
+        for (import, expected) in [
+            (
+                "host_atproto_resolve_service",
+                PluginCapability::AtprotoRead,
+            ),
+            ("host_atproto_blob_download", PluginCapability::AtprotoRead),
+            ("host_labels_get", PluginCapability::AtprotoRead),
+            ("host_attest_sign", PluginCapability::AttestSign),
+            ("host_attest_verify", PluginCapability::AtprotoRead),
+        ] {
+            let req = requirement_for_import(import).expect(import);
+            assert_eq!(req.any_of, &[expected], "{import}");
+        }
     }
 
     #[test]

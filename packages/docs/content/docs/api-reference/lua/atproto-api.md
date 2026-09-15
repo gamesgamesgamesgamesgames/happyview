@@ -2,6 +2,10 @@
 title: "atproto API"
 ---
 
+<Callout type="info">
+The `happyview.atproto` library plugin will replace every function on this page except `spaces`. `blob_upload` moves to `happyview.record` as `upload_blob`. `spaces` keeps this global until its own library lands.
+</Callout>
+
 The `atproto` table provides atproto utility functions. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts).
 
 ## atproto.resolve_service_endpoint
@@ -131,7 +135,7 @@ Downloads a blob from any DID's PDS via the public `com.atproto.sync.getBlob` en
 
 If the content-type header is missing from the PDS response, `mimeType` defaults to `"application/octet-stream"`.
 
-**Throws** on any non-2xx response from the PDS, including 404 (blob not found) and 429 (rate limited). Retry logic is the script's responsibility.
+**Throws** on any non-2xx response from the PDS, including 404 (blob not found) and 429 (rate limited). Retry logic is the script's responsibility. Downloads are capped at the HTTP response limit (100 MB); a larger blob throws rather than downloading.
 
 **Availability:** All script contexts (queries, procedures, record scripts).
 

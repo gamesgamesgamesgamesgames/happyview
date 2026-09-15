@@ -12,6 +12,7 @@
 //! Outside wasm32 every wrapper returns [`HostError::NotWasm`], which keeps a
 //! plugin's pure logic unit-testable natively.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -23,15 +24,16 @@ use serde_json::{Map, Value};
 
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::abi::read_packed;
-#[cfg(target_arch = "wasm32")]
-use crate::wire::LexiconGet;
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::wire::Response;
 use crate::wire::{
-    ApiSurface, BacklinksQuery, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete,
-    CallerRecordPut, CallerXrpcProcedure, CallerXrpcQuery, IndexDelete, IndexPut, PluginError,
-    RecordRef, RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, StrongRef, TableQuery,
+    ApiSurface, AtprotoBlobDownload, AttestSign, AttestVerify, BacklinksQuery, BlobData,
+    CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
+    CallerXrpcQuery, IndexDelete, IndexPut, Label, LabelsGet, PluginError, RecordRef, RecordsCount,
+    RecordsPage, RecordsQuery, RecordsSearch, StrongRef, TableQuery,
 };
+#[cfg(target_arch = "wasm32")]
+use crate::wire::{AtprotoResolveService, LexiconGet};
 
 /// The wire types these wrappers send and receive. Defined in [`crate::wire`],
 /// which the host imports too; re-exported here as the import path plugins use.
@@ -73,6 +75,11 @@ extern "C" {
     fn host_records_index_put(req_ptr: i32, req_len: i32) -> i64;
     fn host_records_index_delete(req_ptr: i32, req_len: i32) -> i64;
     fn host_lexicon_get(req_ptr: i32, req_len: i32) -> i64;
+    fn host_atproto_resolve_service(req_ptr: i32, req_len: i32) -> i64;
+    fn host_atproto_blob_download(req_ptr: i32, req_len: i32) -> i64;
+    fn host_labels_get(req_ptr: i32, req_len: i32) -> i64;
+    fn host_attest_sign(req_ptr: i32, req_len: i32) -> i64;
+    fn host_attest_verify(req_ptr: i32, req_len: i32) -> i64;
 }
 
 /// Why a host call did not produce a value.
@@ -485,6 +492,79 @@ pub fn lexicon_get(nsid: &str) -> Result<Option<Value>, PluginError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = nsid;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Resolve the AT Protocol service a DID's document advertises (its PDS,
+/// typically). `Ok(None)` means the DID does not resolve or names no such
+/// service. Needs `atproto:read`.
+pub fn atproto_resolve_service(did: &str) -> Result<Option<String>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(
+            host_atproto_resolve_service,
+            &AtprotoResolveService { did: did.into() },
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = did;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Download a blob from a repo. Needs `atproto:read`.
+pub fn atproto_blob_download(spec: &AtprotoBlobDownload) -> Result<BlobData, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_atproto_blob_download, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Look up labels applied to a set of URIs, keyed by URI. Every requested URI
+/// is present in the result, possibly with an empty list. Needs
+/// `atproto:read`.
+pub fn labels_get(spec: &LabelsGet) -> Result<BTreeMap<String, Vec<Label>>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_labels_get, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Sign a record, returning the inline signature object to attach to it.
+/// Needs `attest:sign`.
+pub fn attest_sign(spec: &AttestSign) -> Result<Value, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_attest_sign, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Verify a record's attestation signature. Needs `atproto:read`.
+pub fn attest_verify(spec: &AttestVerify) -> Result<bool, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_attest_verify, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
         Err(HostError::NotWasm.into())
     }
 }

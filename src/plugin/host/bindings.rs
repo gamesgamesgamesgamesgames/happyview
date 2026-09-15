@@ -420,6 +420,51 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
+    // Async functions - AT Protocol network reads and attestation
+    linker.func_wrap_async(
+        "env",
+        "host_atproto_resolve_service",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_atproto_resolve_service_impl(&mut caller, req_ptr, req_len).await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_atproto_blob_download",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(
+                async move { host_atproto_blob_download_impl(&mut caller, req_ptr, req_len).await },
+            )
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_labels_get",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_labels_get_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_attest_sign",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_attest_sign_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_attest_verify",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_attest_verify_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
     Ok(())
 }
 
@@ -1173,6 +1218,290 @@ async fn host_db_impl(
             Ok(rows) => serde_json::to_vec(&serde_json::json!({"ok": rows})).unwrap_or_default(),
             Err(e) => error_envelope("DB_ERROR", e),
         }
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// `AtprotoError` → envelope code. Distinct codes so a plugin can tell "no
+/// signer configured" from "signature could not be checked" from an ordinary
+/// database or network failure, rather than seeing one undifferentiated
+/// `HOST_ERROR`.
+fn atproto_error_envelope(e: super::AtprotoError) -> Vec<u8> {
+    use super::AtprotoError;
+    match e {
+        AtprotoError::Resolve(msg) => error_envelope("RESOLVE_ERROR", msg),
+        AtprotoError::Blob { status, body } => {
+            error_envelope("BLOB_ERROR", format!("PDS returned {status}: {body}"))
+        }
+        AtprotoError::NoSigner => error_envelope(
+            "NO_SIGNER",
+            "no attestation signer is configured on this instance",
+        ),
+        AtprotoError::Unverifiable(msg) => error_envelope("UNVERIFIABLE", msg),
+        AtprotoError::Database(inner) => error_envelope("HOST_ERROR", inner),
+        AtprotoError::Other(msg) => error_envelope("HOST_ERROR", msg),
+    }
+}
+
+/// Host function: resolve the AT Protocol service a DID's document
+/// advertises. Needs no session — it reads the public network, not the
+/// caller's own repo — so it runs off `app_state` alone.
+async fn host_atproto_resolve_service_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_atproto_resolve_service";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::AtprotoResolveService =
+        match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+        };
+    let Some(app_state) = caller.data().app_state.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "HOST_ERROR",
+                "this instance has no app state to resolve against",
+            ),
+        )
+        .await;
+    };
+    let response =
+        match super::resolve_service(&app_state.http, &app_state.config.plc_url, &spec.did).await {
+            Ok(endpoint) => {
+                serde_json::to_vec(&serde_json::json!({"ok": endpoint})).unwrap_or_default()
+            }
+            Err(e) => atproto_error_envelope(e),
+        };
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: download a blob from a repo. Same "no session needed" shape
+/// as service resolution — the DID is a parameter of the request, not the
+/// caller's own identity.
+async fn host_atproto_blob_download_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_atproto_blob_download";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::AtprotoBlobDownload = match serde_json::from_slice(&bytes)
+    {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(app_state) = caller.data().app_state.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "HOST_ERROR",
+                "this instance has no app state to resolve against",
+            ),
+        )
+        .await;
+    };
+
+    // A blob download is an HTTP fetch like any other and counts against the
+    // same shared budget `host_http_request` does — it just goes through PDS
+    // resolution instead of a plugin-supplied URL. There is no
+    // `allowed_hosts` check to make here: the host, not the plugin, chose
+    // the PDS host, via DID resolution inside `super::blob_download`.
+    let requests_over_budget = {
+        let usage = &mut caller.data_mut().usage;
+        usage.http_requests += 1;
+        (usage.http_requests > super::MAX_HTTP_REQUESTS).then_some(usage.http_requests)
+    };
+    if let Some(requests) = requests_over_budget {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "BLOB_ERROR",
+                format!(
+                    "too many requests: {requests} > {}",
+                    super::MAX_HTTP_REQUESTS
+                ),
+            ),
+        )
+        .await;
+    }
+
+    // `host_http_request` refuses once the transfer budget is already spent,
+    // before sending — checked here too, not just after the fetch below, so
+    // an exhausted budget can't still push through one more multi-hundred-MB
+    // blob before the next call finally sees it.
+    let already_over_budget =
+        caller.data().usage.http_bytes_transferred > super::MAX_HTTP_TOTAL_TRANSFER;
+    if already_over_budget {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "BLOB_ERROR",
+                format!(
+                    "transfer limit exceeded: {} > {}",
+                    caller.data().usage.http_bytes_transferred,
+                    super::MAX_HTTP_TOTAL_TRANSFER
+                ),
+            ),
+        )
+        .await;
+    }
+
+    let blob = match super::blob_download(&app_state.http, &app_state.config.plc_url, spec).await {
+        Ok(blob) => blob,
+        Err(e) => return write_guest_response(caller, &atproto_error_envelope(e)).await,
+    };
+
+    let transfer_over_budget = {
+        let usage = &mut caller.data_mut().usage;
+        usage.http_bytes_transferred += blob.size;
+        (usage.http_bytes_transferred > super::MAX_HTTP_TOTAL_TRANSFER)
+            .then_some(usage.http_bytes_transferred)
+    };
+    if let Some(transferred) = transfer_over_budget {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "BLOB_ERROR",
+                format!(
+                    "transfer limit exceeded: {transferred} > {}",
+                    super::MAX_HTTP_TOTAL_TRANSFER
+                ),
+            ),
+        )
+        .await;
+    }
+
+    let response = serde_json::to_vec(&serde_json::json!({"ok": blob})).unwrap_or_default();
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: look up labels for a set of URIs, keyed by URI.
+async fn host_labels_get_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_labels_get";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::LabelsGet = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(db) = caller.data().db.clone() else {
+        return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
+    };
+    let backend = caller.data().db_backend;
+    let response = match super::labels_get(&db, backend, &spec.uris).await {
+        Ok(map) => serde_json::to_vec(&serde_json::json!({"ok": map})).unwrap_or_default(),
+        // `labels_get`'s only source of `Other` is the URI-count cap — a
+        // caller-fixable mistake, not a host failure, so it gets `BAD_INPUT`
+        // here rather than the `HOST_ERROR` the shared envelope maps `Other`
+        // to for the other imports.
+        Err(super::AtprotoError::Other(msg)) => error_envelope("BAD_INPUT", msg),
+        Err(e) => atproto_error_envelope(e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: sign a record with this instance's attestation key. Reads
+/// `attestation_signer` off `app_state` — this import needs no session, so it
+/// cannot get the signer any other way.
+async fn host_attest_sign_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_attest_sign";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::AttestSign = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let signer = caller
+        .data()
+        .app_state
+        .as_ref()
+        .and_then(|s| s.attestation_signer.clone());
+    let caller_did = caller.data().call_ctx.caller_did.clone();
+
+    // The DID is part of the signed content, so an absent caller can't fall
+    // back to signing as `""` — that produces a signature that can never
+    // verify against a real repo. A missing signer is checked first (and
+    // reported as `NO_SIGNER` below) so a plugin with neither configured
+    // still gets the more specific reason for the failure it actually hit.
+    if signer.is_some() && caller_did.is_none() {
+        return write_guest_response(
+            caller,
+            &error_envelope("BAD_INPUT", "signing needs a caller"),
+        )
+        .await;
+    }
+    let did = caller_did.unwrap_or_default();
+    let response = match super::attest_sign(signer.as_deref(), &did, spec.record) {
+        Ok(sig) => serde_json::to_vec(&serde_json::json!({"ok": sig})).unwrap_or_default(),
+        Err(e) => atproto_error_envelope(e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: verify a record's attestation signature.
+async fn host_attest_verify_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_attest_verify";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::AttestVerify = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let signer = caller
+        .data()
+        .app_state
+        .as_ref()
+        .and_then(|s| s.attestation_signer.clone());
+    let response = match super::attest_verify(signer.as_deref(), spec) {
+        Ok(valid) => serde_json::to_vec(&serde_json::json!({"ok": valid})).unwrap_or_default(),
+        Err(e) => atproto_error_envelope(e),
     };
     write_guest_response(caller, &response).await
 }

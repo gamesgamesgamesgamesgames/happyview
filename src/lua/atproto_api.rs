@@ -3,8 +3,8 @@ use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::db::{adapt_sql, now_rfc3339};
-use crate::profile;
+use crate::plugin::host;
+use happyview_plugin_sdk::wire::{AtprotoBlobDownload, AttestVerify};
 
 /// Opaque handle to blob bytes stored on the Rust side.
 /// Lua scripts receive this from `atproto.blob_download()` and pass it
@@ -22,14 +22,53 @@ impl mlua::UserData for BlobHandle {
     }
 }
 
+/// `blob_download`'s error messages named the request (`did`/`cid`), which
+/// `host::atproto::AtprotoError` has no reason to carry — a WASM plugin's
+/// `BLOB_ERROR` envelope doesn't need it, since the plugin already has both.
+/// The Lua global keeps naming them because scripts have relied on it.
+fn blob_download_lua_error(
+    did: &str,
+    cid: &str,
+    e: crate::plugin::host::AtprotoError,
+) -> mlua::Error {
+    use crate::plugin::host::AtprotoError;
+    match e {
+        AtprotoError::Resolve(msg) => mlua::Error::runtime(format!("blob_download: {msg}")),
+        AtprotoError::Blob { status, body } => mlua::Error::runtime(format!(
+            "blob_download: PDS returned {status} for did={did} cid={cid}{}",
+            if body.is_empty() {
+                String::new()
+            } else {
+                format!(": {body}")
+            }
+        )),
+        other => mlua::Error::runtime(format!("blob_download: {other}")),
+    }
+}
+
 /// Register the `atproto` table with AT Protocol utility functions.
 ///
 /// When `caller_did` is provided, the `atproto.sign(record)` function is
 /// available for inline attestation signing.
+///
+/// `blob_download` here fetches whatever endpoint a DID document names,
+/// loopback and private ranges included: scripts are operator-authored and
+/// already hold an unrestricted `http` global, and a local PDS is the
+/// normal development setup. The plugin import applies the endpoint guard
+/// instead, since a plugin is a third party.
 pub fn register_atproto_api(
     lua: &Lua,
     state: Arc<AppState>,
     caller_did: Option<&str>,
+) -> LuaResult<()> {
+    register_atproto_api_impl(lua, state, caller_did, true)
+}
+
+fn register_atproto_api_impl(
+    lua: &Lua,
+    state: Arc<AppState>,
+    caller_did: Option<&str>,
+    allow_local_blob_endpoints: bool,
 ) -> LuaResult<()> {
     let atproto_table = lua.create_table()?;
 
@@ -37,13 +76,8 @@ pub fn register_atproto_api(
     let resolve_fn = lua.create_async_function(move |_lua, did: String| {
         let state = state_clone.clone();
         async move {
-            let result =
-                profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, &did).await;
-
-            match result {
-                Ok(endpoint) => Ok(Some(endpoint)),
-                Err(_) => Ok(None),
-            }
+            let endpoint = host::resolve_service(&state.http, &state.config.plc_url, &did).await;
+            Ok(endpoint.unwrap_or(None))
         }
     })?;
 
@@ -56,47 +90,22 @@ pub fn register_atproto_api(
             lua.create_async_function(move |lua, (did, cid): (String, String)| {
                 let state = state_clone.clone();
                 async move {
-                    let pds_endpoint =
-                        profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, &did)
-                            .await
-                            .map_err(|e| {
-                                mlua::Error::runtime(format!(
-                                    "blob_download: failed to resolve PDS for {did}: {e}"
-                                ))
-                            })?;
+                    let blob = host::blob_download_with_policy(
+                        &state.http,
+                        &state.config.plc_url,
+                        AtprotoBlobDownload {
+                            did: did.clone(),
+                            cid: cid.clone(),
+                        },
+                        allow_local_blob_endpoints,
+                    )
+                    .await
+                    .map_err(|e| blob_download_lua_error(&did, &cid, e))?;
 
-                    let url = format!(
-                        "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
-                        pds_endpoint,
-                        urlencoding::encode(&did),
-                        urlencoding::encode(&cid),
-                    );
-
-                    let response = state.http.get(&url).send().await.map_err(|e| {
-                        mlua::Error::runtime(format!("blob_download: request failed: {e}"))
-                    })?;
-
-                    let status = response.status();
-                    if !status.is_success() {
-                        return Err(mlua::Error::runtime(format!(
-                            "blob_download: PDS returned {status} for did={did} cid={cid}"
-                        )));
-                    }
-
-                    let mime_type = response
-                        .headers()
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("application/octet-stream")
-                        .to_string();
-
-                    let bytes = response.bytes().await.map_err(|e| {
-                        mlua::Error::runtime(format!("blob_download: failed to read body: {e}"))
-                    })?;
-
-                    let size = bytes.len();
+                    let mime_type = blob.mime_type;
+                    let size = blob.size as usize;
                     let handle = BlobHandle {
-                        data: bytes,
+                        data: Bytes::from(blob.bytes),
                         mime_type: mime_type.clone(),
                     };
 
@@ -116,61 +125,21 @@ pub fn register_atproto_api(
     let get_labels_fn = lua.create_async_function(move |lua, uri: String| {
         let state = state_clone.clone();
         async move {
-            let backend = state.db_backend;
-            let now = now_rfc3339();
-            let sql = adapt_sql(
-                "SELECT src, uri, val, cts FROM happyview_labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
-                backend,
-            );
-            let rows: Vec<(String, String, String, String)> = crate::db::query_as(&sql)
-                .bind(&uri)
-                .bind(&now)
-                .fetch_all(&state.db)
-                .await
-                .map_err(|e| mlua::Error::runtime(format!("label query failed: {e}")))?;
+            let mut by_uri =
+                host::labels_get(&state.db, state.db_backend, std::slice::from_ref(&uri))
+                    .await
+                    .map_err(|e| mlua::Error::runtime(format!("label query failed: {e}")))?;
+            let labels = by_uri.remove(&uri).unwrap_or_default();
 
             let result = lua.create_table()?;
-            let mut idx = 1;
-
-            for (src, label_uri, val, cts) in &rows {
-                let label = lua.create_table()?;
-                label.set("src", src.as_str())?;
-                label.set("uri", label_uri.as_str())?;
-                label.set("val", val.as_str())?;
-                label.set("cts", cts.as_str())?;
-                result.set(idx, label)?;
-                idx += 1;
+            for (idx, label) in labels.into_iter().enumerate() {
+                let entry = lua.create_table()?;
+                entry.set("src", label.src)?;
+                entry.set("uri", label.uri)?;
+                entry.set("val", label.val)?;
+                entry.set("cts", label.cts)?;
+                result.set(idx + 1, entry)?;
             }
-
-            // Check for self-labels in the record itself.
-            let record_sql = adapt_sql("SELECT did, record FROM happyview_records WHERE uri = ?", backend);
-            let record: Option<(String, String)> = crate::db::query_as(&record_sql)
-                .bind(&uri)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|e| mlua::Error::runtime(format!("record query failed: {e}")))?;
-
-            if let Some((did, record_str)) = record {
-                let record_val: serde_json::Value =
-                    serde_json::from_str(&record_str).unwrap_or(serde_json::json!({}));
-                if let Some(labels) = record_val.get("labels")
-                    && let Some(values) = labels.get("values")
-                    && let Some(arr) = values.as_array()
-                {
-                    for item in arr {
-                        if let Some(val) = item.get("val").and_then(|v| v.as_str()) {
-                            let label = lua.create_table()?;
-                            label.set("src", did.as_str())?;
-                            label.set("uri", uri.as_str())?;
-                            label.set("val", val)?;
-                            label.set("cts", "")?;
-                            result.set(idx, label)?;
-                            idx += 1;
-                        }
-                    }
-                }
-            }
-
             Ok(mlua::Value::Table(result))
         }
     })?;
@@ -181,96 +150,28 @@ pub fn register_atproto_api(
     let get_labels_batch_fn = lua.create_async_function(move |lua, uris: mlua::Table| {
         let state = state_clone.clone();
         async move {
-            let backend = state.db_backend;
-            // Collect URIs from the Lua table.
             let uri_list: Vec<String> = uris
                 .sequence_values::<String>()
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let now = now_rfc3339();
+            let by_uri = host::labels_get(&state.db, state.db_backend, &uri_list)
+                .await
+                .map_err(|e| mlua::Error::runtime(format!("label batch query failed: {e}")))?;
 
-            // Query labels for all URIs (one query per URI since AnyPool doesn't support array binding).
-            let label_sql = adapt_sql(
-                "SELECT src, uri, val, cts FROM happyview_labels WHERE uri = ? AND (exp IS NULL OR exp > ?)",
-                backend,
-            );
-            let mut rows: Vec<(String, String, String, String)> = Vec::new();
-            for uri in &uri_list {
-                let mut uri_rows: Vec<(String, String, String, String)> =
-                    crate::db::query_as(&label_sql)
-                        .bind(uri)
-                        .bind(&now)
-                        .fetch_all(&state.db)
-                        .await
-                        .map_err(|e| {
-                            mlua::Error::runtime(format!("label batch query failed: {e}"))
-                        })?;
-                rows.append(&mut uri_rows);
-            }
-
-            // Query records for self-labels.
-            let record_sql = adapt_sql(
-                "SELECT uri, did, record FROM happyview_records WHERE uri = ?",
-                backend,
-            );
-            let mut records: Vec<(String, String, String)> = Vec::new();
-            for uri in &uri_list {
-                let mut uri_records: Vec<(String, String, String)> = crate::db::query_as(&record_sql)
-                    .bind(uri)
-                    .fetch_all(&state.db)
-                    .await
-                    .map_err(|e| mlua::Error::runtime(format!("record batch query failed: {e}")))?;
-                records.append(&mut uri_records);
-            }
-
-            // Build result table keyed by URI.
             let result = lua.create_table()?;
-
-            // Initialize empty arrays for each URI.
-            let mut counters: std::collections::HashMap<String, i32> =
-                std::collections::HashMap::new();
             for uri in &uri_list {
-                result.set(uri.as_str(), lua.create_table()?)?;
-                counters.insert(uri.clone(), 1);
-            }
-
-            // Add external labels.
-            for (src, uri, val, cts) in &rows {
-                let label = lua.create_table()?;
-                label.set("src", src.as_str())?;
-                label.set("uri", uri.as_str())?;
-                label.set("val", val.as_str())?;
-                label.set("cts", cts.as_str())?;
-
-                let uri_table: mlua::Table = result.get(uri.as_str())?;
-                let idx = counters.get(uri).copied().unwrap_or(1);
-                uri_table.set(idx, label)?;
-                counters.insert(uri.clone(), idx + 1);
-            }
-
-            // Add self-labels from records.
-            for (uri, did, record_str) in &records {
-                let record_val: serde_json::Value =
-                    serde_json::from_str(record_str).unwrap_or(serde_json::json!({}));
-                if let Some(labels) = record_val.get("labels")
-                    && let Some(values) = labels.get("values")
-                    && let Some(arr) = values.as_array()
-                {
-                    for item in arr {
-                        if let Some(val) = item.get("val").and_then(|v| v.as_str()) {
-                            let label = lua.create_table()?;
-                            label.set("src", did.as_str())?;
-                            label.set("uri", uri.as_str())?;
-                            label.set("val", val)?;
-                            label.set("cts", "")?;
-
-                            let uri_table: mlua::Table = result.get(uri.as_str())?;
-                            let idx = counters.get(uri).copied().unwrap_or(1);
-                            uri_table.set(idx, label)?;
-                            counters.insert(uri.clone(), idx + 1);
-                        }
+                let uri_table = lua.create_table()?;
+                if let Some(labels) = by_uri.get(uri) {
+                    for (idx, label) in labels.iter().enumerate() {
+                        let entry = lua.create_table()?;
+                        entry.set("src", label.src.as_str())?;
+                        entry.set("uri", label.uri.as_str())?;
+                        entry.set("val", label.val.as_str())?;
+                        entry.set("cts", label.cts.as_str())?;
+                        uri_table.set(idx + 1, entry)?;
                     }
                 }
+                result.set(uri.as_str(), uri_table)?;
             }
 
             Ok(mlua::Value::Table(result))
@@ -287,21 +188,12 @@ pub fn register_atproto_api(
         let signer = signer.clone();
         let did = caller_did.unwrap_or("").to_string();
         let sign_fn = lua.create_function(move |lua, table: mlua::Value| {
-            let mut record: serde_json::Value = lua
+            let record: serde_json::Value = lua
                 .from_value(table)
                 .map_err(|e| mlua::Error::runtime(format!("atproto.sign: {e}")))?;
 
-            signer
-                .sign_record(&mut record, &did)
+            let sig = host::attest_sign(Some(&signer), &did, record)
                 .map_err(|e| mlua::Error::runtime(format!("atproto.sign: {e}")))?;
-
-            // Extract the last signature (the one we just added)
-            let sig = record
-                .get("signatures")
-                .and_then(|s| s.as_array())
-                .and_then(|arr| arr.last())
-                .cloned()
-                .ok_or_else(|| mlua::Error::runtime("atproto.sign: no signature produced"))?;
 
             lua.to_value(&sig)
                 .map_err(|e| mlua::Error::runtime(format!("atproto.sign: {e}")))
@@ -332,17 +224,23 @@ pub fn register_atproto_api(
                 // let any fault in this path present to a script as "this user
                 // forged their records", with nothing in the logs to say
                 // otherwise. Callers that want the old behaviour can `pcall`.
-                signer
-                    .verify_record_signature(&record_json, &sig_json, &repo_did)
-                    .map_err(|e| {
-                        tracing::warn!(
-                            repository = %repo_did,
-                            error = %e,
-                            "atproto.verify_signature could not check the signature — \
-                             this is not a statement that the record is forged"
-                        );
-                        mlua::Error::runtime(format!("atproto.verify_signature: {e}"))
-                    })
+                host::attest_verify(
+                    Some(&signer),
+                    AttestVerify {
+                        record: record_json,
+                        signature: sig_json,
+                        repo_did: repo_did.clone(),
+                    },
+                )
+                .map_err(|e| {
+                    tracing::warn!(
+                        repository = %repo_did,
+                        error = %e,
+                        "atproto.verify_signature could not check the signature — \
+                         this is not a statement that the record is forged"
+                    );
+                    mlua::Error::runtime(format!("atproto.verify_signature: {e}"))
+                })
             },
         )?;
         atproto_table.set("verify_signature", verify_fn)?;

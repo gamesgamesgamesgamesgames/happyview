@@ -680,6 +680,67 @@ pub struct LexiconGet {
 }
 
 // ---------------------------------------------------------------------------
+// AT Protocol service resolution, blob download, labels, and attestation
+// ---------------------------------------------------------------------------
+
+/// Resolve the AT Protocol service a DID's document advertises (its PDS,
+/// typically). Needs `atproto:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AtprotoResolveService {
+    pub did: String,
+}
+
+/// Download a blob from a repo, by the DID that owns it and the blob's CID.
+/// Needs `atproto:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AtprotoBlobDownload {
+    pub did: String,
+    pub cid: String,
+}
+
+/// A downloaded blob. `bytes` travels the same way an [`HttpResponse`] body
+/// does: a JSON string when it is valid UTF-8, a byte array otherwise.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobData {
+    #[serde(
+        serialize_with = "serialize_body",
+        deserialize_with = "deserialize_body_flexible_required"
+    )]
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+/// Look up labels applied to a set of URIs. Needs `atproto:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelsGet {
+    pub uris: Vec<String>,
+}
+
+/// One label, as issued by a labeler.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Label {
+    pub src: String,
+    pub uri: String,
+    pub val: String,
+    pub cts: String,
+}
+
+/// A record to sign an attestation over. Needs `attest:sign`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttestSign {
+    pub record: Value,
+}
+
+/// A record and its signature, to verify. Needs `atproto:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttestVerify {
+    pub record: Value,
+    pub signature: Value,
+    pub repo_did: String,
+}
+
+// ---------------------------------------------------------------------------
 // Auth plugin inputs and outputs
 // ---------------------------------------------------------------------------
 
@@ -1856,5 +1917,142 @@ mod caller_tests {
         let value = serde_json::to_value(&get).unwrap();
         assert_eq!(value["nsid"], "app.bsky.feed.post");
         assert_eq!(serde_json::from_value::<LexiconGet>(value).unwrap(), get);
+    }
+}
+
+#[cfg(test)]
+mod atproto_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use serde_json::json;
+
+    #[test]
+    fn atproto_resolve_service_round_trips() {
+        let spec = AtprotoResolveService {
+            did: "did:plc:abc".to_string(),
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["did"], "did:plc:abc");
+        assert_eq!(
+            serde_json::from_value::<AtprotoResolveService>(value).unwrap(),
+            spec
+        );
+    }
+
+    #[test]
+    fn atproto_blob_download_round_trips() {
+        let spec = AtprotoBlobDownload {
+            did: "did:plc:abc".to_string(),
+            cid: "bafy123".to_string(),
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["did"], "did:plc:abc");
+        assert_eq!(value["cid"], "bafy123");
+        assert_eq!(
+            serde_json::from_value::<AtprotoBlobDownload>(value).unwrap(),
+            spec
+        );
+    }
+
+    #[test]
+    fn blob_data_bytes_travel_like_an_http_body() {
+        // A UTF-8 payload serializes as a JSON string...
+        let text = BlobData {
+            bytes: b"hello".to_vec(),
+            mime_type: "text/plain".to_string(),
+            size: 5,
+        };
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(value["bytes"], json!("hello"));
+        assert_eq!(value["size"], 5);
+        assert_eq!(serde_json::from_value::<BlobData>(value).unwrap(), text);
+
+        // ...and a non-UTF-8 payload serializes as a byte array, both ways.
+        let binary = BlobData {
+            bytes: vec![0xff, 0xfe],
+            mime_type: "image/png".to_string(),
+            size: 2,
+        };
+        let value = serde_json::to_value(&binary).unwrap();
+        assert_eq!(value["bytes"], json!([255, 254]));
+        assert_eq!(serde_json::from_value::<BlobData>(value).unwrap(), binary);
+
+        // A caller may also send a byte array for text content.
+        let from_array: BlobData = serde_json::from_value(json!({
+            "bytes": [104, 105],
+            "mime_type": "text/plain",
+            "size": 2,
+        }))
+        .unwrap();
+        assert_eq!(from_array.bytes, b"hi");
+    }
+
+    #[test]
+    fn labels_get_spec_round_trips() {
+        let spec = LabelsGet {
+            uris: vec!["at://did:plc:abc/app.bsky.feed.post/1".to_string()],
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            value["uris"],
+            json!(["at://did:plc:abc/app.bsky.feed.post/1"])
+        );
+        assert_eq!(serde_json::from_value::<LabelsGet>(value).unwrap(), spec);
+    }
+
+    #[test]
+    fn label_round_trips() {
+        let label = Label {
+            src: "did:plc:labeler".to_string(),
+            uri: "at://did:plc:abc/app.bsky.feed.post/1".to_string(),
+            val: "spam".to_string(),
+            cts: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let value = serde_json::to_value(&label).unwrap();
+        assert_eq!(value["val"], "spam");
+        assert_eq!(serde_json::from_value::<Label>(value).unwrap(), label);
+    }
+
+    #[test]
+    fn labels_get_result_is_a_map_with_every_requested_uri_present() {
+        // Every requested URI comes back as a key, even with no labels on it —
+        // the host never omits an entry, so a caller can index the map
+        // directly instead of checking for absence first.
+        let value = json!({
+            "at://did:plc:abc/app.bsky.feed.post/1": [
+                {
+                    "src": "did:plc:labeler",
+                    "uri": "at://did:plc:abc/app.bsky.feed.post/1",
+                    "val": "spam",
+                    "cts": "2026-01-01T00:00:00Z",
+                }
+            ],
+            "at://did:plc:abc/app.bsky.feed.post/2": []
+        });
+        let map: BTreeMap<String, Vec<Label>> = serde_json::from_value(value).unwrap();
+        assert_eq!(map["at://did:plc:abc/app.bsky.feed.post/1"][0].val, "spam");
+        assert!(map["at://did:plc:abc/app.bsky.feed.post/2"].is_empty());
+    }
+
+    #[test]
+    fn attest_sign_spec_round_trips() {
+        let spec = AttestSign {
+            record: json!({"text": "hi"}),
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["record"]["text"], "hi");
+        assert_eq!(serde_json::from_value::<AttestSign>(value).unwrap(), spec);
+    }
+
+    #[test]
+    fn attest_verify_spec_round_trips() {
+        let spec = AttestVerify {
+            record: json!({"text": "hi"}),
+            signature: json!({"$sig": {"v": 1}}),
+            repo_did: "did:plc:abc".to_string(),
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["repo_did"], "did:plc:abc");
+        assert_eq!(serde_json::from_value::<AttestVerify>(value).unwrap(), spec);
     }
 }

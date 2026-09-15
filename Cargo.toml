@@ -7,6 +7,7 @@ exclude = [
     "tests/fixtures/sdk_auth",
     "tests/fixtures/sdk_objects",
     "tests/fixtures/sdk_caller",
+    "tests/fixtures/sdk_atproto",
 ]
 
 [workspace.dependencies]

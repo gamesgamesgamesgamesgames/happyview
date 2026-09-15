@@ -94,6 +94,25 @@ const EXPECTED_CALLER_IMPORTS: &[&str] = &[
     "env::host_records_index_put",
 ];
 
+/// The `atproto` fixture is a bare pass-through over every atproto/attestation
+/// host import — nothing else.
+const EXPECTED_ATPROTO_EXPORTS: &[&str] = &[
+    "alloc",
+    "call",
+    "dealloc",
+    "get_api_surface",
+    "memory",
+    "plugin_info",
+];
+
+const EXPECTED_ATPROTO_IMPORTS: &[&str] = &[
+    "env::host_atproto_blob_download",
+    "env::host_atproto_resolve_service",
+    "env::host_attest_sign",
+    "env::host_attest_verify",
+    "env::host_labels_get",
+];
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
         "../../tests/fixtures/{name}/target/wasm32-unknown-unknown/release/{name}.wasm"
@@ -187,5 +206,14 @@ fn the_caller_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
         "sdk_caller",
         EXPECTED_CALLER_EXPORTS,
         EXPECTED_CALLER_IMPORTS,
+    );
+}
+
+#[test]
+fn the_atproto_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
+    check_fixture(
+        "sdk_atproto",
+        EXPECTED_ATPROTO_EXPORTS,
+        EXPECTED_ATPROTO_IMPORTS,
     );
 }

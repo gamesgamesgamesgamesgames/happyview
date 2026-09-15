@@ -1,3 +1,4 @@
+mod atproto;
 mod bindings;
 mod caller;
 mod db;
@@ -8,6 +9,7 @@ mod lookup;
 mod records;
 mod secrets;
 
+pub use atproto::*;
 pub use bindings::{PluginState, register_host_functions};
 pub use caller::*;
 pub use db::*;

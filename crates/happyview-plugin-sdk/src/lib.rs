@@ -52,12 +52,13 @@ pub mod wire;
 
 pub use envelope::{PluginError, Response};
 pub use types::{
-    ApiExport, ApiMethod, ApiSurface, AuthorizeUrlInput, BacklinksQuery, CallContext, CallInput,
+    ApiExport, ApiMethod, ApiSurface, AtprotoBlobDownload, AtprotoResolveService, AttestSign,
+    AttestVerify, AuthorizeUrlInput, BacklinksQuery, BlobData, CallContext, CallInput,
     CallbackInput, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
     CallerXrpcProcedure, CallerXrpcQuery, Condition, ExternalProfile, Filter, IndexDelete,
-    IndexPut, LexiconGet, MethodCall, ObjectCall, PluginInfo, RecordRef, RecordsCount, RecordsPage,
-    RecordsQuery, RecordsSearch, RefreshInput, Sort, Step, StrongRef, TableQuery, TokenInput,
-    TokenSet,
+    IndexPut, Label, LabelsGet, LexiconGet, MethodCall, ObjectCall, PluginInfo, RecordRef,
+    RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, RefreshInput, Sort, Step, StrongRef,
+    TableQuery, TokenInput, TokenSet,
 };
 
 /// Items the macros name in their expansion. Not a public API: a plugin crate

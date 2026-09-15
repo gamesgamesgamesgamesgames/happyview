@@ -46,15 +46,33 @@ pub fn shared_client() -> &'static reqwest::Client {
     SHARED_CLIENT.get_or_init(|| build_http_client(&crate::version::user_agent()))
 }
 
+/// The shared client's settings with redirects disabled, for callers that
+/// vet a host before sending and must not let a redirect carry the request
+/// past that check.
+pub fn build_no_redirect_client(user_agent: &str) -> reqwest::Client {
+    client_builder_with_timeouts(CONNECT_TIMEOUT, READ_TIMEOUT, user_agent)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build HTTP client")
+}
+
 fn client_with_timeouts(connect: Duration, read: Duration, user_agent: &str) -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(connect)
-        .read_timeout(read)
-        .user_agent(user_agent)
+    client_builder_with_timeouts(connect, read, user_agent)
         .build()
         // Only fails if the TLS backend can't initialise, in which case no
         // outbound request would work anyway.
         .expect("failed to build HTTP client")
+}
+
+fn client_builder_with_timeouts(
+    connect: Duration,
+    read: Duration,
+    user_agent: &str,
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .user_agent(user_agent)
 }
 
 /// Wraps our shared, UA-and-timeout-configured `reqwest::Client` so it can
