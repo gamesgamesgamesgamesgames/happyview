@@ -11,8 +11,9 @@
 //! the rest of the suite uses.
 //!
 //! This image is the spec-current reference, so it is where HappyView's own
-//! wire shapes (split policies, `putMember`, the oplog) are checked. The other
-//! hosts predate the 2026-09-10 renames. It serves no capability descriptor, so
+//! wire shapes (split policies, `putMember`, the oplog) are checked. ZDS runs
+//! the same simplespace checks; pds.js predates the 2026-09-10 renames. It
+//! serves no capability descriptor, so
 //! it is the only real host that exercises the probe tier of detection.
 
 mod interop_support;

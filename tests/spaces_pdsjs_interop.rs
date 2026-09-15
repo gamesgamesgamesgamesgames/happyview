@@ -364,9 +364,9 @@ async fn a_repo_with_typed_values_is_refused_rather_than_migrated_wrongly_to_pds
 #[tokio::test]
 #[ignore]
 async fn pdsjs_still_uses_the_pre_split_member_methods() {
-    // addMember, not putMember, as on ZDS. See
-    // `zds_still_uses_the_pre_split_method_spellings` for what this means for
-    // detection.
+    // Detection only reports pds.js as supported because the required-method
+    // list accepts addMember as a spelling of putMember. If this starts
+    // failing, pds.js has caught up and that allowance can be reconsidered.
     let body: Value = client()
         .get(format!("{PDSJS}/xrpc/community.lexicon.service.describe"))
         .send()
