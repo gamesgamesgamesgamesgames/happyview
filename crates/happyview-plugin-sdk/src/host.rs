@@ -29,8 +29,10 @@ use crate::wire::Response;
 use crate::wire::{
     ApiSurface, AtprotoBlobDownload, AttestSign, AttestVerify, BacklinksQuery, BlobData,
     CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
-    CallerXrpcQuery, IndexDelete, IndexPut, Label, LabelsGet, PluginError, RecordRef, RecordsCount,
-    RecordsPage, RecordsQuery, RecordsSearch, StrongRef, TableQuery,
+    CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, Label, LabelsGet, LinkedRepoBlobUpload,
+    LinkedRepoCall, LinkedRepoInfo, LinkedRepoRecordCreate, LinkedRepoRecordDelete,
+    LinkedRepoRecordPut, PluginError, RecordRef, RecordsCount, RecordsPage, RecordsQuery,
+    RecordsSearch, StrongRef, TableQuery,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::wire::{AtprotoResolveService, LexiconGet};
@@ -80,6 +82,13 @@ extern "C" {
     fn host_labels_get(req_ptr: i32, req_len: i32) -> i64;
     fn host_attest_sign(req_ptr: i32, req_len: i32) -> i64;
     fn host_attest_verify(req_ptr: i32, req_len: i32) -> i64;
+    fn host_linked_repos_list(req_ptr: i32, req_len: i32) -> i64;
+    fn host_linked_repo_create_record(req_ptr: i32, req_len: i32) -> i64;
+    fn host_linked_repo_put_record(req_ptr: i32, req_len: i32) -> i64;
+    fn host_linked_repo_delete_record(req_ptr: i32, req_len: i32) -> i64;
+    fn host_linked_repo_upload_blob(req_ptr: i32, req_len: i32) -> i64;
+    fn host_linked_repo_call(req_ptr: i32, req_len: i32) -> i64;
+    fn host_jobs_create(req_ptr: i32, req_len: i32) -> i64;
 }
 
 /// Why a host call did not produce a value.
@@ -561,6 +570,102 @@ pub fn attest_verify(spec: &AttestVerify) -> Result<bool, PluginError> {
     #[cfg(target_arch = "wasm32")]
     {
         call_spec(host_attest_verify, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// List the linked-repo grants the plugin may act through. Needs
+/// `linked_repos:use`.
+pub fn linked_repos_list() -> Result<Vec<LinkedRepoInfo>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_linked_repos_list, &serde_json::json!({}))
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Create a record on a linked repo, as the DID its grant names. Needs
+/// `linked_repos:use`.
+pub fn linked_repo_create_record(spec: &LinkedRepoRecordCreate) -> Result<RecordRef, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_linked_repo_create_record, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Put (create-or-update) a record on a linked repo. Needs `linked_repos:use`.
+pub fn linked_repo_put_record(spec: &LinkedRepoRecordPut) -> Result<RecordRef, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_linked_repo_put_record, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Delete a record from a linked repo. Needs `linked_repos:use`.
+pub fn linked_repo_delete_record(spec: &LinkedRepoRecordDelete) -> Result<(), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // The host sends `{"ok": null}`; discard whatever comes back rather
+        // than fail on a shape a future host might vary.
+        call_spec::<_, Option<Value>>(host_linked_repo_delete_record, spec).map(|_| ())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Upload a blob to a linked repo. Returns the PDS's blob ref as-is. Needs
+/// `linked_repos:use`.
+pub fn linked_repo_upload_blob(spec: &LinkedRepoBlobUpload) -> Result<Value, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_linked_repo_upload_blob, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Send an XRPC call against a linked repo, as the DID its grant names. Needs
+/// `linked_repos:use`.
+pub fn linked_repo_call(spec: &LinkedRepoCall) -> Result<Value, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_linked_repo_call, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Enqueue a background job, returning its id. Needs `jobs:create`.
+pub fn jobs_create(spec: &JobCreate) -> Result<String, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_jobs_create, spec)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

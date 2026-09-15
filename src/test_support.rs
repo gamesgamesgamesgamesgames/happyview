@@ -24,6 +24,24 @@ pub async fn memory_pool() -> sqlx::AnyPool {
         .expect("connect to in-memory sqlite")
 }
 
+/// A [`memory_pool`] with every SQLite migration applied. A hand-written
+/// `CREATE TABLE` in a test drifts silently from the real schema — a
+/// migration can add a column the copy never gets, and a test against the
+/// stale copy keeps passing (or worse, passes against a table production
+/// does not have) while the code it exercises breaks against a real
+/// database. Running the actual migrator is what `src/db.rs`'s
+/// `connect_and_migrate` does for a real deployment; the relative path
+/// resolves under `cargo test --lib` because the crate root is the working
+/// directory.
+pub async fn migrated_memory_pool() -> sqlx::AnyPool {
+    let pool = memory_pool().await;
+    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new("./migrations/sqlite"))
+        .await
+        .expect("load sqlite migrations");
+    migrator.run(&pool).await.expect("run sqlite migrations");
+    pool
+}
+
 /// Build an `AppState` backed by `pool`, wired for SQLite with no network
 /// dependencies reachable (PLC and OAuth point at unroutable local ports).
 pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {

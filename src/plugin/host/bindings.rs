@@ -334,6 +334,148 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
+    // Async functions - writing to a linked repo and enqueuing jobs
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repos_list",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repos_list",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, _spec: serde_json::Value| async move {
+                        super::linked_repos::list(&state).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repo_create_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repo_create_record",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, spec: happyview_plugin_sdk::wire::LinkedRepoRecordCreate| async move {
+                        super::linked_repos::create_record(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repo_put_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repo_put_record",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, spec: happyview_plugin_sdk::wire::LinkedRepoRecordPut| async move {
+                        super::linked_repos::put_record(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repo_delete_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repo_delete_record",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, spec: happyview_plugin_sdk::wire::LinkedRepoRecordDelete| async move {
+                        super::linked_repos::delete_record(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repo_upload_blob",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repo_upload_blob",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, spec: happyview_plugin_sdk::wire::LinkedRepoBlobUpload| async move {
+                        super::linked_repos::upload_blob(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repo_call",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repo_call",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, spec: happyview_plugin_sdk::wire::LinkedRepoCall| async move {
+                        super::linked_repos::call(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_jobs_create",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_jobs_create",
+                    req_ptr,
+                    req_len,
+                    super::jobs::JobsError::code,
+                    |state, caller_did, session, spec: happyview_plugin_sdk::wire::JobCreate| async move {
+                        super::jobs::create(&state, caller_did.as_deref(), session.as_deref(), spec)
+                            .await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
     // Async functions - local index writes and lexicon reads
     linker.func_wrap_async(
         "env",
@@ -979,6 +1121,103 @@ where
     let response = match run(session, spec).await {
         Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
         Err(e) => error_envelope(e.code(), caller_error_message(&e)),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// The gate/decode steps [`host_app_impl`] and [`host_app_caller_impl`]
+/// share: capability, then an app state to act against at all — only the
+/// direct-construction test and external-auth call sites leave it unset —
+/// then the decoded spec. `Err` carries the return value a failure has
+/// already written, so both callers can return it directly.
+async fn host_app_gate<S>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+) -> Result<(crate::AppState, S), i64>
+where
+    S: serde::de::DeserializeOwned,
+{
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return Err(write_guest_response(caller, &envelope).await);
+    }
+    let Some(app_state) = caller.data().app_state.clone() else {
+        return Err(write_guest_response(
+            caller,
+            &error_envelope("HOST_ERROR", "this instance has no app state"),
+        )
+        .await);
+    };
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return Err(0);
+    };
+    let spec: S = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return Err(write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await),
+    };
+    Ok((app_state, spec))
+}
+
+/// One entry point for the six linked-repo imports: each spec already names
+/// the DID whose linked repo it acts on, so none of them needs the runner's
+/// own identity — only the whole instance to act against.
+async fn host_app_impl<S, R, E, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    code: fn(&E) -> &'static str,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    E: std::fmt::Display,
+    F: FnOnce(crate::AppState, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, E>>,
+{
+    let (app_state, spec) = match host_app_gate(caller, import, req_ptr, req_len).await {
+        Ok(pair) => pair,
+        Err(early_return) => return early_return,
+    };
+    let response = match run(app_state, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(code(&e), e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// As [`host_app_impl`], but also threads the runner's own caller DID and
+/// (when it has one) its caller session through to `run` — what
+/// `host_jobs_create` needs to enqueue as the script's runner, rather than as
+/// whoever a spec field might name.
+async fn host_app_caller_impl<S, R, E, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    code: fn(&E) -> &'static str,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    E: std::fmt::Display,
+    F: FnOnce(crate::AppState, Option<String>, Option<Arc<CallerSession>>, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, E>>,
+{
+    let (app_state, spec) = match host_app_gate(caller, import, req_ptr, req_len).await {
+        Ok(pair) => pair,
+        Err(early_return) => return early_return,
+    };
+    let caller_did = caller.data().call_ctx.caller_did.clone();
+    let session = caller.data().caller.clone();
+    let response = match run(app_state, caller_did, session, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(code(&e), e),
     };
     write_guest_response(caller, &response).await
 }

@@ -52,6 +52,10 @@ pub enum PluginCapability {
     AtprotoRead,
     #[serde(rename = "attest:sign")]
     AttestSign,
+    #[serde(rename = "linked_repos:use")]
+    LinkedReposUse,
+    #[serde(rename = "jobs:create")]
+    JobsCreate,
 }
 
 impl PluginCapability {
@@ -73,6 +77,8 @@ impl PluginCapability {
             RecordsWrite,
             AtprotoRead,
             AttestSign,
+            LinkedReposUse,
+            JobsCreate,
         ]
     }
 
@@ -94,6 +100,8 @@ impl PluginCapability {
             RecordsWrite => "records:write",
             AtprotoRead => "atproto:read",
             AttestSign => "attest:sign",
+            LinkedReposUse => "linked_repos:use",
+            JobsCreate => "jobs:create",
         }
     }
 
@@ -105,10 +113,15 @@ impl PluginCapability {
         use PluginCapability::*;
         match self {
             SecretsRead | KvRead | KvWrite => Risk::Low,
-            RecordsRead | NetworkRequest | LibraryCall | CallerRead | AtprotoRead => Risk::Medium,
-            NetworkRequestUnrestricted | DatabaseRead | CallerWrite | RecordsWrite | AttestSign => {
-                Risk::High
+            RecordsRead | NetworkRequest | LibraryCall | CallerRead | AtprotoRead | JobsCreate => {
+                Risk::Medium
             }
+            NetworkRequestUnrestricted
+            | DatabaseRead
+            | CallerWrite
+            | RecordsWrite
+            | AttestSign
+            | LinkedReposUse => Risk::High,
             DatabaseWrite | CallerCall => Risk::Critical,
         }
     }
@@ -151,6 +164,12 @@ impl PluginCapability {
             }
             AttestSign => {
                 "Sign records with this instance's attestation key, producing a signature that asserts this instance vouches for the content."
+            }
+            LinkedReposUse => {
+                "Write records and upload blobs through any repo an admin has linked to this instance, within the scopes that admin granted, and call any XRPC method through it, which only that repo's PDS constrains."
+            }
+            JobsCreate => {
+                "Enqueue background jobs as the user who ran the script, optionally carrying that user's PDS session into the job."
             }
         }
     }
@@ -290,6 +309,34 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
     Requirement {
         import: "host_attest_verify",
         any_of: &[PluginCapability::AtprotoRead],
+    },
+    Requirement {
+        import: "host_linked_repos_list",
+        any_of: &[PluginCapability::LinkedReposUse],
+    },
+    Requirement {
+        import: "host_linked_repo_create_record",
+        any_of: &[PluginCapability::LinkedReposUse],
+    },
+    Requirement {
+        import: "host_linked_repo_put_record",
+        any_of: &[PluginCapability::LinkedReposUse],
+    },
+    Requirement {
+        import: "host_linked_repo_delete_record",
+        any_of: &[PluginCapability::LinkedReposUse],
+    },
+    Requirement {
+        import: "host_linked_repo_upload_blob",
+        any_of: &[PluginCapability::LinkedReposUse],
+    },
+    Requirement {
+        import: "host_linked_repo_call",
+        any_of: &[PluginCapability::LinkedReposUse],
+    },
+    Requirement {
+        import: "host_jobs_create",
+        any_of: &[PluginCapability::JobsCreate],
     },
 ];
 
@@ -469,6 +516,13 @@ mod tests {
             "host_labels_get",
             "host_attest_sign",
             "host_attest_verify",
+            "host_linked_repos_list",
+            "host_linked_repo_create_record",
+            "host_linked_repo_put_record",
+            "host_linked_repo_delete_record",
+            "host_linked_repo_upload_blob",
+            "host_linked_repo_call",
+            "host_jobs_create",
         ] {
             // `None` is only right for the free imports.
             assert_eq!(
@@ -662,6 +716,29 @@ mod tests {
             let req = requirement_for_import(import).expect(import);
             assert_eq!(req.any_of, &[expected], "{import}");
         }
+    }
+
+    /// The six linked-repo imports share one capability — each re-reads its
+    /// grant by DID on every call, so there is nothing narrower to gate one
+    /// import on that another doesn't also need. Enqueuing a job is a
+    /// separate trust decision from writing to a linked repo, so it gets its
+    /// own.
+    #[test]
+    fn linked_repos_and_jobs_imports_map_to_their_capability() {
+        for import in [
+            "host_linked_repos_list",
+            "host_linked_repo_create_record",
+            "host_linked_repo_put_record",
+            "host_linked_repo_delete_record",
+            "host_linked_repo_upload_blob",
+            "host_linked_repo_call",
+        ] {
+            let req = requirement_for_import(import).expect(import);
+            assert_eq!(req.any_of, &[PluginCapability::LinkedReposUse], "{import}");
+        }
+
+        let req = requirement_for_import("host_jobs_create").expect("host_jobs_create");
+        assert_eq!(req.any_of, &[PluginCapability::JobsCreate]);
     }
 
     #[test]

@@ -113,6 +113,27 @@ const EXPECTED_ATPROTO_IMPORTS: &[&str] = &[
     "env::host_labels_get",
 ];
 
+/// The `linked_repos` fixture is a bare pass-through over every linked-repo
+/// and jobs host import — nothing else.
+const EXPECTED_LINKED_REPOS_EXPORTS: &[&str] = &[
+    "alloc",
+    "call",
+    "dealloc",
+    "get_api_surface",
+    "memory",
+    "plugin_info",
+];
+
+const EXPECTED_LINKED_REPOS_IMPORTS: &[&str] = &[
+    "env::host_jobs_create",
+    "env::host_linked_repo_call",
+    "env::host_linked_repo_create_record",
+    "env::host_linked_repo_delete_record",
+    "env::host_linked_repo_put_record",
+    "env::host_linked_repo_upload_blob",
+    "env::host_linked_repos_list",
+];
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
         "../../tests/fixtures/{name}/target/wasm32-unknown-unknown/release/{name}.wasm"
@@ -215,5 +236,14 @@ fn the_atproto_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
         "sdk_atproto",
         EXPECTED_ATPROTO_EXPORTS,
         EXPECTED_ATPROTO_IMPORTS,
+    );
+}
+
+#[test]
+fn the_linked_repos_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
+    check_fixture(
+        "sdk_linked_repos",
+        EXPECTED_LINKED_REPOS_EXPORTS,
+        EXPECTED_LINKED_REPOS_IMPORTS,
     );
 }

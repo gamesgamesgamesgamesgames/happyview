@@ -124,7 +124,7 @@ fn build_module(
                     .call_library_as(&lib_id, &fn_name, &args, &ctx, caller, 0)
                     .await
                     .map_err(|e| mlua::Error::runtime(format!("{lib_id}.{fn_name}: {e}")))?;
-                lua.to_value(&result)
+                json_to_lua(&lua, &result)
             }
         })?;
         module.set(export.name.as_str(), func)?;
@@ -246,9 +246,22 @@ fn immediate_method(
                     .map_err(|e| {
                         mlua::Error::runtime(format!("{lib_id}.{ctor_name}:{name}: {e}"))
                     })?;
-                lua.to_value(&result)
+                json_to_lua(&lua, &result)
             }
         },
+    )
+}
+
+/// A library result becomes Lua the way a script expects a missing value to
+/// look: JSON `null` is `nil`, so `if grant.handle then` and `== nil` both
+/// behave. mlua's default is a `null` sentinel userdata, which is truthy and
+/// concatenates as an error.
+fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> LuaResult<mlua::Value> {
+    lua.to_value_with(
+        value,
+        mlua::serde::SerializeOptions::new()
+            .serialize_none_to_null(false)
+            .serialize_unit_to_null(false),
     )
 }
 
@@ -361,6 +374,31 @@ mod tests {
         let echoed: mlua::Table = result.get("echoed").unwrap();
         let a: mlua::Table = echoed.get("a").unwrap();
         assert_eq!(a.get::<i64>(2).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn null_results_arrive_as_nil() {
+        let state = state_with_library().await;
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_require(&lua, &state, &identity_with(None), None)
+            .await
+            .unwrap();
+
+        lua.load(
+            r#"
+            local lib = require("liba")
+            function handle()
+                local who = lib.whoami()
+                return { is_nil = who == nil, truthy = who and true or false }
+            end
+            "#,
+        )
+        .exec()
+        .unwrap();
+        let handle: mlua::Function = lua.globals().get("handle").unwrap();
+        let result: mlua::Table = handle.call_async(()).await.unwrap();
+        assert!(result.get::<bool>("is_nil").unwrap());
+        assert!(!result.get::<bool>("truthy").unwrap());
     }
 
     #[tokio::test]

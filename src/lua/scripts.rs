@@ -32,13 +32,9 @@
 //!   [`super::execute::execute_procedure_script`] /
 //!   [`super::execute::execute_query_script`] directly.
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, LazyLock};
-
-static JOB_TYPE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9._-]*$").unwrap());
+use std::sync::Arc;
 
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
@@ -128,7 +124,7 @@ impl ParsedTrigger {
         // Suffix validation: NSID for most triggers, but `labeler.apply:_actor`
         // and `job.run:<type>` have their own formats.
         match kind {
-            TriggerKind::JobRun => validate_job_type(suffix)?,
+            TriggerKind::JobRun => crate::jobs::validate_job_type(suffix)?,
             TriggerKind::LabelerApply if suffix == "_actor" => {}
             _ => happyview_nsid::validate_nsid(suffix).map_err(|e| e.to_string())?,
         }
@@ -138,26 +134,6 @@ impl ParsedTrigger {
             suffix: suffix.to_string(),
         })
     }
-}
-
-fn validate_job_type(job_type: &str) -> Result<(), String> {
-    if job_type.is_empty() || job_type.len() > 128 {
-        return Err(format!(
-            "invalid job type '{job_type}': must be 1–128 characters"
-        ));
-    }
-    if !JOB_TYPE_RE.is_match(job_type) {
-        return Err(format!(
-            "invalid job type '{job_type}': must match /^[a-z0-9][a-z0-9._-]*$/"
-        ));
-    }
-    if crate::jobs::native::is_reserved(job_type) {
-        return Err(format!(
-            "invalid job type '{job_type}': the '{}' prefix is reserved for built-in jobs",
-            crate::jobs::native::RESERVED_PREFIX
-        ));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

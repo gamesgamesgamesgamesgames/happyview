@@ -741,6 +741,91 @@ pub struct AttestVerify {
 }
 
 // ---------------------------------------------------------------------------
+// Linked repos and jobs
+// ---------------------------------------------------------------------------
+
+/// One linked-repo grant. Needs `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoInfo {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub status: String,
+    pub scopes: String,
+}
+
+/// A record create against a linked repo, as the DID the grant names. Needs
+/// `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoRecordCreate {
+    pub did: String,
+    pub collection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkey: Option<String>,
+    pub record: Value,
+}
+
+/// A record put (upsert) against a linked repo. Needs `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoRecordPut {
+    pub did: String,
+    pub collection: String,
+    pub rkey: String,
+    pub record: Value,
+    /// A no-create guarantee when set: the PDS refuses unless this CID is the
+    /// record's current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_cid: Option<String>,
+}
+
+/// A record delete against a linked repo. Needs `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoRecordDelete {
+    pub did: String,
+    pub collection: String,
+    pub rkey: String,
+}
+
+/// A blob upload against a linked repo. `bytes` travels the same way a
+/// [`CallerBlobUpload`]'s does. Needs `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoBlobUpload {
+    pub did: String,
+    #[serde(
+        serialize_with = "serialize_body",
+        deserialize_with = "deserialize_body_flexible_required"
+    )]
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+}
+
+/// An XRPC call against a linked repo, as the DID the grant names. Needs
+/// `linked_repos:use`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LinkedRepoCall {
+    pub did: String,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
+}
+
+/// A job to enqueue for the background worker. Needs `jobs:create`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobCreate {
+    pub job_type: String,
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default)]
+    pub auth: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Auth plugin inputs and outputs
 // ---------------------------------------------------------------------------
 
@@ -1624,7 +1709,7 @@ mod object_tests {
             "steps": [{"where": ["author", "=", "did:plc:abc"]}, {"limit": [20]}],
             "call": {"name": "run", "args": []}
         });
-        let call = ObjectCall::from_args(&[doc.clone()]).unwrap();
+        let call = ObjectCall::from_args(core::slice::from_ref(&doc)).unwrap();
         assert_eq!(call.args, vec![json!("app.bsky.feed.post")]);
         assert_eq!(call.steps.len(), 2);
         assert_eq!(call.call.name, "run");
@@ -2054,5 +2139,226 @@ mod atproto_tests {
         let value = serde_json::to_value(&spec).unwrap();
         assert_eq!(value["repo_did"], "did:plc:abc");
         assert_eq!(serde_json::from_value::<AttestVerify>(value).unwrap(), spec);
+    }
+}
+
+#[cfg(test)]
+mod linked_repos_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use serde_json::json;
+
+    #[test]
+    fn linked_repo_info_round_trips_with_every_field_set() {
+        let info = LinkedRepoInfo {
+            id: "grant-1".to_string(),
+            did: Some("did:plc:abc".to_string()),
+            handle: Some("alice.test".to_string()),
+            reason: Some("sync".to_string()),
+            status: "linked".to_string(),
+            scopes: "transition:generic".to_string(),
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["id"], "grant-1");
+        assert_eq!(value["did"], "did:plc:abc");
+        assert_eq!(value["handle"], "alice.test");
+        assert_eq!(value["reason"], "sync");
+        assert_eq!(value["status"], "linked");
+        assert_eq!(value["scopes"], "transition:generic");
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoInfo>(value).unwrap(),
+            info
+        );
+    }
+
+    #[test]
+    fn linked_repo_info_omits_absent_optionals() {
+        let info: LinkedRepoInfo = serde_json::from_value(json!({
+            "id": "grant-1",
+            "status": "pending",
+            "scopes": "transition:generic",
+        }))
+        .unwrap();
+        assert_eq!(info.did, None);
+        assert_eq!(info.handle, None);
+        assert_eq!(info.reason, None);
+
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(value.get("did").is_none());
+        assert!(value.get("handle").is_none());
+        assert!(value.get("reason").is_none());
+    }
+
+    #[test]
+    fn linked_repo_record_create_omits_absent_rkey() {
+        let create: LinkedRepoRecordCreate = serde_json::from_value(json!({
+            "did": "did:plc:abc",
+            "collection": "app.bsky.feed.post",
+            "record": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(create.rkey, None);
+
+        let value = serde_json::to_value(&create).unwrap();
+        assert!(value.get("rkey").is_none());
+
+        let with_rkey = LinkedRepoRecordCreate {
+            did: "did:plc:abc".to_string(),
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: Some("abc123".to_string()),
+            record: json!({"text": "hi"}),
+        };
+        let value = serde_json::to_value(&with_rkey).unwrap();
+        assert_eq!(value["rkey"], "abc123");
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoRecordCreate>(value).unwrap(),
+            with_rkey
+        );
+    }
+
+    #[test]
+    fn linked_repo_record_put_omits_absent_swap_cid() {
+        let put: LinkedRepoRecordPut = serde_json::from_value(json!({
+            "did": "did:plc:abc",
+            "collection": "app.bsky.feed.post",
+            "rkey": "abc123",
+            "record": {"text": "hi"},
+        }))
+        .unwrap();
+        assert_eq!(put.swap_cid, None);
+
+        let value = serde_json::to_value(&put).unwrap();
+        assert!(value.get("swap_cid").is_none());
+
+        let with_swap = LinkedRepoRecordPut {
+            did: "did:plc:abc".to_string(),
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: "abc123".to_string(),
+            record: json!({"text": "hi"}),
+            swap_cid: Some("bafy123".to_string()),
+        };
+        let value = serde_json::to_value(&with_swap).unwrap();
+        assert_eq!(value["swap_cid"], "bafy123");
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoRecordPut>(value).unwrap(),
+            with_swap
+        );
+    }
+
+    #[test]
+    fn linked_repo_record_delete_round_trips() {
+        let delete = LinkedRepoRecordDelete {
+            did: "did:plc:abc".to_string(),
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: "abc123".to_string(),
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(value["did"], "did:plc:abc");
+        assert_eq!(value["rkey"], "abc123");
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoRecordDelete>(value).unwrap(),
+            delete
+        );
+    }
+
+    #[test]
+    fn linked_repo_blob_upload_bytes_travel_like_an_http_body() {
+        // A UTF-8 payload serializes as a JSON string...
+        let text = LinkedRepoBlobUpload {
+            did: "did:plc:abc".to_string(),
+            bytes: b"hello".to_vec(),
+            mime_type: "text/plain".to_string(),
+        };
+        let value = serde_json::to_value(&text).unwrap();
+        assert_eq!(value["bytes"], json!("hello"));
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoBlobUpload>(value).unwrap(),
+            text
+        );
+
+        // ...and a non-UTF-8 payload serializes as a byte array, both ways.
+        let binary = LinkedRepoBlobUpload {
+            did: "did:plc:abc".to_string(),
+            bytes: vec![0xff, 0xfe],
+            mime_type: "image/png".to_string(),
+        };
+        let value = serde_json::to_value(&binary).unwrap();
+        assert_eq!(value["bytes"], json!([255, 254]));
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoBlobUpload>(value).unwrap(),
+            binary
+        );
+
+        // A caller may also send a byte array for text content.
+        let from_array: LinkedRepoBlobUpload = serde_json::from_value(json!({
+            "did": "did:plc:abc",
+            "bytes": [104, 105],
+            "mime_type": "text/plain",
+        }))
+        .unwrap();
+        assert_eq!(from_array.bytes, b"hi");
+    }
+
+    #[test]
+    fn linked_repo_call_omits_absent_params_and_input() {
+        let call: LinkedRepoCall = serde_json::from_value(json!({
+            "did": "did:plc:abc",
+            "method": "com.atproto.repo.describeRepo",
+        }))
+        .unwrap();
+        assert_eq!(call.params, None);
+        assert_eq!(call.input, None);
+
+        let value = serde_json::to_value(&call).unwrap();
+        assert!(value.get("params").is_none());
+        assert!(value.get("input").is_none());
+    }
+
+    #[test]
+    fn linked_repo_call_round_trips_with_params_and_input_set() {
+        let call = LinkedRepoCall {
+            did: "did:plc:abc".to_string(),
+            method: "com.atproto.repo.createRecord".to_string(),
+            params: Some(json!({"foo": "bar"})),
+            input: Some(json!({"collection": "app.bsky.feed.post"})),
+        };
+        let value = serde_json::to_value(&call).unwrap();
+        assert_eq!(value["params"]["foo"], "bar");
+        assert_eq!(value["input"]["collection"], "app.bsky.feed.post");
+        assert_eq!(
+            serde_json::from_value::<LinkedRepoCall>(value).unwrap(),
+            call
+        );
+    }
+}
+
+#[cfg(test)]
+mod jobs_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use serde_json::json;
+
+    #[test]
+    fn job_create_defaults_input_and_auth_when_absent() {
+        let create: JobCreate = serde_json::from_value(json!({
+            "job_type": "example.sync",
+        }))
+        .unwrap();
+        assert_eq!(create.input, Value::Null);
+        assert!(!create.auth);
+    }
+
+    #[test]
+    fn job_create_round_trips_with_every_field_set() {
+        let create = JobCreate {
+            job_type: "example.sync".to_string(),
+            input: json!({"n": 1}),
+            auth: true,
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["job_type"], "example.sync");
+        assert_eq!(value["input"]["n"], 1);
+        assert_eq!(value["auth"], true);
+        assert_eq!(serde_json::from_value::<JobCreate>(value).unwrap(), create);
     }
 }

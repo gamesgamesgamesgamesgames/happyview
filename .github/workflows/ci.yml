@@ -205,6 +205,9 @@ jobs:
       - name: Build SDK atproto fixture
         run: cargo build --manifest-path tests/fixtures/sdk_atproto/Cargo.toml --target wasm32-unknown-unknown --release
 
+      - name: Build SDK linked repos fixture
+        run: cargo build --manifest-path tests/fixtures/sdk_linked_repos/Cargo.toml --target wasm32-unknown-unknown --release
+
       - name: Run plugin SDK tests
         run: cargo test -p happyview-plugin-sdk
 

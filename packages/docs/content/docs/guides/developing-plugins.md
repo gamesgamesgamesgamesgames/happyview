@@ -329,6 +329,8 @@ Every host function except `host_log` is gated by a capability. The loader reads
 | `records:write` | High | Write to this instance's record index directly, bypassing the network. This can replace the body of a record that arrived from the network while its CID and indexed time stay as the network set them. |
 | `atproto:read` | Medium | Resolve any DID's service endpoints, download blobs from any repo on the network, look up labels applied to any URI, and verify this instance's attestation signatures. |
 | `attest:sign` | High | Sign records with this instance's attestation key, producing a signature that asserts this instance vouches for the content. |
+| `linked_repos:use` | High | Write records and upload blobs through any repo an admin has linked to this instance, within the scopes that admin granted, and call any XRPC method through it, which only that repo's PDS constrains. |
+| `jobs:create` | Medium | Enqueue background jobs as the user who ran the script, optionally carrying that user's PDS session into the job. |
 
 `network:request` and `network:request:unrestricted` are mutually exclusive — declare one or the other, never both. `network:request` requires a non-empty `allowed_hosts`; `network:request:unrestricted` requires `allowed_hosts` to be empty. `allowed_hosts` entries are bare hostnames, optionally prefixed `*.` to allow subdomains — no scheme, path, port, or whitespace:
 
@@ -376,6 +378,26 @@ A plugin declaring `atproto:read` or `attest:sign` can import the matching funct
 | `host_labels_get`              | `atproto:read` | `{uris}` → a map of URI to `[{src, uri, val, cts}]`, every requested URI present |
 | `host_attest_sign`             | `attest:sign`  | `{record}` → the signature object just added to it, signed as `ctx.caller_did` |
 | `host_attest_verify`           | `atproto:read` | `{record, signature, repo_did}` → boolean |
+
+### Linked repos and jobs
+
+A plugin declaring `linked_repos:use` or `jobs:create` can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope:
+
+| Import | Capability | Spec → result |
+| --------------------------------- | ------------------- | ------------------------------------------------------------------------------- |
+| `host_linked_repos_list`          | `linked_repos:use`  | `{}` → array of `{id, did, handle, reason, status, scopes}` |
+| `host_linked_repo_create_record`  | `linked_repos:use`  | `{did, collection, rkey?, record}` → `{uri, cid}` |
+| `host_linked_repo_put_record`     | `linked_repos:use`  | `{did, collection, rkey, record, swap_cid?}` → `{uri, cid}` |
+| `host_linked_repo_delete_record`  | `linked_repos:use`  | `{did, collection, rkey}` → nothing |
+| `host_linked_repo_upload_blob`    | `linked_repos:use`  | `{did, bytes, mime_type}` → the PDS's blob reference |
+| `host_linked_repo_call`           | `linked_repos:use`  | `{did, method, params?, input?}` → the response |
+| `host_jobs_create`                | `jobs:create`       | `{job_type, input, auth}` → the job id |
+
+Every import needs no caller session, except `host_jobs_create` with `auth` set, which requires the runner to hold a DPoP session.
+
+Errors reaching the guest: linked repos imports use `NOT_LINKED` (no grant for that DID), `SCOPE` (the grant's scopes don't cover the write), `NEEDS_REAUTH` (the grant needs re-authorization), `PDS_ERROR`, `FORBIDDEN`, `BAD_INPUT`, and `HOST_ERROR`. `host_jobs_create` uses `BAD_INPUT` (an invalid or reserved job type, or a call with no caller DID), `NO_SESSION` (`auth` set on a runner with no DPoP session), `FORBIDDEN`, and `HOST_ERROR`.
+
+`host_linked_repo_call` has no scope pre-check; the PDS enforces the token's actual scope.
 
 ### Using a library from Lua
 
