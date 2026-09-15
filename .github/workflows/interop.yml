@@ -61,9 +61,6 @@ jobs:
       candidate: ${{ steps.plan.outputs.candidate }}
     steps:
       - uses: actions/checkout@v7
-
-      # Dispatch payloads come from outside this repository. Everything in one
-      # is checked against a strict shape before it reaches a shell or a file.
       - name: Plan
         id: plan
         env:
@@ -132,8 +129,6 @@ jobs:
       SUITE: ${{ matrix.suite.test }}
       IMAGE_ENV: ${{ matrix.suite.env }}
       IMAGE: ${{ matrix.suite.image }}
-      # The suites talk to the stack, not a database, and a debug build with no
-      # debuginfo keeps target/ inside the runner's disk.
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
@@ -148,7 +143,7 @@ jobs:
         with:
           shared-key: interop
 
-      # Compiled before the stack starts, so a slow build does not eat into the
+      # Compiled before the stack starts, so a slow build doesn't eat into the
       # time the containers have been up.
       - name: Build the suite
         run: cargo test --test "$SUITE" --no-run
@@ -174,6 +169,7 @@ jobs:
         if: failure()
         run: |
           export "$IMAGE_ENV=$IMAGE"
+          mkdir -p interop-logs
           docker compose --env-file interop/images.env -f "$COMPOSE" logs >interop-logs/containers.log 2>&1 || true
           tail -n 200 interop-logs/containers.log
 
@@ -224,12 +220,7 @@ jobs:
 
       - uses: peter-evans/create-pull-request@v8
         with:
-          # INTEROP_PR_TOKEN so CI runs on the pull request: GitHub does not
-          # trigger workflows from events GITHUB_TOKEN creates. A classic token
-          # with `public_repo` is enough while this repository is public.
           token: ${{ secrets.INTEROP_PR_TOKEN || secrets.GITHUB_TOKEN }}
-          # One rolling branch per target: a newer passing image replaces an
-          # unmerged older one instead of queueing behind it.
           branch: interop/pin-${{ steps.pin.outputs.target }}
           commit-message: "chore(interop): pin ${{ steps.pin.outputs.target }} to its newest passing image"
           title: "chore(interop): pin ${{ steps.pin.outputs.target }} to its newest passing image"
@@ -280,7 +271,7 @@ jobs:
           merge-multiple: true
 
       # One open issue per target, commented on as new failing images arrive,
-      # so a PDS that stays broken is one thread rather than one issue a night.
+      # so a PDS that stays broken is one thread rather than a new issue every night.
       - name: Open or update the issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
