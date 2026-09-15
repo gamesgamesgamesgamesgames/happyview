@@ -2,6 +2,7 @@ import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
+import type { ResolvedIdentity } from "@/types/identity";
 import type {
   BackfillJob,
   BackfillReposResponse,
@@ -242,7 +243,7 @@ export function getBackfillJobs() {
   return apiFetch<BackfillJob[]>("/admin/backfill/status");
 }
 
-export function createBackfillJob(body: { collection?: string; did?: string }) {
+export function createBackfillJob(body: { collection?: string; dids?: string[] }) {
   return apiFetch<{ id: string; status: string }>("/admin/backfill", {
     method: "POST",
     body: JSON.stringify(body),
@@ -456,6 +457,11 @@ export function addUser(body: {
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+export function resolveIdentity(identifier: string) {
+  const qs = new URLSearchParams({ identifier }).toString();
+  return apiFetch<ResolvedIdentity>(`/admin/identity/resolve?${qs}`);
 }
 
 export function deleteUser(id: string) {
@@ -1323,7 +1329,7 @@ export interface ResolveResult {
   avatar: string | null;
 }
 
-export function resolveIdentity(q: string) {
+export function resolveSetupIdentity(q: string) {
   return apiFetch<ResolveResult[]>(
     `/api/setup/resolve?q=${encodeURIComponent(q)}`,
   );

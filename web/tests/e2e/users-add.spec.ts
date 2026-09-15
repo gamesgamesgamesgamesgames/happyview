@@ -20,16 +20,41 @@ async function openAddUserDialog(page: import("@playwright/test").Page) {
   await expect(page.getByRole("heading", { name: "Add User" })).toBeVisible();
 }
 
+/**
+ * Synthetic DIDs have no DID document, so the real resolve endpoint refuses
+ * them. Handles fall through to the server so resolution failures stay real.
+ */
+async function mockSyntheticDidResolution(page: import("@playwright/test").Page) {
+  await page.route("**/admin/identity/resolve?**", (route) => {
+    const identifier = new URL(route.request().url()).searchParams.get("identifier");
+    if (identifier?.startsWith("did:plc:e2e")) {
+      return route.fulfill({ json: { did: identifier, handle: null } });
+    }
+    return route.continue();
+  });
+}
+
+async function enterIdentifier(
+  page: import("@playwright/test").Page,
+  identifier: string,
+) {
+  const input = page.getByLabel("Handle or DID");
+  await input.fill(identifier);
+  await input.press("Enter");
+}
+
 async function submitIdentifier(
   page: import("@playwright/test").Page,
   identifier: string,
 ) {
-  await page.getByLabel("Handle or DID").fill(identifier);
+  await enterIdentifier(page, identifier);
+  await expect(page.locator('[data-status="resolved"]')).toHaveCount(1);
   await page.getByRole("button", { name: "Add", exact: true }).click();
 }
 
 test.describe("Add User", () => {
   test.beforeEach(async ({ page }) => {
+    await mockSyntheticDidResolution(page);
     await loginAsTestAdmin(page);
     await page.goto("/dashboard/settings/users");
   });
@@ -52,7 +77,12 @@ test.describe("Add User", () => {
     await submitIdentifier(page, did);
 
     await expect(page.getByText("User added")).toBeVisible();
-    await expect(page.getByText(did, { exact: true })).toBeVisible();
+
+    // Scoped to the table: the dialog's closing animation can briefly leave
+    // its own account chip, which shows the same DID, still in the DOM.
+    await expect(
+      page.locator("table").getByText(did, { exact: true }),
+    ).toBeVisible();
   });
 
   test("a handle that cannot be resolved is refused, and no user is created", async ({
@@ -64,14 +94,23 @@ test.describe("Add User", () => {
     const handle = "nonexistent-handle.invalid";
 
     await openAddUserDialog(page);
-    await submitIdentifier(page, handle);
+    await enterIdentifier(page, handle);
 
-    await expect(page.getByText("Failed to add user")).toBeVisible();
+    // Resolution happens as the account is entered, so the refusal shows
+    // on the tag and the dialog cannot submit it.
+    await expect(page.locator('[data-status="error"]')).toHaveCount(1);
+    await expect(page.getByRole("button", { name: "Add", exact: true })).toBeDisabled();
 
-    // The regression itself: before the fix this row existed, listing the
-    // handle where a DID belongs, and the account could never sign in.
+    await page.keyboard.press("Escape");
     await page.reload();
     await expect(page.getByText(handle, { exact: true })).toHaveCount(0);
+  });
+
+  test("only one account can be entered", async ({ page }) => {
+    await openAddUserDialog(page);
+    await enterIdentifier(page, `did:plc:e2esingle${Date.now()}`);
+    await expect(page.locator('[data-status="resolved"]')).toHaveCount(1);
+    await expect(page.getByLabel("Handle or DID")).toBeHidden();
   });
 
   test("adding the same account twice reports a conflict rather than a server error", async ({

@@ -33,6 +33,7 @@ export default defineConfig({
         "lexicon-delete.spec.ts",
         "lexicon-id-validation.spec.ts",
         "lexicon-backfill.spec.ts",
+        "backfill-accounts.spec.ts",
         "script-delete.spec.ts",
         "script-job.spec.ts",
         "script-unload-guard.spec.ts",
