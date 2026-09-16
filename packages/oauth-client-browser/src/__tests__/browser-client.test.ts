@@ -153,6 +153,12 @@ function mockFetchForFullFlow() {
   });
 }
 
+function decodeJwtPart(jwt: string, index: 0 | 1): any {
+  const part = jwt.split(".")[index];
+  const padded = part + "=".repeat((4 - (part.length % 4)) % 4);
+  return JSON.parse(atob(padded.replace(/-/g, "+").replace(/_/g, "/")));
+}
+
 describe("HappyViewBrowserClient", () => {
   test("constructor sets up LocalStorageAdapter by default", () => {
     const client = new HappyViewBrowserClient({
@@ -256,6 +262,107 @@ describe("HappyViewBrowserClient", () => {
     );
     const body = (parCall![1] as RequestInit).body as URLSearchParams;
     expect(body.get("dpop_jkt")).toBe("caller-supplied");
+  });
+
+  test("prepareLogin proves possession of the DPoP key on the PAR request", async () => {
+    // `dpop_jkt` alone only promises which key will turn up later; servers that
+    // enforce DPoP on PAR want the proof itself.
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.prepareLogin("user.bsky.social");
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    const proof = new Headers((parCall![1] as RequestInit).headers).get("dpop")!;
+    expect(proof).toBeDefined();
+
+    const header = decodeJwtPart(proof, 0);
+    const payload = decodeJwtPart(proof, 1);
+    expect(header.typ).toBe("dpop+jwt");
+    expect(await jwkThumbprint(header.jwk)).toBe(await jwkThumbprint(testJwk));
+    expect(payload.htm).toBe("POST");
+    expect(payload.htu).toBe("https://pds.example.com/oauth/par");
+    expect(payload.nonce).toBeUndefined();
+  });
+
+  test("prepareLogin omits the PAR proof when the caller binds a key of their own", async () => {
+    // A caller-supplied `dpop_jkt` names a key this client cannot sign with, and
+    // RFC 9449 §10.1 requires the two bindings to agree when both are sent.
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.prepareLogin("user.bsky.social", {
+      dpop_jkt: "caller-supplied",
+    });
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    expect(new Headers((parCall![1] as RequestInit).headers).get("dpop")).toBe(
+      null,
+    );
+  });
+
+  test("prepareLogin retries the PAR request with the nonce the server demands", async () => {
+    let parAttempt = 0;
+    const inner = mockFetchForFullFlow();
+    const fetchFn = mock(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.includes("/oauth/par")) {
+          parAttempt++;
+          if (parAttempt === 1) {
+            return new Response(JSON.stringify({ error: "use_dpop_nonce" }), {
+              status: 400,
+              headers: { "dpop-nonce": "par-nonce-123" },
+            });
+          }
+        }
+        return inner(input, init);
+      },
+    );
+    const client = createClient(fetchFn as unknown as typeof globalThis.fetch);
+
+    const { authorizationUrl } = await client.prepareLogin("user.bsky.social");
+
+    expect(parAttempt).toBe(2);
+    expect(authorizationUrl).toContain("request_uri");
+
+    const retryCall = fetchFn.mock.calls.filter((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    )[1];
+    const proof = new Headers((retryCall![1] as RequestInit).headers).get(
+      "dpop",
+    )!;
+    expect(decodeJwtPart(proof, 1).nonce).toBe("par-nonce-123");
+  });
+
+  test("prepareLogin stops retrying PAR after a bounded number of nonce challenges", async () => {
+    // A server that answers every proof with a fresh challenge must not spin
+    // this loop forever.
+    let parAttempt = 0;
+    const inner = mockFetchForFullFlow();
+    const fetchFn = mock(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.includes("/oauth/par")) {
+          parAttempt++;
+          return new Response(JSON.stringify({ error: "use_dpop_nonce" }), {
+            status: 400,
+            headers: { "dpop-nonce": `par-nonce-${parAttempt}` },
+          });
+        }
+        return inner(input, init);
+      },
+    );
+    const client = createClient(fetchFn as unknown as typeof globalThis.fetch);
+
+    await expect(client.prepareLogin("user.bsky.social")).rejects.toThrow(
+      /PAR request failed/,
+    );
+    expect(parAttempt).toBe(2);
   });
 
   test("prepareLogin binds the direct authorization URL when the server has no PAR endpoint", async () => {

@@ -211,10 +211,8 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     // (https://atproto.com/blog/oauth-improvements#deprecation-notice) and other
     // implementations reject the request outright. A caller-supplied `dpop_jkt`
     // still wins, for anyone driving the key themselves.
-    authParams.set(
-      "dpop_jkt",
-      options?.dpop_jkt ?? (await jwkThumbprint(rawJwk)),
-    );
+    const provisionedJkt = await jwkThumbprint(rawJwk);
+    authParams.set("dpop_jkt", options?.dpop_jkt ?? provisionedJkt);
     if (options?.id_token_hint)
       authParams.set("id_token_hint", options.id_token_hint);
     if (options?.claims)
@@ -238,13 +236,42 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     // ATProto requires Pushed Authorization Requests (PAR)
     const parEndpoint = authMeta.pushed_authorization_request_endpoint;
     if (parEndpoint) {
-      const parResp = await this._fetch(parEndpoint, {
-        method: "POST",
-        headers: {
+      const signProof =
+        authParams.get("dpop_jkt") === provisionedJkt
+          ? await buildProofSigner(rawJwk, parEndpoint)
+          : undefined;
+
+      let dpopNonce: string | undefined;
+      let parResp!: Response;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const headers: Record<string, string> = {
           "content-type": "application/x-www-form-urlencoded",
-        },
-        body: authParams,
-      });
+        };
+        if (signProof) headers.dpop = await signProof(dpopNonce);
+
+        parResp = await this._fetch(parEndpoint, {
+          method: "POST",
+          headers,
+          body: authParams,
+        });
+
+        if (!parResp.ok && attempt === 0 && signProof) {
+          const nonceHeader = parResp.headers.get("dpop-nonce");
+          if (nonceHeader) {
+            const errorBody = await parResp.text();
+            if (errorBody.includes("use_dpop_nonce")) {
+              dpopNonce = nonceHeader;
+              continue;
+            }
+            throw new ResolutionError(
+              `PAR request failed: ${parResp.status} ${errorBody}`,
+            );
+          }
+        }
+
+        break;
+      }
 
       if (!parResp.ok) {
         const err = await parResp.text();
@@ -305,8 +332,10 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     const pending: PendingAuthState = JSON.parse(pendingJson);
 
     try {
-      const dpopKey = await importJwk(pending.rawJwk);
-      const { d: _, ...publicJwk } = pending.rawJwk;
+      const signProof = await buildProofSigner(
+        pending.rawJwk,
+        pending.tokenEndpoint,
+      );
 
       const { clientId, redirectUri } = this.resolveOAuthEndpoints();
 
@@ -314,20 +343,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
       let tokenResp!: Response;
 
       for (let attempt = 0; attempt < 2; attempt++) {
-        const proof = await dpopKey.createJwt(
-          {
-            alg: "ES256",
-            typ: "dpop+jwt",
-            jwk: publicJwk as any,
-          },
-          {
-            htm: "POST",
-            htu: pending.tokenEndpoint,
-            iat: Math.floor(Date.now() / 1000),
-            jti: randomHex(16),
-            ...(dpopNonce ? { nonce: dpopNonce } : {}),
-          },
-        );
+        const proof = await signProof(dpopNonce);
 
         const requestBody = new URLSearchParams({
           grant_type: "authorization_code",
@@ -643,6 +659,31 @@ function extractPdsUrl(doc: DidDocument): string {
   throw new ResolutionError(
     `No #atproto_pds service found in DID document for ${doc.id}`,
   );
+}
+
+async function buildProofSigner(
+  rawJwk: JsonWebKey,
+  endpoint: string,
+): Promise<(nonce?: string) => Promise<string>> {
+  const dpopKey = await importJwk(rawJwk);
+  const { d: _, ...publicJwk } = rawJwk;
+  const htu = endpoint.split("?")[0];
+
+  return (nonce?: string) =>
+    dpopKey.createJwt(
+      {
+        alg: "ES256",
+        typ: "dpop+jwt",
+        jwk: publicJwk as any,
+      },
+      {
+        htm: "POST",
+        htu,
+        iat: Math.floor(Date.now() / 1000),
+        jti: randomHex(16),
+        ...(nonce ? { nonce } : {}),
+      },
+    );
 }
 
 function randomHex(byteLength: number): string {
