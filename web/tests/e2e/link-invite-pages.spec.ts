@@ -84,6 +84,13 @@ test.describe("Linked Repos — invitee-facing pages", () => {
     await expect(page.getByText(TEST_NSID).first()).toBeVisible({
       timeout: 10000,
     })
+    // And translate the actions into prose. Repo actions are repeated `action=`
+    // parameters, so a parser that splits the query on commas leaves the raw
+    // `&action=update` glued to the verb — readable-looking, but garbage.
+    await expect(page.getByText("Create and update")).toBeVisible()
+    // Case-sensitive: the raw scope legitimately contains `create&action=`, so
+    // only the capitalized form is evidence of the verb phrase being mangled.
+    await expect(page.getByText(/Create&action=/)).toHaveCount(0)
     // The admin's stated reason is shown.
     await expect(page.getByText("Mirror published notes")).toBeVisible()
     // The grant is open, so it must ask which account to link.
