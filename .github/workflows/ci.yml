@@ -27,6 +27,10 @@ on:
         description: "Build lex-agent"
         type: boolean
         default: false
+      nsid:
+        description: "Build nsid"
+        type: boolean
+        default: false
   delete:
 
 env:
@@ -49,14 +53,16 @@ jobs:
       oauth-client-browser: ${{ steps.filter.outputs.oauth-client-browser }}
       oauth-client-node: ${{ steps.filter.outputs.oauth-client-node }}
       lex-agent: ${{ steps.filter.outputs.lex-agent }}
+      nsid: ${{ steps.filter.outputs.nsid }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Detect changed paths
         id: filter
         uses: dorny/paths-filter@v4
         with:
+          base: ${{ github.ref }}
           filters: |
             server:
               - 'src/**'
@@ -64,6 +70,7 @@ jobs:
               - 'migrations/**'
               - 'tests/**'
               - 'Cargo.*'
+              - 'crates/**'
               - 'Dockerfile'
               - 'docker-compose*'
               - 'entrypoint.sh'
@@ -79,6 +86,9 @@ jobs:
             lex-agent:
               - 'packages/oauth-client/**'
               - 'packages/lex-agent/**'
+            nsid:
+              - 'crates/happyview-nsid/**'
+              - 'packages/nsid/**'
 
   # ---------------------------------------------------------------------------
   # Server — unit tests, e2e tests, frontend build, lint
@@ -93,32 +103,23 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-release-amd64-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-release-amd64-
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Build release binary
-        run: |
-          docker run --rm \
-            -v "$PWD:/app" \
-            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
-            -v "$HOME/.cargo/git:/usr/local/cargo/git" \
-            -w /app \
-            -e SQLX_OFFLINE=true \
-            rust:1.96.1-bookworm \
-            cargo build --release
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: binary
+          platforms: linux/amd64
+          cache-from: type=gha,scope=builder-linux/amd64
+          cache-to: type=gha,scope=builder-linux/amd64,mode=max,ignore-error=true
+          outputs: type=local,dest=.
 
       - name: Upload server binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: happyview-server
           path: target/release/happyview
@@ -130,21 +131,18 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Cache cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
+          shared-key: test
 
       - name: Run unit tests
         run: cargo test --lib
+
+      - name: Run crate tests
+        run: cargo test --workspace --exclude happyview
 
   e2e-tests:
     needs: changes
@@ -167,18 +165,12 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Cache cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
+          shared-key: test
 
       # Reclaim ~20 GB of preinstalled tooling the Rust build never uses. The
       # e2e build (all test binaries in debug) plus the restored target cache
@@ -219,10 +211,10 @@ jobs:
     runs-on: depot-ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 
@@ -236,24 +228,18 @@ jobs:
     runs-on: depot-ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Cache cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-lint-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-lint-${{ runner.os }}-
+          shared-key: lint
 
       - name: Check formatting
         run: cargo fmt -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   audit:
     needs: changes
@@ -261,7 +247,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -281,12 +267,15 @@ jobs:
       && needs.frontend.result == 'success'
       && needs.build-server.result == 'success'
     runs-on: depot-ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 
@@ -299,23 +288,30 @@ jobs:
         run: npx playwright install chromium --with-deps
 
       - name: Download server binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: happyview-server
           path: .builder-override/app/target/release
 
-      - name: Log in to ATCR
-        run: echo "${{ secrets.ATCR_PASSWORD }}" | docker login atcr.io -u "${{ secrets.ATCR_USERNAME }}" --password-stdin
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Start E2E services
         run: docker compose -f docker-compose.e2e.yml -f docker-compose.e2e.ci.yml up -d --build --wait
         timeout-minutes: 10
 
+      - name: Log resolved Tranquil PDS image
+        run: |
+          docker image inspect ghcr.io/happyproto/pds-test/tranquil:latest \
+            --format 'tranquil-pds resolved to {{.RepoTags}} digest {{.RepoDigests}}'
+
       - name: Run Playwright tests
         working-directory: web
         run: npx playwright test
-        env:
-          PLAYWRIGHT_BASE_URL: http://127.0.0.1:3200
 
       - name: Dump container logs
         if: failure()
@@ -323,7 +319,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: web/playwright-report/
@@ -335,6 +331,10 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # PR builds — compile + Docker on every PR push so reviewers can test
+  #
+  # This job only builds. Fork PRs get a read-only token, so the image is
+  # exported as an artifact and `pr-images.yml` pushes it to GHCR and comments
+  # on the PR from the base repository's context.
   # ---------------------------------------------------------------------------
   pr-build:
     needs: [changes, build-server]
@@ -345,7 +345,6 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: read
-      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -360,41 +359,31 @@ jobs:
       GHCR_IMAGE: ghcr.io/${{ github.repository }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download server binary (amd64)
         if: matrix.arch == 'amd64'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: happyview-server
           path: target/release
 
-      - name: Cache cargo (arm64)
-        if: matrix.arch != 'amd64'
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-release-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-release-${{ matrix.arch }}-
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Build release binary (arm64)
         if: matrix.arch != 'amd64'
-        run: |
-          docker run --rm \
-            -v "$PWD:/app" \
-            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
-            -v "$HOME/.cargo/git:/usr/local/cargo/git" \
-            -w /app \
-            -e SQLX_OFFLINE=true \
-            rust:1.96.1-bookworm \
-            cargo build --release
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: binary
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=builder-${{ matrix.platform }}
+          cache-to: type=gha,scope=builder-${{ matrix.platform }},mode=max,ignore-error=true
+          outputs: type=local,dest=.
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: happyview-linux-${{ matrix.arch }}
           path: target/release/happyview
@@ -404,27 +393,14 @@ jobs:
           mkdir -p .builder-override/app/target/release
           cp target/release/happyview .builder-override/app/target/release/happyview
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.GHCR_IMAGE }}
-          tags: |
-            type=raw,value=pr-${{ github.event.pull_request.number }}
 
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v5
+      - name: Build image
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -433,71 +409,32 @@ jobs:
             builder=.builder-override
           cache-from: type=gha,scope=pr-${{ matrix.platform }}
           cache-to: type=gha,scope=pr-${{ matrix.platform }},mode=max,ignore-error=true
-          outputs: type=image,"name=${{ env.GHCR_IMAGE }}",push-by-digest=true,name-canonical=true,push=true
+          # The docker exporter can't carry attestations.
+          provenance: false
+          outputs: type=docker,name=happyview-pr:${{ matrix.arch }},dest=happyview-image-${{ matrix.arch }}.tar
 
-      - name: Create manifest
-        run: |
-          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}')
-          docker buildx imagetools create --append $TAGS \
-            ${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }} 2>/dev/null || \
-          docker buildx imagetools create $TAGS \
-            ${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}
+      - name: Upload image
+        uses: actions/upload-artifact@v7
+        with:
+          name: happyview-image-${{ matrix.arch }}
+          path: happyview-image-${{ matrix.arch }}.tar
+          retention-days: 7
 
-  pr-build-comment:
+  pr-build-metadata:
     needs: pr-build
     runs-on: depot-ubuntu-24.04
-    permissions:
-      pull-requests: write
     steps:
-      - name: Comment on PR
-        uses: actions/github-script@v7
+      - name: Record PR number
+        # `workflow_run` payloads omit the PR for forks, so pr-images.yml reads
+        # it from here and verifies it against the PR's head SHA.
+        run: echo "${{ github.event.pull_request.number }}" > pr-number
+
+      - name: Upload PR metadata
+        uses: actions/upload-artifact@v7
         with:
-          script: |
-            const sha = context.payload.pull_request.head.sha.substring(0, 7);
-            const prNumber = context.payload.pull_request.number;
-            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const image = `ghcr.io/${context.repo.owner}/${context.repo.repo}`;
-            const body = [
-              '### PR Build',
-              '',
-              `Builds for \`${sha}\`:`,
-              '',
-              '**Docker**',
-              '```sh',
-              `docker pull ${image}:pr-${prNumber}`,
-              '```',
-              '',
-              '**Binaries**',
-              '```sh',
-              `gh run download ${context.runId} -n happyview-linux-amd64`,
-              `gh run download ${context.runId} -n happyview-linux-arm64`,
-              '```',
-              '',
-              `Or download binaries from the [workflow run](${runUrl}).`,
-            ].join('\n');
-
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const existing = comments.find(c => c.body.startsWith('### PR Build'));
-
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }
+          name: pr-build-metadata
+          path: pr-number
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # Server release
@@ -520,12 +457,12 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -561,30 +498,22 @@ jobs:
       ATCR_IMAGE: atcr.io/${{ secrets.ATCR_NAMESPACE }}/happyview
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-release-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-release-${{ matrix.arch }}-
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Build release binary
-        run: |
-          docker run --rm \
-            -v "$PWD:/app" \
-            -v "$HOME/.cargo/registry:/usr/local/cargo/registry" \
-            -v "$HOME/.cargo/git:/usr/local/cargo/git" \
-            -w /app \
-            -e SQLX_OFFLINE=true \
-            -e HAPPYVIEW_VERSION="v${{ needs.release.outputs.version }}" \
-            rust:1.96.1-bookworm \
-            cargo build --release
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: binary
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            HAPPYVIEW_VERSION=v${{ needs.release.outputs.version }}
+          cache-from: type=gha,scope=builder-${{ matrix.platform }}
+          cache-to: type=gha,scope=builder-${{ matrix.platform }},mode=max,ignore-error=true
+          outputs: type=local,dest=.
 
       - name: Upload binary to release
         env:
@@ -600,11 +529,8 @@ jobs:
           mkdir -p .builder-override/app/target/release
           cp target/release/happyview .builder-override/app/target/release/happyview
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -612,7 +538,7 @@ jobs:
 
       # TODO: Re-enable once ATCR rate limit issue is resolved
       # - name: Log in to ATCR
-      #   uses: docker/login-action@v3
+      #   uses: docker/login-action@v4
       #   with:
       #     registry: atcr.io
       #     username: ${{ secrets.ATCR_USERNAME }}
@@ -625,25 +551,32 @@ jobs:
           MAJOR="${VERSION%%.*}"
           MINOR="${VERSION#*.}"
           MINOR="${MINOR%%.*}"
+          # A `-` suffix means semantic-release cut this from `dev` (e.g. 2.13.0-dev.1).
+          # Prereleases must never move the stable moving tags.
+          case "$VERSION" in
+            *-*) PRERELEASE=true ;;
+            *)   PRERELEASE=false ;;
+          esac
           echo "full=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "major=${MAJOR}" >> "$GITHUB_OUTPUT"
           echo "major_minor=${MAJOR}.${MINOR}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
 
       - name: Extract GHCR metadata
         id: meta-ghcr
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.GHCR_IMAGE }}
           tags: |
             type=raw,value=${{ steps.version.outputs.full }}
-            type=raw,value=${{ steps.version.outputs.major_minor }}
-            type=raw,value=${{ steps.version.outputs.major }}
+            type=raw,value=${{ steps.version.outputs.major_minor }},enable=${{ steps.version.outputs.prerelease == 'false' }}
+            type=raw,value=${{ steps.version.outputs.major }},enable=${{ steps.version.outputs.prerelease == 'false' }}
             type=sha
 
       # TODO: Re-enable once ATCR rate limit issue is resolved
       # - name: Extract ATCR metadata
       #   id: meta-atcr
-      #   uses: docker/metadata-action@v5
+      #   uses: docker/metadata-action@v6
       #   with:
       #     images: ${{ env.ATCR_IMAGE }}
       #     tags: |
@@ -654,7 +587,7 @@ jobs:
 
       - name: Build and push to GHCR by digest
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -669,7 +602,7 @@ jobs:
       # - name: Push to ATCR by digest
       #   id: build-atcr
       #   continue-on-error: true
-      #   uses: docker/build-push-action@v5
+      #   uses: docker/build-push-action@v7
       #   with:
       #     context: .
       #     platforms: ${{ matrix.platform }}
@@ -701,6 +634,42 @@ jobs:
       #     fi
 
   # ---------------------------------------------------------------------------
+  # `latest` — retag the finished multi-arch manifest.
+  #
+  # Deliberately not part of `build`'s tag set: those tags are applied per-arch
+  # with `imagetools create --append`, which would append this release's digests
+  # onto whatever index `latest` already points at. `latest` needs no build at
+  # all — once `build` completes, the versioned manifest exists and this is a
+  # single atomic retag of it.
+  #
+  # Skipped for prereleases, since `release` also runs on `dev`.
+  # ---------------------------------------------------------------------------
+  tag-latest:
+    needs: [release, build]
+    if: needs.release.outputs.version != '' && !contains(needs.release.outputs.version, '-')
+    runs-on: depot-ubuntu-24.04
+    permissions:
+      packages: write
+    env:
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point latest at the released version
+        run: |
+          docker buildx imagetools create \
+            -t "${GHCR_IMAGE}:latest" \
+            "${GHCR_IMAGE}:${{ needs.release.outputs.version }}"
+
+  # ---------------------------------------------------------------------------
   # SDK — per-package tests + releases
   # ---------------------------------------------------------------------------
   test-oauth-client:
@@ -709,7 +678,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -732,7 +701,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -758,7 +727,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -784,7 +753,7 @@ jobs:
     runs-on: depot-ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -804,6 +773,29 @@ jobs:
       - name: Test
         run: bun run --filter '@happyview/lex-agent' test
 
+  test-nsid:
+    needs: changes
+    if: always() && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
+    runs-on: depot-ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build
+        run: bun run --filter '@happyview/nsid' build
+
+      - name: Typecheck
+        run: bun run --filter '@happyview/nsid' typecheck
+
+      - name: Test
+        run: bun run --filter '@happyview/nsid' test
+
   release-oauth-client:
     if: >-
       always()
@@ -811,12 +803,13 @@ jobs:
       && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
       && needs.test-oauth-client.result == 'success'
     needs: [changes, test-oauth-client]
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -824,7 +817,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 
@@ -834,13 +827,12 @@ jobs:
       - name: Build oauth-client
         run: bun run --filter '@happyview/oauth-client' build
 
-      - name: Configure npm auth for bun publish
-        run: echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
 
       - name: Release oauth-client
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: packages/oauth-client
         run: npx semantic-release
 
@@ -852,12 +844,13 @@ jobs:
       && needs.test-oauth-client-browser.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
     needs: [changes, test-oauth-client-browser, release-oauth-client]
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -865,7 +858,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 
@@ -892,13 +885,12 @@ jobs:
             }
           "
 
-      - name: Configure npm auth for bun publish
-        run: echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
 
       - name: Release oauth-client-browser
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: packages/oauth-client-browser
         run: npx semantic-release
 
@@ -910,12 +902,13 @@ jobs:
       && needs.test-oauth-client-node.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
     needs: [changes, test-oauth-client-node, release-oauth-client]
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -923,7 +916,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 
@@ -950,13 +943,12 @@ jobs:
             }
           "
 
-      - name: Configure npm auth for bun publish
-        run: echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
 
       - name: Release oauth-client-node
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: packages/oauth-client-node
         run: npx semantic-release
 
@@ -968,12 +960,13 @@ jobs:
       && needs.test-lex-agent.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
     needs: [changes, test-lex-agent, release-oauth-client]
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -981,7 +974,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 
@@ -1008,23 +1001,64 @@ jobs:
             }
           "
 
-      - name: Configure npm auth for bun publish
-        run: echo "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > .npmrc
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
 
       - name: Release lex-agent
         env:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         working-directory: packages/lex-agent
+        run: npx semantic-release
+
+  release-nsid:
+    if: >-
+      always()
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
+      && needs.test-nsid.result == 'success'
+    needs: [changes, test-nsid]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build nsid
+        run: bun run --filter '@happyview/nsid' build
+
+      - name: Ensure npm supports trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Release nsid
+        env:
+          GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
+        working-directory: packages/nsid
         run: npx semantic-release
 
   # ---------------------------------------------------------------------------
   # Mirror to Tangled
   # ---------------------------------------------------------------------------
   mirror:
+    # PRs have nothing to mirror, and fork PRs can't read the SSH key.
+    if: github.event_name != 'pull_request'
     runs-on: depot-ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

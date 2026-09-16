@@ -2,17 +2,40 @@ import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
-import type { BackfillJob, BackfillReposResponse, PdsSummaryResponse } from "@/types/backfill";
+import type { ResolvedIdentity } from "@/types/identity";
+import type {
+  BackfillJob,
+  BackfillReposResponse,
+  PdsSummaryResponse,
+  BackfillErrorsResponse,
+} from "@/types/backfill";
 import type { Job, JobLogsResponse, JobsListResponse } from "@/types/jobs";
+import type {
+  CreateLinkedRepoBody,
+  LinkedRepo,
+  LinkedReposListResponse,
+} from "@/types/linked-repos";
 import type { UserSummary } from "@/types/users";
 import type { AdminListRecordsResponse } from "@/types/records";
 import type { EventsListResponse } from "@/types/events";
 import type { ScriptVariableSummary } from "@/types/script-variables";
-import type { Script, UpsertScriptBody, PatchScriptBody } from "@/types/scripts";
+import type {
+  Script,
+  UpsertScriptBody,
+  PatchScriptBody,
+} from "@/types/scripts";
 import type { LabelerSummary } from "@/types/labelers";
 import type {
   ApiClientSummary,
   CreateApiClientResponse,
+  ApiClientAuthKey,
+  ApiClientAuthProbe,
+  ApiClientAuthKeysResponse,
+  RevokeApiClientAuthKeyResult,
+  RevokeAllApiClientAuthKeysResult,
+  KeyRotationResult,
+  InstanceOauthKeysResponse,
+  RevokeInstanceKeyResult,
 } from "@/types/api-clients";
 import type { SettingEntry } from "@/types/settings";
 import type {
@@ -34,7 +57,20 @@ export type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 export type { CollectionStat, StatsResponse } from "@/types/stats";
 export type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 export type { NetworkLexiconSummary } from "@/types/network-lexicons";
-export type { BackfillJob, BackfillRepoEntry, BackfillReposResponse, PdsSummaryEntry, PdsSummaryResponse, BackfillEvent, BlueskyProfile } from "@/types/backfill";
+export type {
+  BackfillJob,
+  BackfillRepoEntry,
+  BackfillReposResponse,
+  PdsSummaryEntry,
+  PdsSummaryResponse,
+  BackfillEvent,
+  BlueskyProfile,
+} from "@/types/backfill";
+export type {
+  LinkedRepo,
+  LinkedReposListResponse,
+  CreateLinkedRepoBody,
+} from "@/types/linked-repos";
 export type { UserSummary } from "@/types/users";
 export type { AdminRecord, AdminListRecordsResponse } from "@/types/records";
 export type { EventLogEntry, EventsListResponse } from "@/types/events";
@@ -59,6 +95,15 @@ export type { RecordLabel } from "@/types/records";
 export type {
   ApiClientSummary,
   CreateApiClientResponse,
+  ApiClientAuthKey,
+  ApiClientAuthProbe,
+  ApiClientAuthKeysResponse,
+  RevokeApiClientAuthKeyResult,
+  RevokeAllApiClientAuthKeysResult,
+  KeyRotationResult,
+  InstanceOauthKey,
+  InstanceOauthKeysResponse,
+  RevokeInstanceKeyResult,
 } from "@/types/api-clients";
 export type { SettingEntry, InstanceSettings } from "@/types/settings";
 export { INSTANCE_SETTING_KEYS } from "@/types/settings";
@@ -115,7 +160,9 @@ async function apiFetch<T = unknown>(
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
-    } catch { /* not JSON, use raw text */ }
+    } catch {
+      /* not JSON, use raw text */
+    }
     throw new ApiError(res.status, message);
   }
   if (res.status === 204) return null as T;
@@ -166,10 +213,7 @@ export function getNetworkLexicons() {
   return apiFetch<NetworkLexiconSummary[]>("/admin/network-lexicons");
 }
 
-export function resolveNetworkLexicon(
-  nsid: string,
-  signal?: AbortSignal,
-) {
+export function resolveNetworkLexicon(nsid: string, signal?: AbortSignal) {
   return apiFetch<{
     nsid: string;
     authority_did: string;
@@ -199,7 +243,7 @@ export function getBackfillJobs() {
   return apiFetch<BackfillJob[]>("/admin/backfill/status");
 }
 
-export function createBackfillJob(body: { collection?: string; did?: string }) {
+export function createBackfillJob(body: { collection?: string; dids?: string[] }) {
   return apiFetch<{ id: string; status: string }>("/admin/backfill", {
     method: "POST",
     body: JSON.stringify(body),
@@ -242,9 +286,7 @@ export function getBackfillRepos(
 }
 
 export function getBackfillPdsSummary(jobId: string) {
-  return apiFetch<PdsSummaryResponse>(
-    `/admin/backfill/${jobId}/pds-summary`,
-  );
+  return apiFetch<PdsSummaryResponse>(`/admin/backfill/${jobId}/pds-summary`);
 }
 
 export function flushBackfillDetails(jobId: string) {
@@ -255,8 +297,31 @@ export function flushAllBackfillDetails() {
   return apiFetch(`/admin/backfill/details`, { method: "DELETE" });
 }
 
+export function getBackfillErrors(
+  jobId: string,
+  params: { kind?: string; cursor?: string; limit?: number } = {},
+) {
+  const search = new URLSearchParams();
+  if (params.kind) search.set("kind", params.kind);
+  if (params.cursor) search.set("cursor", params.cursor);
+  if (params.limit) search.set("limit", String(params.limit));
+  const qs = search.toString();
+  return apiFetch<BackfillErrorsResponse>(
+    `/admin/backfill/${jobId}/errors${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export function retryFailedBackfill(jobId: string, kinds?: string[]) {
+  return apiFetch<{ id: string }>(`/admin/backfill/${jobId}/retry-failed`, {
+    method: "POST",
+    body: JSON.stringify(kinds ? { kinds } : {}),
+  });
+}
+
 // Jobs
-export function getJobs(params: { status?: string; limit?: number; cursor?: string } = {}) {
+export function getJobs(
+  params: { status?: string; limit?: number; cursor?: string } = {},
+) {
   const qs = new URLSearchParams();
   if (params.status) qs.set("status", params.status);
   if (params.limit) qs.set("limit", String(params.limit));
@@ -300,6 +365,80 @@ export function getJobLogs(
   );
 }
 
+// Linked Repos
+export function getLinkedRepos() {
+  return apiFetch<LinkedReposListResponse>("/admin/linked-repos");
+}
+
+export function createLinkedRepo(body: CreateLinkedRepoBody) {
+  return apiFetch<LinkedRepo>("/admin/linked-repos", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function authorizeLinkedRepo(id: string) {
+  return apiFetch<{ authorize_url: string }>(
+    `/admin/linked-repos/${id}/authorize`,
+    { method: "POST" },
+  );
+}
+
+export function inviteLinkedRepo(id: string) {
+  return apiFetch<{ invite_url: string; expires_at: string }>(
+    `/admin/linked-repos/${id}/invite`,
+    { method: "POST" },
+  );
+}
+
+export function deleteLinkedRepo(id: string) {
+  return apiFetch<{ deleted: boolean }>(`/admin/linked-repos/${id}`, {
+    method: "DELETE",
+  });
+}
+
+// Linked Repos — outstanding invites. `invite_id` is the stored SHA-256 of
+// the token, not the token itself: the actual link is only ever returned
+// once, at mint time, so this list is metadata-only by design.
+export interface LinkedRepoInvite {
+  invite_id: string;
+  expires_at: string;
+}
+
+export interface LinkedRepoInvitesResponse {
+  invites: LinkedRepoInvite[];
+}
+
+export function getLinkedRepoInvites(id: string) {
+  return apiFetch<LinkedRepoInvitesResponse>(
+    `/admin/linked-repos/${id}/invites`,
+  );
+}
+
+export function revokeLinkedRepoInvite(id: string, inviteId: string) {
+  return apiFetch<{ revoked: boolean }>(
+    `/admin/linked-repos/${id}/invites/${encodeURIComponent(inviteId)}`,
+    { method: "DELETE" },
+  );
+}
+
+// Linked Repos — public invite landing page (unauthenticated, token-gated)
+export interface LinkedRepoInviteInfo {
+  valid: boolean;
+  app_name: string;
+  logo_url: string | null;
+  scopes: string[];
+  reason: string | null;
+  pinned_identifier: string | null;
+  expires_at: string | null;
+}
+
+export function getLinkedRepoInvite(token: string) {
+  return apiFetch<LinkedRepoInviteInfo>(
+    `/auth/linked-repo/info?token=${encodeURIComponent(token)}`,
+  );
+}
+
 // Users
 export function getUsers() {
   return apiFetch<UserSummary[]>("/admin/users");
@@ -318,6 +457,11 @@ export function addUser(body: {
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+export function resolveIdentity(identifier: string) {
+  const qs = new URLSearchParams({ identifier }).toString();
+  return apiFetch<ResolvedIdentity>(`/admin/identity/resolve?${qs}`);
 }
 
 export function deleteUser(id: string) {
@@ -399,7 +543,9 @@ export async function xrpcQuery<T = unknown>(
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
-    } catch { /* not JSON, use raw text */ }
+    } catch {
+      /* not JSON, use raw text */
+    }
     throw new ApiError(res.status, message);
   }
   return res.json();
@@ -424,9 +570,169 @@ export function deleteRecord(uri: string) {
 }
 
 export function deleteCollectionRecords(collection: string) {
-  return apiFetch<{ deleted: number }>(
+  return apiFetch<{ job_id: string }>(
     `/admin/records/collection?${new URLSearchParams({ collection })}`,
     { method: "DELETE" },
+  );
+}
+
+export interface EventPurgeFilter {
+  event_type?: string;
+  category?: string;
+  severity?: string;
+  subject?: string;
+  before?: string;
+  after?: string;
+}
+
+// Strips blank/undefined entries so `countEvents` and `purgeEvents` always
+// agree on what "no filter" means for a field — an explicit `""` (e.g. a
+// filter typed in then cleared) must be treated the same as an absent key,
+// not sent as a literal empty-string filter.
+function cleanEventPurgeFilter(
+  filter: EventPurgeFilter,
+): Record<string, string> {
+  const cleaned: Record<string, string> = {};
+  for (const [key, value] of Object.entries(filter)) {
+    if (value) cleaned[key] = value;
+  }
+  return cleaned;
+}
+
+export function countEvents(filter: EventPurgeFilter) {
+  const params = new URLSearchParams(cleanEventPurgeFilter(filter));
+  return apiFetch<{ count: number }>(`/admin/events/count?${params}`);
+}
+
+export function purgeEvents(filter: EventPurgeFilter) {
+  return apiFetch<{ job_id: string }>("/admin/events/purge", {
+    method: "POST",
+    body: JSON.stringify(cleanEventPurgeFilter(filter)),
+  });
+}
+
+// Database (SQLite disk reclamation)
+export interface DatabaseDiskReport {
+  db_bytes: number;
+  wal_bytes: number;
+  // `null` means free space could not be measured — NOT that it measured
+  // zero. Render that case as "unknown", never as "0 B".
+  db_fs_free: number | null;
+  temp_fs_free: number | null;
+  // Whether the database and temp directories share a filesystem, which
+  // changes how much headroom a VACUUM needs (1.2x vs 2.2x the db size).
+  same_filesystem: boolean;
+  db_path: string;
+  temp_path: string;
+}
+
+export interface VacuumResult {
+  status: "ok" | "failed";
+  at: string;
+  db_bytes_before: number;
+  db_bytes_after: number;
+  reclaimed_bytes: number;
+  error: string | null;
+}
+
+export type VacuumFeasibility =
+  | { status: "ok" }
+  | { status: "insufficient"; needed: number; available: number; path: string }
+  | { status: "unknown"; path: string };
+
+export interface DatabaseStatus {
+  backend: "sqlite" | "postgres";
+  disk: DatabaseDiskReport | null;
+  feasibility: VacuumFeasibility | null;
+  vacuum: {
+    requested_at: string | null;
+    attempt_started_at: string | null;
+    completed_at: string | null;
+    last_result: VacuumResult | null;
+  };
+  journal_size_limit: number;
+}
+
+export function getDatabaseStatus() {
+  return apiFetch<DatabaseStatus>("/admin/database/status");
+}
+
+export function scheduleVacuum() {
+  return apiFetch<{ scheduled: boolean }>("/admin/database/vacuum/schedule", {
+    method: "POST",
+  });
+}
+
+export function cancelVacuum() {
+  return apiFetch<{ scheduled: boolean }>("/admin/database/vacuum/schedule", {
+    method: "DELETE",
+  });
+}
+
+// Telemetry
+
+export interface TelemetrySettings {
+  mode: "off" | "manual" | "auto";
+  contact: string | null;
+  lexicon_names: boolean;
+  lexicon_structure: boolean;
+  lexicon_documents: boolean;
+  instance_id: string | null;
+  collector_url: string;
+  /** Whether anyone has ever answered the telemetry question on this
+   * instance. False only for instances predating the setup wizard's
+   * telemetry step, which is what the dashboard prompt exists to catch. */
+  prompted: boolean;
+}
+
+export interface TelemetryBenchmarkEntry {
+  p50: number;
+  value: number;
+  percentile: number;
+}
+
+export interface TelemetryBenchmarks {
+  cohort_size: number;
+  metrics: Record<string, TelemetryBenchmarkEntry>;
+}
+
+/** Every field optional: an omitted field means unchanged. */
+export interface TelemetryUpdate {
+  mode?: "off" | "manual" | "auto";
+  contact?: string;
+  lexicon_names?: boolean;
+  lexicon_structure?: boolean;
+  lexicon_documents?: boolean;
+}
+
+export function getTelemetry() {
+  return apiFetch<TelemetrySettings>("/admin/settings/telemetry");
+}
+
+export function updateTelemetry(body: TelemetryUpdate) {
+  return apiFetch<TelemetrySettings>("/admin/settings/telemetry", {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Record that the telemetry question has been answered, without changing the
+ * answer. Saving any telemetry setting stamps this too; this is the path for
+ * declining — in the setup wizard or by dismissing the dashboard prompt. */
+export function dismissTelemetryPrompt() {
+  return apiFetch<TelemetrySettings>("/admin/settings/telemetry/dismiss", {
+    method: "POST",
+  });
+}
+
+export function getTelemetryPreview() {
+  return apiFetch<Record<string, unknown>>("/admin/settings/telemetry/preview");
+}
+
+export function sendTelemetry() {
+  return apiFetch<{ sent: boolean; benchmarks: TelemetryBenchmarks | null }>(
+    "/admin/settings/telemetry/send",
+    { method: "POST" },
   );
 }
 
@@ -492,7 +798,9 @@ export async function uploadLogo(file: File) {
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
-    } catch { /* not JSON, use raw text */ }
+    } catch {
+      /* not JSON, use raw text */
+    }
     throw new ApiError(res.status, message);
   }
 }
@@ -521,9 +829,17 @@ export function setFeatureFlag(key: string, enabled: boolean) {
 }
 
 // Proxy config
+export type ProxyRouting = "authority" | "serviceproxy";
+
 export type ProxyConfig = {
   mode: "disabled" | "open" | "allowlist" | "blocklist";
   nsids: string[];
+  /**
+   * Omitted on save means "leave unchanged" — the server preserves the stored
+   * value rather than resetting it, so a form that only edits the mode cannot
+   * silently revert routing.
+   */
+  routing?: ProxyRouting;
 };
 
 export function getProxyConfig() {
@@ -613,6 +929,71 @@ export function deleteApiClient(id: string) {
   return apiFetch(`/admin/api-clients/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+// API client AT Protocol authentication key (private_key_jwt confidentiality)
+export function getApiClientAuthKey(id: string) {
+  return apiFetch<ApiClientAuthKey>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-key`,
+  );
+}
+
+export function provisionApiClientAuthKey(id: string) {
+  return apiFetch<ApiClientAuthKey>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-key`,
+    { method: "POST" },
+  );
+}
+
+export function recheckApiClientAuthKey(id: string) {
+  return apiFetch<ApiClientAuthProbe>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-key/recheck`,
+    { method: "POST" },
+  );
+}
+
+export function rotateApiClientAuthKey(id: string) {
+  return apiFetch<KeyRotationResult>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-key/rotate`,
+    { method: "POST" },
+  );
+}
+
+export function listApiClientAuthKeys(id: string) {
+  return apiFetch<ApiClientAuthKeysResponse>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-keys`,
+  );
+}
+
+export function revokeApiClientAuthKey(id: string, kid: string) {
+  return apiFetch<RevokeApiClientAuthKeyResult>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-key/${encodeURIComponent(kid)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function revokeAllApiClientAuthKeys(id: string) {
+  return apiFetch<RevokeAllApiClientAuthKeysResult>(
+    `/admin/api-clients/${encodeURIComponent(id)}/auth-keys`,
+    { method: "DELETE" },
+  );
+}
+
+export function rotateInstanceOauthKey() {
+  return apiFetch<KeyRotationResult>("/admin/oauth/instance-key/rotate", {
+    method: "POST",
+  });
+}
+
+export function listInstanceOauthKeys() {
+  return apiFetch<InstanceOauthKeysResponse>("/admin/oauth/instance-key");
+}
+
+export function revokeInstanceOauthKey(kid: string) {
+  return apiFetch<RevokeInstanceKeyResult>(
+    `/admin/oauth/instance-key/${encodeURIComponent(kid)}`,
+    { method: "DELETE" },
+  );
 }
 
 // Event Logs
@@ -864,36 +1245,41 @@ export function getScripts(opts?: { suffix?: string }) {
   const params = new URLSearchParams();
   if (opts?.suffix) params.set("suffix", opts.suffix);
   const qs = params.toString();
-  return apiFetch<Script[]>(`/admin/scripts${qs ? `?${qs}` : ""}`)
+  return apiFetch<Script[]>(`/admin/scripts${qs ? `?${qs}` : ""}`);
 }
 
 export function getScript(id: string) {
-  return apiFetch<Script>(`/admin/scripts/${encodeURIComponent(id)}`)
+  return apiFetch<Script>(`/admin/scripts/${encodeURIComponent(id)}`);
 }
 
 export function upsertScript(body: UpsertScriptBody) {
   return apiFetch<Script>("/admin/scripts", {
     method: "POST",
     body: JSON.stringify(body),
-  })
+  });
 }
 
 export function patchScript(id: string, body: PatchScriptBody) {
   return apiFetch<Script>(`/admin/scripts/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: JSON.stringify(body),
-  })
+  });
 }
 
 export function deleteScript(id: string) {
   return apiFetch(`/admin/scripts/${encodeURIComponent(id)}`, {
     method: "DELETE",
-  })
+  });
 }
 
 // Setup
 export interface SetupStatus {
-  identity_mode: "did_web" | "did_plc" | "attach_account" | "not_exposed" | null;
+  identity_mode:
+    | "did_web"
+    | "did_plc"
+    | "attach_account"
+    | "not_exposed"
+    | null;
   identity_configured: boolean;
   plc_verified: boolean;
   setup_complete: boolean;
@@ -937,36 +1323,40 @@ export function completeSetup() {
 }
 
 export interface ResolveResult {
-  did: string
-  handle: string | null
-  display_name: string | null
-  avatar: string | null
+  did: string;
+  handle: string | null;
+  display_name: string | null;
+  avatar: string | null;
 }
 
-export function resolveIdentity(q: string) {
-  return apiFetch<ResolveResult[]>(`/api/setup/resolve?q=${encodeURIComponent(q)}`)
+export function resolveSetupIdentity(q: string) {
+  return apiFetch<ResolveResult[]>(
+    `/api/setup/resolve?q=${encodeURIComponent(q)}`,
+  );
 }
 
 export function confirmAttachAuth(body: { original_did: string }) {
   return apiFetch("/api/setup/attach-auth/confirm", {
     method: "POST",
     body: JSON.stringify(body),
-  })
+  });
 }
 
 export function plcRequest() {
-  return apiFetch("/api/setup/plc/request", { method: "POST" })
+  return apiFetch("/api/setup/plc/request", { method: "POST" });
 }
 
 export function plcSubmit(token: string) {
   return apiFetch("/api/setup/plc/submit", {
     method: "POST",
     body: JSON.stringify({ token }),
-  })
+  });
 }
 
 export function plcRegister() {
-  return apiFetch<{ did: string }>("/api/setup/plc/register", { method: "POST" })
+  return apiFetch<{ did: string }>("/api/setup/plc/register", {
+    method: "POST",
+  });
 }
 
 // Service Identity
@@ -1050,7 +1440,9 @@ export function syncPlc() {
 }
 
 export function syncPlcRequest() {
-  return apiFetch("/admin/service-entries/sync-plc/request", { method: "POST" });
+  return apiFetch("/admin/service-entries/sync-plc/request", {
+    method: "POST",
+  });
 }
 
 export function syncPlcSubmit(token: string) {

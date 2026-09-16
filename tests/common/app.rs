@@ -1,8 +1,7 @@
 use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig};
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{
-    AtprotoLocalhostClientMetadata, DefaultHttpClient, KnownScope, OAuthClientConfig,
-    OAuthResolverConfig, Scope,
+    AtprotoLocalhostClientMetadata, KnownScope, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 use axum::Router;
 use axum::http::Request;
@@ -51,9 +50,17 @@ impl TestApp {
         let config = Config {
             host: "127.0.0.1".into(),
             port: 0,
-            database_url: String::new(),
+            // Real value (not the pool, which comes from `db::test_pool()`
+            // above) so that code reading `config.database_url` directly —
+            // e.g. `disk::report` behind `/admin/database/status` — sees a
+            // file it can actually stat on SQLite. Nothing else in the
+            // binary reads this field outside of `main.rs`'s own startup,
+            // which `TestApp` bypasses entirely.
+            database_url: std::env::var("TEST_DATABASE_URL").unwrap_or_default(),
             database_backend: backend,
+            sqlite_journal_size_limit: happyview::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: "http://127.0.0.1:0".into(),
+            user_agent: String::new(),
             session_secret: "test-session-secret-0123456789abcdef".into(),
             jetstream_url: "wss://jetstream1.us-east.bsky.network".into(),
             relay_url: mock_url.clone(),
@@ -65,9 +72,11 @@ impl TestApp {
             logo_uri: None,
             tos_uri: None,
             policy_uri: None,
-            token_encryption_key: None,
+            // Space writes need this to decrypt the `#atproto_space` signing key.
+            token_encryption_key: Some(db::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
 
         let sql = adapt_sql(
@@ -93,7 +102,8 @@ impl TestApp {
         let (collections_tx, _collections_rx) = watch::channel(initial_collections);
         let (labeler_subscriptions_tx, _) = watch::channel(());
 
-        let atrium_http = std::sync::Arc::new(DefaultHttpClient::default());
+        let atrium_http =
+            std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
         let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
             plc_directory_url: "https://plc.directory".into(),
             http_client: std::sync::Arc::clone(&atrium_http),
@@ -103,10 +113,14 @@ impl TestApp {
             http_client: atrium_http,
         });
         let oauth_pool = db::test_pool().await;
+        let oauth_scopes = vec![
+            Scope::Known(KnownScope::Atproto),
+            Scope::Unknown("identity:*".to_string()),
+        ];
         let oauth = atrium_oauth::OAuthClient::new(OAuthClientConfig {
             client_metadata: AtprotoLocalhostClientMetadata {
                 redirect_uris: Some(vec!["http://127.0.0.1:0/auth/callback".into()]),
-                scopes: Some(vec![Scope::Known(KnownScope::Atproto)]),
+                scopes: Some(oauth_scopes.clone()),
             },
             keys: None,
             state_store: happyview::auth::oauth_store::DbStateStore::new(
@@ -120,6 +134,7 @@ impl TestApp {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: happyview::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
 
@@ -157,6 +172,22 @@ impl TestApp {
                 pool.clone(),
                 backend,
             ),
+            linked_repos_client: std::sync::Arc::new(
+                happyview::linked_repos::client::build(
+                    "https://plc.directory",
+                    "http://127.0.0.1:0/oauth-client-metadata.json",
+                    "http://127.0.0.1:0",
+                    "http://127.0.0.1:0/auth/callback".into(),
+                    true,
+                    oauth_scopes,
+                    happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                    pool.clone(),
+                    backend,
+                    None,
+                )
+                .expect("Failed to create test linked-repo OAuth client"),
+            ),
+            linked_repos_client_kid: None,
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-that-is-at-least-32-bytes-long",
             ),
@@ -175,7 +206,13 @@ impl TestApp {
             backfill_db: pool.clone(),
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_jwks: Vec::new(),
+            telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
         };
+
+        if let Some(key) = state.config.token_encryption_key.as_ref() {
+            db::provision_space_signing_key(&state.db, state.db_backend, key).await;
+        }
 
         let router = Self::build_router(&state);
 
@@ -212,9 +249,64 @@ impl TestApp {
         app
     }
 
+    /// Point this app at a real PLC directory and the PDSes registered in it,
+    /// with a loopback OAuth client that may request `scopes`.
+    ///
+    /// For end-to-end tests against a live stack: OAuth, DID resolution and
+    /// PDS calls all go to real servers instead of the mock.
+    pub fn point_at_real_identity(&mut self, plc_url: &str, scopes: &[&str]) {
+        let backend = self.state.db_backend;
+        let http = std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
+        // One store, shared: `/auth/login` reads back the state key the client
+        // just stored through `oauth_state_store`.
+        let state_store =
+            happyview::auth::oauth_store::DbStateStore::new(self.state.db.clone(), backend);
+        let scopes: Vec<Scope> = scopes
+            .iter()
+            .map(|s| match *s {
+                "atproto" => Scope::Known(KnownScope::Atproto),
+                other => Scope::Unknown(other.to_string()),
+            })
+            .collect();
+
+        let oauth = atrium_oauth::OAuthClient::new(OAuthClientConfig {
+            client_metadata: AtprotoLocalhostClientMetadata {
+                redirect_uris: Some(vec!["http://127.0.0.1/auth/callback".into()]),
+                scopes: Some(scopes),
+            },
+            keys: None,
+            state_store: state_store.clone(),
+            session_store: happyview::auth::oauth_store::DbSessionStore::new(
+                self.state.db.clone(),
+                backend,
+            ),
+            resolver: OAuthResolverConfig {
+                did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
+                    plc_directory_url: plc_url.to_string(),
+                    http_client: std::sync::Arc::clone(&http),
+                }),
+                handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
+                    dns_txt_resolver: happyview::dns::NativeDnsResolver::new(),
+                    http_client: http,
+                }),
+                authorization_server_metadata: Default::default(),
+                protected_resource_metadata: Default::default(),
+            },
+            http_client: happyview::http_retry::HappyViewHttpClient::default(),
+        })
+        .expect("failed to create loopback OAuth client");
+
+        self.state.config.plc_url = plc_url.to_string();
+        self.state.oauth = std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
+            std::sync::Arc::new(oauth),
+        ));
+        self.state.oauth_state_store = state_store;
+        self.rebuild_router();
+    }
+
     pub async fn new_with_encryption() -> Self {
         let mut app = Self::new().await;
-        app.state.config.token_encryption_key = Some([0x42u8; 32]);
+        app.state.config.token_encryption_key = Some(db::TEST_ENCRYPTION_KEY);
         app.rebuild_router();
         app
     }

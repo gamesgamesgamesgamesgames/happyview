@@ -130,7 +130,7 @@ impl ParsedTrigger {
         match kind {
             TriggerKind::JobRun => validate_job_type(suffix)?,
             TriggerKind::LabelerApply if suffix == "_actor" => {}
-            _ => validate_nsid(suffix)?,
+            _ => happyview_nsid::validate_nsid(suffix).map_err(|e| e.to_string())?,
         }
 
         Ok(Self {
@@ -151,38 +151,11 @@ fn validate_job_type(job_type: &str) -> Result<(), String> {
             "invalid job type '{job_type}': must match /^[a-z0-9][a-z0-9._-]*$/"
         ));
     }
-    Ok(())
-}
-
-/// Minimal NSID validation: at least two dot-separated segments, each
-/// non-empty and matching `[a-zA-Z][a-zA-Z0-9-]*`. Mirrors the AT Protocol
-/// spec's character class for everyday use; full Unicode strictness lives
-/// in atrium downstream.
-fn validate_nsid(nsid: &str) -> Result<(), String> {
-    let segments: Vec<&str> = nsid.split('.').collect();
-    if segments.len() < 2 {
+    if crate::jobs::native::is_reserved(job_type) {
         return Err(format!(
-            "invalid NSID '{nsid}': need at least 2 dot-separated segments"
+            "invalid job type '{job_type}': the '{}' prefix is reserved for built-in jobs",
+            crate::jobs::native::RESERVED_PREFIX
         ));
-    }
-    for (idx, seg) in segments.iter().enumerate() {
-        if seg.is_empty() {
-            return Err(format!("invalid NSID '{nsid}': empty segment"));
-        }
-        let mut chars = seg.chars();
-        let first = chars.next().unwrap();
-        if !first.is_ascii_alphabetic() {
-            return Err(format!(
-                "invalid NSID '{nsid}': segment {idx} must start with a letter"
-            ));
-        }
-        for c in chars {
-            if !c.is_ascii_alphanumeric() && c != '-' {
-                return Err(format!(
-                    "invalid NSID '{nsid}': segment {idx} contains invalid character '{c}'"
-                ));
-            }
-        }
     }
     Ok(())
 }
@@ -316,20 +289,37 @@ pub struct RecordEventPayload<'a> {
     pub record: Option<&'a Value>,
 }
 
-/// Run the record-event script (if any) for a given event. Returns the
-/// record body the indexer should store: `Some(record)` to proceed,
-/// `None` to skip indexing.
+/// What a record-event script chain decided for an event.
+///
+/// Deliberately not `Option<Value>`. A delete carries no record body, so
+/// "no script ran" and "the script returned `nil`" both used to spell
+/// themselves `None`, and the delete path read the first as the second —
+/// an instance with no scripts at all silently skipped every delete (#80).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordHookOutcome {
+    /// Index the event with the body it arrived with. Either no script ran,
+    /// or the script waved the event through without rewriting it.
+    Proceed,
+    /// Index this body in place of the one that arrived. Only meaningful for
+    /// create/update — a delete has no body to replace.
+    Replace(Value),
+    /// Skip the event entirely — the script returned `nil`. Only ever
+    /// produced by a script that actually ran.
+    Skip,
+}
+
+/// Run the record-event script (if any) for a given event.
 ///
 /// Failure mode is fail-open: a script that exhausts its retry budget is
-/// dead-lettered and the indexer proceeds with the original record.
+/// dead-lettered and the event proceeds as if no script had run.
 pub async fn run_record_event_script(
     state: &AppState,
     payload: RecordEventPayload<'_>,
-) -> Option<Value> {
+) -> RecordHookOutcome {
     let resolved = match resolve_record_event(state, payload.nsid, payload.action).await {
         Some(s) => s,
-        // No script for this trigger → indexer keeps the original record.
-        None => return payload.record.cloned(),
+        // No script for this trigger → index the event unchanged.
+        None => return RecordHookOutcome::Proceed,
     };
 
     let host_id = format!("{}:{}", payload.nsid, payload.action);
@@ -413,21 +403,23 @@ pub async fn run_record_event_script(
     )
     .await;
 
-    // Fail-open: indexer proceeds with the original record.
-    payload.record.cloned()
+    // Fail-open: index the event as if no script had run. For a delete this
+    // means the delete still happens — the record body it lacks is not a
+    // reason to keep a record its PDS no longer has.
+    RecordHookOutcome::Proceed
 }
 
 /// Single attempt at the record-event Lua script. Used internally by the
 /// retry loop and externally by admin retry endpoints.
 ///
-/// Returns `Ok(Some(value))` to continue indexing with `value`,
-/// `Ok(None)` when the script returned `nil` (skip), or `Err(msg)` on
-/// any execution failure.
+/// Returns `Ok(Replace(value))` to continue indexing with `value`,
+/// `Ok(Skip)` when the script returned `nil`, `Ok(Proceed)` when it waved
+/// the event through, or `Err(msg)` on any execution failure.
 pub async fn run_record_event_once(
     state: &AppState,
     script: &ResolvedScript,
     payload: RecordEventPayload<'_>,
-) -> Result<Option<Value>, String> {
+) -> Result<RecordHookOutcome, String> {
     if script.language != ScriptLanguage::Lua {
         return Err(format!(
             "this binary cannot run {} scripts",
@@ -487,15 +479,15 @@ pub async fn run_record_event_once(
         .map_err(|e| e.to_string())?;
 
     match result {
-        mlua::Value::Nil => Ok(None),
+        mlua::Value::Nil => Ok(RecordHookOutcome::Skip),
         mlua::Value::Table(_) => {
             let v: Value = lua
                 .from_value(result)
                 .map_err(|e| format!("convert lua return to JSON: {e}"))?;
-            Ok(Some(v))
+            Ok(RecordHookOutcome::Replace(v))
         }
-        // Non-nil, non-table return — pass-through: keep the original record.
-        _ => Ok(payload.record.cloned()),
+        // Non-nil, non-table return (`return true`) — pass-through.
+        _ => Ok(RecordHookOutcome::Proceed),
     }
 }
 
@@ -729,8 +721,13 @@ fn extract_bool(v: &Value, key: &str) -> Option<bool> {
 // ---------------------------------------------------------------------------
 
 /// Register the default API surface on a fresh sandbox: db / http / xrpc /
-/// atproto / Record. `caller_did` flows into xrpc so authenticated calls
-/// work; pass `None` for unauthenticated contexts.
+/// atproto / linked_repos / jobs / Record. `caller_did` flows into xrpc so
+/// authenticated calls work; pass `None` for unauthenticated contexts.
+///
+/// `linked_repos` needs no caller: a grant carries its own PDS session, so a
+/// record-event script can mirror into a linked repo with no credentials of its
+/// own. It is registered here for the same reason the spaces write surface is —
+/// every script context is meant to have it.
 ///
 /// The Record API is registered in **no-auth mode** here — fine for
 /// record-event and label scripts which have no caller credentials.
@@ -751,6 +748,8 @@ fn register_default_apis(
         .map_err(|e| format!("atproto api: {e}"))?;
     crate::lua::spaces_api::register_spaces_write_api(lua, state.clone(), caller_did)
         .map_err(|e| format!("spaces write api: {e}"))?;
+    crate::lua::linked_repos_api::register_linked_repos_api(lua, state.clone())
+        .map_err(|e| format!("linked repos api: {e}"))?;
     super::jobs_api::register_jobs_api(
         lua,
         state.clone(),
@@ -883,6 +882,173 @@ async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
 mod tests {
     use super::*;
 
+    use crate::AppState;
+    use crate::config::Config;
+    use crate::lexicon::LexiconRegistry;
+    use std::sync::Arc;
+    use tokio::sync::watch;
+
+    fn registration_test_state() -> AppState {
+        let config = Config {
+            host: "127.0.0.1".into(),
+            port: 3000,
+            database_url: String::new(),
+            database_backend: crate::db::DatabaseBackend::Sqlite,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
+            public_url: String::new(),
+            user_agent: String::new(),
+            session_secret: "test-secret".into(),
+            jetstream_url: String::new(),
+            relay_url: String::new(),
+            plc_url: String::new(),
+            static_dir: String::new(),
+            base_path: None,
+            event_log_retention_days: 30,
+            app_name: None,
+            logo_uri: None,
+            tos_uri: None,
+            policy_uri: None,
+            token_encryption_key: None,
+            default_rate_limit_capacity: 100,
+            default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
+        };
+        let (tx, _) = watch::channel(vec![]);
+        let (labeler_tx, _) = watch::channel(());
+        sqlx::any::install_default_drivers();
+        let test_db = sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap();
+        let backend = crate::db::DatabaseBackend::Sqlite;
+        let atrium_http = Arc::new(crate::http_retry::HappyViewHttpClient::default());
+        let did_resolver = atrium_identity::did::CommonDidResolver::new(
+            atrium_identity::did::CommonDidResolverConfig {
+                plc_directory_url: "https://plc.directory".into(),
+                http_client: Arc::clone(&atrium_http),
+            },
+        );
+        let handle_resolver = atrium_identity::handle::AtprotoHandleResolver::new(
+            atrium_identity::handle::AtprotoHandleResolverConfig {
+                dns_txt_resolver: crate::dns::NativeDnsResolver::new(),
+                http_client: atrium_http,
+            },
+        );
+        let scopes = vec![atrium_oauth::Scope::Known(
+            atrium_oauth::KnownScope::Atproto,
+        )];
+        let oauth = atrium_oauth::OAuthClient::new(atrium_oauth::OAuthClientConfig {
+            client_metadata: atrium_oauth::AtprotoLocalhostClientMetadata {
+                redirect_uris: Some(vec!["http://127.0.0.1:0/auth/callback".into()]),
+                scopes: Some(scopes.clone()),
+            },
+            keys: None,
+            state_store: crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend),
+            session_store: crate::auth::oauth_store::DbSessionStore::new(test_db.clone(), backend),
+            resolver: atrium_oauth::OAuthResolverConfig {
+                did_resolver,
+                handle_resolver,
+                authorization_server_metadata: Default::default(),
+                protected_resource_metadata: Default::default(),
+            },
+            http_client: crate::http_retry::HappyViewHttpClient::default(),
+        })
+        .expect("test OAuth client");
+        AppState {
+            config,
+            http: reqwest::Client::new(),
+            db: test_db.clone(),
+            backfill_db: test_db.clone(),
+            db_backend: backend,
+            domain_cache: crate::domain::DomainCache::new(),
+            lexicons: LexiconRegistry::new(),
+            collections_tx: tx,
+            labeler_subscriptions_tx: labeler_tx,
+            rate_limiter: crate::rate_limit::RateLimiter::new(
+                crate::rate_limit::RateLimitDefaults {
+                    query_cost: 1,
+                    procedure_cost: 1,
+                    proxy_cost: 1,
+                },
+            ),
+            oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth))),
+            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
+                test_db.clone(),
+                backend,
+            ),
+            linked_repos_client: Arc::new(
+                crate::linked_repos::client::build(
+                    "https://plc.directory",
+                    "http://127.0.0.1:0/oauth-client-metadata.json",
+                    "http://127.0.0.1:0",
+                    "http://127.0.0.1:0/auth/callback".into(),
+                    true,
+                    scopes,
+                    crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend),
+                    test_db.clone(),
+                    backend,
+                    None,
+                )
+                .expect("test linked-repo OAuth client"),
+            ),
+            linked_repos_client_kid: None,
+            cookie_key: axum_extra::extract::cookie::Key::derive_from(
+                b"test-secret-that-is-at-least-32-bytes-long",
+            ),
+            plugin_registry: Arc::new(crate::plugin::PluginRegistry::new()),
+            wasm_runtime: Arc::new(crate::plugin::WasmRuntime::new().expect("wasm runtime")),
+            attestation_signer: None,
+            official_registry: Arc::new(tokio::sync::RwLock::new(
+                crate::plugin::official_registry::OfficialRegistryState::default(),
+            )),
+            official_registry_config: crate::plugin::official_registry::RegistryConfig::production(
+            ),
+            proxy_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(
+                crate::proxy_config::ProxyConfig::default(),
+            ))),
+            backfill_events_tx: tokio::sync::broadcast::channel(16).0,
+            verbose_event_logging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_jwks: Vec::new(),
+            telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_apis_include_linked_repos() {
+        let state = Arc::new(registration_test_state());
+        let lua = mlua::Lua::new();
+
+        register_default_apis(&lua, &state, "record.create:com.example.thing", None)
+            .expect("default APIs should register");
+
+        let (kind, get_kind, list_kind): (String, String, String) = lua
+            .load("return type(linked_repos), type(linked_repos.get), type(linked_repos.list)")
+            .eval_async()
+            .await
+            .expect("linked_repos should be present for record-event and label scripts");
+
+        assert_eq!(kind, "table");
+        assert_eq!(get_kind, "function");
+        assert_eq!(list_kind, "function");
+    }
+
+    #[tokio::test]
+    async fn default_apis_still_include_the_existing_globals() {
+        let state = Arc::new(registration_test_state());
+        let lua = mlua::Lua::new();
+
+        register_default_apis(&lua, &state, "labeler.apply:app.bsky.feed.post", None)
+            .expect("default APIs should register");
+
+        let ok: bool = lua
+            .load(
+                "return type(db) == 'table' and type(http) == 'table' \
+                    and type(xrpc) == 'table' and type(atproto) == 'table' \
+                    and type(atproto.spaces) == 'table' and type(jobs) == 'table'",
+            )
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(ok, "existing script globals must survive the addition");
+    }
+
     #[test]
     fn parse_record_index_trigger() {
         let t = ParsedTrigger::parse("record.index:com.example.thing").unwrap();
@@ -956,15 +1122,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_nsid() {
-        // single segment
-        assert!(ParsedTrigger::parse("record.index:foo").is_err());
-        // empty suffix
-        assert!(ParsedTrigger::parse("record.index:").is_err());
-        // non-letter start
+    fn delegates_nsid_validation_to_the_shared_crate() {
+        // Shape rules are the crate's job and are pinned by the interop corpus
+        // there. This only proves the wiring.
+        assert!(ParsedTrigger::parse("xrpc.query:pics.2bit.feed.getPhotos").is_ok());
         assert!(ParsedTrigger::parse("record.index:1.foo").is_err());
-        // invalid char
-        assert!(ParsedTrigger::parse("record.index:com.foo!bar").is_err());
+        assert!(ParsedTrigger::parse("record.index:").is_err());
     }
 
     #[test]

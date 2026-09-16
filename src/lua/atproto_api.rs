@@ -324,13 +324,25 @@ pub fn register_atproto_api(
                     .from_value(sig)
                     .map_err(|e| mlua::Error::runtime(format!("atproto.verify_signature: {e}")))?;
 
-                match signer.verify_record_signature(&record_json, &sig_json, &repo_did) {
-                    Ok(valid) => Ok(valid),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "atproto.verify_signature failed");
-                        Ok(false)
-                    }
-                }
+                // `false` and an error are different facts, and only `false`
+                // is a statement about the record: it means we checked and the
+                // signature does not match. An error means we could not check
+                // — malformed signature bytes, a missing field, a record that
+                // will not encode. Collapsing the second into the first would
+                // let any fault in this path present to a script as "this user
+                // forged their records", with nothing in the logs to say
+                // otherwise. Callers that want the old behaviour can `pcall`.
+                signer
+                    .verify_record_signature(&record_json, &sig_json, &repo_did)
+                    .map_err(|e| {
+                        tracing::warn!(
+                            repository = %repo_did,
+                            error = %e,
+                            "atproto.verify_signature could not check the signature — \
+                             this is not a statement that the record is forged"
+                        );
+                        mlua::Error::runtime(format!("atproto.verify_signature: {e}"))
+                    })
             },
         )?;
         atproto_table.set("verify_signature", verify_fn)?;
@@ -416,7 +428,7 @@ pub fn register_atproto_api(
                         .map_err(|e| {
                             mlua::Error::runtime(format!("membership check failed: {e}"))
                         })?;
-                Ok(access.map(|a| a.as_str().to_string()))
+                Ok(access.map(|a| a.as_wire_str().to_string()))
             }
         })?;
     spaces_table.set("get_access", get_access_fn)?;
@@ -461,7 +473,7 @@ pub fn register_atproto_api(
             for (i, member) in members.iter().enumerate() {
                 let entry = lua.create_table()?;
                 entry.set("did", member.did.as_str())?;
-                entry.set("access", member.access.as_str())?;
+                entry.set("access", member.access.as_wire_str())?;
                 result.set(i + 1, entry)?;
             }
             Ok(mlua::Value::Table(result))
@@ -682,7 +694,9 @@ mod tests {
             port: 3000,
             database_url: String::new(),
             database_backend: crate::db::DatabaseBackend::Sqlite,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -694,15 +708,18 @@ mod tests {
             logo_uri: None,
             tos_uri: None,
             policy_uri: None,
-            token_encryption_key: None,
+            // Spaces sign every commit with the `#atproto_space` key, which
+            // is stored encrypted, so space writes need this set.
+            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         let (tx, _) = watch::channel(vec![]);
         let (labeler_tx, _) = watch::channel(());
         sqlx::any::install_default_drivers();
         let test_db = sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap();
-        let atrium_http = std::sync::Arc::new(atrium_oauth::DefaultHttpClient::default());
+        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
         let did_resolver = atrium_identity::did::CommonDidResolver::new(
             atrium_identity::did::CommonDidResolverConfig {
                 plc_directory_url: "https://plc.directory".into(),
@@ -737,6 +754,7 @@ mod tests {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
         AppState {
@@ -763,6 +781,27 @@ mod tests {
                 test_db.clone(),
                 crate::db::DatabaseBackend::Sqlite,
             ),
+            linked_repos_client: std::sync::Arc::new(
+                crate::linked_repos::client::build(
+                    "https://plc.directory",
+                    "http://127.0.0.1:0/oauth-client-metadata.json",
+                    "http://127.0.0.1:0",
+                    "http://127.0.0.1:0/auth/callback".into(),
+                    true,
+                    vec![atrium_oauth::Scope::Known(
+                        atrium_oauth::KnownScope::Atproto,
+                    )],
+                    crate::auth::oauth_store::DbStateStore::new(
+                        test_db.clone(),
+                        crate::db::DatabaseBackend::Sqlite,
+                    ),
+                    test_db.clone(),
+                    crate::db::DatabaseBackend::Sqlite,
+                    None,
+                )
+                .expect("Failed to create test linked-repo OAuth client"),
+            ),
+            linked_repos_client_kid: None,
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-for-tests-only-not-production",
             ),
@@ -781,6 +820,8 @@ mod tests {
             ))),
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_jwks: Vec::new(),
+            telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
         }
     }
 
@@ -927,6 +968,45 @@ mod tests {
         "#;
         let result: bool = lua.load(chunk).eval_async().await.unwrap();
         assert!(!result);
+    }
+
+    /// "We checked and it does not match" and "we could not check" are
+    /// different facts, and only the first is a statement about the record.
+    /// A script that cannot tell them apart will accuse a user of forgery
+    /// because of a decode bug.
+    #[tokio::test]
+    async fn verify_signature_distinguishes_unverifiable_from_invalid() {
+        let state = test_state_with_signer("");
+        let lua = mlua::Lua::new();
+        register_atproto_api(&lua, Arc::new(state), Some("did:plc:caller")).unwrap();
+
+        let chunk = r#"
+            local record = { contributionType = "correction", changes = { name = "Original" } }
+            local sig = atproto.sign(record)
+
+            -- A well-formed signature over a different payload: genuinely invalid.
+            local tampered = { contributionType = "correction", changes = { name = "Tampered" } }
+            local mismatch_ok, mismatch = pcall(atproto.verify_signature, tampered, sig, "did:plc:caller")
+
+            -- Signature bytes that are not base64 at all: unverifiable.
+            sig.signature["$bytes"] = "not!valid!base64"
+            local undecodable_ok, undecodable = pcall(atproto.verify_signature, record, sig, "did:plc:caller")
+
+            return mismatch_ok, mismatch, undecodable_ok, tostring(undecodable)
+        "#;
+        let (mismatch_ok, mismatch, undecodable_ok, undecodable): (bool, bool, bool, String) =
+            lua.load(chunk).eval_async().await.unwrap();
+
+        assert!(mismatch_ok, "a mismatch is an answer, not a failure");
+        assert!(!mismatch, "a signature over a different payload is invalid");
+        assert!(
+            !undecodable_ok,
+            "an unverifiable signature must not be reported as invalid"
+        );
+        assert!(
+            undecodable.contains("invalid base64"),
+            "the error must name the cause, got: {undecodable}"
+        );
     }
 
     #[tokio::test]

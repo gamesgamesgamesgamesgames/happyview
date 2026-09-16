@@ -9,10 +9,47 @@ pub enum ProxyMode {
     Blocklist,
 }
 
+/// Where an unrecognized XRPC method is sent.
+///
+/// This is a separate axis from [`ProxyMode`], which only decides *whether* a
+/// method may be proxied at all. Conflating them was the shape of the original
+/// bug: the proxy had exactly one routing rule and no way to express another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyRouting {
+    /// Resolve the NSID's lexicon-publishing authority via `_lexicon` DNS and
+    /// forward there, unauthenticated.
+    ///
+    /// This answers "who defines this schema", not "who serves this request",
+    /// and the two have different answers. For `com.atproto.repo.*` it resolves
+    /// to the account that publishes the `com.atproto` lexicons, which has no
+    /// relationship to the caller's repo — the request arrives with no
+    /// credentials and is refused. Retained as the default so existing
+    /// instances are not changed underneath their clients.
+    Authority,
+    /// Forward to the caller's own PDS, authenticated as the caller, per the
+    /// AT Protocol service proxying model.
+    ///
+    /// With no `atproto-proxy` header the PDS handles the request itself, which
+    /// is what makes `com.atproto.repo.createRecord` work. With one, the header
+    /// is passed through and the PDS resolves the destination and mints the
+    /// inter-service token — HappyView cannot, since that token is signed by
+    /// the user's own identity key.
+    ServiceProxy,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub mode: ProxyMode,
     pub nsids: Vec<String>,
+    /// Defaulted so configurations stored before this field existed keep the
+    /// behaviour they were saved with.
+    #[serde(default = "default_routing")]
+    pub routing: ProxyRouting,
+}
+
+fn default_routing() -> ProxyRouting {
+    ProxyRouting::Authority
 }
 
 impl Default for ProxyConfig {
@@ -20,6 +57,7 @@ impl Default for ProxyConfig {
         Self {
             mode: ProxyMode::Open,
             nsids: vec![],
+            routing: default_routing(),
         }
     }
 }
@@ -45,45 +83,10 @@ fn nsid_matches(pattern: &str, nsid: &str) -> bool {
     }
 }
 
+/// Re-exported so `admin::proxy_config` keeps a stable import path. The rules
+/// live in `happyview-nsid` alongside every other NSID rule.
 pub fn validate_nsid_pattern(pattern: &str) -> Result<(), String> {
-    if pattern.is_empty() {
-        return Err("NSID pattern must not be empty".into());
-    }
-
-    let (base, is_wildcard) = if let Some(prefix) = pattern.strip_suffix(".*") {
-        (prefix, true)
-    } else {
-        (pattern, false)
-    };
-
-    let segments: Vec<&str> = base.split('.').collect();
-    if segments.len() < 2 {
-        return Err(format!(
-            "NSID pattern must have at least two segments: {pattern}"
-        ));
-    }
-
-    for segment in &segments {
-        if segment.is_empty() {
-            return Err(format!("NSID pattern has empty segment: {pattern}"));
-        }
-        if !segment
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
-            return Err(format!(
-                "NSID segment contains invalid characters: {pattern}"
-            ));
-        }
-    }
-
-    if !is_wildcard && segments.len() < 3 {
-        return Err(format!(
-            "Exact NSID must have at least three segments: {pattern}"
-        ));
-    }
-
-    Ok(())
+    happyview_nsid::validate_nsid_pattern(pattern).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -97,11 +100,36 @@ mod tests {
         assert!(config.nsids.is_empty());
     }
 
+    /// Routing must default to the legacy behaviour, including for configs
+    /// serialised before the field existed — an instance that never opted in
+    /// should not have its clients redirected by an upgrade.
+    #[test]
+    fn routing_defaults_to_authority() {
+        assert_eq!(ProxyConfig::default().routing, ProxyRouting::Authority);
+
+        let stored = r#"{"mode":"open","nsids":[]}"#;
+        let parsed: ProxyConfig = serde_json::from_str(stored).unwrap();
+        assert_eq!(parsed.routing, ProxyRouting::Authority);
+    }
+
+    #[test]
+    fn routing_roundtrips() {
+        let config = ProxyConfig {
+            mode: ProxyMode::Open,
+            nsids: vec![],
+            routing: ProxyRouting::ServiceProxy,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: ProxyConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.routing, ProxyRouting::ServiceProxy);
+    }
+
     #[test]
     fn disabled_blocks_everything() {
         let config = ProxyConfig {
             mode: ProxyMode::Disabled,
             nsids: vec![],
+            routing: ProxyRouting::Authority,
         };
         assert!(!config.allows("com.example.feed.getHot"));
         assert!(!config.allows("anything.at.all"));
@@ -112,6 +140,7 @@ mod tests {
         let config = ProxyConfig {
             mode: ProxyMode::Open,
             nsids: vec![],
+            routing: ProxyRouting::Authority,
         };
         assert!(config.allows("com.example.feed.getHot"));
         assert!(config.allows("anything.at.all"));
@@ -122,6 +151,7 @@ mod tests {
         let config = ProxyConfig {
             mode: ProxyMode::Allowlist,
             nsids: vec!["com.example.feed.getHot".into()],
+            routing: ProxyRouting::Authority,
         };
         assert!(config.allows("com.example.feed.getHot"));
         assert!(!config.allows("com.example.feed.getCold"));
@@ -132,6 +162,7 @@ mod tests {
         let config = ProxyConfig {
             mode: ProxyMode::Allowlist,
             nsids: vec!["com.example.*".into()],
+            routing: ProxyRouting::Authority,
         };
         assert!(config.allows("com.example.feed.getHot"));
         assert!(config.allows("com.example.anything"));
@@ -143,6 +174,7 @@ mod tests {
         let config = ProxyConfig {
             mode: ProxyMode::Blocklist,
             nsids: vec!["com.example.feed.getHot".into()],
+            routing: ProxyRouting::Authority,
         };
         assert!(!config.allows("com.example.feed.getHot"));
         assert!(config.allows("com.example.feed.getCold"));
@@ -153,6 +185,7 @@ mod tests {
         let config = ProxyConfig {
             mode: ProxyMode::Blocklist,
             nsids: vec!["com.example.*".into()],
+            routing: ProxyRouting::Authority,
         };
         assert!(!config.allows("com.example.feed.getHot"));
         assert!(config.allows("com.other.feed.getHot"));
@@ -163,6 +196,7 @@ mod tests {
         let config = ProxyConfig {
             mode: ProxyMode::Allowlist,
             nsids: vec!["com.example.*".into()],
+            routing: ProxyRouting::Authority,
         };
         assert!(
             !config.allows("com.example"),
@@ -197,10 +231,17 @@ mod tests {
     }
 
     #[test]
+    fn validate_digit_leading_authority_pattern() {
+        assert!(validate_nsid_pattern("pics.2bit.*").is_ok());
+        assert!(validate_nsid_pattern("pics.2bit.feed.getPhotos").is_ok());
+    }
+
+    #[test]
     fn roundtrip_json() {
         let config = ProxyConfig {
             mode: ProxyMode::Allowlist,
             nsids: vec!["com.example.*".into()],
+            routing: ProxyRouting::Authority,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: ProxyConfig = serde_json::from_str(&json).unwrap();

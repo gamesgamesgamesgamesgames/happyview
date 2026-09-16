@@ -3,6 +3,7 @@ import {
   HappyViewOAuthClient,
   OAuthCallbackError,
   TokenExchangeError,
+  jwkThumbprint,
   type StorageAdapter,
 } from "@happyview/oauth-client";
 import {
@@ -42,6 +43,14 @@ function mockFetchForFullFlow() {
     const url = input instanceof Request ? input.url : String(input);
 
     if (url.includes("dns.google")) {
+      const queriedName = new URL(url).searchParams.get("name");
+      if (queriedName !== "_atproto.user.bsky.social") {
+        // NXDOMAIN
+        return new Response(JSON.stringify({ Status: 3 }), {
+          status: 200,
+          headers: { "content-type": "application/dns-json" },
+        });
+      }
       return new Response(
         JSON.stringify({
           Status: 0,
@@ -144,6 +153,12 @@ function mockFetchForFullFlow() {
   });
 }
 
+function decodeJwtPart(jwt: string, index: 0 | 1): any {
+  const part = jwt.split(".")[index];
+  const padded = part + "=".repeat((4 - (part.length % 4)) % 4);
+  return JSON.parse(atob(padded.replace(/-/g, "+").replace(/_/g, "/")));
+}
+
 describe("HappyViewBrowserClient", () => {
   test("constructor sets up LocalStorageAdapter by default", () => {
     const client = new HappyViewBrowserClient({
@@ -182,6 +197,231 @@ describe("HappyViewBrowserClient", () => {
       localStorage.key(i),
     ).find((k) => k?.includes("pending-auth"));
     expect(stateKey).toBeDefined();
+  });
+
+  test("prepareLogin accepts a DID without resolving it as a handle", async () => {
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    const authInfo = await client.prepareLogin(
+      "did:plc:abcdefghijklmnopqrstuvwx",
+    );
+
+    expect(authInfo.did).toBe("did:plc:abcdefghijklmnopqrstuvwx");
+    expect(authInfo.authorizationUrl).toContain("pds.example.com");
+
+    const dohCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("dns.google"),
+    );
+    expect(dohCall).toBeUndefined();
+  });
+
+  test("prepareLogin sends a DID identifier as the login_hint", async () => {
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.prepareLogin("did:plc:abcdefghijklmnopqrstuvwx");
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    const body = (parCall![1] as RequestInit).body as URLSearchParams;
+    expect(body.get("login_hint")).toBe("did:plc:abcdefghijklmnopqrstuvwx");
+  });
+
+  test("prepareLogin binds the PAR request to the provisioned DPoP key", async () => {
+    // ⚠ AN UNBOUND PAR IS OFF-SPEC AND SOME PDS IMPLEMENTATIONS REJECT IT
+    // OUTRIGHT. bsky's PDS tolerated a PAR carrying neither a `DPoP` header nor
+    // `dpop_jkt`, but that tolerance is on a deprecation notice and other
+    // implementations (cocoon) fail on it. The client provisions the key
+    // itself, so nothing outside the SDK can supply the binding.
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.prepareLogin("user.bsky.social");
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    expect(parCall).toBeDefined();
+
+    const body = (parCall![1] as RequestInit).body as URLSearchParams;
+    expect(body.get("dpop_jkt")).toBe(await jwkThumbprint(testJwk));
+  });
+
+  test("prepareLogin lets an explicit dpop_jkt override the derived one", async () => {
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.prepareLogin("user.bsky.social", {
+      dpop_jkt: "caller-supplied",
+    });
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    const body = (parCall![1] as RequestInit).body as URLSearchParams;
+    expect(body.get("dpop_jkt")).toBe("caller-supplied");
+  });
+
+  test("prepareLogin proves possession of the DPoP key on the PAR request", async () => {
+    // `dpop_jkt` alone only promises which key will turn up later; servers that
+    // enforce DPoP on PAR want the proof itself.
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.prepareLogin("user.bsky.social");
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    const proof = new Headers((parCall![1] as RequestInit).headers).get("dpop")!;
+    expect(proof).toBeDefined();
+
+    const header = decodeJwtPart(proof, 0);
+    const payload = decodeJwtPart(proof, 1);
+    expect(header.typ).toBe("dpop+jwt");
+    expect(await jwkThumbprint(header.jwk)).toBe(await jwkThumbprint(testJwk));
+    expect(payload.htm).toBe("POST");
+    expect(payload.htu).toBe("https://pds.example.com/oauth/par");
+    expect(payload.nonce).toBeUndefined();
+  });
+
+  test("prepareLogin omits the PAR proof when the caller binds a key of their own", async () => {
+    // A caller-supplied `dpop_jkt` names a key this client cannot sign with, and
+    // RFC 9449 §10.1 requires the two bindings to agree when both are sent.
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.prepareLogin("user.bsky.social", {
+      dpop_jkt: "caller-supplied",
+    });
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    expect(new Headers((parCall![1] as RequestInit).headers).get("dpop")).toBe(
+      null,
+    );
+  });
+
+  test("prepareLogin retries the PAR request with the nonce the server demands", async () => {
+    let parAttempt = 0;
+    const inner = mockFetchForFullFlow();
+    const fetchFn = mock(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.includes("/oauth/par")) {
+          parAttempt++;
+          if (parAttempt === 1) {
+            return new Response(JSON.stringify({ error: "use_dpop_nonce" }), {
+              status: 400,
+              headers: { "dpop-nonce": "par-nonce-123" },
+            });
+          }
+        }
+        return inner(input, init);
+      },
+    );
+    const client = createClient(fetchFn as unknown as typeof globalThis.fetch);
+
+    const { authorizationUrl } = await client.prepareLogin("user.bsky.social");
+
+    expect(parAttempt).toBe(2);
+    expect(authorizationUrl).toContain("request_uri");
+
+    const retryCall = fetchFn.mock.calls.filter((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    )[1];
+    const proof = new Headers((retryCall![1] as RequestInit).headers).get(
+      "dpop",
+    )!;
+    expect(decodeJwtPart(proof, 1).nonce).toBe("par-nonce-123");
+  });
+
+  test("prepareLogin stops retrying PAR after a bounded number of nonce challenges", async () => {
+    // A server that answers every proof with a fresh challenge must not spin
+    // this loop forever.
+    let parAttempt = 0;
+    const inner = mockFetchForFullFlow();
+    const fetchFn = mock(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.includes("/oauth/par")) {
+          parAttempt++;
+          return new Response(JSON.stringify({ error: "use_dpop_nonce" }), {
+            status: 400,
+            headers: { "dpop-nonce": `par-nonce-${parAttempt}` },
+          });
+        }
+        return inner(input, init);
+      },
+    );
+    const client = createClient(fetchFn as unknown as typeof globalThis.fetch);
+
+    await expect(client.prepareLogin("user.bsky.social")).rejects.toThrow(
+      /PAR request failed/,
+    );
+    expect(parAttempt).toBe(2);
+  });
+
+  test("prepareLogin binds the direct authorization URL when the server has no PAR endpoint", async () => {
+    // The no-PAR fallback builds the same params into a query string and needs
+    // the same binding, or the fallback path stays off-spec.
+    const inner = mockFetchForFullFlow();
+    const fetchFn = mock(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.includes(".well-known/oauth-authorization-server")) {
+          return new Response(
+            JSON.stringify({
+              issuer: "https://pds.example.com",
+              authorization_endpoint: "https://pds.example.com/oauth/authorize",
+              token_endpoint: "https://pds.example.com/oauth/token",
+            }),
+            { status: 200 },
+          );
+        }
+        return inner(input, init);
+      },
+    );
+    const client = createClient(fetchFn as unknown as typeof globalThis.fetch);
+
+    const { authorizationUrl } = await client.prepareLogin("user.bsky.social");
+
+    const params = new URL(authorizationUrl).searchParams;
+    expect(params.get("dpop_jkt")).toBe(await jwkThumbprint(testJwk));
+  });
+
+  test("the PAR dpop_jkt matches the key that proves possession at the token endpoint", async () => {
+    // ⚠ THIS IS THE INVARIANT THE WHOLE BINDING RESTS ON. `dpop_jkt` is a
+    // promise to the authorization server about which key will show up at the
+    // token endpoint; if the two ever come from different keys the server is
+    // right to reject the exchange, and the failure lands at `callback` rather
+    // than where the mismatch was introduced. Asserted across a real
+    // prepareLogin → callback pair rather than within either one.
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    const { state } = await client.prepareLogin("user.bsky.social");
+    await client.callback(`?code=auth-code-123&state=${state}`);
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    const jkt = ((parCall![1] as RequestInit).body as URLSearchParams).get(
+      "dpop_jkt",
+    );
+
+    const tokenCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/token"),
+    );
+    const proof = new Headers((tokenCall![1] as RequestInit).headers).get(
+      "dpop",
+    )!;
+    const proofHeader = JSON.parse(atob(proof.split(".")[0]));
+
+    expect(jkt).toBe(await jwkThumbprint(proofHeader.jwk));
   });
 
   test("callback exchanges code for tokens with DPoP proof and registers session", async () => {
@@ -460,8 +700,12 @@ describe("HappyViewBrowserClient", () => {
     } catch (err) {
       expect(err).toBeInstanceOf(OAuthCallbackError);
       expect((err as OAuthCallbackError).state).toBe("statefail");
-      expect((err as OAuthCallbackError).cause).toBeInstanceOf(TokenExchangeError);
-      expect(((err as OAuthCallbackError).cause as TokenExchangeError).status).toBe(400);
+      expect((err as OAuthCallbackError).cause).toBeInstanceOf(
+        TokenExchangeError,
+      );
+      expect(
+        ((err as OAuthCallbackError).cause as TokenExchangeError).status,
+      ).toBe(400);
     }
   });
 
@@ -839,44 +1083,43 @@ describe("HappyViewBrowserClient", () => {
 
   test("callback retries with DPoP nonce on use_dpop_nonce error", async () => {
     let tokenAttempt = 0;
-    const fetchFn = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = input instanceof Request ? input.url : String(input);
+    const fetchFn = mock(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
 
-      if (url.includes("/oauth/token")) {
-        tokenAttempt++;
-        if (tokenAttempt === 1) {
-          return new Response(
-            JSON.stringify({ error: "use_dpop_nonce" }),
-            {
+        if (url.includes("/oauth/token")) {
+          tokenAttempt++;
+          if (tokenAttempt === 1) {
+            return new Response(JSON.stringify({ error: "use_dpop_nonce" }), {
               status: 400,
               headers: { "dpop-nonce": "server-nonce-123" },
-            },
+            });
+          }
+          return new Response(
+            JSON.stringify({
+              access_token: "at_test_token",
+              refresh_token: "rt_test_token",
+              scope: "atproto",
+              sub: "did:plc:abcdefghijklmnopqrstuvwx",
+              iss: "https://pds.example.com",
+            }),
+            { status: 200 },
           );
         }
-        return new Response(
-          JSON.stringify({
-            access_token: "at_test_token",
-            refresh_token: "rt_test_token",
-            scope: "atproto",
-            sub: "did:plc:abcdefghijklmnopqrstuvwx",
-            iss: "https://pds.example.com",
-          }),
-          { status: 200 },
-        );
-      }
 
-      if (url.includes("/oauth/sessions") && init?.method === "POST") {
-        return new Response(
-          JSON.stringify({
-            session_id: "sess_test",
-            did: "did:plc:abcdefghijklmnopqrstuvwx",
-          }),
-          { status: 201 },
-        );
-      }
+        if (url.includes("/oauth/sessions") && init?.method === "POST") {
+          return new Response(
+            JSON.stringify({
+              session_id: "sess_test",
+              did: "did:plc:abcdefghijklmnopqrstuvwx",
+            }),
+            { status: 201 },
+          );
+        }
 
-      return new Response("not found", { status: 404 });
-    });
+        return new Response("not found", { status: 404 });
+      },
+    );
 
     const client = createClient(fetchFn);
 
@@ -906,8 +1149,7 @@ describe("HappyViewBrowserClient", () => {
       (secondTokenCall![1] as RequestInit).headers,
     ).get("dpop")!;
     const payloadB64 = dpopJwt.split(".")[1];
-    const padded =
-      payloadB64 + "=".repeat((4 - (payloadB64.length % 4)) % 4);
+    const padded = payloadB64 + "=".repeat((4 - (payloadB64.length % 4)) % 4);
     const payload = JSON.parse(
       atob(padded.replace(/-/g, "+").replace(/_/g, "/")),
     );

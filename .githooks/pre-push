@@ -1,0 +1,27 @@
+#!/bin/sh
+
+# Exhaustive lint, moved here from pre-commit.
+#
+# `--all-targets` adds the lib compiled with `--cfg test` plus all 42
+# integration test binaries: ~45 compilation units on top of the ~4 that a
+# source change alone needs, almost all of them link steps. That is worth
+# paying once per push, but not once per commit — and especially not once per
+# `git commit --amend`.
+#
+# What it buys: the 737 `#[cfg(test)]` unit tests inside src/ and the tests/
+# binaries are type-checked and linted. Without it, "the tests no longer
+# compile" is not discoverable until CI.
+#
+# CI runs this same command (.github/workflows/ci.yml), so this hook is about
+# finding out before the push round-trip, not about protecting the branch.
+#
+# CARGO_TARGET_DIR keeps clippy out of the directory `cargo test` and `cargo
+# build` use. Clippy runs a different rustc wrapper, so sharing a target dir
+# makes the two invalidate each other's cache and rebuild the world on every
+# alternation. It matches pre-commit's, so the two clippy runs share artifacts.
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target/clippy}" cargo clippy --all-targets -- -D warnings
+if [ $? -ne 0 ]; then
+    echo "clippy check failed. Fix the warnings above."
+    echo "To push anyway: git push --no-verify"
+    exit 1
+fi

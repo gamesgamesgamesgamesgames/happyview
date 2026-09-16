@@ -22,8 +22,12 @@ pub struct UserAuth {
 }
 
 impl UserAuth {
+    pub fn has(&self, permission: Permission) -> bool {
+        self.is_super || self.permissions.contains(&permission)
+    }
+
     pub async fn require(&self, permission: Permission) -> Result<(), AppError> {
-        if self.is_super || self.permissions.contains(&permission) {
+        if self.has(permission) {
             Ok(())
         } else {
             log_event(

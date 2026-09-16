@@ -3,7 +3,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::{SigningKey, signature::Signer};
 use sha2::{Digest, Sha256};
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use crate::auth::OAuthClientRegistry;
 use crate::db::DatabaseBackend;
@@ -17,6 +18,32 @@ struct DpopCredentials {
     session: DpopSession,
     pds_url: String,
     private_jwk: serde_json::Value,
+}
+
+/// Load and decrypt a provisioned DPoP private key.
+async fn load_dpop_private_jwk(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+    dpop_key_id: &str,
+) -> Result<serde_json::Value, AppError> {
+    let key_sql = crate::db::adapt_sql(
+        "SELECT private_key_enc FROM happyview_dpop_keys WHERE id = ?",
+        backend,
+    );
+    let row: Option<(Vec<u8>,)> = crate::db::query_as(&key_sql)
+        .bind(dpop_key_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to look up DPoP key: {e}")))?;
+
+    let (encrypted_key,) = row.ok_or_else(|| AppError::Internal("DPoP key not found".into()))?;
+
+    let key_bytes = decrypt(encryption_key, &encrypted_key)
+        .map_err(|e| AppError::Internal(format!("failed to decrypt DPoP key: {e}")))?;
+
+    serde_json::from_slice(&key_bytes)
+        .map_err(|e| AppError::Internal(format!("failed to parse DPoP key: {e}")))
 }
 
 /// Resolve DPoP credentials: session, PDS URL, and decrypted private key.
@@ -46,23 +73,8 @@ async fn resolve_credentials(
         None => resolve_pds_from_did(http, plc_url, user_did).await?,
     };
 
-    let key_sql = crate::db::adapt_sql(
-        "SELECT private_key_enc FROM happyview_dpop_keys WHERE id = ?",
-        backend,
-    );
-    let row: Option<(Vec<u8>,)> = crate::db::query_as(&key_sql)
-        .bind(&session.dpop_key_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to look up DPoP key: {e}")))?;
-
-    let (encrypted_key,) = row.ok_or_else(|| AppError::Internal("DPoP key not found".into()))?;
-
-    let key_bytes = decrypt(encryption_key, &encrypted_key)
-        .map_err(|e| AppError::Internal(format!("failed to decrypt DPoP key: {e}")))?;
-
-    let private_jwk: serde_json::Value = serde_json::from_slice(&key_bytes)
-        .map_err(|e| AppError::Internal(format!("failed to parse DPoP key: {e}")))?;
+    let private_jwk =
+        load_dpop_private_jwk(pool, backend, encryption_key, &session.dpop_key_id).await?;
 
     Ok(DpopCredentials {
         session,
@@ -71,67 +83,215 @@ async fn resolve_credentials(
     })
 }
 
-/// Make an authenticated POST, handling DPoP nonce negotiation and token refresh.
+/// A response whose body has been read.
+///
+/// Deciding whether to retry means inspecting the body, and reading a
+/// `reqwest::Response` consumes it. Buffering first is what lets the retry
+/// logic distinguish "the server wants a nonce" from "the record you sent is
+/// invalid" — both of which can arrive as a 4xx carrying a `dpop-nonce` header.
+struct BufferedResponse {
+    status: reqwest::StatusCode,
+    headers: reqwest::header::HeaderMap,
+    body: bytes::Bytes,
+}
+
+impl BufferedResponse {
+    async fn read(resp: reqwest::Response) -> Result<Self, AppError> {
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
+        Ok(Self {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    fn dpop_nonce(&self) -> Option<String> {
+        self.headers
+            .get("dpop-nonce")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    fn www_authenticate(&self) -> Option<&str> {
+        self.headers
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+    }
+
+    /// The `error` field of a JSON error body, if there is one.
+    fn body_error(&self) -> Option<String> {
+        serde_json::from_slice::<serde_json::Value>(&self.body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+    }
+
+    /// Is the server asking us to retry with a (new) nonce?
+    ///
+    /// A `dpop-nonce` header alone is not the signal: PDS implementations
+    /// attach one to *every* error response, so keying off it meant a 400 for a
+    /// malformed record was read as a nonce challenge and the write was resent
+    /// unchanged.
+    ///
+    /// The header is necessary but not sufficient. Beyond it we accept an
+    /// explicit `use_dpop_nonce` in `WWW-Authenticate` or the body — and, for a
+    /// 401 only, a response that names no error we recognise. That last case is
+    /// deliberate leniency: a 401 with a fresh nonce and no other explanation is
+    /// what an unadorned nonce challenge looks like, and refusing to retry it
+    /// would break a PDS that is merely terse. A 400 gets no such benefit,
+    /// which is what fixes the resent-write bug.
+    fn wants_dpop_nonce(&self) -> bool {
+        if self.dpop_nonce().is_none() {
+            return false;
+        }
+
+        let explicit = self
+            .www_authenticate()
+            .is_some_and(|h| h.contains("use_dpop_nonce"))
+            || self.body_error().as_deref() == Some("use_dpop_nonce");
+
+        if explicit {
+            return true;
+        }
+
+        self.status == reqwest::StatusCode::UNAUTHORIZED && self.body_error().is_none()
+    }
+
+    /// Would refreshing the access token plausibly help?
+    ///
+    /// Only an invalid or expired *token* is worth a refresh. Treating every
+    /// 401 as expiry — which is what `is_expired_token` used to do — meant an
+    /// insufficient-scope or revoked-grant response triggered a refresh, and a
+    /// refresh that came back `invalid_grant` **deleted the user's session**.
+    /// An unrelated 401 could therefore destroy a working login.
+    ///
+    /// Both spellings are accepted: OAuth uses `invalid_token` in
+    /// `WWW-Authenticate`, while an atproto XRPC error body names
+    /// `InvalidToken` or `ExpiredToken`.
+    fn indicates_invalid_token(&self) -> bool {
+        if self.status != reqwest::StatusCode::UNAUTHORIZED {
+            return false;
+        }
+        if self
+            .www_authenticate()
+            .is_some_and(|h| h.contains("invalid_token"))
+        {
+            return true;
+        }
+        matches!(
+            self.body_error().as_deref(),
+            Some("invalid_token" | "InvalidToken" | "ExpiredToken")
+        )
+    }
+
+    /// Rebuild a `reqwest::Response` for the caller. Status, headers and body
+    /// are preserved so downstream relaying is unchanged.
+    fn into_response(self) -> Result<reqwest::Response, AppError> {
+        let mut builder = atrium_xrpc::http::Response::builder().status(self.status);
+        if let Some(headers) = builder.headers_mut() {
+            *headers = self.headers;
+        }
+        let resp = builder
+            .body(self.body)
+            .map_err(|e| AppError::Internal(format!("failed to rebuild PDS response: {e}")))?;
+        Ok(reqwest::Response::from(resp))
+    }
+}
+
+/// How many times a single request may be re-sent to negotiate a nonce.
+///
+/// Nonces rotate, so one retry is not always enough: a server may hand back a
+/// fresh nonce with the retried request's own rejection. The old code tried
+/// exactly once and then fell through to a token refresh, which could not help.
+const MAX_NONCE_ATTEMPTS: usize = 3;
+
+/// Which responses count as "the server wants a (new) nonce".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NoncePolicy {
+    Resource,
+    AuthServer,
+}
+
+impl NoncePolicy {
+    fn wants_retry(self, resp: &BufferedResponse) -> bool {
+        match self {
+            NoncePolicy::Resource => resp.wants_dpop_nonce(),
+            NoncePolicy::AuthServer => {
+                resp.dpop_nonce().is_some()
+                    && is_use_dpop_nonce_error(&String::from_utf8_lossy(&resp.body))
+            }
+        }
+    }
+}
+
+/// Send a DPoP-signed request, renegotiating the nonce as far as the policy and
+/// `MAX_NONCE_ATTEMPTS` allow, and hand back the last response with the nonce
+/// that produced it.
+async fn send_with_nonce_retry<F>(
+    policy: NoncePolicy,
+    initial_nonce: Option<String>,
+    context: &str,
+    mut build: F,
+) -> Result<(BufferedResponse, Option<String>), AppError>
+where
+    F: FnMut(Option<&str>) -> Result<reqwest::RequestBuilder, AppError>,
+{
+    let mut nonce = initial_nonce;
+
+    for attempt in 0..MAX_NONCE_ATTEMPTS {
+        let resp = build(nonce.as_deref())?
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("{context} failed: {e}")))?;
+
+        let buffered = BufferedResponse::read(resp).await?;
+
+        if policy.wants_retry(&buffered) {
+            let fresh = buffered.dpop_nonce();
+            if fresh.is_some() && fresh != nonce && attempt + 1 < MAX_NONCE_ATTEMPTS {
+                nonce = fresh;
+                continue;
+            }
+        }
+
+        return Ok((buffered, nonce));
+    }
+
+    Err(AppError::Internal(format!(
+        "{context}: DPoP nonce negotiation exhausted"
+    )))
+}
+
+/// Make an authenticated request, handling DPoP nonce negotiation and token
+/// refresh.
 #[allow(clippy::too_many_arguments)]
-async fn dpop_post_with_retry(
+async fn dpop_request_with_retry(
     http: &reqwest::Client,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     encryption_key: &[u8; 32],
     oauth_registry: &Arc<OAuthClientRegistry>,
     creds: &mut DpopCredentials,
+    http_method: &str,
     target_url: &str,
     request_builder: impl Fn(&reqwest::Client, &str, &str) -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, AppError> {
-    let proof = generate_dpop_proof(
-        &creds.private_jwk,
-        "POST",
-        target_url,
-        &creds.session.access_token,
-        None,
-    )?;
+    let access_token = creds.session.access_token.clone();
+    let private_jwk = creds.private_jwk.clone();
 
-    let resp = request_builder(http, &creds.session.access_token, &proof)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("PDS request failed: {e}")))?;
+    let (buffered, nonce) =
+        send_with_nonce_retry(NoncePolicy::Resource, None, "PDS request", |nonce| {
+            let proof =
+                generate_dpop_proof(&private_jwk, http_method, target_url, &access_token, nonce)?;
+            Ok(request_builder(http, &access_token, &proof))
+        })
+        .await?;
 
-    // Handle DPoP nonce requirement
-    if let Some(nonce) = extract_dpop_nonce(&resp) {
-        let proof = generate_dpop_proof(
-            &creds.private_jwk,
-            "POST",
-            target_url,
-            &creds.session.access_token,
-            Some(&nonce),
-        )?;
-
-        let resp = request_builder(http, &creds.session.access_token, &proof)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("PDS request failed: {e}")))?;
-
-        // If we still get invalid_token after nonce, try refresh
-        if is_expired_token(&resp) {
-            return retry_after_refresh(
-                http,
-                pool,
-                backend,
-                encryption_key,
-                oauth_registry,
-                creds,
-                target_url,
-                Some(&nonce),
-                &request_builder,
-            )
-            .await;
-        }
-
-        return Ok(resp);
-    }
-
-    // Handle expired token
-    if is_expired_token(&resp) {
+    if buffered.indicates_invalid_token() {
         return retry_after_refresh(
             http,
             pool,
@@ -139,20 +299,42 @@ async fn dpop_post_with_retry(
             encryption_key,
             oauth_registry,
             creds,
+            http_method,
             target_url,
-            None,
+            nonce.as_deref(),
             &request_builder,
         )
         .await;
     }
 
-    Ok(resp)
+    buffered.into_response()
+}
+
+/// Serialised refresh slots, keyed by the session a refresh would rewrite.
+static REFRESH_LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// The refresh slot for one session, created on first use.
+fn refresh_lock(
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    // Unit separator: it cannot occur in a client id, DID or key id, so no
+    // combination of the three can collide with a different triple.
+    let key = format!("{api_client_id}\u{1f}{user_did}\u{1f}{dpop_key_id}");
+    let mut locks = REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    // Bound memory: drop slots nobody is waiting on once the map grows large.
+    if locks.len() > 10_000 {
+        locks.retain(|_, slot| Arc::strong_count(slot) > 1);
+    }
+    locks
+        .entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 /// Refresh the access token and retry the PDS request.
-///
-/// If the refresh fails with `invalid_grant`, re-reads the session from the
-/// database — a concurrent request may have already refreshed the token.
 #[allow(clippy::too_many_arguments)]
 async fn retry_after_refresh(
     http: &reqwest::Client,
@@ -161,96 +343,105 @@ async fn retry_after_refresh(
     encryption_key: &[u8; 32],
     oauth_registry: &Arc<OAuthClientRegistry>,
     creds: &mut DpopCredentials,
+    http_method: &str,
     target_url: &str,
     nonce: Option<&str>,
     request_builder: &impl Fn(&reqwest::Client, &str, &str) -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, AppError> {
     let stale_access_token = creds.session.access_token.clone();
+    let api_client_id = creds.session.api_client_id.clone();
+    let user_did = creds.session.user_did.clone();
+    let dpop_key_id = creds.session.dpop_key_id.clone();
 
-    if let Err(e) =
-        refresh_access_token(http, pool, backend, encryption_key, oauth_registry, creds).await
+    // Scoped so the slot is released before the retried PDS request goes out —
+    // it guards the refresh, not the work that follows it.
     {
-        // If the refresh token was rejected, check whether a concurrent request
-        // already refreshed the session. Re-read from the database and compare
-        // the access token — if it changed, another refresh succeeded.
-        if is_invalid_grant_error(&e) {
+        let slot = refresh_lock(&api_client_id, &user_did, &dpop_key_id);
+        let _guard = slot.lock().await;
+
+        // Whoever held this slot before us may already have done the work.
+        // Re-reading here is what collapses N concurrent refreshes into one.
+        let fresh_session = super::sessions::get_dpop_session(
+            pool,
+            backend,
+            encryption_key,
+            &api_client_id,
+            &user_did,
+            &dpop_key_id,
+        )
+        .await?;
+
+        if fresh_session.access_token != stale_access_token {
+            tracing::debug!(
+                %user_did,
+                %api_client_id,
+                "another request refreshed this session, using its token"
+            );
+            creds.session = fresh_session;
+        } else if let Err(e) =
+            refresh_access_token(http, pool, backend, encryption_key, oauth_registry, creds).await
+        {
+            if !is_invalid_grant_error(&e) {
+                return Err(e);
+            }
+
+            // We hold the slot, so nothing in this process refreshed behind our
+            // back — but another instance may have. Re-read once before
+            // concluding anything about the grant.
             let fresh_session = super::sessions::get_dpop_session(
                 pool,
                 backend,
                 encryption_key,
-                &creds.session.api_client_id,
-                &creds.session.user_did,
-                &creds.session.dpop_key_id,
+                &api_client_id,
+                &user_did,
+                &dpop_key_id,
             )
             .await?;
 
             if fresh_session.access_token != stale_access_token {
                 tracing::info!(
-                    user_did = %creds.session.user_did,
-                    api_client_id = %creds.session.api_client_id,
+                    %user_did,
+                    %api_client_id,
                     "concurrent refresh detected, using updated token"
                 );
                 creds.session = fresh_session;
             } else {
-                // Session is unrecoverable — clean it up so future requests
-                // fail fast instead of repeating the same doomed refresh.
+                // ⚠ NOTHING IS DELETED HERE, AND THAT IS THE POINT. This used
+                // to call `delete_dpop_session`, which drops the session row
+                // *and* the `happyview_dpop_keys` row it depends on — so a
+                // client holding that key was not logged out, it was wedged:
+                // every later call 401s, including the `DELETE
+                // /oauth/sessions/{did}` that logout itself needs.
                 tracing::warn!(
-                    user_did = %creds.session.user_did,
-                    api_client_id = %creds.session.api_client_id,
-                    "refresh token permanently invalid, deleting broken session"
+                    %user_did,
+                    %api_client_id,
+                    "refresh token rejected and no concurrent refresh found; session left intact for re-authentication"
                 );
-                if let Err(del_err) = super::sessions::delete_dpop_session(
-                    pool,
-                    backend,
-                    &creds.session.api_client_id,
-                    &creds.session.user_did,
-                    &creds.session.dpop_key_id,
-                )
-                .await
-                {
-                    tracing::error!(%del_err, "failed to delete broken DPoP session");
-                }
                 return Err(AppError::Auth(
                     "session expired, please re-authenticate".into(),
                 ));
             }
-        } else {
-            return Err(e);
         }
     }
 
-    let proof = generate_dpop_proof(
-        &creds.private_jwk,
-        "POST",
-        target_url,
-        &creds.session.access_token,
-        nonce,
-    )?;
+    // The refreshed token needs its own nonce negotiation: the nonce is bound
+    // to the proof, not the token, but a server may rotate it on the way past.
+    let access_token = creds.session.access_token.clone();
+    let private_jwk = creds.private_jwk.clone();
 
-    let resp = request_builder(http, &creds.session.access_token, &proof)
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("PDS request failed after token refresh: {e}")))?;
+    let (buffered, _) = send_with_nonce_retry(
+        NoncePolicy::Resource,
+        nonce.map(str::to_string),
+        "PDS request",
+        |nonce| {
+            let proof =
+                generate_dpop_proof(&private_jwk, http_method, target_url, &access_token, nonce)?;
+            Ok(request_builder(http, &access_token, &proof))
+        },
+    )
+    .await?;
 
-    // One more nonce negotiation attempt after refresh
-    if let Some(new_nonce) = extract_dpop_nonce(&resp) {
-        let proof = generate_dpop_proof(
-            &creds.private_jwk,
-            "POST",
-            target_url,
-            &creds.session.access_token,
-            Some(&new_nonce),
-        )?;
-
-        let resp = request_builder(http, &creds.session.access_token, &proof)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("PDS request failed: {e}")))?;
-
-        return Ok(resp);
-    }
-
-    Ok(resp)
+    buffered.into_response()
 }
 
 fn is_invalid_grant_error(e: &AppError) -> bool {
@@ -292,13 +483,14 @@ pub async fn dpop_pds_post(
 
     let body = body.clone();
     let target = target_url.clone();
-    dpop_post_with_retry(
+    dpop_request_with_retry(
         http,
         pool,
         backend,
         encryption_key,
         oauth_registry,
         &mut creds,
+        "POST",
         &target_url,
         |http, access_token, proof| {
             http.post(&target)
@@ -306,6 +498,142 @@ pub async fn dpop_pds_post(
                 .header("DPoP", proof)
                 .header("Content-Type", "application/json")
                 .json(&body)
+        },
+    )
+    .await
+}
+
+/// As [`dpop_pds_post`], additionally forwarding `extra_headers` verbatim.
+///
+/// The headers are attached on every attempt, including nonce retries and the
+/// retry after a token refresh — dropping them on a retry would send a
+/// materially different request than the one that was retried.
+#[allow(clippy::too_many_arguments)]
+pub async fn dpop_pds_post_with_headers(
+    http: &reqwest::Client,
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+    oauth_registry: &Arc<OAuthClientRegistry>,
+    plc_url: &str,
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+    xrpc_method: &str,
+    body: &serde_json::Value,
+    extra_headers: &[(String, String)],
+) -> Result<reqwest::Response, AppError> {
+    let mut creds = resolve_credentials(
+        http,
+        pool,
+        backend,
+        encryption_key,
+        plc_url,
+        api_client_id,
+        user_did,
+        dpop_key_id,
+    )
+    .await?;
+
+    let target_url = format!(
+        "{}/xrpc/{}",
+        creds.pds_url.trim_end_matches('/'),
+        xrpc_method
+    );
+
+    let body = body.clone();
+    let target = target_url.clone();
+    let extra: Vec<(String, String)> = extra_headers.to_vec();
+    dpop_request_with_retry(
+        http,
+        pool,
+        backend,
+        encryption_key,
+        oauth_registry,
+        &mut creds,
+        "POST",
+        &target_url,
+        move |http, access_token, proof| {
+            let mut request = http
+                .post(&target)
+                .header("Authorization", format!("DPoP {access_token}"))
+                .header("DPoP", proof)
+                .header("Content-Type", "application/json");
+            for (name, value) in &extra {
+                request = request.header(name, value);
+            }
+            request.json(&body)
+        },
+    )
+    .await
+}
+
+/// Make an authenticated GET to a PDS XRPC endpoint using a DPoP session.
+///
+/// `query` is the raw query string, forwarded verbatim so repeated parameters
+/// survive — re-encoding through a map would collapse `?a=1&a=2`.
+#[allow(clippy::too_many_arguments)]
+pub async fn dpop_pds_get(
+    http: &reqwest::Client,
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+    oauth_registry: &Arc<OAuthClientRegistry>,
+    plc_url: &str,
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+    xrpc_method: &str,
+    query: &str,
+    extra_headers: &[(String, String)],
+) -> Result<reqwest::Response, AppError> {
+    let mut creds = resolve_credentials(
+        http,
+        pool,
+        backend,
+        encryption_key,
+        plc_url,
+        api_client_id,
+        user_did,
+        dpop_key_id,
+    )
+    .await?;
+
+    // The proof's `htu` is the target URI **without** query or fragment
+    // (RFC 9449 §4.2), so the proof is generated against this bare URL while
+    // the request itself carries the query. For POST the two were always the
+    // same, which is why this distinction has not come up before.
+    let proof_url = format!(
+        "{}/xrpc/{}",
+        creds.pds_url.trim_end_matches('/'),
+        xrpc_method
+    );
+
+    let mut request_url = proof_url.clone();
+    if !query.is_empty() {
+        request_url.push('?');
+        request_url.push_str(query);
+    }
+
+    let extra: Vec<(String, String)> = extra_headers.to_vec();
+    dpop_request_with_retry(
+        http,
+        pool,
+        backend,
+        encryption_key,
+        oauth_registry,
+        &mut creds,
+        "GET",
+        &proof_url,
+        move |http, access_token, proof| {
+            let mut request = http
+                .get(&request_url)
+                .header("Authorization", format!("DPoP {access_token}"))
+                .header("DPoP", proof);
+            for (name, value) in &extra {
+                request = request.header(name, value);
+            }
+            request
         },
     )
     .await
@@ -345,13 +673,14 @@ pub async fn dpop_pds_post_blob(
 
     let content_type = content_type.to_string();
     let target = target_url.clone();
-    dpop_post_with_retry(
+    dpop_request_with_retry(
         http,
         pool,
         backend,
         encryption_key,
         oauth_registry,
         &mut creds,
+        "POST",
         &target_url,
         |http, access_token, proof| {
             http.post(&target)
@@ -364,23 +693,31 @@ pub async fn dpop_pds_post_blob(
     .await
 }
 
-/// Check if a response is a 401 with an expired/invalid token error.
-fn is_expired_token(resp: &reqwest::Response) -> bool {
-    resp.status() == reqwest::StatusCode::UNAUTHORIZED
-}
-
-/// Check if a response indicates that a DPoP nonce is required, and extract it.
-fn extract_dpop_nonce(resp: &reqwest::Response) -> Option<String> {
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-        || resp.status() == reqwest::StatusCode::BAD_REQUEST
-    {
-        resp.headers()
-            .get("dpop-nonce")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-    } else {
-        None
+/// Build the token-endpoint form for a refresh, with client authentication
+/// when the client is confidential.
+///
+/// Used at both the initial attempt and the nonce-retry call site, so the two
+/// cannot drift: a confidential client's assertion must be present either
+/// way, or a nonce retry would silently downgrade to an unauthenticated
+/// refresh.
+fn build_refresh_form(
+    refresh_token: &str,
+    client_id: &str,
+    assertion: Option<String>,
+) -> Vec<(&'static str, String)> {
+    let mut form = vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("refresh_token", refresh_token.to_string()),
+        ("client_id", client_id.to_string()),
+    ];
+    if let Some(assertion) = assertion {
+        form.push((
+            "client_assertion_type",
+            super::client_assertion::CLIENT_ASSERTION_TYPE.to_string(),
+        ));
+        form.push(("client_assertion", assertion));
     }
+    form
 }
 
 /// Refresh an expired access token using the session's refresh_token.
@@ -423,65 +760,74 @@ async fn refresh_access_token(
         .get_resolved_client_id(&client_id_url)
         .unwrap_or(client_id_url);
 
-    let proof = generate_dpop_proof_no_ath(&creds.private_jwk, "POST", &token_endpoint, None)?;
+    let keys = super::client_keys::load_keys(
+        pool,
+        backend,
+        Some(encryption_key),
+        &creds.session.api_client_id,
+    )
+    .await?;
+    let resolved =
+        super::client_keys::resolve_signing_key(&keys, creds.session.signing_kid.as_deref())?;
 
-    let resp = http
-        .post(&token_endpoint)
-        .header("DPoP", &proof)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", &client_id),
-        ])
-        .send()
+    if creds.session.signing_kid.is_none()
+        && let Some(key) = resolved
+        && let Err(e) = crate::auth::oauth_store::stamp_signing_kid_if_unset(
+            pool,
+            backend,
+            "happyview_dpop_sessions",
+            "id",
+            &creds.session.id,
+            &key.kid,
+        )
         .await
-        .map_err(|e| AppError::Internal(format!("token refresh request failed: {e}")))?;
+    {
+        tracing::warn!(
+            error = %e,
+            session_id = %creds.session.id,
+            "failed to lazily stamp DPoP session signing_kid"
+        );
+    }
 
-    let status = resp.status();
-    let dpop_nonce = resp
-        .headers()
-        .get("dpop-nonce")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let body = resp.text().await.unwrap_or_default();
+    let assertion = match resolved {
+        Some(key) => Some(super::client_assertion::build(
+            &key.private_jwk,
+            &key.kid,
+            &client_id,
+            issuer,
+        )?),
+        None => None,
+    };
+
+    // Cloned so the request builder borrows nothing from `creds`, which
+    // `apply_refresh_response` needs mutably once the exchange is done.
+    let private_jwk = creds.private_jwk.clone();
+    let refresh_token = refresh_token.to_string();
+
+    let (buffered, _) = send_with_nonce_retry(
+        NoncePolicy::AuthServer,
+        None,
+        "token refresh request",
+        |nonce| {
+            let proof = generate_dpop_proof_no_ath(&private_jwk, "POST", &token_endpoint, nonce)?;
+            Ok(http
+                .post(&token_endpoint)
+                .header("DPoP", proof)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&build_refresh_form(
+                    &refresh_token,
+                    &client_id,
+                    assertion.clone(),
+                )))
+        },
+    )
+    .await?;
+
+    let status = buffered.status;
+    let body = String::from_utf8_lossy(&buffered.body).to_string();
 
     if status.is_success() {
         return apply_refresh_response(pool, backend, encryption_key, creds, &body).await;
-    }
-
-    // Only retry with a nonce if the error is actually `use_dpop_nonce`.
-    // PDS implementations include `dpop-nonce` on all responses, so checking
-    // the header alone would misinterpret `invalid_grant` as a nonce issue.
-    if let Some(nonce) = dpop_nonce
-        && is_use_dpop_nonce_error(&body)
-    {
-        let proof =
-            generate_dpop_proof_no_ath(&creds.private_jwk, "POST", &token_endpoint, Some(&nonce))?;
-
-        let retry_resp = http
-            .post(&token_endpoint)
-            .header("DPoP", &proof)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-                ("client_id", &client_id),
-            ])
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("token refresh request failed: {e}")))?;
-
-        let retry_status = retry_resp.status();
-        let retry_body = retry_resp.text().await.unwrap_or_default();
-
-        if !retry_status.is_success() {
-            return Err(AppError::Auth(format!(
-                "token refresh failed ({retry_status}): {retry_body}"
-            )));
-        }
-
-        return apply_refresh_response(pool, backend, encryption_key, creds, &retry_body).await;
     }
 
     Err(AppError::Auth(format!(
@@ -518,7 +864,6 @@ async fn apply_refresh_response(
     let new_expires_at = expires_in
         .map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339());
 
-    // Update the stored session
     super::sessions::store_dpop_session(
         pool,
         backend,
@@ -535,6 +880,7 @@ async fn apply_refresh_response(
         &creds.session.scopes,
         creds.session.pds_url.as_deref(),
         creds.session.issuer.as_deref(),
+        creds.session.signing_kid.as_deref(),
     )
     .await?;
 
@@ -556,8 +902,122 @@ async fn apply_refresh_response(
     Ok(())
 }
 
-/// Discover the token endpoint from an OAuth authorization server's metadata.
-async fn discover_token_endpoint(http: &reqwest::Client, issuer: &str) -> Result<String, AppError> {
+/// Revoke a DPoP session's tokens at its authorization server (RFC 7009).
+#[allow(clippy::too_many_arguments)]
+pub async fn revoke_dpop_session_at_as(
+    http: &reqwest::Client,
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+    oauth_registry: &Arc<OAuthClientRegistry>,
+    api_client_id: &str,
+    user_did: &str,
+    dpop_key_id: &str,
+) -> Result<(), AppError> {
+    let session = super::sessions::get_dpop_session(
+        pool,
+        backend,
+        encryption_key,
+        api_client_id,
+        user_did,
+        dpop_key_id,
+    )
+    .await?;
+
+    let Some(issuer) = session.issuer.clone() else {
+        tracing::debug!(%user_did, "session has no issuer recorded; nothing to revoke");
+        return Ok(());
+    };
+
+    let metadata = fetch_auth_server_metadata(http, &issuer).await?;
+    let Some(revocation_endpoint) = metadata["revocation_endpoint"].as_str() else {
+        tracing::debug!(
+            %user_did,
+            %issuer,
+            "authorization server advertises no revocation_endpoint"
+        );
+        return Ok(());
+    };
+
+    // RFC 7009 §2.1: revoking a refresh token SHOULD also invalidate the access
+    // tokens derived from it, so the refresh token is the one worth sending.
+    let (token, token_type_hint) = match session.refresh_token.as_deref() {
+        Some(refresh) => (refresh.to_string(), "refresh_token"),
+        None => (session.access_token.clone(), "access_token"),
+    };
+
+    let client_id_url = lookup_client_id_url(pool, backend, api_client_id).await?;
+    let client_id = oauth_registry
+        .get_resolved_client_id(&client_id_url)
+        .unwrap_or(client_id_url);
+
+    // Signed by the key that established this session, not by whatever is
+    // `current` now — the same pinning a refresh follows. A kid the server does
+    // not associate with this session reads as a client mismatch.
+    let keys =
+        super::client_keys::load_keys(pool, backend, Some(encryption_key), api_client_id).await?;
+    let assertion =
+        match super::client_keys::resolve_signing_key(&keys, session.signing_kid.as_deref())? {
+            Some(key) => Some(super::client_assertion::build(
+                &key.private_jwk,
+                &key.kid,
+                &client_id,
+                &issuer,
+            )?),
+            None => None,
+        };
+
+    let mut form: Vec<(&'static str, String)> = vec![
+        ("token", token),
+        ("token_type_hint", token_type_hint.to_string()),
+        ("client_id", client_id),
+    ];
+    if let Some(assertion) = assertion {
+        form.push((
+            "client_assertion_type",
+            super::client_assertion::CLIENT_ASSERTION_TYPE.to_string(),
+        ));
+        form.push(("client_assertion", assertion));
+    }
+
+    let private_jwk =
+        load_dpop_private_jwk(pool, backend, encryption_key, &session.dpop_key_id).await?;
+
+    let (buffered, _) = send_with_nonce_retry(
+        NoncePolicy::AuthServer,
+        None,
+        "token revocation request",
+        |nonce| {
+            let proof =
+                generate_dpop_proof_no_ath(&private_jwk, "POST", revocation_endpoint, nonce)?;
+            Ok(http
+                .post(revocation_endpoint)
+                .header("DPoP", proof)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&form))
+        },
+    )
+    .await?;
+
+    // RFC 7009 §2.2: a token the server does not recognise is already revoked
+    // as far as anyone is concerned, and answers 200.
+    if buffered.status.is_success() {
+        tracing::info!(%user_did, %api_client_id, "revoked session tokens at authorization server");
+        return Ok(());
+    }
+
+    Err(AppError::Internal(format!(
+        "token revocation failed ({}): {}",
+        buffered.status,
+        String::from_utf8_lossy(&buffered.body)
+    )))
+}
+
+/// Fetch an OAuth authorization server's metadata document.
+async fn fetch_auth_server_metadata(
+    http: &reqwest::Client,
+    issuer: &str,
+) -> Result<serde_json::Value, AppError> {
     let metadata_url = format!(
         "{}/.well-known/oauth-authorization-server",
         issuer.trim_end_matches('/')
@@ -575,10 +1035,14 @@ async fn discover_token_endpoint(http: &reqwest::Client, issuer: &str) -> Result
         )));
     }
 
-    let metadata: serde_json::Value = resp
-        .json()
+    resp.json()
         .await
-        .map_err(|e| AppError::Internal(format!("invalid auth server metadata: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("invalid auth server metadata: {e}")))
+}
+
+/// Discover the token endpoint from an OAuth authorization server's metadata.
+async fn discover_token_endpoint(http: &reqwest::Client, issuer: &str) -> Result<String, AppError> {
+    let metadata = fetch_auth_server_metadata(http, issuer).await?;
 
     metadata["token_endpoint"]
         .as_str()
@@ -587,7 +1051,7 @@ async fn discover_token_endpoint(http: &reqwest::Client, issuer: &str) -> Result
 }
 
 /// Look up the client_id_url for an API client by its internal ID.
-async fn lookup_client_id_url(
+pub(crate) async fn lookup_client_id_url(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     api_client_id: &str,
@@ -719,49 +1183,32 @@ pub async fn verify_access_token_did(
         pds_url.trim_end_matches('/')
     );
 
-    // The PDS may demand a DPoP nonce on the first attempt; retry once with it.
-    let mut nonce: Option<String> = None;
-    for _ in 0..2 {
-        let proof = generate_dpop_proof(
-            private_jwk,
-            "GET",
-            &target_url,
-            access_token,
-            nonce.as_deref(),
-        )?;
-        let resp = http
-            .get(&target_url)
-            .header("Authorization", format!("DPoP {access_token}"))
-            .header("DPoP", proof)
-            .send()
-            .await
-            .map_err(|e| AppError::Internal(format!("getSession request failed: {e}")))?;
+    // The PDS may demand a DPoP nonce, and may rotate it. The previous
+    // `nonce.is_none()` guard meant only the *first* challenge was honoured, so
+    // a rotation on the retry could never be satisfied.
+    let (buffered, _) =
+        send_with_nonce_retry(NoncePolicy::Resource, None, "getSession request", |nonce| {
+            let proof = generate_dpop_proof(private_jwk, "GET", &target_url, access_token, nonce)?;
+            Ok(http
+                .get(&target_url)
+                .header("Authorization", format!("DPoP {access_token}"))
+                .header("DPoP", proof))
+        })
+        .await?;
 
-        if resp.status().is_success() {
-            let body: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| AppError::Internal(format!("invalid getSession response: {e}")))?;
-            return body["did"]
-                .as_str()
-                .map(|s| s.to_string())
-                .ok_or_else(|| AppError::Auth("getSession response missing did".into()));
-        }
-
-        if nonce.is_none()
-            && let Some(n) = extract_dpop_nonce(&resp)
-        {
-            nonce = Some(n);
-            continue;
-        }
-
-        return Err(AppError::Auth(format!(
-            "access token verification failed ({})",
-            resp.status()
-        )));
+    if buffered.status.is_success() {
+        let body: serde_json::Value = serde_json::from_slice(&buffered.body)
+            .map_err(|e| AppError::Internal(format!("invalid getSession response: {e}")))?;
+        return body["did"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| AppError::Auth("getSession response missing did".into()));
     }
 
-    Err(AppError::Auth("access token verification failed".into()))
+    Err(AppError::Auth(format!(
+        "access token verification failed ({})",
+        buffered.status
+    )))
 }
 
 /// Resolve a user's PDS URL from their DID document.
@@ -811,6 +1258,34 @@ async fn resolve_pds_from_did(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_form_is_unauthenticated_for_a_public_client() {
+        let form = build_refresh_form("tok", "https://app.example.com/meta.json", None);
+        assert_eq!(form.len(), 3);
+        assert!(form.iter().all(|(k, _)| *k != "client_assertion"));
+    }
+
+    #[test]
+    fn refresh_form_carries_the_assertion_for_a_confidential_client() {
+        let form = build_refresh_form(
+            "tok",
+            "https://app.example.com/meta.json",
+            Some("signed.jwt.here".to_string()),
+        );
+        let get = |name: &str| {
+            form.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(get("grant_type"), "refresh_token");
+        assert_eq!(get("client_assertion"), "signed.jwt.here");
+        assert_eq!(
+            get("client_assertion_type"),
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+        );
+    }
 
     #[test]
     fn generate_dpop_proof_produces_valid_jwt() {
@@ -901,6 +1376,144 @@ mod tests {
             &keypair.thumbprint,
         );
         assert!(result.is_ok(), "validation failed: {:?}", result.err());
+    }
+
+    fn buffered(status: u16, headers: &[(&str, &str)], body: &str) -> BufferedResponse {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in headers {
+            map.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                reqwest::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        BufferedResponse {
+            status: reqwest::StatusCode::from_u16(status).unwrap(),
+            headers: map,
+            body: bytes::Bytes::from(body.to_string()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // nonce detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nonce_wanted_when_www_authenticate_says_so() {
+        let r = buffered(
+            401,
+            &[
+                ("dpop-nonce", "abc"),
+                ("www-authenticate", r#"DPoP error="use_dpop_nonce""#),
+            ],
+            "",
+        );
+        assert!(r.wants_dpop_nonce());
+    }
+
+    #[test]
+    fn nonce_wanted_when_body_says_so() {
+        let r = buffered(
+            400,
+            &[("dpop-nonce", "abc")],
+            r#"{"error":"use_dpop_nonce"}"#,
+        );
+        assert!(r.wants_dpop_nonce());
+    }
+
+    /// The bug this fixes: PDS implementations attach `dpop-nonce` to every
+    /// error response, so a validation failure looked like a nonce challenge
+    /// and the write was resent unchanged.
+    #[test]
+    fn a_validation_error_carrying_a_nonce_is_not_a_nonce_challenge() {
+        let r = buffered(
+            400,
+            &[("dpop-nonce", "abc")],
+            r#"{"error":"InvalidRequest","message":"Invalid record"}"#,
+        );
+        assert!(!r.wants_dpop_nonce());
+    }
+
+    /// Deliberate leniency: a bare 401 with a fresh nonce and no other
+    /// explanation is what a terse nonce challenge looks like, and refusing it
+    /// would break a PDS that simply does not elaborate.
+    #[test]
+    fn a_bare_401_with_a_nonce_is_treated_as_a_challenge() {
+        let r = buffered(401, &[("dpop-nonce", "abc")], "");
+        assert!(r.wants_dpop_nonce());
+    }
+
+    #[test]
+    fn a_401_naming_another_error_is_not_a_nonce_challenge() {
+        let r = buffered(401, &[("dpop-nonce", "abc")], r#"{"error":"InvalidToken"}"#);
+        assert!(!r.wants_dpop_nonce());
+    }
+
+    #[test]
+    fn no_nonce_header_means_no_challenge() {
+        let r = buffered(401, &[], r#"{"error":"use_dpop_nonce"}"#);
+        assert!(!r.wants_dpop_nonce());
+    }
+
+    // -----------------------------------------------------------------------
+    // token-expiry detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invalid_token_detected_from_www_authenticate() {
+        let r = buffered(
+            401,
+            &[("www-authenticate", r#"DPoP error="invalid_token""#)],
+            "",
+        );
+        assert!(r.indicates_invalid_token());
+    }
+
+    #[test]
+    fn invalid_token_detected_from_atproto_error_names() {
+        for name in ["InvalidToken", "ExpiredToken", "invalid_token"] {
+            let body = format!(r#"{{"error":"{name}"}}"#);
+            assert!(
+                buffered(401, &[], &body).indicates_invalid_token(),
+                "{name} should be treated as a token problem"
+            );
+        }
+    }
+
+    /// The bug this fixes: every 401 was treated as expiry, so an unrelated
+    /// one triggered a refresh — and a refresh returning `invalid_grant`
+    /// deletes the session. An authorization failure could destroy a login.
+    #[test]
+    fn an_unrelated_401_does_not_look_like_an_expired_token() {
+        for body in [
+            r#"{"error":"AuthMissing","message":"Authentication Required"}"#,
+            r#"{"error":"InsufficientScope"}"#,
+            r#"{"error":"AccountTakedown"}"#,
+        ] {
+            assert!(
+                !buffered(401, &[], body).indicates_invalid_token(),
+                "{body} should not trigger a token refresh"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_401_is_never_an_expired_token() {
+        assert!(
+            !buffered(400, &[], r#"{"error":"ExpiredToken"}"#).indicates_invalid_token(),
+            "only a 401 can mean the token is the problem"
+        );
+        assert!(!buffered(200, &[], "{}").indicates_invalid_token());
+    }
+
+    #[test]
+    fn buffered_response_round_trips_status_and_body() {
+        let r = buffered(409, &[("content-type", "application/json")], r#"{"a":1}"#);
+        let resp = r.into_response().unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
     }
 
     #[test]

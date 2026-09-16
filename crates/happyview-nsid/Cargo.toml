@@ -1,0 +1,11 @@
+[package]
+name = "happyview-nsid"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "AT Protocol NSID validation, shared by HappyView's Rust services"
+license = "MIT"
+
+[dependencies]
+regex-lite = "0.1"
+thiserror = "2"

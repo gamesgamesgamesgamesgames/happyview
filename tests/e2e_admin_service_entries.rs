@@ -828,7 +828,7 @@ async fn sync_plc_updates_did_document() {
         .expect("failed to store rotation key");
 
     // Build a genesis-like PLC document for the mock
-    let rotation_did_key = happyview::plc::private_key_to_did_key(&rotation_key_bytes).unwrap();
+    let rotation_did_key = happyview_plc::private_key_to_did_key(&rotation_key_bytes).unwrap();
 
     // Compute the signing key's did:key from the stored identity
     let identity = happyview::service_identity::get_identity(&app.state.db, app.state.db_backend)
@@ -838,7 +838,7 @@ async fn sync_plc_updates_did_document() {
     let signing_key_bytes =
         happyview::plc::decrypt_key(identity.signing_key_enc.as_ref().unwrap(), &encryption_key)
             .unwrap();
-    let signing_did_key = happyview::plc::private_key_to_did_key(&signing_key_bytes).unwrap();
+    let signing_did_key = happyview_plc::private_key_to_did_key(&signing_key_bytes).unwrap();
 
     let genesis_doc = json!({
         "type": "plc_operation",

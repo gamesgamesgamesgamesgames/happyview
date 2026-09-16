@@ -30,6 +30,13 @@ export interface Script {
   description?: string | null
   created_at: string
   updated_at: string
+  /**
+   * `false` when this script's own trigger id would be refused if submitted
+   * today — the NSID rules tightened after it was created. It still fires and
+   * can still be edited, but deleting it is irreversible: it cannot be
+   * recreated with the same id.
+   */
+  recreatable: boolean
 }
 
 /** Body for `POST /admin/scripts` (create or replace by `id`). */

@@ -1,0 +1,46 @@
+{
+  "name": "@happyview/nsid",
+  "version": "0.0.0-development",
+  "description": "AT Protocol NSID validation",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gamesgamesgamesgamesgames/happyview.git",
+    "directory": "packages/nsid"
+  },
+  "bugs": "https://github.com/gamesgamesgamesgamesgames/happyview/issues",
+  "homepage": "https://happyview.dev",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@semantic-release/commit-analyzer": "^13.0.1",
+    "@semantic-release/exec": "^7.0.0",
+    "@semantic-release/github": "^12.0.6",
+    "@semantic-release/release-notes-generator": "^14.1.0",
+    "@types/bun": "^1.3.12",
+    "semantic-release": "^25.0.3",
+    "semantic-release-monorepo": "^8.0.2",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0"
+  }
+}

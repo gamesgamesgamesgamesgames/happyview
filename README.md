@@ -26,6 +26,10 @@ Building an AppView from scratch means wiring up real-time event streams, record
 
 - **Protocol-native**: HappyView works with _any_ PDS, resolves DIDs through the directory, and follows atproto conventions. It's a first-class citizen of the network, not a wrapper around it.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). In short: open PRs against `dev`, sign off your commits with `git commit -s`, and run `git config core.hooksPath .githooks` once per clone.
+
 ## Documentation
 
 Full documentation is available at [happyview.dev](https://happyview.dev).

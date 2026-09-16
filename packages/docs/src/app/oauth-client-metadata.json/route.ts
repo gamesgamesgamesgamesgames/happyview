@@ -8,7 +8,7 @@ export function GET(request: NextRequest) {
     client_name: "HappyView",
     client_uri: origin,
     redirect_uris: [`${origin}/oauth/callback`],
-    grant_types: ["authorization_code"],
+    grant_types: ["authorization_code", "refresh_token"],
     response_types: ["code"],
     scope:
       "atproto repo:site.standard.graph.recommend repo:site.standard.graph.subscription",

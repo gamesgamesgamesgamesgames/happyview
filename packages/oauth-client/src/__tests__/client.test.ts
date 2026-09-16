@@ -1,5 +1,9 @@
 import { describe, expect, mock, test } from "bun:test";
-import { HappyViewOAuthClient } from "../client";
+import {
+  HappyViewOAuthClient,
+  LAST_ACTIVE_KEY,
+  STORAGE_PREFIX,
+} from "../client";
 import { ApiError } from "../errors";
 import { MemoryStorage } from "../storage";
 
@@ -31,6 +35,25 @@ async function generateTestJwk(): Promise<JsonWebKey> {
   // Remove key_ops so importJwk can re-import with its own usage constraints
   delete jwk.key_ops;
   return jwk;
+}
+
+async function storageWithSession(
+  jwk: JsonWebKey,
+  did = "did:plc:testuser",
+): Promise<MemoryStorage> {
+  const storage = new MemoryStorage();
+  await storage.set(
+    `happyview:session:${did}`,
+    JSON.stringify({
+      did,
+      dpopKey: jwk,
+      accessToken: "at_token",
+      clientKey: "hvc_testkey",
+      instanceUrl: "https://happyview.example.com",
+    }),
+  );
+  await storage.set("happyview:last-active-did", did);
+  return storage;
 }
 
 function createClient(overrides?: {
@@ -117,6 +140,36 @@ describe("HappyViewOAuthClient", () => {
       expect(result.pkceVerifier).toBeUndefined();
     });
 
+    test("surfaces the confidential flag from the response", async () => {
+      const testJwk = await generateTestJwk();
+      const { fetchFn } = createMockFetch([
+        {
+          status: 201,
+          body: {
+            provision_id: "hvp_conf_flag",
+            dpop_key: testJwk,
+            confidential: true,
+          },
+        },
+      ]);
+
+      const client = createClient({ fetchFn });
+      expect((await client.provisionDpopKey()).confidential).toBe(true);
+    });
+
+    test("defaults confidential to false when the instance omits it", async () => {
+      const testJwk = await generateTestJwk();
+      const { fetchFn } = createMockFetch([
+        {
+          status: 201,
+          body: { provision_id: "hvp_old", dpop_key: testJwk },
+        },
+      ]);
+
+      const client = createClient({ fetchFn });
+      expect((await client.provisionDpopKey()).confidential).toBe(false);
+    });
+
     test("throws ApiError on non-201 response", async () => {
       const { fetchFn } = createMockFetch([
         { status: 400, body: { message: "bad request" } },
@@ -131,6 +184,75 @@ describe("HappyViewOAuthClient", () => {
         expect((err as ApiError).status).toBe(400);
         expect((err as ApiError).body).toEqual({ message: "bad request" });
       }
+    });
+  });
+
+  describe("getClientAssertion", () => {
+    test("posts the issuer and returns the assertion", async () => {
+      const { fetchFn, calls } = createMockFetch([
+        {
+          status: 200,
+          body: {
+            client_assertion: "a.b.c",
+            client_assertion_type:
+              "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            expires_in: 60,
+          },
+        },
+      ]);
+
+      const client = createClient({ fetchFn, clientSecret: "hvs_sec" });
+      const result = await client.getClientAssertion(
+        "https://pds.example.com",
+      );
+
+      expect(calls[0].url).toBe(
+        "https://happyview.example.com/oauth/client-assertion",
+      );
+      const headers = new Headers(calls[0].init.headers);
+      expect(headers.get("x-client-key")).toBe("hvc_testkey");
+      expect(headers.get("x-client-secret")).toBe("hvs_sec");
+      expect(JSON.parse(calls[0].init.body as string)).toEqual({
+        issuer: "https://pds.example.com",
+      });
+      expect(result.clientAssertion).toBe("a.b.c");
+      expect(result.clientAssertionType).toBe(
+        "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      );
+    });
+
+    test("omits x-client-secret for a public client", async () => {
+      const { fetchFn, calls } = createMockFetch([
+        {
+          status: 200,
+          body: {
+            client_assertion: "x.y.z",
+            client_assertion_type:
+              "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            expires_in: 60,
+          },
+        },
+      ]);
+
+      const client = createClient({ fetchFn });
+      await client.getClientAssertion("https://pds.example.com");
+
+      const headers = new Headers(calls[0].init.headers);
+      expect(headers.has("x-client-secret")).toBe(false);
+    });
+
+    test("throws ApiError when the client has no key", async () => {
+      const { fetchFn } = createMockFetch([
+        {
+          status: 400,
+          body: { error: "this client has no authentication key" },
+        },
+      ]);
+
+      const client = createClient({ fetchFn });
+      await expect(
+        client.getClientAssertion("https://pds.example.com"),
+      ).rejects.toThrow(/no authentication key/);
     });
   });
 
@@ -195,6 +317,102 @@ describe("HappyViewOAuthClient", () => {
 
       const lastActive = await storage.get("happyview:last-active-did");
       expect(lastActive).toBe("did:plc:testuser");
+    });
+  });
+
+  describe("registerSession", () => {
+    const registered = {
+      status: 201,
+      body: {
+        session_id: "sess_new",
+        did: "did:plc:testuser",
+        scopes: ["atproto"],
+      },
+    };
+
+    function newSessionParams(dpopKey: JsonWebKey) {
+      return {
+        provisionId: "hvp_new",
+        did: "did:plc:testuser",
+        accessToken: "at_new",
+        scopes: "atproto",
+        dpopKey,
+      };
+    }
+
+    test("retires this client's previous session for the same account", async () => {
+      const oldJwk = await generateTestJwk();
+      const newJwk = await generateTestJwk();
+      const storage = await storageWithSession(oldJwk);
+      const { fetchFn, calls } = createMockFetch([
+        registered,
+        { status: 204, body: null },
+      ]);
+
+      const client = createClient({ fetchFn, storage });
+      await client.registerSession(newSessionParams(newJwk));
+
+      const del = calls.find((c) => c.init.method === "DELETE");
+      expect(del).toBeDefined();
+      expect(del!.url).toBe(
+        "https://happyview.example.com/oauth/sessions/did:plc:testuser",
+      );
+    });
+
+    test("stores the new session even though the old one was retired", async () => {
+      const oldJwk = await generateTestJwk();
+      const newJwk = await generateTestJwk();
+      const storage = await storageWithSession(oldJwk);
+      const { fetchFn } = createMockFetch([registered, { status: 204, body: null }]);
+
+      const client = createClient({ fetchFn, storage });
+      await client.registerSession(newSessionParams(newJwk));
+
+      const stored = JSON.parse(
+        (await storage.get(`${STORAGE_PREFIX}did:plc:testuser`))!,
+      );
+      expect(stored.accessToken).toBe("at_new");
+      expect(await storage.get(LAST_ACTIVE_KEY)).toBe("did:plc:testuser");
+    });
+
+    test("makes no revocation call when there is no previous session", async () => {
+      const newJwk = await generateTestJwk();
+      const { fetchFn, calls } = createMockFetch([registered]);
+
+      const client = createClient({ fetchFn, storage: new MemoryStorage() });
+      await client.registerSession(newSessionParams(newJwk));
+
+      expect(calls.filter((c) => c.init.method === "DELETE")).toHaveLength(0);
+    });
+
+    test("leaves another account's session alone", async () => {
+      const otherJwk = await generateTestJwk();
+      const newJwk = await generateTestJwk();
+      const storage = await storageWithSession(otherJwk, "did:plc:someoneelse");
+      const { fetchFn, calls } = createMockFetch([registered]);
+
+      const client = createClient({ fetchFn, storage });
+      await client.registerSession(newSessionParams(newJwk));
+
+      expect(calls.filter((c) => c.init.method === "DELETE")).toHaveLength(0);
+      expect(
+        await storage.get(`${STORAGE_PREFIX}did:plc:someoneelse`),
+      ).not.toBeNull();
+    });
+
+    test("a failed retirement does not fail the login", async () => {
+      const oldJwk = await generateTestJwk();
+      const newJwk = await generateTestJwk();
+      const storage = await storageWithSession(oldJwk);
+      const { fetchFn } = createMockFetch([
+        registered,
+        { status: 500, body: { error: "boom" } },
+      ]);
+
+      const client = createClient({ fetchFn, storage });
+      const session = await client.registerSession(newSessionParams(newJwk));
+
+      expect(session.did).toBe("did:plc:testuser");
     });
   });
 
@@ -284,6 +502,157 @@ describe("HappyViewOAuthClient", () => {
         storage,
       });
       await client.deleteSession("did:plc:other");
+
+      expect(await storage.get("happyview:session:did:plc:other")).toBeNull();
+      expect(await storage.get("happyview:last-active-did")).toBe(
+        "did:plc:testuser",
+      );
+    });
+
+    // A logout that leaves the session in storage is self-perpetuating: the
+    // next restore() signs the user straight back in, and pressing "log out"
+    // again repeats the same failure. Local cleanup must be unconditional.
+    test("clears storage when the server rejects the delete with 401", async () => {
+      const testJwk = await generateTestJwk();
+      const { fetchFn } = createMockFetch([{ status: 401, body: {} }]);
+
+      const storage = await storageWithSession(testJwk);
+
+      const client = createClient({ fetchFn, storage });
+      await client.deleteSession("did:plc:testuser");
+
+      expect(
+        await storage.get("happyview:session:did:plc:testuser"),
+      ).toBeNull();
+      expect(await storage.get("happyview:last-active-did")).toBeNull();
+    });
+
+    // 401 means the credential is already invalid — there is nothing left to
+    // revoke, so this is a completed logout, not a failed one.
+    test("does not throw on 401", async () => {
+      const testJwk = await generateTestJwk();
+      const { fetchFn } = createMockFetch([{ status: 401, body: {} }]);
+      const storage = await storageWithSession(testJwk);
+      const client = createClient({ fetchFn, storage });
+
+      await expect(
+        client.deleteSession("did:plc:testuser"),
+      ).resolves.toBeUndefined();
+    });
+
+    test("does not throw on 403", async () => {
+      const testJwk = await generateTestJwk();
+      const { fetchFn } = createMockFetch([{ status: 403, body: {} }]);
+      const storage = await storageWithSession(testJwk);
+      const client = createClient({ fetchFn, storage });
+
+      await expect(
+        client.deleteSession("did:plc:testuser"),
+      ).resolves.toBeUndefined();
+    });
+
+    // A 5xx may mean the server still holds a live session, so the caller has
+    // to hear about it — but they are still logged out locally either way.
+    test("still throws on 500, after clearing storage", async () => {
+      const testJwk = await generateTestJwk();
+      const { fetchFn } = createMockFetch([{ status: 500, body: {} }]);
+      const storage = await storageWithSession(testJwk);
+      const client = createClient({ fetchFn, storage });
+
+      await expect(
+        client.deleteSession("did:plc:testuser"),
+      ).rejects.toThrow(ApiError);
+
+      expect(
+        await storage.get("happyview:session:did:plc:testuser"),
+      ).toBeNull();
+      expect(await storage.get("happyview:last-active-did")).toBeNull();
+    });
+
+    // restoreSession JSON.parses the stored blob, so a corrupt entry throws
+    // before any request is made. That must not strand the user either.
+    test("clears storage when the stored session is corrupt", async () => {
+      const { fetchFn } = createMockFetch([]);
+      const storage = new MemoryStorage();
+      await storage.set("happyview:session:did:plc:testuser", "{not json");
+      await storage.set("happyview:last-active-did", "did:plc:testuser");
+
+      const client = createClient({ fetchFn, storage });
+      await client.deleteSession("did:plc:testuser").catch(() => {});
+
+      expect(
+        await storage.get("happyview:session:did:plc:testuser"),
+      ).toBeNull();
+      expect(await storage.get("happyview:last-active-did")).toBeNull();
+    });
+
+    test("fires onSessionDelete even when the server returns 401", async () => {
+      const testJwk = await generateTestJwk();
+      const { fetchFn } = createMockFetch([{ status: 401, body: {} }]);
+      const storage = await storageWithSession(testJwk);
+
+      const deleted: string[] = [];
+      const client = new HappyViewOAuthClient({
+        instanceUrl: "https://happyview.example.com",
+        clientKey: "hvc_testkey",
+        storage,
+        fetch: fetchFn,
+        sessionHooks: { onSessionDelete: (did) => deleted.push(did) },
+      });
+      await client.deleteSession("did:plc:testuser");
+
+      expect(deleted).toEqual(["did:plc:testuser"]);
+    });
+  });
+
+  // Anyone recovering a stuck session by hand has to know these strings, so
+  // they are API whether or not they are exported. Pin them.
+  describe("storage keys", () => {
+    test("exports the key format it writes", async () => {
+      const testJwk = await generateTestJwk();
+      const storage = await storageWithSession(testJwk);
+
+      expect(STORAGE_PREFIX).toBe("happyview:session:");
+      expect(LAST_ACTIVE_KEY).toBe("happyview:last-active-did");
+      expect(
+        await storage.get(`${STORAGE_PREFIX}did:plc:testuser`),
+      ).not.toBeNull();
+    });
+  });
+
+  describe("forgetSession", () => {
+    test("clears local session state without contacting the server", async () => {
+      const testJwk = await generateTestJwk();
+      const { fetchFn, calls } = createMockFetch([]);
+      const storage = await storageWithSession(testJwk);
+
+      const client = createClient({ fetchFn, storage });
+      await client.forgetSession("did:plc:testuser");
+
+      expect(calls).toHaveLength(0);
+      expect(
+        await storage.get("happyview:session:did:plc:testuser"),
+      ).toBeNull();
+      expect(await storage.get("happyview:last-active-did")).toBeNull();
+    });
+
+    test("preserves last active DID when forgetting a different session", async () => {
+      const testJwk = await generateTestJwk();
+      const storage = new MemoryStorage();
+      await storage.set(
+        "happyview:session:did:plc:other",
+        JSON.stringify({
+          did: "did:plc:other",
+          dpopKey: testJwk,
+          accessToken: "at_token",
+          clientKey: "hvc_testkey",
+          instanceUrl: "https://happyview.example.com",
+        }),
+      );
+      await storage.set("happyview:last-active-did", "did:plc:testuser");
+
+      const client = createClient({ storage });
+      await client.forgetSession("did:plc:other");
 
       expect(await storage.get("happyview:session:did:plc:other")).toBeNull();
       expect(await storage.get("happyview:last-active-did")).toBe(

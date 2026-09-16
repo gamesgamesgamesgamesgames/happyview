@@ -15,8 +15,8 @@ use tracing::{info, warn};
 use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig};
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{
-    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, DefaultHttpClient,
-    GrantType, KnownScope, OAuthClientConfig, OAuthResolverConfig, Scope,
+    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, GrantType, KnownScope,
+    OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 
 #[tokio::main]
@@ -47,6 +47,93 @@ async fn main() {
         backend = ?db_backend,
         "connected to database"
     );
+
+    // The backfill re-mints commits, so it needs the space signing key.
+    let space_signing_key = match config.token_encryption_key.as_ref() {
+        Some(key) => happyview::spaces::service::signing_key_from_pool(&db_pool, db_backend, key)
+            .await
+            .ok(),
+        None => None,
+    };
+
+    match match space_signing_key.as_ref() {
+        Some(key) => {
+            happyview::spaces::cid_backfill::run_if_needed(&db_pool, db_backend, key).await
+        }
+        None => Ok(None),
+    } {
+        Ok(Some(report)) if report.is_noop() => {
+            info!("space CID backfill: nothing to repair");
+        }
+        Ok(Some(report)) => {
+            info!(
+                records_updated = report.records_updated,
+                oplog_rows_remapped = report.oplog_rows_remapped,
+                repos_rebuilt = report.repos_rebuilt,
+                records_unencodable = report.records_unencodable,
+                "space CID backfill applied"
+            );
+            if report.records_unencodable > 0 {
+                tracing::warn!(
+                    count = report.records_unencodable,
+                    "some space records could not be encoded as DAG-CBOR and kept their existing CID"
+                );
+            }
+        }
+        Ok(None) => { /* already completed; skipped without scanning */ }
+        Err(e) => tracing::error!(
+            error = %e,
+            "space CID backfill failed; will retry on next startup"
+        ),
+    }
+
+    // One-time re-mint of every existing commit in the current commit format
+    // (HKDF-Expand-only MAC derivation, plus a signature). Commits are derived
+    // from records, which are not touched, so this recomputes rather than
+    // migrates. Each repo keeps its revision, since the record set is unchanged.
+    match match space_signing_key.as_ref() {
+        Some(key) => {
+            happyview::spaces::rebuild::run_commit_format_rebuild(&db_pool, db_backend, key).await
+        }
+        None => Ok(None),
+    } {
+        Ok(Some(rebuilt)) => info!(
+            repos = rebuilt,
+            "re-minted space commits in the current format"
+        ),
+        Ok(None) => { /* already completed */ }
+        Err(e) => tracing::error!(
+            error = %e,
+            "space commit format rebuild failed; will retry on next startup"
+        ),
+    }
+
+    match happyview::maintenance::vacuum::run_if_requested(
+        &db_pool,
+        db_backend,
+        &config.database_url,
+    )
+    .await
+    {
+        Ok(Some(result)) if result.status == "ok" => {
+            info!(
+                reclaimed = %happyview::maintenance::vacuum::human_bytes(result.reclaimed_bytes),
+                "scheduled vacuum complete"
+            );
+        }
+        Ok(Some(result)) => {
+            tracing::error!(
+                error = %result.error.clone().unwrap_or_default(),
+                "scheduled vacuum failed"
+            );
+        }
+        Ok(None) => { /* not scheduled */ }
+        Err(e) => tracing::error!(error = %e, "scheduled vacuum could not be evaluated"),
+    }
+
+    happyview::telemetry::collect::health::note_restart(&db_pool, db_backend).await;
+    happyview::maintenance::nsid_audit::run(&db_pool, db_backend).await;
+    happyview::maintenance::lexicon_ids::run(&db_pool, db_backend).await;
 
     // Backfill record_refs in the background (first run after upgrade)
     {
@@ -119,7 +206,7 @@ async fn main() {
         .expect("failed to load lexicons");
 
     // Re-fetch all network lexicons from their respective PDSes.
-    let http = reqwest::Client::new();
+    let http = happyview::http_retry::init_shared_client(&config.user_agent);
     let network_rows: Vec<(String, Option<String>, Option<String>)> = crate::db::query_as(
         "SELECT id, authority_did, target_collection FROM happyview_lexicons WHERE source = 'network'",
     )
@@ -418,7 +505,14 @@ async fn main() {
         "{}/auth/callback",
         config.effective_public_url().trim_end_matches('/')
     );
-    let atrium_http = Arc::new(DefaultHttpClient::default());
+    // Use our UA-and-timeout-configured client for OAuth traffic. atrium-oauth's
+    // `default-client` feature (which we no longer enable — see Cargo.toml)
+    // used to build its own unconfigured `reqwest::Client::new()` here, with no
+    // seam for headers or timeouts; this identifies OAuth requests and gives
+    // them the shared connect/read timeouts instead.
+    let atrium_http = Arc::new(happyview::http_retry::HappyViewHttpClient::new(
+        http.clone(),
+    ));
 
     let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
         plc_directory_url: config.plc_url.clone(),
@@ -430,9 +524,7 @@ async fn main() {
         http_client: Arc::clone(&atrium_http),
     });
 
-    let is_loopback = config.public_url.contains("127.0.0.1")
-        || config.public_url.contains("[::1]")
-        || config.public_url.contains("localhost");
+    let is_loopback = happyview::auth::client_registry::is_loopback_url(&config.public_url);
 
     let resolver_config = OAuthResolverConfig {
         did_resolver,
@@ -448,48 +540,92 @@ async fn main() {
         Scope::Unknown("identity:*".to_string()),
     ];
 
+    let linked_repos_scopes = oauth_scopes.clone();
+    let oauth_scopes_for_by_kid = oauth_scopes.clone();
+
+    let instance_key = happyview::oauth::client_keys::ensure_instance_key(
+        &db_pool,
+        db_backend,
+        config.token_encryption_key.as_ref(),
+    )
+    .await
+    .expect("Failed to load OAuth client authentication key");
+
+    let client_jwks = vec![
+        happyview::oauth::client_keys::to_atrium_jwk(&instance_key)
+            .expect("Failed to convert client key to JWK"),
+    ];
+    info!(kid = %instance_key.kid, "confidential OAuth client key ready");
+
+    let instance_client_id_url = config.instance_client_id_url();
+
     let oauth_client = if is_loopback {
         info!("Using loopback OAuth client metadata (local development)");
         atrium_oauth::OAuthClient::new(OAuthClientConfig {
             client_metadata: AtprotoLocalhostClientMetadata {
-                redirect_uris: Some(vec![callback_url]),
+                redirect_uris: Some(vec![callback_url.clone()]),
                 scopes: Some(oauth_scopes),
             },
             keys: None,
             state_store: oauth_state_store.clone(),
             session_store: DbSessionStore::new(db_pool.clone(), db_backend),
             resolver: resolver_config,
+            http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         })
         .expect("Failed to create OAuth client")
     } else {
         atrium_oauth::OAuthClient::new(OAuthClientConfig {
             client_metadata: AtprotoClientMetadata {
-                client_id: format!(
-                    "{}/oauth-client-metadata.json",
-                    config.effective_public_url().trim_end_matches('/')
-                ),
+                client_id: instance_client_id_url.clone(),
                 client_uri: Some(config.effective_public_url()),
-                redirect_uris: vec![callback_url],
-                token_endpoint_auth_method: AuthMethod::None,
+                redirect_uris: vec![callback_url.clone()],
+                token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
                 grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
                 scopes: oauth_scopes,
                 jwks_uri: None,
-                token_endpoint_auth_signing_alg: None,
+                token_endpoint_auth_signing_alg: Some("ES256".to_string()),
             },
-            keys: None,
+            keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend),
+            session_store: DbSessionStore::new(db_pool.clone(), db_backend)
+                .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: resolver_config,
+            http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         })
         .expect("Failed to create OAuth client")
     };
 
-    // Derive the cookie signing key from SESSION_SECRET when it is secure. When
-    // it is not, log the problem loudly and fall back to an ephemeral random key
-    // so no attacker can forge cookies with a known/weak key. Cookie-based auth
-    // is disabled in this state (see the auth extractors and login handlers);
-    // DPoP, service auth, and API-key auth are unaffected. The server still boots
-    // so the dashboard can surface the misconfiguration to an operator.
+    // A loopback client never signs at all, so it gets no pin regardless —
+    // same reasoning as `build_instance_client`'s and `linked_repos::client::
+    // build`'s own `signing_kid` computation, which this must keep matching.
+    // Fixed here, once, alongside `linked_repos_client` itself: that client
+    // is never rebuilt live on rotation (see `oauth::rotation`'s module
+    // doc), so this is the one place its actual kid is ever set.
+    let instance_signing_kid = if is_loopback {
+        None
+    } else {
+        Some(instance_key.kid.clone())
+    };
+
+    let linked_repos_client = Arc::new(
+        happyview::linked_repos::client::build(
+            &config.plc_url,
+            &format!(
+                "{}/oauth-client-metadata.json",
+                config.effective_public_url().trim_end_matches('/')
+            ),
+            &config.effective_public_url(),
+            callback_url.clone(),
+            is_loopback,
+            linked_repos_scopes,
+            oauth_state_store.clone(),
+            db_pool.clone(),
+            db_backend,
+            Some(client_jwks.clone()),
+        )
+        .expect("Failed to create linked-repo OAuth client"),
+    );
+
     let cookie_key = if config.session_secret_secure() {
         axum_extra::extract::cookie::Key::derive_from(config.session_secret.as_bytes())
     } else {
@@ -509,9 +645,10 @@ async fn main() {
 
     // Build the OAuth client registry and load API clients from DB
     let oauth_client_arc = Arc::new(oauth_client);
-    let oauth_registry = Arc::new(happyview::auth::OAuthClientRegistry::new(Arc::clone(
-        &oauth_client_arc,
-    )));
+    let oauth_registry = Arc::new(happyview::auth::OAuthClientRegistry::new_with_kid(
+        Arc::clone(&oauth_client_arc),
+        instance_signing_kid.clone(),
+    ));
     oauth_registry
         .load_from_db(
             &db_pool,
@@ -532,6 +669,7 @@ async fn main() {
             pd.url.clone(),
             primary_client_id_url,
             Arc::clone(&oauth_client_arc),
+            instance_signing_kid.clone(),
         );
     }
 
@@ -550,7 +688,10 @@ async fn main() {
             domain_base_url.trim_end_matches('/')
         );
 
-        let domain_http = Arc::new(DefaultHttpClient::default());
+        // Same reasoning as `atrium_http` above.
+        let domain_http = Arc::new(happyview::http_retry::HappyViewHttpClient::new(
+            http.clone(),
+        ));
         let domain_resolver = OAuthResolverConfig {
             did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
                 plc_directory_url: config.plc_url.clone(),
@@ -569,16 +710,18 @@ async fn main() {
                 client_id: domain_client_id.clone(),
                 client_uri: Some(domain_base_url.clone()),
                 redirect_uris: vec![domain_callback_url],
-                token_endpoint_auth_method: AuthMethod::None,
+                token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
                 grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
                 scopes: vec![Scope::Known(KnownScope::Atproto)],
                 jwks_uri: None,
-                token_endpoint_auth_signing_alg: None,
+                token_endpoint_auth_signing_alg: Some("ES256".to_string()),
             },
-            keys: None,
+            keys: Some(client_jwks.clone()),
             state_store: oauth_state_store.clone(),
-            session_store: DbSessionStore::new(db_pool.clone(), db_backend),
+            session_store: DbSessionStore::new(db_pool.clone(), db_backend)
+                .with_signing_kid(Some(instance_key.kid.clone())),
             resolver: domain_resolver,
+            http_client: happyview::http_retry::HappyViewHttpClient::new(http.clone()),
         }) {
             Ok(client) => {
                 info!(domain = %domain.url, "Registered domain OAuth client");
@@ -586,10 +729,123 @@ async fn main() {
                     domain.url.clone(),
                     domain_client_id,
                     Arc::new(client),
+                    Some(instance_key.kid.clone()),
                 );
             }
             Err(e) => {
                 tracing::error!(domain = %domain.url, error = %e, "Failed to create domain OAuth client");
+            }
+        }
+    }
+
+    // Index every non-revoked instance key by (client_id_url, kid) so a
+    // session pinned to a specific key can be resolved unambiguously — see
+    // `OAuthClientRegistry::register_for_kid`. Each key gets its own,
+    // genuinely single-key `OAuthClient` built fresh here: reusing
+    // `oauth_client_arc` (built from only the *current* key) across every
+    // kid is correct only while exactly one key is ever live. The moment a
+    // `retiring` key coexists with `current` — which rotation makes routine
+    // — that reuse would map the retiring kid to a client that can only
+    // sign with the wrong (current) key, silently, since the lookup itself
+    // succeeds.
+    let instance_keys = happyview::oauth::client_keys::load_keys(
+        &db_pool,
+        db_backend,
+        config.token_encryption_key.as_ref(),
+        happyview::oauth::client_keys::INSTANCE_OWNER,
+    )
+    .await
+    .unwrap_or_default();
+    for key in &instance_keys {
+        match happyview::auth::client_registry::build_instance_client(
+            &config.plc_url,
+            &instance_client_id_url,
+            &config.effective_public_url(),
+            vec![callback_url.clone()],
+            is_loopback,
+            oauth_scopes_for_by_kid.clone(),
+            oauth_state_store.clone(),
+            db_pool.clone(),
+            db_backend,
+            key,
+        ) {
+            Ok(client) => {
+                oauth_registry.register_for_kid(
+                    &instance_client_id_url,
+                    &key.kid,
+                    Arc::new(client),
+                );
+            }
+            Err(e) => {
+                warn!(kid = %key.kid, error = %e, "failed to build per-kid instance OAuth client");
+            }
+        }
+
+        // Same reasoning, nested: each domain's `by_kid` entry must also be
+        // a distinct single-key client, not a reused Arc built for a
+        // different kid.
+        for domain in &all_domains {
+            let domain_base_url = config.url_with_base_path(&domain.url);
+            let domain_callback_url =
+                format!("{}/auth/callback", domain_base_url.trim_end_matches('/'));
+            let domain_client_id = format!(
+                "{}/oauth-client-metadata.json",
+                domain_base_url.trim_end_matches('/')
+            );
+            match happyview::auth::client_registry::build_instance_client(
+                &config.plc_url,
+                &domain_client_id,
+                &domain_base_url,
+                vec![domain_callback_url],
+                false,
+                vec![Scope::Known(KnownScope::Atproto)],
+                oauth_state_store.clone(),
+                db_pool.clone(),
+                db_backend,
+                key,
+            ) {
+                Ok(client) => {
+                    oauth_registry.register_for_kid(&domain_client_id, &key.kid, Arc::new(client));
+                }
+                Err(e) => {
+                    warn!(domain = %domain.url, kid = %key.kid, error = %e, "failed to build per-kid domain OAuth client");
+                }
+            }
+        }
+    }
+
+    // Index the linked-repos client by kid too, in its own namespace kept
+    // separate from the loop above — see `OAuthClientRegistry`'s
+    // `linked_repos_by_kid` field doc for why it cannot share a
+    // `(client_id_url, kid)` entry with the instance/domain clients despite
+    // publishing the same `client_id` text. Same distinct-client-per-kid
+    // reasoning applies here too.
+    for key in &instance_keys {
+        match happyview::oauth::client_keys::to_atrium_jwk(key) {
+            Ok(jwk) => match happyview::linked_repos::client::build(
+                &config.plc_url,
+                &format!(
+                    "{}/oauth-client-metadata.json",
+                    config.effective_public_url().trim_end_matches('/')
+                ),
+                &config.effective_public_url(),
+                callback_url.clone(),
+                is_loopback,
+                oauth_scopes_for_by_kid.clone(),
+                oauth_state_store.clone(),
+                db_pool.clone(),
+                db_backend,
+                Some(vec![jwk]),
+            ) {
+                Ok(client) => {
+                    oauth_registry.register_linked_repos_for_kid(&key.kid, Arc::new(client));
+                }
+                Err(e) => {
+                    warn!(kid = %key.kid, error = %e, "failed to build per-kid linked-repos OAuth client");
+                }
+            },
+            Err(e) => {
+                warn!(kid = %key.kid, error = %e, "failed to convert instance key to JWK for linked-repos registration");
             }
         }
     }
@@ -628,6 +884,8 @@ async fn main() {
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(enabled))
     };
 
+    let telemetry_counters = std::sync::Arc::new(happyview::telemetry::counters::Counters::new());
+
     let state = AppState {
         config: config.clone(),
         http,
@@ -641,6 +899,8 @@ async fn main() {
         rate_limiter,
         oauth: oauth_registry,
         oauth_state_store,
+        linked_repos_client,
+        linked_repos_client_kid: instance_signing_kid,
         cookie_key,
         plugin_registry,
         wasm_runtime,
@@ -650,6 +910,8 @@ async fn main() {
         proxy_config,
         backfill_events_tx,
         verbose_event_logging,
+        client_jwks,
+        telemetry_counters,
     };
 
     jetstream::spawn(state.clone(), collections_rx);
@@ -657,9 +919,23 @@ async fn main() {
     labeler::spawn(state.clone(), labeler_subscriptions_rx);
     tokio::spawn(labeler::spawn_label_gc(state.db.clone(), state.db_backend));
 
+    {
+        let gc_db = state.db.clone();
+        let gc_backend = state.db_backend;
+        tokio::spawn(async move {
+            happyview::auth::state_gc::run_expired_state_gc(gc_db, gc_backend).await;
+        });
+    }
+
+    {
+        let telemetry_state = state.clone();
+        tokio::spawn(async move {
+            happyview::telemetry::reporter::run_reporter(telemetry_state).await;
+        });
+    }
+
     tokio::spawn(happyview::event_log::spawn_retention_cleanup(
         state.db.clone(),
-        state.config.event_log_retention_days,
         state.db_backend,
     ));
 
@@ -695,6 +971,13 @@ async fn main() {
         let state = state.clone();
         tokio::spawn(async move {
             happyview::admin::backfill::run_backfill_retention_cleanup(&state).await;
+        });
+    }
+
+    {
+        let keepalive_state = state.clone();
+        tokio::spawn(async move {
+            happyview::linked_repos::worker::run_keepalive(keepalive_state).await;
         });
     }
 

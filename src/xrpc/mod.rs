@@ -1,5 +1,6 @@
 pub(crate) mod procedure;
 pub(crate) mod query;
+pub(crate) mod scope_check;
 
 use axum::Json;
 use axum::body::Body;
@@ -97,6 +98,153 @@ pub(crate) fn coerce_params(params: &mut HashMap<String, Value>, parameters: &Va
     }
 }
 
+/// Headers forwarded to the caller's PDS when service-proxying.
+///
+/// `atproto-proxy` names the destination the PDS should relay to; HappyView
+/// must not resolve it itself, because the inter-service token that
+/// accompanies a relayed request is signed by the *user's* identity key, which
+/// lives on the PDS. Resolving the DID here and posting directly would produce
+/// an unauthenticated request that looks like it worked in testing.
+const FORWARDED_HEADERS: [&str; 2] = ["atproto-proxy", "atproto-accept-labelers"];
+
+fn forwarded_headers(parts: &Parts) -> Vec<(String, String)> {
+    FORWARDED_HEADERS
+        .iter()
+        .filter_map(|name| {
+            parts
+                .headers
+                .get(*name)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| ((*name).to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// Reject a request that asks to write to somebody else's repo.
+///
+/// A forwarded write always acts as the caller: the DPoP session is looked up
+/// *by DID*, and the cookie path presents the caller's own token. A `repo` that
+/// names anyone else can therefore only fail — and it used to fail deep in
+/// session lookup, reported as a problem with the caller's login rather than
+/// with the repo they asked for. That message cost a reporter several days
+/// (lexicon issue #14); this is the same trap one layer up, so it is refused
+/// here with the answer instead.
+fn check_repo_matches_caller(body: &Value, caller_did: &str) -> Result<(), AppError> {
+    let Some(repo) = body.get("repo").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    if repo == caller_did {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "cannot write to {repo}: a proxied request acts as the authenticated user \
+         ({caller_did}), so it can only reach their own repo. Writing to another \
+         account's repo needs an admin-managed grant — see linked repos."
+    )))
+}
+
+/// Forward an unrecognized XRPC method to the caller's own PDS, as the caller.
+///
+/// This is the AT Protocol service proxying model: absent an `atproto-proxy`
+/// header the PDS handles the request itself, and with one it relays onwards.
+/// Either way the destination is a function of *who is asking*, not of the
+/// NSID — which is the distinction [`proxy_to_authority`] gets wrong.
+async fn forward_to_caller_pds(
+    state: &AppState,
+    claims: &Claims,
+    method: &str,
+    body: &Value,
+    parts: &Parts,
+) -> Result<Response, AppError> {
+    check_repo_matches_caller(body, claims.did())?;
+
+    let auth = crate::repo::pds_auth_for_claims(state, claims).await?;
+    let headers = forwarded_headers(parts);
+
+    enforce_granted_scopes(state, &auth, method, body, &headers).await?;
+
+    tracing::debug!(
+        %method,
+        did = %claims.did(),
+        proxied = !headers.is_empty(),
+        "XRPC service proxy: forwarding to caller's PDS"
+    );
+
+    let resp = auth
+        .post_json_with_headers(state, claims.did(), method, body, &headers)
+        .await?;
+
+    crate::repo::forward_pds_response(resp).await
+}
+
+/// Check a forwarded request against the scopes the session actually holds.
+///
+/// A local pre-flight, not the security boundary — the PDS enforces the token's
+/// scopes regardless. Its value is closing the gap CLAUDE.md records for
+/// `pds::call`: "fine where PDSes enforce granular scopes and a hole where they
+/// don't". It only covers operations that map unambiguously; see
+/// [`scope_check`] for why that is deliberate.
+async fn enforce_granted_scopes(
+    state: &AppState,
+    auth: &crate::repo::PdsAuth,
+    method: &str,
+    body: &Value,
+    headers: &[(String, String)],
+) -> Result<(), AppError> {
+    let proxy_aud = headers
+        .iter()
+        .find(|(name, _)| name == "atproto-proxy")
+        .map(|(_, value)| value.as_str());
+
+    let required = scope_check::required_for(method, body, proxy_aud);
+    if required.is_empty() {
+        return Ok(());
+    }
+
+    // `None` means the granted scopes are not knowable from here (the cookie
+    // path), not that none were granted. Skipping is correct: the PDS is the
+    // authority and still enforces them.
+    let Some(scopes) = auth.granted_scopes(state).await? else {
+        return Ok(());
+    };
+
+    let granted = happyview_scopes::ScopePermissions::parse(&scopes);
+    scope_check::check(&granted, &required, method)
+}
+
+/// Forward an unrecognized query to the caller's own PDS, as the caller.
+///
+/// The GET counterpart of [`forward_to_caller_pds`]. There is no `repo` check
+/// here because a query has no body to name one, and repo *reads* are public.
+async fn forward_query_to_caller_pds(
+    state: &AppState,
+    claims: &Claims,
+    method: &str,
+    query: &str,
+    parts: &Parts,
+) -> Result<Response, AppError> {
+    let auth = crate::repo::pds_auth_for_claims(state, claims).await?;
+    let headers = forwarded_headers(parts);
+
+    // Repo reads need no scope — there is no read permission in the grammar,
+    // because records are public. A *proxied* query is a different matter: it
+    // is an rpc call to the named audience, and `required_for` maps it.
+    enforce_granted_scopes(state, &auth, method, &Value::Null, &headers).await?;
+
+    tracing::debug!(
+        %method,
+        did = %claims.did(),
+        proxied = !headers.is_empty(),
+        "XRPC service proxy: forwarding query to caller's PDS"
+    );
+
+    let resp = auth
+        .get_with_headers(state, claims.did(), method, query, &headers)
+        .await?;
+
+    crate::repo::forward_pds_response(resp).await
+}
+
 /// Proxy an unrecognized XRPC method to its home AppView resolved via DNS.
 pub(crate) async fn proxy_to_authority(
     state: &AppState,
@@ -144,8 +292,21 @@ pub(crate) async fn proxy_to_authority(
     })?;
 
     if !status.is_success() {
+        // The upstream body is relayed verbatim by `AppError::PdsError`, so
+        // without this the caller sees a foreign error with no record on our
+        // side of where it came from — which is exactly how an anonymous
+        // misroute reads as a HappyView bug to whoever reported it.
+        tracing::warn!(
+            %method,
+            %pds_endpoint,
+            %status,
+            body = %String::from_utf8_lossy(&bytes),
+            "XRPC proxy: upstream returned an error"
+        );
         return Err(AppError::PdsError(status, bytes));
     }
+
+    tracing::debug!(%method, %pds_endpoint, "XRPC proxy: resolved authority");
 
     Ok(Response::builder()
         .status(status)
@@ -341,12 +502,33 @@ pub async fn xrpc_get(
     let lexicon = match lexicon {
         Some(l) => l,
         None => {
-            if !state.proxy_config.load().allows(&method) {
+            let proxy_config = state.proxy_config.load();
+            if !proxy_config.allows(&method) {
                 return Err(AppError::Forbidden(
                     "NSID not allowed by proxy policy".into(),
                 ));
             }
-            let mut response = proxy_to_authority(&state, &method, &raw_query, None).await?;
+
+            let mut response = match proxy_config.routing {
+                crate::proxy_config::ProxyRouting::ServiceProxy => {
+                    // Queries, unlike procedures, may arrive anonymously. Under
+                    // this routing there is no PDS to send an anonymous request
+                    // to — the destination is a function of who is asking. This
+                    // is the deliberate break that makes the mode opt-in.
+                    let claims = claims.as_ref().ok_or_else(|| {
+                        AppError::Auth(format!(
+                            "{method} is not implemented by this AppView, and forwarding it \
+                             requires authentication: under service-proxy routing a query is \
+                             sent to the caller's own PDS."
+                        ))
+                    })?;
+                    forward_query_to_caller_pds(&state, claims, &method, &raw_query, &parts).await?
+                }
+                crate::proxy_config::ProxyRouting::Authority => {
+                    proxy_to_authority(&state, &method, &raw_query, None).await?
+                }
+            };
+
             if let CheckResult::Allowed {
                 remaining,
                 limit,
@@ -444,12 +626,28 @@ pub async fn xrpc_post(
     let lexicon = match lexicon {
         Some(l) => l,
         None => {
-            if !state.proxy_config.load().allows(&method) {
+            let proxy_config = state.proxy_config.load();
+            if !proxy_config.allows(&method) {
                 return Err(AppError::Forbidden(
                     "NSID not allowed by proxy policy".into(),
                 ));
             }
-            let mut response = proxy_to_authority(&state, &method, &raw_query, Some(&body)).await?;
+
+            let mut response = match proxy_config.routing {
+                // Every caller here is authenticated — `xrpc_post` refuses
+                // anonymous procedures above — so there is always a PDS to
+                // forward to.
+                crate::proxy_config::ProxyRouting::ServiceProxy => {
+                    let claims = claims.as_ref().ok_or_else(|| {
+                        AppError::Auth("XRPC procedures require DPoP authentication".into())
+                    })?;
+                    forward_to_caller_pds(&state, claims, &method, &body, &parts).await?
+                }
+                crate::proxy_config::ProxyRouting::Authority => {
+                    proxy_to_authority(&state, &method, &raw_query, Some(&body)).await?
+                }
+            };
+
             if let CheckResult::Allowed {
                 remaining,
                 limit,
@@ -699,6 +897,79 @@ mod tests {
         params.insert("client_key".into(), json!("hvc_from_query"));
         let result = extract_client_key(None, &parts, &params);
         assert_eq!(result.unwrap(), "hvc_from_query");
+    }
+
+    // -----------------------------------------------------------------------
+    // service proxying
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn repo_matching_the_caller_is_accepted() {
+        let body = json!({ "repo": "did:plc:caller", "collection": "com.example.post" });
+        assert!(check_repo_matches_caller(&body, "did:plc:caller").is_ok());
+    }
+
+    #[test]
+    fn a_body_with_no_repo_is_accepted() {
+        let body = json!({ "collection": "com.example.post" });
+        assert!(check_repo_matches_caller(&body, "did:plc:caller").is_ok());
+    }
+
+    /// The refusal has to name the way forward, not just say no — the failure
+    /// it replaces sent a reporter looking at their own OAuth setup for days.
+    #[test]
+    fn another_accounts_repo_is_refused_and_says_where_to_go() {
+        let body = json!({ "repo": "did:plc:someone-else" });
+        let err = check_repo_matches_caller(&body, "did:plc:caller").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("did:plc:someone-else"), "{message}");
+        assert!(message.contains("did:plc:caller"), "{message}");
+        assert!(message.contains("linked repos"), "{message}");
+    }
+
+    fn parts_with(headers: &[(&str, &str)]) -> axum::http::request::Parts {
+        let mut builder = axum::http::Request::builder().uri("/xrpc/test");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let (parts, _) = builder.body(()).unwrap().into_parts();
+        parts
+    }
+
+    #[test]
+    fn only_the_named_headers_are_forwarded() {
+        let parts = parts_with(&[
+            ("atproto-proxy", "did:web:api.bsky.app#bsky_appview"),
+            ("atproto-accept-labelers", "did:plc:abc"),
+            // Must not be relayed: the PDS issues its own credentials for the
+            // forwarded request, and ours are bound to this hop.
+            ("authorization", "DPoP secret"),
+            ("dpop", "proof"),
+            ("cookie", "session=secret"),
+            ("x-client-secret", "shh"),
+        ]);
+
+        let forwarded = forwarded_headers(&parts);
+        assert_eq!(forwarded.len(), 2);
+        assert_eq!(
+            forwarded[0],
+            (
+                "atproto-proxy".to_string(),
+                "did:web:api.bsky.app#bsky_appview".to_string()
+            )
+        );
+        assert_eq!(
+            forwarded[1],
+            (
+                "atproto-accept-labelers".to_string(),
+                "did:plc:abc".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn no_forwarded_headers_when_none_are_present() {
+        assert!(forwarded_headers(&parts_with(&[])).is_empty());
     }
 
     #[test]

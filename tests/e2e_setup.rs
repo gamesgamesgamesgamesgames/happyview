@@ -798,3 +798,58 @@ async fn plc_submit_rejects_non_attach_account_mode() {
         "plc_submit should reject non-attach_account mode"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Setup exempts new instances from the one-time vacuum
+// ---------------------------------------------------------------------------
+
+/// A database created by this version already has incremental auto-vacuum and
+/// nothing stranded, so completing setup must record the one-time vacuum as
+/// unnecessary — otherwise a brand-new instance would be prompted to rebuild a
+/// database that has nothing to reclaim.
+#[tokio::test]
+#[serial]
+async fn setup_complete_marks_vacuum_not_needed() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            app.authed_request()
+                .method("POST")
+                .uri("/api/setup/identity")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"mode": "not_exposed"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            app.authed_request()
+                .method("POST")
+                .uri("/api/setup/complete")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let status = happyview::maintenance::vacuum::read_status(&app.state.db, app.state.db_backend)
+        .await
+        .expect("failed to read vacuum status");
+    assert!(
+        status.completed_at.is_some(),
+        "completing setup must mark the vacuum as not needed, so a fresh \
+         instance is never prompted to run one"
+    );
+}

@@ -1,0 +1,20 @@
+[package]
+name = "happyview-plc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "did:plc operation construction, signing, and DID derivation, shared by HappyView's Rust services"
+license = "MIT"
+
+[dependencies]
+base64 = "0.22"
+data-encoding = "2"
+multibase = "0.9"
+p256 = { version = "0.14", features = ["ecdsa"] }
+serde_ipld_dagcbor = "0.6"
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+
+[dev-dependencies]
+rand = "0.10"

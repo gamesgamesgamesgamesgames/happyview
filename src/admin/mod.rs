@@ -1,14 +1,19 @@
-mod api_clients;
+pub(crate) mod api_clients;
 mod api_keys;
 pub(crate) mod auth;
 pub mod backfill;
+pub mod backfill_errors;
+pub mod backfill_retry;
+mod database;
 mod dead_letters;
 mod domains;
 mod events;
 mod feature_flags;
+mod identity;
 mod jobs;
 mod labelers;
 mod lexicons;
+mod linked_repos;
 mod network_lexicons;
 pub(crate) mod permissions;
 mod plugins;
@@ -19,7 +24,9 @@ mod scripts;
 mod service_entries;
 mod service_identity;
 pub mod settings;
+pub mod spaces_migration;
 mod stats;
+mod telemetry;
 pub(crate) mod types;
 mod users;
 mod verification_methods;
@@ -59,9 +66,18 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/backfill/{id}/pds-summary",
             get(backfill::backfill_pds_summary),
         )
+        .route("/backfill/{id}/errors", get(backfill::backfill_errors_list))
+        .route(
+            "/backfill/{id}/retry-failed",
+            post(backfill::retry_failed_backfill),
+        )
         .route(
             "/backfill/{id}/details",
             delete(backfill::flush_backfill_details),
+        )
+        .route(
+            "/spaces/migration-status",
+            get(spaces_migration::migration_status),
         )
         .route("/jobs", get(jobs::list_jobs))
         .route("/jobs/{id}", get(jobs::get_job))
@@ -69,7 +85,34 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route("/jobs/{id}/pause", post(jobs::pause_job))
         .route("/jobs/{id}/resume", post(jobs::resume_job))
         .route("/jobs/{id}/logs", get(jobs::list_job_logs))
+        .route(
+            "/linked-repos",
+            get(linked_repos::list_linked_repos).post(linked_repos::create_linked_repo),
+        )
+        .route(
+            "/linked-repos/{id}",
+            delete(linked_repos::delete_linked_repo),
+        )
+        .route(
+            "/linked-repos/{id}/authorize",
+            post(linked_repos::authorize_linked_repo),
+        )
+        .route(
+            "/linked-repos/{id}/invite",
+            post(linked_repos::invite_linked_repo),
+        )
+        .route(
+            "/linked-repos/{id}/invites",
+            get(linked_repos::list_linked_repo_invites),
+        )
+        .route(
+            "/linked-repos/{id}/invites/{invite_id}",
+            delete(linked_repos::revoke_linked_repo_invite),
+        )
         .route("/events", get(events::list_events))
+        .route("/events/count", get(events::count_events))
+        .route("/events/purge", post(events::purge_events))
+        .route("/identity/resolve", get(identity::resolve_identity))
         .route("/users", post(users::create_user).get(users::list_users))
         .route("/users/transfer-super", post(users::transfer_super))
         .route(
@@ -90,6 +133,11 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route(
             "/records/collection",
             delete(records::delete_collection_records),
+        )
+        .route("/database/status", get(database::status))
+        .route(
+            "/database/vacuum/schedule",
+            post(database::schedule_vacuum).delete(database::cancel_vacuum),
         )
         .route(
             "/network-lexicons",
@@ -129,6 +177,13 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             get(proxy_config::get).put(proxy_config::put),
         )
         .route(
+            "/settings/telemetry",
+            get(telemetry::get).put(telemetry::update),
+        )
+        .route("/settings/telemetry/dismiss", post(telemetry::dismiss))
+        .route("/settings/telemetry/preview", get(telemetry::preview))
+        .route("/settings/telemetry/send", post(telemetry::send))
+        .route(
             "/settings/{key}",
             put(settings::upsert).delete(settings::delete),
         )
@@ -151,6 +206,35 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             get(api_clients::get_api_client)
                 .put(api_clients::update_api_client)
                 .delete(api_clients::delete_api_client),
+        )
+        .route(
+            "/api-clients/{id}/auth-key",
+            post(api_clients::provision_auth_key).get(api_clients::get_auth_key),
+        )
+        .route(
+            "/api-clients/{id}/auth-key/recheck",
+            post(api_clients::recheck_auth_key),
+        )
+        .route(
+            "/api-clients/{id}/auth-key/rotate",
+            post(api_clients::rotate_auth_key),
+        )
+        .route(
+            "/api-clients/{id}/auth-keys",
+            get(api_clients::list_auth_keys).delete(api_clients::revoke_all_auth_keys),
+        )
+        .route(
+            "/api-clients/{id}/auth-key/{kid}",
+            delete(api_clients::revoke_auth_key),
+        )
+        .route(
+            "/oauth/instance-key/rotate",
+            post(api_clients::rotate_instance_key),
+        )
+        .route("/oauth/instance-key", get(api_clients::list_instance_keys))
+        .route(
+            "/oauth/instance-key/{kid}",
+            delete(api_clients::revoke_instance_key),
         )
         .route("/domains", post(domains::create).get(domains::list))
         .route("/domains/{id}", delete(domains::delete))

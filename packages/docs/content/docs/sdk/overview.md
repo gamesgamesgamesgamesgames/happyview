@@ -32,6 +32,8 @@ Third-party apps authenticate using HappyView's [DPoP key provisioning](../getti
 3. The SDK registers the resulting tokens with HappyView.
 4. All subsequent XRPC requests are authenticated with DPoP proofs — HappyView handles its own lexicons locally and proxies standard atproto writes to the user's PDS.
 
+If your app is a confidential atproto OAuth client, step 2 also needs a signed `private_key_jwt` assertion for its PAR and token-exchange requests. `@happyview/oauth-client`'s `getClientAssertion()` mints one — see [OAuth Client — Client assertions](./oauth-client/overview.md#client-assertions).
+
 ## Quick start
 
 ```bash

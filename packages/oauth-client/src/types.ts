@@ -63,6 +63,7 @@ export interface TokenInfo {
 export interface ProvisionKeyResponse {
   provision_id: string;
   dpop_key: JsonWebKey;
+  confidential?: boolean;
 }
 
 export interface RegisterSessionResponse {
@@ -74,4 +75,10 @@ export interface RegisterSessionResponse {
 export interface GetSessionResponse {
   did: string;
   scopes: string[];
+}
+
+export interface ClientAssertionResponse {
+  client_assertion: string;
+  client_assertion_type: string;
+  expires_in: number;
 }

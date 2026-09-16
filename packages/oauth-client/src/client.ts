@@ -4,6 +4,7 @@ import { importJwk } from "./import-jwk";
 import { HappyViewSession } from "./session";
 import { MemoryStorage } from "./storage";
 import type {
+  ClientAssertionResponse,
   GetSessionResponse,
   HappyViewOAuthClientOptions,
   ProvisionKeyResponse,
@@ -14,7 +15,10 @@ import type {
   StoredSession,
 } from "./types";
 
-const STORAGE_PREFIX = "happyview:session:";
+/// The storage keys this client reads and writes. Exported because a consumer
+/// recovering a wedged session by hand would otherwise have to hardcode them,
+/// which silently breaks the day they are renamed.
+export const STORAGE_PREFIX = "happyview:session:";
 export const LAST_ACTIVE_KEY = "happyview:last-active-did";
 
 export interface FetchMetadataOptions {
@@ -59,7 +63,10 @@ export class HappyViewOAuthClient {
     this.clientKey = options.clientKey;
     this.clientSecret = options.clientSecret;
     this.storage = options.storage ?? new MemoryStorage();
-    this._fetch = options.fetch ?? ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, init)) as typeof globalThis.fetch;
+    this._fetch =
+      options.fetch ??
+      (((input: RequestInfo | URL, init?: RequestInit) =>
+        fetch(input, init)) as typeof globalThis.fetch);
     this.sessionHooks = options.sessionHooks ?? {};
   }
 
@@ -72,6 +79,7 @@ export class HappyViewOAuthClient {
     dpopKey: Key;
     rawJwk: JsonWebKey;
     pkceVerifier?: string;
+    confidential: boolean;
   }> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -112,6 +120,54 @@ export class HappyViewOAuthClient {
       dpopKey,
       rawJwk: data.dpop_key,
       pkceVerifier,
+      confidential: data.confidential ?? false,
+    };
+  }
+
+  /**
+   * Mint a `private_key_jwt` client assertion for the OAuth flow against a
+   * user's PDS.
+   */
+  async getClientAssertion(
+    issuer: string,
+    publicAuth?: { provisionId: string; pkceVerifier: string },
+  ): Promise<{ clientAssertion: string; clientAssertionType: string }> {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-client-key": this.clientKey,
+    };
+    if (this.clientSecret) {
+      headers["x-client-secret"] = this.clientSecret;
+    }
+
+    const body: Record<string, unknown> = { issuer };
+    if (publicAuth) {
+      body.provision_id = publicAuth.provisionId;
+      body.pkce_verifier = publicAuth.pkceVerifier;
+    }
+
+    const resp = await this._fetch(
+      `${this.instanceUrl}/oauth/client-assertion`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      },
+    );
+
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new ApiError(
+        `Failed to mint client assertion: ${resp.status} ${(body as any).error ?? (body as any).message ?? resp.statusText}`,
+        resp.status,
+        body,
+      );
+    }
+
+    const data: ClientAssertionResponse = await resp.json();
+    return {
+      clientAssertion: data.client_assertion,
+      clientAssertionType: data.client_assertion_type,
     };
   }
 
@@ -156,6 +212,9 @@ export class HappyViewOAuthClient {
     }
 
     const data: RegisterSessionResponse = await resp.json();
+
+    await this.retirePreviousSession(data.did, params.dpopKey);
+
     const dpopKey = await importJwk(params.dpopKey);
 
     const storedSession: StoredSession = {
@@ -192,24 +251,88 @@ export class HappyViewOAuthClient {
     return session;
   }
 
-  async deleteSession(did: string): Promise<void> {
-    const session = await this.restoreSession(did);
-    if (session) {
-      const resp = await session.fetchHandler(
-        `${this.instanceUrl}/oauth/sessions/${did}`,
-        { method: "DELETE" },
-      );
+  /**
+   * Revoke this client's previous session for `did`, when the login that just
+   * completed replaced it.
+   */
+  private async retirePreviousSession(
+    did: string,
+    newDpopKey: JsonWebKey,
+  ): Promise<void> {
+    try {
+      const raw = await this.storage.get(`${STORAGE_PREFIX}${did}`);
+      if (!raw) return;
 
-      if (!resp.ok && resp.status !== 404) {
-        const body = await resp.json().catch(() => ({}));
-        throw new ApiError(
-          `Failed to delete session: ${resp.status} ${(body as any).error ?? (body as any).message ?? resp.statusText}`,
-          resp.status,
-          body,
-        );
+      const previous = JSON.parse(raw) as StoredSession;
+
+      if (
+        typeof newDpopKey.x === "string" &&
+        previous.dpopKey?.x === newDpopKey.x &&
+        previous.dpopKey?.y === newDpopKey.y
+      ) {
+        return;
       }
-    }
 
+      const session = await this.restoreSession(did);
+      if (!session) return;
+
+      await session.fetchHandler(`${this.instanceUrl}/oauth/sessions/${did}`, {
+        method: "DELETE",
+      });
+    } catch {
+      // Best effort — see above.
+    }
+  }
+
+  /**
+   * Revoke the session server-side and clear it locally.
+   *
+   * The local cleanup runs unconditionally. If it did not, a server that
+   * refuses the revocation would leave the session in storage, `restore()`
+   * would sign the user back in on the next load, and the next logout would
+   * fail identically — a loop with no exit through this API.
+   */
+  async deleteSession(did: string): Promise<void> {
+    try {
+      const session = await this.restoreSession(did);
+      if (session) {
+        const resp = await session.fetchHandler(
+          `${this.instanceUrl}/oauth/sessions/${did}`,
+          { method: "DELETE" },
+        );
+
+        // 404: already gone. 401/403: the credential is itself invalid, so
+        // there is no live session left to revoke. None of these is a logout
+        // that failed, so none of them should be reported as one.
+        const alreadyUnusable =
+          resp.status === 404 || resp.status === 401 || resp.status === 403;
+
+        if (!resp.ok && !alreadyUnusable) {
+          const body = await resp.json().catch(() => ({}));
+          throw new ApiError(
+            `Failed to delete session: ${resp.status} ${(body as any).error ?? (body as any).message ?? resp.statusText}`,
+            resp.status,
+            body,
+          );
+        }
+      }
+    } finally {
+      // 5xx and network errors still throw — the server may genuinely still
+      // hold a live session and the caller deserves to know. They throw from
+      // here, after the local state is gone, so the user is logged out either
+      // way.
+      await this.forgetSession(did);
+    }
+  }
+
+  /**
+   * Clear a session locally without contacting the server.
+   *
+   * The escape hatch for a session that cannot be revoked remotely — a revoked
+   * or expired credential, an unreachable instance. Nothing is revoked, so the
+   * server may still consider the session live until it expires.
+   */
+  async forgetSession(did: string): Promise<void> {
     await this.storage.delete(`${STORAGE_PREFIX}${did}`);
 
     const lastActive = await this.storage.get(LAST_ACTIVE_KEY);

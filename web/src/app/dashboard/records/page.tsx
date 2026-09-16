@@ -10,8 +10,9 @@ import {
 } from "@tanstack/react-table";
 import { toast } from "sonner";
 
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { useVacuumStatus } from "@/components/vacuum-prompt-provider";
 import { toastError } from "@/lib/format";
 import {
   getCollections,
@@ -91,7 +92,15 @@ function formatCellValue(value: unknown): string {
 
 export default function RecordsPage() {
   const { hasPermission } = useCurrentUser();
+  const router = useRouter();
   const searchParams = useSearchParams();
+  // `RecordsPage` sits inside `VacuumPromptProvider`, so it can tell whether
+  // a collection delete on this instance will actually shrink the database
+  // file: on SQLite, `incremental_vacuum` (the delete job's final step) is a
+  // no-op until the one-time vacuum has run once.
+  const { status: vacuumStatus } = useVacuumStatus();
+  const vacuumNotDone =
+    vacuumStatus?.backend === "sqlite" && !vacuumStatus.vacuum.completed_at;
   const initialCollection = searchParams.get("collection") ?? "";
   const appliedInitial = useRef(false);
   const [collections, setCollections] = useState<string[]>([]);
@@ -191,24 +200,30 @@ export default function RecordsPage() {
     if (!selectedCollection) return;
     setDeletingAll(true);
     try {
-      await deleteCollectionRecords(selectedCollection);
+      const { job_id } = await deleteCollectionRecords(selectedCollection);
       setBulkDeleteOpen(false);
       setBulkDeleteMode("selected");
       setBulkDeleteConfirm("");
       setRowSelection({});
-      toast.success("All records deleted");
-      const data = await getCollections();
-      setCollections(data.collections);
-      setCursorStack([]);
-      setNextCursor(undefined);
-      setRecords([]);
-      setSelectedCollection("");
+      toast.success("Deletion started", {
+        description: vacuumNotDone
+          ? "Records are being deleted in the background. Jobs run one at a time, so this may wait behind other work. This instance has not run its one-time database cleanup yet, so the freed space will not be returned to the disk until that runs."
+          : "Records are being deleted in the background. Jobs run one at a time, so this may wait behind other work.",
+        action: {
+          label: "View job",
+          onClick: () => router.push(`/dashboard/jobs?job=${job_id}`),
+        },
+      });
+      // Nothing has actually been deleted yet — the job may still be pending
+      // behind other work — so the view is left as-is rather than clearing
+      // the selection and records list, which previously read as "your
+      // collection is already gone" while it's still sitting right there.
     } catch (e: unknown) {
       toastError("Failed to delete collection", e);
     } finally {
       setDeletingAll(false);
     }
-  }, [selectedCollection]);
+  }, [selectedCollection, router, vacuumNotDone]);
 
   const handleBulkDelete = useCallback(async () => {
     setDeleting(true);
@@ -665,6 +680,22 @@ export default function RecordsPage() {
                   </RadioGroup>
                   {bulkDeleteMode === "all" && (
                     <div className="flex flex-col gap-2">
+                      {vacuumNotDone && (
+                        <p className="text-sm text-muted-foreground">
+                          This instance has not run its one-time database
+                          cleanup yet, so deleted space will not be returned to
+                          the disk until that runs.{" "}
+                          <Button
+                            variant="link"
+                            className="h-auto p-0 text-sm"
+                            onClick={() =>
+                              router.push("/dashboard/settings/database")
+                            }
+                          >
+                            Go to database settings
+                          </Button>
+                        </p>
+                      )}
                       <label
                         className="text-sm"
                         htmlFor="bulk-delete-confirm"

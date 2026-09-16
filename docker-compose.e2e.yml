@@ -1,3 +1,6 @@
+# Isolated from the dev and test stacks — see the note in docker-compose.yml.
+name: happyview-e2e
+
 services:
   postgres:
     image: postgres:17
@@ -17,6 +20,9 @@ services:
       start_period: 5s
 
   plc:
+    # Built nightly by happyproto/pds-test; built from source only when it
+    # cannot be pulled.
+    image: ghcr.io/happyproto/pds-test/plc:latest
     build:
       context: https://github.com/did-method-plc/did-method-plc.git
       dockerfile: packages/server/Dockerfile
@@ -32,11 +38,16 @@ services:
         condition: service_healthy
 
   pds:
-    image: atcr.io/tranquil.farm/tranquil-pds:latest
+    # Built nightly by happyproto/pds-test from the newest tranquil-pds tag, with
+    # the native-tls-roots feature this stack's OAuth flow needs. See
+    # dockerfiles/tranquil-pds.Dockerfile there for why upstream's image is not used.
+    image: ghcr.io/happyproto/pds-test/tranquil:latest
     environment:
       DATABASE_URL: postgres://happyview:happyview@postgres:5432/pds
       PLC_DIRECTORY_URL: http://plc:2582
       TRANQUIL_PDS_ALLOW_INSECURE_SECRETS: "1"
+      DISABLE_RATE_LIMITING: "true"
+      DISABLE_ACCOUNT_VERIFICATION_GATE: "true"
     volumes:
       - ./scripts/e2e-config.toml:/etc/tranquil-pds/config.toml:ro
     ports:
@@ -58,6 +69,13 @@ services:
       default:
         aliases:
           - pds.localhost
+          - happyview.127-0-0-1.sslip.io
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /data/caddy/pki/authorities/local/root.crt"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 2s
 
   happyview:
     build:
@@ -70,7 +88,7 @@ services:
     entrypoint: ["/bin/sh", "/e2e-entrypoint.sh"]
     environment:
       DATABASE_URL: postgres://happyview:happyview@postgres:5432/happyview_test
-      PUBLIC_URL: http://127.0.0.1:3200
+      PUBLIC_URL: https://happyview.127-0-0-1.sslip.io
       HOST: 0.0.0.0
       PORT: "3000"
       PLC_URL: http://plc:2582
@@ -78,6 +96,9 @@ services:
       SESSION_SECRET: e2e-test-secret-that-is-at-least-32-bytes
       TOKEN_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
       JETSTREAM_URL: wss://jetstream1.us-east.bsky.network
+      # A closed port, so e2e runs never send snapshots to the production
+      # collector and the telemetry test sees a send fail.
+      TELEMETRY_COLLECTOR_URL: http://127.0.0.1:9/v1/snapshot
     ports:
       - "3200:3000"
     volumes:
@@ -89,7 +110,14 @@ services:
       plc:
         condition: service_started
       caddy:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   caddy_data:
+
+networks:
+  default:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 3fff:e2e::/64

@@ -1,4 +1,4 @@
-import { defineConfig } from "@playwright/test"
+import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -8,8 +8,10 @@ export default defineConfig({
   workers: 1,
   reporter: process.env.CI ? [["html"], ["github"]] : [["html"]],
   use: {
-    baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://127.0.0.1:3200",
-    trace: "on-first-retry",
+    baseURL:
+      process.env.PLAYWRIGHT_BASE_URL || "https://happyview.127-0-0-1.sslip.io",
+    ignoreHTTPSErrors: true,
+    trace: "retain-on-failure",
   },
   projects: [
     {
@@ -29,12 +31,25 @@ export default defineConfig({
         "service-identity-settings.spec.ts",
         "lexicon-services.spec.ts",
         "lexicon-delete.spec.ts",
+        "lexicon-id-validation.spec.ts",
+        "lexicon-backfill.spec.ts",
+        "backfill-accounts.spec.ts",
         "script-delete.spec.ts",
         "script-job.spec.ts",
+        "script-unload-guard.spec.ts",
         "record-delete.spec.ts",
         "proxy-config.spec.ts",
         "spaces.spec.ts",
         "jobs.spec.ts",
+        "linked-repos.spec.ts",
+        "link-invite-pages.spec.ts",
+        "users-add.spec.ts",
+        "confidential-client.spec.ts",
+        "dpop-session-revocation.spec.ts",
+        // telemetry-settings was written but never listed here, so it
+        // had never actually run.
+        "telemetry-settings.spec.ts",
+        "telemetry-prompt.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },
@@ -43,7 +58,19 @@ export default defineConfig({
       name: "attach-account",
       testMatch: "setup-attach-account.spec.ts",
       dependencies: ["post-setup"],
-      use: { browserName: "chromium", ignoreHTTPSErrors: true },
+      use: { browserName: "chromium" },
+    },
+    {
+      name: "linked-repos-oauth",
+      testMatch: "linked-repos-oauth.spec.ts",
+      dependencies: ["post-setup"],
+      use: { browserName: "chromium" },
+    },
+    {
+      name: "oauth-key-rotation",
+      testMatch: "oauth-key-rotation.spec.ts",
+      dependencies: ["attach-account"],
+      use: { browserName: "chromium" },
     },
     {
       name: "didplc-setup",
@@ -59,4 +86,4 @@ export default defineConfig({
     },
   ],
   globalSetup: "./tests/e2e/global-setup.ts",
-})
+});

@@ -154,7 +154,7 @@ When `auth = true`, the worker loads the creator's OAuth session at execution ti
 
 ### When to use auth
 
-Use `{ auth = true }` when the job needs to create, update, or delete records on the AT Protocol network on behalf of the user. For example, batch record creation, cross-collection syncs, or migrations that write back to the user's PDS.
+Use `{ auth = true }` when the job needs to create, update, or delete records on the atproto network on behalf of the user. For example, batch record creation, cross-collection syncs, or migrations that write back to the user's PDS.
 
 Leave auth off (the default) for jobs that only read data, compute aggregates, sync to external services, clean up local records, or perform any work that doesn't touch a user's PDS.
 

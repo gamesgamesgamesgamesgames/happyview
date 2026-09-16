@@ -358,3 +358,120 @@ curl -X DELETE http://127.0.0.1:3000/admin/api-clients/01J9... -H "$AUTH"
 ```
 
 **Response**: `204 No Content`
+
+## AT Protocol client authentication keys
+
+A client can delegate its AT Protocol OAuth signing key to HappyView, so HappyView authenticates to users' PDSes as a **confidential** client on its behalf. Confidential clients get far longer session lifetimes than public ones (the authorization server's policy — 2 years rather than 2 weeks on a conforming PDS).
+
+Delegating takes two steps: provision a key here, then publish the fields it returns in the client metadata document served at the client's Client ID URL. Until both are done the client stays public, which is the default and requires no action.
+
+Whether the client is *confidential* is not a flag HappyView sets — it is a conclusion the authorization server reaches by fetching the app's published document. These endpoints only provision the key and report what that document currently says.
+
+### Provision the key
+
+```
+POST /admin/api-clients/{id}/auth-key
+```
+
+Requires `api-clients:edit`. Generates an ES256 keypair for this client. Idempotent — returns the existing key if one is already provisioned.
+
+```sh tab="cURL" tab-group="language"
+curl -X POST http://127.0.0.1:3000/admin/api-clients/01J9.../auth-key -H "$AUTH"
+```
+
+**Response**: `200 OK` with the key's `kid` and the `jwks_uri` to publish.
+
+### List every key
+
+```
+GET /admin/api-clients/{id}/auth-keys
+```
+
+Requires `api-clients:view`. Every key the client holds, ordered `current`, then `retiring`, then `revoked`, each with a live `session_count`.
+
+Distinct from `GET .../auth-key`, which reports only the current key. An operator revoking a leaked key needs to see the **retiring** one and how many sessions revoking it will destroy. Revoked keys are listed so a revoke is visibly done.
+
+```sh tab="cURL" tab-group="language"
+curl http://127.0.0.1:3000/admin/api-clients/01J9.../auth-keys -H "$AUTH"
+```
+
+```json
+{
+  "keys": [
+    { "kid": "f0c3...", "status": "current",  "created_at": "...", "session_count": 12 },
+    { "kid": "8b41...", "status": "retiring", "created_at": "...", "session_count": 3 }
+  ],
+  "jwks_uri": "https://happyview.example.com/oauth/clients/01J9.../jwks.json"
+}
+```
+
+### Re-check the published document
+
+```
+POST /admin/api-clients/{id}/auth-key/recheck
+```
+
+Requires `api-clients:edit`. Re-fetches the client's published metadata and reports whether HappyView can act as a confidential client for it, with the reason if not.
+
+### Rotate the key
+
+```
+POST /admin/api-clients/{id}/auth-key/rotate
+```
+
+Requires `api-clients:edit`. Mints a new `current` key and demotes the previous one to `retiring`. **Nothing is logged out**: a retiring key stays in the published JWKS and keeps signing refreshes for the sessions established with it.
+
+### Revoke a key
+
+```
+DELETE /admin/api-clients/{id}/auth-key/{kid}
+```
+
+Requires `api-clients:edit`. Removes the key from the published JWKS immediately and strands every session pinned to it — those users must re-authenticate.
+
+This is the response to a **leaked or compromised key**, not routine cleanup. Rotation alone is not containment: the rotated-out key remains published and valid, which is precisely what keeps existing sessions working. A retiring key with no remaining sessions is swept automatically.
+
+| Status | Meaning |
+| ------ | ------- |
+| `400`  | The target is the `current` key. Rotate first, then revoke the retiring key. |
+| `404`  | No key with that `kid` belongs to this client. |
+
+```sh tab="cURL" tab-group="language"
+curl -X DELETE http://127.0.0.1:3000/admin/api-clients/01J9.../auth-key/$KID -H "$AUTH"
+```
+
+```json
+{ "kid": "8b41...", "sessions_destroyed": 3 }
+```
+
+### Remove the key entirely
+
+```
+DELETE /admin/api-clients/{id}/auth-keys
+```
+
+Requires `api-clients:edit`. Revokes **every** key this client holds and leaves its JWKS empty, un-delegating it completely. Unlike the per-key revoke above, this one does take the `current` key — removing the keyset is the point.
+
+<Callout type="warn" title="Remove the published fields too, or the app breaks">
+This does not downgrade the app to a public client. If its published document still advertises `token_endpoint_auth_method: "private_key_jwt"` and this `jwks_uri`, an authorization server will fetch an empty key set and reject the client outright, and `POST /oauth/client-assertion` will return `400`. **The app is broken, not downgraded, until those three fields are removed from its published metadata too.** Coordinate both halves.
+</Callout>
+
+Returns `400` if the client already holds no key.
+
+```sh tab="cURL" tab-group="language"
+curl -X DELETE http://127.0.0.1:3000/admin/api-clients/01J9.../auth-keys -H "$AUTH"
+```
+
+```json
+{ "revoked": 2, "sessions_destroyed": 15 }
+```
+
+### Responding to a leaked client key
+
+1. `POST .../auth-key/rotate` — the leaked key becomes `retiring`, a fresh key takes over, and the client keeps working.
+2. `GET .../auth-keys` — confirm it is now `retiring` and note its `session_count`, which is how many users step 3 signs out.
+3. `DELETE .../auth-key/{kid}` on the leaked key.
+
+The reverse order is refused: the current key cannot be revoked, because that would leave the client unable to authenticate at all.
+
+If instead you want to stop delegating altogether — not replace the key, but have HappyView hold none — use `DELETE .../auth-keys` above, and remove the three published fields from the app's metadata document at the same time.

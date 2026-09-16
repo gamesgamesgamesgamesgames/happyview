@@ -15,11 +15,17 @@ function handle()
 
   local verified = false
   if atproto.verify_signature and record.signature then
-    verified = atproto.verify_signature(
+    local ok, result = pcall(
+      atproto.verify_signature,
       { text = record.text, createdAt = record.createdAt },
       record.signature,
       params.did
     )
+    if not ok then
+      -- We could not check. Say so — don't report it as a bad signature.
+      return { record = record, verified = nil, error = tostring(result) }
+    end
+    verified = result
   end
 
   return { record = record, verified = verified }
@@ -30,7 +36,9 @@ end
 
 1. Fetch the record by AT URI.
 2. If a signature is present, rebuild the same field table that was signed and verify it with [`atproto.verify_signature()`](../../api-reference/lua/atproto-api.md#atprotoverify_signature).
-3. Return `verified = true` if the signature is valid, `false` if it's missing, invalid, or the signer isn't configured.
+3. Return `verified = true` if the signature is valid, `false` if it's missing, doesn't match, or the signer isn't configured.
+
+The `pcall` matters. `verify_signature` returns `false` only when it checked and the signature didn't match; it *raises* when it couldn't check at all — unparseable signature bytes, a missing field. Assigning that to `verified` would report a decode bug as a forged record.
 
 ## Usage
 

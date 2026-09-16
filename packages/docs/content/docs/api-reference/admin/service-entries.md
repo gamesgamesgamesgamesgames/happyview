@@ -146,7 +146,7 @@ curl -X POST http://127.0.0.1:3000/admin/service-entries \
 | Field          | Type   | Required | Description                                                 |
 | -------------- | ------ | -------- | ----------------------------------------------------------- |
 | `fragment_id`  | string | yes      | DID document fragment (e.g. `#feed`, `#happyview`)          |
-| `service_type` | string | yes      | AT Protocol service type (e.g. `BskyFeedGenerator`)         |
+| `service_type` | string | yes      | atproto service type (e.g. `BskyFeedGenerator`)         |
 
 The entry is created with `access_mode` set to `all`. The endpoint URL is derived from `PUBLIC_URL`.
 

@@ -53,6 +53,13 @@ pub fn register_jobs_api(
                         ));
                     }
 
+                    if crate::jobs::native::is_reserved(&job_type) {
+                        return Err(mlua::Error::runtime(format!(
+                            "job_type prefix '{}' is reserved for built-in jobs",
+                            crate::jobs::native::RESERVED_PREFIX
+                        )));
+                    }
+
                     let caller = caller.as_ref().ok_or_else(|| {
                         mlua::Error::runtime("jobs.create requires an authenticated caller")
                     })?;
@@ -143,12 +150,21 @@ pub fn register_job_context(
         job_table.set("should_stop", should_stop_fn)?;
     }
 
-    // job.wait(seconds) — yield execution for the given duration
+    // job.wait(seconds) — yield execution for the given duration.
     {
-        let wait_fn = lua.create_async_function(move |_lua, seconds: f64| async move {
-            let duration = std::time::Duration::from_secs_f64(seconds.clamp(0.0, 3600.0));
-            tokio::time::sleep(duration).await;
-            Ok(())
+        let state = state.clone();
+        let wait_fn = lua.create_async_function(move |_lua, seconds: f64| {
+            let state = state.clone();
+            async move {
+                let duration = std::time::Duration::from_secs_f64(seconds.clamp(0.0, 3600.0));
+                tokio::time::sleep(duration).await;
+                let elapsed_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                crate::telemetry::counters::add_saturating(
+                    &state.telemetry_counters.job_wait_ms,
+                    elapsed_ms,
+                );
+                Ok(())
+            }
         })?;
         job_table.set("wait", wait_fn)?;
     }
@@ -221,7 +237,9 @@ mod tests {
             port: 3000,
             database_url: String::new(),
             database_backend: crate::db::DatabaseBackend::Sqlite,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -233,15 +251,18 @@ mod tests {
             logo_uri: None,
             tos_uri: None,
             policy_uri: None,
-            token_encryption_key: None,
+            // Spaces sign every commit with the `#atproto_space` key, which
+            // is stored encrypted, so space writes need this set.
+            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         let (tx, _) = watch::channel(vec![]);
         let (labeler_tx, _) = watch::channel(());
         sqlx::any::install_default_drivers();
         let test_db = sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap();
-        let atrium_http = std::sync::Arc::new(atrium_oauth::DefaultHttpClient::default());
+        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
         let did_resolver = atrium_identity::did::CommonDidResolver::new(
             atrium_identity::did::CommonDidResolverConfig {
                 plc_directory_url: "https://plc.directory".into(),
@@ -276,6 +297,7 @@ mod tests {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
         AppState {
@@ -302,6 +324,27 @@ mod tests {
                 test_db.clone(),
                 crate::db::DatabaseBackend::Sqlite,
             ),
+            linked_repos_client: std::sync::Arc::new(
+                crate::linked_repos::client::build(
+                    "https://plc.directory",
+                    "http://127.0.0.1:0/oauth-client-metadata.json",
+                    "http://127.0.0.1:0",
+                    "http://127.0.0.1:0/auth/callback".into(),
+                    true,
+                    vec![atrium_oauth::Scope::Known(
+                        atrium_oauth::KnownScope::Atproto,
+                    )],
+                    crate::auth::oauth_store::DbStateStore::new(
+                        test_db.clone(),
+                        crate::db::DatabaseBackend::Sqlite,
+                    ),
+                    test_db.clone(),
+                    crate::db::DatabaseBackend::Sqlite,
+                    None,
+                )
+                .expect("Failed to create test linked-repo OAuth client"),
+            ),
+            linked_repos_client_kid: None,
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-for-tests-only-not-production",
             ),
@@ -320,6 +363,8 @@ mod tests {
             ))),
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_jwks: Vec::new(),
+            telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
         }
     }
 
@@ -462,7 +507,9 @@ mod tests {
             port: 3000,
             database_url: String::new(),
             database_backend: crate::db::DatabaseBackend::Sqlite,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -477,10 +524,11 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         let (tx, _) = watch::channel(vec![]);
         let (labeler_tx, _) = watch::channel(());
-        let atrium_http = std::sync::Arc::new(atrium_oauth::DefaultHttpClient::default());
+        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
         let did_resolver = atrium_identity::did::CommonDidResolver::new(
             atrium_identity::did::CommonDidResolverConfig {
                 plc_directory_url: "https://plc.directory".into(),
@@ -515,6 +563,7 @@ mod tests {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
         AppState {
@@ -541,6 +590,27 @@ mod tests {
                 pool.clone(),
                 crate::db::DatabaseBackend::Sqlite,
             ),
+            linked_repos_client: std::sync::Arc::new(
+                crate::linked_repos::client::build(
+                    "https://plc.directory",
+                    "http://127.0.0.1:0/oauth-client-metadata.json",
+                    "http://127.0.0.1:0",
+                    "http://127.0.0.1:0/auth/callback".into(),
+                    true,
+                    vec![atrium_oauth::Scope::Known(
+                        atrium_oauth::KnownScope::Atproto,
+                    )],
+                    crate::auth::oauth_store::DbStateStore::new(
+                        pool.clone(),
+                        crate::db::DatabaseBackend::Sqlite,
+                    ),
+                    pool.clone(),
+                    crate::db::DatabaseBackend::Sqlite,
+                    None,
+                )
+                .expect("Failed to create test linked-repo OAuth client"),
+            ),
+            linked_repos_client_kid: None,
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-for-tests-only-not-production",
             ),
@@ -559,6 +629,8 @@ mod tests {
             ))),
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_jwks: Vec::new(),
+            telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
         }
     }
 
@@ -683,5 +755,56 @@ mod tests {
         assert_eq!(row.0, "warn-test-job");
         assert_eq!(row.1, "warn");
         assert_eq!(row.2, "something is off");
+    }
+
+    #[tokio::test]
+    async fn job_wait_adds_the_slept_duration_to_job_wait_ms() {
+        let pool = migrated_pool().await;
+        let state = test_state_with_pool(pool);
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_job_context(
+            &lua,
+            Arc::new(state.clone()),
+            "wait-test-job".into(),
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+        lua.load("job.wait(0.05)").exec_async().await.unwrap();
+
+        assert_eq!(
+            state
+                .telemetry_counters
+                .job_wait_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            50
+        );
+    }
+
+    #[tokio::test]
+    async fn job_wait_accumulates_across_multiple_calls() {
+        let pool = migrated_pool().await;
+        let state = test_state_with_pool(pool);
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_job_context(
+            &lua,
+            Arc::new(state.clone()),
+            "wait-test-job-2".into(),
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+        lua.load("job.wait(0.01) job.wait(0.02)")
+            .exec_async()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state
+                .telemetry_counters
+                .job_wait_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            30
+        );
     }
 }

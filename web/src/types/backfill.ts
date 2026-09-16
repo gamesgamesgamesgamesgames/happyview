@@ -2,6 +2,7 @@ export interface BackfillJob {
   id: string
   collection: string | null
   did: string | null
+  scope: "network" | "dids"
   status: string
   stage: string
   total_repos: number | null
@@ -12,6 +13,7 @@ export interface BackfillJob {
   started_at: string | null
   completed_at: string | null
   created_at: string
+  error_counts?: Record<string, number>
 }
 
 export interface BackfillRepoEntry {
@@ -50,6 +52,7 @@ export interface BackfillEvent {
   stage?: string
   status?: string
   error?: string | null
+  error_counts?: Record<string, number>
 }
 
 export interface BlueskyProfile {
@@ -57,4 +60,31 @@ export interface BlueskyProfile {
   handle: string
   displayName?: string
   avatar?: string
+}
+
+export interface BackfillErrorEntry {
+  did: string
+  collection: string | null
+  phase: string
+  kind: string
+  message: string
+  attempts: number
+  last_at: string
+}
+
+// One kind's exact total, carrying its own retryability. `retryable` is
+// served here rather than duplicated as a client-side kind set — see
+// `BackfillErrorCount` in `src/admin/types.rs` for why.
+export interface BackfillErrorCount {
+  kind: string
+  count: number
+  retryable: boolean
+}
+
+export interface BackfillErrorsResponse {
+  errors: BackfillErrorEntry[]
+  cursor: string | null
+  counts: BackfillErrorCount[]
+  capped: boolean
+  cap: number
 }

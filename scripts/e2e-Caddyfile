@@ -1,4 +1,9 @@
+happyview.127-0-0-1.sslip.io {
+tls internal
+reverse_proxy happyview:3000
+}
+
 pds.localhost {
-	tls internal
-	reverse_proxy pds:3000
+tls internal
+reverse_proxy pds:3000
 }

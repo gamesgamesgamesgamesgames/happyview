@@ -2,7 +2,7 @@
 title: "From Source"
 ---
 
-This guide runs HappyView directly with `cargo run`. If you'd rather use Docker Compose, see [Local Development with Docker](docker.md).
+This guide runs HappyView directly with `cargo run`. If you'd rather run the whole stack in containers, see [Local Development](local-development.md). To deploy from prebuilt images, see [Docker](docker.md).
 
 ## Prerequisites
 
@@ -12,7 +12,7 @@ This guide runs HappyView directly with `cargo run`. If you'd rather use Docker 
 ## 1. Clone and configure
 
 ```sh
-git clone git@tangled.org:gamesgamesgamesgames.games/happyview
+git clone git@github.com:gamesgamesgamesgamesgames/happyview
 cd happyview
 cp .env.example .env
 ```
@@ -27,7 +27,7 @@ SESSION_SECRET=change-me-in-production
 ```
 
 <Callout type="warn" title="Use 127.0.0.1, not localhost">
-ATProto OAuth loopback clients are registered with `127.0.0.1`. If you set `PUBLIC_URL` to `http://localhost:3000`, OAuth sign-in will fail because the redirect URI won't match the loopback client ID. Always use `http://127.0.0.1:3000` for local development.
+atproto OAuth loopback clients are registered with `127.0.0.1`. If you set `PUBLIC_URL` to `http://localhost:3000`, OAuth sign-in will fail because the redirect URI won't match the loopback client ID. Always use `http://127.0.0.1:3000` for local development.
 </Callout>
 
 Or if you prefer Postgres:

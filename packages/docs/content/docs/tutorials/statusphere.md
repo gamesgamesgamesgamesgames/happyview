@@ -19,7 +19,7 @@ Statusphere uses a single record type, `xyz.statusphere.status`. Each record has
 
 Users can set their status as many times as they want. Each status is a new record in their repository, keyed by a TID (timestamp-based identifier). The most recent record is their "current" status.
 
-For more background on how the app works, see the [ATProto Statusphere guide](https://atproto.com/guides/applications).
+For more background on how the app works, see the [atproto Statusphere guide](https://atproto.com/guides/applications).
 
 ## Step 1: Add the record lexicon
 
@@ -492,4 +492,4 @@ Everything was done through the dashboard — no server restarts, no config file
 - [XRPC API](../api-reference/xrpc-api.md): Understand how the generated endpoints behave
 - [Admin API](../api-reference/admin/admin-api.md): Automate lexicon management via the API
 - [Statusphere example app](https://github.com/bluesky-social/statusphere-example-app): See the full Statusphere frontend
-- [ATProto Statusphere guide](https://atproto.com/guides/applications): How the app works at the protocol level
+- [atproto Statusphere guide](https://atproto.com/guides/applications): How the app works at the protocol level

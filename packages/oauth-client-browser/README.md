@@ -40,6 +40,12 @@ const session = await client.signIn("alice.bsky.social", {
 });
 ```
 
+Every sign-in method accepts either a handle or a DID:
+
+```typescript
+await client.signIn("did:plc:abcdefghijklmnopqrstuvwx");
+```
+
 If you need the authorization URL without an immediate redirect, use `prepareLogin`:
 
 ```typescript

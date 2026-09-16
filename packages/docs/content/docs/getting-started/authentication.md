@@ -482,7 +482,7 @@ X-Client-Key: hvc_...
 X-Client-Secret: hvs_...
 ```
 
-Public clients must provide a valid DPoP proof to prove they hold the key. This revokes only the session that matches the DPoP key used in the proof — other device sessions for the same user are unaffected:
+Alternatively, provide a valid DPoP proof to prove you hold the key. This revokes only the session that matches the DPoP key used in the proof — other device sessions for the same user are unaffected:
 
 ```
 DELETE /oauth/sessions/did:plc:user123
@@ -490,6 +490,10 @@ X-Client-Key: hvc_...
 Authorization: DPoP <access_token>
 DPoP: <proof_jwt>
 ```
+
+DPoP auth is accepted here from any client, confidential or public — the same credentials that authorise `/xrpc/*` calls. A confidential client using DPoP does not have to fall back to its secret just to log out.
+
+The `htu` in the proof must match the URL you actually requested, byte for byte. If you percent-encode the DID in the path, sign the encoded form.
 
 To revoke a specific device session (for either client type), use the [device management endpoints](#6-managing-device-sessions) instead.
 
@@ -536,7 +540,7 @@ X-Client-Key: hvc_...
 X-Client-Secret: hvs_...
 ```
 
-For public clients, use DPoP auth instead of `X-Client-Secret`:
+Or use DPoP auth instead of `X-Client-Secret` — accepted from any client type:
 
 ```
 DELETE /oauth/sessions/did:plc:user123/devices/uuid-session-1

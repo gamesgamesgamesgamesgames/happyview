@@ -31,7 +31,9 @@ The `target_collection` is available in Lua scripts as the `collection` global, 
 
 ## Backfill flag
 
-When uploading a record-type lexicon, HappyView automatically creates a backfill job to discover existing records. If you only want to index new records going forward, you can set `backfill` to `false`.
+When a record-type lexicon is uploaded for the first time, HappyView automatically creates a [backfill job](backfill.md) to discover existing records. The job appears on the Backfill page like any other, with the same progress, pause, cancel, and retry controls, and the upload response returns its id as `backfill_job_id`.
+
+Only the *first* upload starts one. Editing a lexicon afterwards re-saves it without re-crawling the network — if you want to backfill again, start one from the Backfill page. If you only want to index new records going forward, set `backfill` to `false`.
 
 ## Jetstream collection filters
 

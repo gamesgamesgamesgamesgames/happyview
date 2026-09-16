@@ -1,13 +1,10 @@
-//! Core record-write service functions for spaces, shared by the HTTP handlers
-//! (`src/spaces/routes.rs`) and (in a later task) a Lua binding, so both call
-//! the exact same membership/validation/write logic.
-
 use crate::AppState;
-use crate::db::{adapt_sql, now_rfc3339};
+use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lua::tid::generate_tid;
+use crate::spaces::lthash::LtHashState;
 use crate::spaces::types::*;
-use crate::spaces::{SpaceUri, db, members};
+use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog};
 use sha2::{Digest, Sha256};
 
 pub(crate) async fn resolve_space(state: &AppState, space_ref: &str) -> Result<Space, AppError> {
@@ -23,10 +20,15 @@ pub(crate) async fn resolve_space(state: &AppState, space_ref: &str) -> Result<S
     .ok_or_else(|| AppError::NotFound("Space not found".into()))
 }
 
-pub(crate) fn content_cid(record: &serde_json::Value) -> String {
-    let bytes = serde_json::to_vec(record).unwrap_or_default();
-    let hash = Sha256::digest(&bytes);
-    format!("bafyrei{}", hex::encode(&hash[..20]))
+pub(crate) fn content_cid(record: &serde_json::Value) -> Result<String, AppError> {
+    crate::cid_verify::compute_record_cid(record)
+        .map(|cid| cid.to_string())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "record cannot be encoded as DAG-CBOR (non-finite number, or malformed $link/$bytes)"
+                    .into(),
+            )
+        })
 }
 
 pub(crate) async fn require_space_admin(
@@ -54,12 +56,6 @@ pub(crate) async fn require_space_admin(
     ))
 }
 
-/// Enforce a space's `allowedCollections` config (`space.config.extra["allowedCollections"]`,
-/// a JSON array of collection NSID strings injected from the lexicon
-/// registry at space-creation time — see `create_space` below). Enforcement
-/// only kicks in when the field is present *and* non-empty, so spaces
-/// without the config (or with an empty list) continue to allow any
-/// collection, preserving backward compatibility.
 pub(crate) fn check_collection_allowed(space: &Space, collection: &str) -> Result<(), AppError> {
     if let Some(serde_json::Value::Array(allowed)) = space.config.extra.get("allowedCollections")
         && !allowed.is_empty()
@@ -78,7 +74,7 @@ pub(crate) async fn require_membership(
     did: &str,
     require_write: bool,
     space_credential: Option<&str>,
-) -> Result<SpaceAccess, AppError> {
+) -> Result<MemberAccess, AppError> {
     if let Some(token) = space_credential {
         let space_uri = format!(
             "at://{}/space/{}/{}",
@@ -99,7 +95,7 @@ pub(crate) async fn require_membership(
                         "Write access is required for this action".into(),
                     ));
                 } else {
-                    return Ok(SpaceAccess::Read);
+                    return Ok(MemberAccess::READ);
                 }
             }
             Ok(_) => {}
@@ -117,6 +113,243 @@ pub(crate) async fn require_membership(
     Ok(access)
 }
 
+pub(crate) struct AppliedOp {
+    pub action: OplogAction,
+    pub collection: String,
+    pub rkey: String,
+    pub new_cid: Option<String>,
+    pub old_cid: Option<String>,
+}
+
+// HappyView signs polyfilled commits with its own `#atproto_space` key.
+//
+// In polyfill mode HappyView is the repo host but holds no per-user signing
+// key, so it cannot produce a signature that verifies against the author's DID
+// document. Polyfilled repos are therefore host-attested, not author-attested.
+// In native mode the user's PDS signs commits, so this path applies only to
+// polyfill mode.
+
+/// Provision the `#atproto_space` key if absent, then load it.
+///
+/// Writes, so it belongs on cold paths only: startup, space creation, and the
+/// offline backfill binaries. The write path uses [`service_signing_key`].
+pub async fn signing_key_from_pool(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+) -> Result<p256::ecdsa::SigningKey, AppError> {
+    crate::verification_methods::ensure_atproto_space_method(pool, backend, encryption_key).await?;
+    load_signing_key(pool, backend, encryption_key).await
+}
+
+/// Load the `#atproto_space` key. Read-only.
+pub async fn load_signing_key(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+) -> Result<p256::ecdsa::SigningKey, AppError> {
+    let key_bytes = crate::verification_methods::get_private_key_bytes(
+        pool,
+        backend,
+        "#atproto_space",
+        encryption_key,
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::Internal(
+            "#atproto_space signing key is missing; it is provisioned at startup and on space creation"
+                .into(),
+        )
+    })?;
+
+    crate::verification_methods::private_key_bytes_to_signing_key(&key_bytes)
+}
+
+/// The signing key for a space write.
+///
+/// Read-only because this runs on every write: provisioning here would issue an
+/// INSERT per write, which wastes a round trip and contends with the caller's
+/// own transaction. Provisioning happens on the cold paths, startup and
+/// `create_space`.
+///
+/// Call it before opening the write transaction. It queries through the pool,
+/// not the transaction's connection, and on SQLite a second connection used
+/// while a write transaction is open can deadlock.
+pub(crate) async fn service_signing_key(
+    state: &AppState,
+) -> Result<p256::ecdsa::SigningKey, AppError> {
+    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+        AppError::Internal(
+            "spaces require a token encryption key to sign commits; set TOKEN_ENCRYPTION_KEY"
+                .into(),
+        )
+    })?;
+    load_signing_key(&state.db, state.db_backend, encryption_key).await
+}
+
+pub(crate) async fn commit_write(
+    conn: &mut sqlx::AnyConnection,
+    backend: DatabaseBackend,
+    space: &Space,
+    author_did: &str,
+    rev: &str,
+    ops: &[AppliedOp],
+    signing_key: &p256::ecdsa::SigningKey,
+) -> Result<(), AppError> {
+    let mut repo_state =
+        db::get_or_create_repo_state(&mut *conn, backend, &space.id, author_did).await?;
+
+    let lthash_bytes: [u8; 2048] = repo_state.lthash_state.as_slice().try_into().map_err(|_| {
+        AppError::Internal(format!(
+            "corrupt repo state: lthash is {} bytes, expected 2048",
+            repo_state.lthash_state.len()
+        ))
+    })?;
+    let mut set_hash = LtHashState::from_bytes(lthash_bytes);
+
+    let now = now_rfc3339();
+    for (idx, op) in ops.iter().enumerate() {
+        if let Some(old) = op.old_cid.as_deref() {
+            set_hash.remove(&lthash::record_element(&op.collection, &op.rkey, old));
+        }
+        if let Some(new) = op.new_cid.as_deref() {
+            set_hash.add(&lthash::record_element(&op.collection, &op.rkey, new));
+        }
+
+        let entry = OplogEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            space_id: space.id.clone(),
+            author_did: author_did.to_string(),
+            rev: rev.to_string(),
+            idx: idx as i32,
+            action: op.action,
+            collection: op.collection.clone(),
+            rkey: op.rkey.clone(),
+            cid: op.new_cid.clone(),
+            prev: op.old_cid.clone(),
+            value: None,
+            created_at: now.clone(),
+        };
+        oplog::append_op(&mut *conn, backend, &entry).await?;
+    }
+
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    let signed = commit::sign_commit(&set_hash.hash(), &space_uri, author_did, rev, signing_key)?;
+
+    repo_state.lthash_state = set_hash.as_bytes().to_vec();
+    repo_state.rev = Some(signed.rev);
+    repo_state.hash = Some(signed.hash.to_vec());
+    repo_state.ikm = Some(signed.ikm.to_vec());
+    repo_state.sig = Some(signed.sig);
+    repo_state.mac = Some(signed.mac.to_vec());
+    db::update_repo_state(&mut *conn, backend, &repo_state).await?;
+
+    db::update_space_revision(&mut *conn, backend, &space.id, rev).await?;
+
+    Ok(())
+}
+
+pub(crate) async fn notify_ops(
+    state: &AppState,
+    space: &Space,
+    author_did: &str,
+    ops: &[AppliedOp],
+) {
+    for op in ops {
+        let _ = notifications::dispatch_write_notification(
+            &state.db,
+            state.db_backend,
+            &state.http,
+            &space.id,
+            author_did,
+            &op.collection,
+            &op.rkey,
+            op.new_cid.as_deref(),
+        )
+        .await;
+    }
+}
+
+/// Whether this repo's writes still belong to HappyView, and if not, forward them.
+///
+/// The AppView does not belong in the write path:
+/// `createRecord`/`putRecord`/`deleteRecord`/`applyWrites` are `pds`-role
+/// methods, and a client holding the user's session should write to their PDS
+/// directly while HappyView only indexes.
+///
+/// This bridge is deprecated. It keeps existing clients working once their
+/// repos migrate. Remove it once clients write to PDSes directly.
+async fn forward_write_if_native(
+    state: &AppState,
+    space: &Space,
+    author_did: &str,
+    method: &str,
+    body: serde_json::Value,
+) -> Result<Option<serde_json::Value>, AppError> {
+    let mut conn = state
+        .db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+    let repo_state =
+        db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, author_did).await?;
+    drop(conn);
+
+    if repo_state.host_mode.is_authoritative_here() {
+        return Ok(None);
+    }
+
+    tracing::warn!(
+        space_id = %space.id,
+        author_did,
+        method,
+        "forwarding a space write to the user's PDS; this bridge is deprecated and \
+         clients should write to the PDS directly"
+    );
+
+    // Without a usable session the write cannot reach the PDS, which is the
+    // source of truth. Writing locally instead would fork the two copies, and
+    // the next sync would drop the record.
+    let session = crate::repo::get_oauth_session(state, author_did)
+        .await
+        .map_err(|e| {
+            AppError::Forbidden(format!(
+                "this space lives on your PDS and HappyView cannot write to it for you; \
+             re-authenticate to continue writing ({e})"
+            ))
+        })?;
+
+    let resp = crate::repo::pds::pds_post_json_raw(state, &session, method, &body).await?;
+    if !resp.status().is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(AppError::BadGateway(format!(
+            "the user's PDS rejected {method}: {detail}"
+        )));
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| AppError::Internal(format!("PDS returned invalid JSON: {e}")))?;
+    Ok(Some(value))
+}
+
+/// Add `swapRecord` to a forwarded write only when the caller gave one.
+///
+/// `"swapRecord": null` is not the same as leaving it out: it asks the PDS to
+/// write only if no record exists, so an unconditional update would fail.
+fn with_swap_record(mut body: serde_json::Value, swap_cid: Option<&str>) -> serde_json::Value {
+    if let Some(swap) = swap_cid {
+        body["swapRecord"] = serde_json::json!(swap);
+    }
+    body
+}
+
 pub(crate) async fn create_record(
     state: &AppState,
     did: &str,
@@ -129,8 +362,39 @@ pub(crate) async fn create_record(
     require_membership(state, &space, did, true, space_credential).await?;
     check_collection_allowed(&space, collection)?;
 
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if let Some(forwarded) = forward_write_if_native(
+        state,
+        &space,
+        did,
+        "com.atproto.space.createRecord",
+        serde_json::json!({
+            "space": space_uri,
+            "repo": did,
+            "collection": collection,
+            "record": record,
+        }),
+    )
+    .await?
+    {
+        let uri = forwarded
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let cid = forwarded
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        return Ok((uri, cid));
+    }
+
     let rkey = generate_tid();
-    let cid = content_cid(&record);
+    let cid = content_cid(&record)?;
     let record_uri = format!(
         "at://{}/space/{}/{}/{}/{}/{}",
         space.did, space.type_nsid, space.skey, did, collection, rkey
@@ -145,9 +409,40 @@ pub(crate) async fn create_record(
         cid: cid.clone(),
         indexed_at: now_rfc3339(),
     };
-    db::insert_space_record(&state.db, state.db_backend, &rec).await?;
     let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+    let ops = vec![AppliedOp {
+        action: OplogAction::Create,
+        collection: collection.to_string(),
+        rkey: rec.rkey.clone(),
+        new_cid: Some(cid.clone()),
+        old_cid: None,
+    }];
+
+    // Before the transaction; see `service_signing_key`.
+    let signing_key = service_signing_key(state).await?;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    db::insert_space_record(&mut *tx, state.db_backend, &rec).await?;
+    commit_write(
+        &mut tx,
+        state.db_backend,
+        &space,
+        did,
+        &rev,
+        &ops,
+        &signing_key,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
+
+    notify_ops(state, &space, did, &ops).await;
+
     Ok((record_uri, cid))
 }
 
@@ -166,7 +461,42 @@ pub(crate) async fn put_record(
     require_membership(state, &space, did, true, space_credential).await?;
     check_collection_allowed(&space, collection)?;
 
-    let cid = content_cid(&record);
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if let Some(forwarded) = forward_write_if_native(
+        state,
+        &space,
+        did,
+        "com.atproto.space.putRecord",
+        with_swap_record(
+            serde_json::json!({
+                "space": space_uri,
+                "repo": did,
+                "collection": collection,
+                "rkey": rkey,
+                "record": record,
+            }),
+            swap_cid.as_deref(),
+        ),
+    )
+    .await?
+    {
+        let uri = forwarded
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let cid = forwarded
+            .get("cid")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        return Ok((uri, cid));
+    }
+
+    let cid = content_cid(&record)?;
     let record_uri = format!(
         "at://{}/space/{}/{}/{}/{}/{}",
         space.did, space.type_nsid, space.skey, did, collection, rkey
@@ -181,13 +511,57 @@ pub(crate) async fn put_record(
         cid: cid.clone(),
         indexed_at: now_rfc3339(),
     };
-    if let Some(swap) = swap_cid {
-        db::upsert_space_record_with_swap(&state.db, state.db_backend, &rec, &swap).await?;
-    } else {
-        db::upsert_space_record(&state.db, state.db_backend, &rec).await?;
-    }
     let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+    // Before the transaction; see `service_signing_key`.
+    let signing_key = service_signing_key(state).await?;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
+    let old_cid = match swap_cid.as_deref() {
+        Some(swap) => Some(swap.to_string()),
+        None => db::get_space_record(&mut *tx, state.db_backend, &record_uri)
+            .await?
+            .map(|r| r.cid),
+    };
+    let action = if old_cid.is_some() {
+        OplogAction::Update
+    } else {
+        OplogAction::Create
+    };
+
+    if let Some(swap) = swap_cid {
+        db::upsert_space_record_with_swap(&mut tx, state.db_backend, &rec, &swap).await?;
+    } else {
+        db::upsert_space_record(&mut *tx, state.db_backend, &rec).await?;
+    }
+
+    let ops = vec![AppliedOp {
+        action,
+        collection: collection.to_string(),
+        rkey: rkey.to_string(),
+        new_cid: Some(cid.clone()),
+        old_cid,
+    }];
+    commit_write(
+        &mut tx,
+        state.db_backend,
+        &space,
+        did,
+        &rev,
+        &ops,
+        &signing_key,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
+
+    notify_ops(state, &space, did, &ops).await;
+
     Ok((record_uri, cid))
 }
 
@@ -202,27 +576,86 @@ pub(crate) async fn delete_record(
     let space = resolve_space(state, space_ref).await?;
     require_membership(state, &space, did, true, None).await?;
 
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if forward_write_if_native(
+        state,
+        &space,
+        did,
+        "com.atproto.space.deleteRecord",
+        with_swap_record(
+            serde_json::json!({
+                "space": space_uri,
+                "repo": did,
+                "collection": collection,
+                "rkey": rkey,
+            }),
+            swap_cid.as_deref(),
+        ),
+    )
+    .await?
+    .is_some()
+    {
+        return Ok(());
+    }
+
     let record_uri = format!(
         "at://{}/space/{}/{}/{}/{}/{}",
         space.did, space.type_nsid, space.skey, did, collection, rkey
     );
-    if let Some(swap) = swap_cid {
-        db::delete_space_record_with_swap(&state.db, state.db_backend, &record_uri, &swap).await?;
+    let rev = generate_tid();
+    // Before the transaction; see `service_signing_key`.
+    let signing_key = service_signing_key(state).await?;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
+    let old_cid = if let Some(swap) = swap_cid {
+        db::delete_space_record_with_swap(&mut tx, state.db_backend, &record_uri, &swap).await?;
+        swap
     } else {
-        let record = db::get_space_record(&state.db, state.db_backend, &record_uri).await?;
-        match record {
+        let record = db::get_space_record(&mut *tx, state.db_backend, &record_uri).await?;
+        let cid = match record {
             Some(r) if r.author_did != did => {
                 return Err(AppError::Forbidden(
                     "You can only delete your own records".into(),
                 ));
             }
             None => return Err(AppError::NotFound("Record not found".into())),
-            _ => {}
-        }
-        db::delete_space_record(&state.db, state.db_backend, &record_uri).await?;
-    }
-    let rev = generate_tid();
-    db::update_space_revision(&state.db, state.db_backend, &space.id, &rev).await?;
+            Some(r) => r.cid,
+        };
+        db::delete_space_record(&mut *tx, state.db_backend, &record_uri).await?;
+        cid
+    };
+
+    let ops = vec![AppliedOp {
+        action: OplogAction::Delete,
+        collection: collection.to_string(),
+        rkey: rkey.to_string(),
+        new_cid: None,
+        old_cid: Some(old_cid),
+    }];
+    commit_write(
+        &mut tx,
+        state.db_backend,
+        &space,
+        did,
+        &rev,
+        &ops,
+        &signing_key,
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
+
+    notify_ops(state, &space, did, &ops).await;
+
     Ok(())
 }
 
@@ -234,9 +667,9 @@ pub(crate) async fn create_space(
     skey: &str,
     display_name: Option<String>,
     description: Option<String>,
-    mint_policy: Option<MintPolicy>,
+    read_policy: Option<Policy>,
+    write_policy: Option<Policy>,
     app_access: Option<AppAccess>,
-    managing_app_did: Option<String>,
     config: Option<SpaceConfig>,
 ) -> Result<Space, AppError> {
     if type_nsid.is_empty() || skey.is_empty() {
@@ -274,9 +707,9 @@ pub(crate) async fn create_space(
         skey: skey.to_string(),
         display_name,
         description,
-        mint_policy: mint_policy.unwrap_or(MintPolicy::MemberList),
+        read_policy: read_policy.unwrap_or_default(),
+        write_policy: write_policy.unwrap_or_default(),
         app_access: app_access.unwrap_or_default(),
-        managing_app_did,
         config,
         revision: None,
         created_at: now_rfc3339(),
@@ -297,7 +730,7 @@ pub(crate) async fn create_space(
         id: uuid::Uuid::new_v4().to_string(),
         space_id: space.id.clone(),
         did: did.to_string(),
-        access: SpaceAccess::Write,
+        access: MemberAccess::WRITE,
         is_delegation: false,
         granted_by: Some(did.to_string()),
         created_at: now_rfc3339(),
@@ -306,12 +739,50 @@ pub(crate) async fn create_space(
     Ok(space)
 }
 
+/// Add a member, or replace their read and write access if they already exist.
+///
+/// `putMember` semantics: a repeat call updates the member rather than
+/// conflicting. The upsert preserves `read_self` instead of resetting it.
+/// `read_self` is HappyView-local and never sent over the wire, so a caller
+/// replacing read/write access has not asked to lift an own-records-only
+/// restriction.
+pub(crate) async fn put_member(
+    state: &AppState,
+    actor_did: &str,
+    space_ref: &str,
+    member_did: &str,
+    access: MemberAccess,
+    is_delegation: Option<bool>,
+) -> Result<SpaceMember, AppError> {
+    let space = resolve_space(state, space_ref).await?;
+    require_space_admin(state, &space, actor_did).await?;
+
+    let existing = db::get_member(&state.db, state.db_backend, &space.id, member_did).await?;
+    let member = SpaceMember {
+        id: existing
+            .as_ref()
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        space_id: space.id,
+        did: member_did.to_string(),
+        access: MemberAccess {
+            read_self: existing.map(|m| m.access.read_self).unwrap_or(false),
+            ..access
+        },
+        is_delegation: is_delegation.unwrap_or(false),
+        granted_by: Some(actor_did.to_string()),
+        created_at: now_rfc3339(),
+    };
+    db::add_member(&state.db, state.db_backend, &member).await?;
+    Ok(member)
+}
+
 pub(crate) async fn add_member(
     state: &AppState,
     actor_did: &str,
     space_ref: &str,
     member_did: &str,
-    access: Option<SpaceAccess>,
+    access: Option<MemberAccess>,
     is_delegation: Option<bool>,
 ) -> Result<SpaceMember, AppError> {
     let space = resolve_space(state, space_ref).await?;
@@ -328,7 +799,7 @@ pub(crate) async fn add_member(
         id: uuid::Uuid::new_v4().to_string(),
         space_id: space.id,
         did: member_did.to_string(),
-        access: access.unwrap_or(SpaceAccess::Read),
+        access: access.unwrap_or(MemberAccess::READ),
         is_delegation: is_delegation.unwrap_or(false),
         granted_by: Some(actor_did.to_string()),
         created_at: now_rfc3339(),
@@ -344,9 +815,9 @@ pub(crate) async fn update_space(
     space_ref: &str,
     display_name: Option<Option<String>>,
     description: Option<Option<String>>,
-    mint_policy: Option<MintPolicy>,
+    read_policy: Option<Policy>,
+    write_policy: Option<Policy>,
     app_access: Option<AppAccess>,
-    managing_app_did: Option<Option<String>>,
     config: Option<SpaceConfig>,
 ) -> Result<Space, AppError> {
     let mut space = resolve_space(state, space_ref).await?;
@@ -357,14 +828,15 @@ pub(crate) async fn update_space(
     if let Some(desc) = description {
         space.description = desc;
     }
-    if let Some(policy) = mint_policy {
-        space.mint_policy = policy;
+    // Each supplied policy replaces the current one wholesale, per the lexicon.
+    if let Some(policy) = read_policy {
+        space.read_policy = policy;
+    }
+    if let Some(policy) = write_policy {
+        space.write_policy = policy;
     }
     if let Some(access) = app_access {
         space.app_access = access;
-    }
-    if let Some(did) = managing_app_did {
-        space.managing_app_did = did;
     }
     if let Some(cfg) = config {
         space.config = cfg;
@@ -405,7 +877,7 @@ pub(crate) async fn create_invite(
     state: &AppState,
     actor_did: &str,
     space_ref: &str,
-    access: Option<SpaceAccess>,
+    access: Option<MemberAccess>,
     max_uses: Option<i64>,
     expires_at: Option<String>,
 ) -> Result<(SpaceInvite, String), AppError> {
@@ -420,7 +892,7 @@ pub(crate) async fn create_invite(
         space_id: space.id,
         token_hash,
         created_by: actor_did.to_string(),
-        access: access.unwrap_or(SpaceAccess::Read),
+        access: access.unwrap_or(MemberAccess::READ),
         max_uses,
         uses: 0,
         expires_at,
@@ -435,7 +907,7 @@ pub(crate) async fn accept_invite(
     state: &AppState,
     did: &str,
     token: &str,
-) -> Result<(String, SpaceAccess), AppError> {
+) -> Result<(String, MemberAccess), AppError> {
     let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
     let invite = db::get_invite_by_token_hash(&state.db, state.db_backend, &token_hash)
         .await?
@@ -489,11 +961,6 @@ mod tests {
     use crate::lexicon::LexiconRegistry;
     use tokio::sync::watch;
 
-    /// These are integration tests requiring Postgres, mirroring the skip
-    /// idiom used by `tests/common`'s `require_db!` macro: when
-    /// `TEST_DATABASE_URL` isn't set, the test returns early instead of
-    /// failing, so `cargo test --lib` stays DB-free. Run for real via:
-    /// `TEST_DATABASE_URL=postgres://... cargo test -p happyview spaces::service`
     macro_rules! require_test_db {
         () => {
             if std::env::var("TEST_DATABASE_URL").is_err() {
@@ -503,9 +970,6 @@ mod tests {
         };
     }
 
-    /// Build an `AppState` backed by a migrated, empty Postgres database
-    /// (`TEST_DATABASE_URL`). Callers must have already checked
-    /// `require_test_db!()`.
     async fn service_empty_db() -> AppState {
         let url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must be set for spaces::service integration tests");
@@ -517,7 +981,9 @@ mod tests {
             port: 0,
             database_url: String::new(),
             database_backend: backend,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -529,14 +995,16 @@ mod tests {
             logo_uri: None,
             tos_uri: None,
             policy_uri: None,
-            token_encryption_key: None,
+            // Space writes need this to decrypt the `#atproto_space` signing key.
+            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         let (collections_tx, _) = watch::channel(vec![]);
         let (labeler_subscriptions_tx, _) = watch::channel(());
 
-        let atrium_http = std::sync::Arc::new(atrium_oauth::DefaultHttpClient::default());
+        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
         let did_resolver = atrium_identity::did::CommonDidResolver::new(
             atrium_identity::did::CommonDidResolverConfig {
                 plc_directory_url: "https://plc.directory".into(),
@@ -565,10 +1033,11 @@ mod tests {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
 
-        AppState {
+        let state = AppState {
             config,
             http: reqwest::Client::new(),
             db: pool.clone(),
@@ -589,6 +1058,24 @@ mod tests {
                 oauth,
             ))),
             oauth_state_store: crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+            linked_repos_client: std::sync::Arc::new(
+                crate::linked_repos::client::build(
+                    "https://plc.directory",
+                    "http://127.0.0.1:0/oauth-client-metadata.json",
+                    "http://127.0.0.1:0",
+                    "http://127.0.0.1:0/auth/callback".into(),
+                    true,
+                    vec![atrium_oauth::Scope::Known(
+                        atrium_oauth::KnownScope::Atproto,
+                    )],
+                    crate::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                    pool.clone(),
+                    backend,
+                    None,
+                )
+                .expect("Failed to create test linked-repo OAuth client"),
+            ),
+            linked_repos_client_kid: None,
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-for-tests-only-not-production",
             ),
@@ -607,22 +1094,19 @@ mod tests {
             ))),
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
+            client_jwks: Vec::new(),
+            telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
+        };
+
+        crate::test_support::provision_space_signing_key(&state).await;
+
+        state
     }
 
-    /// Build a migrated Postgres-backed `AppState` seeded with one space and
-    /// one write-member (also the space's `authority_did`, for later tasks).
-    /// Returns `(state, space_uri, member_did)`.
-    ///
-    /// Uses randomised DIDs/skeys so parallel tests sharing the same
-    /// `TEST_DATABASE_URL` database don't collide (no truncation is needed).
     async fn service_test_db() -> (AppState, String, String) {
         service_test_db_with_config(SpaceConfig::default()).await
     }
 
-    /// Same as `service_test_db`, but lets the caller supply the seeded
-    /// space's `config` (e.g. to set `allowedCollections` for enforcement
-    /// tests).
     async fn service_test_db_with_config(config: SpaceConfig) -> (AppState, String, String) {
         let state = service_empty_db().await;
 
@@ -642,9 +1126,9 @@ mod tests {
             skey: skey.clone(),
             display_name: None,
             description: None,
-            mint_policy: MintPolicy::MemberList,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
             app_access: AppAccess::default(),
-            managing_app_did: None,
             config,
             revision: None,
             created_at: now_rfc3339(),
@@ -658,7 +1142,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             space_id: space_id.clone(),
             did: member_did.clone(),
-            access: SpaceAccess::Write,
+            access: MemberAccess::WRITE,
             is_delegation: false,
             granted_by: None,
             created_at: now_rfc3339(),
@@ -671,8 +1155,6 @@ mod tests {
         (state, space_uri, member_did)
     }
 
-    /// Build a `SpaceConfig` whose `allowedCollections` extra is set to the
-    /// given list of collection NSIDs.
     fn config_with_allowed_collections(allowed: &[&str]) -> SpaceConfig {
         let mut config = SpaceConfig::default();
         config.extra.insert(
@@ -687,8 +1169,6 @@ mod tests {
         config
     }
 
-    /// Build a minimal, DB-free `Space` for pure unit tests of
-    /// `check_collection_allowed`.
     fn space_with_config(config: SpaceConfig) -> Space {
         Space {
             id: "space-id".into(),
@@ -699,9 +1179,9 @@ mod tests {
             skey: "main".into(),
             display_name: None,
             description: None,
-            mint_policy: MintPolicy::MemberList,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
             app_access: AppAccess::default(),
-            managing_app_did: None,
             config,
             revision: None,
             created_at: now_rfc3339(),
@@ -742,17 +1222,6 @@ mod tests {
         assert!(super::check_collection_allowed(&space, "com.example.anything").is_ok());
     }
 
-    /// `delete_record` builds the record URI from the *caller's own* DID
-    /// (see the `record_uri` construction in `service::delete_record`), so a
-    /// second write-member can never naturally collide with another
-    /// author's URI through the normal create/put/delete API surface — both
-    /// segments are always the same `did`. To exercise the ownership check
-    /// (`r.author_did != did` -> Forbidden) at all we have to manufacture a
-    /// data state where the URI's embedded DID segment (member B) diverges
-    /// from the row's stored `author_did` (member A), by seeding the record
-    /// directly via `db::insert_space_record` rather than going through
-    /// `create_record`/`put_record`. This still exercises the real
-    /// `delete_record` ownership-check code path.
     #[tokio::test]
     async fn delete_record_forbidden_for_non_author() {
         require_test_db!();
@@ -763,7 +1232,7 @@ mod tests {
             &member_a,
             &space_uri,
             &member_b,
-            Some(SpaceAccess::Write),
+            Some(MemberAccess::WRITE),
             None,
         )
         .await
@@ -772,8 +1241,6 @@ mod tests {
         let space = super::resolve_space(&state, &space_uri).await.unwrap();
         let collection = "com.example.item";
         let rkey = "fixedrkey-ownership";
-        // This is the exact URI `delete_record` will construct when member_b
-        // calls it with this collection/rkey.
         let record_uri = format!(
             "at://{}/space/{}/{}/{}/{}/{}",
             space.did, space.type_nsid, space.skey, member_b, collection, rkey
@@ -786,7 +1253,7 @@ mod tests {
             collection: collection.to_string(),
             rkey: rkey.to_string(),
             record: content.clone(),
-            cid: super::content_cid(&content),
+            cid: super::content_cid(&content).expect("test record must be DAG-CBOR encodable"),
             indexed_at: now_rfc3339(),
         };
         db::insert_space_record(&state.db, state.db_backend, &rec)
@@ -809,13 +1276,6 @@ mod tests {
         );
     }
 
-    /// A caller who is not a member of the space at all must be rejected
-    /// with `Forbidden` (write-membership check), not `NotFound`. Before the
-    /// membership check was added, `delete_record` would build the record
-    /// URI from the *caller's own* DID, fail to find a row at that URI (since
-    /// the non-member never authored anything), and return `NotFound`
-    /// instead — masking the fact that non-members should never be allowed
-    /// to reach the ownership check at all.
     #[tokio::test]
     async fn delete_record_rejects_non_member() {
         require_test_db!();
@@ -1133,8 +1593,6 @@ mod tests {
         assert!(matches!(err, crate::error::AppError::Forbidden(_)));
     }
 
-    /// A space whose config declares `allowedCollections` must reject a
-    /// `create_record` write to a collection not on that list.
     #[tokio::test]
     async fn create_record_rejects_disallowed_collection() {
         require_test_db!();
@@ -1163,8 +1621,6 @@ mod tests {
         }
     }
 
-    /// A space whose config declares `allowedCollections` still permits a
-    /// `create_record` write to a collection that *is* on the list.
     #[tokio::test]
     async fn create_record_allows_listed_collection() {
         require_test_db!();
@@ -1185,8 +1641,6 @@ mod tests {
         assert!(uri.contains("/com.example.allowed/"));
     }
 
-    /// A space without an `allowedCollections` config (the default,
-    /// backward-compatible case) allows a write to any collection.
     #[tokio::test]
     async fn create_record_allows_any_collection_when_config_absent() {
         require_test_db!();
@@ -1203,8 +1657,6 @@ mod tests {
         .expect("space without allowedCollections config should allow any collection");
     }
 
-    /// A space with an explicitly *empty* `allowedCollections` list also
-    /// allows a write to any collection (same backward-compat rule).
     #[tokio::test]
     async fn create_record_allows_any_collection_when_list_empty() {
         require_test_db!();
@@ -1222,8 +1674,6 @@ mod tests {
         .expect("empty allowedCollections list should allow any collection");
     }
 
-    /// A space whose config declares `allowedCollections` must reject a
-    /// `put_record` write to a collection not on that list.
     #[tokio::test]
     async fn put_record_rejects_disallowed_collection() {
         require_test_db!();
@@ -1254,8 +1704,6 @@ mod tests {
         }
     }
 
-    /// A `put_record` write to a collection ON the space's `allowedCollections`
-    /// list succeeds (positive-case parity with `create_record_allows_listed_collection`).
     #[tokio::test]
     async fn put_record_allows_listed_collection() {
         require_test_db!();
@@ -1304,7 +1752,7 @@ mod tests {
             crate::spaces::members::is_member(&state.db, state.db_backend, &space.id, &creator_did)
                 .await
                 .unwrap();
-        assert_eq!(access, Some(crate::spaces::types::SpaceAccess::Write));
+        assert_eq!(access, Some(crate::spaces::types::MemberAccess::WRITE));
     }
 
     #[tokio::test]
@@ -1331,7 +1779,7 @@ mod tests {
             &authority,
             &space_uri,
             "did:plc:newbie",
-            Some(crate::spaces::types::SpaceAccess::Write),
+            Some(crate::spaces::types::MemberAccess::WRITE),
             None,
         )
         .await
@@ -1358,7 +1806,7 @@ mod tests {
             &state,
             &authority,
             &space_uri,
-            Some(crate::spaces::types::SpaceAccess::Write),
+            Some(crate::spaces::types::MemberAccess::WRITE),
             None,
             None,
         )
@@ -1368,7 +1816,7 @@ mod tests {
             .await
             .expect("joiner redeems invite");
         assert_eq!(joined_uri, space_uri);
-        assert_eq!(access, crate::spaces::types::SpaceAccess::Write);
+        assert_eq!(access, crate::spaces::types::MemberAccess::WRITE);
         // now a member with write access
         let space = super::resolve_space(&state, &space_uri).await.unwrap();
         let acc = crate::spaces::members::is_member(
@@ -1379,6 +1827,113 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(acc, Some(crate::spaces::types::SpaceAccess::Write));
+        assert_eq!(acc, Some(crate::spaces::types::MemberAccess::WRITE));
+    }
+}
+
+#[cfg(test)]
+mod native_write_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn swap_record_is_left_out_unless_given() {
+        let body = with_swap_record(serde_json::json!({ "rkey": "a" }), None);
+        assert!(body.get("swapRecord").is_none(), "{body}");
+
+        let body = with_swap_record(serde_json::json!({ "rkey": "a" }), Some("bafyold"));
+        assert_eq!(body["swapRecord"], "bafyold");
+    }
+    use crate::spaces::host_mode::HostMode;
+
+    const USER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+
+    async fn state_with_space(mode: HostMode) -> (AppState, Space) {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let state = crate::test_support::test_state_with_pool(pool);
+
+        let space = Space {
+            id: "sp-bridge".into(),
+            did: USER.into(),
+            authority_did: USER.into(),
+            creator_did: USER.into(),
+            type_nsid: "com.example.forum".into(),
+            skey: "main".into(),
+            display_name: None,
+            description: None,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
+            app_access: AppAccess::Open,
+            config: SpaceConfig::default(),
+            revision: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+        db::create_space(&state.db, state.db_backend, &space)
+            .await
+            .expect("seed space");
+
+        let mut conn = state.db.acquire().await.unwrap();
+        let mut repo_state =
+            db::get_or_create_repo_state(&mut conn, state.db_backend, &space.id, USER)
+                .await
+                .unwrap();
+        repo_state.host_mode = mode;
+        db::update_repo_state(&mut *conn, state.db_backend, &repo_state)
+            .await
+            .unwrap();
+
+        (state, space)
+    }
+
+    #[tokio::test]
+    async fn a_polyfill_write_stays_local() {
+        let (state, space) = state_with_space(HostMode::Polyfill).await;
+        let forwarded = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("no error");
+        assert!(forwarded.is_none(), "polyfill writes must not be forwarded");
+    }
+
+    #[tokio::test]
+    async fn a_migrating_write_stays_local() {
+        // HappyView is still authoritative until the handoff verifies, so a
+        // write mid-migration belongs here, not on the PDS.
+        let (state, space) = state_with_space(HostMode::Migrating).await;
+        let forwarded = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("no error");
+        assert!(forwarded.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_native_write_without_a_session_fails() {
+        let (state, space) = state_with_space(HostMode::Native).await;
+        let err = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("a native write with no session must not write locally");
+
+        assert!(matches!(err, AppError::Forbidden(_)), "got {err:?}");
+        assert!(
+            format!("{err}").contains("re-authenticate"),
+            "the error should tell the user what to do: {err}"
+        );
     }
 }

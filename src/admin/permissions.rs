@@ -60,6 +60,8 @@ pub enum Permission {
 
     #[serde(rename = "events:read")]
     EventsRead,
+    #[serde(rename = "events:purge")]
+    EventsPurge,
 
     #[serde(rename = "labelers:create")]
     LabelersCreate,
@@ -120,6 +122,13 @@ pub enum Permission {
     JobsCreate,
     #[serde(rename = "jobs:manage")]
     JobsManage,
+
+    #[serde(rename = "linked-repos:read")]
+    LinkedReposRead,
+    #[serde(rename = "linked-repos:create")]
+    LinkedReposCreate,
+    #[serde(rename = "linked-repos:delete")]
+    LinkedReposDelete,
 }
 
 impl Permission {
@@ -146,6 +155,7 @@ impl Permission {
             Self::BackfillRead => "backfill:read",
             Self::StatsRead => "stats:read",
             Self::EventsRead => "events:read",
+            Self::EventsPurge => "events:purge",
             Self::LabelersCreate => "labelers:create",
             Self::LabelersRead => "labelers:read",
             Self::LabelersDelete => "labelers:delete",
@@ -172,6 +182,9 @@ impl Permission {
             Self::JobsRead => "jobs:read",
             Self::JobsCreate => "jobs:create",
             Self::JobsManage => "jobs:manage",
+            Self::LinkedReposRead => "linked-repos:read",
+            Self::LinkedReposCreate => "linked-repos:create",
+            Self::LinkedReposDelete => "linked-repos:delete",
         }
     }
 
@@ -295,6 +308,12 @@ impl Permission {
                 key: "events:read",
                 name: "View Events",
                 description: "View the event log",
+                category: "System",
+            },
+            Self::EventsPurge => PermissionInfo {
+                key: "events:purge",
+                name: "Purge Events",
+                description: "Bulk-delete event log entries matching a filter",
                 category: "System",
             },
             Self::LabelersCreate => PermissionInfo {
@@ -453,6 +472,24 @@ impl Permission {
                 description: "Cancel, pause, and resume background jobs",
                 category: "Jobs",
             },
+            Self::LinkedReposRead => PermissionInfo {
+                key: "linked-repos:read",
+                name: "View Linked Repos",
+                description: "View linked repos, their status, and their scopes",
+                category: "Linked Repos",
+            },
+            Self::LinkedReposCreate => PermissionInfo {
+                key: "linked-repos:create",
+                name: "Link Repos",
+                description: "Add linked repos and start authorization flows",
+                category: "Linked Repos",
+            },
+            Self::LinkedReposDelete => PermissionInfo {
+                key: "linked-repos:delete",
+                name: "Unlink Repos",
+                description: "Revoke linked repos and delete their stored sessions",
+                category: "Linked Repos",
+            },
         }
     }
 
@@ -479,6 +516,7 @@ impl Permission {
             Self::BackfillRead,
             Self::StatsRead,
             Self::EventsRead,
+            Self::EventsPurge,
             Self::LabelersCreate,
             Self::LabelersRead,
             Self::LabelersDelete,
@@ -505,6 +543,9 @@ impl Permission {
             Self::JobsRead,
             Self::JobsCreate,
             Self::JobsManage,
+            Self::LinkedReposRead,
+            Self::LinkedReposCreate,
+            Self::LinkedReposDelete,
         ])
     }
 }
@@ -535,6 +576,7 @@ pub fn catalog() -> Vec<PermissionInfo> {
         BackfillRead,
         StatsRead,
         EventsRead,
+        EventsPurge,
         LabelersCreate,
         LabelersRead,
         LabelersDelete,
@@ -559,6 +601,9 @@ pub fn catalog() -> Vec<PermissionInfo> {
         JobsRead,
         JobsCreate,
         JobsManage,
+        LinkedReposRead,
+        LinkedReposCreate,
+        LinkedReposDelete,
     ]
     .iter()
     .map(|p| p.info())
@@ -779,6 +824,18 @@ mod tests {
                     entry.key
                 );
             }
+        }
+    }
+
+    #[test]
+    fn events_purge_is_registered_and_not_granted_by_default_templates() {
+        assert_eq!(Permission::EventsPurge.as_str(), "events:purge");
+        assert!(Permission::all().contains(&Permission::EventsPurge));
+        for template in [Template::Viewer, Template::Operator, Template::Manager] {
+            assert!(
+                !template.permissions().contains(&Permission::EventsPurge),
+                "purging the audit log must not come with a built-in role template"
+            );
         }
     }
 }

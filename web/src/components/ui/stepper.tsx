@@ -262,34 +262,42 @@ function Stepper(props: StepperProps) {
   });
 
   const store = React.useMemo<Store>(() => {
+    const notify = () => {
+      for (const cb of listenersRef.current) {
+        cb();
+      }
+    };
+
+    const setState: Store["setState"] = (key, value) => {
+      if (Object.is(stateRef.current[key], value)) return;
+
+      if (key === "value" && typeof value === "string") {
+        stateRef.current.value = value;
+        propsRef.current.onValueChange?.(value);
+      } else {
+        stateRef.current[key] = value;
+      }
+
+      notify();
+    };
+
     return {
       subscribe: (cb) => {
         listenersRef.current.add(cb);
         return () => listenersRef.current.delete(cb);
       },
       getState: () => stateRef.current,
-      setState: (key, value) => {
-        if (Object.is(stateRef.current[key], value)) return;
-
-        if (key === "value" && typeof value === "string") {
-          stateRef.current.value = value;
-          propsRef.current.onValueChange?.(value);
-        } else {
-          stateRef.current[key] = value;
-        }
-
-        store.notify();
-      },
+      setState,
       setStateWithValidation: async (value, direction) => {
         if (!propsRef.current.onValidate) {
-          store.setState("value", value);
+          setState("value", value);
           return true;
         }
 
         try {
           const isValid = await propsRef.current.onValidate(value, direction);
           if (isValid) {
-            store.setState("value", value);
+            setState("value", value);
           }
           return isValid;
         } catch {
@@ -301,12 +309,12 @@ function Stepper(props: StepperProps) {
         const newStep: StepState = { value, completed, disabled };
         stateRef.current.steps.set(value, newStep);
         propsRef.current.onValueAdd?.(value);
-        store.notify();
+        notify();
       },
       removeStep: (value) => {
         stateRef.current.steps.delete(value);
         propsRef.current.onValueRemove?.(value);
-        store.notify();
+        notify();
       },
       setStep: (value, completed, disabled) => {
         const step = stateRef.current.steps.get(value);
@@ -318,14 +326,10 @@ function Stepper(props: StepperProps) {
             propsRef.current.onValueComplete?.(value, completed);
           }
 
-          store.notify();
+          notify();
         }
       },
-      notify: () => {
-        for (const cb of listenersRef.current) {
-          cb();
-        }
-      },
+      notify,
     };
   }, [listenersRef, stateRef, propsRef]);
 

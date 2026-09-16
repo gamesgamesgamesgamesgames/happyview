@@ -12,17 +12,48 @@ FROM rust:1.96.1-bookworm AS builder
 WORKDIR /app
 
 # Build dependencies first (cached until Cargo.toml/Cargo.lock change)
+# Every workspace member needs its manifest and a stub source here, or cargo
+# cannot resolve the workspace and the dependency-cache layer fails outright.
+# Adding a crate under crates/ means adding it to this list too.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && touch src/lib.rs && echo "fn main() {}" > src/bin/migrate_lua_sql.rs
+COPY crates/happyview-nsid/Cargo.toml crates/happyview-nsid/
+COPY crates/happyview-plc/Cargo.toml crates/happyview-plc/
+COPY crates/happyview-scopes/Cargo.toml crates/happyview-scopes/
+RUN mkdir -p crates/happyview-nsid/src crates/happyview-plc/src crates/happyview-scopes/src \
+    && touch crates/happyview-nsid/src/lib.rs crates/happyview-plc/src/lib.rs crates/happyview-scopes/src/lib.rs
+RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && touch src/lib.rs && echo "fn main() {}" > src/bin/migrate_lua_sql.rs && echo "fn main() {}" > src/bin/migrate_space_cids.rs
 ENV SQLX_OFFLINE=true
 RUN cargo build --release && rm -rf src target/release/.fingerprint/happyview-*
 
 # Build application code
 COPY src/ src/
+COPY crates/ crates/
 COPY migrations/ migrations/
 ARG HAPPYVIEW_VERSION
 ENV HAPPYVIEW_VERSION=$HAPPYVIEW_VERSION
+
+# Cargo.toml's package version is deliberately not bumped per release, so
+# CARGO_PKG_VERSION reports 0.1.0 unless it is stamped here. Do it before
+# compiling so crate metadata matches the tag this image is built from --
+# telemetry reported 0.1.0 fleet-wide for exactly this reason. Local builds
+# pass no build-arg and keep the repo version. See src/version.rs.
+RUN set -eu; \
+    v="${HAPPYVIEW_VERSION#v}"; \
+    if [ -n "$v" ]; then \
+      test "$(grep -c '^version = ' Cargo.toml)" = 1 \
+        || { echo "Cargo.toml: expected exactly one top-level 'version =' line" >&2; exit 1; }; \
+      sed -i "s|^version = .*|version = \"$v\"|" Cargo.toml; \
+      grep -qx "version = \"$v\"" Cargo.toml \
+        || { echo "Cargo.toml: version stamp failed" >&2; exit 1; }; \
+      echo "stamped Cargo.toml version = $v"; \
+    else \
+      echo "no HAPPYVIEW_VERSION build-arg; keeping repo version"; \
+    fi
+
 RUN cargo build --release
+
+FROM scratch AS binary
+COPY --from=builder /app/target/release/happyview /target/release/happyview
 
 FROM debian:bookworm-slim
 

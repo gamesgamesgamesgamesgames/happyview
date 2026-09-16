@@ -4,6 +4,8 @@ pub mod app;
 pub mod auth;
 #[allow(dead_code, unused_imports)]
 pub mod db;
+#[allow(unused_imports)]
+pub use db::insert_oauth_session;
 #[allow(dead_code, unused_imports)]
 pub mod fixtures;
 #[allow(dead_code, unused_imports)]

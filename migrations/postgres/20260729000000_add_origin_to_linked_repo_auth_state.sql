@@ -1,0 +1,12 @@
+-- Records how an in-flight linked-repo authorization was started, so the OAuth
+-- callback knows where to send the person completing it.
+--
+-- 'admin'  — an admin ran the flow inline from the dashboard; send them back to
+--            the Linked Repos page.
+-- 'invite' — someone opened an invite link; they are very likely NOT an admin of
+--            this instance, so sending them to the dashboard would bounce them
+--            to /login. They get a public result page instead.
+--
+-- Nullable, and treated as 'admin' when absent, so rows written before this
+-- migration keep their previous behavior.
+ALTER TABLE happyview_linked_repo_auth_state ADD COLUMN origin TEXT;

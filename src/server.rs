@@ -68,6 +68,9 @@ pub fn router(state: AppState) -> Router {
                 crate::feature_middleware::require_spaces,
             )),
         )
+        // Public and unauthenticated: detection happens before authorization,
+        // and must also answer on a build with spaces disabled.
+        .merge(crate::spaces::describe::describe_routes())
         .merge(crate::spaces::simplespace::simplespace_routes().layer(
             axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -75,6 +78,14 @@ pub fn router(state: AppState) -> Router {
             ),
         ))
         .nest("/auth", crate::auth::routes::routes())
+        .route(
+            "/auth/linked-repo/start",
+            get(crate::linked_repos::flow::start_handler),
+        )
+        .route(
+            "/auth/linked-repo/info",
+            get(crate::linked_repos::flow::invite_info_handler),
+        )
         .nest("/external-auth", crate::external_auth::routes())
         .nest("/oauth", crate::oauth::routes::routes())
         // https://atproto.com/specs/oauth#types-of-clients
@@ -179,6 +190,10 @@ pub fn router(state: AppState) -> Router {
     outer
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn_with_state(state.clone(), cors))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::telemetry_middleware::count_http_bytes,
+        ))
         .with_state(state)
 }
 
@@ -322,10 +337,7 @@ async fn config_endpoint(
             .or_else(|| state.config.logo_uri.clone())
     };
 
-    let version: &str = match option_env!("HAPPYVIEW_VERSION") {
-        Some(v) if !v.is_empty() => v.trim_start_matches('v'),
-        _ => env!("CARGO_PKG_VERSION"),
-    };
+    let version: &str = crate::version::version();
 
     let spaces_enabled = crate::feature_flags::is_enabled(
         pool,
@@ -406,7 +418,63 @@ async fn client_metadata(
         metadata["policy_uri"] = serde_json::Value::String(uri);
     }
 
+    let base_scopes = crate::linked_repos::scope::client_base_scopes(
+        oauth_client.client_metadata.scope.as_deref(),
+        &oauth_client.client_metadata.client_id,
+    );
+    match crate::linked_repos::db::all_scopes(&state).await {
+        Ok(grant_scopes) => {
+            let union = crate::linked_repos::scope::union(&grant_scopes, &base_scopes);
+            metadata["scope"] = serde_json::Value::String(union);
+        }
+        Err(e) => {
+            // Serving a doc without grant scopes would break every linked-repo
+            // authorization; log loudly rather than failing silently.
+            tracing::error!(error = %e, "failed to compute linked-repo scope union");
+        }
+    }
+
+    if metadata.get("jwks").is_some() {
+        match crate::oauth::client_keys::load_keys(
+            pool,
+            backend,
+            state.config.token_encryption_key.as_ref(),
+            crate::oauth::client_keys::INSTANCE_OWNER,
+        )
+        .await
+        {
+            Ok(keys) => apply_jwks_override(&mut metadata, &keys),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to load instance client keys for jwks");
+            }
+        }
+    }
+
     Json(metadata)
+}
+
+fn published_jwks(keys: &[crate::oauth::client_keys::ClientKey]) -> Option<serde_json::Value> {
+    let publishable: Vec<_> = keys
+        .iter()
+        .filter(|k| k.status != crate::oauth::client_keys::KeyStatus::Revoked)
+        .cloned()
+        .collect();
+    if publishable.is_empty() {
+        return None;
+    }
+    Some(crate::oauth::client_keys::render_jwks(&publishable))
+}
+
+fn apply_jwks_override(
+    metadata: &mut serde_json::Value,
+    keys: &[crate::oauth::client_keys::ClientKey],
+) {
+    if metadata.get("jwks").is_none() {
+        return;
+    }
+    if let Some(jwks) = published_jwks(keys) {
+        metadata["jwks"] = jwks;
+    }
 }
 
 fn extract_public_key_multibase(
@@ -537,4 +605,122 @@ async fn get_profile(
     }
 
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_jwks_override, published_jwks};
+    use crate::oauth::client_keys::{KeyStatus, generate_client_key};
+
+    const PRIVATE_JWK_PARAMS: &[&str] = &["d", "p", "q", "dp", "dq", "qi"];
+
+    fn key_with_status(status: KeyStatus) -> crate::oauth::client_keys::ClientKey {
+        let mut key = generate_client_key(crate::oauth::client_keys::INSTANCE_OWNER).unwrap();
+        key.status = status;
+        key
+    }
+
+    /// Regression test for the defect: after a rotation there are two
+    /// non-revoked keys (current + retiring), and both must be published —
+    /// the retiring one is what live sessions' refreshes are pinned to.
+    #[test]
+    fn both_current_and_retiring_keys_are_published() {
+        let current = key_with_status(KeyStatus::Current);
+        let retiring = key_with_status(KeyStatus::Retiring);
+
+        let jwks = published_jwks(&[current.clone(), retiring.clone()]).unwrap();
+        let kids: Vec<&str> = jwks["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["kid"].as_str().unwrap())
+            .collect();
+
+        assert!(kids.contains(&current.kid.as_str()));
+        assert!(kids.contains(&retiring.kid.as_str()));
+        assert_eq!(kids.len(), 2);
+    }
+
+    #[test]
+    fn a_revoked_key_is_not_published_alongside_a_current_one() {
+        let current = key_with_status(KeyStatus::Current);
+        let revoked = key_with_status(KeyStatus::Revoked);
+
+        let jwks = published_jwks(&[current.clone(), revoked.clone()]).unwrap();
+        let kids: Vec<&str> = jwks["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["kid"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(kids, vec![current.kid.as_str()]);
+    }
+
+    #[test]
+    fn published_jwks_contains_no_private_key_material() {
+        let current = key_with_status(KeyStatus::Current);
+        let retiring = key_with_status(KeyStatus::Retiring);
+
+        // Sanity check the fixture actually has private material to omit,
+        // so this test cannot pass vacuously.
+        assert!(current.private_jwk["d"].is_string());
+
+        let jwks = published_jwks(&[current, retiring]).unwrap();
+        for key in jwks["keys"].as_array().unwrap() {
+            for param in PRIVATE_JWK_PARAMS {
+                assert!(
+                    key.get(*param).is_none(),
+                    "published JWK unexpectedly contains private parameter `{param}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_revoked_keys_publish_nothing() {
+        let revoked = key_with_status(KeyStatus::Revoked);
+        assert!(published_jwks(&[revoked]).is_none());
+    }
+
+    #[test]
+    fn no_keys_publishes_nothing() {
+        assert!(published_jwks(&[]).is_none());
+    }
+
+    #[test]
+    fn a_public_clients_metadata_gets_no_jwks_field() {
+        let mut metadata = serde_json::json!({
+            "client_id": "https://example.com/oauth-client-metadata.json",
+            "client_name": "Example",
+        });
+        let keys = vec![key_with_status(KeyStatus::Current)];
+
+        apply_jwks_override(&mut metadata, &keys);
+
+        assert!(metadata.get("jwks").is_none());
+    }
+
+    #[test]
+    fn a_confidential_clients_jwks_field_is_replaced_with_the_full_key_set() {
+        let mut metadata = serde_json::json!({
+            "client_id": "https://example.com/oauth-client-metadata.json",
+            // Stand-in for atrium's single-key projection, which is exactly
+            // what this override must widen.
+            "jwks": {"keys": []},
+        });
+        let current = key_with_status(KeyStatus::Current);
+        let retiring = key_with_status(KeyStatus::Retiring);
+
+        apply_jwks_override(&mut metadata, &[current.clone(), retiring.clone()]);
+
+        let kids: Vec<&str> = metadata["jwks"]["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["kid"].as_str().unwrap())
+            .collect();
+        assert!(kids.contains(&current.kid.as_str()));
+        assert!(kids.contains(&retiring.kid.as_str()));
+    }
 }
