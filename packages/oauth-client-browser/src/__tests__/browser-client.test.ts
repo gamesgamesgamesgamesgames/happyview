@@ -43,6 +43,14 @@ function mockFetchForFullFlow() {
     const url = input instanceof Request ? input.url : String(input);
 
     if (url.includes("dns.google")) {
+      const queriedName = new URL(url).searchParams.get("name");
+      if (queriedName !== "_atproto.user.bsky.social") {
+        // NXDOMAIN
+        return new Response(JSON.stringify({ Status: 3 }), {
+          status: 200,
+          headers: { "content-type": "application/dns-json" },
+        });
+      }
       return new Response(
         JSON.stringify({
           Status: 0,
@@ -183,6 +191,36 @@ describe("HappyViewBrowserClient", () => {
       localStorage.key(i),
     ).find((k) => k?.includes("pending-auth"));
     expect(stateKey).toBeDefined();
+  });
+
+  test("prepareLogin accepts a DID without resolving it as a handle", async () => {
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    const authInfo = await client.prepareLogin(
+      "did:plc:abcdefghijklmnopqrstuvwx",
+    );
+
+    expect(authInfo.did).toBe("did:plc:abcdefghijklmnopqrstuvwx");
+    expect(authInfo.authorizationUrl).toContain("pds.example.com");
+
+    const dohCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("dns.google"),
+    );
+    expect(dohCall).toBeUndefined();
+  });
+
+  test("prepareLogin sends a DID identifier as the login_hint", async () => {
+    const fetchFn = mockFetchForFullFlow();
+    const client = createClient(fetchFn);
+
+    await client.prepareLogin("did:plc:abcdefghijklmnopqrstuvwx");
+
+    const parCall = fetchFn.mock.calls.find((call: any[]) =>
+      String(call[0]).includes("/oauth/par"),
+    );
+    const body = (parCall![1] as RequestInit).body as URLSearchParams;
+    expect(body.get("login_hint")).toBe("did:plc:abcdefghijklmnopqrstuvwx");
   });
 
   test("prepareLogin binds the PAR request to the provisioned DPoP key", async () => {
@@ -555,8 +593,12 @@ describe("HappyViewBrowserClient", () => {
     } catch (err) {
       expect(err).toBeInstanceOf(OAuthCallbackError);
       expect((err as OAuthCallbackError).state).toBe("statefail");
-      expect((err as OAuthCallbackError).cause).toBeInstanceOf(TokenExchangeError);
-      expect(((err as OAuthCallbackError).cause as TokenExchangeError).status).toBe(400);
+      expect((err as OAuthCallbackError).cause).toBeInstanceOf(
+        TokenExchangeError,
+      );
+      expect(
+        ((err as OAuthCallbackError).cause as TokenExchangeError).status,
+      ).toBe(400);
     }
   });
 
@@ -934,44 +976,43 @@ describe("HappyViewBrowserClient", () => {
 
   test("callback retries with DPoP nonce on use_dpop_nonce error", async () => {
     let tokenAttempt = 0;
-    const fetchFn = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = input instanceof Request ? input.url : String(input);
+    const fetchFn = mock(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : String(input);
 
-      if (url.includes("/oauth/token")) {
-        tokenAttempt++;
-        if (tokenAttempt === 1) {
-          return new Response(
-            JSON.stringify({ error: "use_dpop_nonce" }),
-            {
+        if (url.includes("/oauth/token")) {
+          tokenAttempt++;
+          if (tokenAttempt === 1) {
+            return new Response(JSON.stringify({ error: "use_dpop_nonce" }), {
               status: 400,
               headers: { "dpop-nonce": "server-nonce-123" },
-            },
+            });
+          }
+          return new Response(
+            JSON.stringify({
+              access_token: "at_test_token",
+              refresh_token: "rt_test_token",
+              scope: "atproto",
+              sub: "did:plc:abcdefghijklmnopqrstuvwx",
+              iss: "https://pds.example.com",
+            }),
+            { status: 200 },
           );
         }
-        return new Response(
-          JSON.stringify({
-            access_token: "at_test_token",
-            refresh_token: "rt_test_token",
-            scope: "atproto",
-            sub: "did:plc:abcdefghijklmnopqrstuvwx",
-            iss: "https://pds.example.com",
-          }),
-          { status: 200 },
-        );
-      }
 
-      if (url.includes("/oauth/sessions") && init?.method === "POST") {
-        return new Response(
-          JSON.stringify({
-            session_id: "sess_test",
-            did: "did:plc:abcdefghijklmnopqrstuvwx",
-          }),
-          { status: 201 },
-        );
-      }
+        if (url.includes("/oauth/sessions") && init?.method === "POST") {
+          return new Response(
+            JSON.stringify({
+              session_id: "sess_test",
+              did: "did:plc:abcdefghijklmnopqrstuvwx",
+            }),
+            { status: 201 },
+          );
+        }
 
-      return new Response("not found", { status: 404 });
-    });
+        return new Response("not found", { status: 404 });
+      },
+    );
 
     const client = createClient(fetchFn);
 
@@ -1001,8 +1042,7 @@ describe("HappyViewBrowserClient", () => {
       (secondTokenCall![1] as RequestInit).headers,
     ).get("dpop")!;
     const payloadB64 = dpopJwt.split(".")[1];
-    const padded =
-      payloadB64 + "=".repeat((4 - (payloadB64.length % 4)) % 4);
+    const padded = payloadB64 + "=".repeat((4 - (payloadB64.length % 4)) % 4);
     const payload = JSON.parse(
       atob(padded.replace(/-/g, "+").replace(/_/g, "/")),
     );

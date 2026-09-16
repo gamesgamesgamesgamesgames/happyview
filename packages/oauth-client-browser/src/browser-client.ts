@@ -1,6 +1,6 @@
 import { AtprotoDohHandleResolver } from "@atproto-labs/handle-resolver";
 import { DidResolverCommon } from "@atproto-labs/did-resolver";
-import type { DidDocument } from "@atproto/did";
+import { isDid, type Did, type DidDocument } from "@atproto/did";
 import {
   HappyViewOAuthClient,
   HappyViewSession,
@@ -125,13 +125,21 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
   }
 
   async prepareLogin(
-    handle: string,
+    identifier: string,
     options?: LoginOptions,
   ): Promise<PrepareLoginResult> {
-    // Resolve handle → DID → DID document → PDS URL → auth server metadata
-    const resolvedDid = await this.handleResolver.resolve(handle);
-    if (!resolvedDid) {
-      throw new ResolutionError(`Failed to resolve handle: ${handle}`);
+    // Resolve identifier → DID → DID document → PDS URL → auth server metadata.
+    // A DID is already the resolution target: sending it to the handle resolver
+    // would look up a `_atproto.did:plc:…` TXT record, which cannot exist.
+    let resolvedDid: Did;
+    if (isDid(identifier)) {
+      resolvedDid = identifier;
+    } else {
+      const handleDid = await this.handleResolver.resolve(identifier);
+      if (!handleDid) {
+        throw new ResolutionError(`Failed to resolve handle: ${identifier}`);
+      }
+      resolvedDid = handleDid;
     }
     const did = resolvedDid as string;
 
@@ -186,7 +194,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
       scope: scopes,
       code_challenge: authPkceChallenge,
       code_challenge_method: "S256",
-      login_hint: handle,
+      login_hint: identifier,
     });
 
     if (options?.display) authParams.set("display", options.display);
@@ -262,8 +270,8 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     return { authorizationUrl, did, state };
   }
 
-  async login(handle: string, options?: LoginOptions): Promise<void> {
-    const { authorizationUrl } = await this.prepareLogin(handle, options);
+  async login(identifier: string, options?: LoginOptions): Promise<void> {
+    const { authorizationUrl } = await this.prepareLogin(identifier, options);
     window.location.href = authorizationUrl;
   }
 
@@ -470,21 +478,24 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
   }
 
   async signIn(
-    handle: string,
+    identifier: string,
     options?: SignInOptions,
   ): Promise<HappyViewSession | void> {
     if (options?.display === "popup") {
-      return this.signInPopup(handle, options);
+      return this.signInPopup(identifier, options);
     }
-    return this.signInRedirect(handle, options);
+    return this.signInRedirect(identifier, options);
   }
 
-  async signInRedirect(handle: string, options?: LoginOptions): Promise<void> {
-    return this.login(handle, options);
+  async signInRedirect(
+    identifier: string,
+    options?: LoginOptions,
+  ): Promise<void> {
+    return this.login(identifier, options);
   }
 
   async signInPopup(
-    handle: string,
+    identifier: string,
     options?: PopupLoginOptions,
   ): Promise<HappyViewSession> {
     const popupTarget = options?.popupName ?? "_blank";
@@ -494,7 +505,7 @@ export class HappyViewBrowserClient extends HappyViewOAuthClient {
     let popup = window.open("about:blank", popupTarget, popupFeatures);
 
     const stateKey = Math.random().toString(36).slice(2);
-    const result = await this.prepareLogin(handle, {
+    const result = await this.prepareLogin(identifier, {
       ...options,
       state: `${POPUP_STATE_PREFIX}${stateKey}`,
     });
