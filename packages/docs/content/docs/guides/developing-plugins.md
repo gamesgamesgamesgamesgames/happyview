@@ -332,6 +332,8 @@ Every host function except `host_log` is gated by a capability. The loader reads
 | `attest:sign` | High | Sign records with this instance's attestation key, producing a signature that asserts this instance vouches for the content. |
 | `linked_repos:use` | High | Write records and upload blobs through any repo an admin has linked to this instance, within the scopes that admin granted, and call any XRPC method through it, which only that repo's PDS constrains. |
 | `jobs:create` | Medium | Enqueue background jobs as the user who ran the script, optionally carrying that user's PDS session into the job. |
+| `spaces:read` | High | Read the members and records of every space this instance holds, regardless of each space's read policy. |
+| `spaces:write` | High | Create spaces, write records into them, and manage their members and invites, as the user who ran the script and with that user's access. |
 
 `network:request`, `network:request:defined`, and `network:request:unrestricted` are mutually exclusive — declare exactly one. `network:request` requires a non-empty `allowed_hosts`; `network:request:unrestricted` requires `allowed_hosts` to be empty; `network:request:defined` also requires `allowed_hosts` to be empty, because its hosts come from the operator's plugin settings instead of the manifest. `allowed_hosts` entries, wherever they come from, are bare hostnames, optionally prefixed `*.` to allow subdomains — no scheme, path, port, or whitespace:
 
@@ -401,6 +403,32 @@ Every import needs no caller session, except `host_jobs_create` with `auth` set,
 Errors reaching the guest: linked repos imports use `NOT_LINKED` (no grant for that DID), `SCOPE` (the grant's scopes don't cover the write), `NEEDS_REAUTH` (the grant needs re-authorization), `PDS_ERROR`, `FORBIDDEN`, `BAD_INPUT`, and `HOST_ERROR`. `host_jobs_create` uses `BAD_INPUT` (an invalid or reserved job type, or a call with no caller DID), `NO_SESSION` (`auth` set on a runner with no DPoP session), `FORBIDDEN`, and `HOST_ERROR`.
 
 `host_linked_repo_call` has no scope pre-check; the PDS enforces the token's actual scope.
+
+### Spaces
+
+A plugin declaring `spaces:read` or `spaces:write` can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope. A space is `{uri, id, did, authority_did, creator_did, type, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at}`; a member is `{did, access}`, where `access` is one of `read`, `write`, `read_self`, or `none`; an invite is `{invite_id, token, access, max_uses, expires_at}`; a record is `{uri, collection, rkey, record, cid, author_did}`.
+
+| Import | Capability | Spec → result |
+| --- | --- | --- |
+| `host_spaces_info` | `spaces:read` | `{uri}` → the space, or null |
+| `host_spaces_query` | `spaces:read` | `{uri, collection?, limit?, cursor?}` → `{records, cursor?}`, `cursor` absent on the last page |
+| `host_spaces_members` | `spaces:read` | `{uri}` → array of members |
+| `host_spaces_access` | `spaces:read` | `{uri, did}` → the DID's access, or null if they aren't a member or the space does not exist |
+| `host_spaces_create` | `spaces:write` | `{type, skey, display_name?, description?, read_policy?, write_policy?, app_access?, config?}` → the space |
+| `host_spaces_accept_invite` | `spaces:write` | `{token}` → the space |
+| `host_spaces_write_record` | `spaces:write` | `{uri, collection, record}` → `{uri, cid}` |
+| `host_spaces_put_record` | `spaces:write` | `{uri, collection, rkey, record, swap_cid?}` → `{uri, cid}` |
+| `host_spaces_delete_record` | `spaces:write` | `{uri, collection, rkey, swap_cid?}` → nothing |
+| `host_spaces_add_member` | `spaces:write` | `{uri, did, access?, is_delegation?}` → the member |
+| `host_spaces_set_member` | `spaces:write` | `{uri, did, access?, is_delegation?}` → the member, upserting rather than raising `CONFLICT` on an existing one |
+| `host_spaces_remove_member` | `spaces:write` | `{uri, did}` → nothing |
+| `host_spaces_update` | `spaces:write` | `{uri, display_name?, description?, read_policy?, write_policy?, app_access?, config?}` → the space |
+| `host_spaces_delete` | `spaces:write` | `{uri}` → nothing |
+| `host_spaces_create_invite` | `spaces:write` | `{uri, access?, max_uses?, expires_at?}` → the invite |
+
+`spaces:read` needs no caller and enforces no space's read policy — that's why it's High rather than Medium, and its capability description says exactly what it reaches. Every `spaces:write` import acts as `ctx.caller_did` and fails with `BAD_INPUT` when the call has none; a write against a space whose repo has migrated to the member's own PDS then uses that member's session and fails with `NOT_AUTHORIZED` if they have none. On `host_spaces_update`, a key absent from the spec leaves that field unchanged, `false` clears `display_name` or `description`, and a string sets it; `read_policy`, `write_policy`, `app_access`, and `config` replace whole when present.
+
+Errors reaching the guest: `SPACES_DISABLED` (the `spaces_enabled` feature flag is off), `NOT_FOUND`, `NOT_AUTHORIZED`, `CONFLICT`, `PDS_ERROR`, `BAD_INPUT`, `HOST_ERROR`, and `FORBIDDEN`.
 
 ### Using a library from Lua
 

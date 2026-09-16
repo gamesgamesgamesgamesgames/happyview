@@ -2,19 +2,13 @@ use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
 use std::sync::Arc;
 
 use crate::AppState;
+use crate::plugin::host;
 use crate::spaces::{SpaceUri, service};
+
+use happyview_plugin_sdk::wire::{Patch, SpaceUpdate, SpacesAccess, SpacesMembers, SpacesQuery};
 
 pub const SPACES_NO_CALLER_MSG: &str =
     "this space operation requires an authenticated caller (caller_did is not set in this context)";
-
-async fn spaces_enabled(state: &AppState) -> bool {
-    crate::feature_flags::is_enabled(
-        &state.db,
-        crate::feature_flags::FeatureFlag::SPACES_ENABLED,
-        state.db_backend,
-    )
-    .await
-}
 
 pub(crate) struct LuaSpace {
     state: Arc<AppState>,
@@ -42,9 +36,9 @@ impl mlua::UserData for LuaSpace {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
             let did = this.require_caller()?;
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let collection: String = opts
                 .get("collection")
                 .map_err(|_| mlua::Error::runtime("write_record: collection is required"))?;
@@ -68,9 +62,9 @@ impl mlua::UserData for LuaSpace {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
             let did = this.require_caller()?;
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let collection: String = opts
                 .get("collection")
                 .map_err(|_| mlua::Error::runtime("put_record: collection is required"))?;
@@ -108,9 +102,9 @@ impl mlua::UserData for LuaSpace {
                 let state = this.state.clone();
                 let space_uri = this.space_uri.clone();
                 let did = this.require_caller()?;
-                if !spaces_enabled(&state).await {
-                    return Err(mlua::Error::runtime("spaces feature is not enabled"));
-                }
+                host::spaces::require_enabled(&state)
+                    .await
+                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
                 let collection: String = opts
                     .get("collection")
                     .map_err(|_| mlua::Error::runtime("delete_record: collection is required"))?;
@@ -130,18 +124,19 @@ impl mlua::UserData for LuaSpace {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
             let actor = this.require_caller()?;
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let member_did: String = opts
                 .get("did")
                 .map_err(|_| mlua::Error::runtime("add_member: did is required"))?;
             // `access` is a single-word shorthand for the member booleans.
             let access: Option<crate::spaces::types::MemberAccess> =
                 match opts.get::<Option<String>>("access").ok().flatten() {
-                    Some(s) => Some(member_access_from_str(&s).ok_or_else(|| {
-                        mlua::Error::runtime(format!("add_member: invalid access '{s}'"))
-                    })?),
+                    Some(s) => Some(
+                        host::spaces::parse_access(&s)
+                            .map_err(|e| mlua::Error::runtime(format!("add_member: {e}")))?,
+                    ),
                     None => None,
                 };
             let is_delegation: Option<bool> = opts.get("is_delegation").ok();
@@ -168,9 +163,9 @@ impl mlua::UserData for LuaSpace {
                 let state = this.state.clone();
                 let space_uri = this.space_uri.clone();
                 let actor = this.require_caller()?;
-                if !spaces_enabled(&state).await {
-                    return Err(mlua::Error::runtime("spaces feature is not enabled"));
-                }
+                host::spaces::require_enabled(&state)
+                    .await
+                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
                 let member_did: String = opts
                     .get("did")
                     .map_err(|_| mlua::Error::runtime("remove_member: did is required"))?;
@@ -185,56 +180,57 @@ impl mlua::UserData for LuaSpace {
         methods.add_async_method("members", |lua, this, ()| async move {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
-            let space = service::resolve_space(&state, &space_uri)
+            // Checked here, bare, before the op-prefixed wrap below: a script
+            // matching the literal flag-off text needs it unprefixed.
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            let members = host::spaces::members(&state, SpacesMembers { uri: space_uri })
                 .await
                 .map_err(|e| mlua::Error::runtime(format!("members: {e}")))?;
-            let members =
-                crate::spaces::members::resolve_members(&state.db, state.db_backend, &space.id)
-                    .await
-                    .map_err(|e| mlua::Error::runtime(format!("members: {e}")))?;
             let result = lua.create_table()?;
             for (i, m) in members.iter().enumerate() {
                 let entry = lua.create_table()?;
                 entry.set("did", m.did.as_str())?;
-                entry.set("access", m.access.as_wire_str())?;
+                entry.set("access", m.access.as_str())?;
                 result.set(i + 1, entry)?;
             }
             Ok(mlua::Value::Table(result))
         });
 
-        // space:is_member(did) -> bool ; space:access(did) -> 'read'|'write'|nil
+        // space:is_member(did) -> bool ; space:access(did) -> 'read'|'write'|'read_self'|nil
         methods.add_async_method("is_member", |_lua, this, did: String| async move {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
-            let space = service::resolve_space(&state, &space_uri)
+            host::spaces::require_enabled(&state)
                 .await
-                .map_err(|e| mlua::Error::runtime(format!("is_member: {e}")))?;
-            let access =
-                crate::spaces::members::is_member(&state.db, state.db_backend, &space.id, &did)
-                    .await
-                    .map_err(|e| mlua::Error::runtime(format!("is_member: {e}")))?;
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            let access = host::spaces::access(
+                &state,
+                SpacesAccess {
+                    uri: space_uri,
+                    did,
+                },
+            )
+            .await
+            .map_err(|e| mlua::Error::runtime(format!("is_member: {e}")))?;
             Ok(access.is_some())
         });
         methods.add_async_method("access", |_lua, this, did: String| async move {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
-            let space = service::resolve_space(&state, &space_uri)
+            host::spaces::require_enabled(&state)
                 .await
-                .map_err(|e| mlua::Error::runtime(format!("access: {e}")))?;
-            let access =
-                crate::spaces::members::is_member(&state.db, state.db_backend, &space.id, &did)
-                    .await
-                    .map_err(|e| mlua::Error::runtime(format!("access: {e}")))?;
-            Ok(access.map(|a| a.as_wire_str().to_string()))
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            host::spaces::access(
+                &state,
+                SpacesAccess {
+                    uri: space_uri,
+                    did,
+                },
+            )
+            .await
+            .map_err(|e| mlua::Error::runtime(format!("access: {e}")))
         });
 
         // space:update{ display_name?, description?, read_policy?, write_policy?, app_access?, config? } -> true
@@ -243,44 +239,31 @@ impl mlua::UserData for LuaSpace {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
             let actor = this.require_caller()?;
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
-            // Patch semantics: key present with string => Some(Some(s)); key present and false => Some(None) (clear); key absent => None.
-            fn nullable(opts: &mlua::Table, key: &str) -> mlua::Result<Option<Option<String>>> {
-                match opts.get::<mlua::Value>(key)? {
-                    mlua::Value::Nil => Ok(None),
-                    mlua::Value::Boolean(false) => Ok(Some(None)),
-                    mlua::Value::String(s) => Ok(Some(Some(s.to_str()?.to_owned()))),
-                    _ => Err(mlua::Error::runtime(format!(
-                        "update: {key} must be a string or false"
-                    ))),
-                }
-            }
-            let display_name = nullable(&opts, "display_name")?;
-            let description = nullable(&opts, "description")?;
-            let read_policy = policy_opt(&lua, &opts, "read_policy")?;
-            let write_policy = policy_opt(&lua, &opts, "write_policy")?;
-            let app_access: Option<crate::spaces::types::AppAccess> =
-                match opts.get::<mlua::Value>("app_access") {
-                    Ok(mlua::Value::Nil) | Err(_) => None,
-                    Ok(v) => Some(lua.from_value(v)?),
-                };
-            let config: Option<crate::spaces::types::SpaceConfig> =
-                match opts.get::<mlua::Value>("config") {
-                    Ok(mlua::Value::Nil) | Err(_) => None,
-                    Ok(v) => Some(lua.from_value(v)?),
-                };
-            service::update_space(
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            let display_name = lua_patch(&opts, "display_name")?;
+            let description = lua_patch(&opts, "description")?;
+            let read_policy =
+                typed_value::<crate::spaces::types::Policy>(&lua, &opts, "read_policy", true)?;
+            let write_policy =
+                typed_value::<crate::spaces::types::Policy>(&lua, &opts, "write_policy", true)?;
+            let app_access =
+                typed_value::<crate::spaces::types::AppAccess>(&lua, &opts, "app_access", true)?;
+            let config =
+                typed_value::<crate::spaces::types::SpaceConfig>(&lua, &opts, "config", false)?;
+            host::spaces::update(
                 &state,
                 &actor,
-                &space_uri,
-                display_name,
-                description,
-                read_policy,
-                write_policy,
-                app_access,
-                config,
+                SpaceUpdate {
+                    uri: space_uri,
+                    display_name,
+                    description,
+                    read_policy,
+                    write_policy,
+                    app_access,
+                    config,
+                },
             )
             .await
             .map_err(|e| mlua::Error::runtime(format!("update: {e}")))?;
@@ -292,9 +275,9 @@ impl mlua::UserData for LuaSpace {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
             let actor = this.require_caller()?;
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             service::delete_space(&state, &actor, &space_uri)
                 .await
                 .map_err(|e| mlua::Error::runtime(format!("delete: {e}")))?;
@@ -305,30 +288,26 @@ impl mlua::UserData for LuaSpace {
         methods.add_async_method("query", |lua, this, opts: mlua::Table| async move {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
-            let space = service::resolve_space(&state, &space_uri)
+            host::spaces::require_enabled(&state)
                 .await
-                .map_err(|e| mlua::Error::runtime(format!("query: {e}")))?;
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let collection: Option<String> = opts.get("collection").ok();
-            let limit: i64 = opts.get("limit").unwrap_or(50);
+            let limit: Option<i64> = opts.get("limit").ok();
             let cursor: Option<String> = opts.get("cursor").ok();
-            let (records, next_cursor) = crate::spaces::db::list_space_records(
-                &state.db,
-                state.db_backend,
-                &space.id,
-                None,
-                collection.as_deref(),
-                limit.min(100),
-                cursor.as_deref(),
-                false,
+            let page = host::spaces::query(
+                &state,
+                SpacesQuery {
+                    uri: space_uri,
+                    collection,
+                    limit,
+                    cursor,
+                },
             )
             .await
             .map_err(|e| mlua::Error::runtime(format!("query: {e}")))?;
             let result = lua.create_table()?;
             let records_table = lua.create_table()?;
-            for (i, r) in records.iter().enumerate() {
+            for (i, r) in page.records.iter().enumerate() {
                 let entry = lua.to_value(&serde_json::json!({
                     "uri": r.uri, "collection": r.collection, "rkey": r.rkey,
                     "record": r.record, "cid": r.cid, "authorDid": r.author_did,
@@ -336,7 +315,7 @@ impl mlua::UserData for LuaSpace {
                 records_table.set(i + 1, entry)?;
             }
             result.set("records", records_table)?;
-            match next_cursor {
+            match page.cursor {
                 Some(c) => result.set("cursor", c)?,
                 None => result.set("cursor", mlua::Value::Nil)?,
             }
@@ -348,14 +327,15 @@ impl mlua::UserData for LuaSpace {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
             let actor = this.require_caller()?;
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let access: Option<crate::spaces::types::MemberAccess> =
                 match opts.get::<Option<String>>("access").ok().flatten() {
-                    Some(s) => Some(member_access_from_str(&s).ok_or_else(|| {
-                        mlua::Error::runtime(format!("create_invite: invalid access '{s}'"))
-                    })?),
+                    Some(s) => Some(
+                        host::spaces::parse_access(&s)
+                            .map_err(|e| mlua::Error::runtime(format!("create_invite: {e}")))?,
+                    ),
                     None => None,
                 };
             let max_uses: Option<i64> = opts.get("max_uses").ok();
@@ -375,27 +355,70 @@ impl mlua::UserData for LuaSpace {
     }
 }
 
-/// Parse the Lua `access` shorthand into the member booleans.
+/// Decode an optional structured field from a Lua table.
 ///
-/// Scripts pass a single word (`read`, `read_self`, `write` or `none`), which
-/// maps onto the read/write booleans.
-fn member_access_from_str(s: &str) -> Option<crate::spaces::types::MemberAccess> {
-    crate::spaces::types::MemberAccess::parse_wire(s)
+/// `empty_tables_as_arrays` is on for `Policy` and `AppAccess`, which are
+/// internally tagged (`#[serde(tag = "$type")]`): serde buffers the whole
+/// table generically to read the tag before it knows a variant's field types,
+/// so an empty nested table such as `allowed = {}` is read without the `Vec`
+/// hint that would otherwise make it an array, and mlua's default reads an
+/// empty table as an object. It stays off for `SpaceConfig`, whose free-form
+/// extra keys carry no type at all, so an empty table there is an object.
+fn structured<T: serde::de::DeserializeOwned>(
+    lua: &Lua,
+    opts: &mlua::Table,
+    key: &str,
+    empty_tables_as_arrays: bool,
+) -> mlua::Result<Option<T>> {
+    match opts.get::<mlua::Value>(key) {
+        Ok(mlua::Value::Nil) | Err(_) => Ok(None),
+        Ok(value) => {
+            let options = mlua::serde::DeserializeOptions::new()
+                .encode_empty_tables_as_array(empty_tables_as_arrays);
+            Ok(Some(lua.from_value_with(value, options)?))
+        }
+    }
 }
 
-/// Read an optional policy from a Lua table.
-///
-/// Policies are lexicon open unions (`{ ["$type"] = "...#publicPolicy" }`), so
-/// they come through as tables and are deserialized by serde, which also rejects
-/// any variant this host does not implement.
 fn policy_opt(
     lua: &Lua,
     opts: &mlua::Table,
     key: &str,
 ) -> mlua::Result<Option<crate::spaces::types::Policy>> {
-    match opts.get::<mlua::Value>(key) {
-        Ok(mlua::Value::Nil) | Err(_) => Ok(None),
-        Ok(value) => Ok(Some(lua.from_value(value)?)),
+    structured(lua, opts, key, true)
+}
+
+/// A structured field re-serialised for `SpaceUpdate`, which carries these
+/// fields as raw JSON so the host module can decode them once for every
+/// caller.
+fn typed_value<T: serde::de::DeserializeOwned + serde::Serialize>(
+    lua: &Lua,
+    opts: &mlua::Table,
+    key: &str,
+    empty_tables_as_arrays: bool,
+) -> mlua::Result<Option<serde_json::Value>> {
+    match structured::<T>(lua, opts, key, empty_tables_as_arrays)? {
+        None => Ok(None),
+        Some(typed) => {
+            Ok(Some(serde_json::to_value(typed).map_err(|e| {
+                mlua::Error::runtime(format!("update: {key}: {e}"))
+            })?))
+        }
+    }
+}
+
+/// The `display_name`/`description` three-way patch, read off a Lua table
+/// into the SDK's [`Patch`] instead of `spaces_api`'s own `Option<Option<_>>`
+/// — `host::spaces::update` is what applies it, so this only has to produce
+/// the enum, not decide what each state means.
+fn lua_patch(opts: &mlua::Table, key: &str) -> mlua::Result<Patch<String>> {
+    match opts.get::<mlua::Value>(key)? {
+        mlua::Value::Nil => Ok(Patch::Unchanged),
+        mlua::Value::Boolean(false) => Ok(Patch::Clear),
+        mlua::Value::String(s) => Ok(Patch::Set(s.to_str()?.to_owned())),
+        _ => Err(mlua::Error::runtime(format!(
+            "update: {key} must be a string or false"
+        ))),
     }
 }
 
@@ -417,9 +440,9 @@ pub fn register_spaces_write_api(
         let state = state_clone.clone();
         let caller_did = caller_clone.clone();
         async move {
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let parsed = SpaceUri::parse(&space_uri)
                 .map_err(|e| mlua::Error::runtime(format!("invalid space URI: {e}")))?;
             let space = service::resolve_space(&state, &parsed.space_uri()).await;
@@ -446,9 +469,9 @@ pub fn register_spaces_write_api(
         let state = state_clone.clone();
         let caller_did = caller_clone.clone();
         async move {
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let did = caller_did.ok_or_else(|| mlua::Error::runtime(SPACES_NO_CALLER_MSG))?;
             let type_nsid: String = opts
                 .get("type")
@@ -460,17 +483,10 @@ pub fn register_spaces_write_api(
             let description: Option<String> = opts.get("description").ok();
             let read_policy = policy_opt(&lua, &opts, "read_policy")?;
             let write_policy = policy_opt(&lua, &opts, "write_policy")?;
-            // app_access and config accept structured tables; deserialize via serde.
-            let app_access: Option<crate::spaces::types::AppAccess> =
-                match opts.get::<mlua::Value>("app_access") {
-                    Ok(mlua::Value::Nil) | Err(_) => None,
-                    Ok(v) => Some(lua.from_value(v)?),
-                };
-            let config: Option<crate::spaces::types::SpaceConfig> =
-                match opts.get::<mlua::Value>("config") {
-                    Ok(mlua::Value::Nil) | Err(_) => None,
-                    Ok(v) => Some(lua.from_value(v)?),
-                };
+            let app_access =
+                structured::<crate::spaces::types::AppAccess>(&lua, &opts, "app_access", true)?;
+            let config =
+                structured::<crate::spaces::types::SpaceConfig>(&lua, &opts, "config", false)?;
             let space = service::create_space(
                 &state,
                 &did,
@@ -505,9 +521,9 @@ pub fn register_spaces_write_api(
         let state = state_clone.clone();
         let caller_did = caller_clone.clone();
         async move {
-            if !spaces_enabled(&state).await {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let did = caller_did.ok_or_else(|| mlua::Error::runtime(SPACES_NO_CALLER_MSG))?;
             let token: String = opts
                 .get("token")
@@ -1728,6 +1744,132 @@ mod tests {
         );
     }
 
+    /// An empty `allowed` table decodes as an array only with `structured`'s
+    /// empty-tables-as-arrays option on; this pins that `update` uses it.
+    #[tokio::test]
+    async fn update_keeps_an_empty_extra_config_table_an_object() {
+        require_test_db!();
+        let (state, space_uri, authority_did) = db_seeded_space().await;
+
+        let lua = mlua::Lua::new();
+        let state_arc = std::sync::Arc::new(state);
+        crate::lua::atproto_api::register_atproto_api(
+            &lua,
+            state_arc.clone(),
+            Some(&authority_did),
+        )
+        .unwrap();
+        super::register_spaces_write_api(&lua, state_arc.clone(), Some(&authority_did)).unwrap();
+
+        let chunk = format!(
+            r#"
+                local space = atproto.spaces.get("{space_uri}")
+                assert(space:update{{ config = {{ widgets = {{}} }} }} == true)
+            "#
+        );
+        lua.load(&chunk).exec_async().await.unwrap();
+
+        let persisted = crate::spaces::service::resolve_space(&state_arc, &space_uri)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted.config.extra.get("widgets"),
+            Some(&serde_json::json!({})),
+            "an untyped empty table is an object, as it is everywhere else in Lua"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_accepts_an_empty_allow_list() {
+        require_test_db!();
+        let (state, _space_uri, authority_did) = db_seeded_space().await;
+
+        let lua = mlua::Lua::new();
+        let state_arc = std::sync::Arc::new(state);
+        crate::lua::atproto_api::register_atproto_api(
+            &lua,
+            state_arc.clone(),
+            Some(&authority_did),
+        )
+        .unwrap();
+        super::register_spaces_write_api(&lua, state_arc.clone(), Some(&authority_did)).unwrap();
+
+        let uri: String = lua
+            .load(
+                r#"
+                local space = atproto.spaces.create{
+                    type = "com.example.space",
+                    skey = "empty-allow-list",
+                    app_access = {
+                        ["$type"] = "com.atproto.simplespace.defs#allowList",
+                        allowed = {},
+                    },
+                }
+                return space.uri
+            "#,
+            )
+            .eval_async()
+            .await
+            .unwrap();
+
+        let persisted = crate::spaces::service::resolve_space(&state_arc, &uri)
+            .await
+            .unwrap();
+        match &persisted.app_access {
+            crate::spaces::types::AppAccess::AllowList { allowed } => {
+                assert!(
+                    allowed.is_empty(),
+                    "expected an empty allow list, got {allowed:?}"
+                );
+            }
+            other => panic!("expected AllowList app_access, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn update_accepts_an_empty_allow_list() {
+        require_test_db!();
+        let (state, space_uri, authority_did) = db_seeded_space().await;
+
+        let lua = mlua::Lua::new();
+        let state_arc = std::sync::Arc::new(state);
+        crate::lua::atproto_api::register_atproto_api(
+            &lua,
+            state_arc.clone(),
+            Some(&authority_did),
+        )
+        .unwrap();
+        super::register_spaces_write_api(&lua, state_arc.clone(), Some(&authority_did)).unwrap();
+
+        let chunk = format!(
+            r#"
+                local space = atproto.spaces.get("{space_uri}")
+                assert(space ~= nil, "space handle should not be nil")
+                assert(space:update{{
+                    app_access = {{
+                        ["$type"] = "com.atproto.simplespace.defs#allowList",
+                        allowed = {{}},
+                    }},
+                }} == true)
+            "#
+        );
+        lua.load(&chunk).exec_async().await.unwrap();
+
+        let persisted = crate::spaces::service::resolve_space(&state_arc, &space_uri)
+            .await
+            .unwrap();
+        match &persisted.app_access {
+            crate::spaces::types::AppAccess::AllowList { allowed } => {
+                assert!(
+                    allowed.is_empty(),
+                    "expected an empty allow list, got {allowed:?}"
+                );
+            }
+            other => panic!("expected AllowList app_access, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     #[serial(spaces_feature_flag)]
     async fn members_and_query_work_without_caller() {
@@ -1821,6 +1963,34 @@ mod tests {
             "#
         );
         let err: String = lua.load(&chunk).eval_async().await.unwrap();
+        assert!(
+            err.contains("spaces feature is not enabled"),
+            "expected feature-flag error, got: {err}"
+        );
+
+        // `update` needs a caller (checked first, same as every other write
+        // method), so it gets its own registration rather than reusing the
+        // callerless one above.
+        let caller_lua = mlua::Lua::new();
+        crate::lua::atproto_api::register_atproto_api(
+            &caller_lua,
+            state_arc.clone(),
+            Some(&member_did),
+        )
+        .unwrap();
+        super::register_spaces_write_api(&caller_lua, state_arc.clone(), Some(&member_did))
+            .unwrap();
+        let update_chunk = format!(
+            r#"
+                local space = atproto.spaces.__test_handle("{space_uri}")
+                local ok, err = pcall(function()
+                    return space:update{{ display_name = "renamed" }}
+                end)
+                assert(not ok, "update should fail when spaces feature flag is disabled")
+                return tostring(err)
+            "#
+        );
+        let err: String = caller_lua.load(&update_chunk).eval_async().await.unwrap();
         assert!(
             err.contains("spaces feature is not enabled"),
             "expected feature-flag error, got: {err}"

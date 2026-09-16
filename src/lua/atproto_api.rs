@@ -250,20 +250,19 @@ fn register_atproto_api_impl(
     let spaces_table = lua.create_table()?;
 
     // atproto.spaces.is_member(space_uri, did) -> boolean
+    //
+    // The feature-flag gate is `host::spaces::require_enabled` — shared with
+    // every other spaces entry point — but everything past it stays this
+    // function's own lookup, so its error text (distinct per failing stage)
+    // matches what a script pattern-matches on.
     let state_clone = state.clone();
     let is_member_fn =
         lua.create_async_function(move |_lua, (space_uri, did): (String, String)| {
             let state = state_clone.clone();
             async move {
-                if !crate::feature_flags::is_enabled(
-                    &state.db,
-                    crate::feature_flags::FeatureFlag::SPACES_ENABLED,
-                    state.db_backend,
-                )
-                .await
-                {
-                    return Err(mlua::Error::runtime("spaces feature is not enabled"));
-                }
+                host::spaces::require_enabled(&state)
+                    .await
+                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
                 let uri = crate::spaces::SpaceUri::parse(&space_uri)
                     .map_err(|e| mlua::Error::runtime(format!("invalid space URI: {e}")))?;
                 let space = crate::spaces::db::get_space_by_address(
@@ -290,21 +289,15 @@ fn register_atproto_api_impl(
         })?;
     spaces_table.set("is_member", is_member_fn)?;
 
-    // atproto.spaces.get_access(space_uri, did) -> 'read' | 'write' | nil
+    // atproto.spaces.get_access(space_uri, did) -> 'read' | 'write' | 'read_self' | nil
     let state_clone = state.clone();
     let get_access_fn =
         lua.create_async_function(move |_lua, (space_uri, did): (String, String)| {
             let state = state_clone.clone();
             async move {
-                if !crate::feature_flags::is_enabled(
-                    &state.db,
-                    crate::feature_flags::FeatureFlag::SPACES_ENABLED,
-                    state.db_backend,
-                )
-                .await
-                {
-                    return Err(mlua::Error::runtime("spaces feature is not enabled"));
-                }
+                host::spaces::require_enabled(&state)
+                    .await
+                    .map_err(|e| mlua::Error::runtime(e.to_string()))?;
                 let uri = crate::spaces::SpaceUri::parse(&space_uri)
                     .map_err(|e| mlua::Error::runtime(format!("invalid space URI: {e}")))?;
                 let space = crate::spaces::db::get_space_by_address(
@@ -336,15 +329,9 @@ fn register_atproto_api_impl(
     let list_members_fn = lua.create_async_function(move |lua, space_uri: String| {
         let state = state_clone.clone();
         async move {
-            if !crate::feature_flags::is_enabled(
-                &state.db,
-                crate::feature_flags::FeatureFlag::SPACES_ENABLED,
-                state.db_backend,
-            )
-            .await
-            {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let uri = crate::spaces::SpaceUri::parse(&space_uri)
                 .map_err(|e| mlua::Error::runtime(format!("invalid space URI: {e}")))?;
             let space = crate::spaces::db::get_space_by_address(
@@ -384,15 +371,9 @@ fn register_atproto_api_impl(
     let query_fn = lua.create_async_function(move |lua, opts: mlua::Table| {
         let state = state_clone.clone();
         async move {
-            if !crate::feature_flags::is_enabled(
-                &state.db,
-                crate::feature_flags::FeatureFlag::SPACES_ENABLED,
-                state.db_backend,
-            )
-            .await
-            {
-                return Err(mlua::Error::runtime("spaces feature is not enabled"));
-            }
+            host::spaces::require_enabled(&state)
+                .await
+                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
             let space_uri: String = opts
                 .get("space_uri")
                 .map_err(|_| mlua::Error::runtime("space_uri is required"))?;

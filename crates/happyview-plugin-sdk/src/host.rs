@@ -32,7 +32,10 @@ use crate::wire::{
     CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, Label, LabelsGet, LinkedRepoBlobUpload,
     LinkedRepoCall, LinkedRepoInfo, LinkedRepoRecordCreate, LinkedRepoRecordDelete,
     LinkedRepoRecordPut, PluginError, RecordRef, RecordsCount, RecordsPage, RecordsQuery,
-    RecordsSearch, StrongRef, TableQuery,
+    RecordsSearch, SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd,
+    SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite,
+    SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo,
+    SpacesMembers, SpacesQuery, StrongRef, TableQuery,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::wire::{AtprotoResolveService, LexiconGet};
@@ -90,6 +93,21 @@ extern "C" {
     fn host_linked_repo_upload_blob(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repo_call(req_ptr: i32, req_len: i32) -> i64;
     fn host_jobs_create(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_info(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_query(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_members(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_access(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_create(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_accept_invite(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_write_record(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_put_record(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_delete_record(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_add_member(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_set_member(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_remove_member(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_update(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_delete(req_ptr: i32, req_len: i32) -> i64;
+    fn host_spaces_create_invite(req_ptr: i32, req_len: i32) -> i64;
 }
 
 /// Why a host call did not produce a value.
@@ -318,6 +336,16 @@ fn call_spec<S: serde::Serialize, R: serde::de::DeserializeOwned>(
     decode_required::<R>(packed).map_err(PluginError::from)
 }
 
+/// A write whose only answer is `{"ok": null}`. Whatever value does come
+/// back is discarded rather than failing on a shape a future host might vary.
+#[cfg(target_arch = "wasm32")]
+fn call_void<S: serde::Serialize>(
+    import: unsafe extern "C" fn(i32, i32) -> i64,
+    spec: &S,
+) -> Result<(), PluginError> {
+    call_spec::<_, Option<Value>>(import, spec).map(|_| ())
+}
+
 /// Page through indexed records matching a filter. Needs `records:read`.
 pub fn records_query(spec: &RecordsQuery) -> Result<RecordsPage, PluginError> {
     #[cfg(target_arch = "wasm32")]
@@ -432,9 +460,7 @@ pub fn caller_put_record(spec: &CallerRecordPut) -> Result<RecordRef, PluginErro
 pub fn caller_delete_record(spec: &CallerRecordDelete) -> Result<(), PluginError> {
     #[cfg(target_arch = "wasm32")]
     {
-        // The host sends `{"ok": null}`; discard whatever comes back rather
-        // than fail on a shape a future host might vary.
-        call_spec::<_, Option<Value>>(host_caller_delete_record, spec).map(|_| ())
+        call_void(host_caller_delete_record, spec)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -642,9 +668,7 @@ pub fn linked_repo_put_record(spec: &LinkedRepoRecordPut) -> Result<RecordRef, P
 pub fn linked_repo_delete_record(spec: &LinkedRepoRecordDelete) -> Result<(), PluginError> {
     #[cfg(target_arch = "wasm32")]
     {
-        // The host sends `{"ok": null}`; discard whatever comes back rather
-        // than fail on a shape a future host might vary.
-        call_spec::<_, Option<Value>>(host_linked_repo_delete_record, spec).map(|_| ())
+        call_void(host_linked_repo_delete_record, spec)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -686,6 +710,206 @@ pub fn jobs_create(spec: &JobCreate) -> Result<String, PluginError> {
     #[cfg(target_arch = "wasm32")]
     {
         call_spec(host_jobs_create, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Look up a space's fields by URI. `Ok(None)` means no such space. Needs
+/// `spaces:read`.
+pub fn spaces_info(spec: &SpacesInfo) -> Result<Option<SpaceInfo>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_info, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Page through a space's records. Needs `spaces:read`.
+pub fn spaces_query(spec: &SpacesQuery) -> Result<SpaceRecordsPage, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_query, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// List a space's members. Needs `spaces:read`.
+pub fn spaces_members(spec: &SpacesMembers) -> Result<Vec<SpaceMemberInfo>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_members, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// A DID's access level on a space. `Ok(None)` means not a member, or no such
+/// space. Needs `spaces:read`.
+pub fn spaces_access(spec: &SpacesAccess) -> Result<Option<String>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_access, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Create a space. Needs `spaces:write`.
+pub fn spaces_create(spec: &SpacesCreate) -> Result<SpaceInfo, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_create, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Redeem an invite token, joining the space it names. Needs `spaces:write`.
+pub fn spaces_accept_invite(spec: &SpacesAcceptInvite) -> Result<SpaceInfo, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_accept_invite, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Create a record in a space, as the caller. Needs `spaces:write`.
+pub fn spaces_write_record(spec: &SpaceRecordWrite) -> Result<RecordRef, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_write_record, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Put (create-or-update) a record in a space, as the caller. Needs
+/// `spaces:write`.
+pub fn spaces_put_record(spec: &SpaceRecordPut) -> Result<RecordRef, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_put_record, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Delete a record from a space, as the caller. Needs `spaces:write`.
+pub fn spaces_delete_record(spec: &SpaceRecordDelete) -> Result<(), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_void(host_spaces_delete_record, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Add a space member. Refuses if the DID is already a member. Needs
+/// `spaces:write`.
+pub fn spaces_add_member(spec: &SpaceMemberAdd) -> Result<SpaceMemberInfo, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_add_member, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Add or update a space member, preserving an existing member's
+/// `read_self`. Needs `spaces:write`.
+pub fn spaces_set_member(spec: &SpaceMemberAdd) -> Result<SpaceMemberInfo, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_set_member, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Remove a space member. Needs `spaces:write`.
+pub fn spaces_remove_member(spec: &SpaceMemberRemove) -> Result<(), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_void(host_spaces_remove_member, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Update a space's fields. Needs `spaces:write`.
+pub fn spaces_update(spec: &SpaceUpdate) -> Result<SpaceInfo, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_update, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Delete a space. Needs `spaces:write`.
+pub fn spaces_delete(spec: &SpaceDelete) -> Result<(), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_void(host_spaces_delete, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Mint an invite for a space. Needs `spaces:write`.
+pub fn spaces_create_invite(spec: &SpaceInviteCreate) -> Result<SpaceInviteInfo, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_spaces_create_invite, spec)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

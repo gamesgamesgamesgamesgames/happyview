@@ -58,6 +58,10 @@ pub enum PluginCapability {
     LinkedReposUse,
     #[serde(rename = "jobs:create")]
     JobsCreate,
+    #[serde(rename = "spaces:read")]
+    SpacesRead,
+    #[serde(rename = "spaces:write")]
+    SpacesWrite,
 }
 
 impl PluginCapability {
@@ -82,6 +86,8 @@ impl PluginCapability {
             AttestSign,
             LinkedReposUse,
             JobsCreate,
+            SpacesRead,
+            SpacesWrite,
         ]
     }
 
@@ -106,6 +112,8 @@ impl PluginCapability {
             AttestSign => "attest:sign",
             LinkedReposUse => "linked_repos:use",
             JobsCreate => "jobs:create",
+            SpacesRead => "spaces:read",
+            SpacesWrite => "spaces:write",
         }
     }
 
@@ -129,7 +137,9 @@ impl PluginCapability {
             | CallerWrite
             | RecordsWrite
             | AttestSign
-            | LinkedReposUse => Risk::High,
+            | LinkedReposUse
+            | SpacesRead
+            | SpacesWrite => Risk::High,
             DatabaseWrite | CallerCall => Risk::Critical,
         }
     }
@@ -181,6 +191,12 @@ impl PluginCapability {
             }
             JobsCreate => {
                 "Enqueue background jobs as the user who ran the script, optionally carrying that user's PDS session into the job."
+            }
+            SpacesRead => {
+                "Read the members and records of every space this instance holds, regardless of each space's read policy."
+            }
+            SpacesWrite => {
+                "Create spaces, write records into them, and manage their members and invites, as the user who ran the script and with that user's access."
             }
         }
     }
@@ -349,6 +365,66 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
     Requirement {
         import: "host_jobs_create",
         any_of: &[PluginCapability::JobsCreate],
+    },
+    Requirement {
+        import: "host_spaces_info",
+        any_of: &[PluginCapability::SpacesRead],
+    },
+    Requirement {
+        import: "host_spaces_query",
+        any_of: &[PluginCapability::SpacesRead],
+    },
+    Requirement {
+        import: "host_spaces_members",
+        any_of: &[PluginCapability::SpacesRead],
+    },
+    Requirement {
+        import: "host_spaces_access",
+        any_of: &[PluginCapability::SpacesRead],
+    },
+    Requirement {
+        import: "host_spaces_create",
+        any_of: &[PluginCapability::SpacesWrite],
+    },
+    Requirement {
+        import: "host_spaces_accept_invite",
+        any_of: &[PluginCapability::SpacesWrite],
+    },
+    Requirement {
+        import: "host_spaces_write_record",
+        any_of: &[PluginCapability::SpacesWrite],
+    },
+    Requirement {
+        import: "host_spaces_put_record",
+        any_of: &[PluginCapability::SpacesWrite],
+    },
+    Requirement {
+        import: "host_spaces_delete_record",
+        any_of: &[PluginCapability::SpacesWrite],
+    },
+    Requirement {
+        import: "host_spaces_add_member",
+        any_of: &[PluginCapability::SpacesWrite],
+    },
+    Requirement {
+        import: "host_spaces_set_member",
+        any_of: &[PluginCapability::SpacesWrite],
+    },
+    Requirement {
+        import: "host_spaces_remove_member",
+        any_of: &[PluginCapability::SpacesWrite],
+    },
+    Requirement {
+        import: "host_spaces_update",
+        any_of: &[PluginCapability::SpacesWrite],
+    },
+    Requirement {
+        import: "host_spaces_delete",
+        any_of: &[PluginCapability::SpacesWrite],
+    },
+    Requirement {
+        import: "host_spaces_create_invite",
+        any_of: &[PluginCapability::SpacesWrite],
     },
 ];
 
@@ -538,6 +614,21 @@ mod tests {
             "host_linked_repo_upload_blob",
             "host_linked_repo_call",
             "host_jobs_create",
+            "host_spaces_info",
+            "host_spaces_query",
+            "host_spaces_members",
+            "host_spaces_access",
+            "host_spaces_create",
+            "host_spaces_accept_invite",
+            "host_spaces_write_record",
+            "host_spaces_put_record",
+            "host_spaces_delete_record",
+            "host_spaces_add_member",
+            "host_spaces_set_member",
+            "host_spaces_remove_member",
+            "host_spaces_update",
+            "host_spaces_delete",
+            "host_spaces_create_invite",
             "host_allowed_hosts",
         ] {
             // `None` is only right for the free imports.
@@ -773,6 +864,59 @@ mod tests {
 
         let req = requirement_for_import("host_jobs_create").expect("host_jobs_create");
         assert_eq!(req.any_of, &[PluginCapability::JobsCreate]);
+    }
+
+    /// Four reads share `spaces:read`; the other eleven imports (creating a
+    /// space, joining one, writing/managing its records, members and
+    /// invites) share `spaces:write` — reads never grant a write, and no
+    /// write import is reachable on a read-only declaration.
+    #[test]
+    fn spaces_imports_map_to_their_capability() {
+        for import in [
+            "host_spaces_info",
+            "host_spaces_query",
+            "host_spaces_members",
+            "host_spaces_access",
+        ] {
+            let req = requirement_for_import(import).expect(import);
+            assert_eq!(req.any_of, &[PluginCapability::SpacesRead], "{import}");
+        }
+
+        for import in [
+            "host_spaces_create",
+            "host_spaces_accept_invite",
+            "host_spaces_write_record",
+            "host_spaces_put_record",
+            "host_spaces_delete_record",
+            "host_spaces_add_member",
+            "host_spaces_set_member",
+            "host_spaces_remove_member",
+            "host_spaces_update",
+            "host_spaces_delete",
+            "host_spaces_create_invite",
+        ] {
+            let req = requirement_for_import(import).expect(import);
+            assert_eq!(req.any_of, &[PluginCapability::SpacesWrite], "{import}");
+        }
+    }
+
+    /// Both spaces capabilities sit at `High`, matching `database:read` —
+    /// reading every space's members and records regardless of read policy
+    /// is the same order of trust as arbitrary read-only SQL, and writing as
+    /// the caller with that caller's own access is High rather than
+    /// Critical because it can't act as anyone else.
+    #[test]
+    fn spaces_capabilities_are_high_risk_with_their_exact_descriptions() {
+        assert_eq!(PluginCapability::SpacesRead.risk(), Risk::High);
+        assert_eq!(
+            PluginCapability::SpacesRead.description(),
+            "Read the members and records of every space this instance holds, regardless of each space's read policy."
+        );
+        assert_eq!(PluginCapability::SpacesWrite.risk(), Risk::High);
+        assert_eq!(
+            PluginCapability::SpacesWrite.description(),
+            "Create spaces, write records into them, and manage their members and invites, as the user who ran the script and with that user's access."
+        );
     }
 
     #[test]

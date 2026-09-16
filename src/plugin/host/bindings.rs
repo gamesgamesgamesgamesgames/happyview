@@ -476,6 +476,347 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
+    // Async functions - spaces. Four reads need no caller; the eleven writes
+    // act as `ctx.caller_did` and refuse before reaching the module when the
+    // script context has none, via `require_spaces_caller`.
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_info",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_spaces_info",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, spec: happyview_plugin_sdk::wire::SpacesInfo| async move {
+                        super::spaces::info(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_spaces_query",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, spec: happyview_plugin_sdk::wire::SpacesQuery| async move {
+                        super::spaces::query(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_members",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_spaces_members",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, spec: happyview_plugin_sdk::wire::SpacesMembers| async move {
+                        super::spaces::members(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_access",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_spaces_access",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, spec: happyview_plugin_sdk::wire::SpacesAccess| async move {
+                        super::spaces::access(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_create",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_create",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpacesCreate| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::create(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_accept_invite",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_accept_invite",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpacesAcceptInvite| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::accept_invite(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_write_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_write_record",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceRecordWrite| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::write_record(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_put_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_put_record",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceRecordPut| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::put_record(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_delete_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_delete_record",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceRecordDelete| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::delete_record(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_add_member",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_add_member",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceMemberAdd| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::add_member(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_set_member",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_set_member",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceMemberAdd| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::set_member(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_remove_member",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_remove_member",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceMemberRemove| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::remove_member(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_update",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_update",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, caller_did, _session, spec: happyview_plugin_sdk::wire::SpaceUpdate| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::update(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_delete",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_delete",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, caller_did, _session, spec: happyview_plugin_sdk::wire::SpaceDelete| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::delete(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_create_invite",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_create_invite",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceInviteCreate| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::create_invite(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
     // Async functions - local index writes and lexicon reads
     linker.func_wrap_async(
         "env",
@@ -1249,6 +1590,17 @@ where
         Err(e) => error_envelope(code(&e), e),
     };
     write_guest_response(caller, &response).await
+}
+
+/// Every space write acts as `ctx.caller_did` and has no other identity to
+/// fall back to. Refusing here, before the module runs, keeps that rule in
+/// one place rather than in each of the eleven write functions.
+fn require_spaces_caller(caller_did: Option<String>) -> Result<String, super::spaces::SpacesError> {
+    caller_did.ok_or_else(|| {
+        super::spaces::SpacesError::BadInput(
+            "a space write needs a caller; this script context has none".into(),
+        )
+    })
 }
 
 /// `host_caller_xrpc_query` on its own: gate on the capability, decode the

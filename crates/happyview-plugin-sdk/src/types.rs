@@ -12,6 +12,10 @@ pub use crate::wire::{
     CallerXrpcProcedure, CallerXrpcQuery, Condition, ExternalProfile, Filter, IndexDelete,
     IndexPut, JobCreate, Label, LabelsGet, LexiconGet, LinkedRepoBlobUpload, LinkedRepoCall,
     LinkedRepoInfo, LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut,
-    MethodCall, ObjectCall, PluginInfo, RecordRef, RecordsCount, RecordsPage, RecordsQuery,
-    RecordsSearch, RefreshInput, Sort, Step, StrongRef, TableQuery, TokenInput, TokenSet,
+    MethodCall, ObjectCall, Patch, PluginInfo, RecordRef, RecordsCount, RecordsPage, RecordsQuery,
+    RecordsSearch, RefreshInput, Sort, SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo,
+    SpaceMemberAdd, SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete, SpaceRecordInfo,
+    SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite,
+    SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers, SpacesQuery, Step, StrongRef,
+    TableQuery, TokenInput, TokenSet,
 };

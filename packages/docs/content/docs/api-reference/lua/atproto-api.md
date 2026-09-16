@@ -3,8 +3,15 @@ title: "atproto API"
 ---
 
 <Callout type="info">
-The `happyview.atproto` library plugin will replace every function on this page except `spaces`. `blob_upload` moves to `happyview.record` as `upload_blob`. `spaces` keeps this global until its own library lands.
+The `happyview.atproto` library plugin replaces every function on this page except `spaces`, and `blob_upload` lives in `happyview.record` as `upload_blob`. `spaces` is replaced by `happyview.spaces`, with a few differences: `get(space_uri)` never returns `nil` — an unknown URI raises `NOT_FOUND` on the first method call, not on `get` itself, and `info(space_uri)` is the nil-able lookup; `is_member` and `access` are handle methods, and also exist as functions taking a space URI; `set_member` adds the upsert `add_member` lacks, since a second `add_member` for the same DID raises `CONFLICT`.
 </Callout>
+
+```lua
+local spaces = require("happyview.spaces")
+
+local space = spaces.get("at://did:plc:abc123/space/com.example.forum/main")
+space:write_record{ collection = "com.example.forum.post", record = { text = "hi" } }
+```
 
 The `atproto` table provides atproto utility functions. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts).
 

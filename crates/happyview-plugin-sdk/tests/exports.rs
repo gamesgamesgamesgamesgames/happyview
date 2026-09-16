@@ -135,6 +135,35 @@ const EXPECTED_LINKED_REPOS_IMPORTS: &[&str] = &[
     "env::host_linked_repos_list",
 ];
 
+/// The `spaces` fixture is a bare pass-through over every spaces host
+/// import — nothing else.
+const EXPECTED_SPACES_EXPORTS: &[&str] = &[
+    "alloc",
+    "call",
+    "dealloc",
+    "get_api_surface",
+    "memory",
+    "plugin_info",
+];
+
+const EXPECTED_SPACES_IMPORTS: &[&str] = &[
+    "env::host_spaces_access",
+    "env::host_spaces_accept_invite",
+    "env::host_spaces_add_member",
+    "env::host_spaces_create",
+    "env::host_spaces_create_invite",
+    "env::host_spaces_delete",
+    "env::host_spaces_delete_record",
+    "env::host_spaces_info",
+    "env::host_spaces_members",
+    "env::host_spaces_put_record",
+    "env::host_spaces_query",
+    "env::host_spaces_remove_member",
+    "env::host_spaces_set_member",
+    "env::host_spaces_update",
+    "env::host_spaces_write_record",
+];
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
         "../../tests/fixtures/{name}/target/wasm32-unknown-unknown/release/{name}.wasm"
@@ -246,5 +275,14 @@ fn the_linked_repos_fixture_exports_the_library_abi_and_imports_only_what_it_use
         "sdk_linked_repos",
         EXPECTED_LINKED_REPOS_EXPORTS,
         EXPECTED_LINKED_REPOS_IMPORTS,
+    );
+}
+
+#[test]
+fn the_spaces_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
+    check_fixture(
+        "sdk_spaces",
+        EXPECTED_SPACES_EXPORTS,
+        EXPECTED_SPACES_IMPORTS,
     );
 }

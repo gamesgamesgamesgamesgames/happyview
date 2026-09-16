@@ -21,16 +21,21 @@ use serde_json::{Map, Value};
 // Envelope
 // ---------------------------------------------------------------------------
 
-/// The wire envelope, in both directions.
+/// The `{ok}` / `{error}` envelope every host import answers with, and the
+/// shape a plugin's own exports return; the host parses it as
+/// `PluginResponse`.
 ///
-/// A plugin returns either `{"ok": <value>}` or
-/// `{"error": {"code", "message", "retryable"}}`; the host parses exactly this
-/// shape, under the name `PluginResponse`.
+/// `Err` is declared first and that order is load-bearing: `untagged` keeps
+/// the first variant that fits, and an absent `Option<_>` field deserialises
+/// as `None`, so `Ok { ok: Option<_> }` fits an `{"error": ...}` envelope as
+/// well as a real one. `PluginError`'s fields are all required, so `Err` fits
+/// only a genuine error envelope, and trying it first is what lets an
+/// `Option`-returning wrapper report an error at all.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Response<T> {
-    Ok { ok: T },
     Err { error: PluginError },
+    Ok { ok: T },
 }
 
 impl<T> Response<T> {
@@ -826,6 +831,286 @@ pub struct JobCreate {
 }
 
 // ---------------------------------------------------------------------------
+// Spaces
+// ---------------------------------------------------------------------------
+
+/// A permissioned space's fields, as `happyview.spaces` reads and returns
+/// them. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceInfo {
+    pub uri: String,
+    pub id: String,
+    pub did: String,
+    pub authority_did: String,
+    pub creator_did: String,
+    #[serde(rename = "type")]
+    pub type_nsid: String,
+    pub skey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub read_policy: Value,
+    pub write_policy: Value,
+    pub app_access: Value,
+    pub config: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One member of a space. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceMemberInfo {
+    pub did: String,
+    pub access: String,
+}
+
+/// An invite minted for a space. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceInviteInfo {
+    pub invite_id: String,
+    pub token: String,
+    pub access: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+/// One record read back from a space. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceRecordInfo {
+    pub uri: String,
+    pub collection: String,
+    pub rkey: String,
+    pub record: Value,
+    pub cid: String,
+    pub author_did: String,
+}
+
+/// A page of space records. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceRecordsPage {
+    pub records: Vec<SpaceRecordInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// Look up a space's fields by URI. `Ok(None)` means no such space. Needs
+/// `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesInfo {
+    pub uri: String,
+}
+
+/// Page through a space's records, optionally filtered to one collection.
+/// Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesQuery {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// List a space's members. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesMembers {
+    pub uri: String,
+}
+
+/// A DID's access level on a space. `Ok(None)` means the DID is not a member,
+/// or the space does not exist. Needs `spaces:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesAccess {
+    pub uri: String,
+    pub did: String,
+}
+
+/// Create a space. `skey` and the collection's `type` NSID are the only
+/// required fields; every policy defaults to whatever the service assigns an
+/// unconfigured space. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesCreate {
+    #[serde(rename = "type")]
+    pub type_nsid: String,
+    pub skey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_access: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+/// Redeem an invite token, joining the space it names. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpacesAcceptInvite {
+    pub token: String,
+}
+
+/// Create a record in a space, as the caller. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceRecordWrite {
+    pub uri: String,
+    pub collection: String,
+    pub record: Value,
+}
+
+/// Put (create-or-update) a record in a space, as the caller. Needs
+/// `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceRecordPut {
+    pub uri: String,
+    pub collection: String,
+    pub rkey: String,
+    pub record: Value,
+    /// A no-create guarantee when set: the service refuses unless this CID is
+    /// the record's current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_cid: Option<String>,
+}
+
+/// Delete a record from a space, as the caller. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceRecordDelete {
+    pub uri: String,
+    pub collection: String,
+    pub rkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_cid: Option<String>,
+}
+
+/// Add or set a space member. Shared by `add_member` (refuses an existing
+/// member) and `set_member` (the service's upsert, which keeps an existing
+/// member's `read_self`). Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceMemberAdd {
+    pub uri: String,
+    pub did: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_delegation: Option<bool>,
+}
+
+/// Remove a space member. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceMemberRemove {
+    pub uri: String,
+    pub did: String,
+}
+
+/// Update a space's fields. `display_name` and `description` are
+/// [`Patch`]es; the policy fields are plain replacements, since a script
+/// always sends a complete policy document rather than editing one in place.
+/// Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceUpdate {
+    pub uri: String,
+    #[serde(
+        default,
+        deserialize_with = "patch_string",
+        skip_serializing_if = "Patch::is_unchanged"
+    )]
+    pub display_name: Patch<String>,
+    #[serde(
+        default,
+        deserialize_with = "patch_string",
+        skip_serializing_if = "Patch::is_unchanged"
+    )]
+    pub description: Patch<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_access: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+/// A field that can be left alone, cleared, or set to a new value.
+///
+/// A Lua script can send `false` but has no way to send JSON `null`, so an
+/// absent key is the only spelling left for "leave this alone" — `Unchanged`.
+/// `false` or an explicit `null` means `Clear`; a string means `Set`.
+/// `#[serde(default)]` gives `Unchanged` when the key is missing entirely, and
+/// serializing skips `Unchanged` (via `Patch::is_unchanged`) so a spec built
+/// without touching a field never mentions it on the wire.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Patch<T> {
+    #[default]
+    Unchanged,
+    Clear,
+    Set(T),
+}
+
+impl<T> Patch<T> {
+    pub fn is_unchanged(&self) -> bool {
+        matches!(self, Patch::Unchanged)
+    }
+}
+
+impl<T: Serialize> Serialize for Patch<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // Never reached when the field carries `skip_serializing_if =
+            // "Patch::is_unchanged"`; `null` is the closest honest answer if
+            // it ever is.
+            Patch::Unchanged | Patch::Clear => serializer.serialize_none(),
+            Patch::Set(value) => value.serialize(serializer),
+        }
+    }
+}
+
+/// The `deserialize_with` for a `Patch<String>` field. Not a generic
+/// `Deserialize` impl: the three-state reading (`false`/`null` vs. absent)
+/// only makes sense at the field, where `#[serde(default)]` already handles
+/// "absent", so this only ever sees a key that was actually present.
+pub fn patch_string<'de, D>(deserializer: D) -> Result<Patch<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Value::deserialize(deserializer)? {
+        Value::Null | Value::Bool(false) => Ok(Patch::Clear),
+        Value::String(s) => Ok(Patch::Set(s)),
+        other => Err(serde::de::Error::custom(format!(
+            "expected a string, false, or null for a patch field, found {other}"
+        ))),
+    }
+}
+
+/// Delete a space. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceDelete {
+    pub uri: String,
+}
+
+/// Mint an invite for a space. Needs `spaces:write`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpaceInviteCreate {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Auth plugin inputs and outputs
 // ---------------------------------------------------------------------------
 
@@ -1303,12 +1588,28 @@ mod tests {
 
     #[test]
     fn an_ok_envelope_holding_an_error_key_still_parses_as_ok() {
-        // `Response` is untagged, so ordering matters: `{"ok": ...}` must win.
+        // The ambiguity here is in the *value under* `ok`, not in the
+        // envelope's own top-level shape, so `{"ok": ...}` wins regardless of
+        // variant order.
         let parsed: Response<Value> = serde_json::from_str(r#"{"ok":{"error":"inner"}}"#).unwrap();
         assert_eq!(
             parsed.into_result().unwrap(),
             serde_json::json!({"error": "inner"})
         );
+    }
+
+    /// `Response<Option<_>>` must resolve on the envelope's top-level key,
+    /// not on whether `T` happens to accept a missing field.
+    #[test]
+    fn an_error_envelope_parses_as_err_even_when_ok_would_be_optional() {
+        let parsed: Response<Option<Value>> =
+            serde_json::from_str(r#"{"error":{"code":"NOT_AUTHORIZED","message":"nope"}}"#)
+                .unwrap();
+        let err = parsed.into_result().unwrap_err();
+        assert_eq!(err.code, "NOT_AUTHORIZED");
+
+        let parsed: Response<Option<Value>> = serde_json::from_str(r#"{"ok":null}"#).unwrap();
+        assert_eq!(parsed.into_result().unwrap(), None);
     }
 
     #[test]
@@ -2360,5 +2661,497 @@ mod jobs_tests {
         assert_eq!(value["input"]["n"], 1);
         assert_eq!(value["auth"], true);
         assert_eq!(serde_json::from_value::<JobCreate>(value).unwrap(), create);
+    }
+}
+
+#[cfg(test)]
+mod spaces_tests {
+    use super::*;
+    use alloc::string::ToString;
+    use serde_json::json;
+
+    fn space_info() -> SpaceInfo {
+        SpaceInfo {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            id: "space-1".to_string(),
+            did: "did:plc:owner".to_string(),
+            authority_did: "did:plc:authority".to_string(),
+            creator_did: "did:plc:creator".to_string(),
+            type_nsid: "dev.happyview.board".to_string(),
+            skey: "main".to_string(),
+            display_name: Some("Main board".to_string()),
+            description: Some("The default board".to_string()),
+            read_policy: json!({"kind": "members"}),
+            write_policy: json!({"kind": "members"}),
+            app_access: json!({"kind": "open"}),
+            config: json!({}),
+            revision: Some("rev-1".to_string()),
+            created_at: "2026-09-15T00:00:00Z".to_string(),
+            updated_at: "2026-09-15T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn space_info_round_trips_with_every_field_set() {
+        let info = space_info();
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["type"], "dev.happyview.board");
+        assert!(value.get("type_nsid").is_none());
+        assert_eq!(value["display_name"], "Main board");
+        assert_eq!(serde_json::from_value::<SpaceInfo>(value).unwrap(), info);
+    }
+
+    #[test]
+    fn space_info_omits_absent_optionals() {
+        let mut info = space_info();
+        info.display_name = None;
+        info.description = None;
+        info.revision = None;
+        let value = serde_json::to_value(&info).unwrap();
+        assert!(value.get("display_name").is_none());
+        assert!(value.get("description").is_none());
+        assert!(value.get("revision").is_none());
+        assert_eq!(serde_json::from_value::<SpaceInfo>(value).unwrap(), info);
+    }
+
+    #[test]
+    fn space_member_info_round_trips() {
+        let member = SpaceMemberInfo {
+            did: "did:plc:member".to_string(),
+            access: "write".to_string(),
+        };
+        let value = serde_json::to_value(&member).unwrap();
+        assert_eq!(value["did"], "did:plc:member");
+        assert_eq!(value["access"], "write");
+        assert_eq!(
+            serde_json::from_value::<SpaceMemberInfo>(value).unwrap(),
+            member
+        );
+    }
+
+    #[test]
+    fn space_invite_info_omits_absent_optionals() {
+        let invite = SpaceInviteInfo {
+            invite_id: "invite-1".to_string(),
+            token: "tok".to_string(),
+            access: "read".to_string(),
+            max_uses: None,
+            expires_at: None,
+        };
+        let value = serde_json::to_value(&invite).unwrap();
+        assert!(value.get("max_uses").is_none());
+        assert!(value.get("expires_at").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpaceInviteInfo>(value).unwrap(),
+            invite
+        );
+    }
+
+    #[test]
+    fn space_record_info_round_trips() {
+        let record = SpaceRecordInfo {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main/did:plc:author/dev.happyview.post/abc".to_string(),
+            collection: "dev.happyview.post".to_string(),
+            rkey: "abc".to_string(),
+            record: json!({"text": "hi"}),
+            cid: "bafyabc".to_string(),
+            author_did: "did:plc:author".to_string(),
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["author_did"], "did:plc:author");
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordInfo>(value).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn space_records_page_without_cursor_omits_the_key() {
+        let record = SpaceRecordInfo {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main/did:plc:author/dev.happyview.post/abc".to_string(),
+            collection: "dev.happyview.post".to_string(),
+            rkey: "abc".to_string(),
+            record: json!({"text": "hi"}),
+            cid: "bafyabc".to_string(),
+            author_did: "did:plc:author".to_string(),
+        };
+        let page = SpaceRecordsPage {
+            records: alloc::vec![record],
+            cursor: None,
+        };
+        let value = serde_json::to_value(&page).unwrap();
+        assert!(value.get("cursor").is_none());
+        assert_eq!(value["records"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordsPage>(value).unwrap(),
+            page
+        );
+    }
+
+    #[test]
+    fn space_records_page_round_trips_with_cursor_set() {
+        let page = SpaceRecordsPage {
+            records: alloc::vec![],
+            cursor: Some("cursor-1".to_string()),
+        };
+        let value = serde_json::to_value(&page).unwrap();
+        assert_eq!(value["cursor"], "cursor-1");
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordsPage>(value).unwrap(),
+            page
+        );
+    }
+
+    #[test]
+    fn spaces_info_round_trips() {
+        let info = SpacesInfo {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+        };
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(serde_json::from_value::<SpacesInfo>(value).unwrap(), info);
+    }
+
+    #[test]
+    fn spaces_query_defaults_optionals_when_absent() {
+        let query: SpacesQuery = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+        }))
+        .unwrap();
+        assert_eq!(query.collection, None);
+        assert_eq!(query.limit, None);
+        assert_eq!(query.cursor, None);
+    }
+
+    #[test]
+    fn spaces_query_round_trips_with_every_field_set() {
+        let query = SpacesQuery {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            collection: Some("dev.happyview.post".to_string()),
+            limit: Some(25),
+            cursor: Some("cursor-1".to_string()),
+        };
+        let value = serde_json::to_value(&query).unwrap();
+        assert_eq!(value["collection"], "dev.happyview.post");
+        assert_eq!(value["limit"], 25);
+        assert_eq!(serde_json::from_value::<SpacesQuery>(value).unwrap(), query);
+    }
+
+    #[test]
+    fn spaces_members_and_access_round_trip() {
+        let members = SpacesMembers {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+        };
+        let value = serde_json::to_value(&members).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpacesMembers>(value).unwrap(),
+            members
+        );
+
+        let access = SpacesAccess {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            did: "did:plc:member".to_string(),
+        };
+        let value = serde_json::to_value(&access).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpacesAccess>(value).unwrap(),
+            access
+        );
+    }
+
+    #[test]
+    fn spaces_create_accepts_only_the_two_required_keys() {
+        let create: SpacesCreate = serde_json::from_value(json!({
+            "type": "dev.happyview.board",
+            "skey": "main",
+        }))
+        .unwrap();
+        assert_eq!(create.type_nsid, "dev.happyview.board");
+        assert_eq!(create.skey, "main");
+        assert_eq!(create.display_name, None);
+        assert_eq!(create.description, None);
+        assert_eq!(create.read_policy, None);
+        assert_eq!(create.write_policy, None);
+        assert_eq!(create.app_access, None);
+        assert_eq!(create.config, None);
+    }
+
+    #[test]
+    fn spaces_create_round_trips_with_every_field_set() {
+        let create = SpacesCreate {
+            type_nsid: "dev.happyview.board".to_string(),
+            skey: "main".to_string(),
+            display_name: Some("Main board".to_string()),
+            description: Some("desc".to_string()),
+            read_policy: Some(json!({"kind": "members"})),
+            write_policy: Some(json!({"kind": "members"})),
+            app_access: Some(json!({"kind": "open"})),
+            config: Some(json!({"foo": "bar"})),
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["type"], "dev.happyview.board");
+        assert!(value.get("type_nsid").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpacesCreate>(value).unwrap(),
+            create
+        );
+    }
+
+    #[test]
+    fn spaces_accept_invite_round_trips() {
+        let accept = SpacesAcceptInvite {
+            token: "tok".to_string(),
+        };
+        let value = serde_json::to_value(&accept).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpacesAcceptInvite>(value).unwrap(),
+            accept
+        );
+    }
+
+    #[test]
+    fn space_record_write_round_trips() {
+        let write = SpaceRecordWrite {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            collection: "dev.happyview.post".to_string(),
+            record: json!({"text": "hi"}),
+        };
+        let value = serde_json::to_value(&write).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordWrite>(value).unwrap(),
+            write
+        );
+    }
+
+    #[test]
+    fn space_record_put_omits_absent_swap_cid() {
+        let put = SpaceRecordPut {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            collection: "dev.happyview.post".to_string(),
+            rkey: "abc".to_string(),
+            record: json!({"text": "hi"}),
+            swap_cid: None,
+        };
+        let value = serde_json::to_value(&put).unwrap();
+        assert!(value.get("swap_cid").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordPut>(value).unwrap(),
+            put
+        );
+    }
+
+    #[test]
+    fn space_record_delete_round_trips_with_swap_cid_set() {
+        let delete = SpaceRecordDelete {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            collection: "dev.happyview.post".to_string(),
+            rkey: "abc".to_string(),
+            swap_cid: Some("bafyabc".to_string()),
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(value["swap_cid"], "bafyabc");
+        assert_eq!(
+            serde_json::from_value::<SpaceRecordDelete>(value).unwrap(),
+            delete
+        );
+    }
+
+    #[test]
+    fn space_member_add_defaults_access_and_is_delegation_when_absent() {
+        let add: SpaceMemberAdd = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+            "did": "did:plc:member",
+        }))
+        .unwrap();
+        assert_eq!(add.access, None);
+        assert_eq!(add.is_delegation, None);
+    }
+
+    #[test]
+    fn space_member_add_round_trips_with_every_field_set() {
+        let add = SpaceMemberAdd {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            did: "did:plc:member".to_string(),
+            access: Some("write".to_string()),
+            is_delegation: Some(true),
+        };
+        let value = serde_json::to_value(&add).unwrap();
+        assert_eq!(value["access"], "write");
+        assert_eq!(value["is_delegation"], true);
+        assert_eq!(
+            serde_json::from_value::<SpaceMemberAdd>(value).unwrap(),
+            add
+        );
+    }
+
+    #[test]
+    fn space_member_remove_round_trips() {
+        let remove = SpaceMemberRemove {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            did: "did:plc:member".to_string(),
+        };
+        let value = serde_json::to_value(&remove).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpaceMemberRemove>(value).unwrap(),
+            remove
+        );
+    }
+
+    #[test]
+    fn space_delete_round_trips() {
+        let delete = SpaceDelete {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+        };
+        let value = serde_json::to_value(&delete).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpaceDelete>(value).unwrap(),
+            delete
+        );
+    }
+
+    #[test]
+    fn space_invite_create_omits_absent_optionals() {
+        let create = SpaceInviteCreate {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            access: None,
+            max_uses: None,
+            expires_at: None,
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert!(value.get("access").is_none());
+        assert!(value.get("max_uses").is_none());
+        assert!(value.get("expires_at").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpaceInviteCreate>(value).unwrap(),
+            create
+        );
+    }
+
+    #[test]
+    fn space_invite_create_round_trips_with_every_field_set() {
+        let create = SpaceInviteCreate {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            access: Some("read".to_string()),
+            max_uses: Some(5),
+            expires_at: Some("2026-10-01T00:00:00Z".to_string()),
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["access"], "read");
+        assert_eq!(value["max_uses"], 5);
+        assert_eq!(
+            serde_json::from_value::<SpaceInviteCreate>(value).unwrap(),
+            create
+        );
+    }
+
+    fn base_update() -> SpaceUpdate {
+        SpaceUpdate {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            display_name: Patch::Unchanged,
+            description: Patch::Unchanged,
+            read_policy: None,
+            write_policy: None,
+            app_access: None,
+            config: None,
+        }
+    }
+
+    #[test]
+    fn space_update_absent_patch_fields_deserialize_to_unchanged() {
+        let update: SpaceUpdate = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+        }))
+        .unwrap();
+        assert_eq!(update.display_name, Patch::Unchanged);
+        assert_eq!(update.description, Patch::Unchanged);
+    }
+
+    #[test]
+    fn space_update_false_patch_field_deserializes_to_clear() {
+        let update: SpaceUpdate = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+            "display_name": false,
+        }))
+        .unwrap();
+        assert_eq!(update.display_name, Patch::Clear);
+    }
+
+    #[test]
+    fn space_update_null_patch_field_deserializes_to_clear() {
+        let update: SpaceUpdate = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+            "display_name": null,
+        }))
+        .unwrap();
+        assert_eq!(update.display_name, Patch::Clear);
+    }
+
+    #[test]
+    fn space_update_string_patch_field_deserializes_to_set() {
+        let update: SpaceUpdate = serde_json::from_value(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+            "display_name": "New name",
+        }))
+        .unwrap();
+        assert_eq!(update.display_name, Patch::Set("New name".to_string()));
+    }
+
+    #[test]
+    fn space_update_true_patch_field_is_rejected() {
+        let err = serde_json::from_value::<SpaceUpdate>(json!({
+            "uri": "at://did:plc:owner/space/dev.happyview.board/main",
+            "display_name": true,
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("patch field"), "{err}");
+    }
+
+    #[test]
+    fn space_update_unchanged_fields_are_absent_on_the_wire() {
+        let update = base_update();
+        let value = serde_json::to_value(&update).unwrap();
+        assert!(value.get("display_name").is_none());
+        assert!(value.get("description").is_none());
+        assert_eq!(
+            serde_json::from_value::<SpaceUpdate>(value).unwrap(),
+            update
+        );
+    }
+
+    #[test]
+    fn space_update_clear_serializes_to_null_and_round_trips() {
+        let mut update = base_update();
+        update.display_name = Patch::Clear;
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(value["display_name"], Value::Null);
+        assert_eq!(
+            serde_json::from_value::<SpaceUpdate>(value).unwrap(),
+            update
+        );
+    }
+
+    #[test]
+    fn space_update_set_serializes_to_the_string_and_round_trips() {
+        let mut update = base_update();
+        update.description = Patch::Set("New description".to_string());
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(value["description"], "New description");
+        assert_eq!(
+            serde_json::from_value::<SpaceUpdate>(value).unwrap(),
+            update
+        );
+    }
+
+    #[test]
+    fn space_update_round_trips_with_policy_fields_set() {
+        let mut update = base_update();
+        update.read_policy = Some(json!({"kind": "members"}));
+        update.write_policy = Some(json!({"kind": "members"}));
+        update.app_access = Some(json!({"kind": "open"}));
+        update.config = Some(json!({"foo": "bar"}));
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SpaceUpdate>(value).unwrap(),
+            update
+        );
     }
 }

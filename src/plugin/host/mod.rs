@@ -10,6 +10,10 @@ mod logging;
 mod lookup;
 mod records;
 mod secrets;
+// `pub(crate)`, not private like `jobs`/`linked_repos`: the Lua `atproto.spaces`
+// global (`src/lua/spaces_api.rs`, `src/lua/atproto_api.rs`) calls into this
+// module too, so it needs to be reachable from outside `plugin::host`.
+pub(crate) mod spaces;
 
 pub use atproto::*;
 pub use bindings::{PluginState, register_host_functions};
@@ -22,10 +26,11 @@ pub use lookup::*;
 pub use records::*;
 pub use secrets::*;
 
-// `jobs` and `linked_repos` are deliberately not glob-exported: both define
-// functions sharing a name with `caller`'s (`create_record`, `put_record`,
-// `delete_record`, `upload_blob`) for the same operation on a different
-// account's repo. `bindings.rs` reaches them by their full module path.
+// `jobs`, `linked_repos` and `spaces` are deliberately not glob-exported:
+// each defines functions sharing a name with another module's (`create`,
+// `create_record`, `put_record`, `delete_record`, `update`, `delete`,
+// `upload_blob`...) for a different operation. `bindings.rs` reaches them by
+// their full module path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
