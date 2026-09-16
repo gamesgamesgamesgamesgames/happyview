@@ -42,9 +42,9 @@ import type {
   ExternalProvider,
   LinkedAccount,
   AuthorizeResponse,
-  SyncResponse,
   UnlinkResponse,
   ConnectResponse,
+  RefreshResponse,
 } from "@/types/external-accounts";
 import type {
   DeadLettersListResponse,
@@ -111,9 +111,9 @@ export type {
   ExternalProvider,
   LinkedAccount,
   AuthorizeResponse,
-  SyncResponse,
   UnlinkResponse,
   ConnectResponse,
+  RefreshResponse,
   ConfigSchema,
   ConfigProperty,
 } from "@/types/external-accounts";
@@ -1030,16 +1030,16 @@ export function authorizeExternal(pluginId: string, redirectUri: string) {
   );
 }
 
-export function syncExternal(pluginId: string) {
-  return apiFetch<SyncResponse>(
-    `/external-auth/${encodeURIComponent(pluginId)}/sync`,
+export function unlinkExternal(pluginId: string) {
+  return apiFetch<UnlinkResponse>(
+    `/external-auth/${encodeURIComponent(pluginId)}/unlink`,
     { method: "POST" },
   );
 }
 
-export function unlinkExternal(pluginId: string) {
-  return apiFetch<UnlinkResponse>(
-    `/external-auth/${encodeURIComponent(pluginId)}/unlink`,
+export function refreshExternalAccount(pluginId: string) {
+  return apiFetch<RefreshResponse>(
+    `/external-auth/${encodeURIComponent(pluginId)}/refresh`,
     { method: "POST" },
   );
 }
@@ -1059,6 +1059,9 @@ import type {
   PluginSummary,
   PluginsListResponse,
   OfficialPluginsListResponse,
+  PluginType,
+  PluginDependency,
+  CapabilityReport,
 } from "@/types/plugins";
 export type {
   PluginSummary,
@@ -1072,7 +1075,11 @@ export function getPlugins() {
   return apiFetch<PluginsListResponse>("/admin/plugins");
 }
 
-export function addPlugin(body: { url: string; sha256?: string }) {
+export function addPlugin(body: {
+  url: string;
+  sha256?: string;
+  accepted_capabilities?: string[];
+}) {
   return apiFetch<PluginSummary>("/admin/plugins", {
     method: "POST",
     body: JSON.stringify(body),
@@ -1127,6 +1134,23 @@ export function updatePluginSecrets(
   });
 }
 
+export interface PluginAllowedHostsResponse {
+  hosts: string[];
+}
+
+export function getPluginAllowedHosts(id: string) {
+  return apiFetch<PluginAllowedHostsResponse>(
+    `/admin/plugins/${encodeURIComponent(id)}/allowed-hosts`,
+  );
+}
+
+export function updatePluginAllowedHosts(id: string, hosts: string[]) {
+  return apiFetch<PluginAllowedHostsResponse>(
+    `/admin/plugins/${encodeURIComponent(id)}/allowed-hosts`,
+    { method: "PUT", body: JSON.stringify({ hosts }) },
+  );
+}
+
 export interface SecretDefinition {
   key: string;
   name: string;
@@ -1143,6 +1167,12 @@ export interface PluginPreview {
   required_secrets: SecretDefinition[];
   manifest_url: string;
   wasm_url: string;
+  plugin_type: PluginType;
+  namespace: string | null;
+  dependencies: PluginDependency[];
+  allowed_hosts: string[];
+  capabilities: CapabilityReport;
+  sha256: string;
 }
 
 export function previewPlugin(url: string, signal?: AbortSignal) {

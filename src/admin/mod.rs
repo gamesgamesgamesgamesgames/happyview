@@ -198,6 +198,10 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             get(plugins::get_secrets).put(plugins::update_secrets),
         )
         .route(
+            "/plugins/{id}/allowed-hosts",
+            get(plugins::get_allowed_hosts).put(plugins::update_allowed_hosts),
+        )
+        .route(
             "/api-clients",
             post(api_clients::create_api_client).get(api_clients::list_api_clients),
         )

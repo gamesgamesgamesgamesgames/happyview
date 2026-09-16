@@ -21,34 +21,40 @@ export const LEXICON_TEMPLATE = JSON.stringify(
 
 export function procedureScript(collection: string): string {
   const target = collection || "COLLECTION";
-  return `function handle()
+  return `local log = require("internal.logging")
+
+function handle(input, ctx)
   local r = Record("${target}", input)
   r:save()
+  log.info("record saved", { uri = r._uri })
   return { uri = r._uri, cid = r._cid }
 end
 `;
 }
 
 export function indexHookScript(): string {
-  return `function handle()
-  if action == "delete" then
+  return `local log = require("internal.logging")
+
+function handle(input, ctx)
+  if input.action == "delete" then
     -- record was deleted
-    log("deleted " .. uri)
+    log.info("deleted " .. input.uri)
   else
     -- record was created or updated
-    log(action .. " " .. uri)
+    log.info(input.action .. " " .. input.uri)
   end
 end
 `;
 }
 
-export function queryScript(collection: string): string {
-  const target = collection || "COLLECTION";
-  return `collection = "${target}"
+export function queryScript(): string {
+  return `local log = require("internal.logging")
 
-function handle()
-  if params.uri then
-    local record = db.get(params.uri)
+function handle(input, ctx)
+  log.info("handling query", { uri = input.uri })
+
+  if input.uri then
+    local record = db.get(input.uri)
     if not record then
       error("record not found")
     end
@@ -56,10 +62,10 @@ function handle()
   end
 
   return db.query({
-    collection = collection,
-    did = params.did,
-    limit = params.limit,
-    cursor = params.cursor,
+    collection = ctx.collection,
+    did = input.did,
+    limit = input.limit,
+    cursor = input.cursor,
   })
 end
 `;

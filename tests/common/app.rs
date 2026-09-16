@@ -4,14 +4,18 @@ use atrium_oauth::{
     AtprotoLocalhostClientMetadata, KnownScope, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 use axum::Router;
+use axum::body::Body;
 use axum::http::Request;
 use base64::Engine as _;
 use happyview::config::Config;
 use happyview::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use happyview::lexicon::LexiconRegistry;
 use happyview::{AppState, server};
+use http_body_util::BodyExt;
 use p256::elliptic_curve::sec1::ToSec1Point;
+use serde_json::Value;
 use tokio::sync::watch;
+use tower::ServiceExt;
 use wiremock::MockServer;
 
 use crate::common::db;
@@ -727,14 +731,19 @@ impl TestApp {
 
     /// Install a fake plugin directly into the registry at the given version.
     pub async fn install_fake_plugin(&self, id: &str, version: &str) {
-        use happyview::plugin::{LoadedPlugin, PluginInfo, PluginSource};
+        use happyview::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource};
+
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "version": version, "api_version": "2", "capabilities": [],
+        }))
+        .unwrap();
 
         let plugin = LoadedPlugin {
             info: PluginInfo {
                 id: id.to_string(),
                 name: id.to_string(),
                 version: version.to_string(),
-                api_version: "1".to_string(),
+                api_version: "2".to_string(),
                 icon_url: None,
                 required_secrets: vec![],
                 auth_type: "openid".to_string(),
@@ -744,9 +753,72 @@ impl TestApp {
                 url: format!("https://example.com/{id}.wasm"),
                 sha256: None,
             },
-            wasm_bytes: vec![],
-            manifest: None,
+            // Valid, trivial WASM — not `vec![]`, which `analyze_imports`
+            // (and so `capabilities::report`) rejects as unparseable,
+            // leaving a parser error in `capabilities.undeclared` for
+            // every caller that lists this fake plugin.
+            wasm_bytes: wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap(),
+            manifest: Some(manifest),
         };
         self.state.plugin_registry.register(plugin).await;
+    }
+
+    /// GET `path` as the admin user and parse the response body as JSON.
+    pub async fn get_json(&self, path: &str) -> Value {
+        let cookie = self.admin_cookie();
+        let req = Request::builder()
+            .uri(path)
+            .header(cookie.0, cookie.1)
+            .body(Body::empty())
+            .unwrap();
+        let resp = self.router.clone().oneshot(req).await.unwrap();
+        Self::response_json(resp).await
+    }
+
+    /// DELETE `path` as the admin user, returning the status code and the
+    /// response body as JSON (`Value::Null` for an empty body).
+    pub async fn delete_json(&self, path: &str) -> (u16, Value) {
+        let cookie = self.admin_cookie();
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(path)
+            .header(cookie.0, cookie.1)
+            .body(Body::empty())
+            .unwrap();
+        let resp = self.router.clone().oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        (status, Self::response_json(resp).await)
+    }
+
+    /// POST `body` as JSON to `path` as the admin user, returning the parsed
+    /// response body. Use `post_json_status` when the status code matters.
+    pub async fn post_json(&self, path: &str, body: Value) -> Value {
+        let (_, body) = self.post_json_status(path, body).await;
+        body
+    }
+
+    /// POST `body` as JSON to `path` as the admin user, returning the status
+    /// code and the parsed response body.
+    pub async fn post_json_status(&self, path: &str, body: Value) -> (u16, Value) {
+        let cookie = self.admin_cookie();
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(cookie.0, cookie.1)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = self.router.clone().oneshot(req).await.unwrap();
+        let status = resp.status().as_u16();
+        (status, Self::response_json(resp).await)
+    }
+
+    async fn response_json(resp: axum::response::Response) -> Value {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        }
     }
 }

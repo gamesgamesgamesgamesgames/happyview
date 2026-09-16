@@ -1,0 +1,17 @@
+[package]
+name = "sdk-spaces"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sdk_spaces"
+crate-type = ["cdylib"]
+
+[dependencies]
+happyview-plugin-sdk = { path = "../../../crates/happyview-plugin-sdk" }
+serde = { version = "1", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -131,39 +131,37 @@ export function parseTriggerId(
 }
 
 /**
- * A reasonable starter script body — defines the required `handle()`
- * function. Used to prefill the new-script form.
+ * A reasonable starter script body — defines the required
+ * `handle(input, ctx)` function. Used to prefill the new-script form.
  */
-export const DEFAULT_SCRIPT_BODY = `-- Trigger script: receives an \`event\` table describing what fired
--- the script and returns either a transformed event/record (table) or
--- \`nil\` to skip the operation.
+export const DEFAULT_SCRIPT_BODY = `-- Trigger script: \`input\` is the trigger's payload; \`ctx\` describes
+-- this invocation (caller, environment, trigger id, and more). Return
+-- a transformed value, or \`nil\` to skip the operation.
 --
--- Available APIs: db.*, http.*, xrpc.*, atproto.*, Record.*, env.<KEY>
+-- require("internal.*") and installed libraries provide the rest.
 
-function handle()
-  log("script fired")
-  return event
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  log.info("script fired", { trigger = ctx.trigger })
+  return input
 end
 `
 
-export const DEFAULT_JOB_SCRIPT_BODY = `-- Job runner: executes as a background job.
+export const DEFAULT_JOB_SCRIPT_BODY = `-- Job runner: executes as a background job. \`input\` is the job's
+-- input table; \`ctx.job\` exposes the job's id, progress(data),
+-- should_stop(), and wait(seconds). Return value becomes the job's result.
 --
--- Available globals:
---   job.input      — the input table passed to jobs.create()
---   job.id         — the job's UUID
---   job.progress() — persist progress (visible in the dashboard)
---   job.should_stop() — check for pause/cancel (cooperative)
---   job.wait(seconds) — sleep (0–3600s)
---
--- Available APIs: db.*, http.*, xrpc.*, atproto.*, Record.*, env.<KEY>
--- Return value becomes the job's result.
+-- require("internal.*") and installed libraries provide the rest.
 
-function handle()
-  local input = job.input
+local log = require("internal.logging")
 
-  job.progress({ status = "working" })
+function handle(input, ctx)
+  log.info("job started", { job_id = ctx.job.id })
 
-  if job.should_stop() then
+  ctx.job.progress({ status = "working" })
+
+  if ctx.job.should_stop() then
     return { partial = true }
   end
 

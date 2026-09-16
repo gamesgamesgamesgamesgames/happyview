@@ -24,10 +24,12 @@ pub async fn memory_pool() -> sqlx::AnyPool {
         .expect("connect to in-memory sqlite")
 }
 
-/// An in-memory SQLite pool with migrations applied.
-///
-/// `memory_pool` gives an empty database; anything touching real tables needs
-/// this instead.
+/// A [`memory_pool`] with every SQLite migration applied. A hand-written
+/// `CREATE TABLE` in a test drifts silently from the real schema — a
+/// migration can add a column the copy never gets, and a test against the
+/// stale copy keeps passing while the code it exercises breaks against a real
+/// database. The path is anchored to the crate manifest so the helper works
+/// from any working directory.
 pub async fn migrated_memory_pool() -> sqlx::AnyPool {
     let pool = memory_pool().await;
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite");

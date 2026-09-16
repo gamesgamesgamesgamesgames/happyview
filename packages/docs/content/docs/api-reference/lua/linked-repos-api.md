@@ -2,6 +2,17 @@
 title: "Linked Repos API"
 ---
 
+<Callout type="info">
+Use the `happyview.linked_repos` library instead. This global is scheduled for removal in v3. `get(did)` never returns `nil` — an unlinked DID surfaces as `NOT_LINKED` on the first method call, not on `get` itself — and the handle it returns has no `did`, `handle`, `status`, or `scopes` fields; read those from `list()` instead.
+</Callout>
+
+```lua
+local linked_repos = require("happyview.linked_repos")
+
+local repo = linked_repos.get("did:plc:abc123")
+repo:create_record{ collection = "com.example.note", record = { text = "hi" } }
+```
+
 Lua API for writing to repos an admin has linked to this instance. For a conceptual overview, see [Linked Repos](../../guides/linked-repos.md).
 
 ## `linked_repos` table

@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use wasmtime::{Linker, Memory, TypedFunc};
 
+use crate::plugin::caller::CallerSession;
+use crate::plugin::capabilities::{PluginCapability, is_free_import, requirement_for_import};
+
 /// State stored in wasmtime's Store during plugin execution
 pub struct PluginState {
     pub plugin_id: String,
@@ -16,6 +19,23 @@ pub struct PluginState {
     pub memory: Option<Memory>,
     pub alloc: Option<TypedFunc<u32, u32>>,
     pub dealloc: Option<TypedFunc<(u32, u32), ()>>,
+    pub capabilities: std::collections::HashSet<crate::plugin::capabilities::PluginCapability>,
+    pub allowed_hosts: Vec<String>,
+    pub plugin_type: crate::plugin::PluginType,
+    pub executor: Option<crate::plugin::PluginExecutor>,
+    pub call_ctx: crate::plugin::library::LibraryCallContext,
+    pub depth: u8,
+    /// The credentials of the user whose script is running, when there are
+    /// any. Every `host_caller_*` import refuses without it, except
+    /// `host_caller_xrpc_query`, which a session-less query, record-event or
+    /// label script can also reach.
+    pub caller: Option<Arc<crate::plugin::caller::CallerSession>>,
+    /// The full instance, carried from `PluginExecutor::app_state` so a
+    /// caller-acting import can run without a `CallerSession` to source it
+    /// from. `Some` for every real instantiation; `None` only for the
+    /// direct-construction test and external-auth call sites that never
+    /// reach such an import.
+    pub app_state: Option<crate::AppState>,
 }
 
 /// Check that a memory access is within bounds
@@ -28,6 +48,32 @@ fn check_bounds(offset: usize, length: usize, mem_size: usize) -> Result<(usize,
         return Err(());
     }
     Ok((offset, end))
+}
+
+/// Every host function except `host_log` starts here.
+pub(super) fn require_capability(
+    state: &PluginState,
+    req: crate::plugin::capabilities::Requirement,
+) -> Result<(), Vec<u8>> {
+    if req.any_of.iter().any(|c| state.capabilities.contains(c)) {
+        return Ok(());
+    }
+    let wanted: Vec<&str> = req.any_of.iter().map(|c| c.as_str()).collect();
+    Err(error_envelope(
+        "FORBIDDEN",
+        format!(
+            "plugin '{}' lacks the {} capability",
+            state.plugin_id,
+            wanted.join(" or ")
+        ),
+    ))
+}
+
+fn error_envelope(code: &str, message: impl std::fmt::Display) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "error": {"code": code, "message": message.to_string(), "retryable": false}
+    }))
+    .unwrap_or_default()
 }
 
 /// Register all host functions with the linker
@@ -87,6 +133,826 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         "host_lookup_record",
         |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
             Box::new(async move { host_lookup_record_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_records_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_query",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::records_query(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_records_count",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_count",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::records_count(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_records_get",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_get",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec: GetSpec| async move {
+                        super::records_get(&db, backend, &spec.uri).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_records_search",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_search",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::records_search(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_table_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_table_query",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::table_query(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_backlinks_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_backlinks_query",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::backlinks_query(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    // Async functions - acting as the calling user
+    linker.func_wrap_async(
+        "env",
+        "host_caller_create_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_caller_impl(
+                    &mut caller,
+                    "host_caller_create_record",
+                    req_ptr,
+                    req_len,
+                    |session, spec| async move { super::create_record(&session, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_caller_put_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_caller_impl(
+                    &mut caller,
+                    "host_caller_put_record",
+                    req_ptr,
+                    req_len,
+                    |session, spec| async move { super::put_record(&session, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_caller_delete_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_caller_impl(
+                    &mut caller,
+                    "host_caller_delete_record",
+                    req_ptr,
+                    req_len,
+                    |session, spec| async move { super::delete_record(&session, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_caller_upload_blob",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_caller_impl(
+                    &mut caller,
+                    "host_caller_upload_blob",
+                    req_ptr,
+                    req_len,
+                    |session, spec| async move { super::upload_blob(&session, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_caller_xrpc_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_caller_query_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_caller_xrpc_procedure",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_caller_impl(
+                    &mut caller,
+                    "host_caller_xrpc_procedure",
+                    req_ptr,
+                    req_len,
+                    |session, spec| async move { super::xrpc_procedure(&session, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    // Async functions - writing to a linked repo and enqueuing jobs
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repos_list",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repos_list",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, _spec: serde_json::Value| async move {
+                        super::linked_repos::list(&state).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repo_create_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repo_create_record",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, spec: happyview_plugin_sdk::wire::LinkedRepoRecordCreate| async move {
+                        super::linked_repos::create_record(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repo_put_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repo_put_record",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, spec: happyview_plugin_sdk::wire::LinkedRepoRecordPut| async move {
+                        super::linked_repos::put_record(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repo_delete_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repo_delete_record",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, spec: happyview_plugin_sdk::wire::LinkedRepoRecordDelete| async move {
+                        super::linked_repos::delete_record(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repo_upload_blob",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repo_upload_blob",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, spec: happyview_plugin_sdk::wire::LinkedRepoBlobUpload| async move {
+                        super::linked_repos::upload_blob(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_linked_repo_call",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_linked_repo_call",
+                    req_ptr,
+                    req_len,
+                    super::linked_repos::LinkedRepoError::code,
+                    |state, spec: happyview_plugin_sdk::wire::LinkedRepoCall| async move {
+                        super::linked_repos::call(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_jobs_create",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_jobs_create",
+                    req_ptr,
+                    req_len,
+                    super::jobs::JobsError::code,
+                    |state, caller_did, session, spec: happyview_plugin_sdk::wire::JobCreate| async move {
+                        super::jobs::create(&state, caller_did.as_deref(), session.as_deref(), spec)
+                            .await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    // Async functions - spaces. Four reads need no caller; the eleven writes
+    // act as `ctx.caller_did` and refuse before reaching the module when the
+    // script context has none, via `require_spaces_caller`.
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_info",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_spaces_info",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, spec: happyview_plugin_sdk::wire::SpacesInfo| async move {
+                        super::spaces::info(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_spaces_query",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, spec: happyview_plugin_sdk::wire::SpacesQuery| async move {
+                        super::spaces::query(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_members",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_spaces_members",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, spec: happyview_plugin_sdk::wire::SpacesMembers| async move {
+                        super::spaces::members(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_access",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_impl(
+                    &mut caller,
+                    "host_spaces_access",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, spec: happyview_plugin_sdk::wire::SpacesAccess| async move {
+                        super::spaces::access(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_create",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_create",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpacesCreate| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::create(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_accept_invite",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_accept_invite",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpacesAcceptInvite| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::accept_invite(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_write_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_write_record",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceRecordWrite| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::write_record(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_put_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_put_record",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceRecordPut| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::put_record(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_delete_record",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_delete_record",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceRecordDelete| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::delete_record(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_add_member",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_add_member",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceMemberAdd| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::add_member(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_set_member",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_set_member",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceMemberAdd| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::set_member(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_remove_member",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_remove_member",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceMemberRemove| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::remove_member(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_update",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_update",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, caller_did, _session, spec: happyview_plugin_sdk::wire::SpaceUpdate| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::update(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_delete",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_delete",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state, caller_did, _session, spec: happyview_plugin_sdk::wire::SpaceDelete| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::delete(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_spaces_create_invite",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_app_caller_impl(
+                    &mut caller,
+                    "host_spaces_create_invite",
+                    req_ptr,
+                    req_len,
+                    super::spaces::SpacesError::code,
+                    |state,
+                     caller_did,
+                     _session,
+                     spec: happyview_plugin_sdk::wire::SpaceInviteCreate| async move {
+                        let caller_did = require_spaces_caller(caller_did)?;
+                        super::spaces::create_invite(&state, &caller_did, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    // Async functions - local index writes and lexicon reads
+    linker.func_wrap_async(
+        "env",
+        "host_records_index_put",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_index_put",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec| async move { super::index_put(&db, backend, spec).await },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_records_index_delete",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_spec_impl(
+                    &mut caller,
+                    "host_records_index_delete",
+                    req_ptr,
+                    req_len,
+                    |db, backend, spec: happyview_plugin_sdk::wire::IndexDelete| async move {
+                        super::index_delete(&db, backend, &spec.uri).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_lexicon_get",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_lexicon_get_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_allowed_hosts",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_allowed_hosts_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_call_library",
+        |mut caller: wasmtime::Caller<'_, PluginState>,
+         (lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len): (i32, i32, i32, i32, i32, i32)| {
+            Box::new(async move {
+                host_call_library_impl(&mut caller, lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len)
+                    .await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_get_api_surface",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (lib_ptr, lib_len): (i32, i32)| {
+            Box::new(async move { host_get_api_surface_impl(&mut caller, lib_ptr, lib_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_db_query",
+        |mut caller: wasmtime::Caller<'_, PluginState>,
+         (sql_ptr, sql_len, params_ptr, params_len): (i32, i32, i32, i32)| {
+            Box::new(async move {
+                host_db_impl(&mut caller, false, sql_ptr, sql_len, params_ptr, params_len).await
+            })
+        },
+    )?;
+    linker.func_wrap_async(
+        "env",
+        "host_db_execute",
+        |mut caller: wasmtime::Caller<'_, PluginState>,
+         (sql_ptr, sql_len, params_ptr, params_len): (i32, i32, i32, i32)| {
+            Box::new(async move {
+                host_db_impl(&mut caller, true, sql_ptr, sql_len, params_ptr, params_len).await
+            })
+        },
+    )?;
+
+    // Async functions - AT Protocol network reads and attestation
+    linker.func_wrap_async(
+        "env",
+        "host_atproto_resolve_service",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move {
+                host_atproto_resolve_service_impl(&mut caller, req_ptr, req_len).await
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_atproto_blob_download",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(
+                async move { host_atproto_blob_download_impl(&mut caller, req_ptr, req_len).await },
+            )
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_labels_get",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_labels_get_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_attest_sign",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_attest_sign_impl(&mut caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "env",
+        "host_attest_verify",
+        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
+            Box::new(async move { host_attest_verify_impl(&mut caller, req_ptr, req_len).await })
         },
     )?;
 
@@ -193,6 +1059,13 @@ async fn host_get_secret_impl(
     name_ptr: i32,
     name_len: i32,
 ) -> i64 {
+    if let Err(envelope) = require_capability(
+        caller.data(),
+        requirement_for_import("host_get_secret").unwrap(),
+    ) {
+        return write_guest_response(caller, &envelope).await;
+    }
+
     let name = match read_guest_string(caller, name_ptr, name_len) {
         Some(n) => n,
         None => return 0,
@@ -232,6 +1105,13 @@ async fn host_http_request_impl(
     req_ptr: i32,
     req_len: i32,
 ) -> i64 {
+    if let Err(envelope) = require_capability(
+        caller.data(),
+        requirement_for_import("host_http_request").unwrap(),
+    ) {
+        return write_guest_response(caller, &envelope).await;
+    }
+
     let req_bytes = match read_guest_bytes(caller, req_ptr, req_len) {
         Some(b) => b,
         None => {
@@ -253,6 +1133,31 @@ async fn host_http_request_impl(
     let url = request.url.clone();
     let method = request.method.clone();
 
+    let unrestricted = {
+        let state = caller.data();
+        let unrestricted = state
+            .capabilities
+            .contains(&PluginCapability::NetworkRequestUnrestricted);
+        if !unrestricted {
+            let host = reqwest::Url::parse(&request.url)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from));
+            let ok = host
+                .as_deref()
+                .map(|h| super::host_allowed(&state.allowed_hosts, h))
+                .unwrap_or(false);
+            if !ok {
+                let defined = state
+                    .capabilities
+                    .contains(&PluginCapability::NetworkRequestDefined);
+                let message =
+                    super::allowed_hosts_denial(&state.allowed_hosts, defined, host.as_deref());
+                return write_guest_response(caller, &error_envelope("FORBIDDEN", message)).await;
+            }
+        }
+        unrestricted
+    };
+
     let ctx = match build_host_context(caller.data()) {
         Some(c) => c,
         None => {
@@ -263,7 +1168,7 @@ async fn host_http_request_impl(
 
     let result = {
         let usage = &mut caller.data_mut().usage;
-        super::http_request(&ctx, usage, request).await
+        super::http_request(&ctx, usage, request, unrestricted).await
     };
 
     let response_bytes = match result {
@@ -295,6 +1200,13 @@ async fn host_kv_get_impl(
     key_ptr: i32,
     key_len: i32,
 ) -> i64 {
+    if let Err(envelope) = require_capability(
+        caller.data(),
+        requirement_for_import("host_kv_get").unwrap(),
+    ) {
+        return write_guest_response(caller, &envelope).await;
+    }
+
     let key = match read_guest_string(caller, key_ptr, key_len) {
         Some(k) => k,
         None => return 0,
@@ -321,7 +1233,10 @@ async fn host_kv_get_impl(
     write_guest_response(caller, &response_bytes).await
 }
 
-/// Host function: set a value in KV store
+/// Host function: set a value in KV store. Returns `0` on success and `-1`
+/// on any failure, including a missing `kv:write` capability — the `env`
+/// import signature is a bare `i32`, so there's no envelope to carry a
+/// distinct "forbidden" code back to the guest.
 async fn host_kv_set_impl(
     caller: &mut wasmtime::Caller<'_, PluginState>,
     key_ptr: i32,
@@ -330,6 +1245,19 @@ async fn host_kv_set_impl(
     val_len: i32,
     ttl: i32,
 ) -> i32 {
+    if require_capability(
+        caller.data(),
+        requirement_for_import("host_kv_set").unwrap(),
+    )
+    .is_err()
+    {
+        tracing::warn!(
+            plugin_id = %caller.data().plugin_id,
+            "host_kv_set: missing kv:write capability"
+        );
+        return -1;
+    }
+
     let key = match read_guest_string(caller, key_ptr, key_len) {
         Some(k) => k,
         None => return -1,
@@ -353,12 +1281,28 @@ async fn host_kv_set_impl(
     }
 }
 
-/// Host function: delete a value from KV store
+/// Host function: delete a value from KV store. Returns `0` on success and
+/// `-1` on any failure, including a missing `kv:write` capability — the
+/// `env` import signature is a bare `i32`, so there's no envelope to carry a
+/// distinct "forbidden" code back to the guest.
 async fn host_kv_delete_impl(
     caller: &mut wasmtime::Caller<'_, PluginState>,
     key_ptr: i32,
     key_len: i32,
 ) -> i32 {
+    if require_capability(
+        caller.data(),
+        requirement_for_import("host_kv_delete").unwrap(),
+    )
+    .is_err()
+    {
+        tracing::warn!(
+            plugin_id = %caller.data().plugin_id,
+            "host_kv_delete: missing kv:write capability"
+        );
+        return -1;
+    }
+
     let key = match read_guest_string(caller, key_ptr, key_len) {
         Some(k) => k,
         None => return -1,
@@ -381,6 +1325,13 @@ async fn host_lookup_record_impl(
     req_ptr: i32,
     req_len: i32,
 ) -> i64 {
+    if let Err(envelope) = require_capability(
+        caller.data(),
+        requirement_for_import("host_lookup_record").unwrap(),
+    ) {
+        return write_guest_response(caller, &envelope).await;
+    }
+
     let req_bytes = match read_guest_bytes(caller, req_ptr, req_len) {
         Some(b) => b,
         None => return 0,
@@ -409,6 +1360,772 @@ async fn host_lookup_record_impl(
     write_guest_response(caller, &response_bytes).await
 }
 
+/// `host_lexicon_get` reads the in-memory lexicon registry, not the database,
+/// so it can't go through `host_spec_impl` — that refuses instances with no
+/// pool, which a lexicon lookup never needed in the first place.
+async fn host_lexicon_get_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::LexiconGet = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let lexicons = caller.data().lexicons.clone();
+    let value = super::lexicon_get(&lexicons, &spec.nsid).await;
+    let response = serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default();
+    write_guest_response(caller, &response).await
+}
+
+/// The plugin's effective allowed-hosts list, resolved once at instantiation
+/// and carried on `PluginState`: the operator's list under
+/// `network:request:defined`, the manifest's under `network:request`, or
+/// empty otherwise. A plugin reads this to behave sensibly no matter which
+/// of the three network capabilities it holds.
+fn resolved_allowed_hosts(state: &PluginState) -> Vec<String> {
+    state.allowed_hosts.clone()
+}
+
+/// `host_allowed_hosts` is a free import: the list itself carries nothing
+/// secret, and a plugin needs to be able to read it regardless of which
+/// capability (if any) it holds. The request is always `{}`; nothing to
+/// decode.
+async fn host_allowed_hosts_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    _req_ptr: i32,
+    _req_len: i32,
+) -> i64 {
+    let hosts = resolved_allowed_hosts(caller.data());
+    let response = serde_json::to_vec(&serde_json::json!({"ok": hosts})).unwrap_or_default();
+    write_guest_response(caller, &response).await
+}
+
+/// One entry point for every spec-taking record/table query import: gate on
+/// the import's capability, decode the spec, run it against the database, and
+/// wrap the result in the standard envelope. `RecordsError::InvalidSpec`
+/// becomes `INVALID_SPEC` rather than `DB_ERROR` so a plugin can tell a bad
+/// query from a database failure.
+async fn host_spec_impl<S, R, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    F: FnOnce(sqlx::AnyPool, crate::db::DatabaseBackend, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, super::RecordsError>>,
+{
+    // A free import has no row in the requirements table and nothing to gate
+    // on; anything else missing one is a programming error, not a grant.
+    if !is_free_import(import)
+        && let Err(envelope) =
+            require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: S = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(db) = caller.data().db.clone() else {
+        return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
+    };
+    let backend = caller.data().db_backend;
+    let response = match run(db, backend, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(super::RecordsError::InvalidSpec(msg)) => error_envelope("INVALID_SPEC", msg),
+        Err(e) => error_envelope("DB_ERROR", e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// One entry point for every import that acts as the calling user: gate on
+/// the import's capability, then on there being a user at all, then decode the
+/// spec and run it. The session comes off the instance rather than the spec,
+/// so a library cannot name a user it was not lent.
+async fn host_caller_impl<S, R, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    F: FnOnce(Arc<CallerSession>, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, super::CallerError>>,
+{
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(session) = caller.data().caller.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "NO_SESSION",
+                "this script context has no caller session, so nothing can be done as a user here",
+            ),
+        )
+        .await;
+    };
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: S = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let response = match run(session, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(e.code(), caller_error_message(&e)),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// The gate/decode steps [`host_app_impl`] and [`host_app_caller_impl`]
+/// share: capability, then an app state to act against at all — only the
+/// direct-construction test and external-auth call sites leave it unset —
+/// then the decoded spec. `Err` carries the return value a failure has
+/// already written, so both callers can return it directly.
+async fn host_app_gate<S>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+) -> Result<(crate::AppState, S), i64>
+where
+    S: serde::de::DeserializeOwned,
+{
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return Err(write_guest_response(caller, &envelope).await);
+    }
+    let Some(app_state) = caller.data().app_state.clone() else {
+        return Err(write_guest_response(
+            caller,
+            &error_envelope("HOST_ERROR", "this instance has no app state"),
+        )
+        .await);
+    };
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return Err(0);
+    };
+    let spec: S = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return Err(write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await),
+    };
+    Ok((app_state, spec))
+}
+
+/// One entry point for the six linked-repo imports: each spec already names
+/// the DID whose linked repo it acts on, so none of them needs the runner's
+/// own identity — only the whole instance to act against.
+async fn host_app_impl<S, R, E, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    code: fn(&E) -> &'static str,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    E: std::fmt::Display,
+    F: FnOnce(crate::AppState, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, E>>,
+{
+    let (app_state, spec) = match host_app_gate(caller, import, req_ptr, req_len).await {
+        Ok(pair) => pair,
+        Err(early_return) => return early_return,
+    };
+    let response = match run(app_state, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(code(&e), e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// As [`host_app_impl`], but also threads the runner's own caller DID and
+/// (when it has one) its caller session through to `run` — what
+/// `host_jobs_create` needs to enqueue as the script's runner, rather than as
+/// whoever a spec field might name.
+async fn host_app_caller_impl<S, R, E, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    code: fn(&E) -> &'static str,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    E: std::fmt::Display,
+    F: FnOnce(crate::AppState, Option<String>, Option<Arc<CallerSession>>, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, E>>,
+{
+    let (app_state, spec) = match host_app_gate(caller, import, req_ptr, req_len).await {
+        Ok(pair) => pair,
+        Err(early_return) => return early_return,
+    };
+    let caller_did = caller.data().call_ctx.caller_did.clone();
+    let session = caller.data().caller.clone();
+    let response = match run(app_state, caller_did, session, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(code(&e), e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// Every space write acts as `ctx.caller_did` and has no other identity to
+/// fall back to. Refusing here, before the module runs, keeps that rule in
+/// one place rather than in each of the eleven write functions.
+fn require_spaces_caller(caller_did: Option<String>) -> Result<String, super::spaces::SpacesError> {
+    caller_did.ok_or_else(|| {
+        super::spaces::SpacesError::BadInput(
+            "a space write needs a caller; this script context has none".into(),
+        )
+    })
+}
+
+/// `host_caller_xrpc_query` on its own: gate on the capability, decode the
+/// spec, and run it, but — unlike [`host_caller_impl`] — never refuse for
+/// lacking a session. A query needs no PDS auth to run: the Lua `xrpc.query`
+/// global has never required one, and a query, record-event or label script
+/// has no session to lend. The session, when the runner has one, still
+/// supplies its claims; otherwise the call context's `caller_did` stands in,
+/// exactly as `xrpc.query` falls back to it today.
+async fn host_caller_query_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_caller_xrpc_query";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::CallerXrpcQuery = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(app_state) = caller.data().app_state.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "HOST_ERROR",
+                "this instance has no app state to query against",
+            ),
+        )
+        .await;
+    };
+    let session = caller.data().caller.clone();
+    let caller_did = caller.data().call_ctx.caller_did.clone();
+    let response = match super::xrpc_query(
+        &app_state,
+        session.as_deref(),
+        caller_did.as_deref(),
+        spec,
+    )
+    .await
+    {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(e.code(), caller_error_message(&e)),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// A dead session has to survive the trip out through the guest and the Lua
+/// bridge, which flatten everything into one error string. The prefix is what
+/// the script executor recognises there to answer 401 rather than 500.
+fn caller_error_message(e: &super::CallerError) -> String {
+    match e {
+        super::CallerError::Auth(_) => {
+            format!("{}{e}", crate::error::LUA_AUTH_ERROR_PREFIX)
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The host-side input to `host_records_get`: the SDK wrapper sends
+/// `{"uri": ...}` rather than a bare string so it shares `host_spec_impl`'s
+/// JSON-spec envelope with every other record/table import.
+#[derive(serde::Deserialize)]
+struct GetSpec {
+    uri: String,
+}
+
+/// Gate on `library:call`, then hand back the executor.
+fn library_access(
+    state: &PluginState,
+    import: &str,
+) -> Result<crate::plugin::PluginExecutor, Vec<u8>> {
+    require_capability(
+        state,
+        crate::plugin::capabilities::requirement_for_import(import).unwrap(),
+    )?;
+    state
+        .executor
+        .clone()
+        .ok_or_else(|| error_envelope("HOST_ERROR", "no executor attached to this instance"))
+}
+
+async fn host_call_library_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    lib_ptr: i32,
+    lib_len: i32,
+    fn_ptr: i32,
+    fn_len: i32,
+    args_ptr: i32,
+    args_len: i32,
+) -> i64 {
+    let (Some(lib), Some(function), Some(args_bytes)) = (
+        read_guest_string(caller, lib_ptr, lib_len),
+        read_guest_string(caller, fn_ptr, fn_len),
+        read_guest_bytes(caller, args_ptr, args_len),
+    ) else {
+        return 0;
+    };
+    let args: Vec<serde_json::Value> = match serde_json::from_slice(&args_bytes) {
+        Ok(serde_json::Value::Array(a)) => a,
+        Ok(_) => {
+            return write_guest_response(
+                caller,
+                &error_envelope("BAD_INPUT", "args must be a JSON array"),
+            )
+            .await;
+        }
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let executor = match library_access(caller.data(), "host_call_library") {
+        Ok(e) => e,
+        Err(envelope) => return write_guest_response(caller, &envelope).await,
+    };
+    let ctx = caller.data().call_ctx.clone();
+    let depth = caller.data().depth + 1;
+    // A library reached through another library acts as the same user, so the
+    // session travels the whole chain rather than stopping at the first hop.
+    let session = caller.data().caller.clone();
+    let response = match executor
+        .call_library_as(&lib, &function, &args, &ctx, session, depth)
+        .await
+    {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(crate::plugin::ExecutionError::PluginError { code, message, retryable }) => {
+            serde_json::to_vec(&serde_json::json!({"error": {"code": code, "message": message, "retryable": retryable}}))
+                .unwrap_or_default()
+        }
+        Err(e) => error_envelope("LIBRARY_ERROR", e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+async fn host_get_api_surface_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    lib_ptr: i32,
+    lib_len: i32,
+) -> i64 {
+    let Some(lib) = read_guest_string(caller, lib_ptr, lib_len) else {
+        return 0;
+    };
+    let executor = match library_access(caller.data(), "host_get_api_surface") {
+        Ok(e) => e,
+        Err(envelope) => return write_guest_response(caller, &envelope).await,
+    };
+    let response = match executor.api_surface(&lib).await {
+        Ok(surface) => {
+            serde_json::to_vec(&serde_json::json!({"ok": &*surface})).unwrap_or_default()
+        }
+        Err(e) => error_envelope("LIBRARY_ERROR", e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: run raw SQL. `execute` selects `host_db_execute` (needs
+/// `database:write`) vs `host_db_query` (needs either `database:read` or
+/// `database:write`, but read-only capability restricts it to read-only SQL).
+/// SQL is passed through untranslated with backend-native placeholders
+/// (`?` on SQLite, `$1`… on Postgres).
+async fn host_db_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    execute: bool,
+    sql_ptr: i32,
+    sql_len: i32,
+    params_ptr: i32,
+    params_len: i32,
+) -> i64 {
+    let import = if execute {
+        "host_db_execute"
+    } else {
+        "host_db_query"
+    };
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let (Some(sql), Some(params_bytes)) = (
+        read_guest_string(caller, sql_ptr, sql_len),
+        read_guest_bytes(caller, params_ptr, params_len),
+    ) else {
+        return 0;
+    };
+    let params: Vec<serde_json::Value> = if params_bytes.is_empty() {
+        Vec::new()
+    } else {
+        match serde_json::from_slice(&params_bytes) {
+            Ok(serde_json::Value::Array(a)) => a,
+            _ => {
+                return write_guest_response(
+                    caller,
+                    &error_envelope("BAD_INPUT", "params must be a JSON array"),
+                )
+                .await;
+            }
+        }
+    };
+    // database:read alone may only run queries; database:write may run anything through either import.
+    if !caller
+        .data()
+        .capabilities
+        .contains(&PluginCapability::DatabaseWrite)
+    {
+        match crate::raw_sql_guard::is_read_only(&sql) {
+            Ok(true) => {}
+            Ok(false) => {
+                return write_guest_response(
+                    caller,
+                    &error_envelope(
+                        "FORBIDDEN",
+                        "database:read permits only read-only statements; declare database:write to modify data",
+                    ),
+                )
+                .await;
+            }
+            Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+        }
+    }
+    let Some(db) = caller.data().db.clone() else {
+        return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
+    };
+    let response = if execute {
+        match super::run_execute(&db, &sql, &params).await {
+            Ok(n) => serde_json::to_vec(&serde_json::json!({"ok": {"rows_affected": n}}))
+                .unwrap_or_default(),
+            Err(e) => error_envelope("DB_ERROR", e),
+        }
+    } else {
+        match super::run_query(&db, &sql, &params).await {
+            Ok(rows) => serde_json::to_vec(&serde_json::json!({"ok": rows})).unwrap_or_default(),
+            Err(e) => error_envelope("DB_ERROR", e),
+        }
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// `AtprotoError` → envelope code. Distinct codes so a plugin can tell "no
+/// signer configured" from "signature could not be checked" from an ordinary
+/// database or network failure, rather than seeing one undifferentiated
+/// `HOST_ERROR`.
+fn atproto_error_envelope(e: super::AtprotoError) -> Vec<u8> {
+    use super::AtprotoError;
+    match e {
+        AtprotoError::Resolve(msg) => error_envelope("RESOLVE_ERROR", msg),
+        AtprotoError::Blob { status, body } => {
+            error_envelope("BLOB_ERROR", format!("PDS returned {status}: {body}"))
+        }
+        AtprotoError::NoSigner => error_envelope(
+            "NO_SIGNER",
+            "no attestation signer is configured on this instance",
+        ),
+        AtprotoError::Unverifiable(msg) => error_envelope("UNVERIFIABLE", msg),
+        AtprotoError::Database(inner) => error_envelope("HOST_ERROR", inner),
+        AtprotoError::Other(msg) => error_envelope("HOST_ERROR", msg),
+    }
+}
+
+/// Host function: resolve the AT Protocol service a DID's document
+/// advertises. Needs no session — it reads the public network, not the
+/// caller's own repo — so it runs off `app_state` alone.
+async fn host_atproto_resolve_service_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_atproto_resolve_service";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::AtprotoResolveService =
+        match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+        };
+    let Some(app_state) = caller.data().app_state.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "HOST_ERROR",
+                "this instance has no app state to resolve against",
+            ),
+        )
+        .await;
+    };
+    let response =
+        match super::resolve_service(&app_state.http, &app_state.config.plc_url, &spec.did).await {
+            Ok(endpoint) => {
+                serde_json::to_vec(&serde_json::json!({"ok": endpoint})).unwrap_or_default()
+            }
+            Err(e) => atproto_error_envelope(e),
+        };
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: download a blob from a repo. Same "no session needed" shape
+/// as service resolution — the DID is a parameter of the request, not the
+/// caller's own identity.
+async fn host_atproto_blob_download_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_atproto_blob_download";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::AtprotoBlobDownload = match serde_json::from_slice(&bytes)
+    {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(app_state) = caller.data().app_state.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "HOST_ERROR",
+                "this instance has no app state to resolve against",
+            ),
+        )
+        .await;
+    };
+
+    // A blob download is an HTTP fetch like any other and counts against the
+    // same shared budget `host_http_request` does — it just goes through PDS
+    // resolution instead of a plugin-supplied URL. There is no
+    // `allowed_hosts` check to make here: the host, not the plugin, chose
+    // the PDS host, via DID resolution inside `super::blob_download`.
+    let requests_over_budget = {
+        let usage = &mut caller.data_mut().usage;
+        usage.http_requests += 1;
+        (usage.http_requests > super::MAX_HTTP_REQUESTS).then_some(usage.http_requests)
+    };
+    if let Some(requests) = requests_over_budget {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "BLOB_ERROR",
+                format!(
+                    "too many requests: {requests} > {}",
+                    super::MAX_HTTP_REQUESTS
+                ),
+            ),
+        )
+        .await;
+    }
+
+    // `host_http_request` refuses once the transfer budget is already spent,
+    // before sending — checked here too, not just after the fetch below, so
+    // an exhausted budget can't still push through one more multi-hundred-MB
+    // blob before the next call finally sees it.
+    let already_over_budget =
+        caller.data().usage.http_bytes_transferred > super::MAX_HTTP_TOTAL_TRANSFER;
+    if already_over_budget {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "BLOB_ERROR",
+                format!(
+                    "transfer limit exceeded: {} > {}",
+                    caller.data().usage.http_bytes_transferred,
+                    super::MAX_HTTP_TOTAL_TRANSFER
+                ),
+            ),
+        )
+        .await;
+    }
+
+    let blob = match super::blob_download(&app_state.http, &app_state.config.plc_url, spec).await {
+        Ok(blob) => blob,
+        Err(e) => return write_guest_response(caller, &atproto_error_envelope(e)).await,
+    };
+
+    let transfer_over_budget = {
+        let usage = &mut caller.data_mut().usage;
+        usage.http_bytes_transferred += blob.size;
+        (usage.http_bytes_transferred > super::MAX_HTTP_TOTAL_TRANSFER)
+            .then_some(usage.http_bytes_transferred)
+    };
+    if let Some(transferred) = transfer_over_budget {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "BLOB_ERROR",
+                format!(
+                    "transfer limit exceeded: {transferred} > {}",
+                    super::MAX_HTTP_TOTAL_TRANSFER
+                ),
+            ),
+        )
+        .await;
+    }
+
+    let response = serde_json::to_vec(&serde_json::json!({"ok": blob})).unwrap_or_default();
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: look up labels for a set of URIs, keyed by URI.
+async fn host_labels_get_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_labels_get";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::LabelsGet = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(db) = caller.data().db.clone() else {
+        return write_guest_response(caller, &error_envelope("HOST_ERROR", "no database")).await;
+    };
+    let backend = caller.data().db_backend;
+    let response = match super::labels_get(&db, backend, &spec.uris).await {
+        Ok(map) => serde_json::to_vec(&serde_json::json!({"ok": map})).unwrap_or_default(),
+        // `labels_get`'s only source of `Other` is the URI-count cap — a
+        // caller-fixable mistake, not a host failure, so it gets `BAD_INPUT`
+        // here rather than the `HOST_ERROR` the shared envelope maps `Other`
+        // to for the other imports.
+        Err(super::AtprotoError::Other(msg)) => error_envelope("BAD_INPUT", msg),
+        Err(e) => atproto_error_envelope(e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: sign a record with this instance's attestation key. Reads
+/// `attestation_signer` off `app_state` — this import needs no session, so it
+/// cannot get the signer any other way.
+async fn host_attest_sign_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_attest_sign";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::AttestSign = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let signer = caller
+        .data()
+        .app_state
+        .as_ref()
+        .and_then(|s| s.attestation_signer.clone());
+    let caller_did = caller.data().call_ctx.caller_did.clone();
+
+    // The DID is part of the signed content, so an absent caller can't fall
+    // back to signing as `""` — that produces a signature that can never
+    // verify against a real repo. A missing signer is checked first (and
+    // reported as `NO_SIGNER` below) so a plugin with neither configured
+    // still gets the more specific reason for the failure it actually hit.
+    if signer.is_some() && caller_did.is_none() {
+        return write_guest_response(
+            caller,
+            &error_envelope("BAD_INPUT", "signing needs a caller"),
+        )
+        .await;
+    }
+    let did = caller_did.unwrap_or_default();
+    let response = match super::attest_sign(signer.as_deref(), &did, spec.record) {
+        Ok(sig) => serde_json::to_vec(&serde_json::json!({"ok": sig})).unwrap_or_default(),
+        Err(e) => atproto_error_envelope(e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: verify a record's attestation signature.
+async fn host_attest_verify_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_attest_verify";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::AttestVerify = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let signer = caller
+        .data()
+        .app_state
+        .as_ref()
+        .and_then(|s| s.attestation_signer.clone());
+    let response = match super::attest_verify(signer.as_deref(), spec) {
+        Ok(valid) => serde_json::to_vec(&serde_json::json!({"ok": valid})).unwrap_or_default(),
+        Err(e) => atproto_error_envelope(e),
+    };
+    write_guest_response(caller, &response).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +2142,88 @@ mod tests {
             let _ = &state.alloc;
             let _ = &state.dealloc;
         }
+    }
+
+    /// Every field filled by hand, the way `PluginExecutor::instantiate`
+    /// does — no `Default` impl exists for `PluginState`, since a real
+    /// instance is never built any other way. Tests that only care about one
+    /// or two fields (here, `allowed_hosts`) use this rather than each
+    /// re-deriving the rest.
+    fn test_plugin_state(allowed_hosts: Vec<String>) -> PluginState {
+        sqlx::any::install_default_drivers();
+        PluginState {
+            plugin_id: "test-plugin".into(),
+            scope: "did:example:test".into(),
+            secrets: HashMap::new(),
+            config: serde_json::json!({}),
+            db: None,
+            db_backend: crate::db::DatabaseBackend::Sqlite,
+            http_client: reqwest::Client::new(),
+            lexicons: Arc::new(crate::lexicon::LexiconRegistry::new()),
+            usage: Default::default(),
+            memory: None,
+            alloc: None,
+            dealloc: None,
+            capabilities: std::collections::HashSet::new(),
+            allowed_hosts,
+            plugin_type: crate::plugin::PluginType::Library,
+            executor: None,
+            call_ctx: crate::plugin::library::LibraryCallContext::default(),
+            depth: 0,
+            caller: None,
+            app_state: None,
+        }
+    }
+
+    /// Direct construction with no hosts set — the default a plugin sees
+    /// before an operator has configured `network:request:defined`, or under
+    /// any capability that grants none.
+    #[test]
+    fn resolved_allowed_hosts_defaults_to_empty() {
+        let state = test_plugin_state(Vec::new());
+        assert!(resolved_allowed_hosts(&state).is_empty());
+    }
+
+    #[test]
+    fn resolved_allowed_hosts_returns_the_resolved_list() {
+        let hosts = vec![
+            "api.example.com".to_string(),
+            "*.cdn.example.com".to_string(),
+        ];
+        let state = test_plugin_state(hosts.clone());
+        assert_eq!(resolved_allowed_hosts(&state), hosts);
+    }
+
+    /// The executor recovers a 401 by finding the prefix anywhere in the
+    /// error string, so the envelope has to carry it out of the guest.
+    #[test]
+    fn an_auth_failure_leaves_with_the_prefix_the_executor_looks_for() {
+        let envelope = error_envelope(
+            super::super::CallerError::Auth("expired".into()).code(),
+            caller_error_message(&super::super::CallerError::Auth("expired".into())),
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        assert_eq!(parsed["error"]["code"], "AUTH_REQUIRED");
+        let message = parsed["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(crate::error::LUA_AUTH_ERROR_PREFIX),
+            "{message}"
+        );
+        assert!(message.contains("expired"), "{message}");
+    }
+
+    /// Only an auth failure gets the prefix; anything else wearing it would
+    /// turn an unrelated error into a spurious logout.
+    #[test]
+    fn other_failures_are_not_dressed_as_auth_failures() {
+        let message = caller_error_message(&super::super::CallerError::Pds {
+            status: 400,
+            body: "InvalidSwap".into(),
+        });
+        assert!(
+            !message.contains(crate::error::LUA_AUTH_ERROR_PREFIX),
+            "{message}"
+        );
     }
 
     #[test]

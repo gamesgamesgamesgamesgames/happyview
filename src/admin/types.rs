@@ -379,6 +379,27 @@ pub(super) struct PluginSummary {
     pub(super) latest_version: Option<String>,
     #[serde(default)]
     pub(super) pending_releases: Vec<crate::plugin::official_registry::ReleaseEntry>,
+    pub(super) plugin_type: String,
+    pub(super) namespace: Option<String>,
+    #[serde(default)]
+    pub(super) dependencies: Vec<crate::plugin::PluginDependency>,
+    #[serde(default)]
+    pub(super) allowed_hosts: Vec<String>,
+    pub(super) capabilities: crate::plugin::capabilities::CapabilityReport,
+}
+
+/// GET /admin/plugins query params.
+#[derive(Deserialize)]
+pub(super) struct ListPluginsQuery {
+    #[serde(rename = "type")]
+    pub(super) plugin_type: Option<String>,
+}
+
+/// DELETE /admin/plugins/{id} query params.
+#[derive(Deserialize, Default)]
+pub(super) struct RemovePluginQuery {
+    #[serde(default)]
+    pub(super) force: bool,
 }
 
 #[derive(Serialize)]
@@ -401,12 +422,16 @@ pub(super) struct OfficialPluginsListResponse {
 pub(super) struct ReloadPluginBody {
     #[serde(default)]
     pub(super) url: Option<String>,
+    #[serde(default)]
+    pub(super) accepted_capabilities: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 pub(super) struct AddPluginBody {
     pub(super) url: String,
     pub(super) sha256: Option<String>,
+    #[serde(default)]
+    pub(super) accepted_capabilities: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -433,6 +458,14 @@ pub(super) struct PluginPreviewResponse {
     pub(super) required_secrets: Vec<SecretDefinition>,
     pub(super) manifest_url: String,
     pub(super) wasm_url: String,
+    pub(super) plugin_type: String,
+    pub(super) namespace: Option<String>,
+    #[serde(default)]
+    pub(super) dependencies: Vec<crate::plugin::PluginDependency>,
+    #[serde(default)]
+    pub(super) allowed_hosts: Vec<String>,
+    pub(super) capabilities: crate::plugin::capabilities::CapabilityReport,
+    pub(super) sha256: String,
 }
 
 #[derive(Serialize)]
@@ -444,6 +477,16 @@ pub(super) struct PluginSecretsResponse {
 #[derive(Deserialize)]
 pub(super) struct UpdatePluginSecretsBody {
     pub(super) secrets: std::collections::HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+pub(super) struct PluginAllowedHostsResponse {
+    pub(super) hosts: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct UpdatePluginAllowedHostsBody {
+    pub(super) hosts: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

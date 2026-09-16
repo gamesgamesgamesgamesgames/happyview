@@ -9,6 +9,7 @@
     "json-api",
     "jobs-api",
     "linked-repos-api",
+    "built-in-modules",
     "utility-globals",
     "standard-libraries"
   ]

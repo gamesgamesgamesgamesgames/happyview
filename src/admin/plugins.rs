@@ -1,16 +1,21 @@
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
+use crate::plugin::capabilities;
 use crate::plugin::encryption::{decrypt, encrypt};
+use crate::plugin::graph::GraphError;
 use crate::plugin::loader;
 use crate::plugin::official_registry::{OfficialPlugin, ReleaseEntry};
+use crate::plugin::{LoadedPlugin, PluginType};
 
 /// If the reload request provides a new URL, use it and clear the old sha256
 /// (the new version has its own hash). Otherwise keep the stored values.
@@ -74,18 +79,52 @@ fn compute_update_info(
 use super::auth::UserAuth;
 use super::permissions::Permission;
 use super::types::{
-    AddPluginBody, PluginPreviewResponse, PluginSecretsResponse, PluginSummary,
-    PluginsListResponse, PreviewPluginBody, UpdatePluginSecretsBody,
+    AddPluginBody, ListPluginsQuery, PluginAllowedHostsResponse, PluginPreviewResponse,
+    PluginSecretsResponse, PluginSummary, PluginsListResponse, PreviewPluginBody,
+    RemovePluginQuery, UpdatePluginAllowedHostsBody, UpdatePluginSecretsBody,
 };
 
-/// GET /admin/plugins - list all loaded plugins
+/// The type/namespace/dependency/host/capability fields shared by every
+/// `PluginSummary` and `PluginPreviewResponse` response.
+struct CapabilityFields {
+    plugin_type: String,
+    namespace: Option<String>,
+    dependencies: Vec<crate::plugin::PluginDependency>,
+    allowed_hosts: Vec<String>,
+    capabilities: capabilities::CapabilityReport,
+}
+
+fn capability_fields(p: &LoadedPlugin) -> CapabilityFields {
+    let report = capabilities::report(p).unwrap_or_else(|e| capabilities::CapabilityReport {
+        declared: Vec::new(),
+        required_by_imports: Vec::new(),
+        undeclared: vec![e],
+    });
+    CapabilityFields {
+        plugin_type: p.plugin_type().as_str().to_string(),
+        namespace: p.namespace().map(String::from),
+        dependencies: p.dependencies().to_vec(),
+        allowed_hosts: p.allowed_hosts().to_vec(),
+        capabilities: report,
+    }
+}
+
+/// GET /admin/plugins - list all loaded plugins, optionally filtered by
+/// `?type=library|interpreter|auth`.
 pub(super) async fn list(
     State(state): State<AppState>,
     auth: UserAuth,
+    Query(q): Query<ListPluginsQuery>,
 ) -> Result<Json<PluginsListResponse>, AppError> {
     auth.require(Permission::PluginsRead).await?;
 
-    let plugins = state.plugin_registry.list().await;
+    let plugins = if let Some(type_str) = &q.plugin_type {
+        let t = PluginType::parse_str(type_str)
+            .ok_or_else(|| AppError::BadRequest(format!("Unknown plugin type '{}'", type_str)))?;
+        state.plugin_registry.list_by_type(t).await
+    } else {
+        state.plugin_registry.list().await
+    };
 
     // Query which plugins have secrets configured
     let configured_plugins: std::collections::HashSet<String> = {
@@ -128,13 +167,15 @@ pub(super) async fn list(
                         })
                         .collect()
                 } else {
-                    // Legacy plugins without manifest - create minimal SecretDefinition from keys
+                    // No manifest (the loader always attaches one; this only
+                    // covers a plugin registered directly, bypassing it) -
+                    // fall back to minimal SecretDefinitions from the keys.
                     p.info
                         .required_secrets
                         .iter()
                         .map(|key| super::types::SecretDefinition {
                             key: key.clone(),
-                            name: key.clone(), // Use key as name for legacy
+                            name: key.clone(), // No richer name available
                             description: None,
                         })
                         .collect()
@@ -146,6 +187,7 @@ pub(super) async fn list(
 
             let update_info =
                 compute_update_info(&p.info.version, official_guard.plugins.get(&p.info.id));
+            let cap_fields = capability_fields(&p);
 
             PluginSummary {
                 id: p.info.id.clone(),
@@ -162,6 +204,11 @@ pub(super) async fn list(
                 update_available: update_info.update_available,
                 latest_version: update_info.latest_version,
                 pending_releases: update_info.pending_releases,
+                plugin_type: cap_fields.plugin_type,
+                namespace: cap_fields.namespace,
+                dependencies: cap_fields.dependencies,
+                allowed_hosts: cap_fields.allowed_hosts,
+                capabilities: cap_fields.capabilities,
             }
         })
         .collect();
@@ -184,6 +231,17 @@ pub(super) async fn preview(
         .await
         .map_err(|e| AppError::BadRequest(format!("Failed to fetch manifest: {}", e)))?;
 
+    // Download the WASM too, so the capability report and sha256 reflect
+    // what would actually be installed. A `CapabilityMismatch` or
+    // `UnknownImport` here is surfaced verbatim: it's the reason the
+    // plugin cannot be installed.
+    let plugin = loader::load_from_manifest(&state.http, &preview, None)
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    let cap_fields = capability_fields(&plugin);
+    let sha256 = hex::encode(Sha256::digest(&plugin.wasm_bytes));
+
     Ok(Json(PluginPreviewResponse {
         id: preview.manifest.id,
         name: preview.manifest.name,
@@ -203,7 +261,43 @@ pub(super) async fn preview(
             .collect(),
         manifest_url: preview.manifest_url,
         wasm_url: preview.wasm_url,
+        plugin_type: cap_fields.plugin_type,
+        namespace: cap_fields.namespace,
+        dependencies: cap_fields.dependencies,
+        allowed_hosts: cap_fields.allowed_hosts,
+        capabilities: cap_fields.capabilities,
+        sha256,
     }))
+}
+
+/// If `accepted` was supplied, every capability `plugin` would actually be
+/// granted must be covered by it — used identically by `add` and `reload` so
+/// a reload can't silently bring in an import the operator never consented
+/// to. Returns the sorted, deduped capability names (for the event log
+/// detail) when a check was performed, or `None` when `accepted` was omitted
+/// (consent checking is opt-in on the wire).
+fn check_capability_consent(
+    plugin: &LoadedPlugin,
+    accepted: &Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, AppError> {
+    let Some(accepted) = accepted else {
+        return Ok(None);
+    };
+    let effective = capabilities::effective_set(plugin).map_err(AppError::BadRequest)?;
+    let missing: Vec<&str> = effective
+        .iter()
+        .map(|c| c.as_str())
+        .filter(|name| !accepted.iter().any(|a| a == name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "capability consent missing: {}",
+            missing.join(", ")
+        )));
+    }
+    let mut names: Vec<String> = effective.iter().map(|c| c.as_str().to_string()).collect();
+    names.sort();
+    Ok(Some(names))
 }
 
 /// POST /admin/plugins - add a new plugin from URL
@@ -222,6 +316,10 @@ pub(super) async fn add(
     let plugin = loader::load_from_manifest(&state.http, &preview, body.sha256.as_deref())
         .await
         .map_err(|e| AppError::BadRequest(format!("Failed to load plugin: {}", e)))?;
+
+    // If the caller told us which capabilities they consent to, every
+    // capability the plugin would actually be granted must be covered.
+    let consented_capabilities = check_capability_consent(&plugin, &body.accepted_capabilities)?;
 
     // Use manifest for rich secret metadata if available
     let required_secrets: Vec<super::types::SecretDefinition> =
@@ -250,6 +348,7 @@ pub(super) async fn add(
 
     // Newly added plugins are not configured (unless they have no required secrets)
     let secrets_configured = required_secrets.is_empty();
+    let cap_fields = capability_fields(&plugin);
 
     let summary = PluginSummary {
         id: plugin.info.id.clone(),
@@ -266,12 +365,27 @@ pub(super) async fn add(
         update_available: false,
         latest_version: None,
         pending_releases: Vec::new(),
+        plugin_type: cap_fields.plugin_type,
+        namespace: cap_fields.namespace,
+        dependencies: cap_fields.dependencies,
+        allowed_hosts: cap_fields.allowed_hosts,
+        capabilities: cap_fields.capabilities,
     };
 
     let plugin_id = plugin.info.id.clone();
 
-    // Register the plugin (this also persists to DB)
-    state.plugin_registry.register(plugin).await;
+    // Validate against the dependency graph and register (this also
+    // persists to DB).
+    state
+        .plugin_registry
+        .install(plugin)
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    let mut detail = serde_json::json!({ "url": body.url });
+    if let Some(caps) = consented_capabilities {
+        detail["capabilities"] = serde_json::json!(caps);
+    }
 
     log_event(
         &state.db,
@@ -280,7 +394,7 @@ pub(super) async fn add(
             severity: Severity::Info,
             actor_did: Some(auth.did.clone()),
             subject: Some(plugin_id),
-            detail: serde_json::json!({ "url": body.url }),
+            detail,
         },
         state.db_backend,
     )
@@ -294,44 +408,72 @@ pub(super) async fn remove(
     State(state): State<AppState>,
     auth: UserAuth,
     Path(plugin_id): Path<String>,
-) -> Result<StatusCode, AppError> {
+    Query(q): Query<RemovePluginQuery>,
+) -> Result<axum::response::Response, AppError> {
     auth.require(Permission::PluginsDelete).await?;
 
-    // Remove from registry
-    let removed = state.plugin_registry.remove(&plugin_id).await;
+    // Validate against the dependency graph (unless forced) and remove from
+    // the registry. `removed` is dependents-first: for a forced cascade,
+    // everything that depended on `plugin_id` comes out before it does.
+    let removed = match state.plugin_registry.uninstall(&plugin_id, q.force).await {
+        Ok(ids) if ids.is_empty() => {
+            return Err(AppError::NotFound(format!(
+                "Plugin '{}' not found",
+                plugin_id
+            )));
+        }
+        Ok(ids) => ids,
+        Err(GraphError::HasDependents { dependents, .. }) => {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "plugin '{plugin_id}' is required by: {}",
+                        dependents.join(", ")
+                    ),
+                    "dependents": dependents,
+                })),
+            )
+                .into_response());
+        }
+        Err(e) => return Err(AppError::BadRequest(e.to_string())),
+    };
 
-    if removed.is_none() {
-        return Err(AppError::NotFound(format!(
-            "Plugin '{}' not found",
-            plugin_id
-        )));
+    // Remove each id from the database and log one event per id.
+    for id in &removed {
+        let sql = adapt_sql(
+            "DELETE FROM happyview_plugins WHERE id = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to delete plugin: {}", e)))?;
+
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "plugin.removed".to_string(),
+                severity: Severity::Info,
+                actor_did: Some(auth.did.clone()),
+                subject: Some(id.clone()),
+                detail: serde_json::json!({}),
+            },
+            state.db_backend,
+        )
+        .await;
     }
 
-    // Remove from database
-    let sql = adapt_sql(
-        "DELETE FROM happyview_plugins WHERE id = ?",
-        state.db_backend,
-    );
-    crate::db::query(&sql)
-        .bind(&plugin_id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to delete plugin: {}", e)))?;
-
-    log_event(
-        &state.db,
-        EventLog {
-            event_type: "plugin.removed".to_string(),
-            severity: Severity::Info,
-            actor_did: Some(auth.did.clone()),
-            subject: Some(plugin_id),
-            detail: serde_json::json!({}),
-        },
-        state.db_backend,
-    )
-    .await;
-
-    Ok(StatusCode::NO_CONTENT)
+    if removed == [plugin_id] {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "removed": removed })),
+        )
+            .into_response())
+    }
 }
 
 /// POST /admin/plugins/{id}/reload - reload a plugin from its source
@@ -359,10 +501,9 @@ pub(super) async fn reload(
         }
     };
 
-    let (url, sha256) = resolve_reload_url((url, sha256), body.map(|Json(b)| b));
-
-    // Remove old plugin
-    state.plugin_registry.remove(&plugin_id).await;
+    let body = body.map(|Json(b)| b);
+    let accepted_capabilities = body.as_ref().and_then(|b| b.accepted_capabilities.clone());
+    let (url, sha256) = resolve_reload_url((url, sha256), body);
 
     // Reload via manifest
     let preview = loader::fetch_manifest(&state.http, &url)
@@ -372,6 +513,16 @@ pub(super) async fn reload(
     let plugin = loader::load_from_manifest(&state.http, &preview, sha256.as_deref())
         .await
         .map_err(|e| AppError::BadRequest(format!("Failed to reload plugin: {}", e)))?;
+
+    // Same consent check `add` performs, so a reloaded version can't bring in
+    // a capability the operator never agreed to. Checked before the old
+    // plugin is removed, so a refusal here leaves the currently-installed
+    // version untouched rather than uninstalling it and then failing to
+    // reinstall.
+    let consented_capabilities = check_capability_consent(&plugin, &accepted_capabilities)?;
+
+    // Remove old plugin
+    state.plugin_registry.remove(&plugin_id).await;
 
     // Use manifest for rich secret metadata if available
     let required_secrets: Vec<super::types::SecretDefinition> =
@@ -413,6 +564,8 @@ pub(super) async fn reload(
             .is_some()
     };
 
+    let cap_fields = capability_fields(&plugin);
+
     let summary = PluginSummary {
         id: plugin.info.id.clone(),
         name: plugin.info.name.clone(),
@@ -428,6 +581,11 @@ pub(super) async fn reload(
         update_available: false,
         latest_version: None,
         pending_releases: Vec::new(),
+        plugin_type: cap_fields.plugin_type,
+        namespace: cap_fields.namespace,
+        dependencies: cap_fields.dependencies,
+        allowed_hosts: cap_fields.allowed_hosts,
+        capabilities: cap_fields.capabilities,
     };
 
     // Persist the (possibly new) URL so restarts pick it up
@@ -442,8 +600,17 @@ pub(super) async fn reload(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to persist plugin URL: {}", e)))?;
 
-    // Register the reloaded plugin
-    state.plugin_registry.register(plugin).await;
+    // Validate against the dependency graph and register the reloaded plugin
+    state
+        .plugin_registry
+        .install(plugin)
+        .await
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    let mut detail = serde_json::json!({ "url": url });
+    if let Some(caps) = consented_capabilities {
+        detail["capabilities"] = serde_json::json!(caps);
+    }
 
     log_event(
         &state.db,
@@ -452,7 +619,7 @@ pub(super) async fn reload(
             severity: Severity::Info,
             actor_did: Some(auth.did.clone()),
             subject: Some(plugin_id),
-            detail: serde_json::json!({ "url": url }),
+            detail,
         },
         state.db_backend,
     )
@@ -637,6 +804,90 @@ pub(super) async fn update_secrets(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// A plugin's `allowed_hosts` only means anything under
+/// `network:request:defined` — the operator has nowhere else to point it,
+/// since `network:request` takes its list from the manifest and
+/// `network:request:unrestricted` needs none. Both allowed-hosts endpoints
+/// refuse a plugin that hasn't declared it, the same way they refuse one
+/// that doesn't exist.
+fn require_network_request_defined(plugin: &LoadedPlugin) -> Result<(), AppError> {
+    if plugin
+        .declared_capabilities()
+        .contains(&capabilities::PluginCapability::NetworkRequestDefined)
+    {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "plugin '{}' does not declare network:request:defined",
+            plugin.info.id
+        )))
+    }
+}
+
+/// GET /admin/plugins/{id}/allowed-hosts - operator-configured hosts for a
+/// `network:request:defined` plugin
+pub(super) async fn get_allowed_hosts(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<PluginAllowedHostsResponse>, AppError> {
+    auth.require(Permission::PluginsRead).await?;
+
+    let plugin = state
+        .plugin_registry
+        .get(&plugin_id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Plugin '{}' not found", plugin_id)))?;
+    require_network_request_defined(&plugin)?;
+
+    let hosts = crate::plugin::config::load_allowed_hosts(&state.db, state.db_backend, &plugin_id)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to fetch config: {}", e)))?;
+
+    Ok(Json(PluginAllowedHostsResponse { hosts }))
+}
+
+/// PUT /admin/plugins/{id}/allowed-hosts - replace the operator-configured
+/// hosts for a `network:request:defined` plugin, returning the stored list
+pub(super) async fn update_allowed_hosts(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(plugin_id): Path<String>,
+    Json(body): Json<UpdatePluginAllowedHostsBody>,
+) -> Result<Json<PluginAllowedHostsResponse>, AppError> {
+    auth.require(Permission::PluginsCreate).await?;
+
+    let plugin = state
+        .plugin_registry
+        .get(&plugin_id)
+        .await
+        .ok_or_else(|| AppError::NotFound(format!("Plugin '{}' not found", plugin_id)))?;
+    require_network_request_defined(&plugin)?;
+
+    crate::plugin::config::store_allowed_hosts(
+        &state.db,
+        state.db_backend,
+        &plugin_id,
+        &body.hosts,
+    )
+    .await?;
+
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "plugin.allowed_hosts_updated".to_string(),
+            severity: Severity::Info,
+            actor_did: Some(auth.did.clone()),
+            subject: Some(plugin_id),
+            detail: serde_json::json!({ "allowed_hosts": &body.hosts }),
+        },
+        state.db_backend,
+    )
+    .await;
+
+    Ok(Json(PluginAllowedHostsResponse { hosts: body.hosts }))
+}
+
 /// POST /admin/plugins/{id}/check-update — force a cache refresh for one plugin
 pub(super) async fn check_update(
     State(state): State<AppState>,
@@ -697,6 +948,8 @@ pub(super) async fn check_update(
         }
     };
 
+    let cap_fields = capability_fields(&current);
+
     Ok(Json(PluginSummary {
         id: current.info.id.clone(),
         name: current.info.name.clone(),
@@ -712,6 +965,11 @@ pub(super) async fn check_update(
         update_available: update_info.update_available,
         latest_version: update_info.latest_version,
         pending_releases: update_info.pending_releases,
+        plugin_type: cap_fields.plugin_type,
+        namespace: cap_fields.namespace,
+        dependencies: cap_fields.dependencies,
+        allowed_hosts: cap_fields.allowed_hosts,
+        capabilities: cap_fields.capabilities,
     }))
 }
 
@@ -809,6 +1067,7 @@ mod tests {
         let current = ("https://old".to_string(), Some("deadbeef".to_string()));
         let body = super::super::types::ReloadPluginBody {
             url: Some("https://new".into()),
+            ..Default::default()
         };
         let (url, sha) = resolve_reload_url(current, Some(body));
         assert_eq!(url, "https://new");
@@ -826,7 +1085,7 @@ mod tests {
     #[test]
     fn resolve_reload_url_keeps_current_when_body_url_is_none() {
         let current = ("https://old".to_string(), Some("deadbeef".to_string()));
-        let body = super::super::types::ReloadPluginBody { url: None };
+        let body = super::super::types::ReloadPluginBody::default();
         let (url, sha) = resolve_reload_url(current, Some(body));
         assert_eq!(url, "https://old");
         assert_eq!(sha.as_deref(), Some("deadbeef"));

@@ -2,6 +2,16 @@
 title: "Jobs API"
 ---
 
+<Callout type="info">
+Use the `happyview.jobs` library instead. This global is scheduled for removal in v3. `create` with `auth = true` raises `NO_SESSION` when the runner has no DPoP session, where this global silently enqueues a job with nothing to act as. The running job's controls (`job.id`, `job.progress`, `job.should_stop`, `job.wait`) stay on `ctx.job`.
+</Callout>
+
+```lua
+local jobs = require("happyview.jobs")
+
+local job_id = jobs.create("export", { collection = collection }, { auth = true })
+```
+
 Lua API for creating and managing background jobs. For a conceptual overview, see [Background Jobs](../../guides/background-jobs.md).
 
 ## `jobs` table

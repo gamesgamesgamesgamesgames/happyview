@@ -2,6 +2,10 @@
 title: "Record API"
 ---
 
+<Callout type="info">
+Use the `happyview.record` library instead. This global is scheduled for removal in v3.
+</Callout>
+
 The `Record` API is available in **procedure**, **query**, and **record/label** scripts. In procedure scripts the full API is available — writes are proxied to the caller's PDS and indexed locally. In query and record/label scripts it runs in **no-auth mode**: `Record.load`, `r:save_local()`, `r:delete_local()`, and `Record.delete_local()` work, but PDS-touching methods (`r:save()`, `r:delete()`) raise an error.
 
 ## Constructor

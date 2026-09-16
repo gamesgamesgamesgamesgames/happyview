@@ -238,6 +238,21 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         let _ = db::set_error(state, &job.id, &format!("jobs api: {e}")).await;
         return;
     }
+    // A job that did not inherit its creator's auth has nothing to act as, so
+    // its library calls carry no session at all.
+    let caller_session = claims
+        .clone()
+        .zip(pds_auth_arc.clone())
+        .map(|(claims, pds_auth)| {
+            Arc::new(crate::plugin::caller::CallerSession {
+                did: job.created_by.clone(),
+                delegate_did: None,
+                claims,
+                pds_auth,
+                app_state: state.clone(),
+            })
+        });
+    let has_pds_auth = caller_session.is_some();
     if let Err(e) =
         crate::lua::record::register_record_api(&lua, state_arc.clone(), claims, pds_auth_arc, None)
     {
@@ -253,13 +268,27 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         let _ = db::set_error(state, &job.id, &format!("log api: {e}")).await;
         return;
     }
-    if let Err(e) = crate::lua::jobs_api::register_job_context(
+    let job_table = match crate::lua::jobs_api::register_job_context(
         &lua,
         state_arc.clone(),
         job.id.clone(),
         job.input.clone(),
     ) {
-        let _ = db::set_error(state, &job.id, &format!("job context: {e}")).await;
+        Ok(t) => t,
+        Err(e) => {
+            let _ = db::set_error(state, &job.id, &format!("job context: {e}")).await;
+            return;
+        }
+    };
+    let identity = crate::lua::builtins::ScriptIdentity {
+        trigger_id: trigger_id.clone(),
+        caller_did: Some(job.created_by.clone()),
+        job_id: Some(job.id.clone()),
+    };
+    if let Err(e) =
+        crate::lua::require_api::register_require(&lua, state, &identity, caller_session).await
+    {
+        let _ = db::set_error(state, &job.id, &format!("require api: {e}")).await;
         return;
     }
 
@@ -317,7 +346,39 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         }
     };
 
-    let outcome = match handle.call_async::<mlua::Value>(()).await {
+    let handle_input = match lua.to_value(&job.input) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = db::set_error(state, &job.id, &format!("job input: {e}")).await;
+            return;
+        }
+    };
+    let handle_ctx = match crate::lua::context::build_ctx(
+        &lua,
+        &crate::lua::context::Invocation {
+            trigger_id: &trigger_id,
+            caller_did: Some(&job.created_by),
+            has_pds_auth,
+            env: &env_vars,
+            method: None,
+            collection: None,
+            params: None,
+            delegate_did: None,
+            space: None,
+            job: Some(job_table),
+        },
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = db::set_error(state, &job.id, &format!("job ctx: {e}")).await;
+            return;
+        }
+    };
+
+    let outcome = match handle
+        .call_async::<mlua::Value>((handle_input, handle_ctx))
+        .await
+    {
         Ok(result) => {
             JobOutcome::Completed(lua.from_value(result).unwrap_or(serde_json::json!(null)))
         }

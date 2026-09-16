@@ -164,6 +164,8 @@ pub fn validate_script(source: &str) -> Result<(), String> {
     lua.globals()
         .set("env", env_stub)
         .map_err(|e| format!("failed to set env stub: {e}"))?;
+    super::require_api::register_require_stub(&lua)
+        .map_err(|e| format!("failed to set require stub: {e}"))?;
     lua.load(source)
         .exec()
         .map_err(|e| format!("script compilation failed: {e}"))?;

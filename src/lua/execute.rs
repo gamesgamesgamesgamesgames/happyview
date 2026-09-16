@@ -38,6 +38,18 @@ impl Drop for ScriptTimingGuard {
     }
 }
 
+/// The text after the auth-error prefix, wherever it sits in the message.
+/// `mlua` wraps a raised error in its own context (`runtime error: ...`), so
+/// the prefix mlua's `Display` produces is no longer guaranteed to lead the
+/// string — `strip_prefix` would then miss it and the whole wrapped message,
+/// prefix included, would leak into the 401 body.
+fn auth_message_after_prefix(msg: &str) -> String {
+    match msg.find(LUA_AUTH_ERROR_PREFIX) {
+        Some(i) => msg[i + LUA_AUTH_ERROR_PREFIX.len()..].to_string(),
+        None => msg.to_string(),
+    }
+}
+
 /// Load all script variables from the database as a key-value map.
 async fn load_env_vars(db: &sqlx::AnyPool, backend: DatabaseBackend) -> HashMap<String, String> {
     let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
@@ -380,6 +392,16 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
+    let caller_session = pds_auth_arc.clone().map(|pds_auth| {
+        Arc::new(crate::plugin::caller::CallerSession {
+            did: claims.did().to_string(),
+            delegate_did: delegate_did.map(|s| s.to_string()),
+            claims: claims_arc.clone(),
+            pds_auth,
+            app_state: state.clone(),
+        })
+    });
+    let has_pds_auth = caller_session.is_some();
     if let Err(e) = record::register_record_api(
         &lua,
         state_arc.clone(),
@@ -441,6 +463,37 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
+    let identity = super::builtins::ScriptIdentity {
+        trigger_id: trigger_id.clone(),
+        caller_did: Some(claims.did().to_string()),
+        job_id: None,
+    };
+    if let Err(e) =
+        super::require_api::register_require(&lua, state, &identity, caller_session).await
+    {
+        let error_message = format!("failed to register require api: {e}");
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "script.error".to_string(),
+                severity: Severity::Error,
+                actor_did: Some(claims.did().to_string()),
+                subject: Some(method.to_string()),
+                detail: serde_json::json!({
+                    "error": error_message,
+                    "script_source": script_source,
+                    "input": input_json,
+                    "caller_did": claims.did(),
+                    "method": method,
+                    "duration_ms": start.elapsed().as_millis() as u64,
+                }),
+            },
+            backend,
+        )
+        .await;
+        return Err(AppError::Internal(error_message));
+    }
+
     if let Err(e) = context::set_procedure_context(
         &lua,
         method,
@@ -474,7 +527,8 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
-    if let Err(e) = context::set_env_context(&lua, &load_env_vars(&state.db, backend).await) {
+    let env_vars = load_env_vars(&state.db, backend).await;
+    if let Err(e) = context::set_env_context(&lua, &env_vars) {
         let error_message = format!("failed to set env context: {e}");
         log_event(
             &state.db,
@@ -562,7 +616,36 @@ pub async fn execute_procedure_script(
         }
     };
 
-    let result: mlua::Value = match handle.call_async(()).await {
+    let handle_input = match lua.to_value(&input_json) {
+        Ok(v) => v,
+        Err(e) => {
+            let error_message = format!("failed to convert input to lua: {e}");
+            return Err(AppError::Internal(error_message));
+        }
+    };
+    let handle_ctx = match context::build_ctx(
+        &lua,
+        &context::Invocation {
+            trigger_id: &trigger_id,
+            caller_did: Some(claims.did()),
+            has_pds_auth,
+            env: &env_vars,
+            method: Some(method),
+            collection: Some(collection),
+            params: Some(params),
+            delegate_did,
+            space: space_ctx,
+            job: None,
+        },
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            let error_message = format!("failed to build ctx: {e}");
+            return Err(AppError::Internal(error_message));
+        }
+    };
+
+    let result: mlua::Value = match handle.call_async((handle_input, handle_ctx)).await {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
@@ -571,10 +654,7 @@ pub async fn execute_procedure_script(
             let app_error = if msg.contains(LUA_AUTH_ERROR_PREFIX)
                 || clean_msg.contains(LUA_AUTH_ERROR_PREFIX)
             {
-                let auth_msg = clean_msg
-                    .strip_prefix(LUA_AUTH_ERROR_PREFIX)
-                    .unwrap_or(&clean_msg)
-                    .to_string();
+                let auth_msg = auth_message_after_prefix(&clean_msg);
                 AppError::Auth(auth_msg)
             } else if msg.contains("execution limit") {
                 AppError::ScriptError {
@@ -925,6 +1005,33 @@ pub async fn execute_query_script(
         return Err(AppError::Internal(error_message));
     }
 
+    let identity = super::builtins::ScriptIdentity {
+        trigger_id: trigger_id.clone(),
+        caller_did: claims.map(|c| c.did().to_string()),
+        job_id: None,
+    };
+    if let Err(e) = super::require_api::register_require(&lua, state, &identity, None).await {
+        let error_message = format!("failed to register require api: {e}");
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "script.error".to_string(),
+                severity: Severity::Error,
+                actor_did: None,
+                subject: Some(method.to_string()),
+                detail: serde_json::json!({
+                    "error": error_message,
+                    "script_source": script_source,
+                    "method": method,
+                    "duration_ms": start.elapsed().as_millis() as u64,
+                }),
+            },
+            backend,
+        )
+        .await;
+        return Err(AppError::Internal(error_message));
+    }
+
     if let Err(e) = context::set_query_context(
         &lua,
         method,
@@ -954,7 +1061,8 @@ pub async fn execute_query_script(
         return Err(AppError::Internal(error_message));
     }
 
-    if let Err(e) = context::set_env_context(&lua, &load_env_vars(&state.db, backend).await) {
+    let env_vars = load_env_vars(&state.db, backend).await;
+    if let Err(e) = context::set_env_context(&lua, &env_vars) {
         let error_message = format!("failed to set env context: {e}");
         log_event(
             &state.db,
@@ -1036,7 +1144,36 @@ pub async fn execute_query_script(
         }
     };
 
-    let result: mlua::Value = match handle.call_async(()).await {
+    let handle_input = match lua.to_value(params) {
+        Ok(v) => v,
+        Err(e) => {
+            let error_message = format!("failed to convert params to lua: {e}");
+            return Err(AppError::Internal(error_message));
+        }
+    };
+    let handle_ctx = match context::build_ctx(
+        &lua,
+        &context::Invocation {
+            trigger_id: &trigger_id,
+            caller_did: claims.map(|c| c.did()),
+            has_pds_auth: false,
+            env: &env_vars,
+            method: Some(method),
+            collection: Some(collection),
+            params: None,
+            delegate_did: None,
+            space: space_ctx,
+            job: None,
+        },
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            let error_message = format!("failed to build ctx: {e}");
+            return Err(AppError::Internal(error_message));
+        }
+    };
+
+    let result: mlua::Value = match handle.call_async((handle_input, handle_ctx)).await {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
@@ -1045,10 +1182,7 @@ pub async fn execute_query_script(
             let app_error = if msg.contains(LUA_AUTH_ERROR_PREFIX)
                 || clean_msg.contains(LUA_AUTH_ERROR_PREFIX)
             {
-                let auth_msg = clean_msg
-                    .strip_prefix(LUA_AUTH_ERROR_PREFIX)
-                    .unwrap_or(&clean_msg)
-                    .to_string();
+                let auth_msg = auth_message_after_prefix(&clean_msg);
                 AppError::Auth(auth_msg)
             } else if msg.contains("execution limit") {
                 AppError::ScriptError {
@@ -1171,6 +1305,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn auth_message_survives_a_prefix_that_is_not_leading() {
+        let wrapped = format!(
+            "runtime error: caller.create_record: Plugin returned error: AUTH_REQUIRED - {}DPoP session not found",
+            LUA_AUTH_ERROR_PREFIX
+        );
+        assert_eq!(
+            auth_message_after_prefix(&wrapped),
+            "DPoP session not found"
+        );
+    }
+
+    #[test]
+    fn auth_message_falls_back_to_the_whole_string_without_a_prefix() {
+        assert_eq!(
+            auth_message_after_prefix("no prefix here"),
+            "no prefix here"
+        );
+    }
+
     #[tokio::test]
     async fn successful_script_execution_moves_the_script_counters() {
         let state = test_state_with_pool(memory_pool().await);
@@ -1195,6 +1349,36 @@ mod tests {
             result.err()
         );
         assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn query_handle_receives_input_and_ctx() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), serde_json::json!("1"));
+        let claims = Claims::new_for_test("did:plc:test".to_string());
+
+        let result = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            "function handle(input, ctx) return { x = input.x, who = ctx.caller_did, trig = ctx.trigger, legacy = params.x } end",
+            Some(&claims),
+            None,
+        )
+        .await;
+
+        let response = result.expect("script should have executed");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["x"], "1");
+        assert_eq!(json["who"], "did:plc:test");
+        assert!(json["trig"].as_str().unwrap().starts_with("xrpc.query:"));
+        assert_eq!(json["legacy"], "1");
     }
 
     #[tokio::test]

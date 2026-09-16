@@ -32,13 +32,9 @@
 //!   [`super::execute::execute_procedure_script`] /
 //!   [`super::execute::execute_query_script`] directly.
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, LazyLock};
-
-static JOB_TYPE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9._-]*$").unwrap());
+use std::sync::Arc;
 
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
@@ -128,7 +124,7 @@ impl ParsedTrigger {
         // Suffix validation: NSID for most triggers, but `labeler.apply:_actor`
         // and `job.run:<type>` have their own formats.
         match kind {
-            TriggerKind::JobRun => validate_job_type(suffix)?,
+            TriggerKind::JobRun => crate::jobs::validate_job_type(suffix)?,
             TriggerKind::LabelerApply if suffix == "_actor" => {}
             _ => happyview_nsid::validate_nsid(suffix).map_err(|e| e.to_string())?,
         }
@@ -138,26 +134,6 @@ impl ParsedTrigger {
             suffix: suffix.to_string(),
         })
     }
-}
-
-fn validate_job_type(job_type: &str) -> Result<(), String> {
-    if job_type.is_empty() || job_type.len() > 128 {
-        return Err(format!(
-            "invalid job type '{job_type}': must be 1–128 characters"
-        ));
-    }
-    if !JOB_TYPE_RE.is_match(job_type) {
-        return Err(format!(
-            "invalid job type '{job_type}': must match /^[a-z0-9][a-z0-9._-]*$/"
-        ));
-    }
-    if crate::jobs::native::is_reserved(job_type) {
-        return Err(format!(
-            "invalid job type '{job_type}': the '{}' prefix is reserved for built-in jobs",
-            crate::jobs::native::RESERVED_PREFIX
-        ));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +404,7 @@ pub async fn run_record_event_once(
     }
     let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
     let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, &script.id, Some(payload.did))?;
+    register_default_apis(&lua, &state_arc, &script.id, Some(payload.did)).await?;
 
     // Legacy globals (action, uri, did, collection, rkey, record) for
     // convenience / backwards compatibility.
@@ -455,16 +431,15 @@ pub async fn run_record_event_once(
         "rkey": payload.rkey,
         "record": payload.record,
     });
+    let event_lua = lua
+        .to_value(&event_value)
+        .map_err(|e| format!("event lua-conv: {e}"))?;
     lua.globals()
-        .set(
-            "event",
-            lua.to_value(&event_value)
-                .map_err(|e| format!("event lua-conv: {e}"))?,
-        )
+        .set("event", event_lua.clone())
         .map_err(|e| format!("set event global: {e}"))?;
 
-    context::set_env_context(&lua, &load_env_vars(&state.db, state.db_backend).await)
-        .map_err(|e| format!("set env: {e}"))?;
+    let env_vars = load_env_vars(&state.db, state.db_backend).await;
+    context::set_env_context(&lua, &env_vars).map_err(|e| format!("set env: {e}"))?;
 
     lua.load(script.body.as_str())
         .exec()
@@ -473,8 +448,24 @@ pub async fn run_record_event_once(
         .globals()
         .get("handle")
         .map_err(|e| format!("missing handle(): {e}"))?;
+    let ctx = context::build_ctx(
+        &lua,
+        &context::Invocation {
+            trigger_id: &script.id,
+            caller_did: Some(payload.did),
+            has_pds_auth: false,
+            env: &env_vars,
+            method: None,
+            collection: Some(payload.nsid),
+            params: None,
+            delegate_did: None,
+            space: None,
+            job: None,
+        },
+    )
+    .map_err(|e| format!("build ctx: {e}"))?;
     let result: mlua::Value = handle
-        .call_async::<mlua::Value>(())
+        .call_async::<mlua::Value>((event_lua, ctx))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -637,7 +628,7 @@ async fn run_label_lua_once(
     }
     let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
     let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, &script.id, None)?;
+    register_default_apis(&lua, &state_arc, &script.id, None).await?;
 
     use mlua::LuaSerdeExt;
     let globals = lua.globals();
@@ -662,15 +653,14 @@ async fn run_label_lua_once(
     }
     .map_err(|e| format!("set exp: {e}"))?;
     let event_value = serde_json::to_value(event).map_err(|e| format!("encode event: {e}"))?;
+    let event_lua = lua
+        .to_value(&event_value)
+        .map_err(|e| format!("event lua-conv: {e}"))?;
     globals
-        .set(
-            "event",
-            lua.to_value(&event_value)
-                .map_err(|e| format!("event lua-conv: {e}"))?,
-        )
+        .set("event", event_lua.clone())
         .map_err(|e| format!("set event: {e}"))?;
-    context::set_env_context(&lua, &load_env_vars(&state.db, state.db_backend).await)
-        .map_err(|e| format!("set env: {e}"))?;
+    let env_vars = load_env_vars(&state.db, state.db_backend).await;
+    context::set_env_context(&lua, &env_vars).map_err(|e| format!("set env: {e}"))?;
 
     lua.load(script.body.as_str())
         .exec()
@@ -679,8 +669,24 @@ async fn run_label_lua_once(
         .globals()
         .get("handle")
         .map_err(|e| format!("missing handle(): {e}"))?;
+    let ctx = context::build_ctx(
+        &lua,
+        &context::Invocation {
+            trigger_id: &script.id,
+            caller_did: None,
+            has_pds_auth: false,
+            env: &env_vars,
+            method: None,
+            collection: None,
+            params: None,
+            delegate_did: None,
+            space: None,
+            job: None,
+        },
+    )
+    .map_err(|e| format!("build ctx: {e}"))?;
     let result: mlua::Value = handle
-        .call_async::<mlua::Value>(())
+        .call_async::<mlua::Value>((event_lua, ctx))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -734,7 +740,7 @@ fn extract_bool(v: &Value, key: &str) -> Option<bool> {
 /// Calling `:save()` / `:delete()` (the PDS-touching variants) errors
 /// clearly with the no-PDS-auth message; the local-only variants
 /// (`:save_local`, `:delete_local`, `Record.delete_local`) work.
-fn register_default_apis(
+async fn register_default_apis(
     lua: &mlua::Lua,
     state: &Arc<AppState>,
     trigger_id: &str,
@@ -763,6 +769,12 @@ fn register_default_apis(
     record::register_record_api_no_auth(lua, state.clone())
         .map_err(|e| format!("record api: {e}"))?;
     register_log_event_api(lua, state, trigger_id, caller_did)?;
+    let identity = crate::lua::builtins::ScriptIdentity {
+        trigger_id: trigger_id.to_string(),
+        caller_did: caller_did.map(String::from),
+        job_id: None,
+    };
+    crate::lua::require_api::register_require(lua, state, &identity, None).await?;
     Ok(())
 }
 
@@ -1016,6 +1028,7 @@ mod tests {
         let lua = mlua::Lua::new();
 
         register_default_apis(&lua, &state, "record.create:com.example.thing", None)
+            .await
             .expect("default APIs should register");
 
         let (kind, get_kind, list_kind): (String, String, String) = lua
@@ -1035,6 +1048,7 @@ mod tests {
         let lua = mlua::Lua::new();
 
         register_default_apis(&lua, &state, "labeler.apply:app.bsky.feed.post", None)
+            .await
             .expect("default APIs should register");
 
         let ok: bool = lua

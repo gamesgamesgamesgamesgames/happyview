@@ -2,13 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { Plus, Trash2, RefreshCw, ExternalLink, Settings, Loader2, AlertTriangle, CheckCircle2, AlertCircle, ArrowUpCircle, Search } from "lucide-react";
+import { Plus, Trash2, RefreshCw, ExternalLink, Settings, Loader2, AlertTriangle, CheckCircle2, AlertCircle, ArrowUpCircle, Search, ChevronDown } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { useOfficialPlugins } from "@/hooks/use-official-plugins";
-import { getPlugins, addPlugin, removePlugin, reloadPlugin, getPluginSecrets, updatePluginSecrets, previewPlugin, checkPluginUpdate, type PluginPreview } from "@/lib/api";
+import { getPlugins, addPlugin, removePlugin, reloadPlugin, getPluginSecrets, updatePluginSecrets, getPluginAllowedHosts, updatePluginAllowedHosts, previewPlugin, checkPluginUpdate, type PluginPreview } from "@/lib/api";
 import type { PluginSummary } from "@/types/plugins";
 import { PluginUpdateDialog } from "@/components/plugin-update-dialog";
+import { PluginCapabilities, visibleCapabilities } from "@/components/plugin-capabilities";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -26,6 +27,11 @@ import {
   PopoverContent,
 } from "@/components/ui/popover";
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import {
   Table,
   TableBody,
   TableCell,
@@ -33,6 +39,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { MultiInput } from "@/components/ui/multi-input";
 import {
   ResponsiveDialog,
   ResponsiveDialogClose,
@@ -62,6 +69,12 @@ function formatAuthType(authType: string): string {
   return formats[authType] || authType;
 }
 
+function hasDefinedHostsCapability(plugin: PluginSummary): boolean {
+  return visibleCapabilities(plugin.capabilities).some(
+    (c) => c.name === "network:request:defined",
+  );
+}
+
 export default function PluginsPage() {
   const { hasPermission } = useCurrentUser();
   const [plugins, setPlugins] = useState<PluginSummary[]>([]);
@@ -80,6 +93,7 @@ export default function PluginsPage() {
   const [newUrl, setNewUrl] = useState("");
   const [adding, setAdding] = useState(false);
   const [pluginPreview, setPluginPreview] = useState<PluginPreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const [comboboxOpen, setComboboxOpen] = useState<boolean>(false);
   const [selectedManifestUrl, setSelectedManifestUrl] = useState<string | null>(
     null,
@@ -106,6 +120,8 @@ export default function PluginsPage() {
   const [configPlugin, setConfigPlugin] = useState<PluginSummary | null>(null);
   const [secretValues, setSecretValues] = useState<Record<string, string>>({});
   const [savingSecrets, setSavingSecrets] = useState(false);
+  const [allowedHosts, setAllowedHosts] = useState<string[]>([""]);
+  const [configuredHosts, setConfiguredHosts] = useState<Record<string, string[]>>({});
 
   const canCreate = hasPermission("plugins:create");
   const canDelete = hasPermission("plugins:delete");
@@ -163,18 +179,26 @@ export default function PluginsPage() {
     if (!addOpen) return;
     if (!effectivePreviewUrl) {
       setPluginPreview(null);
+      setPreviewError(null);
       return;
     }
     const controller = new AbortController();
+    setPreviewError(null);
     const timer = setTimeout(async () => {
       try {
         const preview = await previewPlugin(
           effectivePreviewUrl,
           controller.signal,
         );
-        if (!controller.signal.aborted) setPluginPreview(preview);
-      } catch {
-        // fail silently
+        if (!controller.signal.aborted) {
+          setPluginPreview(preview);
+          setPreviewError(null);
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) {
+          setPluginPreview(null);
+          setPreviewError(e instanceof Error ? e.message : String(e));
+        }
       }
     }, 500);
     return () => {
@@ -189,10 +213,16 @@ export default function PluginsPage() {
     setAdding(true);
     setError(null);
     try {
-      await addPlugin({ url: pluginPreview.wasm_url });
+      const capabilities = visibleCapabilities(pluginPreview.capabilities);
+      await addPlugin({
+        url: pluginPreview.wasm_url,
+        sha256: pluginPreview.sha256,
+        accepted_capabilities: capabilities.map((c) => c.name),
+      });
       setAddOpen(false);
       setNewUrl("");
       setPluginPreview(null);
+      setPreviewError(null);
       setSelectedManifestUrl(null);
       load();
     } catch (e) {
@@ -206,6 +236,7 @@ export default function PluginsPage() {
     setAddOpen(false);
     setNewUrl("");
     setPluginPreview(null);
+    setPreviewError(null);
     setSelectedManifestUrl(null);
     setComboboxOpen(false);
     setError(null);
@@ -248,6 +279,13 @@ export default function PluginsPage() {
         initial[secret.key] = response.secrets[secret.key] || "";
       }
       setSecretValues(initial);
+      if (hasDefinedHostsCapability(plugin)) {
+        const hostsResponse = await getPluginAllowedHosts(plugin.id);
+        setAllowedHosts([...hostsResponse.hosts, ""]);
+        setConfiguredHosts((prev) => ({ ...prev, [plugin.id]: hostsResponse.hosts }));
+      } else {
+        setAllowedHosts([""]);
+      }
       setConfigOpen(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -260,9 +298,15 @@ export default function PluginsPage() {
     setError(null);
     try {
       await updatePluginSecrets(configPlugin.id, secretValues);
+      if (hasDefinedHostsCapability(configPlugin)) {
+        const hosts = allowedHosts.map((host) => host.trim()).filter(Boolean);
+        const hostsResponse = await updatePluginAllowedHosts(configPlugin.id, hosts);
+        setConfiguredHosts((prev) => ({ ...prev, [configPlugin.id]: hostsResponse.hosts }));
+      }
       setConfigOpen(false);
       setConfigPlugin(null);
       setSecretValues({});
+      setAllowedHosts([""]);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -436,6 +480,10 @@ export default function PluginsPage() {
                     </p>
                   </div>
 
+                  {previewError && (
+                    <p className="text-sm text-destructive">{previewError}</p>
+                  )}
+
                   {pluginPreview && (
                     <div className="grid gap-4 rounded-lg border p-4">
                       <div className="flex items-start gap-4">
@@ -479,6 +527,21 @@ export default function PluginsPage() {
                               ))}
                             </div>
                           </div>
+                        )}
+                      </div>
+
+                      <div className="space-y-2">
+                        <h4 className="text-sm font-medium">This plugin can</h4>
+                        <PluginCapabilities
+                          entries={visibleCapabilities(pluginPreview.capabilities)}
+                          allowedHosts={pluginPreview.allowed_hosts}
+                        />
+                        {visibleCapabilities(pluginPreview.capabilities).some(
+                          (c) => c.risk === "critical" || c.risk === "high",
+                        ) && (
+                          <p className="text-sm text-destructive">
+                            This plugin asks for dangerous permissions. Only install it if you trust its publisher.
+                          </p>
                         )}
                       </div>
                     </div>
@@ -530,14 +593,42 @@ export default function PluginsPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {plugins.map((plugin) => (
+                {plugins.map((plugin) => {
+                  const capabilities = visibleCapabilities(plugin.capabilities);
+                  return (
                   <TableRow key={plugin.id}>
                     <TableCell>
-                      <div className="flex flex-col">
-                        <span className="font-medium">{plugin.name}</span>
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">{plugin.name}</span>
+                          <Badge variant="outline">{plugin.plugin_type}</Badge>
+                        </div>
                         <code className="text-muted-foreground text-xs">
                           {plugin.id}
                         </code>
+                        {capabilities.length > 0 && (
+                          <Collapsible>
+                            <CollapsibleTrigger asChild>
+                              <button
+                                type="button"
+                                className="flex w-fit items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                              >
+                                <ChevronDown className="size-3" />
+                                <span>Permissions</span>
+                              </button>
+                            </CollapsibleTrigger>
+                            <CollapsibleContent className="mt-1 max-w-sm">
+                              <PluginCapabilities
+                                entries={capabilities}
+                                allowedHosts={
+                                  hasDefinedHostsCapability(plugin)
+                                    ? configuredHosts[plugin.id]
+                                    : plugin.allowed_hosts
+                                }
+                              />
+                            </CollapsibleContent>
+                          </Collapsible>
+                        )}
                       </div>
                     </TableCell>
                     <TableCell>
@@ -605,18 +696,24 @@ export default function PluginsPage() {
                             />
                           </Button>
                         )}
-                        {canCreate && plugin.required_secrets?.length > 0 && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-8"
-                            title={encryptionConfigured ? "Configure secrets" : "Encryption not configured"}
-                            onClick={() => handleOpenConfig(plugin)}
-                            disabled={!encryptionConfigured}
-                          >
-                            <Settings className="size-4" />
-                          </Button>
-                        )}
+                        {canCreate &&
+                          (plugin.required_secrets?.length > 0 ||
+                            hasDefinedHostsCapability(plugin)) && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="size-8"
+                              title={
+                                plugin.required_secrets?.length > 0 && !encryptionConfigured
+                                  ? "Encryption not configured"
+                                  : "Configure plugin"
+                              }
+                              onClick={() => handleOpenConfig(plugin)}
+                              disabled={plugin.required_secrets?.length > 0 && !encryptionConfigured}
+                            >
+                              <Settings className="size-4" />
+                            </Button>
+                          )}
                         {canCreate && plugin.source === "url" && (
                           <Button
                             variant="ghost"
@@ -646,7 +743,8 @@ export default function PluginsPage() {
                       </div>
                     </TableCell>
                   </TableRow>
-                ))}
+                  );
+                })}
               </TableBody>
             </Table>
           </div>
@@ -660,7 +758,9 @@ export default function PluginsPage() {
                 Configure {configPlugin?.name}
               </ResponsiveDialogTitle>
               <ResponsiveDialogDescription>
-                Enter the required secrets for this plugin. Leave empty to use environment variables.
+                {configPlugin && configPlugin.required_secrets.length > 0
+                  ? "Enter the required secrets for this plugin. Leave empty to use environment variables."
+                  : "Configure this plugin's settings."}
               </ResponsiveDialogDescription>
             </ResponsiveDialogHeader>
             <div className="grid gap-4 py-4">
@@ -684,6 +784,20 @@ export default function PluginsPage() {
                   />
                 </div>
               ))}
+              {configPlugin && hasDefinedHostsCapability(configPlugin) && (
+                <div className="grid gap-2">
+                  <Label htmlFor="allowed-hosts">Allowed hosts</Label>
+                  <p className="text-xs text-muted-foreground">
+                    This plugin can only make requests to hosts listed here.
+                  </p>
+                  <MultiInput
+                    id="allowed-hosts"
+                    values={allowedHosts}
+                    onChange={setAllowedHosts}
+                    placeholder="api.example.com"
+                  />
+                </div>
+              )}
             </div>
             <ResponsiveDialogFooter>
               <ResponsiveDialogClose asChild>
@@ -692,7 +806,7 @@ export default function PluginsPage() {
                 </Button>
               </ResponsiveDialogClose>
               <Button onClick={handleSaveSecrets} disabled={savingSecrets}>
-                {savingSecrets ? "Saving..." : "Save Secrets"}
+                {savingSecrets ? "Saving..." : "Save"}
               </Button>
             </ResponsiveDialogFooter>
           </ResponsiveDialogContent>

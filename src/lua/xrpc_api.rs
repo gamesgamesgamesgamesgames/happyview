@@ -108,7 +108,7 @@ pub fn register_xrpc_api(
 }
 
 /// Execute a query XRPC — local handler if known, proxy if not.
-async fn execute_local_query(
+pub(crate) async fn execute_local_query(
     state: &AppState,
     method: &str,
     params: &mut HashMap<String, Value>,
@@ -151,7 +151,7 @@ fn params_to_query_string(params: &HashMap<String, Value>) -> String {
 }
 
 /// Execute a procedure XRPC — local handler if known, proxy if not.
-async fn execute_local_procedure(
+pub(crate) async fn execute_local_procedure(
     state: &AppState,
     method: &str,
     claims: &Claims,

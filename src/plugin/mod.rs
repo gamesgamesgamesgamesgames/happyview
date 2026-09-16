@@ -1,12 +1,17 @@
 pub mod attestation;
+pub mod caller;
+pub mod capabilities;
+pub mod config;
 pub mod encryption;
 pub mod executor;
+pub mod graph;
 pub mod host;
+pub mod library;
 pub mod loader;
 pub mod memory;
 pub mod official_registry;
 mod runtime;
-pub mod sync;
+pub mod secrets;
 mod types;
 
 pub use executor::{ExecutionError, PluginExecutor, PluginInstance};
@@ -15,6 +20,7 @@ pub use runtime::WasmRuntime;
 pub use types::*;
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
+use graph::{GraphError, PluginNode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -24,6 +30,7 @@ pub struct PluginRegistry {
     plugins: RwLock<HashMap<String, Arc<LoadedPlugin>>>,
     db: Option<sqlx::AnyPool>,
     db_backend: DatabaseBackend,
+    api_surfaces: RwLock<HashMap<String, Arc<library::ApiSurface>>>,
 }
 
 impl Default for PluginRegistry {
@@ -32,6 +39,7 @@ impl Default for PluginRegistry {
             plugins: RwLock::new(HashMap::new()),
             db: None,
             db_backend: DatabaseBackend::Sqlite,
+            api_surfaces: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -47,11 +55,13 @@ impl PluginRegistry {
             plugins: RwLock::new(HashMap::new()),
             db: Some(db),
             db_backend,
+            api_surfaces: RwLock::new(HashMap::new()),
         }
     }
 
     pub async fn register(&self, plugin: LoadedPlugin) {
         let id = plugin.info.id.clone();
+        self.invalidate_api_surface(&id).await;
 
         // Persist to database if configured
         if let Some(db) = &self.db
@@ -61,6 +71,21 @@ impl PluginRegistry {
         }
 
         self.plugins.write().await.insert(id, Arc::new(plugin));
+    }
+
+    pub async fn cached_api_surface(&self, id: &str) -> Option<Arc<library::ApiSurface>> {
+        self.api_surfaces.read().await.get(id).cloned()
+    }
+
+    pub async fn cache_api_surface(&self, id: &str, surface: Arc<library::ApiSurface>) {
+        self.api_surfaces
+            .write()
+            .await
+            .insert(id.to_string(), surface);
+    }
+
+    pub async fn invalidate_api_surface(&self, id: &str) {
+        self.api_surfaces.write().await.remove(id);
     }
 
     async fn persist_plugin(
@@ -82,7 +107,7 @@ impl PluginRegistry {
         let now = now_rfc3339();
         let sql = adapt_sql(
             "INSERT INTO happyview_plugins (id, source, url, sha256, enabled, loaded_at, api_version, manifest)
-             VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+             VALUES (?, ?, ?, ?, TRUE, ?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET
                 source = excluded.source,
                 url = excluded.url,
@@ -116,6 +141,7 @@ impl PluginRegistry {
     }
 
     pub async fn remove(&self, id: &str) -> Option<Arc<LoadedPlugin>> {
+        self.invalidate_api_surface(id).await;
         self.plugins.write().await.remove(id)
     }
 
@@ -135,7 +161,7 @@ impl PluginRegistry {
             .await
             .map_err(|e| format!("Failed to load plugins from DB: {}", e))?;
 
-        let mut loaded = 0;
+        let mut plugins = Vec::new();
 
         for (id, source, url, sha256) in rows {
             // Skip if already loaded
@@ -154,8 +180,7 @@ impl PluginRegistry {
                                 {
                                     Ok(plugin) => {
                                         tracing::info!(plugin_id = %id, "Loaded plugin from DB");
-                                        self.plugins.write().await.insert(id, Arc::new(plugin));
-                                        loaded += 1;
+                                        plugins.push(plugin);
                                     }
                                     Err(e) => {
                                         tracing::error!(plugin_id = %id, error = %e, "Failed to load plugin WASM");
@@ -174,8 +199,7 @@ impl PluginRegistry {
                         match loader::load_from_file(path).await {
                             Ok(plugin) => {
                                 tracing::info!(plugin_id = %id, "Loaded plugin from DB (file)");
-                                self.plugins.write().await.insert(id, Arc::new(plugin));
-                                loaded += 1;
+                                plugins.push(plugin);
                             }
                             Err(e) => {
                                 tracing::error!(plugin_id = %id, error = %e, "Failed to load plugin from DB");
@@ -189,6 +213,193 @@ impl PluginRegistry {
             }
         }
 
-        Ok(loaded)
+        let count = plugins.len();
+        let failures = self.register_all(plugins).await;
+        for (id, err) in &failures {
+            tracing::error!(plugin_id = %id, error = %err, "Failed to install plugin from DB");
+        }
+        Ok(count - failures.len())
+    }
+
+    /// Snapshot of the graph for validation.
+    pub async fn nodes(&self) -> Vec<PluginNode> {
+        self.plugins
+            .read()
+            .await
+            .values()
+            .map(|p| PluginNode::from(p.as_ref()))
+            .collect()
+    }
+
+    /// Validate against the dependency graph, then register (and persist).
+    /// This is what the admin API and boot loading go through; `register`
+    /// stays as the unchecked primitive for tests and internal callers.
+    pub async fn install(&self, plugin: LoadedPlugin) -> Result<(), GraphError> {
+        // A library's namespace is how other plugins reach it
+        // (`get_library_by_namespace`), so two installed plugins claiming the
+        // same one would make that lookup ambiguous. Reinstalling the same id
+        // under its own namespace is fine — that's an upgrade, not a clash.
+        if let Some(namespace) = plugin.namespace() {
+            let existing = self.plugins.read().await;
+            if let Some(other) = existing
+                .values()
+                .find(|p| p.info.id != plugin.info.id && p.namespace() == Some(namespace))
+            {
+                return Err(GraphError::NamespaceTaken {
+                    namespace: namespace.to_string(),
+                    by: other.info.id.clone(),
+                });
+            }
+        }
+
+        let candidate = PluginNode::from(&plugin);
+        let installed = self.nodes().await;
+        graph::validate_install(&installed, &candidate)?;
+        self.register(plugin).await;
+        Ok(())
+    }
+
+    /// Remove a plugin. Refused with `HasDependents` unless `force`, in which
+    /// case dependents are removed too. Returns the ids removed, dependents
+    /// first; empty when `id` was not installed.
+    pub async fn uninstall(&self, id: &str, force: bool) -> Result<Vec<String>, GraphError> {
+        if self.get(id).await.is_none() {
+            return Ok(Vec::new());
+        }
+        let installed = self.nodes().await;
+        let mut ids = if force {
+            graph::transitive_dependents(&installed, id)
+        } else {
+            graph::validate_remove(&installed, id)?;
+            Vec::new()
+        };
+        ids.push(id.to_string());
+        for id in &ids {
+            self.remove(id).await;
+        }
+        Ok(ids)
+    }
+
+    /// Install a batch in dependency order. Plugins whose dependencies are
+    /// unmet, or that sit on a cycle, are skipped and reported by id.
+    pub async fn register_all(&self, plugins: Vec<LoadedPlugin>) -> Vec<(String, GraphError)> {
+        let mut failures = Vec::new();
+        let mut pending: HashMap<String, LoadedPlugin> = plugins
+            .into_iter()
+            .map(|p| (p.info.id.clone(), p))
+            .collect();
+
+        let mut nodes: Vec<PluginNode> = self
+            .nodes()
+            .await
+            .into_iter()
+            .filter(|n| !pending.contains_key(&n.id))
+            .collect();
+        nodes.extend(pending.values().map(PluginNode::from));
+        let order = match graph::load_order(&nodes) {
+            Ok(order) => order,
+            Err(GraphError::Cycle(cycle)) => {
+                // Drop the cycle members, then order what is left.
+                for id in &cycle {
+                    if pending.remove(id).is_some() {
+                        failures.push((id.clone(), GraphError::Cycle(cycle.clone())));
+                    }
+                }
+                let remaining: Vec<PluginNode> = nodes
+                    .iter()
+                    .filter(|n| !cycle.contains(&n.id))
+                    .cloned()
+                    .collect();
+                graph::load_order(&remaining).unwrap_or_default()
+            }
+            Err(other) => {
+                for (id, _) in pending.drain() {
+                    failures.push((id, other.clone()));
+                }
+                Vec::new()
+            }
+        };
+
+        for id in order {
+            let Some(plugin) = pending.remove(&id) else {
+                continue;
+            };
+            if let Err(e) = self.install(plugin).await {
+                failures.push((id, e));
+            }
+        }
+        failures.sort_by(|a, b| a.0.cmp(&b.0));
+        failures
+    }
+
+    pub async fn list_by_type(&self, plugin_type: PluginType) -> Vec<Arc<LoadedPlugin>> {
+        self.plugins
+            .read()
+            .await
+            .values()
+            .filter(|p| p.plugin_type() == plugin_type)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn get_library_by_namespace(&self, namespace: &str) -> Option<Arc<LoadedPlugin>> {
+        self.plugins
+            .read()
+            .await
+            .values()
+            .find(|p| p.namespace() == Some(namespace))
+            .cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::memory_pool;
+
+    /// `enabled` is BOOLEAN on Postgres and INTEGER on SQLite, so the persist
+    /// statement has to use a literal both backends accept.
+    #[tokio::test]
+    async fn register_persists_an_enabled_row() {
+        let pool = memory_pool().await;
+        crate::db::query(
+            "CREATE TABLE happyview_plugins (
+                id TEXT PRIMARY KEY, source TEXT NOT NULL, url TEXT, sha256 TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1, loaded_at TEXT,
+                api_version TEXT NOT NULL, manifest TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let registry = PluginRegistry::with_db(pool.clone(), DatabaseBackend::Sqlite);
+        registry
+            .register(LoadedPlugin {
+                info: PluginInfo {
+                    id: "p".into(),
+                    name: "p".into(),
+                    version: "1.0.0".into(),
+                    api_version: "2".into(),
+                    icon_url: None,
+                    required_secrets: vec![],
+                    auth_type: "openid".into(),
+                    config_schema: None,
+                },
+                source: PluginSource::Url {
+                    url: "https://example.test/p.wasm".into(),
+                    sha256: None,
+                },
+                wasm_bytes: vec![],
+                manifest: None,
+            })
+            .await;
+
+        let (enabled,): (i64,) =
+            crate::db::query_as("SELECT enabled FROM happyview_plugins WHERE id = 'p'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(enabled, 1);
     }
 }

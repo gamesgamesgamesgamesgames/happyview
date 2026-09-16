@@ -1,7 +1,6 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
-import { X } from "lucide-react"
 
 import { useCurrentUser } from "@/hooks/use-current-user"
 import {
@@ -12,7 +11,7 @@ import {
 } from "@/lib/api"
 import { SiteHeader } from "@/components/site-header"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import { MultiInput } from "@/components/ui/multi-input"
 import { Label } from "@/components/ui/label"
 
 const MODES = [
@@ -104,47 +103,6 @@ export default function XrpcProxySettingsPage() {
     }
   }
 
-  function handleNsidChange(index: number, value: string) {
-    const next = [...nsids]
-    next[index] = value
-    if (index === nsids.length - 1 && value.trim() !== "") {
-      next.push("")
-    }
-    setNsids(next)
-  }
-
-  function handleNsidRemove(index: number) {
-    const next = nsids.filter((_, i) => i !== index)
-    if (next.length === 0 || next[next.length - 1].trim() !== "") {
-      next.push("")
-    }
-    setNsids(next)
-  }
-
-  function handleNsidPaste(
-    index: number,
-    e: React.ClipboardEvent<HTMLInputElement>,
-  ) {
-    const text = e.clipboardData.getData("text")
-    const parts = text.split(/[,;\s\n]+/).map((s) => s.trim()).filter(Boolean)
-    if (parts.length <= 1) return
-    e.preventDefault()
-    const before = nsids.slice(0, index)
-    const after = nsids.slice(index + 1).filter((s) => s.trim() !== "")
-    const next = [...before, ...parts, ...after, ""]
-    setNsids(next)
-  }
-
-  function handleNsidKeyDown(
-    index: number,
-    e: React.KeyboardEvent<HTMLInputElement>,
-  ) {
-    if (e.key === "Backspace" && nsids[index] === "" && nsids.length > 1) {
-      e.preventDefault()
-      handleNsidRemove(index)
-    }
-  }
-
   return (
     <>
       <SiteHeader title="XRPC Proxy" />
@@ -229,32 +187,12 @@ export default function XrpcProxySettingsPage() {
               Enter NSID patterns. Use <code className="text-[11px] bg-muted px-1 py-0.5 rounded">com.example.*</code> to
               match all NSIDs under a namespace.
             </p>
-            <div className="flex flex-col gap-1.5">
-              {nsids.map((val, index) => (
-                <div key={index} className="flex gap-1.5">
-                  <Input
-                    value={val}
-                    onChange={(e) => handleNsidChange(index, e.target.value)}
-                    onKeyDown={(e) => handleNsidKeyDown(index, e)}
-                    onPaste={(e) => handleNsidPaste(index, e)}
-                    placeholder="com.example.feed.*"
-                    className="font-mono text-sm"
-                    disabled={!canManage}
-                  />
-                  {nsids.length > 1 && val !== "" && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => handleNsidRemove(index)}
-                      disabled={!canManage}
-                    >
-                      <X className="size-4" />
-                    </Button>
-                  )}
-                </div>
-              ))}
-            </div>
+            <MultiInput
+              values={nsids}
+              onChange={setNsids}
+              placeholder="com.example.feed.*"
+              disabled={!canManage}
+            />
           </div>
         )}
 
