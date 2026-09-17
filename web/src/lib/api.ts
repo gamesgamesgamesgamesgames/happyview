@@ -22,6 +22,8 @@ import type {
   Script,
   UpsertScriptBody,
   PatchScriptBody,
+  CodemodResult,
+  CodemodRequestBody,
 } from "@/types/scripts";
 import type { LabelerSummary } from "@/types/labelers";
 import type {
@@ -1294,6 +1296,23 @@ export function deleteScript(id: string) {
   return apiFetch(`/admin/scripts/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+/**
+ * Preview (or, with `apply`, perform) the v3 codemod on a stored script.
+ * `CodemodRequestBody` says what each flag needs.
+ */
+export function codemodScript(id: string, apply?: boolean, allowMarkers?: boolean) {
+  const body: CodemodRequestBody = {};
+  if (apply) body.apply = true;
+  if (allowMarkers) body.allow_markers = true;
+  return apiFetch<CodemodResult>(
+    `/admin/scripts/${encodeURIComponent(id)}/codemod`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  );
 }
 
 // Setup

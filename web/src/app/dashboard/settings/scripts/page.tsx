@@ -186,6 +186,28 @@ export default function ScriptsPage() {
         enableSorting: true,
       },
       {
+        id: "needs_migration",
+        accessorFn: (row) => row.needs_migration.length > 0,
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} label="Contract" />
+        ),
+        cell: ({ row }) =>
+          row.original.needs_migration.length > 0 ? (
+            <Badge
+              variant="outline"
+              className="border-amber-500/50 text-amber-500"
+              title={
+                row.original.needs_migration[0] === "unparseable"
+                  ? "Could not parse this script as Lua"
+                  : `Still references: ${row.original.needs_migration.join(", ")}`
+              }
+            >
+              Needs migration
+            </Badge>
+          ) : null,
+        enableSorting: true,
+      },
+      {
         id: "updated_at",
         accessorKey: "updated_at",
         header: ({ column }) => (

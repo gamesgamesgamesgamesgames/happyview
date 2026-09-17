@@ -7,6 +7,7 @@
     "background-jobs",
     "label-scripts",
     "lua-scripting",
+    "migrating-scripts",
     "api-clients",
     "linked-repos",
     "attestation-signing",

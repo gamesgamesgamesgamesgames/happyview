@@ -41,6 +41,12 @@ interface Script {
   description: string | null;
   created_at: string;
   updated_at: string;
+  // v2 globals (`db`, `Record`, `now`, `params`, …) this script still
+  // references as free names; empty once migrated onto
+  // require("happyview.*") / require("internal.*"). Always empty for a
+  // non-Lua script. Can instead be ["unparseable"] when a Lua `body` does
+  // not parse at all.
+  needs_migration: string[];
 }
 
 // List all scripts
@@ -120,7 +126,8 @@ curl "http://127.0.0.1:3000/admin/scripts?suffix=xyz.statusphere.status" -H "$AU
     "body": "function handle()\n  return event\nend",
     "description": "Process indexed statuses",
     "created_at": "2026-01-01T00:00:00Z",
-    "updated_at": "2026-01-01T00:00:00Z"
+    "updated_at": "2026-01-01T00:00:00Z",
+    "needs_migration": ["event"]
   }
 ]
 ```
@@ -173,7 +180,8 @@ curl "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status"
   "body": "function handle()\n  return event\nend",
   "description": "Process indexed statuses",
   "created_at": "2026-01-01T00:00:00Z",
-  "updated_at": "2026-01-01T00:00:00Z"
+  "updated_at": "2026-01-01T00:00:00Z",
+  "needs_migration": ["event"]
 }
 ```
 
@@ -271,7 +279,8 @@ curl -X POST http://127.0.0.1:3000/admin/scripts \
   "body": "function handle()\n  return event\nend",
   "description": "Process indexed statuses",
   "created_at": "2026-01-01T00:00:00Z",
-  "updated_at": "2026-01-01T00:00:00Z"
+  "updated_at": "2026-01-01T00:00:00Z",
+  "needs_migration": ["event"]
 }
 ```
 
@@ -357,7 +366,8 @@ curl -X PATCH "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statuspher
   "body": "function handle()\n  return event\nend",
   "description": "Updated description for status processing",
   "created_at": "2026-01-01T00:00:00Z",
-  "updated_at": "2026-01-01T00:00:00Z"
+  "updated_at": "2026-01-01T00:00:00Z",
+  "needs_migration": ["event"]
 }
 ```
 
@@ -403,3 +413,131 @@ curl -X DELETE "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphe
 ```
 
 **Response**: `204 No Content`
+
+## Preview or apply the v3 codemod
+
+```
+POST /admin/scripts/{id}/codemod
+```
+
+Rewrites a Lua script's body onto the v3 `handle(input, ctx)` contract — the rewrite [Migrating Scripts to v3](../../guides/migrating-scripts.md) describes. Only `script_type: "lua"` is supported. Previewing needs `scripts:read`; `apply: true` needs `scripts:manage` as well, since it stores the rewritten body. Omit the request body entirely, or send `{}`, to preview.
+
+```ts tab="TypeScript" tab-group="language"
+interface CodemodResult {
+  source: string;
+  notes: { line: number; message: string }[];
+  changed: boolean;
+}
+
+const response = await fetch(
+  "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status/codemod",
+  {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  },
+);
+const preview: CodemodResult = await response.json();
+
+// Apply once the notes are reviewed; allow_markers is required if any remain
+const applied = await fetch(
+  "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status/codemod",
+  {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ apply: true, allow_markers: true }),
+  },
+);
+const data: CodemodResult = await applied.json();
+```
+```js tab="JavaScript" tab-group="language"
+const response = await fetch(
+  "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status/codemod",
+  {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  },
+);
+const preview = await response.json();
+
+const applied = await fetch(
+  "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status/codemod",
+  {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ apply: true, allow_markers: true }),
+  },
+);
+const data = await applied.json();
+```
+```rust tab="Rust" tab-group="language"
+let preview = client
+    .post("http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status/codemod")
+    .bearer_auth(token)
+    .json(&serde_json::json!({}))
+    .send()
+    .await?;
+let data: serde_json::Value = preview.json().await?;
+
+let applied = client
+    .post("http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status/codemod")
+    .bearer_auth(token)
+    .json(&serde_json::json!({ "apply": true, "allow_markers": true }))
+    .send()
+    .await?;
+let data: serde_json::Value = applied.json().await?;
+```
+```go tab="Go" tab-group="language"
+body := bytes.NewBufferString(`{}`)
+req, _ := http.NewRequest("POST", "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status/codemod", body)
+req.Header.Set("Authorization", "Bearer "+token)
+req.Header.Set("Content-Type", "application/json")
+resp, err := http.DefaultClient.Do(req)
+
+applyBody := bytes.NewBufferString(`{"apply": true, "allow_markers": true}`)
+req, _ = http.NewRequest("POST", "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status/codemod", applyBody)
+req.Header.Set("Authorization", "Bearer "+token)
+req.Header.Set("Content-Type", "application/json")
+resp, err = http.DefaultClient.Do(req)
+```
+```sh tab="cURL" tab-group="language"
+# Preview
+curl -X POST "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status/codemod" \
+  -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Apply, accepting any remaining markers
+curl -X POST "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status/codemod" \
+  -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{ "apply": true, "allow_markers": true }'
+```
+
+| Field           | Type    | Required | Description                                                                 |
+| --------------- | ------- | -------- | ---------------------------------------------------------------------------- |
+| `apply`         | boolean | no       | Defaults to `false` (preview only). `true` stores the rewritten body.        |
+| `allow_markers` | boolean | no       | Required alongside `apply: true` when the rewrite still leaves `-- codemod:` markers behind. |
+
+**Response**: `200 OK`
+
+```json
+{
+  "source": "local log = require(\"internal.logging\")\n\nfunction handle(input, ctx)\n  log.info(\"script fired\", { trigger = ctx.trigger })\n  return input\nend",
+  "notes": [],
+  "changed": true
+}
+```
+
+| Field              | Type    | Description                                                                                |
+| ------------------ | ------- | ------------------------------------------------------------------------------------------ |
+| `source`           | string  | The rewritten script body.                                                                 |
+| `notes`            | array   | Constructs the codemod could not rewrite mechanically, each left under a `-- codemod:` comment in `source`. |
+| `notes[].line`     | number  | Line number in the **original** body the construct sits on — not the rewritten `source` above. |
+| `notes[].message`  | string  | What changed and what to finish by hand.                                                   |
+| `changed`          | boolean | `false` when the rewrite equals the stored body, so there is nothing to apply; `source` then equals the stored body. Not a statement that the script is on the v3 contract: one applied with markers left in place reports `false` too. |
+
+`apply: true` on a rewrite that changed the script (`changed: true`) and still has one or more notes returns `409 Conflict` unless `allow_markers: true` is also set. Re-applying when the rewrite changes nothing (`changed: false`) is a no-op and returns `200 OK` regardless of `allow_markers`.
+
+A non-Lua `script_type` returns `400 Bad Request`. A body that doesn't parse as Lua also returns `400 Bad Request` rather than a result — this is different from `needs_migration`'s `"unparseable"`, which is a value on the *script list/get* response, not this endpoint.

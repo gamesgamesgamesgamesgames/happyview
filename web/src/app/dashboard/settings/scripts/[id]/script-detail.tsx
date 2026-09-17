@@ -32,6 +32,7 @@ import {
   type ScriptFormState,
   stateFromScript,
 } from "../script-form";
+import { MigrateScriptDialog } from "../migrate-dialog";
 
 export default function ScriptDetail() {
   const pathname = usePathname();
@@ -248,6 +249,14 @@ export default function ScriptDetail() {
             </AlertDialog>
           )}
           <div className="flex gap-2">
+            {script?.script_type === "lua" && (
+              <MigrateScriptDialog
+                scriptId={id}
+                currentBody={script.body}
+                canApply={canManage}
+                onApplied={load}
+              />
+            )}
             {canManage && (
               <Button onClick={handleSave} disabled={!isDirty || saving}>
                 {saving ? "Saving..." : "Save"}

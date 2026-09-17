@@ -23,6 +23,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
+use crate::codemod::{self, ScriptKind};
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
@@ -53,6 +54,13 @@ pub(super) struct ScriptResponse {
     /// still fires and can still be edited, but it cannot be recreated with
     /// the same id after deletion.
     pub recreatable: bool,
+    /// v2 globals this script still references, for the kind its trigger id
+    /// implies. Empty once migrated. Always empty for a non-Lua script — the
+    /// v2/v3 contract this names is Lua's.
+    ///
+    /// The single entry `"unparseable"` is not a global, as
+    /// `codemod::needs_migration` explains.
+    pub needs_migration: Vec<String>,
 }
 
 impl ScriptResponse {
@@ -73,6 +81,14 @@ impl ScriptResponse {
         let outbound_xrpcs: Option<Vec<String>> =
             outbound_xrpcs_json.and_then(|j| serde_json::from_str(&j).ok());
         let recreatable = ParsedTrigger::parse(&id).is_ok();
+        let needs_migration = if script_type == ScriptLanguage::Lua.as_str() {
+            codemod::needs_migration(&body, ScriptKind::from_trigger_id(&id))
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             id,
             script_type,
@@ -82,6 +98,7 @@ impl ScriptResponse {
             created_at,
             updated_at,
             recreatable,
+            needs_migration,
         }
     }
 }
@@ -119,6 +136,39 @@ where
 {
     let v: Option<String> = Option::deserialize(d)?;
     Ok(Some(v))
+}
+
+/// Body for `POST /admin/scripts/{id}/codemod`. Omitted entirely for a
+/// preview.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct CodemodBody {
+    #[serde(default)]
+    pub apply: bool,
+    /// Overrides the marker guard on apply — see `codemod_apply`.
+    #[serde(default)]
+    pub allow_markers: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct CodemodNote {
+    pub line: usize,
+    pub message: String,
+}
+
+impl From<codemod::Note> for CodemodNote {
+    fn from(note: codemod::Note) -> Self {
+        Self {
+            line: note.line,
+            message: note.message,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct CodemodResponse {
+    pub source: String,
+    pub notes: Vec<CodemodNote>,
+    pub changed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +489,101 @@ pub(super) async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /admin/scripts/{id}/codemod` — rewrite the row's body onto the v3
+/// `handle(input, ctx)` contract. Preview by default; `{"apply": true}`
+/// stores the result, which needs `scripts:manage` since it is a write —
+/// `scripts:read` alone only ever previews.
+///
+/// A rewrite that would store something new and still leaves `-- codemod:`
+/// markers behind is refused (409) unless `allow_markers` is also set: a
+/// marked construct still runs on the old globals for those lines, so
+/// storing it would make the script look migrated when it is not.
+pub(super) async fn codemod_apply(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+    body: Option<Json<CodemodBody>>,
+) -> Result<Json<CodemodResponse>, AppError> {
+    auth.require(Permission::ScriptsRead).await?;
+
+    let existing = fetch_one(&state, &id).await?;
+    if existing.script_type != ScriptLanguage::Lua.as_str() {
+        return Err(AppError::BadRequest(
+            "codemod applies to Lua scripts".to_string(),
+        ));
+    }
+
+    let (apply, allow_markers) = body
+        .map(|Json(b)| (b.apply, b.allow_markers))
+        .unwrap_or_default();
+    if apply {
+        auth.require(Permission::ScriptsManage).await?;
+    }
+
+    let kind = ScriptKind::from_trigger_id(&id);
+    let rewrite = codemod::rewrite(&existing.body, kind)
+        .map_err(|e| AppError::BadRequest(format!("script did not parse as Lua: {e}")))?;
+    let changed = rewrite.source != existing.body;
+    let marker_count = rewrite.notes.len();
+
+    // The guard is about what gets stored, so it only fires where something
+    // would be: re-applying a rewrite that has already landed writes nothing,
+    // and refusing it would make a repeated call look like a new problem.
+    if apply && changed && marker_count > 0 && !allow_markers {
+        return Err(AppError::Conflict(format!(
+            "codemod left {marker_count} marker(s) in place; refusing to apply without allow_markers"
+        )));
+    }
+
+    if apply && changed {
+        let backend = state.db_backend;
+        let outbound_xrpcs = crate::lua_analysis::extract_outbound_xrpcs(&rewrite.source);
+        let outbound_json = if outbound_xrpcs.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&outbound_xrpcs).map_err(|e| {
+                AppError::Internal(format!("failed to serialize outbound xrpcs: {e}"))
+            })?)
+        };
+        let now = now_rfc3339();
+
+        let sql = adapt_sql(
+            "UPDATE happyview_scripts SET body = ?, outbound_xrpcs = ?, updated_at = ? WHERE id = ?",
+            backend,
+        );
+        crate::db::query(&sql)
+            .bind(&rewrite.source)
+            .bind(&outbound_json)
+            .bind(&now)
+            .bind(&id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to apply codemod: {e}")))?;
+
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "script.codemod_applied".to_string(),
+                severity: Severity::Info,
+                actor_did: Some(auth.did.clone()),
+                subject: Some(id.clone()),
+                detail: serde_json::json!({
+                    "script_type": existing.script_type,
+                    "markers": marker_count,
+                }),
+            },
+            backend,
+        )
+        .await;
+    }
+
+    Ok(Json(CodemodResponse {
+        source: rewrite.source,
+        notes: rewrite.notes.into_iter().map(CodemodNote::from).collect(),
+        changed,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -552,5 +697,33 @@ mod tests {
             "2026-01-01T00:00:00+00:00".into(),
         );
         assert_eq!(garbage.outbound_xrpcs, None);
+    }
+
+    #[test]
+    fn from_row_reports_needs_migration_for_a_lua_script() {
+        let r = ScriptResponse::from_row(
+            "xrpc.query:com.example.list".into(),
+            "lua".into(),
+            "function handle()\n  return params.q\nend\n".into(),
+            None,
+            None,
+            "2026-01-01T00:00:00+00:00".into(),
+            "2026-01-01T00:00:00+00:00".into(),
+        );
+        assert_eq!(r.needs_migration, vec!["params".to_string()]);
+    }
+
+    #[test]
+    fn from_row_needs_migration_is_empty_for_a_non_lua_script() {
+        let r = ScriptResponse::from_row(
+            "xrpc.query:com.example.list".into(),
+            "javascript".into(),
+            "function handle() { return params.q; }".into(),
+            None,
+            None,
+            "2026-01-01T00:00:00+00:00".into(),
+            "2026-01-01T00:00:00+00:00".into(),
+        );
+        assert!(r.needs_migration.is_empty());
     }
 }

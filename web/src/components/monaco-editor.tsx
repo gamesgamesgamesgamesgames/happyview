@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
 import { useTheme } from "next-themes";
 import type { editor, Position } from "monaco-editor";
+import type { Monaco } from "@monaco-editor/react";
 import {
   LUA_KEYWORDS,
   LUA_BUILTINS,
@@ -21,6 +22,25 @@ import {
 import { HOVER_DOCS } from "@/lib/lua-hover";
 
 const Editor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
+const DiffEditor = dynamic(
+  () => import("@monaco-editor/react").then((m) => m.DiffEditor),
+  { ssr: false },
+);
+
+/**
+ * Registers the dark theme both `MonacoEditor` and `MonacoDiffEditor` use,
+ * reading the sidebar background so the editor's chrome matches the shell.
+ * Idempotent — `defineTheme` overwrites, so re-registering per mount is fine.
+ */
+function defineHappyViewDarkTheme(monaco: Monaco) {
+  const bg = resolveCssColor("var(--sidebar)");
+  monaco.editor.defineTheme("happyview-dark", {
+    base: "vs-dark",
+    inherit: true,
+    rules: [],
+    colors: { "editor.background": bg },
+  });
+}
 
 interface MonacoEditorProps {
   value: string;
@@ -72,13 +92,7 @@ export function MonacoEditor({
           loading="Loading editor..."
           path={language === "json" ? "lexicon.json" : undefined}
           beforeMount={(monaco) => {
-            const bg = resolveCssColor("var(--sidebar)");
-            monaco.editor.defineTheme("happyview-dark", {
-              base: "vs-dark",
-              inherit: true,
-              rules: [],
-              colors: { "editor.background": bg },
-            });
+            defineHappyViewDarkTheme(monaco);
 
             // Configure JSON language service with Lexicon schema
             if (language === "json") {
@@ -535,6 +549,50 @@ export function MonacoEditor({
             hideCursorInOverviewRuler: readOnly,
             overviewRulerLanes: readOnly ? 0 : 3,
             quickSuggestions: true,
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+interface MonacoDiffEditorProps {
+  /** Left ("before") side. */
+  original: string;
+  /** Right ("after") side. */
+  modified: string;
+  language: string;
+  className?: string;
+}
+
+/** Read-only side-by-side diff, styled to match {@link MonacoEditor}. */
+export function MonacoDiffEditor({
+  original,
+  modified,
+  language,
+  className,
+}: MonacoDiffEditorProps) {
+  const { resolvedTheme } = useTheme();
+
+  return (
+    <div className={`relative ${className ?? ""}`}>
+      <div className="absolute inset-0">
+        <DiffEditor
+          height="100%"
+          language={language}
+          original={original}
+          modified={modified}
+          theme={resolvedTheme === "dark" ? "happyview-dark" : "vs"}
+          loading="Loading diff..."
+          beforeMount={defineHappyViewDarkTheme}
+          options={{
+            readOnly: true,
+            minimap: { enabled: false },
+            automaticLayout: true,
+            scrollBeyondLastLine: false,
+            wordWrap: "on",
+            fontSize: 12,
+            renderSideBySide: true,
           }}
         />
       </div>

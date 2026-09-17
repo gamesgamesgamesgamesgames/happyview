@@ -158,6 +158,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
                 .patch(scripts::patch)
                 .delete(scripts::delete),
         )
+        .route("/scripts/{id}/codemod", post(scripts::codemod_apply))
         .route("/labelers", post(labelers::add).get(labelers::list))
         .route(
             "/labelers/{did}",

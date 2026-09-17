@@ -37,6 +37,53 @@ export interface Script {
    * recreated with the same id.
    */
   recreatable: boolean
+  /**
+   * Removed v2 globals (`db`, `Record`, `now`, `params`, …) this script still
+   * references as free names. Empty once migrated onto `require("happyview.*")`
+   * / `require("internal.*")` — always empty for a JavaScript script, since
+   * the codemod only understands Lua. Can instead be `["unparseable"]` when
+   * the body does not parse as Lua at all, so migration status can't be read
+   * off it.
+   */
+  needs_migration: string[]
+}
+
+/** One construct the codemod could not rewrite mechanically. */
+export interface CodemodNote {
+  /** Line number in the *original* source the construct sits on. */
+  line: number
+  message: string
+}
+
+/** Result of `POST /admin/scripts/{id}/codemod`. */
+export interface CodemodResult {
+  source: string
+  notes: CodemodNote[]
+  /**
+   * `false` when the rewrite equals the stored body, so applying would store
+   * nothing. Not the same as being on the v3 contract: a script applied with
+   * markers left in place reports `false` too.
+   */
+  changed: boolean
+}
+
+/**
+ * Body for `POST /admin/scripts/{id}/codemod`. Omit entirely, or send `{}`,
+ * to preview without storing anything.
+ */
+export interface CodemodRequestBody {
+  /**
+   * Stores the rewritten body. Previewing needs `scripts:read`; this needs
+   * `scripts:manage`, since it writes the row.
+   */
+  apply?: boolean
+  /**
+   * Required alongside `apply` when the rewrite changed the body and still
+   * leaves `-- codemod:` markers behind; otherwise the request is refused
+   * with 409. Sent only when the operator ticks it, never as `false`, so the
+   * server's default refusal holds.
+   */
+  allow_markers?: boolean
 }
 
 /** Body for `POST /admin/scripts` (create or replace by `id`). */
