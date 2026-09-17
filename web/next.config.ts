@@ -8,6 +8,13 @@ const nextConfig: NextConfig = {
   trailingSlash: true,
   images: { unoptimized: true },
   basePath,
+  turbopack: {
+    rules: {
+      // Editor templates are kept as Lua files, imported as plain strings,
+      // so a Rust test can parse the same source the editor prefills.
+      "*.lua": { loaders: ["./scripts/lua-source-loader.js"], as: "*.js" },
+    },
+  },
 };
 
 if (process.env.NODE_ENV === "production") {

@@ -1,3 +1,9 @@
+import type { TriggerKind } from "@/types/scripts";
+
+import jobBody from "./lua-templates/job.lua";
+import recordEventBody from "./lua-templates/record-event.lua";
+import triggerBody from "./lua-templates/trigger.lua";
+
 export const LEXICON_TEMPLATE = JSON.stringify(
   {
     $type: "com.atproto.lexicon.schema",
@@ -19,54 +25,31 @@ export const LEXICON_TEMPLATE = JSON.stringify(
   2,
 );
 
-export function procedureScript(collection: string): string {
-  const target = collection || "COLLECTION";
-  return `local log = require("internal.logging")
+/** Starter body for a trigger whose return value is the response. */
+export const DEFAULT_SCRIPT_BODY: string = triggerBody;
 
-function handle(input, ctx)
-  local r = Record("${target}", input)
-  r:save()
-  log.info("record saved", { uri = r._uri })
-  return { uri = r._uri, cid = r._cid }
-end
-`;
+/** Starter body for a `job.run:<type>` script. */
+export const DEFAULT_JOB_SCRIPT_BODY: string = jobBody;
+
+/**
+ * Starter body for a `record.*` script. A record script's table return
+ * replaces the record body, so echoing `input` there would index the event
+ * envelope in place of every record; this body returns the record itself.
+ */
+export const DEFAULT_RECORD_SCRIPT_BODY: string = recordEventBody;
+
+/** The body the new-script form prefills for a trigger kind. */
+export function defaultBodyFor(kind: TriggerKind): string {
+  if (kind === "job.run") return DEFAULT_JOB_SCRIPT_BODY;
+  if (kind.startsWith("record.")) return DEFAULT_RECORD_SCRIPT_BODY;
+  return DEFAULT_SCRIPT_BODY;
 }
 
-export function indexHookScript(): string {
-  return `local log = require("internal.logging")
-
-function handle(input, ctx)
-  if input.action == "delete" then
-    -- record was deleted
-    log.info("deleted " .. input.uri)
-  else
-    -- record was created or updated
-    log.info(input.action .. " " .. input.uri)
-  end
-end
-`;
-}
-
-export function queryScript(): string {
-  return `local log = require("internal.logging")
-
-function handle(input, ctx)
-  log.info("handling query", { uri = input.uri })
-
-  if input.uri then
-    local record = db.get(input.uri)
-    if not record then
-      error("record not found")
-    end
-    return { record = record }
-  end
-
-  return db.query({
-    collection = ctx.collection,
-    did = input.did,
-    limit = input.limit,
-    cursor = input.cursor,
-  })
-end
-`;
+/** Whether `body` is still one of the prefills, untouched by the operator. */
+export function isDefaultBody(body: string): boolean {
+  return (
+    body === DEFAULT_SCRIPT_BODY ||
+    body === DEFAULT_JOB_SCRIPT_BODY ||
+    body === DEFAULT_RECORD_SCRIPT_BODY
+  );
 }

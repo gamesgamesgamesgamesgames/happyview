@@ -2,16 +2,14 @@
 
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { Wand2 } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
-import { getLexicons, upsertScript } from "@/lib/api";
+import { getLexicons, isUnmigratedRefusal, upsertScript } from "@/lib/api";
 import type { LexiconSummary } from "@/types/lexicons";
+import { defaultBodyFor } from "@/lib/lua-templates";
 import type { TriggerKind } from "@/types/scripts";
-import {
-  DEFAULT_JOB_SCRIPT_BODY,
-  DEFAULT_SCRIPT_BODY,
-  parseTriggerId,
-} from "@/types/scripts";
+import { parseTriggerId } from "@/types/scripts";
 import { SiteHeader } from "@/components/site-header";
 import {
   AlertDialog,
@@ -26,6 +24,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 
+import { MigrateScriptDialog } from "../migrate-dialog";
 import {
   JOB_SOURCE,
   ScriptForm,
@@ -48,6 +47,7 @@ function NewScriptInner() {
   const [lexiconsLoading, setLexiconsLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [refused, setRefused] = useState(false);
 
   // If the URL changes (e.g. user navigates with new ?id=...), refresh state.
   useEffect(() => {
@@ -62,12 +62,10 @@ function NewScriptInner() {
   }, []);
 
   const isDirty = useMemo(() => {
-    const defaultBody =
-      state.source === JOB_SOURCE ? DEFAULT_JOB_SCRIPT_BODY : DEFAULT_SCRIPT_BODY;
     return (
       state.suffix !== "" ||
       state.description !== "" ||
-      state.body !== defaultBody
+      state.body !== defaultBodyFor(state.kind)
     );
   }, [state]);
 
@@ -101,6 +99,7 @@ function NewScriptInner() {
     if (!canSave) return;
     setSaving(true);
     setError(null);
+    setRefused(false);
     try {
       const id = composeTriggerId(state);
       await upsertScript({
@@ -112,6 +111,7 @@ function NewScriptInner() {
       router.push(`/dashboard/settings/scripts/${encodeURIComponent(id)}`);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
+      setRefused(isUnmigratedRefusal(e));
     } finally {
       // Also runs on the success path. The navigation that follows a save is a
       // full page load, and a load can be abandoned — by a prompt the operator
@@ -150,7 +150,28 @@ function NewScriptInner() {
       <SiteHeader title="New script" backHref="/dashboard/settings/scripts" />
       <div className="flex flex-col flex-1 min-h-0">
         <div className="flex flex-col flex-1 min-h-0 gap-6 p-4 md:p-6">
-          {error && <p className="text-destructive text-sm">{error}</p>}
+          {error && (
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-destructive text-sm">{error}</p>
+              {refused && (
+                <MigrateScriptDialog
+                  scriptId={composeTriggerId(state)}
+                  currentBody={state.body}
+                  trigger={
+                    <Button variant="outline" size="sm">
+                      <Wand2 className="size-4" />
+                      Migrate this script
+                    </Button>
+                  }
+                  onRewritten={(source) => {
+                    setState({ ...state, body: source });
+                    setError(null);
+                    setRefused(false);
+                  }}
+                />
+              )}
+            </div>
+          )}
           <ScriptForm state={state} onChange={setState} lexicons={lexicons} lexiconsLoading={lexiconsLoading} />
         </div>
         <footer className="bg-sidebar-accent flex justify-between gap-2 px-4 py-2 md:px-6 md:py-4 rounded-b-md">
@@ -225,7 +246,7 @@ function initialState(searchParams: URLSearchParams): ScriptFormState {
         suffix: parsed.suffix,
         source: isJob ? JOB_SOURCE : parsed.suffix,
         description: "",
-        body: isJob ? DEFAULT_JOB_SCRIPT_BODY : DEFAULT_SCRIPT_BODY,
+        body: defaultBodyFor(parsed.kind),
       };
     }
   }
@@ -234,11 +255,12 @@ function initialState(searchParams: URLSearchParams): ScriptFormState {
   const kind = (searchParams.get("kind") as TriggerKind | null) ?? "record.index";
   const source = searchParams.get("source") ?? searchParams.get("suffix") ?? "";
   const isJob = kind === "job.run" || source === JOB_SOURCE;
+  const resolvedKind: TriggerKind = isJob ? "job.run" : kind;
   return {
-    kind: isJob ? "job.run" : kind,
+    kind: resolvedKind,
     suffix: isJob ? "" : (searchParams.get("suffix") ?? ""),
     source: isJob ? JOB_SOURCE : source,
     description: "",
-    body: isJob ? DEFAULT_JOB_SCRIPT_BODY : DEFAULT_SCRIPT_BODY,
+    body: defaultBodyFor(resolvedKind),
   };
 }

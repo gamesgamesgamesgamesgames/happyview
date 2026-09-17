@@ -18,13 +18,9 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import type { LexiconSummary } from "@/types/lexicons";
+import { defaultBodyFor, isDefaultBody } from "@/lib/lua-templates";
 import type { TriggerKind } from "@/types/scripts";
-import {
-  DEFAULT_JOB_SCRIPT_BODY,
-  DEFAULT_SCRIPT_BODY,
-  TRIGGER_KIND_LABELS,
-  parseTriggerId,
-} from "@/types/scripts";
+import { TRIGGER_KIND_LABELS, parseTriggerId } from "@/types/scripts";
 
 /**
  * Sentinel suffix used when the operator picks "Actor" in the lexicon
@@ -125,6 +121,19 @@ export function isValidJobType(value: string): boolean {
   return (
     value.length > 0 && value.length <= 128 && JOB_TYPE_PATTERN.test(value)
   );
+}
+
+/**
+ * Change the trigger kind, swapping the prefilled body along with it while
+ * the operator has not touched it. Each kind reads its return value
+ * differently, so a prefill written for one kind is wrong for another.
+ */
+function withKind(state: ScriptFormState, kind: TriggerKind): ScriptFormState {
+  return {
+    ...state,
+    kind,
+    body: isDefaultBody(state.body) ? defaultBodyFor(kind) : state.body,
+  };
 }
 
 function actionsFor(
@@ -262,24 +271,16 @@ function TriggerComposer({
     if (actions.length === 0) return;
     const current = stateRef.current;
     if (!actions.some((a) => a.kind === current.kind)) {
-      onChange({ ...current, kind: actions[0].kind });
+      onChange(withKind(current, actions[0].kind));
     }
   }, [actions, onChange]);
 
   function handleSourceChange(next: string) {
-    const wasJob = state.source === JOB_SOURCE;
-    const isNowJob = next === JOB_SOURCE;
-    const bodyIsDefault =
-      state.body === DEFAULT_SCRIPT_BODY ||
-      state.body === DEFAULT_JOB_SCRIPT_BODY;
-
-    if (isNowJob) {
+    if (next === JOB_SOURCE) {
       onChange({
-        ...state,
+        ...withKind(state, "job.run"),
         source: JOB_SOURCE,
         suffix: "",
-        kind: "job.run",
-        body: bodyIsDefault ? DEFAULT_JOB_SCRIPT_BODY : state.body,
       });
       return;
     }
@@ -288,11 +289,9 @@ function TriggerComposer({
       ? state.kind
       : (nextActions[0]?.kind ?? state.kind);
     onChange({
-      ...state,
+      ...withKind(state, nextKind),
       source: next,
       suffix: next,
-      kind: nextKind,
-      body: wasJob && bodyIsDefault ? DEFAULT_SCRIPT_BODY : state.body,
     });
   }
 
@@ -393,7 +392,7 @@ function TriggerComposer({
               <Select
                 value={state.kind}
                 onValueChange={(v) =>
-                  onChange({ ...state, kind: v as TriggerKind })
+                  onChange(withKind(state, v as TriggerKind))
                 }
                 disabled={actions.length <= 1}
               >
