@@ -61,6 +61,7 @@ async fn record_imports_round_trip_through_wasm() {
         .await
         .unwrap();
     assert_eq!(page["records"][0]["uri"], "at://a/c/2");
+    assert_eq!(page["records"][0]["record"], json!({"n": "two"}));
     assert!(page["cursor"].is_string());
 
     let n = exec
@@ -85,7 +86,18 @@ async fn record_imports_round_trip_through_wasm() {
         )
         .await
         .unwrap();
-    assert_eq!(got["n"], "one");
+    assert_eq!(
+        got,
+        json!({
+            "uri": "at://a/c/1",
+            "did": "did:plc:a",
+            "collection": "c",
+            "rkey": "1",
+            "cid": "cid1",
+            "indexed_at": null,
+            "record": {"n": "one"},
+        })
+    );
 
     let found = exec
         .call_library(
@@ -98,6 +110,8 @@ async fn record_imports_round_trip_through_wasm() {
         .await
         .unwrap();
     assert_eq!(found.as_array().unwrap().len(), 1);
+    assert_eq!(found[0]["uri"], "at://a/c/2");
+    assert_eq!(found[0]["record"]["n"], "two");
 
     let back = exec
         .call_library(
@@ -110,6 +124,7 @@ async fn record_imports_round_trip_through_wasm() {
         .await
         .unwrap();
     assert_eq!(back["records"][0]["uri"], "at://a/c/2");
+    assert_eq!(back["records"][0]["record"]["n"], "two");
 
     let rows = exec.call_library("sdk_objects", "table_query", &[json!({"table": "leaderboard", "filter": {"field": "score", "op": ">", "value": "100"}})], &ctx, 0).await.unwrap();
     assert_eq!(rows[0]["name"], "y");
@@ -131,14 +146,14 @@ async fn chain_through_lua_require() {
            function handle()
              local d = o.chain("a"):add(1):doc()
              local page = o.records_query({ collection = "c", limit = 1 })
-             return d.args[1] .. ":" .. #d.steps .. ":" .. page.records[1].uri
+             return d.args[1] .. ":" .. #d.steps .. ":" .. page.records[1].uri .. ":" .. page.records[1].record.n
            end"#,
     )
     .exec()
     .unwrap();
     let handle: mlua::Function = lua.globals().get("handle").unwrap();
     let out: String = handle.call_async(()).await.unwrap();
-    assert_eq!(out, "a:1:at://a/c/2");
+    assert_eq!(out, "a:1:at://a/c/2:two");
 }
 
 #[tokio::test]

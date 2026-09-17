@@ -84,6 +84,20 @@ fn lua_err(e: RecordsError) -> mlua::Error {
     }
 }
 
+/// The `db` global's row shape: the stored body with `uri` injected, which is
+/// what scripts written against it read. The reads underneath return an
+/// envelope, and this global is the boundary that flattens it.
+fn flatten(envelope: &JsonValue) -> JsonValue {
+    let mut record = envelope
+        .get("record")
+        .cloned()
+        .unwrap_or_else(|| JsonValue::Object(Default::default()));
+    if let (Some(obj), Some(uri)) = (record.as_object_mut(), envelope.get("uri")) {
+        obj.insert("uri".to_string(), uri.clone());
+    }
+    record
+}
+
 fn page_to_lua(lua: &Lua, page: RecordsPage) -> LuaResult<mlua::Value> {
     let result = lua.create_table()?;
     if let Some(cursor) = page.cursor {
@@ -92,7 +106,7 @@ fn page_to_lua(lua: &Lua, page: RecordsPage) -> LuaResult<mlua::Value> {
     let values: Vec<mlua::Value> = page
         .records
         .iter()
-        .map(|r| lua.to_value(r))
+        .map(|r| lua.to_value(&flatten(r)))
         .collect::<LuaResult<_>>()?;
     let records = lua.create_sequence_from(values)?;
     records.set_metatable(Some(lua.array_metatable()))?;
@@ -167,7 +181,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
                 .await
                 .map_err(lua_err)?;
             match record {
-                Some(record) => lua.to_value(&record),
+                Some(record) => lua.to_value(&flatten(&record)),
                 None => Ok(mlua::Value::Nil),
             }
         }
@@ -194,7 +208,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
 
             let record_values: Vec<mlua::Value> = records
                 .iter()
-                .map(|r| lua.to_value(r))
+                .map(|r| lua.to_value(&flatten(r)))
                 .collect::<LuaResult<_>>()?;
             let records_table = lua.create_sequence_from(record_values)?;
             records_table.set_metatable(Some(lua.array_metatable()))?;
@@ -598,6 +612,20 @@ mod tests {
             err.contains("invalid sortDirection"),
             "expected sortDirection error, got: {err}"
         );
+    }
+
+    #[test]
+    fn flatten_puts_the_uri_on_the_body_and_drops_the_rest() {
+        let envelope = json!({
+            "uri": "at://a/c/1",
+            "did": "did:plc:a",
+            "collection": "c",
+            "rkey": "1",
+            "cid": "cid1",
+            "indexed_at": null,
+            "record": {"n": "one", "uri": "at://spoof"},
+        });
+        assert_eq!(flatten(&envelope), json!({"n": "one", "uri": "at://a/c/1"}));
     }
 
     #[test]

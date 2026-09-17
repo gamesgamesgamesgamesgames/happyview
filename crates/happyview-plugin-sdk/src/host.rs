@@ -346,7 +346,9 @@ fn call_void<S: serde::Serialize>(
     call_spec::<_, Option<Value>>(import, spec).map(|_| ())
 }
 
-/// Page through indexed records matching a filter. Needs `records:read`.
+/// Page through indexed records matching a filter; each entry of the page is a
+/// [`RecordEnvelope`](crate::wire::RecordEnvelope) as JSON. Needs
+/// `records:read`.
 pub fn records_query(spec: &RecordsQuery) -> Result<RecordsPage, PluginError> {
     #[cfg(target_arch = "wasm32")]
     {
@@ -372,8 +374,9 @@ pub fn records_count(spec: &RecordsCount) -> Result<i64, PluginError> {
     }
 }
 
-/// Fetch one indexed record by its `at://` URI. `Ok(None)` means it is not
-/// indexed. Needs `records:read`.
+/// Fetch one indexed record by its `at://` URI, as a
+/// [`RecordEnvelope`](crate::wire::RecordEnvelope) in JSON. `Ok(None)` means
+/// it is not indexed. Needs `records:read`.
 pub fn records_get(uri: &str) -> Result<Option<Value>, PluginError> {
     #[cfg(target_arch = "wasm32")]
     {
@@ -386,7 +389,8 @@ pub fn records_get(uri: &str) -> Result<Option<Value>, PluginError> {
     }
 }
 
-/// Substring-search one JSON field across a collection's records. Needs
+/// Substring-search one JSON field across a collection's records; each match
+/// is a [`RecordEnvelope`](crate::wire::RecordEnvelope) as JSON. Needs
 /// `records:read`.
 pub fn records_search(spec: &RecordsSearch) -> Result<Vec<Value>, PluginError> {
     #[cfg(target_arch = "wasm32")]
@@ -414,7 +418,9 @@ pub fn table_query(spec: &TableQuery) -> Result<Value, PluginError> {
     }
 }
 
-/// Page through records that reference a given URI. Needs `records:read`.
+/// Page through records that reference a given URI; each entry of the page is
+/// a [`RecordEnvelope`](crate::wire::RecordEnvelope) as JSON. Needs
+/// `records:read`.
 pub fn backlinks_query(spec: &BacklinksQuery) -> Result<RecordsPage, PluginError> {
     #[cfg(target_arch = "wasm32")]
     {

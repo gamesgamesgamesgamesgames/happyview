@@ -556,9 +556,32 @@ pub struct BacklinksQuery {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecordsPage {
+    /// Each entry is a [`RecordEnvelope`] as JSON.
     pub records: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+}
+
+/// One indexed record as `host_records_query`, `host_records_get`,
+/// `host_records_search` and `host_backlinks_query` return it: the index's
+/// columns beside the stored body, the way an XRPC `getRecord` answers. The
+/// body sits under its own key so a record may carry any field, `uri`
+/// included, without colliding with what the index knows about it.
+///
+/// `cid` is null while the row holds the empty placeholder a local index write
+/// stores; `indexed_at` is null until the network has echoed the record back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordEnvelope {
+    pub uri: String,
+    pub did: String,
+    pub collection: String,
+    pub rkey: String,
+    #[serde(default)]
+    pub cid: Option<String>,
+    #[serde(default)]
+    pub indexed_at: Option<String>,
+    /// The stored body verbatim.
+    pub record: Value,
 }
 
 /// A strong reference to an AT Protocol record, as `host_lookup_record` returns it.

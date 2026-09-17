@@ -183,15 +183,18 @@ pub async fn create_record(
     if spec.validate {
         check_against_lexicon(caller, &spec.collection, &spec.record).await?;
     }
+    let record = with_type(spec.record, &spec.collection);
     let body = create_body(
         &repo,
         &spec.collection,
         spec.rkey.as_deref(),
-        &spec.record,
+        &record,
         spec.validate,
     );
     let result = post(caller, &repo, "com.atproto.repo.createRecord", &body).await?;
-    record_ref(&result)
+    let reference = record_ref(&result)?;
+    mirror_write(caller, &reference, &record).await;
+    Ok(reference)
 }
 
 pub async fn put_record(
@@ -204,16 +207,19 @@ pub async fn put_record(
     if spec.validate {
         check_against_lexicon(caller, &collection, &spec.record).await?;
     }
+    let record = with_type(spec.record, &collection);
     let body = put_body(
         &repo,
         &collection,
         &rkey,
-        &spec.record,
+        &record,
         spec.swap_cid.as_deref(),
         spec.validate,
     );
     let result = post(caller, &repo, "com.atproto.repo.putRecord", &body).await?;
-    record_ref(&result)
+    let reference = record_ref(&result)?;
+    mirror_write(caller, &reference, &record).await;
+    Ok(reference)
 }
 
 pub async fn delete_record(
@@ -225,7 +231,57 @@ pub async fn delete_record(
         .map_err(CallerError::WritableRepo)?;
     let body = delete_body(&repo, &collection, &rkey);
     post(caller, &repo, "com.atproto.repo.deleteRecord", &body).await?;
+    let state = &caller.app_state;
+    if let Err(e) = super::mirror_network_delete(&state.db, state.db_backend, &spec.uri).await {
+        tracing::warn!(uri = %spec.uri, "record deleted on the PDS but still in the index: {e}");
+    }
     Ok(())
+}
+
+/// The PDS has accepted the write, so the index is told what it holds.
+/// A mirror that fails leaves the index stale until Jetstream echoes the
+/// record; it never turns an accepted write into an error the script would
+/// have to undo.
+async fn mirror_write(caller: &CallerSession, reference: &RecordRef, record: &Value) {
+    let state = &caller.app_state;
+    let (did, collection, rkey) = match parse_at_uri(&reference.uri) {
+        Ok(parts) => parts,
+        Err(e) => {
+            tracing::warn!(
+                uri = %reference.uri,
+                "record written to the PDS but its index row not written: {e}"
+            );
+            return;
+        }
+    };
+    let mirrored = super::mirror_network_write(
+        &state.db,
+        state.db_backend,
+        super::NetworkWrite {
+            uri: &reference.uri,
+            did: &did,
+            collection: &collection,
+            rkey: &rkey,
+            record,
+            cid: &reference.cid,
+        },
+    )
+    .await;
+    if let Err(e) = mirrored {
+        tracing::warn!(uri = %reference.uri, "record written to the PDS but its index mirror failed: {e}");
+    }
+}
+
+/// A record carries `$type = collection` on the wire, and a PDS fills it in
+/// when absent, so the body the index mirrors has to carry it too or the row's
+/// body would not match the version its `cid` describes.
+fn with_type(mut record: Value, collection: &str) -> Value {
+    if let Some(obj) = record.as_object_mut()
+        && !obj.contains_key("$type")
+    {
+        obj.insert("$type".to_string(), json!(collection));
+    }
+    record
 }
 
 /// Returns the PDS's blob reference verbatim, so the guest can drop it into a
@@ -434,6 +490,24 @@ mod tests {
             true,
         );
         assert_eq!(guarded["swapRecord"], "bafy");
+    }
+
+    #[test]
+    fn a_record_without_a_type_gets_its_collection_as_one() {
+        let typed = with_type(json!({"a": 1}), "app.bsky.feed.post");
+        assert_eq!(typed, json!({"$type": "app.bsky.feed.post", "a": 1}));
+        let body = create_body("did:plc:me", "app.bsky.feed.post", None, &typed, true);
+        assert_eq!(body["record"]["$type"], "app.bsky.feed.post");
+    }
+
+    #[test]
+    fn an_existing_type_is_left_alone() {
+        let record = json!({"$type": "app.bsky.feed.like", "a": 1});
+        assert_eq!(with_type(record.clone(), "app.bsky.feed.post"), record);
+        assert_eq!(
+            with_type(json!("scalar"), "app.bsky.feed.post"),
+            json!("scalar")
+        );
     }
 
     #[test]

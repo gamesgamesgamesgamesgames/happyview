@@ -529,5 +529,342 @@ async fn index_put_and_lexicon_get_round_trip() {
         .await
         .unwrap()
         .expect("index_put should have made the record readable through records_get");
-    assert_eq!(row["title"], "Indexed");
+    assert_eq!(row["record"]["title"], "Indexed");
+}
+
+// ---------------------------------------------------------------------------
+// Mirroring: a write through the caller lands in the index at once
+// ---------------------------------------------------------------------------
+
+async fn indexed(app: &TestApp, uri: &str) -> Option<Value> {
+    happyview::plugin::host::records_get(&app.state.db, app.state.db_backend, uri)
+        .await
+        .unwrap()
+}
+
+async fn ref_targets(app: &TestApp, source_uri: &str) -> Vec<String> {
+    let sql = happyview::db::adapt_sql(
+        "SELECT target_uri FROM happyview_record_refs WHERE source_uri = ? ORDER BY target_uri",
+        app.state.db_backend,
+    );
+    let rows: Vec<(String,)> = happyview::db::query_as(&sql)
+        .bind(source_uri)
+        .fetch_all(&app.state.db)
+        .await
+        .unwrap();
+    rows.into_iter().map(|(t,)| t).collect()
+}
+
+async fn set_indexed_at(app: &TestApp, uri: &str, indexed_at: &str) {
+    let sql = happyview::db::adapt_sql(
+        "UPDATE happyview_records SET indexed_at = ? WHERE uri = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(indexed_at)
+        .bind(uri)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+}
+
+/// Mount a PDS write endpoint for `did` that answers `response` once.
+async fn mount_pds_write(
+    app: &TestApp,
+    did: &str,
+    method: &str,
+    access_token: &str,
+    response: Value,
+) {
+    Mock::given(wiremock::matchers::method("POST"))
+        .and(path(format!("/pds/{did}/xrpc/com.atproto.repo.{method}")))
+        .and(header(
+            "authorization",
+            format!("DPoP {access_token}").as_str(),
+        ))
+        .and(body_partial_json(json!({ "repo": did })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .expect(1)
+        .mount(&app.mock_server)
+        .await;
+}
+
+/// Make the index refuse rows in `collection`, so a PDS write can succeed
+/// while its mirror cannot. `allow_collection` undoes it; both run at the
+/// start of the test that needs them so an earlier panic cannot leave the
+/// probe behind.
+async fn refuse_collection(app: &TestApp, collection: &str) {
+    let sql = match app.state.db_backend {
+        happyview::db::DatabaseBackend::Postgres => format!(
+            "ALTER TABLE happyview_records ADD CONSTRAINT mirror_probe CHECK (collection <> '{collection}')"
+        ),
+        happyview::db::DatabaseBackend::Sqlite => format!(
+            "CREATE TRIGGER mirror_probe BEFORE INSERT ON happyview_records \
+             WHEN NEW.collection = '{collection}' \
+             BEGIN SELECT RAISE(ABORT, 'mirror probe'); END"
+        ),
+    };
+    happyview::db::query(&sql)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+}
+
+async fn allow_collection(app: &TestApp) {
+    let sql = match app.state.db_backend {
+        happyview::db::DatabaseBackend::Postgres => {
+            "ALTER TABLE happyview_records DROP CONSTRAINT IF EXISTS mirror_probe"
+        }
+        happyview::db::DatabaseBackend::Sqlite => "DROP TRIGGER IF EXISTS mirror_probe",
+    };
+    happyview::db::query(sql)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn a_created_record_is_mirrored_into_the_index() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(
+        &app,
+        &format!("xrpc.procedure:{CREATE_GAME}"),
+        "function handle(input, ctx)\n\
+           local c = require(\"caller\")\n\
+           return c.create_record({ collection = \"com.example.post\", record = { text = input.text, subject = input.subject }, validate = false })\n\
+         end",
+    )
+    .await;
+
+    const DID: &str = "did:plc:sdkcallermirror";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+    update_session_pds_url(&app, DID, &format!("{}/pds/{DID}", app.mock_server.uri())).await;
+    let uri = format!("at://{DID}/com.example.post/abc");
+    mount_pds_write(
+        &app,
+        DID,
+        "createRecord",
+        &access_token,
+        json!({ "uri": uri, "cid": "bafyreicaller" }),
+    )
+    .await;
+
+    let resp = dpop_post(
+        &app,
+        &format!("/xrpc/{CREATE_GAME}"),
+        &json!({ "text": "hello", "subject": "at://did:plc:other/com.example.post/parent" }),
+        &client_key,
+        &dpop_key,
+        &access_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let row = indexed(&app, &uri)
+        .await
+        .expect("the write is in the index");
+    assert_eq!(row["did"], DID);
+    assert_eq!(row["collection"], "com.example.post");
+    assert_eq!(row["rkey"], "abc");
+    assert_eq!(row["cid"], "bafyreicaller");
+    assert!(row["indexed_at"].is_null(), "{row}");
+    assert_eq!(
+        row["record"],
+        json!({
+            "$type": "com.example.post",
+            "text": "hello",
+            "subject": "at://did:plc:other/com.example.post/parent",
+        })
+    );
+    assert_eq!(
+        ref_targets(&app, &uri).await,
+        vec!["at://did:plc:other/com.example.post/parent"]
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_put_record_replaces_the_mirrored_cid_and_keeps_indexed_at() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(
+        &app,
+        &format!("xrpc.procedure:{CREATE_GAME}"),
+        "function handle(input, ctx)\n\
+           local c = require(\"caller\")\n\
+           return c.put_record({ uri = input.uri, record = { text = input.text }, validate = false })\n\
+         end",
+    )
+    .await;
+
+    const DID: &str = "did:plc:sdkcallerputter";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+    update_session_pds_url(&app, DID, &format!("{}/pds/{DID}", app.mock_server.uri())).await;
+    let uri = format!("at://{DID}/com.example.post/abc");
+    happyview::plugin::host::index_put(
+        &app.state.db,
+        app.state.db_backend,
+        happyview_plugin_sdk::wire::IndexPut {
+            collection: "com.example.post".into(),
+            rkey: "abc".into(),
+            did: Some(DID.into()),
+            record: json!({ "text": "first" }),
+            cid: Some("bafyold".into()),
+        },
+    )
+    .await
+    .unwrap();
+    set_indexed_at(&app, &uri, "2026-01-01T00:00:00+00:00").await;
+    mount_pds_write(
+        &app,
+        DID,
+        "putRecord",
+        &access_token,
+        json!({ "uri": uri, "cid": "bafynew" }),
+    )
+    .await;
+
+    let resp = dpop_post(
+        &app,
+        &format!("/xrpc/{CREATE_GAME}"),
+        &json!({ "uri": uri, "text": "second" }),
+        &client_key,
+        &dpop_key,
+        &access_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cid"], "bafynew");
+
+    let row = indexed(&app, &uri).await.expect("the row is still there");
+    assert_eq!(row["cid"], "bafynew");
+    assert_eq!(row["indexed_at"], "2026-01-01T00:00:00+00:00");
+    assert_eq!(
+        row["record"],
+        json!({ "$type": "com.example.post", "text": "second" })
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_deleted_record_leaves_the_index_with_its_refs() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(
+        &app,
+        &format!("xrpc.procedure:{CREATE_GAME}"),
+        "function handle(input, ctx)\n\
+           local c = require(\"caller\")\n\
+           c.delete_record({ uri = input.uri })\n\
+           return { deleted = true }\n\
+         end",
+    )
+    .await;
+
+    const DID: &str = "did:plc:sdkcallerdeleter";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+    update_session_pds_url(&app, DID, &format!("{}/pds/{DID}", app.mock_server.uri())).await;
+    let uri = format!("at://{DID}/com.example.post/abc");
+    happyview::plugin::host::index_put(
+        &app.state.db,
+        app.state.db_backend,
+        happyview_plugin_sdk::wire::IndexPut {
+            collection: "com.example.post".into(),
+            rkey: "abc".into(),
+            did: Some(DID.into()),
+            record: json!({ "text": "bye", "subject": "at://did:plc:other/com.example.post/parent" }),
+            cid: Some("bafyold".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(ref_targets(&app, &uri).await.len(), 1);
+    mount_pds_write(&app, DID, "deleteRecord", &access_token, json!({})).await;
+
+    let resp = dpop_post(
+        &app,
+        &format!("/xrpc/{CREATE_GAME}"),
+        &json!({ "uri": uri }),
+        &client_key,
+        &dpop_key,
+        &access_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["deleted"], true);
+
+    assert!(indexed(&app, &uri).await.is_none());
+    assert!(ref_targets(&app, &uri).await.is_empty());
+}
+
+/// The PDS accepted the write, so the script gets its reference whatever the
+/// index did with it: a mirror that cannot land is the index's problem until
+/// Jetstream catches it up, never the script's.
+#[tokio::test]
+#[serial]
+async fn a_mirror_failure_leaves_the_write_successful() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(
+        &app,
+        &format!("xrpc.procedure:{CREATE_GAME}"),
+        "function handle(input, ctx)\n\
+           local c = require(\"caller\")\n\
+           return c.create_record({ collection = \"com.example.unmirrorable\", record = { text = input.text }, validate = false })\n\
+         end",
+    )
+    .await;
+
+    const DID: &str = "did:plc:sdkcallerunmirrored";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+    update_session_pds_url(&app, DID, &format!("{}/pds/{DID}", app.mock_server.uri())).await;
+    let uri = format!("at://{DID}/com.example.unmirrorable/abc");
+    mount_pds_write(
+        &app,
+        DID,
+        "createRecord",
+        &access_token,
+        json!({ "uri": uri, "cid": "bafyreicaller" }),
+    )
+    .await;
+
+    allow_collection(&app).await;
+    refuse_collection(&app, "com.example.unmirrorable").await;
+    let resp = dpop_post(
+        &app,
+        &format!("/xrpc/{CREATE_GAME}"),
+        &json!({ "text": "hello" }),
+        &client_key,
+        &dpop_key,
+        &access_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    let row = indexed(&app, &uri).await;
+    allow_collection(&app).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["uri"], uri);
+    assert_eq!(body["cid"], "bafyreicaller");
+    assert!(
+        row.is_none(),
+        "the probe should have refused the mirror: {row:?}"
+    );
 }

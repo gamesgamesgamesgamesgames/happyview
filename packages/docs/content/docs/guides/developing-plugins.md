@@ -291,12 +291,14 @@ A plugin declaring the listed capability can import the matching function below.
 
 | Import | Capability | Spec |
 | --------------------------- | ----------------------------------- | ------------------------------------------------------------------------------- |
-| `host_records_query`        | `records:read`                      | `{collection, did?, filter?, sort?, limit?, cursor?}` → `{records, cursor?}`     |
+| `host_records_query`        | `records:read`                      | `{collection, did?, filter?, sort?, limit?, cursor?}` → `{records, cursor?}`, each record an envelope |
 | `host_records_count`        | `records:read`                      | `{collection, did?, filter?}` → integer                                         |
-| `host_records_get`          | `records:read`                      | `{uri}` → record or null                                                        |
-| `host_records_search`       | `records:read`                      | `{collection, field, query, limit?}` → records                                  |
-| `host_backlinks_query`      | `records:read`                      | `{uri, collection, did?, limit?, cursor?}` → `{records, cursor?}`                |
+| `host_records_get`          | `records:read`                      | `{uri}` → envelope or null                                                      |
+| `host_records_search`       | `records:read`                      | `{collection, field, query, limit?}` → envelopes                                |
+| `host_backlinks_query`      | `records:read`                      | `{uri, collection, did?, limit?, cursor?}` → `{records, cursor?}`, each record an envelope |
 | `host_table_query`          | `database:read` or `database:write` | `{table, filter?, sort?, limit?, count?}` → rows, or an integer when `count` is set |
+
+An envelope is `{uri, did, collection, rkey, cid, indexed_at, record}`: the stored body sits under `record` untouched, a PDS write carries its `cid` at once while `indexed_at` stays null until the network echoes the record, and a `save_local` row has neither.
 
 `filter`, on `host_records_query`, `host_records_count`, and `host_table_query`, is `{field, op, value}` or `{combine: "and"|"or", conditions: [...]}`, nesting capped at 5.
 
@@ -325,7 +327,7 @@ Every host function except `host_log` is gated by a capability. The loader reads
 | `database:read` | High | Run arbitrary read-only SQL against indexed records, labels, lexicons, jobs and space data. Internal auth, secret and key tables are blocked. |
 | `database:write` | Critical | Run arbitrary SQL, including `INSERT`, `UPDATE`, `DELETE` and `DROP`, against indexed records, labels, lexicons, jobs and space data. This can destroy your index. |
 | `caller:read` | Medium | Read from the AT Protocol network as the user who ran the script. |
-| `caller:write` | High | Create, update and delete records in the user's own repository and upload blobs to it. |
+| `caller:write` | High | Create, update and delete records in the user's own repository and upload blobs to it. Each record write is mirrored into the local index at once, so the plugin sees its own write on the next read. |
 | `caller:call` | Critical | Call any XRPC procedure as the user, including ones that change their account. A procedure this instance does not serve is forwarded to the NSID's authority without the user's credentials. |
 | `records:write` | High | Write to this instance's record index directly, bypassing the network. This can replace the body of a record that arrived from the network while its CID and indexed time stay as the network set them. |
 | `atproto:read` | Medium | Resolve any DID's service endpoints, download blobs from any repo on the network, look up labels applied to any URI, and verify this instance's attestation signatures. |
@@ -353,9 +355,9 @@ A plugin declaring `caller:read`, `caller:write`, `caller:call`, or `records:wri
 | Import | Capability | Spec → result |
 | --------------------------- | ------------ | ------------------------------------------------------------------------------- |
 | `host_caller_xrpc_query`    | `caller:read`  | `{method, params?}` → the response body |
-| `host_caller_create_record` | `caller:write` | `{collection, rkey?, repo?, record, validate}` → `{uri, cid}` |
-| `host_caller_put_record`    | `caller:write` | `{uri, record, swap_cid?, validate}` → `{uri, cid}` |
-| `host_caller_delete_record` | `caller:write` | `{uri}` → nothing |
+| `host_caller_create_record` | `caller:write` | `{collection, rkey?, repo?, record, validate}` → `{uri, cid}`; mirrored into the index |
+| `host_caller_put_record`    | `caller:write` | `{uri, record, swap_cid?, validate}` → `{uri, cid}`; mirrored into the index |
+| `host_caller_delete_record` | `caller:write` | `{uri}` → nothing; removed from the index |
 | `host_caller_upload_blob`   | `caller:write` | `{bytes, mime_type}` → the PDS's blob reference |
 | `host_caller_xrpc_procedure`| `caller:call`  | `{method, input, params?}` → the response body |
 | `host_records_index_put`    | `records:write`| `{collection, rkey, did?, record, cid?}` → `{uri, cid}` |
@@ -444,6 +446,7 @@ function handle()
     :limit(20)
     :run()
 
+  -- each entry is an envelope; the post itself is entry.record
   return page.records
 end
 ```
