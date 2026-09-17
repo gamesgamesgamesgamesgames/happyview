@@ -17,18 +17,12 @@ local Record = (function()
   local __codemod_methods = {}
   local __codemod_meta = {}
 
-  -- Which records came out of `load`, kept beside the object rather than on
-  -- it so a record handed back as a response carries only the keys v2 gave
-  -- it. Weak keys let a record be collected with the script that made it.
-  local __codemod_loaded = setmetatable({}, { __mode = "k" })
-
   -- The lexicon lookup is a v3 export the shim cannot do without; naming it
   -- here turns a library that predates it into a failure that says so.
   local __codemod_lexicon = record.lexicon
 
-  -- `at://<did>/<collection>/<rkey>`, the only place a loaded record's
-  -- collection and repo are still written down once the library has handed
-  -- back the body alone.
+  -- `at://<did>/<collection>/<rkey>`: a record that has only its `_uri` still
+  -- has to say which repo and key a local save goes to.
   local function __codemod_parse_uri(uri)
     return string.match(uri, "^at://([^/]+)/([^/]+)/(.+)$")
   end
@@ -57,20 +51,6 @@ local Record = (function()
     end
     body["$type"] = rawget(self, "_collection")
     return body
-  end
-
-  -- v2 wrote a saved record into the local index beside the PDS write, so a
-  -- script reads its own write back at once instead of after Jetstream
-  -- delivers it. The row's cid and indexed_at are the network's to set.
-  local function __codemod_mirror(self, uri)
-    local did, _, rkey = __codemod_parse_uri(uri)
-    if did == nil then
-      return
-    end
-    local ok, err = pcall(record.save_local, rawget(self, "_collection"), rkey, __codemod_fields(self), did)
-    if not ok then
-      log.warn("Record:save() reached the PDS but not the local index for " .. uri .. ": " .. tostring(err))
-    end
   end
 
   local function __codemod_require_lexicon()
@@ -124,17 +104,7 @@ local Record = (function()
   end
 
   function __codemod_meta.__index(self, key)
-    local method = __codemod_methods[key]
-    if method ~= nil then
-      return method
-    end
-    -- v3 hands back a record's body and nothing else, so a record this script
-    -- loaded has no CID to offer, and answering nil would read as a record
-    -- without one. A record saved locally never had a CID on either side.
-    if key == "_cid" and __codemod_loaded[self] then
-      error("_cid is only set by :save(); v3 reports no CID for a record read out of the index")
-    end
-    return nil
+    return __codemod_methods[key]
   end
 
   function __codemod_meta.__newindex(self, key, value)
@@ -204,7 +174,6 @@ local Record = (function()
     end
     rawset(self, "_uri", ref.uri)
     rawset(self, "_cid", ref.cid)
-    __codemod_mirror(self, ref.uri)
     return ref
   end
 
@@ -213,26 +182,21 @@ local Record = (function()
     return self
   end
 
-  -- v2 refused to delete anything without a caller, tried the PDS only for a
-  -- repo the caller can write, and dropped the index row whatever the PDS
-  -- answered, because "remove it from view" stays meaningful either way.
+  -- v2 refused to delete anything without a caller, and dropped the index
+  -- row whatever else the PDS answered, because "remove it from view" stays
+  -- meaningful either way.
   function __codemod_methods.delete(self)
     local uri = rawget(self, "_uri")
     if uri == nil then
       error("cannot delete a Record that has no _uri")
     end
     local ok, err = pcall(record.delete, uri)
-    if not ok then
-      local message = tostring(err)
-      if string.find(message, "NO_SESSION", 1, true) then
-        error("no PDS auth in this script context — use :save_local() / :delete_local() / Record.delete_local(uri) for local-only mutation")
-      end
-      log.warn("PDS deleteRecord skipped or failed for " .. uri .. ": " .. message .. " — proceeding with local delete anyway")
+    if not ok and string.find(tostring(err), "NO_SESSION", 1, true) then
+      error("no PDS auth in this script context — use :save_local() / :delete_local() / Record.delete_local(uri) for local-only mutation")
     end
     record.delete_local(uri)
     rawset(self, "_uri", nil)
     rawset(self, "_cid", nil)
-    __codemod_loaded[self] = nil
     return self
   end
 
@@ -266,7 +230,6 @@ local Record = (function()
     record.delete_local(uri)
     rawset(self, "_uri", nil)
     rawset(self, "_cid", nil)
-    __codemod_loaded[self] = nil
     return self
   end
 
@@ -274,19 +237,18 @@ local Record = (function()
 
   function __codemod_Record.load(uri)
     __codemod_require_lexicon()
-    local body = record.load(uri)
-    if body == nil then
+    local row = record.load(uri)
+    if row == nil then
       return nil
     end
-    local _, collection = __codemod_parse_uri(uri)
-    local self = __codemod_build(collection, uri, __codemod_main_def(collection))
-    __codemod_loaded[self] = true
-    for key, value in pairs(body) do
-      -- `$type` comes back on save from the collection. The library writes its
-      -- own `uri` key into every body it returns, over a stored one, so a
-      -- stored `uri` field cannot be told from the injected key and goes with
-      -- it.
-      if key ~= "$type" and key ~= "uri" then
+    local self = __codemod_build(row.collection, row.uri, __codemod_main_def(row.collection))
+    -- v2 read the cid column as a string, so a row written only by
+    -- `save_local` carried an empty one; an envelope with no cid reads the
+    -- same here.
+    rawset(self, "_cid", row.cid or "")
+    for key, value in pairs(row.record) do
+      -- `$type` comes back on save from the collection.
+      if key ~= "$type" then
         rawset(self, key, value)
       end
     end

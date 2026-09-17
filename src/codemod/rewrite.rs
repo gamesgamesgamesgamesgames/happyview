@@ -31,8 +31,6 @@ const MARK_AUTHOR_DID: &str =
     "v3 space records spell it author_did -- rename this read to author_did";
 const MARK_HANDLE_PARAMS: &str = "handle takes exactly (input, ctx) in v3 -- cut this parameter list down to two, then re-run the codemod";
 const MARK_NO_HANDLE: &str = "input and ctx are handle's parameters in v3 -- declare function handle(input, ctx) and read them there";
-const MARK_LOAD_URI: &str = "Record.load cannot preserve a stored top-level uri field, v3 reads replace it with the record's own URI -- if this lexicon declares one, read the body with sql.raw over happyview_records";
-const MARK_LOADED_CID: &str = "_cid on a loaded record raises, v3 reads return no CID -- read it with sql.raw over happyview_records, or drop it";
 
 fn never_nil_message(name: &str) -> String {
     format!(
@@ -94,7 +92,7 @@ pub fn rewrite(source: &str, kind: ScriptKind) -> Result<Rewrite, CodemodError> 
     let mut blocks: Vec<String> = polyfills::ALL
         .iter()
         .filter(|polyfill| planner.polyfills.contains(polyfill.name))
-        .map(|polyfill| polyfill.block())
+        .map(|polyfill| polyfill.block(&planner.shimmed))
         .collect();
     if declare_hoist {
         blocks.push(format!(
@@ -179,20 +177,18 @@ struct Planner<'a> {
     blob_handles: HashSet<String>,
     /// Names bound to a page of space records.
     space_pages: HashSet<String>,
-    /// Names bound from `Record.load(...)`.
-    loaded_records: HashSet<String>,
     /// Start bytes of the calls that stand alone as statements, whose result
     /// nothing can read.
     statement_calls: HashSet<usize>,
     reads_spaces_query: bool,
-    /// The stored-`uri` caveat is about the shim, not a call site, so it is
-    /// said once per script.
-    load_marked: bool,
     edits: Vec<Edit>,
     notes: Vec<Note>,
     needed: BTreeSet<&'static str>,
     /// Shims the script needs, by the global each stands in for.
     polyfills: BTreeSet<&'static str>,
+    /// Canonical module names whose reads went through a shim, which is what
+    /// each shim's header names.
+    shimmed: BTreeSet<&'static str>,
     handle: Option<HandleSite>,
     /// Where the rewrite reads `input` or `ctx`. A read outside `handle`'s own
     /// body is what the hoist exists for.
@@ -219,7 +215,6 @@ impl<'a> Planner<'a> {
             spaces: HashSet::new(),
             blobs: HashSet::new(),
             pages: HashSet::new(),
-            loaded_records: HashSet::new(),
             spaces_query: false,
             handle_parameters: None,
             handle_assigns_hoisted: false,
@@ -251,14 +246,13 @@ impl<'a> Planner<'a> {
             space_handles: scan.spaces,
             blob_handles: scan.blobs,
             space_pages: scan.pages,
-            loaded_records: scan.loaded_records,
             statement_calls: HashSet::new(),
             reads_spaces_query: scan.spaces_query,
-            load_marked: false,
             edits: Vec::new(),
             notes: Vec::new(),
             needed: BTreeSet::new(),
             polyfills: BTreeSet::new(),
+            shimmed: BTreeSet::new(),
             handle: None,
             contract_sites: Vec::new(),
             markers: Vec::new(),
@@ -522,23 +516,52 @@ impl<'a> Planner<'a> {
     }
 
     /// Replace the head, its dotted names and the call that follows them —
-    /// everything up to and including `path.segs[at]`.
+    /// everything up to and including `path.segs[at]`. Answers whether the
+    /// replacement was taken.
     fn replace_through(
         &mut self,
         path: &Path<'_>,
         at: usize,
         pieces: Vec<Piece>,
         modules: &[&'static str],
-    ) {
+    ) -> bool {
         let end = match path.segs.get(at) {
             Some(Seg::Call(args)) => end_of(*args),
             Some(Seg::Method(_, args)) => end_of(*args),
             _ => None,
         };
         let (Some(start), Some(end)) = (path.start(), end) else {
-            return;
+            return false;
         };
-        self.commit(path, modules, vec![Edit { start, end, pieces }]);
+        self.commit(path, modules, vec![Edit { start, end, pieces }])
+    }
+
+    /// A read whose v3 answer is an envelope where v2 answered the body with
+    /// `uri` on it. The replacement passes the result through the flatten
+    /// shim, which is written once the first such read lands.
+    fn flatten_through(
+        &mut self,
+        path: &Path<'_>,
+        at: usize,
+        pieces: Vec<Piece>,
+        modules: &[&'static str],
+    ) {
+        if self.replace_through(path, at, pieces, modules) {
+            self.polyfills.insert(polyfills::FLATTEN.name);
+            self.shimmed.extend(modules);
+        }
+    }
+
+    /// Whether a `db.get` or `db.search` call's result is read at all. One
+    /// standing alone as a statement has no result to shape, so no wrapper is
+    /// written around it, and `db.search`'s could not be: neither a table
+    /// constructor nor a parenthesised expression is a statement. The chain
+    /// reads wrap unconditionally, since a call on a chain is an expression
+    /// either way.
+    fn result_is_read(&self, path: &Path<'_>) -> bool {
+        !self
+            .statement_calls
+            .contains(&path.start().unwrap_or(usize::MAX))
     }
 
     fn no_equivalent(&mut self, path: &Path<'_>, name: &str, module: Option<&'static str>) {
@@ -603,12 +626,6 @@ impl<'a> Planner<'a> {
                 && !matches!(path.segs.get(1), Some(Seg::Call(_)))
             {
                 self.mark(&path, MARK_SPACE_FIELD.into());
-            }
-            if self.loaded_records.contains(name)
-                && let Some(Seg::Dot(field)) = path.segs.first()
-                && identifier(field) == Some("_cid")
-            {
-                self.mark(&path, MARK_LOADED_CID.into());
             }
             // A downloaded blob is bytes and a MIME type on both sides; the
             // two spellings differ, and the v3 name implies no userdata.
@@ -767,9 +784,10 @@ impl<'a> Planner<'a> {
 
     fn visit_db(&mut self, path: &Path<'_>, dots: &[&str]) {
         match dots.first() {
-            Some(&"get") | Some(&"backend") => {
+            Some(&"backend") => {
                 self.commit(path, &["db"], Vec::new());
             }
+            Some(&"get") => self.visit_db_get(path),
             Some(&"raw") => self.rename_head(path, 1, "sql.raw", &["sql"]),
             Some(&"count") => self.visit_db_count(path),
             Some(&"search") => self.visit_db_search(path),
@@ -777,6 +795,31 @@ impl<'a> Planner<'a> {
             Some(&"backlinks") => self.visit_db_backlinks(path),
             _ => self.no_equivalent(path, "db", Some("db")),
         }
+    }
+
+    /// The argument list is carried over as source, so whatever is rewritten
+    /// inside it comes with it.
+    fn visit_db_get(&mut self, path: &Path<'_>) {
+        let Some(Seg::Call(args)) = path.segs.get(1) else {
+            return self.no_equivalent(path, "db", Some("db"));
+        };
+        if !self.result_is_read(path) {
+            self.commit(path, &["db"], Vec::new());
+            return;
+        }
+        let (Some(start), Some(end)) = (start_of(*args), end_of(*args)) else {
+            return;
+        };
+        self.flatten_through(
+            path,
+            1,
+            vec![
+                Piece::Text("__codemod_flat(db.get".into()),
+                Piece::Source(start, end),
+                Piece::Text(")".into()),
+            ],
+            &["db"],
+        );
     }
 
     fn visit_db_count(&mut self, path: &Path<'_>) {
@@ -832,14 +875,10 @@ impl<'a> Planner<'a> {
         // v2 answered with `{records = ...}` and the library answers with the
         // array itself, so the wrapper is what keeps a caller's `.records`
         // working. It is parenthesised because Lua cannot index a table
-        // constructor directly. A call standing alone as a statement has no
-        // result to shape, and neither a constructor nor a parenthesised
-        // expression is a statement, so that one is left bare.
-        let wrapped = !self
-            .statement_calls
-            .contains(&path.start().unwrap_or(usize::MAX));
+        // constructor directly.
+        let wrapped = self.result_is_read(path);
         let open = if wrapped {
-            "({ records = db.search("
+            "({ records = __codemod_flat_rows(db.search("
         } else {
             "db.search("
         };
@@ -850,8 +889,13 @@ impl<'a> Planner<'a> {
             }
             pieces.push(argument);
         }
-        pieces.push(Piece::Text(if wrapped { ") })" } else { ")" }.into()));
-        self.replace_through(path, 1, pieces, &["db"]);
+        if wrapped {
+            pieces.push(Piece::Text(")) })".into()));
+            self.flatten_through(path, 1, pieces, &["db"]);
+        } else {
+            pieces.push(Piece::Text(")".into()));
+            self.replace_through(path, 1, pieces, &["db"]);
+        }
     }
 
     fn visit_db_query(&mut self, path: &Path<'_>) {
@@ -877,7 +921,10 @@ impl<'a> Planner<'a> {
             return self.mark(path, MARK_DB_QUERY.into());
         };
 
-        let mut pieces = vec![Piece::Text("db.records(".into()), collection];
+        let mut pieces = vec![
+            Piece::Text("__codemod_flat_page(db.records(".into()),
+            collection,
+        ];
         pieces.push(Piece::Text(")".into()));
 
         if let Some(filter) = take(&options, "filter") {
@@ -947,8 +994,8 @@ impl<'a> Planner<'a> {
             pieces.push(value);
             pieces.push(Piece::Text(")".into()));
         }
-        pieces.push(Piece::Text(":run()".into()));
-        self.replace_through(path, 1, pieces, &["db"]);
+        pieces.push(Piece::Text(":run())".into()));
+        self.flatten_through(path, 1, pieces, &["db"]);
     }
 
     fn visit_db_backlinks(&mut self, path: &Path<'_>) {
@@ -965,7 +1012,7 @@ impl<'a> Planner<'a> {
         let Some(uri) = take(&options, "uri").and_then(source_piece) else {
             return self.mark(path, MARK_DB_BACKLINKS.into());
         };
-        let mut pieces = vec![Piece::Text("backlinks.to(".into()), uri];
+        let mut pieces = vec![Piece::Text("__codemod_flat_page(backlinks.to(".into()), uri];
         pieces.push(Piece::Text(")".into()));
         for key in ["collection", "did", "limit", "cursor"] {
             let Some(value) = take(&options, key) else {
@@ -978,8 +1025,8 @@ impl<'a> Planner<'a> {
             pieces.push(value);
             pieces.push(Piece::Text(")".into()));
         }
-        pieces.push(Piece::Text(":run()".into()));
-        self.replace_through(path, 1, pieces, &["backlinks"]);
+        pieces.push(Piece::Text(":run())".into()));
+        self.flatten_through(path, 1, pieces, &["backlinks"]);
     }
 
     // -- shims -----------------------------------------------------------
@@ -991,6 +1038,7 @@ impl<'a> Planner<'a> {
         let taken = self.commit(path, polyfill.modules, Vec::new());
         if taken {
             self.polyfills.insert(polyfill.name);
+            self.shimmed.extend(polyfill.over);
         }
         taken
     }
@@ -1002,14 +1050,6 @@ impl<'a> Planner<'a> {
         match dots.first() {
             None => {
                 self.need_polyfill(path, &polyfills::RECORD);
-            }
-            Some(&"load" | &"load_all") => {
-                // The caveat is about the shim's `load`, so it is said only
-                // where the shim is actually written.
-                if self.need_polyfill(path, &polyfills::RECORD) && !self.load_marked {
-                    self.load_marked = true;
-                    self.mark(path, MARK_LOAD_URI.into());
-                }
             }
             Some(name) if STATICS.contains(name) => {
                 self.need_polyfill(path, &polyfills::RECORD);
@@ -1443,7 +1483,6 @@ struct ContextScan {
     spaces: HashSet<String>,
     blobs: HashSet<String>,
     pages: HashSet<String>,
-    loaded_records: HashSet<String>,
     spaces_query: bool,
     handle_parameters: Option<Vec<String>>,
     handle_assigns_hoisted: bool,
@@ -1469,9 +1508,6 @@ impl Visitor for ContextScan {
             match path.head_name() {
                 Some("linked_repos") if dots.first() == Some(&"get") => {
                     self.linked_repos.insert(name.to_string());
-                }
-                Some("Record") if dots.first() == Some(&"load") => {
-                    self.loaded_records.insert(name.to_string());
                 }
                 Some("atproto") if dots.first() == Some(&"blob_download") => {
                     self.blobs.insert(name.to_string());
@@ -1614,14 +1650,7 @@ mod tests {
             ScriptKind::Procedure,
         )
         .unwrap();
-        assert_eq!(result.notes.len(), 1, "{:?}", result.notes);
-        assert!(
-            result.notes[0]
-                .message
-                .starts_with("Record.load cannot preserve"),
-            "{:?}",
-            result.notes
-        );
+        assert!(result.notes.is_empty(), "{:?}", result.notes);
         assert!(
             result.source.contains("local Record = (function()"),
             "{}",
@@ -1927,36 +1956,180 @@ mod tests {
     }
 
     #[test]
-    fn a_cid_read_off_a_loaded_record_is_marked() {
+    fn a_db_get_is_read_through_the_flatten_shim() {
         let result = rewrite(
-            "function handle()\n  local r = Record.load(\"at://x/c/1\")\n  return { cid = r._cid }\nend\n",
-            ScriptKind::Procedure,
+            "function handle()\n  return db.get(params.uri).title\nend\n",
+            ScriptKind::Query,
         )
         .unwrap();
+        assert!(result.notes.is_empty(), "{:?}", result.notes);
         assert!(
             result
-                .notes
-                .iter()
-                .any(|note| note.message.starts_with("_cid on a loaded record raises")),
-            "{:?}",
-            result.notes
+                .source
+                .contains("return __codemod_flat(db.get(input.uri)).title"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result
+                .source
+                .contains("-- codemod polyfill: v2 row shape over happyview.db;"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result
+                .source
+                .contains("local db = require(\"happyview.db\")"),
+            "{}",
+            result.source
         );
     }
 
     #[test]
-    fn the_stored_uri_caveat_is_said_once_per_script() {
+    fn every_read_shape_passes_through_the_shim_written_once() {
+        let result = query(
+            "function handle()\n  local one = db.get(params.uri)\n  local page = db.query({ collection = \"c\" })\n  local found = db.search({ collection = \"c\", field = \"f\", query = \"q\" })\n  local likes = db.backlinks({ uri = params.uri })\n  return { one = one, page = page, found = found, likes = likes }\nend\n",
+        );
+        assert!(
+            result.contains("__codemod_flat(db.get(input.uri))"),
+            "{result}"
+        );
+        assert!(
+            result.contains("__codemod_flat_page(db.records(\"c\"):run())"),
+            "{result}"
+        );
+        assert!(
+            result.contains("({ records = __codemod_flat_rows(db.search(\"c\", \"f\", \"q\")) })"),
+            "{result}"
+        );
+        assert!(
+            result.contains("__codemod_flat_page(backlinks.to(input.uri):run())"),
+            "{result}"
+        );
+        assert_eq!(
+            result.matches("-- codemod polyfill: v2 row shape").count(),
+            1,
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn a_backlinks_read_alone_needs_no_db_require_for_the_shim() {
+        let result = query("function handle()\n  return db.backlinks({ uri = params.uri })\nend\n");
+        assert!(!result.contains("require(\"happyview.db\")"), "{result}");
+        assert!(
+            result.contains("local backlinks = require(\"happyview.backlinks\")"),
+            "{result}"
+        );
+        assert!(
+            result.contains("-- codemod polyfill: v2 row shape over happyview.backlinks;"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn a_bare_db_search_statement_writes_no_shim() {
+        let result = query(
+            "function handle()\n  db.search({ collection = \"c\", field = \"f\", query = \"q\" })\n  return {}\nend\n",
+        );
+        assert!(
+            result.contains("  db.search(\"c\", \"f\", \"q\")\n"),
+            "{result}"
+        );
+        assert!(!result.contains("__codemod_flat"), "{result}");
+    }
+
+    #[test]
+    fn a_bare_db_get_statement_is_neither_wrapped_nor_shimmed() {
         let result = rewrite(
-            "function handle()\n  local a = Record.load(\"at://x/c/1\")\n  local b = Record.load_all({ \"at://x/c/2\" })\n  return { a = a, b = b }\nend\n",
-            ScriptKind::Procedure,
+            "db.get(TID.toNumber(x))\n\nfunction handle()\n  return 1\nend\n",
+            ScriptKind::Query,
         )
         .unwrap();
-        let caveats: Vec<_> = result
-            .notes
-            .iter()
-            .filter(|note| note.message.starts_with("Record.load cannot preserve"))
-            .collect();
-        assert_eq!(caveats.len(), 1, "{:?}", result.notes);
-        assert_eq!(caveats[0].line, 2);
+        assert_eq!(result.notes.len(), 1, "{:?}", result.notes);
+        assert!(
+            result
+                .source
+                .contains("-- codemod: TID.toNumber has no mechanical equivalent -- rewrite it by hand\ndb.get(TID.toNumber(x))\n"),
+            "{}",
+            result.source
+        );
+        assert_eq!(result.source.matches("-- codemod:").count(), 1);
+        assert!(
+            !result.source.contains("__codemod_flat"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result
+                .source
+                .contains("local db = require(\"happyview.db\")"),
+            "{}",
+            result.source
+        );
+    }
+
+    /// A marker anchored at the statement's first byte sits at the wrapped
+    /// call's own start; the source piece begins after `db.get`, so the
+    /// insert renders once, above the statement, and never inside the call.
+    #[test]
+    fn a_marker_at_the_start_of_a_wrapped_db_get_is_written_once() {
+        let result = rewrite(
+            "db.get(TID.toNumber(x)).seen = true\n\nfunction handle()\n  return 1\nend\n",
+            ScriptKind::Query,
+        )
+        .unwrap();
+        assert_eq!(result.notes.len(), 1, "{:?}", result.notes);
+        assert!(
+            result
+                .source
+                .contains("-- codemod: TID.toNumber has no mechanical equivalent -- rewrite it by hand\n__codemod_flat(db.get(TID.toNumber(x))).seen = true\n"),
+            "{}",
+            result.source
+        );
+        assert_eq!(result.source.matches("-- codemod:").count(), 1);
+    }
+
+    #[test]
+    fn the_row_shape_header_names_only_the_libraries_read_through() {
+        let backlinks_only =
+            query("function handle()\n  return db.backlinks({ uri = params.uri })\nend\n");
+        assert!(
+            backlinks_only.contains("-- codemod polyfill: v2 row shape over happyview.backlinks;"),
+            "{backlinks_only}"
+        );
+        let both = query(
+            "function handle()\n  return { a = db.get(params.uri), b = db.backlinks({ uri = params.uri }) }\nend\n",
+        );
+        assert!(
+            both.contains(
+                "-- codemod polyfill: v2 row shape over happyview.db and happyview.backlinks;"
+            ),
+            "{both}"
+        );
+    }
+
+    #[test]
+    fn a_db_get_read_as_a_value_is_marked() {
+        let result = rewrite(
+            "function handle()\n  local get = db.get\n  return get(params.uri)\nend\n",
+            ScriptKind::Query,
+        )
+        .unwrap();
+        assert_eq!(result.notes.len(), 1, "{:?}", result.notes);
+        assert!(
+            result.notes[0]
+                .message
+                .starts_with("db.get has no mechanical equivalent"),
+            "{:?}",
+            result.notes
+        );
+        assert!(
+            !result.source.contains("__codemod_flat"),
+            "{}",
+            result.source
+        );
     }
 
     #[test]
@@ -2020,17 +2193,17 @@ mod tests {
     }
 
     #[test]
-    fn the_stored_uri_caveat_is_not_said_for_a_shim_that_was_refused() {
+    fn a_shim_refused_for_a_taken_name_is_not_written() {
         let result = rewrite(
             "function handle()\n  local record = {}\n  return Record.load(\"at://x/c/1\")\nend\n",
             ScriptKind::Procedure,
         )
         .unwrap();
+        assert_eq!(result.notes.len(), 1, "{:?}", result.notes);
         assert!(
-            result
-                .notes
-                .iter()
-                .all(|note| !note.message.starts_with("Record.load cannot preserve")),
+            result.notes[0]
+                .message
+                .contains("'record' is bound by this script"),
             "{:?}",
             result.notes
         );
@@ -2184,7 +2357,9 @@ mod tests {
             "function handle()\n  return db.search({ collection = \"c\", field = \"f\", query = \"q\" }).records\nend\n",
         );
         assert!(
-            result.contains("({ records = db.search(\"c\", \"f\", \"q\") }).records"),
+            result.contains(
+                "({ records = __codemod_flat_rows(db.search(\"c\", \"f\", \"q\")) }).records"
+            ),
             "{result}"
         );
     }

@@ -1,6 +1,3 @@
-local backlinks = require("happyview.backlinks")
-
--- codemod polyfill: v2 row shape over happyview.backlinks; replace with the library API when convenient
 local __codemod_flat, __codemod_flat_page, __codemod_flat_rows = (function()
   -- v2 handed a row back as the record body with `uri` written onto it; the
   -- library hands back an envelope around the body, and every read this
@@ -32,7 +29,3 @@ local __codemod_flat, __codemod_flat_page, __codemod_flat_rows = (function()
 
   return __codemod_flat, __codemod_flat_page, __codemod_flat_rows
 end)()
-
-function handle(input, ctx)
-  return __codemod_flat_page(backlinks.to(input.uri):collection("app.example.like"):did(input.did):limit(20):cursor(input.cursor):run())
-end

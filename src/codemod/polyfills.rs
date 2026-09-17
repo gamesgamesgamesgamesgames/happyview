@@ -1,19 +1,29 @@
-//! The v2 shims a rewritten script carries in place of a global v3 dropped.
+//! The v2 shims a rewritten script carries where a rename would not do.
 //!
 //! Two globals differ in what they *mean* rather than what they are called, so
 //! a rename would produce a script that runs and answers differently: `xrpc`
 //! answers `{status, body}` in v2 and raises in v3, and `Record` is an object
-//! held across statements in v2 and a set of unrelated functions in v3. Each
-//! is shimmed once, in Lua, at the top of the script.
+//! held across statements in v2 and a set of unrelated functions in v3. A
+//! third shim keeps the row shape `db` reads answered: v2 handed back the
+//! body with `uri` on it, v3 an envelope around the body, and the reads a
+//! script makes pass through it. Each is written once, in Lua, at the top of
+//! the script.
 //!
 //! A shim is meant to be retired. It is a way to keep a script correct while
 //! its author rewrites it against the library, not a second supported surface.
 
+use std::collections::BTreeSet;
+
 use super::requires;
 
 pub struct Polyfill {
-    /// The global it stands in for.
+    /// What the header calls it: the global it stands in for, or the shape
+    /// it keeps.
     pub name: &'static str,
+    /// The canonical module names the header can say it stands over. It
+    /// names only those the script's rewrites reached, so a script that
+    /// reads through one library is not pointed at another.
+    pub over: &'static [&'static str],
     /// Canonical module names its body reads. The requires block binds them
     /// and the shim closes over those locals rather than requiring its own:
     /// a Lua local is not in scope until after its own statement, so inside
@@ -23,29 +33,56 @@ pub struct Polyfill {
     body: &'static str,
 }
 
+pub const FLATTEN: Polyfill = Polyfill {
+    name: "row shape",
+    over: &["db", "backlinks"],
+    modules: &[],
+    body: include_str!("polyfills/flatten.lua"),
+};
+
 pub const RECORD: Polyfill = Polyfill {
     name: "Record",
-    modules: &["record", "tids", "log"],
+    over: &["record"],
+    modules: &["record", "tids"],
     body: include_str!("polyfills/record.lua"),
 };
 
 pub const XRPC: Polyfill = Polyfill {
     name: "xrpc",
+    over: &["xrpc"],
     modules: &["xrpc", "json"],
     body: include_str!("polyfills/xrpc.lua"),
 };
 
 /// Declaration order is the order the shims are written in.
-pub const ALL: [&Polyfill; 2] = [&RECORD, &XRPC];
+pub const ALL: [&Polyfill; 3] = [&FLATTEN, &RECORD, &XRPC];
 
 impl Polyfill {
     /// The shim as it is spliced in: one line saying what it is and that it is
-    /// temporary, then the block.
-    pub fn block(&self) -> String {
-        let library = requires::module_path(self.modules[0]).unwrap_or_default();
+    /// temporary, then the block. `shimmed` is the set of canonical module
+    /// names whose reads went through a shim; the header names those of
+    /// `over` among them, or all of `over` when none is.
+    pub fn block(&self, shimmed: &BTreeSet<&str>) -> String {
+        let reached: Vec<&str> = self
+            .over
+            .iter()
+            .copied()
+            .filter(|module| shimmed.contains(module))
+            .collect();
+        let over = if reached.is_empty() {
+            self.over.to_vec()
+        } else {
+            reached
+        };
+        let libraries: Vec<&str> = over
+            .iter()
+            .filter_map(|module| requires::module_path(module))
+            .collect();
         format!(
-            "-- codemod polyfill: v2 {} over {library}; replace with the library API when convenient\n{}",
-            self.name, self.body
+            "-- codemod polyfill: v2 {} over {}; replace with the library API when convenient\n{}",
+            self.name,
+            libraries.join(" and "),
+            self.body
         )
     }
 }
@@ -77,7 +114,6 @@ local exports = {
   ["happyview.xrpc"] = { "query", "procedure" },
   ["internal.tids"] = { "create" },
   ["internal.json"] = { "encode" },
-  ["internal.logging"] = { "info", "warn" },
 }
 
 omit = {}
@@ -110,7 +146,7 @@ end
             .collect();
         let chunk = format!(
             "{STUBS}\n{setup}\n{requires}\n{}\n{script}",
-            polyfill.block()
+            polyfill.block(&BTreeSet::new())
         );
         lua.load(chunk).exec().expect("polyfill script");
         lua
@@ -161,6 +197,86 @@ end
         )
     }
 
+    /// An envelope for `at://did:plc:a/app.t/1` around `body`, the shape
+    /// `record.load` answers.
+    fn envelope(cid: &str, body: &str) -> String {
+        format!(
+            r#"answers["happyview.record.load"] = {{ uri = "at://did:plc:a/app.t/1", did = "did:plc:a", collection = "app.t", rkey = "1", cid = {cid}, record = {body} }}"#
+        )
+    }
+
+    // -- row shape -------------------------------------------------------
+
+    #[test]
+    fn a_flattened_row_is_the_body_with_its_own_uri_on_it() {
+        let lua = run(
+            &FLATTEN,
+            "",
+            r#"
+row = __codemod_flat({ uri = "at://did:plc:a/app.t/1", did = "did:plc:a", collection = "app.t", rkey = "1", cid = "bafy", record = { title = "hi", uri = "at://stored" } })
+missing = __codemod_flat(nil)
+"#,
+        );
+        let row = global(&lua, "row");
+        assert_eq!(text(field(&row, "title")).as_deref(), Some("hi"));
+        assert_eq!(
+            text(field(&row, "uri")).as_deref(),
+            Some("at://did:plc:a/app.t/1")
+        );
+        assert!(field(&row, "cid").is_nil());
+        assert!(field(&row, "record").is_nil());
+        assert!(global(&lua, "missing").is_nil());
+    }
+
+    #[test]
+    fn a_flattened_page_keeps_its_cursor_and_the_array_its_rows_came_in() {
+        let lua = run(
+            &FLATTEN,
+            "",
+            r#"
+local mark = {}
+local rows = setmetatable({
+  { uri = "at://did:plc:a/app.t/1", record = { n = 1 } },
+  { uri = "at://did:plc:a/app.t/2", record = { n = 2 } },
+}, mark)
+page = __codemod_flat_page({ records = rows, cursor = "next" })
+same_array = page.records == rows
+kept_mark = getmetatable(page.records) == mark
+"#,
+        );
+        let page = global(&lua, "page");
+        assert_eq!(text(field(&page, "cursor")).as_deref(), Some("next"));
+        let second: mlua::Value = field(&page, "records")
+            .as_table()
+            .expect("records")
+            .get(2)
+            .expect("row");
+        assert_eq!(field(&second, "n"), mlua::Value::Integer(2));
+        assert_eq!(
+            text(field(&second, "uri")).as_deref(),
+            Some("at://did:plc:a/app.t/2")
+        );
+        assert_eq!(global(&lua, "same_array"), mlua::Value::Boolean(true));
+        assert_eq!(global(&lua, "kept_mark"), mlua::Value::Boolean(true));
+    }
+
+    #[test]
+    fn flattened_rows_are_the_array_they_arrived_in() {
+        let lua = run(
+            &FLATTEN,
+            "",
+            r#"
+local rows = { { uri = "at://did:plc:a/app.t/1", record = { n = 1 } } }
+same = __codemod_flat_rows(rows) == rows
+first = rows[1]
+empty = __codemod_flat_rows({})
+"#,
+        );
+        assert_eq!(global(&lua, "same"), mlua::Value::Boolean(true));
+        assert_eq!(field(&global(&lua, "first"), "n"), mlua::Value::Integer(1));
+        assert!(global(&lua, "empty").as_table().expect("table").is_empty());
+    }
+
     // -- Record ----------------------------------------------------------
 
     #[test]
@@ -175,7 +291,6 @@ end
             vec![
                 ("happyview.record".into(), "lexicon".into()),
                 ("happyview.record".into(), "create".into()),
-                ("happyview.record".into(), "save_local".into()),
             ]
         );
         assert_eq!(
@@ -192,10 +307,11 @@ end
     fn a_record_that_already_has_a_uri_saves_as_a_put() {
         let lua = run(
             &RECORD,
-            r#"
-answers["happyview.record.load"] = { title = "hi", ["$type"] = "app.t", uri = "at://did:plc:a/app.t/1" }
-answers["happyview.record.put"] = { uri = "at://did:plc:a/app.t/1", cid = "bafy2" }
-"#,
+            &format!(
+                "{}\n{}",
+                envelope(r#""bafy""#, r#"{ title = "hi", ["$type"] = "app.t" }"#),
+                r#"answers["happyview.record.put"] = { uri = "at://did:plc:a/app.t/1", cid = "bafy2" }"#
+            ),
             r#"
 local r = Record.load("at://did:plc:a/app.t/1")
 r.title = "bye"
@@ -208,7 +324,6 @@ r:save()
                 ("happyview.record".into(), "load".into()),
                 ("happyview.record".into(), "lexicon".into()),
                 ("happyview.record".into(), "put".into()),
-                ("happyview.record".into(), "save_local".into()),
             ]
         );
         assert_eq!(
@@ -221,67 +336,20 @@ r:save()
         );
     }
 
+    /// The library writes a saved record into the index itself, so the shim
+    /// touching the index too would write the same row twice.
     #[test]
-    fn a_create_is_mirrored_into_the_local_index_under_the_returned_uri() {
+    fn a_save_writes_nothing_into_the_index_itself() {
         let lua = run(
             &RECORD,
             r#"answers["happyview.record.create"] = { uri = "at://did:plc:a/app.t/3k", cid = "bafy" }"#,
-            r#"Record("app.t", { title = "hi" }):save()"#,
-        );
-        assert_eq!(
-            calls(&lua)[2],
-            ("happyview.record".into(), "save_local".into())
-        );
-        assert_eq!(text(argument(&lua, 3, 1)).as_deref(), Some("app.t"));
-        assert_eq!(text(argument(&lua, 3, 2)).as_deref(), Some("3k"));
-        assert_eq!(
-            text(field(&argument(&lua, 3, 3), "title")).as_deref(),
-            Some("hi")
-        );
-        assert_eq!(
-            text(field(&argument(&lua, 3, 3), "$type")).as_deref(),
-            Some("app.t")
-        );
-        assert_eq!(text(argument(&lua, 3, 4)).as_deref(), Some("did:plc:a"));
-    }
-
-    #[test]
-    fn a_put_is_mirrored_into_the_local_index_under_its_own_uri() {
-        let lua = run(
-            &RECORD,
-            r#"
-answers["happyview.record.load"] = { title = "hi", uri = "at://did:plc:a/app.t/1" }
-answers["happyview.record.put"] = { uri = "at://did:plc:a/app.t/1", cid = "bafy2" }
-"#,
-            r#"
-local r = Record.load("at://did:plc:a/app.t/1")
-r.title = "bye"
-r:save()
-"#,
-        );
-        assert_eq!(
-            calls(&lua)[3],
-            ("happyview.record".into(), "save_local".into())
-        );
-        assert_eq!(text(argument(&lua, 4, 2)).as_deref(), Some("1"));
-        assert_eq!(
-            text(field(&argument(&lua, 4, 3), "title")).as_deref(),
-            Some("bye")
-        );
-        assert_eq!(text(argument(&lua, 4, 4)).as_deref(), Some("did:plc:a"));
-    }
-
-    #[test]
-    fn a_mirror_that_fails_is_logged_and_the_save_still_answers() {
-        let lua = run(
-            &RECORD,
-            r#"
-answers["happyview.record.create"] = { uri = "at://did:plc:a/app.t/3k", cid = "bafy" }
-answers["happyview.record.save_local"] = function() error("DB_ERROR - locked", 0) end
-"#,
             r#"saved = Record("app.t", { title = "hi" }):save()"#,
         );
-        assert_eq!(calls(&lua)[3], ("internal.logging".into(), "warn".into()));
+        assert!(
+            !calls(&lua).iter().any(|call| call.1 == "save_local"),
+            "{:?}",
+            calls(&lua)
+        );
         assert_eq!(
             text(field(&global(&lua, "saved"), "_cid")).as_deref(),
             Some("bafy")
@@ -289,7 +357,7 @@ answers["happyview.record.save_local"] = function() error("DB_ERROR - locked", 0
     }
 
     #[test]
-    fn save_all_mirrors_each_record_and_answers_the_refs_the_library_gave() {
+    fn save_all_answers_the_refs_the_library_gave() {
         let lua = run(
             &RECORD,
             r#"
@@ -309,9 +377,7 @@ refs = Record.save_all({ Record("app.t", { title = "one" }), Record("app.t", { t
                 ("happyview.record".into(), "lexicon".into()),
                 ("happyview.record".into(), "lexicon".into()),
                 ("happyview.record".into(), "create".into()),
-                ("happyview.record".into(), "save_local".into()),
                 ("happyview.record".into(), "create".into()),
-                ("happyview.record".into(), "save_local".into()),
             ]
         );
         let refs = global(&lua, "refs");
@@ -327,10 +393,11 @@ refs = Record.save_all({ Record("app.t", { title = "one" }), Record("app.t", { t
     fn deleting_without_a_caller_raises_and_leaves_the_local_row() {
         let lua = run(
             &RECORD,
-            r#"
-answers["happyview.record.load"] = { title = "hi", uri = "at://did:plc:a/app.t/1" }
-answers["happyview.record.delete"] = function() error("happyview.record.delete: Plugin returned error: NO_SESSION - no caller", 0) end
-"#,
+            &format!(
+                "{}\n{}",
+                envelope(r#""bafy""#, r#"{ title = "hi" }"#),
+                r#"answers["happyview.record.delete"] = function() error("happyview.record.delete: Plugin returned error: NO_SESSION - no caller", 0) end"#
+            ),
             r#"
 local r = Record.load("at://did:plc:a/app.t/1")
 ok, err = pcall(function() r:delete() end)
@@ -356,15 +423,16 @@ still = r._uri
     }
 
     #[test]
-    fn deleting_a_repo_the_caller_cannot_write_logs_and_drops_the_local_row() {
+    fn deleting_a_repo_the_caller_cannot_write_drops_the_local_row() {
         let lua = run(
             &RECORD,
+            &format!(
+                "{}\n{}",
+                envelope(r#""bafy""#, r#"{ title = "hi" }"#),
+                r#"answers["happyview.record.delete"] = function() error("WRITABLE_REPO - cannot write to repo did:plc:other", 0) end"#
+            ),
             r#"
-answers["happyview.record.load"] = { title = "hi", uri = "at://did:plc:other/app.t/1" }
-answers["happyview.record.delete"] = function() error("WRITABLE_REPO - cannot write to repo did:plc:other", 0) end
-"#,
-            r#"
-local r = Record.load("at://did:plc:other/app.t/1")
+local r = Record.load("at://did:plc:a/app.t/1")
 r:delete()
 gone = r._uri
 "#,
@@ -375,7 +443,6 @@ gone = r._uri
                 ("happyview.record".into(), "load".into()),
                 ("happyview.record".into(), "lexicon".into()),
                 ("happyview.record".into(), "delete".into()),
-                ("internal.logging".into(), "warn".into()),
                 ("happyview.record".into(), "delete_local".into()),
             ]
         );
@@ -456,24 +523,54 @@ ok, err = pcall(function() r:save() end)
     fn loading_strips_the_type_and_saving_puts_it_back() {
         let lua = run(
             &RECORD,
-            r#"
-answers["happyview.record.load"] = { title = "hi", ["$type"] = "app.t", uri = "at://did:plc:a/app.t/1" }
-answers["happyview.record.put"] = { uri = "at://did:plc:a/app.t/1", cid = "bafy" }
-"#,
+            &format!(
+                "{}\n{}",
+                envelope(r#""bafy""#, r#"{ title = "hi", ["$type"] = "app.t" }"#),
+                r#"answers["happyview.record.put"] = { uri = "at://did:plc:a/app.t/1", cid = "bafy" }"#
+            ),
             r#"
 local r = Record.load("at://did:plc:a/app.t/1")
 loaded_type = r["$type"]
-loaded_uri_field = r.uri
 collection = r._collection
+uri = r._uri
 r:save()
 "#,
         );
         assert!(global(&lua, "loaded_type").is_nil());
-        assert!(global(&lua, "loaded_uri_field").is_nil());
         assert_eq!(text(global(&lua, "collection")).as_deref(), Some("app.t"));
+        assert_eq!(
+            text(global(&lua, "uri")).as_deref(),
+            Some("at://did:plc:a/app.t/1")
+        );
         assert_eq!(
             text(field(&argument(&lua, 3, 2), "$type")).as_deref(),
             Some("app.t")
+        );
+    }
+
+    /// The envelope keeps the body apart from the record's own URI, so a
+    /// lexicon that declares a `uri` field reads back what was stored.
+    #[test]
+    fn a_stored_uri_field_survives_a_load() {
+        let lua = run(
+            &RECORD,
+            &envelope(
+                r#""bafy""#,
+                r#"{ title = "hi", uri = "https://example.com" }"#,
+            ),
+            r#"
+local r = Record.load("at://did:plc:a/app.t/1")
+stored = r.uri
+own = r._uri
+"#,
+        );
+        assert_eq!(
+            text(global(&lua, "stored")).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            text(global(&lua, "own")).as_deref(),
+            Some("at://did:plc:a/app.t/1")
         );
     }
 
@@ -519,7 +616,7 @@ r:save()
             &format!(
                 "{}\n{}\n{}",
                 lexicon("tid", r#"{ title = { type = "string" } }"#),
-                r#"answers["happyview.record.load"] = { title = "hi", stale = 1, uri = "at://did:plc:a/app.t/1" }"#,
+                envelope(r#""bafy""#, r#"{ title = "hi", stale = 1 }"#),
                 r#"answers["happyview.record.put"] = { uri = "at://did:plc:a/app.t/1", cid = "bafy2" }"#
             ),
             r#"Record.load("at://did:plc:a/app.t/1"):save()"#,
@@ -628,25 +725,30 @@ kept = Record("app.t", { status = "final" }).status
         assert_eq!(text(global(&lua, "kept")).as_deref(), Some("final"));
     }
 
+    /// A record handed back as a response carries only the keys v2 gave it:
+    /// its fields and the `_` bookkeeping v2 also had.
     #[test]
-    fn a_loaded_record_carries_no_shim_bookkeeping_key() {
+    fn a_loaded_record_carries_only_the_keys_v2_gave_it() {
         let lua = run(
             &RECORD,
-            r#"answers["happyview.record.load"] = { title = "hi", uri = "at://did:plc:a/app.t/1" }"#,
+            &envelope(r#""bafy""#, r#"{ title = "hi" }"#),
             r#"
 local r = Record.load("at://did:plc:a/app.t/1")
 keys = {}
 for key in pairs(r) do
   keys[key] = true
 end
-cid_ok = pcall(function() return r._cid end)
 "#,
         );
         let keys = global(&lua, "keys");
-        assert!(field(&keys, "_loaded").is_nil());
         assert_eq!(field(&keys, "title"), mlua::Value::Boolean(true));
         assert_eq!(field(&keys, "_uri"), mlua::Value::Boolean(true));
-        assert_eq!(global(&lua, "cid_ok"), mlua::Value::Boolean(false));
+        assert_eq!(field(&keys, "_cid"), mlua::Value::Boolean(true));
+        assert_eq!(field(&keys, "_collection"), mlua::Value::Boolean(true));
+        assert!(field(&keys, "record").is_nil());
+        assert!(field(&keys, "did").is_nil());
+        assert!(field(&keys, "rkey").is_nil());
+        assert!(field(&keys, "indexed_at").is_nil());
     }
 
     #[test]
@@ -696,19 +798,30 @@ key_ok = pcall(function() Record("app.t", {})._key_type = "tid" end)
     }
 
     #[test]
-    fn a_loaded_records_cid_says_it_is_unavailable_rather_than_reading_nil() {
+    fn a_loaded_records_cid_is_the_envelopes() {
         let lua = run(
             &RECORD,
-            r#"answers["happyview.record.load"] = { title = "hi", uri = "at://did:plc:a/app.t/1" }"#,
+            &envelope(r#""bafy""#, r#"{ title = "hi" }"#),
+            r#"cid = Record.load("at://did:plc:a/app.t/1")._cid"#,
+        );
+        assert_eq!(text(global(&lua, "cid")).as_deref(), Some("bafy"));
+    }
+
+    /// v2 read the cid column as a string, and a `save_local` row stores an
+    /// empty one; a v2 script guarding on `if r._cid then` took that branch.
+    #[test]
+    fn a_loaded_record_with_no_cid_reads_an_empty_string_as_v2_did() {
+        let lua = run(
+            &RECORD,
+            &envelope("nil", r#"{ title = "hi" }"#),
             r#"
 local r = Record.load("at://did:plc:a/app.t/1")
-ok, err = pcall(function() return r._cid end)
+cid = r._cid
+truthy = r._cid and true or false
 "#,
         );
-        assert_eq!(global(&lua, "ok"), mlua::Value::Boolean(false));
-        let message = global(&lua, "err");
-        let message = message.to_string().expect("message");
-        assert!(message.contains("_cid"), "{message}");
+        assert_eq!(text(global(&lua, "cid")).as_deref(), Some(""));
+        assert_eq!(global(&lua, "truthy"), mlua::Value::Boolean(true));
     }
 
     #[test]
@@ -777,14 +890,16 @@ answers["happyview.record.save_local"] = { uri = "at://did:plc:a/app.t/3kabcd" }
     fn deleting_drops_the_local_row_even_when_the_pds_refuses() {
         let lua = run(
             &RECORD,
-            r#"
-answers["happyview.record.load"] = { title = "hi", uri = "at://did:plc:a/app.t/1" }
-answers["happyview.record.delete"] = function() error("PDS_ERROR - PDS returned 400: nope") end
-"#,
+            &format!(
+                "{}\n{}",
+                envelope(r#""bafy""#, r#"{ title = "hi" }"#),
+                r#"answers["happyview.record.delete"] = function() error("PDS_ERROR - PDS returned 400: nope") end"#
+            ),
             r#"
 local r = Record.load("at://did:plc:a/app.t/1")
 r:delete()
 gone = r._uri
+gone_cid = r._cid
 "#,
         );
         assert_eq!(
@@ -793,11 +908,11 @@ gone = r._uri
                 ("happyview.record".into(), "load".into()),
                 ("happyview.record".into(), "lexicon".into()),
                 ("happyview.record".into(), "delete".into()),
-                ("internal.logging".into(), "warn".into()),
                 ("happyview.record".into(), "delete_local".into()),
             ]
         );
         assert!(global(&lua, "gone").is_nil());
+        assert!(global(&lua, "gone_cid").is_nil());
     }
 
     #[test]
@@ -817,7 +932,7 @@ gone = r._uri
             r#"
 answers["happyview.record.load"] = function(uri)
   if uri == "at://did:plc:a/app.t/2" then
-    return { title = "two", uri = uri }
+    return { uri = uri, did = "did:plc:a", collection = "app.t", rkey = "2", cid = "bafy", record = { title = "two" } }
   end
   return nil
 end
@@ -913,7 +1028,8 @@ answers["internal.json.encode"] = "{}"
     #[test]
     fn every_shim_names_modules_the_requires_block_can_bind() {
         for polyfill in ALL {
-            for module in polyfill.modules {
+            assert!(!polyfill.over.is_empty(), "{}", polyfill.name);
+            for module in polyfill.over.iter().chain(polyfill.modules) {
                 assert!(
                     requires::module_path(module).is_some(),
                     "{}: {module}",
@@ -924,9 +1040,34 @@ answers["internal.json.encode"] = "{}"
     }
 
     #[test]
-    fn every_shim_binds_the_global_it_stands_in_for_and_says_it_is_temporary() {
+    fn the_row_shape_header_names_the_libraries_the_script_reads_through() {
+        let header = |shimmed: &[&str]| {
+            FLATTEN
+                .block(&shimmed.iter().copied().collect())
+                .lines()
+                .next()
+                .expect("header")
+                .to_string()
+        };
+        assert_eq!(
+            header(&["backlinks"]),
+            "-- codemod polyfill: v2 row shape over happyview.backlinks; replace with the library API when convenient"
+        );
+        assert_eq!(
+            header(&["db", "record"]),
+            "-- codemod polyfill: v2 row shape over happyview.db; replace with the library API when convenient"
+        );
+        assert_eq!(
+            header(&["db", "backlinks"]),
+            "-- codemod polyfill: v2 row shape over happyview.db and happyview.backlinks; replace with the library API when convenient"
+        );
+        assert_eq!(header(&[]), header(&["db", "backlinks"]));
+    }
+
+    #[test]
+    fn every_shim_is_one_local_block_under_a_header_that_says_it_is_temporary() {
         for polyfill in ALL {
-            let block = polyfill.block();
+            let block = polyfill.block(&BTreeSet::new());
             let mut lines = block.lines();
             let header = lines.next().expect("header");
             assert!(
@@ -934,11 +1075,27 @@ answers["internal.json.encode"] = "{}"
                     && header.ends_with("; replace with the library API when convenient"),
                 "{header}"
             );
-            assert_eq!(
-                lines.next(),
-                Some(format!("local {} = (function()", polyfill.name).as_str())
+            let opening = lines.next().expect("opening line");
+            assert!(
+                opening.starts_with("local ") && opening.ends_with(" = (function()"),
+                "{}: {opening}",
+                polyfill.name
             );
             assert!(full_moon::parse(&block).is_ok(), "{}", polyfill.name);
         }
+    }
+
+    #[test]
+    fn a_shim_that_stands_in_for_a_global_binds_that_name() {
+        for polyfill in [&RECORD, &XRPC] {
+            assert_eq!(
+                polyfill.block(&BTreeSet::new()).lines().nth(1),
+                Some(format!("local {} = (function()", polyfill.name).as_str())
+            );
+        }
+        assert_eq!(
+            FLATTEN.block(&BTreeSet::new()).lines().nth(1),
+            Some("local __codemod_flat, __codemod_flat_page, __codemod_flat_rows = (function()")
+        );
     }
 }
