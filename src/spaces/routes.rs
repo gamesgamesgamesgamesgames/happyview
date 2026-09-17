@@ -11,11 +11,11 @@ use crate::AppState;
 use crate::auth::XrpcClaims;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::lua::tid::generate_tid;
 use crate::spaces::scope::{check_delegation_token_access, check_read_access};
 use crate::spaces::service;
 use crate::spaces::types::*;
 use crate::spaces::{db, members, notifications, oplog};
+use crate::tid::generate_tid;
 
 // ---------------------------------------------------------------------------
 // Request / response types

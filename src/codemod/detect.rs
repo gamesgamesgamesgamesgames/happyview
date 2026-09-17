@@ -16,7 +16,7 @@ use full_moon::visitors::Visitor;
 use super::ScriptKind;
 
 /// The globals v3 removes, in the order `needs_migration` reports them.
-pub const REMOVED_GLOBALS: [&str; 31] = [
+pub const REMOVED_GLOBALS: [&str; 32] = [
     "db",
     "Record",
     "xrpc",
@@ -30,6 +30,7 @@ pub const REMOVED_GLOBALS: [&str; 31] = [
     "TID",
     "json",
     "toarray",
+    "input",
     "params",
     "event",
     "record",
@@ -49,6 +50,10 @@ pub const REMOVED_GLOBALS: [&str; 31] = [
     "env",
     "space",
 ];
+
+/// What `needs_migration` answers, alone, for a script it cannot parse. Not a
+/// global, so a caller listing globals has to tell it apart.
+pub const UNPARSEABLE: &str = "unparseable";
 
 /// One step after the head of a name reference: `db` `.get` `(uri)`.
 pub enum Seg<'a> {
@@ -304,7 +309,8 @@ fn span(node: &impl Node) -> (usize, usize) {
 /// record script and an undefined global in a query, so reporting it depends
 /// on the kind; `Unknown` reports every one rather than clear a script it
 /// cannot judge.
-const KIND_DEPENDENT: [&str; 15] = [
+const KIND_DEPENDENT: [&str; 16] = [
+    "input",
     "record",
     "action",
     "uri",
@@ -324,7 +330,10 @@ const KIND_DEPENDENT: [&str; 15] = [
 
 fn set_by(kind: ScriptKind) -> &'static [&'static str] {
     match kind {
-        ScriptKind::Procedure | ScriptKind::Query => &["params", "method", "collection"],
+        // Only the procedure runner installed the request body as a global;
+        // every other kind's payload had a name of its own.
+        ScriptKind::Procedure => &["input", "params", "method", "collection"],
+        ScriptKind::Query => &["params", "method", "collection"],
         ScriptKind::RecordEvent => &[
             "event",
             "record",
@@ -346,7 +355,7 @@ fn set_by(kind: ScriptKind) -> &'static [&'static str] {
 /// nothing left to do.
 pub fn needs_migration(source: &str, kind: ScriptKind) -> Vec<&'static str> {
     let Ok(ast) = full_moon::parse(source) else {
-        return vec!["unparseable"];
+        return vec![UNPARSEABLE];
     };
     let mut scan = FreeScan {
         kind,
@@ -502,6 +511,52 @@ mod tests {
         );
         assert!(needs_migration(source, ScriptKind::Query).is_empty());
         assert_eq!(needs_migration(source, ScriptKind::Unknown), vec!["rkey"]);
+    }
+
+    #[test]
+    fn a_label_script_reports_the_label_events_fields() {
+        let source = r#"
+            function handle()
+              if neg then return nil end
+              return { src = src, uri = uri, val = val, cts = cts, exp = exp, raw = event }
+            end
+        "#;
+        assert_eq!(
+            needs_migration(source, ScriptKind::Label),
+            vec!["event", "uri", "src", "val", "neg", "cts", "exp"]
+        );
+        assert_eq!(
+            needs_migration(source, ScriptKind::Query),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn a_procedures_input_read_outside_handles_parameters_is_reported() {
+        let at_file_scope =
+            "local seed = input.seed\nfunction handle(input, ctx)\n  return seed\nend\n";
+        let in_a_helper = "local function q()\n  return input.q\nend\nfunction handle(input, ctx)\n  return q()\nend\n";
+        let no_parameters = "function handle()\n  return input.q\nend\n";
+        for source in [at_file_scope, in_a_helper, no_parameters] {
+            assert_eq!(
+                needs_migration(source, ScriptKind::Procedure),
+                vec!["input"],
+                "{source}"
+            );
+        }
+        // Only the procedure runner installed it.
+        assert!(needs_migration(in_a_helper, ScriptKind::Query).is_empty());
+    }
+
+    #[test]
+    fn an_input_bound_by_the_contract_is_not_reported() {
+        let in_handle = "function handle(input, ctx)\n  return input.q\nend\n";
+        let hoisted = "local input, ctx\n\nlocal function q()\n  return input.q\nend\n\nfunction handle(handle_input, handle_ctx)\n  input, ctx = handle_input, handle_ctx\n  return q()\nend\n";
+        for source in [in_handle, hoisted] {
+            for kind in [ScriptKind::Procedure, ScriptKind::Unknown] {
+                assert!(needs_migration(source, kind).is_empty(), "{source}");
+            }
+        }
     }
 
     #[test]

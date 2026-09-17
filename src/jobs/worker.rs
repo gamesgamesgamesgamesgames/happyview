@@ -112,7 +112,7 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         }
     };
 
-    let (claims, pds_auth_arc) = if job.inherit_auth {
+    let (claims, pds_auth) = if job.inherit_auth {
         let pds_auth = if let (Some(api_client_id), Some(dpop_key_id)) =
             (&job.api_client_id, &job.dpop_key_id)
         {
@@ -176,107 +176,23 @@ async fn execute_job(state: &AppState, job: &super::Job) {
 
     lua.remove_hook();
 
-    let state_arc = Arc::new(state.clone());
-
-    if let Err(e) = crate::lua::db_api::register_db_api(&lua, state_arc.clone()) {
-        let _ = db::set_error(state, &job.id, &format!("db api: {e}")).await;
-        return;
-    }
-    if let Err(e) = crate::lua::http_api::register_http_api(&lua, state_arc.clone()) {
-        let _ = db::set_error(state, &job.id, &format!("http api: {e}")).await;
-        return;
-    }
-    if let Err(e) = crate::lua::xrpc_api::register_xrpc_api(
-        &lua,
-        state_arc.clone(),
-        Some(job.created_by.clone()),
-    ) {
-        let _ = db::set_error(state, &job.id, &format!("xrpc api: {e}")).await;
-        return;
-    }
-    if let Err(e) = crate::lua::atproto_api::register_atproto_api(
-        &lua,
-        state_arc.clone(),
-        Some(&job.created_by),
-    ) {
-        let _ = db::set_error(state, &job.id, &format!("atproto api: {e}")).await;
-        return;
-    }
-    if let Err(e) = crate::lua::spaces_api::register_spaces_write_api(
-        &lua,
-        state_arc.clone(),
-        Some(&job.created_by),
-    ) {
-        let _ = db::set_error(state, &job.id, &format!("spaces write api: {e}")).await;
-        return;
-    }
-    if let Err(e) = crate::lua::linked_repos_api::register_linked_repos_api(&lua, state_arc.clone())
-    {
-        let _ = db::set_error(state, &job.id, &format!("linked repos api: {e}")).await;
-        return;
-    }
-    if let (Some(c), Some(p)) = (&claims, &pds_auth_arc)
-        && let Err(e) = crate::lua::atproto_api::register_atproto_blob_api(
-            &lua,
-            state_arc.clone(),
-            c.clone(),
-            p.clone(),
-        )
-    {
-        let _ = db::set_error(state, &job.id, &format!("blob api: {e}")).await;
-        return;
-    }
-    if let Err(e) = crate::lua::jobs_api::register_jobs_api(
-        &lua,
-        state_arc.clone(),
-        Some(crate::lua::jobs_api::JobsCaller {
-            did: job.created_by.clone(),
-            api_client_id: job.api_client_id.clone(),
-            dpop_key_id: job.dpop_key_id.clone(),
-        }),
-    ) {
-        let _ = db::set_error(state, &job.id, &format!("jobs api: {e}")).await;
-        return;
-    }
     // A job that did not inherit its creator's auth has nothing to act as, so
     // its library calls carry no session at all.
-    let caller_session = claims
-        .clone()
-        .zip(pds_auth_arc.clone())
-        .map(|(claims, pds_auth)| {
-            Arc::new(crate::plugin::caller::CallerSession {
-                did: job.created_by.clone(),
-                delegate_did: None,
-                claims,
-                pds_auth,
-                app_state: state.clone(),
-            })
-        });
+    let caller_session = claims.zip(pds_auth).map(|(claims, pds_auth)| {
+        Arc::new(crate::plugin::caller::CallerSession {
+            did: job.created_by.clone(),
+            delegate_did: None,
+            claims,
+            pds_auth,
+            app_state: state.clone(),
+        })
+    });
     let has_pds_auth = caller_session.is_some();
-    if let Err(e) =
-        crate::lua::record::register_record_api(&lua, state_arc.clone(), claims, pds_auth_arc, None)
+    let job_table = match super::script_ctx::job_ctx(&lua, Arc::new(state.clone()), job.id.clone())
     {
-        let _ = db::set_error(state, &job.id, &format!("record api: {e}")).await;
-        return;
-    }
-    if let Err(e) = crate::lua::scripts::register_log_event_api(
-        &lua,
-        &state_arc,
-        &trigger_id,
-        Some(&job.created_by),
-    ) {
-        let _ = db::set_error(state, &job.id, &format!("log api: {e}")).await;
-        return;
-    }
-    let job_table = match crate::lua::jobs_api::register_job_context(
-        &lua,
-        state_arc.clone(),
-        job.id.clone(),
-        job.input.clone(),
-    ) {
         Ok(t) => t,
         Err(e) => {
-            let _ = db::set_error(state, &job.id, &format!("job context: {e}")).await;
+            let _ = db::set_error(state, &job.id, &format!("job ctx: {e}")).await;
             return;
         }
     };
@@ -293,44 +209,6 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     }
 
     let env_vars = load_env_vars(&state.db, backend).await;
-    if let Err(e) = crate::lua::context::set_env_context(&lua, &env_vars) {
-        let _ = db::set_error(state, &job.id, &format!("env context: {e}")).await;
-        return;
-    }
-
-    if let Err(e) = lua.globals().set("caller_did", job.created_by.as_str()) {
-        let _ = db::set_error(state, &job.id, &format!("caller_did: {e}")).await;
-        return;
-    }
-
-    {
-        let existing_log: mlua::Function = lua.globals().get("log").unwrap();
-        let state_for_log = state_arc.clone();
-        let job_id_for_log = job.id.clone();
-        let dual_log = lua
-            .create_async_function(move |_lua, msg: String| {
-                let existing = existing_log.clone();
-                let state = state_for_log.clone();
-                let job_id = job_id_for_log.clone();
-                async move {
-                    let _ = existing.call_async::<()>(msg.clone()).await;
-                    if let Err(e) = crate::jobs::logs::insert_log(
-                        &state.db,
-                        state.db_backend,
-                        &job_id,
-                        "info",
-                        &msg,
-                    )
-                    .await
-                    {
-                        tracing::warn!(job_id = %job_id, error = %e, "dual log insert failed");
-                    }
-                    Ok(())
-                }
-            })
-            .unwrap();
-        let _ = lua.globals().set("log", dual_log);
-    }
 
     if let Err(e) = lua.load(script.body.as_str()).exec() {
         let error = format!("script load failed: {e}");

@@ -16,11 +16,7 @@ use crate::lexicon::ParsedLexicon;
 use crate::repo;
 use crate::telemetry::counters::Counters;
 
-use super::atproto_api;
 use super::context;
-use super::db_api;
-use super::http_api;
-use super::record;
 use super::sandbox;
 
 struct ScriptTimingGuard {
@@ -168,301 +164,18 @@ pub async fn execute_procedure_script(
         }
     };
 
-    let state_arc = Arc::new(state.clone());
     let claims_arc = Arc::new(claims.clone());
-    let pds_auth_arc = pds_auth.map(Arc::new);
-
-    if let Err(e) = db_api::register_db_api(&lua, state_arc.clone()) {
-        let error_message = format!("failed to register db API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = http_api::register_http_api(&lua, state_arc.clone()) {
-        let error_message = format!("failed to register http API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) =
-        super::xrpc_api::register_xrpc_api(&lua, state_arc.clone(), Some(claims.did().to_string()))
-    {
-        let error_message = format!("failed to register xrpc API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = atproto_api::register_atproto_api(&lua, state_arc.clone(), Some(claims.did())) {
-        let error_message = format!("failed to register atproto API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = crate::lua::spaces_api::register_spaces_write_api(
-        &lua,
-        state_arc.clone(),
-        Some(claims.did()),
-    ) {
-        let error_message = format!("failed to register spaces write API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = crate::lua::linked_repos_api::register_linked_repos_api(&lua, state_arc.clone())
-    {
-        let error_message = format!("failed to register linked repos API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Some(ref pds_auth) = pds_auth_arc
-        && let Err(e) = atproto_api::register_atproto_blob_api(
-            &lua,
-            state_arc.clone(),
-            claims_arc.clone(),
-            pds_auth.clone(),
-        )
-    {
-        let error_message = format!("failed to register atproto blob API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = super::jobs_api::register_jobs_api(
-        &lua,
-        state_arc.clone(),
-        Some(super::jobs_api::JobsCaller {
-            did: claims.did().to_string(),
-            api_client_id: pds_auth_arc.as_ref().and_then(|a| match a.as_ref() {
-                repo::PdsAuth::Dpop { api_client_id, .. } => Some(api_client_id.clone()),
-                _ => None,
-            }),
-            dpop_key_id: pds_auth_arc.as_ref().and_then(|a| match a.as_ref() {
-                repo::PdsAuth::Dpop { dpop_key_id, .. } => Some(dpop_key_id.clone()),
-                _ => None,
-            }),
-        }),
-    ) {
-        let error_message = format!("failed to register jobs API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    let caller_session = pds_auth_arc.clone().map(|pds_auth| {
+    let caller_session = pds_auth.map(|pds_auth| {
         Arc::new(crate::plugin::caller::CallerSession {
             did: claims.did().to_string(),
             delegate_did: delegate_did.map(|s| s.to_string()),
             claims: claims_arc.clone(),
-            pds_auth,
+            pds_auth: Arc::new(pds_auth),
             app_state: state.clone(),
         })
     });
     let has_pds_auth = caller_session.is_some();
-    if let Err(e) = record::register_record_api(
-        &lua,
-        state_arc.clone(),
-        Some(claims_arc),
-        pds_auth_arc,
-        delegate_did.map(|s| s.to_string()),
-    ) {
-        let error_message = format!("failed to register Record API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    // Override the sandbox's tracing-only `log()` with a version that
-    // also writes a `script.log` row to `event_logs` so operators can
-    // see script output from the dashboard. The xrpc trigger id is
-    // computed from the lexicon's id + procedure type.
     let trigger_id = format!("xrpc.procedure:{}", lexicon.id);
-    if let Err(e) =
-        super::scripts::register_log_event_api(&lua, &state_arc, &trigger_id, Some(claims.did()))
-    {
-        let error_message = format!("failed to register log API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
     let identity = super::builtins::ScriptIdentity {
         trigger_id: trigger_id.clone(),
         caller_did: Some(claims.did().to_string()),
@@ -494,64 +207,7 @@ pub async fn execute_procedure_script(
         return Err(AppError::Internal(error_message));
     }
 
-    if let Err(e) = context::set_procedure_context(
-        &lua,
-        method,
-        input,
-        params,
-        claims.did(),
-        collection,
-        space_ctx,
-        delegate_did,
-    ) {
-        let error_message = format!("failed to set context: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
     let env_vars = load_env_vars(&state.db, backend).await;
-    if let Err(e) = context::set_env_context(&lua, &env_vars) {
-        let error_message = format!("failed to set env context: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: Some(claims.did().to_string()),
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "input": input_json,
-                    "caller_did": claims.did(),
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
     if let Err(e) = lua.load(script).exec() {
         let error_message = format!("{e}");
         tracing::error!(method, error = %e, "lua script load failed");
@@ -804,207 +460,7 @@ pub async fn execute_query_script(
         }
     };
 
-    let state_arc = Arc::new(state.clone());
-
-    if let Err(e) = db_api::register_db_api(&lua, state_arc.clone()) {
-        let error_message = format!("failed to register db API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = http_api::register_http_api(&lua, state_arc.clone()) {
-        let error_message = format!("failed to register http API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = super::xrpc_api::register_xrpc_api(
-        &lua,
-        state_arc.clone(),
-        claims.map(|c| c.did().to_string()),
-    ) {
-        let error_message = format!("failed to register xrpc API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) =
-        atproto_api::register_atproto_api(&lua, state_arc.clone(), claims.map(|c| c.did()))
-    {
-        let error_message = format!("failed to register atproto API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = crate::lua::spaces_api::register_spaces_write_api(
-        &lua,
-        state_arc.clone(),
-        claims.map(|c| c.did()),
-    ) {
-        let error_message = format!("failed to register spaces write API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    if let Err(e) = crate::lua::linked_repos_api::register_linked_repos_api(&lua, state_arc.clone())
-    {
-        let error_message = format!("failed to register linked repos API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    // Register the Record API in no-auth mode. Queries don't have a PDS
-    // auth context — the local-only methods (Record.load, :save_local,
-    // :delete_local, Record.delete_local) work; PDS-touching variants
-    // error with the no-PDS-auth message.
-    if let Err(e) = record::register_record_api_no_auth(&lua, state_arc.clone()) {
-        let error_message = format!("failed to register Record API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
-    // Override the sandbox's tracing-only `log()` with a version that
-    // also writes a `script.log` row to `event_logs`.
     let trigger_id = format!("xrpc.query:{}", lexicon.id);
-    if let Err(e) = super::scripts::register_log_event_api(
-        &lua,
-        &state_arc,
-        &trigger_id,
-        claims.map(|c| c.did()),
-    ) {
-        let error_message = format!("failed to register log API: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
     let identity = super::builtins::ScriptIdentity {
         trigger_id: trigger_id.clone(),
         caller_did: claims.map(|c| c.did().to_string()),
@@ -1032,58 +488,7 @@ pub async fn execute_query_script(
         return Err(AppError::Internal(error_message));
     }
 
-    if let Err(e) = context::set_query_context(
-        &lua,
-        method,
-        params,
-        collection,
-        claims.map(|c| c.did()),
-        space_ctx,
-    ) {
-        let error_message = format!("failed to set context: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
     let env_vars = load_env_vars(&state.db, backend).await;
-    if let Err(e) = context::set_env_context(&lua, &env_vars) {
-        let error_message = format!("failed to set env context: {e}");
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: "script.error".to_string(),
-                severity: Severity::Error,
-                actor_did: None,
-                subject: Some(method.to_string()),
-                detail: serde_json::json!({
-                    "error": error_message,
-                    "script_source": script_source,
-                    "method": method,
-                    "duration_ms": start.elapsed().as_millis() as u64,
-                }),
-            },
-            backend,
-        )
-        .await;
-        return Err(AppError::Internal(error_message));
-    }
-
     if let Err(e) = lua.load(script).exec() {
         let error_message = format!("{e}");
         tracing::error!(method, error = %e, "lua script load failed");
@@ -1364,7 +769,7 @@ mod tests {
             "com.example.probe",
             &params,
             &lexicon,
-            "function handle(input, ctx) return { x = input.x, who = ctx.caller_did, trig = ctx.trigger, legacy = params.x } end",
+            "function handle(input, ctx) return { x = input.x, who = ctx.caller_did, trig = ctx.trigger } end",
             Some(&claims),
             None,
         )
@@ -1378,7 +783,83 @@ mod tests {
         assert_eq!(json["x"], "1");
         assert_eq!(json["who"], "did:plc:test");
         assert!(json["trig"].as_str().unwrap().starts_with("xrpc.query:"));
-        assert_eq!(json["legacy"], "1");
+    }
+
+    #[tokio::test]
+    async fn a_stored_unmigrated_script_fails_naming_the_removed_global() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let mut params = HashMap::new();
+        params.insert("x".to_string(), serde_json::json!("1"));
+
+        let err = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            "function handle() return { x = params.x } end",
+            None,
+            None,
+        )
+        .await
+        .expect_err("a read of the removed `params` global must raise");
+
+        match err {
+            AppError::ScriptError {
+                error_type: ScriptErrorType::Runtime,
+                message,
+                ..
+            } => assert!(
+                message.contains("the 'params' global was removed in v3")
+                    && message.contains("Migrating scripts guide"),
+                "{message}"
+            ),
+            other => panic!("expected a runtime script error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_script_reaches_the_host_only_through_require() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+
+        let response = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            r#"
+            local time = require("internal.time")
+            function handle()
+                return {
+                    has_require = type(require) == "function",
+                    has_time = type(time.now()) == "number",
+                    raw_db = rawget(_G, "db") == nil,
+                    raw_log = rawget(_G, "log") == nil,
+                    raw_env = rawget(_G, "env") == nil,
+                }
+            end
+            "#,
+            None,
+            None,
+        )
+        .await
+        .expect("script should have executed");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "has_require": true,
+                "has_time": true,
+                "raw_db": true,
+                "raw_log": true,
+                "raw_env": true,
+            })
+        );
     }
 
     #[tokio::test]

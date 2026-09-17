@@ -1,6 +1,7 @@
 pub(crate) mod db;
 pub(crate) mod logs;
 pub mod native;
+pub(crate) mod script_ctx;
 pub mod worker;
 
 use regex::Regex;
@@ -30,9 +31,9 @@ static JOB_TYPE_RE: LazyLock<Regex> =
 
 /// Whether `job_type` may be enqueued: 1–128 characters matching
 /// `/^[a-z0-9][a-z0-9._-]*$/` and outside the `happyview.` prefix reserved for
-/// native jobs. Shared by the trigger grammar (`job.run:<type>`), the
-/// `jobs.create` Lua global, and the `happyview.jobs` library import, so a
-/// type accepted in one is accepted in all three.
+/// native jobs. Shared by the trigger grammar (`job.run:<type>`) and the
+/// `happyview.jobs` library import, so a type accepted in one is accepted in
+/// the other.
 pub fn validate_job_type(job_type: &str) -> Result<(), String> {
     if job_type.is_empty() || job_type.len() > 128 {
         return Err(format!(

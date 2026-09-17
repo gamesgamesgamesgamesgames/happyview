@@ -43,8 +43,8 @@ impl CallerSession {
 /// rewritten OAuth clients before the real answer surfaced: the instance was
 /// never given access to the repo the script had redirected the write to.
 ///
-/// Writing to another account's repo is what [`linked_repos`](crate::lua::linked_repos_api)
-/// is for.
+/// Writing to another account's repo is what the `happyview.linked_repos`
+/// library (`plugin::host::linked_repos`) is for.
 pub fn check_writable_repo(
     repo: &str,
     caller_did: &str,
@@ -54,10 +54,11 @@ pub fn check_writable_repo(
         return Ok(());
     }
     Err(format!(
-        "cannot write to repo {repo}: a Record write acts as the caller \
+        "cannot write to repo {repo}: a record write acts as the caller \
          ({caller_did}), so it can only target the caller's own repo. To write \
          to another account's repo, an admin must link that repo, and the \
-         script should use linked_repos.get(\"{repo}\") instead of set_repo()."
+         script should write through require(\"happyview.linked_repos\").get(\"{repo}\") \
+         instead of naming the repo."
     ))
 }
 

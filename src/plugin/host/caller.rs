@@ -1,7 +1,8 @@
 //! Host imports that act as the calling script's user: repo writes, blob
 //! uploads and XRPC calls issued with the caller's own credentials. Each one
-//! takes the same route the Lua globals take, so DPoP nonce handling, token
-//! refresh and the local XRPC handlers are shared rather than reimplemented.
+//! goes through the instance's own PDS and XRPC paths, so DPoP nonce
+//! handling, token refresh and the local XRPC handlers are shared rather than
+//! reimplemented.
 
 use std::collections::HashMap;
 
@@ -290,7 +291,7 @@ pub async fn upload_blob(
     caller: &CallerSession,
     spec: CallerBlobUpload,
 ) -> Result<Value, CallerError> {
-    crate::lua::atproto_api::upload_blob_to_pds(
+    crate::repo::upload_blob_to_pds(
         &caller.app_state,
         &caller.did,
         &caller.pds_auth,
@@ -302,11 +303,10 @@ pub async fn upload_blob(
 }
 
 /// Unlike every other `host_caller_*` import, this one runs with no
-/// [`CallerSession`] at all — exactly the way the Lua `xrpc.query` global
-/// needs no PDS auth for a query, record-event or label script. `caller_did`
-/// stands in for a session's claims when there is no session; a fully
-/// anonymous call still reaches a registered local handler or the proxy, the
-/// same as it always did.
+/// [`CallerSession`] at all: a query needs no PDS auth, and a query,
+/// record-event or label script has no session to lend. `caller_did` stands
+/// in for a session's claims when there is no session; a fully anonymous call
+/// still reaches a registered local handler or the proxy.
 pub async fn xrpc_query(
     app_state: &AppState,
     caller: Option<&CallerSession>,
@@ -323,7 +323,7 @@ pub async fn xrpc_query(
         }
     };
     let response =
-        crate::lua::xrpc_api::execute_local_query(app_state, &spec.method, &mut params, claims)
+        crate::xrpc::local::execute_local_query(app_state, &spec.method, &mut params, claims)
             .await
             .map_err(xrpc_failure)?;
     response_json(response).await
@@ -334,7 +334,7 @@ pub async fn xrpc_procedure(
     spec: CallerXrpcProcedure,
 ) -> Result<Value, CallerError> {
     let mut params: HashMap<String, Value> = spec.params.into_iter().collect();
-    let response = crate::lua::xrpc_api::execute_local_procedure(
+    let response = crate::xrpc::local::execute_local_procedure(
         &caller.app_state,
         &spec.method,
         &caller.claims,

@@ -34,13 +34,12 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
 
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
 
-use super::{atproto_api, context, db_api, http_api, record, sandbox, xrpc_api};
+use super::{context, sandbox};
 
 /// Number of attempts (1 initial + 3 retries) before dead-lettering.
 const MAX_ATTEMPTS: u32 = 4;
@@ -403,25 +402,8 @@ pub async fn run_record_event_once(
         ));
     }
     let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
-    let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, &script.id, Some(payload.did)).await?;
+    install_require(&lua, state, &script.id, Some(payload.did)).await?;
 
-    // Legacy globals (action, uri, did, collection, rkey, record) for
-    // convenience / backwards compatibility.
-    context::set_hook_context(
-        &lua,
-        payload.action,
-        payload.uri,
-        payload.did,
-        payload.nsid,
-        payload.rkey,
-        payload.record,
-    )
-    .map_err(|e| format!("set hook context: {e}"))?;
-
-    // Also expose an `event` table — same fields, different idiom. New
-    // scripts can read `event.action` / `event.record.title` instead of
-    // the bare globals; both styles work.
     use mlua::LuaSerdeExt;
     let event_value = serde_json::json!({
         "action": payload.action,
@@ -434,12 +416,8 @@ pub async fn run_record_event_once(
     let event_lua = lua
         .to_value(&event_value)
         .map_err(|e| format!("event lua-conv: {e}"))?;
-    lua.globals()
-        .set("event", event_lua.clone())
-        .map_err(|e| format!("set event global: {e}"))?;
 
     let env_vars = load_env_vars(&state.db, state.db_backend).await;
-    context::set_env_context(&lua, &env_vars).map_err(|e| format!("set env: {e}"))?;
 
     lua.load(script.body.as_str())
         .exec()
@@ -627,40 +605,14 @@ async fn run_label_lua_once(
         ));
     }
     let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
-    let state_arc = Arc::new(state.clone());
-    register_default_apis(&lua, &state_arc, &script.id, None).await?;
+    install_require(&lua, state, &script.id, None).await?;
 
     use mlua::LuaSerdeExt;
-    let globals = lua.globals();
-    globals
-        .set("src", event.src.clone())
-        .map_err(|e| format!("set src: {e}"))?;
-    globals
-        .set("uri", event.uri.clone())
-        .map_err(|e| format!("set uri: {e}"))?;
-    globals
-        .set("val", event.val.clone())
-        .map_err(|e| format!("set val: {e}"))?;
-    globals
-        .set("neg", event.neg)
-        .map_err(|e| format!("set neg: {e}"))?;
-    globals
-        .set("cts", event.cts.clone())
-        .map_err(|e| format!("set cts: {e}"))?;
-    match &event.exp {
-        Some(exp) => globals.set("exp", exp.clone()),
-        None => globals.set("exp", mlua::Value::Nil),
-    }
-    .map_err(|e| format!("set exp: {e}"))?;
     let event_value = serde_json::to_value(event).map_err(|e| format!("encode event: {e}"))?;
     let event_lua = lua
         .to_value(&event_value)
         .map_err(|e| format!("event lua-conv: {e}"))?;
-    globals
-        .set("event", event_lua.clone())
-        .map_err(|e| format!("set event: {e}"))?;
     let env_vars = load_env_vars(&state.db, state.db_backend).await;
-    context::set_env_context(&lua, &env_vars).map_err(|e| format!("set env: {e}"))?;
 
     lua.load(script.body.as_str())
         .exec()
@@ -726,114 +678,25 @@ fn extract_bool(v: &Value, key: &str) -> Option<bool> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Register the default API surface on a fresh sandbox: db / http / xrpc /
-/// atproto / linked_repos / jobs / Record. `caller_did` flows into xrpc so
-/// authenticated calls work; pass `None` for unauthenticated contexts.
-///
-/// `linked_repos` needs no caller: a grant carries its own PDS session, so a
-/// record-event script can mirror into a linked repo with no credentials of its
-/// own. It is registered here for the same reason the spaces write surface is —
-/// every script context is meant to have it.
-///
-/// The Record API is registered in **no-auth mode** here — fine for
-/// record-event and label scripts which have no caller credentials.
-/// Calling `:save()` / `:delete()` (the PDS-touching variants) errors
-/// clearly with the no-PDS-auth message; the local-only variants
-/// (`:save_local`, `:delete_local`, `Record.delete_local`) work.
-async fn register_default_apis(
+/// Install `require` on a fresh sandbox: the one way a script reaches the
+/// host. `caller_did` is who the script logs as and who a library reads as
+/// the caller; a record-event script runs as the record's author, a label
+/// script as nobody. Neither holds PDS credentials, so no session is passed.
+async fn install_require(
     lua: &mlua::Lua,
-    state: &Arc<AppState>,
+    state: &AppState,
     trigger_id: &str,
     caller_did: Option<&str>,
 ) -> Result<(), String> {
-    db_api::register_db_api(lua, state.clone()).map_err(|e| format!("db api: {e}"))?;
-    http_api::register_http_api(lua, state.clone()).map_err(|e| format!("http api: {e}"))?;
-    xrpc_api::register_xrpc_api(lua, state.clone(), caller_did.map(String::from))
-        .map_err(|e| format!("xrpc api: {e}"))?;
-    atproto_api::register_atproto_api(lua, state.clone(), None)
-        .map_err(|e| format!("atproto api: {e}"))?;
-    crate::lua::spaces_api::register_spaces_write_api(lua, state.clone(), caller_did)
-        .map_err(|e| format!("spaces write api: {e}"))?;
-    crate::lua::linked_repos_api::register_linked_repos_api(lua, state.clone())
-        .map_err(|e| format!("linked repos api: {e}"))?;
-    super::jobs_api::register_jobs_api(
-        lua,
-        state.clone(),
-        caller_did.map(|d| super::jobs_api::JobsCaller {
-            did: d.to_string(),
-            api_client_id: None,
-            dpop_key_id: None,
-        }),
-    )
-    .map_err(|e| format!("jobs api: {e}"))?;
-    record::register_record_api_no_auth(lua, state.clone())
-        .map_err(|e| format!("record api: {e}"))?;
-    register_log_event_api(lua, state, trigger_id, caller_did)?;
     let identity = crate::lua::builtins::ScriptIdentity {
         trigger_id: trigger_id.to_string(),
         caller_did: caller_did.map(String::from),
         job_id: None,
     };
-    crate::lua::require_api::register_require(lua, state, &identity, None).await?;
-    Ok(())
+    crate::lua::require_api::register_require(lua, state, &identity, None).await
 }
 
-/// Register `log(msg)` as a Lua global that writes a `script.log` row to
-/// `event_logs` (so operators can inspect script output from
-/// `/dashboard/events` without tailing stderr) AND emits a
-/// `tracing::debug!` for ops who do tail.
-///
-/// `trigger_id` is recorded as the row's `subject` so events for a
-/// specific script can be filtered by trigger. `caller_did` is recorded
-/// as `actor_did` when the runner has one (XRPC handlers); record /
-/// label runners pass `None`.
-///
-/// This intentionally **overrides** the basic `log()` helper that
-/// `sandbox::create_sandbox()` registers (which only writes to
-/// `tracing::debug!`). All script runners call this helper so every
-/// trigger family lands its `log()` calls in the event log.
-pub(crate) fn register_log_event_api(
-    lua: &mlua::Lua,
-    state: &Arc<AppState>,
-    trigger_id: &str,
-    caller_did: Option<&str>,
-) -> Result<(), String> {
-    let state = state.clone();
-    let trigger_id = trigger_id.to_string();
-    let caller_did = caller_did.map(String::from);
-    let log_fn = lua
-        .create_async_function(move |_, msg: String| {
-            let state = state.clone();
-            let trigger_id = trigger_id.clone();
-            let caller_did = caller_did.clone();
-            async move {
-                tracing::debug!(lua_log = %msg, trigger = %trigger_id, "lua script log");
-                log_event(
-                    &state.db,
-                    EventLog {
-                        event_type: "script.log".to_string(),
-                        severity: Severity::Info,
-                        actor_did: caller_did,
-                        subject: Some(trigger_id.clone()),
-                        detail: serde_json::json!({
-                            "trigger": trigger_id,
-                            "message": msg,
-                        }),
-                    },
-                    state.db_backend,
-                )
-                .await;
-                Ok(())
-            }
-        })
-        .map_err(|e| format!("log api: {e}"))?;
-    lua.globals()
-        .set("log", log_fn)
-        .map_err(|e| format!("set log global: {e}"))?;
-    Ok(())
-}
-
-/// Load `script_variables` as a flat key→value map for the `env` global.
+/// Load `script_variables` as a flat key→value map for `ctx.env`.
 async fn load_env_vars(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -1023,44 +886,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_apis_include_linked_repos() {
-        let state = Arc::new(registration_test_state());
-        let lua = mlua::Lua::new();
+    async fn install_require_installs_only_require() {
+        let state = registration_test_state();
+        let lua = sandbox::create_sandbox().unwrap();
 
-        register_default_apis(&lua, &state, "record.create:com.example.thing", None)
+        install_require(&lua, &state, "record.create:com.example.thing", None)
             .await
-            .expect("default APIs should register");
+            .expect("require should install");
 
-        let (kind, get_kind, list_kind): (String, String, String) = lua
-            .load("return type(linked_repos), type(linked_repos.get), type(linked_repos.list)")
-            .eval_async()
-            .await
-            .expect("linked_repos should be present for record-event and label scripts");
-
-        assert_eq!(kind, "table");
-        assert_eq!(get_kind, "function");
-        assert_eq!(list_kind, "function");
+        let globals = lua.globals();
+        assert!(globals.get::<mlua::Function>("require").is_ok());
+        for name in [
+            "db",
+            "http",
+            "xrpc",
+            "atproto",
+            "linked_repos",
+            "jobs",
+            "Record",
+            "log",
+            "env",
+            "event",
+        ] {
+            let raw: mlua::Value = globals.raw_get(name).unwrap();
+            assert!(raw.is_nil(), "{name} is defined on the globals table");
+        }
     }
 
     #[tokio::test]
-    async fn default_apis_still_include_the_existing_globals() {
-        let state = Arc::new(registration_test_state());
-        let lua = mlua::Lua::new();
+    async fn install_require_serves_the_builtins() {
+        let state = registration_test_state();
+        let lua = sandbox::create_sandbox().unwrap();
 
-        register_default_apis(&lua, &state, "labeler.apply:app.bsky.feed.post", None)
+        install_require(&lua, &state, "labeler.apply:app.bsky.feed.post", None)
             .await
-            .expect("default APIs should register");
+            .expect("require should install");
 
         let ok: bool = lua
             .load(
-                "return type(db) == 'table' and type(http) == 'table' \
-                    and type(xrpc) == 'table' and type(atproto) == 'table' \
-                    and type(atproto.spaces) == 'table' and type(jobs) == 'table'",
+                r#"
+                local time = require("internal.time")
+                local json = require("internal.json")
+                return type(time.now()) == "number" and json.encode({ a = 1 }) == '{"a":1}'
+                "#,
             )
             .eval_async()
             .await
             .unwrap();
-        assert!(ok, "existing script globals must survive the addition");
+        assert!(ok);
     }
 
     #[test]

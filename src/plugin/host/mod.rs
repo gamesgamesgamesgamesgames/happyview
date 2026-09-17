@@ -10,10 +10,7 @@ mod logging;
 mod lookup;
 mod records;
 mod secrets;
-// `pub(crate)`, not private like `jobs`/`linked_repos`: the Lua `atproto.spaces`
-// global (`src/lua/spaces_api.rs`, `src/lua/atproto_api.rs`) calls into this
-// module too, so it needs to be reachable from outside `plugin::host`.
-pub(crate) mod spaces;
+mod spaces;
 
 pub use atproto::*;
 pub use bindings::{PluginState, register_host_functions};

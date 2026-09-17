@@ -1,3 +1,4 @@
+pub(crate) mod local;
 pub(crate) mod procedure;
 pub(crate) mod query;
 pub(crate) mod scope_check;

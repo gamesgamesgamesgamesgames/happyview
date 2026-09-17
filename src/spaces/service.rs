@@ -1,10 +1,10 @@
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::lua::tid::generate_tid;
 use crate::spaces::lthash::LtHashState;
 use crate::spaces::types::*;
 use crate::spaces::{SpaceUri, commit, db, lthash, members, notifications, oplog};
+use crate::tid::generate_tid;
 use sha2::{Digest, Sha256};
 
 pub(crate) async fn resolve_space(state: &AppState, space_ref: &str) -> Result<Space, AppError> {

@@ -4,9 +4,9 @@
 //! - Admin CRUD on `/admin/scripts` with trigger-id validation.
 //! - Dispatcher cascade for record events
 //!   (`record.<action>:<nsid>` → `record.index:<nsid>`).
-//! - Label scripts: URI-routed dispatch + Record local mutation
-//!   (`Record.delete_local`, `:save_local`).
-//! - The no-PDS-auth boundary: a label script that calls `r:save()`
+//! - Label scripts: URI-routed dispatch + local index mutation through
+//!   `happyview.record` (`delete_local`, `save_local`).
+//! - The no-session boundary: a label script that calls `record.put`
 //!   gets dead-lettered fail-open with the original record untouched.
 
 mod common;
@@ -194,7 +194,7 @@ async fn fetch_record_body(app: &TestApp, uri: &str) -> Option<Value> {
 async fn create_then_get_script_round_trips() {
     let app = TestApp::new().await;
     let id = "record.create:com.example.thing";
-    create_script(&app, id, "function handle() return event.record end").await;
+    create_script(&app, id, "function handle(input) return input.record end").await;
 
     let resp = app
         .router
@@ -219,13 +219,13 @@ async fn list_scripts_returns_all_rows() {
     create_script(
         &app,
         "record.create:com.example.thing",
-        "function handle() return event.record end",
+        "function handle(input) return input.record end",
     )
     .await;
     create_script(
         &app,
         "labeler.apply:_actor",
-        "function handle() return event end",
+        "function handle(input) return input end",
     )
     .await;
 
@@ -303,7 +303,7 @@ async fn create_allows_labeler_apply_actor_special_case() {
             app.admin_cookie(),
             &json!({
                 "id": "labeler.apply:_actor",
-                "body": "function handle() return event end",
+                "body": "function handle(input) return input end",
             }),
         ))
         .await
@@ -338,7 +338,7 @@ async fn create_rejects_invalid_lua_body() {
 async fn patch_updates_body() {
     let app = TestApp::new().await;
     let id = "record.create:com.example.thing";
-    create_script(&app, id, "function handle() return event.record end").await;
+    create_script(&app, id, "function handle(input) return input.record end").await;
 
     let resp = app
         .router
@@ -361,7 +361,7 @@ async fn patch_updates_body() {
 async fn delete_removes_script() {
     let app = TestApp::new().await;
     let id = "record.delete:com.example.thing";
-    create_script(&app, id, "function handle() return event.record end").await;
+    create_script(&app, id, "function handle(input) return input.record end").await;
 
     let resp = app
         .router
@@ -401,7 +401,7 @@ async fn cascade_wildcard_runs_when_no_action_specific() {
         &app,
         "record.index:games.gamesgamesgamesgames.game",
         // Wildcard — uppercases the title for any action.
-        "function handle() event.record.title = string.upper(event.record.title); return event.record end",
+        "function handle(input) input.record.title = string.upper(input.record.title); return input.record end",
     )
     .await;
 
@@ -437,13 +437,13 @@ async fn cascade_action_specific_wins_over_wildcard() {
     create_script(
         &app,
         "record.index:games.gamesgamesgamesgames.game",
-        "function handle() event.record.title = 'WILDCARD'; return event.record end",
+        "function handle(input) input.record.title = 'WILDCARD'; return input.record end",
     )
     .await;
     create_script(
         &app,
         "record.create:games.gamesgamesgamesgames.game",
-        "function handle() event.record.title = 'CREATE-SPECIFIC'; return event.record end",
+        "function handle(input) input.record.title = 'CREATE-SPECIFIC'; return input.record end",
     )
     .await;
 
@@ -556,7 +556,7 @@ async fn record_create_returning_nil_skips_indexing() {
 }
 
 // ---------------------------------------------------------------------------
-// log() in scripts → event_logs
+// internal.logging in scripts → event_logs
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -569,7 +569,7 @@ async fn record_event_script_log_writes_event_log_row() {
     create_script(
         &app,
         "record.create:games.gamesgamesgamesgames.game",
-        "function handle() log('hello from script'); return event.record end",
+        "local log = require('internal.logging')\nfunction handle(input) log.info('hello from script'); return input.record end",
     )
     .await;
 
@@ -586,7 +586,7 @@ async fn record_event_script_log_writes_event_log_row() {
     )
     .await;
 
-    // The script's log("hello from script") should land in event_logs
+    // The script's log.info("hello from script") should land in event_logs
     // as a `script.log` row whose subject is the trigger id.
     let row: (String, String) = happyview::db::query_as(&adapt_sql(
         "SELECT subject, detail FROM happyview_event_logs
@@ -630,9 +630,10 @@ async fn label_script_can_drop_record_via_record_delete_local() {
     create_script(
         &app,
         "labeler.apply:app.bsky.feed.post",
-        "function handle() \
-            if event.val == 'spam' then Record.delete_local(event.uri) end \
-            return event \
+        "local record = require('happyview.record') \
+         function handle(input) \
+            if input.val == 'spam' then record.delete_local(input.uri) end \
+            return input \
          end",
     )
     .await;
@@ -673,12 +674,16 @@ async fn label_script_can_redact_record_via_save_local() {
     create_script(
         &app,
         "labeler.apply:app.bsky.feed.post",
-        "function handle() \
-            if event.val == 'redact' then \
-                local r = Record.load(event.uri) \
-                if r then r.text = '[redacted by ' .. event.src .. ']'; r:save_local() end \
+        "local record = require('happyview.record') \
+         function handle(input) \
+            if input.val == 'redact' then \
+                local entry = record.load(input.uri) \
+                if entry then \
+                    entry.record.text = '[redacted by ' .. input.src .. ']' \
+                    record.save_local('app.bsky.feed.post', 'rkey1', entry.record, 'did:plc:author') \
+                end \
             end; \
-            return event \
+            return input \
          end",
     )
     .await;
@@ -710,12 +715,13 @@ async fn label_script_uri_routes_actor_special_case() {
     create_script(
         &app,
         "labeler.apply:_actor",
-        // Sentinel: write a row into a caller-owned table (db.raw cannot touch
+        // Sentinel: write a row into a caller-owned table (sql.raw cannot touch
         // internal HappyView tables) so we can detect that the script ran.
-        "function handle() \
-            db.raw('CREATE TABLE IF NOT EXISTS script_sentinel (k TEXT)') \
-            db.raw('INSERT INTO script_sentinel (k) VALUES (?)', {'fired'}) \
-            return event \
+        "local sql = require('happyview.sql') \
+         function handle(input) \
+            sql.raw('CREATE TABLE IF NOT EXISTS script_sentinel (k TEXT)') \
+            sql.raw('INSERT INTO script_sentinel (k) VALUES (?)', {'fired'}) \
+            return input \
          end",
     )
     .await;
@@ -750,7 +756,7 @@ async fn label_script_uri_routes_actor_special_case() {
 #[tokio::test]
 #[serial]
 #[ignore]
-async fn label_script_calling_record_save_dead_letters_with_clear_message() {
+async fn label_script_calling_record_put_dead_letters_with_clear_message() {
     let app = TestApp::new().await;
 
     let uri = "at://did:plc:author/app.bsky.feed.post/rkey1";
@@ -767,10 +773,11 @@ async fn label_script_calling_record_save_dead_letters_with_clear_message() {
     create_script(
         &app,
         "labeler.apply:app.bsky.feed.post",
-        "function handle() \
-            local r = Record.load(event.uri) \
-            if r then r.text = 'should fail'; r:save() end \
-            return event \
+        "local record = require('happyview.record') \
+         function handle(input) \
+            local entry = record.load(input.uri) \
+            if entry then record.put(input.uri, { text = 'should fail' }) end \
+            return input \
          end",
     )
     .await;
@@ -795,7 +802,7 @@ async fn label_script_calling_record_save_dead_letters_with_clear_message() {
     let body = fetch_record_body(&app, uri).await.unwrap();
     assert_eq!(body["text"], "untouched");
 
-    // A dead-letter row exists with the NO_PDS_AUTH message.
+    // A dead-letter row exists with the no-session message.
     let dl: (String,) = happyview::db::query_as(&adapt_sql(
         "SELECT error FROM happyview_dead_letter_scripts WHERE host_kind = 'label' \
          AND host_id = 'did:plc:labeler' ORDER BY id DESC LIMIT 1",
@@ -805,8 +812,8 @@ async fn label_script_calling_record_save_dead_letters_with_clear_message() {
     .await
     .expect("expected a dead_letter_scripts row");
     assert!(
-        dl.0.contains("no PDS auth"),
-        "expected NO_PDS_AUTH message in dead-letter, got: {}",
+        dl.0.contains("NO_SESSION"),
+        "expected the no-session error in the dead-letter, got: {}",
         dl.0
     );
 }
@@ -832,9 +839,10 @@ async fn record_event_script_can_call_record_delete_local() {
     create_script(
         &app,
         "record.create:games.gamesgamesgamesgames.game",
-        "function handle() \
-            Record.delete_local('at://did:plc:test/games.gamesgamesgamesgames.game/old') \
-            return event.record \
+        "local record = require('happyview.record') \
+         function handle(input) \
+            record.delete_local('at://did:plc:test/games.gamesgamesgamesgames.game/old') \
+            return input.record \
          end",
     )
     .await;

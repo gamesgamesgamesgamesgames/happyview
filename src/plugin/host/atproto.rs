@@ -1,6 +1,4 @@
-//! AT Protocol network reads and attestation signing for plugins. Shared with
-//! the Lua `atproto` global (`src/lua/atproto_api.rs`), which wraps these same
-//! functions for scripts rather than re-implementing them.
+//! AT Protocol network reads and attestation signing for plugins.
 
 use std::collections::BTreeMap;
 
@@ -131,9 +129,8 @@ pub async fn blob_download(
 
 /// `blob_download` with the endpoint-safety check toggleable. The plugin
 /// import goes through [`blob_download`], which pins `allow_local` to
-/// `false`; the Lua global passes `true` for the reason given on
-/// `register_atproto_api`; tests that need a real fetch against `wiremock`
-/// (always a loopback address) pass `true` as well.
+/// `false`; tests that need a real fetch against `wiremock` (always a
+/// loopback address) pass `true`.
 pub(crate) async fn blob_download_with_policy(
     http: &reqwest::Client,
     plc_url: &str,

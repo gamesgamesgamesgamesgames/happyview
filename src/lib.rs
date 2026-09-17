@@ -44,6 +44,7 @@ pub mod spaces;
 pub mod telemetry;
 pub mod telemetry_middleware;
 pub mod test_support;
+pub mod tid;
 pub mod verification_methods;
 pub mod version;
 pub mod xrpc;

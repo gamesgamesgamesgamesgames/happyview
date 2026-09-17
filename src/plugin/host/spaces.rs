@@ -474,10 +474,9 @@ mod tests {
         };
     }
 
-    /// Mirrors `lua::spaces_api`'s `db_test_state`: a migrated Postgres
-    /// `AppState` (`TEST_DATABASE_URL`), the same shape the Lua global's own
-    /// tests build against, so the two suites see identical behaviour from
-    /// identical setups.
+    /// A migrated Postgres `AppState` (`TEST_DATABASE_URL`), the same shape
+    /// the HTTP handlers' own tests build against, so the two suites see
+    /// identical behaviour from identical setups.
     async fn db_test_state() -> AppState {
         let url = std::env::var("TEST_DATABASE_URL")
             .expect("TEST_DATABASE_URL must be set for host::spaces integration tests");

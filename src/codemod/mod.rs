@@ -12,9 +12,9 @@ mod requires;
 mod rewrite;
 
 #[cfg(test)]
-mod equivalence;
+mod behaviour;
 
-pub use detect::needs_migration;
+pub use detect::{REMOVED_GLOBALS, UNPARSEABLE, needs_migration};
 pub use rewrite::rewrite;
 
 /// What the runner hands `handle` as its first argument. A procedure receives

@@ -1605,11 +1605,10 @@ fn require_spaces_caller(caller_did: Option<String>) -> Result<String, super::sp
 
 /// `host_caller_xrpc_query` on its own: gate on the capability, decode the
 /// spec, and run it, but — unlike [`host_caller_impl`] — never refuse for
-/// lacking a session. A query needs no PDS auth to run: the Lua `xrpc.query`
-/// global has never required one, and a query, record-event or label script
-/// has no session to lend. The session, when the runner has one, still
-/// supplies its claims; otherwise the call context's `caller_did` stands in,
-/// exactly as `xrpc.query` falls back to it today.
+/// lacking a session. A query needs no PDS auth to run, and a query,
+/// record-event or label script has no session to lend. The session, when the
+/// runner has one, still supplies its claims; otherwise the call context's
+/// `caller_did` stands in.
 async fn host_caller_query_impl(
     caller: &mut wasmtime::Caller<'_, PluginState>,
     req_ptr: i32,

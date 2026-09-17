@@ -3,7 +3,7 @@
 //! canonical names (the SDK's `naming` module says why those are what Lua
 //! sees), whose function exports dispatch through
 //! `PluginExecutor::call_library` and whose constructor exports produce
-//! chainable objects. Additive — existing globals stay.
+//! chainable objects.
 //!
 //! `internal.*` built-ins resolve before any library lookup and share the
 //! same cache slot, so a script uses a built-in and a plugin the same way.
@@ -275,7 +275,7 @@ fn json_array(lua: &Lua, table: mlua::Table) -> LuaResult<Vec<serde_json::Value>
 /// For `validate_script`: any `require("x")` yields a table whose every
 /// field is a function returning another such table, so a top-level chain
 /// of any shape — `db.records("c"):where(...):limit(5)` — compiles without
-/// an instance. Mirrors the `env` stub there.
+/// an instance.
 pub fn register_require_stub(lua: &Lua) -> LuaResult<()> {
     let require = lua.create_function(|lua, _name: String| stub_table(lua))?;
     lua.globals().set("require", require)
@@ -456,7 +456,7 @@ mod tests {
         register_require(&lua, &state, &identity_with(None), None)
             .await
             .unwrap();
-        lua.load(r#"local lib = require("liba"); function handle() return lib.call_other("liba", "nope", toarray({})) end"#)
+        lua.load(r#"local lib = require("liba"); local json = require("internal.json"); function handle() return lib.call_other("liba", "nope", json.to_array({})) end"#)
             .exec()
             .unwrap();
         let handle: mlua::Function = lua.globals().get("handle").unwrap();
@@ -465,8 +465,8 @@ mod tests {
     }
 
     /// An unmarked empty Lua table `{}` stays a JSON object — the same
-    /// convention `toarray`/`json.encode` use everywhere else. Only an
-    /// explicit `toarray({})` should read as `[]`.
+    /// convention `json.encode` uses everywhere else. Only an explicit
+    /// `json.to_array({})` should read as `[]`.
     #[tokio::test]
     async fn empty_table_argument_stays_an_object() {
         let state = state_with_library().await;
@@ -477,11 +477,12 @@ mod tests {
         lua.load(
             r#"
             local lib = require("liba")
+            local json = require("internal.json")
             function handle_object()
                 return json.encode(lib.echo({}))
             end
             function handle_array()
-                return json.encode(lib.echo(toarray({})))
+                return json.encode(lib.echo(json.to_array({})))
             end
             "#,
         )
@@ -540,6 +541,7 @@ mod tests {
         lua.load(
             r#"
             local o = require("objects")
+            local json = require("internal.json")
             function handle()
                 local c = o.chain(1)
                 local same = c:add(2)

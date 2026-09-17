@@ -8,7 +8,7 @@ use crate::auth::XrpcClaims;
 use crate::error::AppError;
 use crate::rate_limit::CheckResult;
 
-use super::pds::pds_post_blob;
+use super::pds::{PdsAuth, pds_post_blob};
 
 pub async fn upload_blob(
     State(state): State<AppState>,
@@ -112,4 +112,87 @@ pub async fn upload_blob(
     }
 
     Ok(response)
+}
+
+/// Upload a blob to the caller's PDS through whichever credential the caller
+/// holds, returning the PDS's blob reference verbatim.
+pub(crate) async fn upload_blob_to_pds(
+    state: &AppState,
+    caller_did: &str,
+    pds_auth: &PdsAuth,
+    content_type: &str,
+    blob_bytes: Bytes,
+) -> Result<serde_json::Value, AppError> {
+    match pds_auth {
+        PdsAuth::OAuth(session) => {
+            use atrium_xrpc::{
+                InputDataOrBytes, OutputDataOrBytes, XrpcClient, XrpcRequest, http::Method,
+            };
+
+            let request = XrpcRequest {
+                method: Method::POST,
+                nsid: "com.atproto.repo.uploadBlob".to_string(),
+                parameters: None::<()>,
+                input: Some(InputDataOrBytes::<()>::Bytes(blob_bytes.to_vec())),
+                encoding: Some(content_type.to_string()),
+            };
+
+            let result: Result<
+                OutputDataOrBytes<serde_json::Value>,
+                atrium_xrpc::Error<serde_json::Value>,
+            > = session.send_xrpc(&request).await;
+
+            match result {
+                Ok(OutputDataOrBytes::Data(data)) => Ok(data),
+                Ok(OutputDataOrBytes::Bytes(bytes)) => serde_json::from_slice(&bytes)
+                    .map_err(|e| AppError::Internal(format!("invalid uploadBlob response: {e}"))),
+                Err(atrium_xrpc::Error::XrpcResponse(xrpc_err)) => {
+                    let status = axum::http::StatusCode::from_u16(xrpc_err.status.as_u16())
+                        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                    let body = xrpc_err
+                        .error
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    Err(AppError::PdsError(status, Bytes::from(body)))
+                }
+                Err(e) => Err(AppError::Internal(format!("PDS uploadBlob failed: {e}"))),
+            }
+        }
+        PdsAuth::Dpop {
+            api_client_id,
+            dpop_key_id,
+            encryption_key,
+        } => {
+            let resp = crate::oauth::pds_write::dpop_pds_post_blob(
+                &state.http,
+                &state.db,
+                state.db_backend,
+                encryption_key,
+                &state.oauth,
+                &state.config.plc_url,
+                api_client_id,
+                caller_did,
+                dpop_key_id,
+                content_type,
+                blob_bytes,
+            )
+            .await?;
+
+            let status = resp.status();
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| AppError::Internal(format!("failed to read upload response: {e}")))?;
+
+            if !status.is_success() {
+                let axum_status = axum::http::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                return Err(AppError::PdsError(axum_status, body));
+            }
+
+            serde_json::from_slice(&body)
+                .map_err(|e| AppError::Internal(format!("invalid uploadBlob response: {e}")))
+        }
+    }
 }

@@ -30,6 +30,7 @@ const MARK_SPACE_RETURN: &str = "v3 space handles carry no fields, so returning 
 const MARK_AUTHOR_DID: &str =
     "v3 space records spell it author_did -- rename this read to author_did";
 const MARK_HANDLE_PARAMS: &str = "handle takes exactly (input, ctx) in v3 -- cut this parameter list down to two, then re-run the codemod";
+const MARK_READ_AT_LOAD: &str = "this runs while the script loads, before handle receives input and ctx -- move the read into handle, or into a function handle calls";
 const MARK_NO_HANDLE: &str = "input and ctx are handle's parameters in v3 -- declare function handle(input, ctx) and read them there";
 
 fn never_nil_message(name: &str) -> String {
@@ -117,7 +118,14 @@ pub fn rewrite(source: &str, kind: ScriptKind) -> Result<Rewrite, CodemodError> 
 /// The globals whose meaning comes from the trigger rather than the runtime.
 fn kind_global(kind: ScriptKind, name: &str) -> Option<&'static str> {
     let table: &[(&str, &str)] = match kind {
-        ScriptKind::Procedure => &[("params", "ctx.params"), ("collection", "ctx.collection")],
+        // `input` keeps its name. It is listed so a read of it counts as a
+        // read of the contract, which is what hoists it for a helper outside
+        // `handle`.
+        ScriptKind::Procedure => &[
+            ("input", "input"),
+            ("params", "ctx.params"),
+            ("collection", "ctx.collection"),
+        ],
         ScriptKind::Query => &[("params", "input"), ("collection", "ctx.collection")],
         ScriptKind::RecordEvent => &[
             ("event", "input"),
@@ -193,6 +201,10 @@ struct Planner<'a> {
     /// Where the rewrite reads `input` or `ctx`. A read outside `handle`'s own
     /// body is what the hoist exists for.
     contract_sites: Vec<usize>,
+    /// Every function body's byte range. A read of `input` or `ctx` inside
+    /// none of them runs as the chunk loads, which is before `handle` is
+    /// called and so before either has a value, hoisted or not.
+    function_bodies: Vec<(usize, usize)>,
     /// Marks are collected rather than placed as they are found: where the
     /// comment can go depends on the splices the rest of the pass produces.
     markers: Vec<(usize, String)>,
@@ -255,6 +267,7 @@ impl<'a> Planner<'a> {
             shimmed: BTreeSet::new(),
             handle: None,
             contract_sites: Vec::new(),
+            function_bodies: Vec::new(),
             markers: Vec::new(),
             statements: Vec::new(),
         }
@@ -281,6 +294,16 @@ impl<'a> Planner<'a> {
             if message == MARK_NO_HANDLE {
                 self.mark(path, message.to_string());
             }
+            return false;
+        }
+        if reads_contract
+            && let Some(at) = path.start()
+            && !self
+                .function_bodies
+                .iter()
+                .any(|(start, end)| *start <= at && at < *end)
+        {
+            self.mark_at(at, MARK_READ_AT_LOAD.to_string());
             return false;
         }
         let taken = modules
@@ -645,7 +668,9 @@ impl<'a> Planner<'a> {
         // The global here, the script's own name a few lines away. Rewriting
         // would leave the two meanings of one word side by side, so this is
         // the one place a person has to choose.
-        if self.bindings.names.contains(name) {
+        // Every migrated `handle` binds `input`, so that name being bound says
+        // nothing here; a binding of the script's own is refused in `commit`.
+        if name != "input" && self.bindings.names.contains(name) {
             self.mark(&path, blocked_message(name));
             return;
         }
@@ -1223,6 +1248,12 @@ impl Visitor for Planner<'_> {
     fn visit_function_call(&mut self, node: &FunctionCall) {
         if let Some(path) = Path::build(node.prefix(), node.suffixes()) {
             self.visit_path(path);
+        }
+    }
+
+    fn visit_function_body(&mut self, node: &full_moon::ast::FunctionBody) {
+        if let Some(range) = span(node) {
+            self.function_bodies.push(range);
         }
     }
 
@@ -1926,6 +1957,117 @@ mod tests {
         assert!(
             result.contains("function handle(handle_input, handle_ctx)"),
             "{result}"
+        );
+    }
+
+    #[test]
+    fn a_procedures_input_read_in_a_helper_hoists_like_any_context_read() {
+        let source = "local function q()\n  return input.q\nend\n\nfunction handle()\n  return { q = q() }\nend\n";
+        let result = rewrite(source, ScriptKind::Procedure).unwrap();
+        assert!(result.notes.is_empty(), "{:?}", result.notes);
+        assert_eq!(
+            result.source,
+            "local input, ctx\n\nlocal function q()\n  return input.q\nend\n\nfunction handle(handle_input, handle_ctx)\n  input, ctx = handle_input, handle_ctx\n  return { q = q() }\nend\n"
+        );
+
+        let again = rewrite(&result.source, ScriptKind::Procedure).unwrap();
+        assert_eq!(again.source, result.source);
+        assert!(again.notes.is_empty(), "{:?}", again.notes);
+    }
+
+    /// `handle(input, ctx)` binds `input` for its own body only, so the
+    /// signature being in place does not make the helper's read a bound one.
+    #[test]
+    fn a_helpers_input_read_hoists_under_a_signature_already_on_the_contract() {
+        let result = rewrite(
+            "local function q()\n  return input.q\nend\n\nfunction handle(input, ctx)\n  return { q = q(), s = input.s }\nend\n",
+            ScriptKind::Procedure,
+        )
+        .unwrap();
+        assert!(result.notes.is_empty(), "{:?}", result.notes);
+        assert!(
+            result.source.starts_with("local input, ctx\n\n"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("function handle(handle_input, handle_ctx)\n  input, ctx = handle_input, handle_ctx\n"),
+            "{}",
+            result.source
+        );
+    }
+
+    #[test]
+    fn a_procedure_on_the_contract_rewrites_to_itself() {
+        let source = "function handle(input, ctx)\n  return { status = input.status, who = ctx.caller_did }\nend\n";
+        let result = rewrite(source, ScriptKind::Procedure).unwrap();
+        assert_eq!(result.source, source);
+        assert!(result.notes.is_empty(), "{:?}", result.notes);
+    }
+
+    /// A hoisted `input` is still `nil` while the chunk loads, so a read at
+    /// file scope is left for a person rather than rewritten into one that
+    /// fails on load.
+    #[test]
+    fn a_procedures_input_read_at_file_scope_is_marked_rather_than_hoisted() {
+        let source =
+            "local seed = input.seed\n\nfunction handle()\n  return { seed = seed }\nend\n";
+        let result = rewrite(source, ScriptKind::Procedure).unwrap();
+        assert_eq!(result.notes.len(), 1, "{:?}", result.notes);
+        assert_eq!(result.notes[0].line, 1);
+        assert_eq!(result.notes[0].message, super::MARK_READ_AT_LOAD);
+        assert!(
+            !result.source.contains("local input, ctx"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("\nlocal seed = input.seed\n"),
+            "{}",
+            result.source
+        );
+        assert!(
+            result.source.contains("function handle(input, ctx)"),
+            "{}",
+            result.source
+        );
+
+        let again = rewrite(&result.source, ScriptKind::Procedure).unwrap();
+        assert_eq!(again.source, result.source);
+        assert_eq!(again.notes.len(), 1, "{:?}", again.notes);
+    }
+
+    #[test]
+    fn any_context_read_at_file_scope_is_marked() {
+        let result = rewrite(
+            "local BASE = env.API_URL\n\nfunction handle()\n  return { base = BASE, q = params.q }\nend\n",
+            ScriptKind::Query,
+        )
+        .unwrap();
+        assert_eq!(result.notes.len(), 1, "{:?}", result.notes);
+        assert_eq!(result.notes[0].message, super::MARK_READ_AT_LOAD);
+        assert!(
+            result.source.contains("local BASE = env.API_URL"),
+            "{}",
+            result.source
+        );
+        assert!(result.source.contains("q = input.q"), "{}", result.source);
+    }
+
+    #[test]
+    fn a_free_input_is_not_a_global_outside_a_procedure() {
+        let result = rewrite(
+            "local function q()\n  return input.q\nend\n\nfunction handle()\n  return q()\nend\n",
+            ScriptKind::Query,
+        )
+        .unwrap();
+        assert_eq!(result.notes.len(), 1, "{:?}", result.notes);
+        assert!(
+            result.notes[0]
+                .message
+                .contains("input is not a global in a query script"),
+            "{:?}",
+            result.notes
         );
     }
 

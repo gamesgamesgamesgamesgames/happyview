@@ -15,9 +15,9 @@
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::lua::tid::generate_tid;
 use crate::spaces::lthash::{LtHashState, record_element};
 use crate::spaces::{commit, db};
+use crate::tid::generate_tid;
 
 /// Marker so the one-time commit-format rebuild does not repeat on every boot.
 const COMMIT_FORMAT_MARKER_KEY: &str = "space_commit_format_rebuild_completed_at";

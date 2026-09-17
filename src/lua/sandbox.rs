@@ -1,38 +1,58 @@
-use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
-
-use super::tid::{
-    generate_tid, tid_from_iso8601, tid_from_number, tid_from_unix_microseconds, tid_to_iso8601,
-    tid_to_number, tid_to_unix_microseconds,
-};
+use mlua::{Lua, Result as LuaResult};
 
 const INSTRUCTION_LIMIT: u32 = 1_000_000;
 
-/// Body of the `json` global's `encode` and of `internal.json.encode`. Each
-/// of the three bodies below is kept in one place so the two spellings of it
-/// cannot drift apart.
-pub(crate) fn json_encode(lua: &Lua, value: mlua::Value) -> LuaResult<String> {
-    let json_value: serde_json::Value = lua
-        .from_value(value)
-        .map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))?;
-    serde_json::to_string(&json_value)
-        .map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))
-}
+/// The names a v2 script reached the host through. Reading one raises rather
+/// than yielding `nil`: a stored script that predates the codemod would
+/// otherwise fail as `attempt to index a nil value` somewhere inside its own
+/// body, naming neither the global nor the fix. Assignment is untouched, so a
+/// script can still define helpers at file scope.
+///
+/// The label event's fields sit alongside the record event's: both arrive as
+/// `input`, and a label script reading a bare `val` is as unmigrated as a
+/// record script reading a bare `record`.
+pub const REMOVED_GLOBALS: [&str; 32] = [
+    "now",
+    "log",
+    "TID",
+    "toarray",
+    "json",
+    "method",
+    "input",
+    "params",
+    "caller_did",
+    "collection",
+    "delegate_did",
+    "env",
+    "space",
+    "action",
+    "uri",
+    "did",
+    "rkey",
+    "record",
+    "event",
+    "job",
+    "src",
+    "val",
+    "neg",
+    "cts",
+    "exp",
+    "db",
+    "http",
+    "xrpc",
+    "atproto",
+    "linked_repos",
+    "jobs",
+    "Record",
+];
 
-/// Body of the `json` global's `decode` and of `internal.json.decode`.
-pub(crate) fn json_decode(lua: &Lua, s: String) -> LuaResult<mlua::Value> {
-    let json_value: serde_json::Value =
-        serde_json::from_str(&s).map_err(|e| mlua::Error::runtime(format!("json.decode: {e}")))?;
-    lua.to_value(&json_value)
-        .map_err(|e| mlua::Error::runtime(format!("json.decode: {e}")))
-}
-
-/// Body of the `toarray` global and of `internal.json.to_array`: marks a
-/// table as a JSON array so an empty one serializes as `[]` instead of `{}`.
-pub(crate) fn to_array(lua: &Lua, table: mlua::Table) -> LuaResult<mlua::Table> {
-    let values: Vec<mlua::Value> = table.sequence_values().collect::<LuaResult<_>>()?;
-    let seq = lua.create_sequence_from(values)?;
-    seq.set_metatable(Some(lua.array_metatable()))?;
-    Ok(seq)
+/// The error a read of a removed global raises.
+pub fn removed_global_message(name: &str) -> String {
+    format!(
+        "the '{name}' global was removed in v3; run the script codemod \
+         (Settings → Scripts → Migrate, or happyview-codemod) -- see the \
+         Migrating scripts guide"
+    )
 }
 
 /// Create a fresh sandboxed Lua VM.
@@ -40,7 +60,11 @@ pub(crate) fn to_array(lua: &Lua, table: mlua::Table) -> LuaResult<mlua::Table> 
 /// - Dangerous globals (`io`, `debug`, `package`, `require`, `dofile`, `loadfile`, `load`) are removed.
 /// - `os` is replaced with a safe subset exposing only `time`, `date`, `difftime`, and `clock`.
 /// - An instruction-count hook prevents infinite loops.
-/// - Utility globals `now()` and `log()` are injected.
+/// - A read of any name in [`REMOVED_GLOBALS`] raises; any other unknown name
+///   is `nil`, as in plain Lua.
+///
+/// Everything else a script needs arrives through `require`, which the runner
+/// installs, and through the arguments of `handle(input, ctx)`.
 pub fn create_sandbox() -> LuaResult<Lua> {
     let lua = Lua::new();
 
@@ -79,73 +103,20 @@ pub fn create_sandbox() -> LuaResult<Lua> {
         |_lua, _debug| Err(mlua::Error::runtime("script exceeded execution limit")),
     )?;
 
-    // Utility: now() returns UTC ISO 8601 string
-    let now_fn = lua.create_function(|_, ()| Ok(chrono::Utc::now().to_rfc3339()))?;
-    globals.set("now", now_fn)?;
-
-    // `log(message)` no-op stub. The real implementation lives in
-    // `super::scripts::register_log_event_api` and is registered by
-    // every runner so the trigger context can be threaded into each
-    // `event_logs` row. The stub here exists only so paths that exec
-    // a script body OUTSIDE a runner — namely `validate_script`
-    // (admin write-time linting) and the in-process xrpc_api tests —
-    // don't break on top-level `log("...")` calls in user scripts.
-    // The runner-level registration always overrides this stub.
-    let log_fn = lua.create_function(|_, _msg: String| Ok(()))?;
-    globals.set("log", log_fn)?;
-
-    // Utility: TID table — callable as TID() to generate, plus conversion methods
-    let tid_table = lua.create_table()?;
-    tid_table.set(
-        "toISO8601",
-        lua.create_function(|_, tid: String| {
-            tid_to_iso8601(&tid).ok_or_else(|| mlua::Error::runtime(format!("invalid TID: {tid}")))
+    let guard = lua.create_table()?;
+    guard.set(
+        "__index",
+        lua.create_function(|_, (_globals, key): (mlua::Table, mlua::Value)| {
+            if let mlua::Value::String(name) = &key {
+                let name = name.to_str()?;
+                if REMOVED_GLOBALS.contains(&&*name) {
+                    return Err(mlua::Error::runtime(removed_global_message(&name)));
+                }
+            }
+            Ok(mlua::Value::Nil)
         })?,
     )?;
-    tid_table.set(
-        "fromISO8601",
-        lua.create_function(|_, iso: String| {
-            tid_from_iso8601(&iso)
-                .ok_or_else(|| mlua::Error::runtime(format!("invalid ISO 8601: {iso}")))
-        })?,
-    )?;
-    tid_table.set(
-        "toUnixMicroseconds",
-        lua.create_function(|_, tid: String| {
-            tid_to_unix_microseconds(&tid)
-                .ok_or_else(|| mlua::Error::runtime(format!("invalid TID: {tid}")))
-        })?,
-    )?;
-    tid_table.set(
-        "fromUnixMicroseconds",
-        lua.create_function(|_, us: i64| Ok(tid_from_unix_microseconds(us)))?,
-    )?;
-    tid_table.set(
-        "toNumber",
-        lua.create_function(|_, tid: String| {
-            tid_to_number(&tid)
-                .map(|v| v as i64)
-                .ok_or_else(|| mlua::Error::runtime(format!("invalid TID: {tid}")))
-        })?,
-    )?;
-    tid_table.set(
-        "fromNumber",
-        lua.create_function(|_, val: i64| Ok(tid_from_number(val as u64)))?,
-    )?;
-    let tid_meta = lua.create_table()?;
-    tid_meta.set(
-        "__call",
-        lua.create_function(|_, _: mlua::MultiValue| Ok(generate_tid()))?,
-    )?;
-    let _ = tid_table.set_metatable(Some(tid_meta));
-    globals.set("TID", tid_table)?;
-
-    globals.set("toarray", lua.create_function(to_array)?)?;
-
-    let json_table = lua.create_table()?;
-    json_table.set("encode", lua.create_function(json_encode)?)?;
-    json_table.set("decode", lua.create_function(json_decode)?)?;
-    globals.set("json", json_table)?;
+    globals.set_metatable(Some(guard))?;
 
     Ok(lua)
 }
@@ -153,20 +124,6 @@ pub fn create_sandbox() -> LuaResult<Lua> {
 /// Validate that a script compiles and defines a `handle` function.
 pub fn validate_script(source: &str) -> Result<(), String> {
     let lua = create_sandbox().map_err(|e| format!("failed to create Lua VM: {e}"))?;
-    // Set a stub env table that returns "" for any missing key so scripts
-    // that do top-level concatenation (e.g. `env.URL .. "/path"`) don't fail.
-    let env_stub = lua.create_table().unwrap();
-    let meta = lua.create_table().unwrap();
-    meta.set(
-        "__index",
-        lua.create_function(|_, (_t, _k): (mlua::Value, mlua::Value)| Ok("".to_string()))
-            .unwrap(),
-    )
-    .unwrap();
-    let _ = env_stub.set_metatable(Some(meta));
-    lua.globals()
-        .set("env", env_stub)
-        .map_err(|e| format!("failed to set env stub: {e}"))?;
     super::require_api::register_require_stub(&lua)
         .map_err(|e| format!("failed to set require stub: {e}"))?;
     lua.load(source)
@@ -210,129 +167,102 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_provides_now() {
+    fn sandbox_keeps_print_and_the_standard_libraries() {
         let lua = create_sandbox().unwrap();
-        let result: String = lua.load("return now()").eval().unwrap();
-        assert!(result.contains("T")); // ISO 8601 format
+        let ok: bool = lua
+            .load(
+                "return type(print) == 'function' and type(string.upper) == 'function' \
+                 and type(table.concat) == 'function' and type(math.floor) == 'function'",
+            )
+            .eval()
+            .unwrap();
+        assert!(ok);
+    }
+
+    /// A name the guard raises on and the codemod has never heard of is a
+    /// script the codemod calls finished and the runtime refuses.
+    #[test]
+    fn the_guard_and_the_codemod_name_the_same_globals() {
+        let mut guarded = REMOVED_GLOBALS.to_vec();
+        let mut rewritten = crate::codemod::REMOVED_GLOBALS.to_vec();
+        guarded.sort_unstable();
+        rewritten.sort_unstable();
+        assert_eq!(guarded, rewritten);
     }
 
     #[test]
-    fn sandbox_provides_log() {
+    fn sandbox_defines_none_of_the_utility_globals() {
         let lua = create_sandbox().unwrap();
-        lua.load(r#"log("test message")"#).exec().unwrap();
-    }
-
-    #[test]
-    fn sandbox_provides_tid() {
-        let lua = create_sandbox().unwrap();
-        let result: String = lua.load("return TID()").eval().unwrap();
-        assert_eq!(result.len(), 13);
-        let valid = "234567abcdefghijklmnopqrstuvwxyz";
-        for ch in result.chars() {
-            assert!(valid.contains(ch), "invalid char '{ch}' in TID");
+        for name in ["now", "log", "TID", "toarray", "json"] {
+            let raw: mlua::Value = lua.globals().raw_get(name).unwrap();
+            assert!(raw.is_nil(), "{name} is still defined on the globals table");
         }
     }
 
     #[test]
-    fn sandbox_tid_returns_unique_values() {
+    fn every_removed_global_raises_the_migration_sentence() {
         let lua = create_sandbox().unwrap();
-        let a: String = lua.load("return TID()").eval().unwrap();
-        let b: String = lua.load("return TID()").eval().unwrap();
-        assert_ne!(a, b);
+        for name in REMOVED_GLOBALS {
+            let err = lua
+                .load(format!("return {name}"))
+                .eval::<mlua::Value>()
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&removed_global_message(name)), "{name}: {err}");
+        }
     }
 
     #[test]
-    fn sandbox_tid_to_iso8601() {
-        let lua = create_sandbox().unwrap();
-        let iso: String = lua.load(r#"return TID.toISO8601(TID())"#).eval().unwrap();
-        assert!(iso.contains("T") && iso.ends_with("Z"));
+    fn the_migration_sentence_names_the_global_and_the_codemod() {
+        assert_eq!(
+            removed_global_message("db"),
+            "the 'db' global was removed in v3; run the script codemod \
+             (Settings → Scripts → Migrate, or happyview-codemod) -- see the \
+             Migrating scripts guide"
+        );
     }
 
     #[test]
-    fn sandbox_tid_from_iso8601() {
+    fn a_removed_global_raises_inside_handle_too() {
         let lua = create_sandbox().unwrap();
-        let tid: String = lua
-            .load(r#"return TID.fromISO8601("2024-01-01T00:00:00Z")"#)
+        lua.load("function handle() return params.q end")
+            .exec()
+            .unwrap();
+        let handle: mlua::Function = lua.globals().get("handle").unwrap();
+        let err = handle.call::<mlua::Value>(()).unwrap_err().to_string();
+        assert!(
+            err.contains("the 'params' global was removed in v3"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_unknown_global_is_nil() {
+        let lua = create_sandbox().unwrap();
+        let value: mlua::Value = lua.load("return no_such_thing").eval().unwrap();
+        assert!(value.is_nil());
+        let value: mlua::Value = lua.load("return _G[42]").eval().unwrap();
+        assert!(value.is_nil());
+    }
+
+    #[test]
+    fn assigning_a_global_stays_allowed() {
+        let lua = create_sandbox().unwrap();
+        let n: i64 = lua
+            .load("helper_count = 3; function helper() return helper_count end; return helper()")
             .eval()
             .unwrap();
-        assert_eq!(tid.len(), 13);
+        assert_eq!(n, 3);
     }
 
     #[test]
-    fn sandbox_tid_roundtrip() {
+    fn a_script_may_shadow_a_removed_name_by_assigning_it() {
         let lua = create_sandbox().unwrap();
-        let result: String = lua
-            .load(
-                r#"
-                local tid = TID()
-                local iso = TID.toISO8601(tid)
-                local tid2 = TID.fromISO8601(iso)
-                return TID.toISO8601(tid2)
-            "#,
-            )
+        let s: String = lua
+            .load(r#"log = function(m) return "mine:" .. m end; return log("x")"#)
             .eval()
             .unwrap();
-        assert!(result.contains("T") && result.ends_with("Z"));
-    }
-
-    #[test]
-    fn sandbox_tid_to_unix_microseconds() {
-        let lua = create_sandbox().unwrap();
-        let us: i64 = lua
-            .load(r#"return TID.toUnixMicroseconds(TID.fromISO8601("2024-01-01T00:00:00Z"))"#)
-            .eval()
-            .unwrap();
-        assert_eq!(us, 1_704_067_200_000_000);
-    }
-
-    #[test]
-    fn sandbox_tid_from_unix_microseconds() {
-        let lua = create_sandbox().unwrap();
-        let tid: String = lua
-            .load("return TID.fromUnixMicroseconds(1704067200000000)")
-            .eval()
-            .unwrap();
-        assert_eq!(tid.len(), 13);
-        let iso: String = lua
-            .load(format!(r#"return TID.toISO8601("{tid}")"#))
-            .eval()
-            .unwrap();
-        assert_eq!(iso, "2024-01-01T00:00:00.000000Z");
-    }
-
-    #[test]
-    fn sandbox_tid_number_lossless_roundtrip() {
-        let lua = create_sandbox().unwrap();
-        let result: bool = lua
-            .load(
-                r#"
-                local tid = TID()
-                local n = TID.toNumber(tid)
-                local tid2 = TID.fromNumber(n)
-                return tid == tid2
-            "#,
-            )
-            .eval()
-            .unwrap();
-        assert!(result, "toNumber/fromNumber should be lossless");
-    }
-
-    #[test]
-    fn sandbox_tid_to_iso8601_errors_on_invalid() {
-        let lua = create_sandbox().unwrap();
-        let result = lua
-            .load(r#"return TID.toISO8601("garbage")"#)
-            .eval::<String>();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn sandbox_tid_from_iso8601_errors_on_invalid() {
-        let lua = create_sandbox().unwrap();
-        let result = lua
-            .load(r#"return TID.fromISO8601("not a date")"#)
-            .eval::<String>();
-        assert!(result.is_err());
+        assert_eq!(s, "mine:x");
     }
 
     #[test]
@@ -354,6 +284,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_script_accepts_the_v3_contract() {
+        let result = validate_script(
+            r#"
+            local db = require("happyview.db")
+            local log = require("internal.logging")
+            function handle(input, ctx)
+                log.info("hi", { who = ctx.caller_did })
+                return db.records("app.test.rec"):limit(input.limit):all()
+            end
+            "#,
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
     fn validate_script_rejects_missing_handle() {
         let result = validate_script("function other() return {} end");
         assert!(result.is_err());
@@ -367,71 +312,44 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_provides_toarray() {
-        let lua = create_sandbox().unwrap();
-        lua.load(r#"result = toarray({})"#).exec().unwrap();
+    fn validate_script_reports_a_top_level_removed_global_by_name() {
+        let err =
+            validate_script(r#"local base = env.URL .. "/x"; function handle() end"#).unwrap_err();
+        assert!(err.contains("the 'env' global was removed in v3"), "{err}");
     }
 
+    /// `validate_script` loads the chunk in a guarded sandbox, so passing it
+    /// proves no removed global is read at load; `needs_migration` covers the
+    /// reads inside `handle`, under the kind that reports the most names. A
+    /// template failing either would be refused by the very form it prefills.
     #[test]
-    fn sandbox_toarray_preserves_values() {
-        let lua = create_sandbox().unwrap();
-        let result: Vec<i64> = lua
-            .load(r#"return toarray({10, 20, 30})"#)
-            .eval::<mlua::Table>()
-            .unwrap()
-            .sequence_values()
-            .collect::<LuaResult<_>>()
-            .unwrap();
-        assert_eq!(result, vec![10, 20, 30]);
-    }
+    fn every_editor_template_loads_under_the_guard_and_would_save() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/lua-templates");
+        let mut templates: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "lua"))
+            .collect();
+        templates.sort();
+        assert!(
+            !templates.is_empty(),
+            "no templates under {}",
+            dir.display()
+        );
 
-    #[test]
-    fn sandbox_toarray_empty_serializes_as_array() {
-        use mlua::LuaSerdeExt;
-        let lua = create_sandbox().unwrap();
-        let table: mlua::Table = lua.load(r#"return toarray({})"#).eval().unwrap();
-        let json: serde_json::Value = lua.from_value(mlua::Value::Table(table)).unwrap();
-        assert!(json.is_array(), "expected JSON array, got: {json}");
-    }
-
-    #[test]
-    fn sandbox_provides_json_encode() {
-        let lua = create_sandbox().unwrap();
-        let result: String = lua
-            .load(r#"return json.encode({name = "test", count = 42})"#)
-            .eval()
-            .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["name"], "test");
-        assert_eq!(parsed["count"], 42);
-    }
-
-    #[test]
-    fn sandbox_provides_json_decode() {
-        let lua = create_sandbox().unwrap();
-        let result: mlua::Table = lua
-            .load(r#"return json.decode('{"name":"test","count":42}')"#)
-            .eval()
-            .unwrap();
-        assert_eq!(result.get::<String>("name").unwrap(), "test");
-        assert_eq!(result.get::<i64>("count").unwrap(), 42);
-    }
-
-    #[test]
-    fn sandbox_json_encode_array() {
-        let lua = create_sandbox().unwrap();
-        let result: String = lua
-            .load(r#"return json.encode(toarray({1, 2, 3}))"#)
-            .eval()
-            .unwrap();
-        assert_eq!(result, "[1,2,3]");
-    }
-
-    #[test]
-    fn sandbox_json_decode_invalid_returns_error() {
-        let lua = create_sandbox().unwrap();
-        let result: Result<mlua::Value, _> =
-            lua.load(r#"return json.decode("not valid json")"#).eval();
-        assert!(result.is_err());
+        for path in templates {
+            let source = std::fs::read_to_string(&path).unwrap();
+            if let Err(e) = validate_script(&source) {
+                panic!("{}: {e}", path.display());
+            }
+            let remaining =
+                crate::codemod::needs_migration(&source, crate::codemod::ScriptKind::Unknown);
+            assert!(
+                remaining.is_empty(),
+                "{}: still references {remaining:?}",
+                path.display()
+            );
+        }
     }
 }

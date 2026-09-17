@@ -8,8 +8,7 @@ use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
 
 use crate::AppState;
 use crate::event_log::{EventLog, Severity, log_event};
-use crate::lua::sandbox::{json_decode, json_encode, to_array};
-use crate::lua::tid::{generate_tid, tid_from_unix_microseconds, tid_to_unix_microseconds};
+use crate::tid::{generate_tid, tid_from_unix_microseconds, tid_to_unix_microseconds};
 
 pub const BUILTIN_PREFIX: &str = "internal.";
 
@@ -96,13 +95,37 @@ fn tids(lua: &Lua) -> LuaResult<mlua::Table> {
     Ok(t)
 }
 
-/// The `json` and `toarray` globals' bodies, under `require("internal.json")`.
 fn json(lua: &Lua) -> LuaResult<mlua::Table> {
     let t = lua.create_table()?;
     t.set("encode", lua.create_function(json_encode)?)?;
     t.set("decode", lua.create_function(json_decode)?)?;
     t.set("to_array", lua.create_function(to_array)?)?;
     Ok(t)
+}
+
+fn json_encode(lua: &Lua, value: mlua::Value) -> LuaResult<String> {
+    let json_value: serde_json::Value = lua
+        .from_value(value)
+        .map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))?;
+    serde_json::to_string(&json_value)
+        .map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))
+}
+
+fn json_decode(lua: &Lua, s: String) -> LuaResult<mlua::Value> {
+    let json_value: serde_json::Value =
+        serde_json::from_str(&s).map_err(|e| mlua::Error::runtime(format!("json.decode: {e}")))?;
+    lua.to_value(&json_value)
+        .map_err(|e| mlua::Error::runtime(format!("json.decode: {e}")))
+}
+
+/// Marks a table as a JSON array so an empty one serializes as `[]` instead
+/// of `{}`: Lua has one table type, and an empty sequence and an empty map
+/// are the same value until something says which was meant.
+fn to_array(lua: &Lua, table: mlua::Table) -> LuaResult<mlua::Table> {
+    let values: Vec<mlua::Value> = table.sequence_values().collect::<LuaResult<_>>()?;
+    let seq = lua.create_sequence_from(values)?;
+    seq.set_metatable(Some(lua.array_metatable()))?;
+    Ok(seq)
 }
 
 fn logging(lua: &Lua, state: &AppState, identity: &ScriptIdentity) -> LuaResult<mlua::Table> {
