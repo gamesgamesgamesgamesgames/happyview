@@ -7,6 +7,34 @@ use super::tid::{
 
 const INSTRUCTION_LIMIT: u32 = 1_000_000;
 
+/// Body of the `json` global's `encode` and of `internal.json.encode`. Each
+/// of the three bodies below is kept in one place so the two spellings of it
+/// cannot drift apart.
+pub(crate) fn json_encode(lua: &Lua, value: mlua::Value) -> LuaResult<String> {
+    let json_value: serde_json::Value = lua
+        .from_value(value)
+        .map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))?;
+    serde_json::to_string(&json_value)
+        .map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))
+}
+
+/// Body of the `json` global's `decode` and of `internal.json.decode`.
+pub(crate) fn json_decode(lua: &Lua, s: String) -> LuaResult<mlua::Value> {
+    let json_value: serde_json::Value =
+        serde_json::from_str(&s).map_err(|e| mlua::Error::runtime(format!("json.decode: {e}")))?;
+    lua.to_value(&json_value)
+        .map_err(|e| mlua::Error::runtime(format!("json.decode: {e}")))
+}
+
+/// Body of the `toarray` global and of `internal.json.to_array`: marks a
+/// table as a JSON array so an empty one serializes as `[]` instead of `{}`.
+pub(crate) fn to_array(lua: &Lua, table: mlua::Table) -> LuaResult<mlua::Table> {
+    let values: Vec<mlua::Value> = table.sequence_values().collect::<LuaResult<_>>()?;
+    let seq = lua.create_sequence_from(values)?;
+    seq.set_metatable(Some(lua.array_metatable()))?;
+    Ok(seq)
+}
+
 /// Create a fresh sandboxed Lua VM.
 ///
 /// - Dangerous globals (`io`, `debug`, `package`, `require`, `dofile`, `loadfile`, `load`) are removed.
@@ -112,36 +140,11 @@ pub fn create_sandbox() -> LuaResult<Lua> {
     let _ = tid_table.set_metatable(Some(tid_meta));
     globals.set("TID", tid_table)?;
 
-    // Utility: toarray(table) marks a table as a JSON array for serialization.
-    // Ensures empty tables serialize as [] instead of {}.
-    let toarray_fn = lua.create_function(|lua, table: mlua::Table| {
-        let values: Vec<mlua::Value> = table.sequence_values().collect::<LuaResult<_>>()?;
-        let seq = lua.create_sequence_from(values)?;
-        seq.set_metatable(Some(lua.array_metatable()))?;
-        Ok(seq)
-    })?;
-    globals.set("toarray", toarray_fn)?;
+    globals.set("toarray", lua.create_function(to_array)?)?;
 
-    // JSON utilities: json.encode(table) -> string, json.decode(string) -> table
     let json_table = lua.create_table()?;
-
-    let encode_fn = lua.create_function(|lua, value: mlua::Value| {
-        let json_value: serde_json::Value = lua
-            .from_value(value)
-            .map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))?;
-        serde_json::to_string(&json_value)
-            .map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))
-    })?;
-    json_table.set("encode", encode_fn)?;
-
-    let decode_fn = lua.create_function(|lua, s: String| {
-        let json_value: serde_json::Value = serde_json::from_str(&s)
-            .map_err(|e| mlua::Error::runtime(format!("json.decode: {e}")))?;
-        lua.to_value(&json_value)
-            .map_err(|e| mlua::Error::runtime(format!("json.decode: {e}")))
-    })?;
-    json_table.set("decode", decode_fn)?;
-
+    json_table.set("encode", lua.create_function(json_encode)?)?;
+    json_table.set("decode", lua.create_function(json_decode)?)?;
     globals.set("json", json_table)?;
 
     Ok(lua)

@@ -8,6 +8,7 @@ use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
 
 use crate::AppState;
 use crate::event_log::{EventLog, Severity, log_event};
+use crate::lua::sandbox::{json_decode, json_encode, to_array};
 use crate::lua::tid::{generate_tid, tid_from_unix_microseconds, tid_to_unix_microseconds};
 
 pub const BUILTIN_PREFIX: &str = "internal.";
@@ -15,7 +16,12 @@ pub const BUILTIN_PREFIX: &str = "internal.";
 /// Every built-in module name, for `require` lookup and for naming them in
 /// an unknown-module error. The one list, so a new built-in can't be added
 /// to the match below and forgotten here.
-pub const BUILTIN_MODULES: [&str; 3] = ["internal.logging", "internal.time", "internal.tids"];
+pub const BUILTIN_MODULES: [&str; 4] = [
+    "internal.logging",
+    "internal.time",
+    "internal.tids",
+    "internal.json",
+];
 
 /// Who a script is running as, for log attribution.
 #[derive(Debug, Clone, Default)]
@@ -42,6 +48,7 @@ pub fn builtin_module(
         "logging" => logging(lua, state, identity)?,
         "time" => time(lua)?,
         "tids" => tids(lua)?,
+        "json" => json(lua)?,
         _ => unreachable!("BUILTIN_MODULES and this match must name the same suffixes"),
     }))
 }
@@ -86,6 +93,15 @@ fn tids(lua: &Lua) -> LuaResult<mlua::Table> {
                 .ok_or_else(|| mlua::Error::runtime(format!("invalid TID: {tid}")))
         })?,
     )?;
+    Ok(t)
+}
+
+/// The `json` and `toarray` globals' bodies, under `require("internal.json")`.
+fn json(lua: &Lua) -> LuaResult<mlua::Table> {
+    let t = lua.create_table()?;
+    t.set("encode", lua.create_function(json_encode)?)?;
+    t.set("decode", lua.create_function(json_decode)?)?;
+    t.set("to_array", lua.create_function(to_array)?)?;
     Ok(t)
 }
 
@@ -233,6 +249,42 @@ mod tests {
             .eval::<mlua::Value>()
             .unwrap_err();
         assert!(err.to_string().contains("invalid TID"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn json_module_round_trips_and_marks_arrays() {
+        let lua = create_sandbox().unwrap();
+        let state = test_state_with_pool(memory_pool().await);
+        let json = builtin_module(&lua, &state, &identity(), "internal.json")
+            .unwrap()
+            .unwrap();
+        lua.globals().set("json", json).unwrap();
+        let round_tripped: String = lua
+            .load(r#"return json.encode(json.decode('{"a":1}'))"#)
+            .eval()
+            .unwrap();
+        assert_eq!(round_tripped, r#"{"a":1}"#);
+        let empty_array: String = lua
+            .load(r#"return json.encode(json.to_array({}))"#)
+            .eval()
+            .unwrap();
+        assert_eq!(empty_array, "[]");
+        let encode_err = lua
+            .load(r#"return json.encode(json)"#)
+            .eval::<mlua::Value>()
+            .unwrap_err();
+        assert!(
+            encode_err.to_string().contains("json.encode:"),
+            "{encode_err}"
+        );
+        let decode_err = lua
+            .load(r#"return json.decode("not valid json")"#)
+            .eval::<mlua::Value>()
+            .unwrap_err();
+        assert!(
+            decode_err.to_string().contains("json.decode:"),
+            "{decode_err}"
+        );
     }
 
     #[tokio::test]

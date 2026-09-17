@@ -429,7 +429,7 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains(
-                "module 'internal.loging' not found -- built-in modules are: internal.logging, internal.time, internal.tids"
+                "module 'internal.loging' not found -- built-in modules are: internal.logging, internal.time, internal.tids, internal.json"
             ),
             "{err}"
         );

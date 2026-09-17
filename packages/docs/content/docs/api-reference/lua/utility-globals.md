@@ -112,3 +112,7 @@ return { items = toarray({}) }
 ```
 
 You don't need `toarray()` on results from `db.query`, `db.search`, `db.backlinks`, or `db.raw` — those already return properly marked arrays. Use it when you build a table yourself with `table.insert()` or array-index assignment.
+
+<Callout type="info">
+`require("internal.json").to_array` does the same thing — see [Built-in Modules](built-in-modules.md#internaljson).
+</Callout>

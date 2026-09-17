@@ -4,6 +4,10 @@ title: "JSON API"
 
 The `json` global provides JSON serialization and deserialization. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts).
 
+<Callout type="info">
+`require("internal.json")` provides the same `encode`/`decode`, plus `to_array` in place of the [`toarray`](utility-globals.md#toarray) global — see [Built-in Modules](built-in-modules.md#internaljson).
+</Callout>
+
 ## json.encode
 
 ```lua

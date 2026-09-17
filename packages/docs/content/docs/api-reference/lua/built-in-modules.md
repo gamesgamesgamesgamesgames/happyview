@@ -29,10 +29,21 @@ time.from_iso8601(string)          -- unix milliseconds, or nil on an unparseabl
 
 ```lua
 local tids = require("internal.tids")
-tids.create()                    -- a fresh TID for now
-tids.to_tid(ms)                    -- TID for a unix-millisecond timestamp
-tids.from_tid(tid)                 -- unix milliseconds, raises on an invalid TID
+tids.create()            -- a fresh TID for now
+tids.to_tid(ms)          -- TID for a unix-millisecond timestamp
+tids.from_tid(tid)       -- unix milliseconds, raises on an invalid TID
 ```
+
+## `internal.json`
+
+```lua
+local json = require("internal.json")
+json.encode(value)       -- Lua value -> JSON string
+json.decode(string)      -- JSON string -> Lua value
+json.to_array(table)     -- marks a table as a JSON array, so an empty one encodes as [] rather than {}
+```
+
+Same behavior as the `json` global and `toarray()` — see [JSON API](json-api.md) and [Utility Globals](utility-globals.md#toarray).
 
 ## Next steps
 
