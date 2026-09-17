@@ -2,10 +2,15 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Wand2 } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
-import { deleteScript, getScript, patchScript } from "@/lib/api";
+import {
+  deleteScript,
+  getScript,
+  isUnmigratedRefusal,
+  patchScript,
+} from "@/lib/api";
 import type { Script, TriggerFamily } from "@/types/scripts";
 import {
   TRIGGER_KIND_LABELS,
@@ -46,6 +51,7 @@ export default function ScriptDetail() {
   const router = useRouter();
   const [script, setScript] = useState<Script | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refused, setRefused] = useState(false);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
@@ -90,21 +96,26 @@ export default function ScriptDetail() {
   }, [isDirty]);
 
   const handleSave = useCallback(async () => {
-    if (!state || !script || !isDirty || saving) return;
+    if (!state || !script || !original || !isDirty || saving) return;
     setSaving(true);
     setError(null);
+    setRefused(false);
     try {
       await patchScript(script.id, {
-        body: state.body,
+        // The server checks the body a request submits, so a stored script
+        // awaiting migration keeps an editable description only if an
+        // untouched body stays out of the request.
+        ...(state.body !== original.body && { body: state.body }),
         description: state.description.trim() || null,
       });
       load();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
+      setRefused(isUnmigratedRefusal(e));
     } finally {
       setSaving(false);
     }
-  }, [state, script, isDirty, saving, load]);
+  }, [state, script, original, isDirty, saving, load]);
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -166,7 +177,28 @@ export default function ScriptDetail() {
 
       <div className="flex flex-col flex-1 min-h-0">
         <div className="flex flex-col flex-1 min-h-0 gap-6 p-4 md:p-6">
-          {error && <p className="text-destructive text-sm">{error}</p>}
+          {error && (
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-destructive text-sm">{error}</p>
+              {refused && (
+                <MigrateScriptDialog
+                  scriptId={id}
+                  currentBody={state.body}
+                  trigger={
+                    <Button variant="outline" size="sm">
+                      <Wand2 className="size-4" />
+                      Migrate this script
+                    </Button>
+                  }
+                  onRewritten={(source) => {
+                    setState({ ...state, body: source });
+                    setError(null);
+                    setRefused(false);
+                  }}
+                />
+              )}
+            </div>
+          )}
 
           {parsed && (
             <div className="flex gap-2 items-baseline">

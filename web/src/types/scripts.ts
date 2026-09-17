@@ -84,6 +84,23 @@ export interface CodemodRequestBody {
    * server's default refusal holds.
    */
   allow_markers?: boolean
+  /**
+   * Text to rewrite in place of the stored body, for an editor holding edits
+   * the server has not seen. Preview only: the server refuses it alongside
+   * `apply`. No stored script is needed, so it works before the first save;
+   * the id in the path then supplies only the script's kind.
+   */
+  source?: string
+}
+
+/**
+ * The 400 `POST /admin/scripts` and `PATCH /admin/scripts/{id}` answer for a
+ * Lua body that still references removed v2 globals. `removed_globals` is
+ * what identifies it; `error` is the same list as a sentence.
+ */
+export interface UnmigratedScriptError {
+  error: string
+  removed_globals: string[]
 }
 
 /** Body for `POST /admin/scripts` (create or replace by `id`). */
@@ -176,42 +193,3 @@ export function parseTriggerId(
   if (!kind) return null
   return { kind, suffix }
 }
-
-/**
- * A reasonable starter script body — defines the required
- * `handle(input, ctx)` function. Used to prefill the new-script form.
- */
-export const DEFAULT_SCRIPT_BODY = `-- Trigger script: \`input\` is the trigger's payload; \`ctx\` describes
--- this invocation (caller, environment, trigger id, and more). Return
--- a transformed value, or \`nil\` to skip the operation.
---
--- require("internal.*") and installed libraries provide the rest.
-
-local log = require("internal.logging")
-
-function handle(input, ctx)
-  log.info("script fired", { trigger = ctx.trigger })
-  return input
-end
-`
-
-export const DEFAULT_JOB_SCRIPT_BODY = `-- Job runner: executes as a background job. \`input\` is the job's
--- input table; \`ctx.job\` exposes the job's id, progress(data),
--- should_stop(), and wait(seconds). Return value becomes the job's result.
---
--- require("internal.*") and installed libraries provide the rest.
-
-local log = require("internal.logging")
-
-function handle(input, ctx)
-  log.info("job started", { job_id = ctx.job.id })
-
-  ctx.job.progress({ status = "working" })
-
-  if ctx.job.should_stop() then
-    return { partial = true }
-  end
-
-  return { done = true }
-end
-`

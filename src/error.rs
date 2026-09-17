@@ -90,6 +90,10 @@ pub enum AppError {
     /// requested auth path is disabled until an operator fixes it. Renders as
     /// 503 so clients and the dashboard can distinguish it from a normal 401.
     ServerMisconfigured(String),
+    /// A script save refused for the removed globals its body still reads.
+    /// The names travel as a field of their own so a client can offer the
+    /// codemod without depending on the message's wording.
+    UnmigratedScript(Vec<String>),
     /// An XRPC error carrying a lexicon-defined code, e.g. `UnsupportedPolicy`.
     ///
     /// Clients switch on `error`, so a generic BadRequest is not
@@ -113,6 +117,13 @@ pub enum AppError {
     },
 }
 
+fn unmigrated_script_message(globals: &[String]) -> String {
+    format!(
+        "script references removed globals: {} -- run the codemod first",
+        globals.join(", ")
+    )
+}
+
 impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -129,6 +140,9 @@ impl std::fmt::Display for AppError {
             AppError::NotFound(msg) => write!(f, "not found: {msg}"),
             AppError::PdsError(status, _) => write!(f, "PDS error: {status}"),
             AppError::ServerMisconfigured(msg) => write!(f, "server misconfigured: {msg}"),
+            AppError::UnmigratedScript(globals) => {
+                write!(f, "bad request: {}", unmigrated_script_message(globals))
+            }
             AppError::RateLimited { retry_after, .. } => {
                 write!(f, "rate limited: retry after {retry_after}s")
             }
@@ -209,6 +223,13 @@ impl IntoResponse for AppError {
                 });
                 (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response()
             }
+            AppError::UnmigratedScript(globals) => {
+                let body = serde_json::json!({
+                    "error": unmigrated_script_message(&globals),
+                    "removed_globals": globals,
+                });
+                (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+            }
             AppError::XrpcError {
                 status,
                 code,
@@ -265,6 +286,7 @@ impl IntoResponse for AppError {
                     | AppError::InsufficientPermissions(..)
                     | AppError::Internal(..)
                     | AppError::ServerMisconfigured(..)
+                    | AppError::UnmigratedScript(..)
                     | AppError::RateLimited { .. }
                     | AppError::XrpcError { .. }
                     | AppError::ScriptError { .. } => unreachable!(),
@@ -289,6 +311,23 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn an_unmigrated_script_names_its_globals_in_the_message_and_as_a_field() {
+        let (status, body) = response_parts(AppError::UnmigratedScript(vec![
+            "db".into(),
+            "params".into(),
+        ]))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "script references removed globals: db, params -- run the codemod first",
+                "removed_globals": ["db", "params"],
+            })
+        );
     }
 
     #[tokio::test]

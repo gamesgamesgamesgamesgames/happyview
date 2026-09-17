@@ -1,10 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 import { Loader2, Wand2 } from "lucide-react";
 import { toast } from "sonner";
 
-import { codemodScript } from "@/lib/api";
+import { codemodScript, previewCodemodDraft } from "@/lib/api";
 import { toastError } from "@/lib/format";
 import type { CodemodResult } from "@/types/scripts";
 import { MonacoDiffEditor } from "@/components/monaco-editor";
@@ -21,18 +21,38 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 
+/** Rewrites the stored script, and Apply stores the result. */
+interface StoredTarget {
+  canApply: boolean;
+  onApplied: () => void;
+  onRewritten?: undefined;
+}
+
+/**
+ * Rewrites `currentBody` as the editor holds it, and hands the result back
+ * for the editor to show. Nothing is stored, so it needs no stored script.
+ */
+interface DraftTarget {
+  onRewritten: (source: string) => void;
+  canApply?: undefined;
+  onApplied?: undefined;
+}
+
 /** Preview and apply the v3 codemod for one Lua script. */
 export function MigrateScriptDialog({
   scriptId,
   currentBody,
+  trigger,
   canApply,
   onApplied,
+  onRewritten,
 }: {
   scriptId: string;
   currentBody: string;
-  canApply: boolean;
-  onApplied: () => void;
-}) {
+  /** Replaces the default Migrate button as what opens the dialog. */
+  trigger?: ReactNode;
+} & (StoredTarget | DraftTarget)) {
+  const isDraft = onRewritten !== undefined;
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [applying, setApplying] = useState(false);
@@ -52,7 +72,7 @@ export function MigrateScriptDialog({
     setLoading(true);
     setError(null);
     setAllowMarkers(false);
-    codemodScript(scriptId)
+    (isDraft ? previewCodemodDraft(scriptId, currentBody) : codemodScript(scriptId))
       .then(setResult)
       .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
@@ -60,6 +80,11 @@ export function MigrateScriptDialog({
 
   async function handleApply() {
     if (!result?.changed || applying) return;
+    if (isDraft) {
+      onRewritten(result.source);
+      handleOpenChange(false);
+      return;
+    }
     if (result.notes.length > 0 && !allowMarkers) return;
     setApplying(true);
     try {
@@ -78,10 +103,12 @@ export function MigrateScriptDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
-        <Button variant="outline">
-          <Wand2 className="size-4" />
-          Migrate
-        </Button>
+        {trigger ?? (
+          <Button variant="outline">
+            <Wand2 className="size-4" />
+            Migrate
+          </Button>
+        )}
       </DialogTrigger>
       <DialogContent className="flex h-[85vh] flex-col sm:max-w-5xl">
         <DialogHeader>
@@ -95,7 +122,10 @@ export function MigrateScriptDialog({
             <code className="bg-muted rounded px-1 font-mono text-xs">
               require(&quot;happyview.*&quot;)
             </code>
-            . Nothing is saved until you apply it.
+            .{" "}
+            {isDraft
+              ? "Accepting it replaces the editor's contents; nothing is saved until you save the script."
+              : "Nothing is saved until you apply it."}
           </DialogDescription>
         </DialogHeader>
 
@@ -148,7 +178,14 @@ export function MigrateScriptDialog({
                       </li>
                     ))}
                   </ul>
-                  {result.changed && (
+                  {isDraft && (
+                    <p className="mt-3 text-xs">
+                      A marked line still references a removed global, so the
+                      script is refused on save until each one is rewritten by
+                      hand.
+                    </p>
+                  )}
+                  {result.changed && !isDraft && (
                     <label className="mt-3 flex items-center gap-2 text-xs">
                       <Checkbox
                         checked={allowMarkers}
@@ -170,17 +207,23 @@ export function MigrateScriptDialog({
           <DialogClose asChild>
             <Button variant="outline">Cancel</Button>
           </DialogClose>
-          {canApply && (
-            <Button
-              onClick={handleApply}
-              disabled={
-                !result?.changed ||
-                applying ||
-                (result.notes.length > 0 && !allowMarkers)
-              }
-            >
-              {applying ? "Applying..." : "Apply"}
+          {isDraft ? (
+            <Button onClick={handleApply} disabled={!result?.changed}>
+              Use rewritten script
             </Button>
+          ) : (
+            canApply && (
+              <Button
+                onClick={handleApply}
+                disabled={
+                  !result?.changed ||
+                  applying ||
+                  (result.notes.length > 0 && !allowMarkers)
+                }
+              >
+                {applying ? "Applying..." : "Apply"}
+              </Button>
+            )
           )}
         </DialogFooter>
       </DialogContent>

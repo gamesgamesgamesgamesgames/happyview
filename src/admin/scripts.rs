@@ -10,6 +10,8 @@
 //! - On create / patch the body is parsed against the script_type
 //!   (lua → [`crate::lua::validate_script`]). Invalid bodies are
 //!   rejected at write-time with a 400.
+//! - A Lua body that still reaches a removed global is refused with a 400
+//!   (see [`refuse_unmigrated`]), ahead of the compile check.
 //! - The trigger id is parsed against
 //!   [`crate::lua::ParsedTrigger::parse`]; unknown prefixes / invalid
 //!   NSIDs are rejected at write-time with a 400.
@@ -147,6 +149,9 @@ pub(super) struct CodemodBody {
     /// Overrides the marker guard on apply — see `codemod_apply`.
     #[serde(default)]
     pub allow_markers: bool,
+    /// Text to rewrite in place of the stored body. Preview only.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,6 +276,7 @@ pub(super) async fn upsert(
     }
 
     let script_type = body.script_type.unwrap_or_default();
+    refuse_unmigrated(&body.id, script_type.as_str(), &body.body)?;
     validate_body_for_type(&body.body, script_type)?;
 
     let outbound_xrpcs = crate::lua_analysis::extract_outbound_xrpcs(&body.body);
@@ -377,6 +383,7 @@ pub(super) async fn patch(
     }
     if let Some(ref new_body) = body.body {
         let lang = body.script_type.unwrap_or_default();
+        refuse_unmigrated(&id, lang.as_str(), new_body)?;
         validate_body_for_type(new_body, lang)?;
     }
     if let Some(Some(ref desc)) = body.description
@@ -498,6 +505,11 @@ pub(super) async fn delete(
 /// markers behind is refused (409) unless `allow_markers` is also set: a
 /// marked construct still runs on the old globals for those lines, so
 /// storing it would make the script look migrated when it is not.
+///
+/// `source` previews the rewrite of text the table does not hold. The save
+/// paths refuse an unmigrated body, so the editor needs the rewrite of what
+/// it is showing, and a script that has never been saved has no row to read:
+/// the id then supplies only the kind.
 pub(super) async fn codemod_apply(
     State(state): State<AppState>,
     auth: UserAuth,
@@ -506,6 +518,27 @@ pub(super) async fn codemod_apply(
 ) -> Result<Json<CodemodResponse>, AppError> {
     auth.require(Permission::ScriptsRead).await?;
 
+    let CodemodBody {
+        apply,
+        allow_markers,
+        source: draft,
+    } = body.map(|Json(b)| b).unwrap_or_default();
+    let kind = ScriptKind::from_trigger_id(&id);
+
+    if let Some(draft) = draft {
+        if apply {
+            return Err(AppError::BadRequest(
+                "apply rewrites the stored script; a supplied source is preview-only".to_string(),
+            ));
+        }
+        let rewrite = rewrite_lua(&draft, kind)?;
+        return Ok(Json(CodemodResponse {
+            changed: rewrite.source != draft,
+            source: rewrite.source,
+            notes: rewrite.notes.into_iter().map(CodemodNote::from).collect(),
+        }));
+    }
+
     let existing = fetch_one(&state, &id).await?;
     if existing.script_type != ScriptLanguage::Lua.as_str() {
         return Err(AppError::BadRequest(
@@ -513,16 +546,11 @@ pub(super) async fn codemod_apply(
         ));
     }
 
-    let (apply, allow_markers) = body
-        .map(|Json(b)| (b.apply, b.allow_markers))
-        .unwrap_or_default();
     if apply {
         auth.require(Permission::ScriptsManage).await?;
     }
 
-    let kind = ScriptKind::from_trigger_id(&id);
-    let rewrite = codemod::rewrite(&existing.body, kind)
-        .map_err(|e| AppError::BadRequest(format!("script did not parse as Lua: {e}")))?;
+    let rewrite = rewrite_lua(&existing.body, kind)?;
     let changed = rewrite.source != existing.body;
     let marker_count = rewrite.notes.len();
 
@@ -620,6 +648,38 @@ async fn fetch_one(state: &AppState, id: &str) -> Result<ScriptResponse, AppErro
         outbound_xrpcs_json,
         created_at,
         updated_at,
+    ))
+}
+
+fn rewrite_lua(source: &str, kind: ScriptKind) -> Result<codemod::Rewrite, AppError> {
+    codemod::rewrite(source, kind)
+        .map_err(|e| AppError::BadRequest(format!("script did not parse as Lua: {e}")))
+}
+
+/// Refuses a Lua body that still reaches a removed global, naming each one in
+/// `needs_migration`'s order. Such a script would save cleanly and then fail
+/// on its first run, far from the edit that caused it.
+///
+/// It runs ahead of the compile check. That check loads the chunk under the
+/// removed-name guard, so a read at file scope would otherwise answer as a
+/// compilation failure, which offers no way to the codemod.
+///
+/// The codemod's own apply does not come through here: what it may leave
+/// behind are marked constructs, the markers are comments saying what to
+/// finish, and `allow_markers` is the operator's consent to store them.
+///
+/// A body the scanner cannot read is left to the compile check, which owns
+/// the message for a script that does not parse.
+fn refuse_unmigrated(id: &str, script_type: &str, body: &str) -> Result<(), AppError> {
+    if script_type != ScriptLanguage::Lua.as_str() {
+        return Ok(());
+    }
+    let remaining = codemod::needs_migration(body, ScriptKind::from_trigger_id(id));
+    if remaining.is_empty() || remaining == [codemod::UNPARSEABLE] {
+        return Ok(());
+    }
+    Err(AppError::UnmigratedScript(
+        remaining.into_iter().map(str::to_string).collect(),
     ))
 }
 
@@ -725,5 +785,56 @@ mod tests {
             "2026-01-01T00:00:00+00:00".into(),
         );
         assert!(r.needs_migration.is_empty());
+    }
+
+    fn refusal(id: &str, script_type: &str, body: &str) -> Option<String> {
+        match refuse_unmigrated(id, script_type, body) {
+            Ok(()) => None,
+            Err(AppError::UnmigratedScript(globals)) => Some(globals.join(", ")),
+            Err(other) => panic!("expected an unmigrated-script refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unmigrated_body_is_refused_naming_its_globals_in_order() {
+        let body = "function handle()\n  log(now())\n  return db.get(params.uri)\nend\n";
+        assert_eq!(
+            refusal("xrpc.query:com.example.list", "lua", body).as_deref(),
+            Some("db, log, now, params")
+        );
+    }
+
+    #[test]
+    fn the_refusal_follows_the_kind_the_trigger_id_implies() {
+        let body = "function handle()\n  return { v = val }\nend\n";
+        assert_eq!(
+            refusal("labeler.apply:_actor", "lua", body).as_deref(),
+            Some("val")
+        );
+        assert_eq!(refusal("xrpc.query:com.example.list", "lua", body), None);
+    }
+
+    #[test]
+    fn a_migrated_body_is_not_refused() {
+        let body = "local db = require(\"happyview.db\")\n\
+                    function handle(input, ctx)\n  return db.get(input.uri)\nend\n";
+        assert_eq!(refusal("xrpc.query:com.example.list", "lua", body), None);
+    }
+
+    #[test]
+    fn a_non_lua_body_is_not_checked() {
+        let body = "function handle() { return params.q; }";
+        assert_eq!(
+            refusal("xrpc.query:com.example.list", "javascript", body),
+            None
+        );
+    }
+
+    #[test]
+    fn a_body_the_scanner_cannot_read_is_not_called_unmigrated() {
+        assert_eq!(
+            refusal("xrpc.query:com.example.list", "lua", "function handle( end"),
+            None
+        );
     }
 }

@@ -89,8 +89,8 @@ export {
   TRIGGER_FAMILY_LABELS,
   familyOf,
   parseTriggerId,
-  DEFAULT_SCRIPT_BODY,
 } from "@/types/scripts";
+export { DEFAULT_SCRIPT_BODY } from "@/lib/lua-templates";
 export type { LabelerSummary } from "@/types/labelers";
 export type { RecordLabel } from "@/types/records";
 export type {
@@ -130,9 +130,15 @@ const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /**
+   * The removed v2 globals a refused script save named, from the response's
+   * `removed_globals`. Absent on every other error.
+   */
+  removedGlobals?: string[];
+  constructor(status: number, message: string, removedGlobals?: string[]) {
     super(message);
     this.status = status;
+    this.removedGlobals = removedGlobals;
   }
 }
 
@@ -158,13 +164,17 @@ async function apiFetch<T = unknown>(
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     let message = text;
+    let removedGlobals: string[] | undefined;
     try {
       const parsed = JSON.parse(text);
       if (typeof parsed.error === "string") message = parsed.error;
+      if (Array.isArray(parsed.removed_globals)) {
+        removedGlobals = parsed.removed_globals;
+      }
     } catch {
       /* not JSON, use raw text */
     }
-    throw new ApiError(res.status, message);
+    throw new ApiError(res.status, message, removedGlobals);
   }
   if (res.status === 204) return null as T;
   const text = await res.text();
@@ -1313,6 +1323,29 @@ export function codemodScript(id: string, apply?: boolean, allowMarkers?: boolea
       body: JSON.stringify(body),
     },
   );
+}
+
+/**
+ * Preview the v3 codemod on text the server does not hold: an editor's unsaved
+ * body, or a script that has never been saved.
+ */
+export function previewCodemodDraft(id: string, source: string) {
+  const body: CodemodRequestBody = { source };
+  return apiFetch<CodemodResult>(
+    `/admin/scripts/${encodeURIComponent(id)}/codemod`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+/**
+ * Whether a save failed because the body still references removed v2 globals,
+ * the one save error the Migrate dialog can resolve.
+ */
+export function isUnmigratedRefusal(e: unknown): boolean {
+  return e instanceof ApiError && e.removedGlobals !== undefined;
 }
 
 // Setup
