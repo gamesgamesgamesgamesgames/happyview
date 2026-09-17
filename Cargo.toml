@@ -54,6 +54,7 @@ happyview-plc = { workspace = true }
 happyview-plugin-sdk = { workspace = true }
 happyview-scopes = { workspace = true }
 hex = "0.4"
+full_moon = { version = "2", features = ["lua54"] }
 futures-util = "0.3"
 jose-jwk = { version = "0.1", default-features = false, features = ["p256"] }
 jsonwebtoken = "10"
@@ -106,6 +107,10 @@ path = "src/bin/migrate_lua_sql.rs"
 [[bin]]
 name = "migrate-space-cids"
 path = "src/bin/migrate_space_cids.rs"
+
+[[bin]]
+name = "happyview-codemod"
+path = "src/bin/codemod.rs"
 
 [dev-dependencies]
 wiremock = "0.6"

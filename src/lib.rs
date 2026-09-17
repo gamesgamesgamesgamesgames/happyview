@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod auth;
 pub mod cid_verify;
+pub mod codemod;
 pub mod config;
 pub mod constant_time;
 pub mod db;
