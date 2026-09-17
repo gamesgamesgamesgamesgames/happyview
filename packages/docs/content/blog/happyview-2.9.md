@@ -73,7 +73,7 @@ local result = db.query({
 })
 ```
 
-Full docs are in the [Database API reference](/api-reference/lua/database-api).
+Full docs are in the [Database API reference](/api-reference/lua/libraries).
 
 ## Auth fixes
 

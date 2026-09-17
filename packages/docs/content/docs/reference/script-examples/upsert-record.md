@@ -7,37 +7,40 @@ Create a new record, or update an existing one if the client provides its rkey.
 **Lexicon type:** procedure
 
 ```lua
-function handle()
-  local rkey = input.rkey or TID()
-  local uri = "at://" .. caller_did .. "/" .. collection .. "/" .. rkey
+local time = require("internal.time")
+local tids = require("internal.tids")
+local db = require("happyview.db")
+local record = require("happyview.record")
 
-  local r = Record.load(uri)
-  if r then
+function handle(input, ctx)
+  local rkey = input.rkey or tids.create()
+  local uri = "at://" .. ctx.caller_did .. "/" .. ctx.collection .. "/" .. rkey
+  local ts = time.to_iso8601(time.now())
+
+  local existing = db.get(uri)
+  if existing then
     -- Update existing record
-    r.status = input.status
-    r.updatedAt = now()
-    r:save()
-  else
-    -- Create new record
-    r = Record(collection, {
-      status = input.status,
-      createdAt = now(),
-      updatedAt = now(),
-    })
-    r:set_rkey(rkey)
-    r:save()
+    local body = existing.record
+    body.status = input.status
+    body.updatedAt = ts
+    return record.put(uri, body)
   end
 
-  return { uri = r._uri, cid = r._cid }
+  -- Create new record
+  return record.create(ctx.collection, {
+    status = input.status,
+    createdAt = ts,
+    updatedAt = ts,
+  }, { rkey = rkey })
 end
 ```
 
 ## How it works
 
-1. Use the client-provided `input.rkey` if present, otherwise generate a new [`TID()`](../../guides/lua-scripting.md#utility-globals). This means omitting `rkey` always creates, while providing one enables updates.
-2. Build the AT URI from the caller's DID, the target collection, and the rkey, then try to load it with [`Record.load`](../../api-reference/lua/record-api.md#static-methods).
-3. If the record exists, update its fields and save. Since `_uri` is already set, `r:save()` calls `putRecord`.
-4. If it doesn't exist, create a new record, set the rkey explicitly with `r:set_rkey()`, and save. This calls `createRecord` with the specified rkey.
+1. Use the client-provided `input.rkey` if present, otherwise mint a fresh TID with [`tids.create()`](../../api-reference/lua/built-in-modules.md#internaltids). This means omitting `rkey` always creates, while providing one enables updates.
+2. Build the AT URI from the caller's DID, the target collection, and the rkey, then look it up with `db.get`.
+3. If the record exists, change its fields and write it back with `record.put`, which calls `putRecord`.
+4. If it doesn't exist, create it with `record.create`, passing the rkey in `opts` so `createRecord` uses that key. Both writes answer `{ uri, cid }`.
 
 ## Usage
 

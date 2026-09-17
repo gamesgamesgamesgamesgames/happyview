@@ -68,7 +68,7 @@ The default `docker-compose.yml` ships with the Postgres service commented out. 
 
 ## Lua scripts
 
-Both backends support the same Lua database API (`db.query`, `db.get`, `db.count`). Write SQL in **SQLite syntax** by default. If you are using Postgres, HappyView automatically translates common SQLite patterns to Postgres equivalents at runtime.
+Both backends support the same Lua libraries. A `happyview.db` chain is portable: the host generates the SQL for whichever backend is running. `happyview.sql`'s `raw` is not: the statement goes to the backend untranslated, so its placeholders (`?` on SQLite, `$1` on Postgres) and functions must be the running backend's. A script that has to run on both branches on `db.backend()`.
 
 If you are migrating existing Lua scripts from Postgres SQL syntax to SQLite syntax, see the [Postgres to SQLite migration guide](postgres-to-sqlite-migration.md).
 

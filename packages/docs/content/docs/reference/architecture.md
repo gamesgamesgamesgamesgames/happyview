@@ -53,7 +53,7 @@ sequenceDiagram
     X->>R: Lookup (must be Query type)
     alt Lua script attached
         R->>L: Execute script
-        L->>D: db.query / db.get / db.raw
+        L->>D: happyview.db / happyview.sql
         D-->>L: Results
         L-->>X: Response table
     else No script
@@ -80,8 +80,8 @@ sequenceDiagram
     A->>X: Validated claims
     X->>R: Lookup (must be Procedure type)
     alt Lua script attached
-        R->>L: Execute script (Record API)
-        L->>S: Record:save()
+        R->>L: Execute script
+        L->>S: happyview.record create/put
     else No script
         R->>S: Default create/update (auto-detect from uri field)
     end

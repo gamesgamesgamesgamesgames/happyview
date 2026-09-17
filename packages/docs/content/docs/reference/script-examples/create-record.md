@@ -7,18 +7,18 @@ The simplest write: take the request body, save it as a record, and return the U
 **Lexicon type:** procedure
 
 ```lua
-function handle()
-  local r = Record(collection, input)
-  r:save()
-  return { uri = r._uri, cid = r._cid }
+local record = require("happyview.record")
+
+function handle(input, ctx)
+  return record.create(ctx.collection, input)
 end
 ```
 
 ## How it works
 
-1. Create a new [`Record`](../../api-reference/lua/record-api.md) instance from the target collection, populated with the fields from the request body.
-2. Call `r:save()`, which creates the record on the caller's PDS and indexes it locally.
-3. Return the AT URI and CID of the newly created record.
+1. `record.create` on [`happyview.record`](../../api-reference/lua/libraries.md) takes the target collection and the fields from the request body, validates them against the collection's lexicon, and creates the record on the caller's PDS.
+2. The write is mirrored into the local index at once.
+3. `create` answers `{ uri, cid }`, which is returned as the response.
 
 ## Usage
 

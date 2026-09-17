@@ -6,8 +6,6 @@ Record and label scripts are Lua scripts that run in response to events on the a
 
 These scripts are event-driven -- they react to incoming Jetstream events (which include events caused by HappyView's own PDS writes), not to XRPC requests. For scripts that run in response to XRPC queries and procedures, see [Lua Scripting](./lua-scripting.md).
 
-> **Migration note:** Prior to v2.9, record scripts were called "index hooks" and were attached directly to lexicons. They now live in their own `happyview_scripts` table and are managed separately. Existing index hooks were automatically migrated.
-
 ## Trigger grammar
 
 Every script is identified by a **trigger string** -- the script's `id` in the `happyview_scripts` table IS its trigger binding. There is no separate name or host column; the trigger string determines which events the script receives.
@@ -57,14 +55,16 @@ When creating a script, you provide the trigger string as the script's `id`. For
 
 ## Script structure
 
-Like query and procedure scripts, record and label scripts must define a `handle()` function:
+Like query and procedure scripts, record and label scripts define a `handle(input, ctx)` function. `input` is the event:
 
 ```lua
-function handle()
-  if action == "delete" then
-    log("deleted " .. uri)
+local log = require("internal.logging")
+
+function handle(input, ctx)
+  if input.action == "delete" then
+    log.info("deleted", { uri = input.uri })
   else
-    log(action .. " " .. uri)
+    log.info(input.action, { uri = input.uri })
   end
   return true
 end
@@ -81,9 +81,9 @@ The function is called once per event.
 | `true`       | The original record is stored as-is                         |
 | *(no script)* | The original record is stored as-is                        |
 
-On **delete** events, returning `nil` skips the delete (the record stays in the database). Because a delete event carries no `record`, `return record` returns `nil` there -- use `return true` to let a delete proceed.
+On **delete** events, returning `nil` skips the delete (the record stays in the database). Because a delete event carries no `record`, `return input.record` returns `nil` there -- use `return true` to let a delete proceed.
 
-**Important:** If your script has side effects (e.g. syncing to a search index) but you want normal indexing to proceed, return `record` or `true` -- not nothing. A missing return statement returns `nil`, which **skips indexing**.
+**Important:** If your script has side effects (e.g. syncing to a search index) but you want normal indexing to proceed, return `input.record` or `true` -- not nothing. A missing return statement returns `nil`, which **skips indexing**.
 
 ### Label script return values
 
@@ -94,15 +94,15 @@ On **delete** events, returning `nil` skips the delete (the record stays in the 
 | `true`       | The original label is stored as-is                           |
 | *(no script)* | The original label is stored as-is                          |
 
-When a label script returns a table, any field the script omits falls back to the original value. This means `return event` passes the label through unchanged, while `return { val = "new-value" }` rewrites only the `val` field.
+When a label script returns a table, any field the script omits falls back to the original value. This means `return input` passes the label through unchanged, while `return { val = "new-value" }` rewrites only the `val` field.
 
-## Context globals
+## The event
 
-### Record script globals
+### Record events
 
-These globals are set before `handle()` is called for record events:
+`input` for a record event:
 
-| Global       | Type   | Description                                        |
+| Field        | Type   | Description                                        |
 | ------------ | ------ | -------------------------------------------------- |
 | `action`     | string | `"create"`, `"update"`, or `"delete"`              |
 | `uri`        | string | The full AT URI (e.g. `at://did:plc:abc/col/rkey`) |
@@ -110,38 +110,31 @@ These globals are set before `handle()` is called for record events:
 | `collection` | string | The collection NSID                                |
 | `rkey`       | string | The record key                                     |
 | `record`     | table? | The full record as a Lua table (nil on delete)     |
-| `event`      | table  | The full event payload (see below)                 |
 
-The `event` table contains the same fields as the individual globals (`action`, `uri`, `did`, `collection`, `rkey`, `record`). New scripts can use either style -- `event.action` or the bare `action` global -- both work. The `event` table corresponds to the `RecordEventPayload` struct in the Rust dispatcher.
+`ctx.caller_did` is the repo DID the event came from and `ctx.collection` is the collection NSID. The event is the `RecordEventPayload` struct in the Rust dispatcher.
 
-### Label script globals
+### Label events
 
-These globals are set before `handle()` is called for label events:
+`input` for a label event:
 
-| Global  | Type    | Description                                      |
+| Field   | Type    | Description                                      |
 | ------- | ------- | ------------------------------------------------ |
 | `src`   | string  | DID of the labeler that issued the label         |
 | `uri`   | string  | The label subject (`at://` URI or bare DID)      |
 | `val`   | string  | The label value (e.g. `"!hide"`, `"nudity"`)     |
 | `neg`   | boolean | `true` if this is a negation (label removal)     |
 | `cts`   | string  | Creation timestamp (ISO 8601)                    |
-| `exp`   | string? | Expiration timestamp (nil if the label does not expire) |
-| `event` | table   | The full label event as a table (same fields)    |
+| `exp`   | string? | Expiration timestamp (absent if the label does not expire) |
 
-Record and label scripts do **not** have access to `caller_did`, `input`, `params`, or `method`. They run from the event stream, not from a user request.
+`ctx.caller_did` is `nil` for a label event: there is no repo it acts for.
+
+Neither kind runs from a user request, so `ctx.method` and `ctx.params` are `nil` and `ctx.has_pds_auth` is `false`. The full `ctx` table is in the [Script Contract](../api-reference/lua/script-contract.md#ctx).
 
 ## Available APIs
 
-Record and label scripts have access to:
+Record and label scripts `require` the same [built-in modules](../api-reference/lua/built-in-modules.md) and [libraries](../api-reference/lua/libraries.md) as every other script. What differs is the session: there is none, so a library call that acts on a PDS as the caller (`create`, `put`, `delete` and `upload_blob` on `happyview.record`; `procedure` on `happyview.xrpc`) raises `NO_SESSION`. Reads, `happyview.http`, `happyview.linked_repos`, and `happyview.record`'s `save_local` and `delete_local` all work. `jobs.create` enqueues as `ctx.caller_did`, so it works from a record event and raises from a label script, which has no caller. `save_local` from a label script needs an explicit `did` for the same reason.
 
-- **[Record API](../api-reference/lua/record-api.md)** (no-auth mode) -- `Record.load`, `r:save_local()`, `r:delete_local()`, `Record.delete_local()`. PDS-touching methods (`r:save()`, `r:delete()`) raise an error.
-- **[Database API](../api-reference/lua/database-api.md)** -- `db.query`, `db.get`, `db.search`, `db.backlinks`, `db.count`, `db.raw`
-- **[HTTP API](../api-reference/lua/http-api.md)** -- `http.get`, `http.post`, `http.put`, `http.patch`, `http.delete`, `http.head`
-- **[XRPC Lua API](../api-reference/lua/xrpc-lua-api.md)** -- `xrpc.query`, `xrpc.procedure`
-- **[atproto API](../api-reference/lua/atproto-api.md)** -- `atproto.resolve_service_endpoint`, `atproto.get_labels`, `atproto.get_labels_batch`
-- **[JSON API](../api-reference/lua/json-api.md)** -- `json.encode`, `json.decode`
-- **[Utility globals](./lua-scripting.md#utility-globals)** -- `log()`, `now()`, `TID()`, `toarray()`
-- **[Script variables](../api-reference/admin/script-variables.md)** -- `env` table with key-value pairs configured in the dashboard
+Script variables configured in the dashboard are on `ctx.env`.
 
 ## Error handling and retries
 
@@ -181,11 +174,12 @@ The `happyview_dead_letter_scripts` table stores events that failed all retry at
 Create a script with trigger `record.index:your.collection.nsid` to skip indexing any record that doesn't have a `title` field:
 
 ```lua
-function handle()
-  if action == "delete" then
+function handle(input, ctx)
+  if input.action == "delete" then
     return true  -- allow deletes to proceed
   end
 
+  local record = input.record
   if record.title == nil or record.title == "" then
     return nil  -- skip: no title
   end
@@ -199,11 +193,12 @@ end
 Enrich a record with a computed field before it is stored:
 
 ```lua
-function handle()
-  if action == "delete" then
+function handle(input, ctx)
+  if input.action == "delete" then
     return true
   end
 
+  local record = input.record
   record.slug = string.lower(string.gsub(record.title or "", "%s+", "-"))
   return record
 end
@@ -212,17 +207,20 @@ end
 ### Post to a webhook
 
 ```lua
-function handle()
+local json = require("internal.json")
+local http = require("happyview.http")
+
+function handle(input, ctx)
   http.post("https://hooks.example.com/records", {
     headers = { ["Content-Type"] = "application/json" },
     body = json.encode({
-      action = action,
-      uri = uri,
-      did = did,
-      record = record
-    })
+      action = input.action,
+      uri = input.uri,
+      did = input.did,
+      record = input.record,
+    }),
   })
-  return record or true  -- `record` is nil on delete; `true` lets it proceed
+  return input.record or true  -- `record` is nil on delete; `true` lets it proceed
 end
 ```
 
@@ -231,30 +229,33 @@ end
 Push records to an Algolia search index on create/update, and remove them on delete:
 
 ```lua
-function handle()
+local json = require("internal.json")
+local http = require("happyview.http")
+
+function handle(input, ctx)
   local headers = {
     ["X-Algolia-API-Key"] = "your-api-key",
     ["X-Algolia-Application-Id"] = "your-app-id",
-    ["Content-Type"] = "application/json"
+    ["Content-Type"] = "application/json",
   }
 
-  if action == "delete" then
-    http.delete("https://YOUR-APP.algolia.net/1/indexes/records/" .. uri, {
-      headers = headers
+  if input.action == "delete" then
+    http.delete("https://YOUR-APP.algolia.net/1/indexes/records/" .. input.uri, {
+      headers = headers,
     })
   else
-    http.put("https://YOUR-APP.algolia.net/1/indexes/records/" .. uri, {
+    http.put("https://YOUR-APP.algolia.net/1/indexes/records/" .. input.uri, {
       headers = headers,
       body = json.encode({
-        objectID = uri,
-        collection = collection,
-        did = did,
-        record = record
-      })
+        objectID = input.uri,
+        collection = input.collection,
+        did = input.did,
+        record = input.record,
+      }),
     })
   end
 
-  return record or true  -- `record` is nil on delete; `true` lets it proceed
+  return input.record or true  -- `record` is nil on delete; `true` lets it proceed
 end
 ```
 
@@ -265,31 +266,34 @@ See the full [Algolia sync reference](../reference/script-examples/algolia-sync.
 Push records to a self-hosted Meilisearch index on create/update, and remove them on delete:
 
 ```lua
-function handle()
+local json = require("internal.json")
+local http = require("happyview.http")
+
+function handle(input, ctx)
   local headers = {
-    ["Authorization"] = "Bearer " .. env.MEILISEARCH_API_KEY,
-    ["Content-Type"] = "application/json"
+    ["Authorization"] = "Bearer " .. ctx.env.MEILISEARCH_API_KEY,
+    ["Content-Type"] = "application/json",
   }
 
-  if action == "delete" then
-    http.delete(env.MEILISEARCH_URL .. "/indexes/records/documents/" .. uri, {
-      headers = headers
+  if input.action == "delete" then
+    http.delete(ctx.env.MEILISEARCH_URL .. "/indexes/records/documents/" .. input.uri, {
+      headers = headers,
     })
   else
-    http.post(env.MEILISEARCH_URL .. "/indexes/records/documents", {
+    http.post(ctx.env.MEILISEARCH_URL .. "/indexes/records/documents", {
       headers = headers,
-      body = json.encode(toarray({
+      body = json.encode(json.to_array({
         {
-          id = uri,
-          collection = collection,
-          did = did,
-          record = record
-        }
-      }))
+          id = input.uri,
+          collection = input.collection,
+          did = input.did,
+          record = input.record,
+        },
+      })),
     })
   end
 
-  return record or true  -- `record` is nil on delete; `true` lets it proceed
+  return input.record or true  -- `record` is nil on delete; `true` lets it proceed
 end
 ```
 
@@ -300,14 +304,14 @@ See the full [Meilisearch sync reference](../reference/script-examples/meilisear
 Create a script with trigger `labeler.apply:your.collection.nsid` to only persist specific label values:
 
 ```lua
-function handle()
+function handle(input, ctx)
   local allowed = { ["!hide"] = true, ["nudity"] = true, ["spam"] = true }
 
-  if not allowed[val] then
+  if not allowed[input.val] then
     return nil  -- skip: label value not in allowlist
   end
 
-  return event
+  return input
 end
 ```
 
@@ -316,8 +320,8 @@ end
 Normalize the label value before it is stored:
 
 ```lua
-function handle()
-  return { val = string.lower(val) }
+function handle(input, ctx)
+  return { val = string.lower(input.val) }
 end
 ```
 
@@ -326,5 +330,6 @@ Fields not returned fall back to their original values, so only `val` is changed
 ## Next steps
 
 - [Lua Scripting](./lua-scripting.md): Full reference for the sandbox, APIs, and debugging (covers query and procedure scripts)
+- [Script Contract](../api-reference/lua/script-contract.md): `input` and `ctx` for every script kind
 - [Admin API -- Scripts](../api-reference/admin/scripts.md): Create and manage scripts via the API
 - [Lexicons](lexicons.md): Understand how record, query, and procedure lexicons work together

@@ -2,7 +2,7 @@
 title: "Built-in Modules"
 ---
 
-`require` serves two kinds of module. Installed libraries are WASM plugins — see [Developing Plugins](../../guides/developing-plugins.md). Built-in modules are provided by the runtime directly, under the `internal.` prefix, because they need to be the host itself: a log line has to carry the trigger and script it came from, a clock has to be the host's clock. A plugin cannot claim a namespace starting with `internal.`.
+`require` serves two kinds of module. Installed [libraries](libraries.md) are WASM plugins. Built-in modules are provided by the runtime directly, under the `internal.` prefix, because they need to be the host itself: a log line has to carry the trigger and script it came from, a clock has to be the host's clock. A plugin cannot claim a namespace starting with `internal.`.
 
 ## `internal.logging`
 
@@ -14,16 +14,18 @@ log.warn(message[, fields])
 log.error(message[, fields])
 ```
 
-`fields` is a table stored as JSON on the event, so `log.error("save failed", { uri = uri, err = tostring(err) })` is queryable rather than a stringified blob. Events carry the trigger id and caller, same as today. `debug` writes only to the process log — it is not recorded as an event. In a job script, `info`/`warn`/`error` also write to that job's own log.
+`fields` is a table stored as JSON on the event, so `log.error("save failed", { uri = uri, err = tostring(err) })` is queryable rather than a stringified blob. `info`, `warn` and `error` are recorded as `script.log` events in the [event log](../../guides/event-logs.md), carrying the trigger id and caller; `debug` writes only to the process log. In a job script, `info`/`warn`/`error` also write to that job's own log.
 
 ## `internal.time`
 
 ```lua
 local time = require("internal.time")
 time.now()                       -- unix milliseconds, integer
-time.to_iso8601(ms)                -- "2026-09-13T15:04:05.000Z", raises on an out-of-range timestamp
-time.from_iso8601(string)          -- unix milliseconds, or nil on an unparseable string
+time.to_iso8601(ms)              -- "2026-09-13T15:04:05.000Z", raises on an out-of-range timestamp
+time.from_iso8601(string)        -- unix milliseconds, or nil on an unparseable string
 ```
+
+`time.to_iso8601(time.now())` is the current UTC timestamp for a `createdAt` field.
 
 ## `internal.tids`
 
@@ -34,6 +36,8 @@ tids.to_tid(ms)          -- TID for a unix-millisecond timestamp
 tids.from_tid(tid)       -- unix milliseconds, raises on an invalid TID
 ```
 
+A TID is atproto's 13-character sortable record key. `tids.create()` is the rkey to use when a script needs to name a record before writing it.
+
 ## `internal.json`
 
 ```lua
@@ -43,10 +47,9 @@ json.decode(string)      -- JSON string -> Lua value
 json.to_array(table)     -- marks a table as a JSON array, so an empty one encodes as [] rather than {}
 ```
 
-Same behavior as the `json` global and `toarray()` — see [JSON API](json-api.md) and [Utility Globals](utility-globals.md#toarray).
+Encoding rules and examples: [JSON](json-api.md).
 
 ## Next steps
 
-- [`handle(input, ctx)` contract](../../guides/lua-scripting.md#the-handleinput-ctx-contract): where `ctx` comes from
-- [Developing Plugins](../../guides/developing-plugins.md): installed libraries, reached the same way via `require`
-- [Utility Globals](utility-globals.md): the globals these built-ins replace
+- [Script Contract](script-contract.md): `handle(input, ctx)` and where `ctx` comes from
+- [Libraries](libraries.md): the `happyview.*` modules, reached the same way via `require`

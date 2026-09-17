@@ -7,25 +7,27 @@ Fetch a single record by its AT URI.
 **Lexicon type:** query
 
 ```lua
-function handle()
-  if not params.uri then
+local db = require("happyview.db")
+
+function handle(input, ctx)
+  if not input.uri then
     return { error = "uri parameter is required" }
   end
 
-  local record = db.get(params.uri)
-  if not record then
+  local row = db.get(input.uri)
+  if not row then
     return { error = "not found" }
   end
 
-  return { record = record }
+  return { record = row }
 end
 ```
 
 ## How it works
 
 1. Check that the `uri` query parameter is present. Return a structured error if missing.
-2. Look up the record with [`db.get`](../../api-reference/lua/database-api.md#dbget), which returns the record table or `nil`.
-3. Return the record wrapped in an object.
+2. Look up the record with `db.get`, which returns an [envelope](../../api-reference/lua/libraries.md#conventions-every-library-follows) (`{ uri, did, collection, rkey, cid, indexed_at, record }`) or `nil`.
+3. Return the envelope wrapped in an object. The record body is its `record` field.
 
 ## Usage
 

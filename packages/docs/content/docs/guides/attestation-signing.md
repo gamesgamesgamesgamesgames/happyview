@@ -2,7 +2,7 @@
 title: "Attestation Signing"
 ---
 
-HappyView can sign records with an ECDSA (secp256k1) keypair so their origin can be verified later. Lua scripts call `atproto.sign()` to attach an inline signature to a record and `atproto.verify_signature()` to check one. HappyView's implementation follows the [atproto attestation spec](https://tangled.org/strings/did:plc:cbkjy5n7bk3ax2wplmtjofq2/3m3fy2xuahc22).
+HappyView can sign records with an ECDSA (secp256k1) keypair so their origin can be verified later. Lua scripts call `sign` on `happyview.atproto` to attach an inline signature to a record and `verify_signature` to check one. HappyView's implementation follows the [atproto attestation spec](https://tangled.org/strings/did:plc:cbkjy5n7bk3ax2wplmtjofq2/3m3fy2xuahc22).
 
 ## How it works
 
@@ -35,21 +35,25 @@ HappyView checks for signing configuration in this order:
 2. **Database** — if previously generated keys exist in `happyview_instance_settings`, they're loaded
 3. **Auto-generation** — a new key is generated and persisted to the database
 
-If key loading fails for any reason, signing is disabled and `atproto.sign` / `atproto.verify_signature` will be `nil` in Lua scripts.
+If key loading fails for any reason, signing is disabled and both `sign` and `verify_signature` raise `NO_SIGNER`.
 
 ## Using in Lua scripts
 
-Available in queries, procedures, and record/label scripts via the [atproto API](../api-reference/lua/atproto-api.md).
+Both functions live on the [`happyview.atproto`](../api-reference/lua/libraries.md) library, available in every script kind.
 
 ### Signing a record
 
 ```lua
-function handle()
-  local r = Record(collection, input)
-  r:save()
+local time = require("internal.time")
+local record = require("happyview.record")
+local atproto = require("happyview.atproto")
 
-  local sig = atproto.sign({ text = input.text, createdAt = input.createdAt })
-  return { uri = r._uri, cid = r._cid, signature = sig }
+function handle(input, ctx)
+  local body = { text = input.text, createdAt = time.to_iso8601(time.now()) }
+  local ref = record.create(ctx.collection, body)
+
+  local sig = atproto.sign(body)
+  return { uri = ref.uri, cid = ref.cid, signature = sig }
 end
 ```
 
@@ -65,21 +69,27 @@ The returned signature object:
 }
 ```
 
+`sign` signs as `ctx.caller_did`, since the DID is part of the signed content; it raises `BAD_INPUT` from a script with no caller.
+
 ### Verifying a signature
 
 ```lua
-function handle()
-  local record = db.get(params.uri)
-  if not record then
+local db = require("happyview.db")
+local atproto = require("happyview.atproto")
+
+function handle(input, ctx)
+  local row = db.get(input.uri)
+  if not row then
     return { error = "not found" }
   end
+  local record = row.record
 
   local sig = record.signatures and record.signatures[1]
   if not sig then
     return { record = record, verified = false }
   end
 
-  local ok, valid = pcall(atproto.verify_signature, record, sig, record.did)
+  local ok, valid = pcall(atproto.verify_signature, record, sig, row.did)
   if not ok then
     -- Couldn't check — that is not the same as "the signature is bad".
     return { record = record, verified = nil, error = tostring(valid) }
@@ -88,15 +98,16 @@ function handle()
 end
 ```
 
-`verify_signature` returns `false` only when it checked the signature and it didn't match. It **raises** when it couldn't check — signature bytes that aren't valid base64, a missing field, a record that won't encode. Keep those apart: a script that treats "couldn't check" as `false` will report a fault in its own verification path as a forged record, which is a serious thing to tell a user about their own data.
+`verify_signature` returns `false` only when it checked the signature and it didn't match. It **raises** `UNVERIFIABLE` when it couldn't check — signature bytes that aren't valid base64, a missing field, a record that won't encode. Keep those apart: a script that treats "couldn't check" as `false` will report a fault in its own verification path as a forged record, which is a serious thing to tell a user about their own data.
 
 ### Checking availability
 
-Both functions are `nil` when no signer is configured:
+Both functions raise `NO_SIGNER` when no signer is configured. A script that should work either way wraps the call:
 
 ```lua
-if atproto.sign then
-  record.signature = atproto.sign(record)
+local ok, sig = pcall(atproto.sign, body)
+if ok then
+  body.signature = sig
 end
 ```
 
@@ -112,29 +123,28 @@ Signatures are stored as objects in the record's `signatures` array:
 
 ## Security considerations
 
-`atproto.sign` exposes the instance's signing key to Lua scripts. Treat it as a
+`sign` exposes the instance's signing key to Lua scripts. Treat it as a
 privileged capability:
 
 - **It signs exactly what you give it.** A signature only proves *"this HappyView
   instance signed this content"* — it does **not** prove the content is authentic,
   is present in anyone's repo, or was authored by any particular DID. Only sign
   content you have already verified.
-- **It's available to any script**, including ones that run on untrusted input —
-  record-event and label scripts (triggered by arbitrary firehose records) and
-  anonymous XRPC queries. In those contexts there is no authenticated caller, so
-  the signature's `repository` binding is empty. Don't sign untrusted input (a
-  firehose record, an anonymous request parameter) unless you intend the instance
-  to vouch for it.
-- **Creating scripts requires the `scripts:manage` permission.** The signing key
-  is therefore only reachable by operators you have trusted with that permission —
-  grant it accordingly, and review scripts that call `atproto.sign`.
+- **It's available to any script with a caller**, including a record-event script
+  triggered by an arbitrary firehose record, where the caller is the record's
+  repo DID. Don't sign untrusted input (a firehose record, a request parameter)
+  unless you intend the instance to vouch for it.
+- **Installing `happyview.atproto` grants `attest:sign`, and creating scripts requires
+  the `scripts:manage` permission.** The signing key is therefore only reachable by
+  operators you have trusted with that permission — grant it accordingly, and review
+  scripts that call `sign`.
 
 If you need signatures scoped to a specific verified subject, have the script
 verify the subject itself (e.g. confirm the record's `did` and content against the
-source) before calling `atproto.sign`.
+source) before calling `sign`.
 
 ## Next steps
 
-- [atproto API reference](../api-reference/lua/atproto-api.md#atprotosign) — `atproto.sign` and `atproto.verify_signature` parameter docs
+- [Libraries](../api-reference/lua/libraries.md) — `happyview.atproto` and where its full surface is documented
 - [Signed Record](../reference/script-examples/signed-record.md) — save a record with an attestation signature
 - [Verify Signed Record](../reference/script-examples/signed-record-verify.md) — fetch a record and verify its signature

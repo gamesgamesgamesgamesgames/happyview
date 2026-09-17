@@ -298,17 +298,17 @@ A plugin declaring the listed capability can import the matching function below.
 | `host_backlinks_query`      | `records:read`                      | `{uri, collection, did?, limit?, cursor?}` → `{records, cursor?}`, each record an envelope |
 | `host_table_query`          | `database:read` or `database:write` | `{table, filter?, sort?, limit?, count?}` → rows, or an integer when `count` is set |
 
-An envelope is `{uri, did, collection, rkey, cid, indexed_at, record}`: the stored body sits under `record` untouched, a PDS write carries its `cid` at once while `indexed_at` stays null until the network echoes the record, and a `save_local` row has neither.
+An envelope is the record shape every library read answers, described in [Libraries](../api-reference/lua/libraries.md#conventions-every-library-follows).
 
 `filter`, on `host_records_query`, `host_records_count`, and `host_table_query`, is `{field, op, value}` or `{combine: "and"|"or", conditions: [...]}`, nesting capped at 5.
 
 #### Database access
 
-`host_db_query` and `host_db_execute` run SQL **untranslated** against whichever backend HappyView is running on — placeholders are backend-native (`?` on SQLite, `$1`, `$2`, … on Postgres), the same rule as Lua's [`db.raw`](../api-reference/lua/database-api.md#protected-tables). A plugin that supports both backends branches on placeholder syntax itself, using `ctx.db_backend` from the [call envelope](#library-plugins) — the plugin equivalent of Lua's `db.backend()`. Record and table queries go through the imports above; `host_db_query`/`host_db_execute` are for raw SQL only.
+`host_db_query` and `host_db_execute` run SQL **untranslated** against whichever backend HappyView is running on — placeholders are backend-native (`?` on SQLite, `$1`, `$2`, … on Postgres), the same rule as `raw` on [`happyview.sql`](../api-reference/lua/libraries.md). A plugin that supports both backends branches on placeholder syntax itself, using `ctx.db_backend` from the [call envelope](#library-plugins) — the plugin equivalent of `happyview.db`'s `backend()`. Record and table queries go through the imports above; `host_db_query`/`host_db_execute` are for raw SQL only.
 
 - `database:read` permits `host_db_query` only, and only read-only statements: every statement must be a query whose body and every CTE are `SELECT`s. `WITH … INSERT/UPDATE/DELETE` and a data-modifying CTE (`WITH x AS (DELETE FROM t RETURNING uri) SELECT * FROM x`) count as writes and are rejected before they run.
 - `database:write` permits both imports for any statement, including `INSERT`, `UPDATE`, `DELETE`, and `DROP`.
-- Both share the same protected-table guard as `db.raw`: `happyview_*` tables (and `_sqlx_migrations`) are blocked by default, except the same allowlist of public AppView data — `happyview_records`, `happyview_record_refs`, `happyview_labels`, `happyview_lexicons`, `happyview_jobs`, and the space data tables (`happyview_spaces`, `happyview_space_members`, `happyview_space_records`, `happyview_space_record_oplog`, `happyview_space_notify_registrations`, `happyview_space_dids`). Secrets, tokens, auth/privilege state, trust config, and cryptographic key material stay blocked regardless of which database capability is declared.
+- Both share the same protected-table guard as `happyview.sql`: `happyview_*` tables (and `_sqlx_migrations`) are blocked by default, except the same allowlist of public AppView data — `happyview_records`, `happyview_record_refs`, `happyview_labels`, `happyview_lexicons`, `happyview_jobs`, and the space data tables (`happyview_spaces`, `happyview_space_members`, `happyview_space_records`, `happyview_space_record_oplog`, `happyview_space_notify_registrations`, `happyview_space_dids`). Secrets, tokens, auth/privilege state, trust config, and cryptographic key material stay blocked regardless of which database capability is declared.
 
 ### Capabilities
 
@@ -366,7 +366,7 @@ A plugin declaring `caller:read`, `caller:write`, `caller:call`, or `records:wri
 
 `host_records_index_put`'s `did` is optional on the wire but required to succeed — the host has no default author for a row and rejects a spec without one.
 
-A library receives the script's session only when the script runner that made the call holds the user's PDS session — a procedure script running with PDS auth, or a job created with `{ auth = true }`. A query, record-event, or label script has no session, and a declared-capability call from one fails with `NO_SESSION` — except `host_caller_xrpc_query`, which needs no session at all, the same as the Lua `xrpc.query` global it mirrors. The [AT Protocol reads and attestation](#at-protocol-reads-and-attestation) imports below also need no session, since each acts on a DID, blob, URI, or record named in its own spec rather than on the caller's repo.
+A library receives the script's session only when the script runner that made the call holds the user's PDS session — a procedure script running with PDS auth, or a job created with `{ auth = true }`. A query, record-event, or label script has no session, and a declared-capability call from one fails with `NO_SESSION` — except `host_caller_xrpc_query`, which needs no session at all, the same as `happyview.xrpc`'s `query`, which it backs. The [AT Protocol reads and attestation](#at-protocol-reads-and-attestation) imports below also need no session, since each acts on a DID, blob, URI, or record named in its own spec rather than on the caller's repo.
 
 A record write, put, or delete targets the caller's own repo, or the repo of the account the script is delegated to act for. Any other repo fails with `WRITABLE_REPO`, since a caller-acting write can never succeed against a repo the instance holds no credentials for.
 
@@ -439,7 +439,7 @@ Installed libraries are available to scripts via `require(namespace)`. Each `fun
 ```lua
 local db = require("happyview.db")
 
-function handle()
+function handle(input, ctx)
   local page = db.records("app.bsky.feed.post")
     :where("author", "=", "did:plc:abc")
     :sort("createdAt", "desc")
@@ -459,7 +459,7 @@ end
 module '<name>' not found -- is the '<name>' library plugin installed?
 ```
 
-An empty Lua table argument (`{}`) is encoded as a JSON object, matching `json.encode`'s convention everywhere else — wrap it in `toarray({})` to send an empty JSON array instead.
+An empty Lua table argument (`{}`) is encoded as a JSON object, the same convention as `internal.json`'s `encode` — pass it through `json.to_array({})` to send an empty JSON array instead.
 
 ### Using the SDK
 

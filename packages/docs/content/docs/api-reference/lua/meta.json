@@ -1,16 +1,10 @@
 {
   "title": "Lua API",
   "pages": [
-    "record-api",
-    "database-api",
-    "http-api",
-    "xrpc-lua-api",
-    "atproto-api",
-    "json-api",
-    "jobs-api",
-    "linked-repos-api",
+    "script-contract",
     "built-in-modules",
-    "utility-globals",
+    "libraries",
+    "json-api",
     "standard-libraries"
   ]
 }

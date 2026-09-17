@@ -25,7 +25,7 @@ All of this functionality is possible today, but it requires saving an atproto i
 
 Linked Repos allows those accounts to be authorized over OAuth, with their sessions refreshed automatically in the background. Better yet, because it's using OAuth, you can limit the blast radius of a destructive script by adding limited scopes when linking the account.
 
-Full docs: [Linked Repos](/guides/linked-repos), [Admin API — Linked Repos](/api-reference/admin/linked-repos), [Lua API — `linked_repos`](/api-reference/lua/linked-repos-api).
+Full docs: [Linked Repos](/guides/linked-repos), [Admin API — Linked Repos](/api-reference/admin/linked-repos), [Lua API — `linked_repos`](/api-reference/lua/libraries).
 
 ## Permissioned data update
 

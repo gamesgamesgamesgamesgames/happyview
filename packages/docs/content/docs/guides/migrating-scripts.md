@@ -2,7 +2,7 @@
 title: "Migrating Scripts to v3"
 ---
 
-v3 removes the per-trigger globals (`params`, `caller_did`, `event`, `db`, `Record`, `now()`, …) that [Lua Scripting](lua-scripting.md) and [Record & Label Scripts](record-scripts.md) still document as deprecated. Everything moves onto the `handle(input, ctx)` contract and `require("internal.*")` / `require("happyview.*")` modules.
+v3 removes the globals (`params`, `caller_did`, `event`, `db`, `Record`, `now()`, …) a v2 script reached HappyView through. Everything moves onto the `handle(input, ctx)` contract and `require("internal.*")` / `require("happyview.*")` modules.
 
 A codemod does the rewrite for you — from the script editor or a CLI — and leaves anything it can't rewrite mechanically as a `-- codemod:` comment for you to finish by hand.
 
@@ -14,6 +14,7 @@ A codemod does the rewrite for you — from the script editor or a CLI — and l
 
 | Kind | Old | New |
 |---|---|---|
+| Procedure | `input` | `input` — the name is unchanged, but it is now `handle`'s first parameter rather than a global, so a read outside `handle` is [hoisted](#hoisting-input-and-ctx) |
 | Procedure | `params` | `ctx.params` |
 | Procedure, Query | `collection` | `ctx.collection` |
 | Query | `params` | `input` |
@@ -30,6 +31,8 @@ A codemod does the rewrite for you — from the script editor or a CLI — and l
 A contract rewrite sometimes needs to read `input` or `ctx` outside `handle`'s body — a module-level helper, say. When that happens the codemod adds `local input, ctx` right after the requires block (after any polyfills), and makes `handle`'s first line `input, ctx = handle_input, handle_ctx`, renaming `handle`'s own parameters to `handle_input, handle_ctx` so they don't collide with the hoisted locals. When every rewritten use stays inside `handle`, nothing is hoisted. A `handle` already declared `(input, ctx)` is hoisted the same way when a helper outside it needs the context, and a `handle(handle_input, handle_ctx)` whose `local input, ctx` declaration is missing gets it back.
 
 A `handle` declared with parameters other than exactly `(input, ctx)` gets those parameters renamed: `function handle(evt)` becomes `function handle(input, ctx)` (or `function handle(handle_input, handle_ctx)` when a helper outside `handle` forces the hoist), and every use of `evt` in the body becomes `input`. A `handle` with more than two parameters is left as a marker instead — there's no place to route the extra parameters.
+
+The hoist covers a read inside a function that runs after `handle` has been called. A read at file scope runs while the script loads, when even a hoisted `input` and `ctx` are still `nil`, so it gets [marker 16](#markers) instead. A function that reads them and is itself called at file scope fails the same way and is not marked, so check for one by hand.
 
 **Built-ins** move to [`internal.*` modules](../api-reference/lua/built-in-modules.md): `log(x)` → `log.info(x)`; `TID()` → `tids.create()`; `json.K` → `json.K` on `require("internal.json")`; `toarray(x)` → `json.to_array(x)`. `now()` is the one exception — see below. `TID` conversions other than construction are markers; see below.
 
@@ -68,7 +71,7 @@ Three things in v2 have no direct v3 equivalent: two globals whose return shapes
 ```
 
 - **row shape** — binds `__codemod_flat`, `__codemod_flat_page` and `__codemod_flat_rows`, and is written when the script reads through `db.get`, `db.query`, `db.search` or `db.backlinks`; its header names the library or libraries those reads go through, `happyview.db`, `happyview.backlinks`, or `happyview.db and happyview.backlinks`. A v3 read answers an envelope, `{uri, did, collection, rkey, cid, indexed_at, record}`, with the stored body verbatim under `record`; v2 answered the body with `uri` written onto it. `__codemod_flat(row)` returns the envelope's `record` with `uri` set to the record's own URI (`nil` for `nil`); `__codemod_flat_page(page)` maps `page.records` through it and keeps `cursor`; `__codemod_flat_rows(rows)` maps an array. Rows are replaced inside the array they arrived in, so an empty page still encodes as `[]`. To retire it, read `row.uri` and `row.record.title` off the envelope instead. As in v2, a stored top-level `uri` field is hidden on the flattened row by the record's own URI; the envelope's `record.uri` is where a script that needs it finds it.
-- **`Record`** — reproduces the v2 [`Record` API](../api-reference/lua/record-api.md): the `Record(collection, fields)` constructor and its `Record.new(collection, fields)` spelling; `Record.load(uri)`, `Record.load_all(uris)`, `Record.save_all(records)`, `Record.delete_local(uri)`; and the instance methods `:save()`, `:delete()`, `:save_local()`, `:delete_local()`, `:set_rkey(r)`, `:set_repo(did)`, `:set_key_type(t)`, `:generate_rkey()`. It's built on `require("happyview.record")` and `require("internal.tids")`, so prefer those directly in new code — the shim exists only to keep an existing script's `Record` calls working unchanged. Easy to miss:
+- **`Record`** — reproduces the v2 `Record` API: the `Record(collection, fields)` constructor and its `Record.new(collection, fields)` spelling; `Record.load(uri)`, `Record.load_all(uris)`, `Record.save_all(records)`, `Record.delete_local(uri)`; and the instance methods `:save()`, `:delete()`, `:save_local()`, `:delete_local()`, `:set_rkey(r)`, `:set_repo(did)`, `:set_key_type(t)`, `:generate_rkey()`. It's built on `require("happyview.record")` and `require("internal.tids")`, so prefer those directly in new code — the shim exists only to keep an existing script's `Record` calls working unchanged. Easy to miss:
   - `:save()` and `Record.save_all` see their write in the local index at once, as in v2, because the v3 library mirrors every `create`, `put` and `delete` into the index itself; the row holds the PDS's `cid` and no `indexed_at` until Jetstream echoes it. `Record.save_all` answers `{uri, cid}` per record, which is what the v3 library returns, rather than the PDS's full response.
   - `:delete()` raises without a caller, and always removes the local row whatever else the PDS answered; a refusal or failure there is neither raised nor logged.
   - A write sends only what v2 sent: `_`-prefixed fields are dropped, and when the collection's lexicon declares `properties` (read through `record.lexicon(collection)`), so is every field it doesn't declare. The lexicon's record key also sets the key type `:generate_rkey()` and `:save_local()` mint from, so a `literal:` key is honoured.
@@ -102,12 +105,33 @@ These are the only markers the codemod emits, each substituting the specific nam
 13. `{dotted} has no mechanical equivalent -- rewrite it by hand` — the same case when there is no library to point at. The `TID` conversions land here (`TID.toISO8601`, `TID.fromISO8601`, `TID.toUnixMicroseconds`, `TID.fromUnixMicroseconds`, `TID.toNumber`, `TID.fromNumber`): `internal.tids` carries millisecond precision, so none of them round-trip losslessly, and each is left for a by-hand decision rather than a lossy automatic rewrite.
 14. `{name} depends on the script's trigger kind -- re-run the codemod with that kind, or rewrite it by hand` — a kind-dependent name (`record`, `uri`, `did`, `collection`, …) in a script whose trigger kind the codemod couldn't determine.
 15. `{name} is not a global in a {kind} script -- rewrite it by hand` — a removed global referenced in a script where that name never meant anything for its kind (e.g. `params` in a record script).
+16. `this runs while the script loads, before handle receives input and ctx -- move the read into handle, or into a function handle calls` — a read of `input` or any context global (`env`, `params`, `caller_did`, …) at file scope, outside every function, such as `local BASE = env.API_URL`. v2 set its globals before loading the script; v3 passes `input` and `ctx` to `handle`, which runs after the load, so nothing the codemod could write there would have a value yet.
+
+## What happens to an unmigrated script
+
+A script stored before the upgrade stays in the table untouched, and the scripts list flags it with the globals it still references. It fails the first time it reads one of them, with an error that names the global:
+
+```
+the 'params' global was removed in v3; run the script codemod (Settings → Scripts → Migrate, or happyview-codemod) -- see the Migrating scripts guide
+```
+
+Only the removed names raise. Any other undefined name is `nil`, as in plain Lua, and a script may still assign its own globals, including one that reuses a removed name.
+
+Saving is stricter than running. Creating or editing a script whose body still references a removed global is refused, whether from the script editor or through [`POST`/`PATCH /admin/scripts`](../api-reference/admin/scripts.md#saving-an-unmigrated-script):
+
+```
+script references removed globals: db, params -- run the codemod first
+```
+
+The editor shows that message with a **Migrate this script** button beside it, which rewrites the text in the editor rather than the stored script, so unsaved edits survive. The codemod's own Apply is the one exception to the refusal: it may store a script with `-- codemod:` markers left in it, once you confirm, because the markers say exactly which lines are unfinished. Editing that script afterwards means finishing those lines, since the save is refused until they are.
 
 ## Running the codemod
 
 ### From the script editor
 
 Open a Lua script and click **Migrate**. It shows a diff of the current body against the rewritten one, with any notes listed underneath. Nothing is saved until you click **Apply** — which stores the rewritten body and reloads the script. Previewing only needs permission to view scripts; applying needs permission to manage them. If the rewrite still has markers, Apply stays disabled until you confirm applying with them left in place.
+
+Migrate works on the stored script. When a save is refused for referencing a removed global, the **Migrate this script** button next to the error opens the same preview on what the editor currently holds, and **Use rewritten script** puts the result back into the editor for you to save.
 
 ### From the CLI
 

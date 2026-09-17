@@ -61,7 +61,7 @@ Common issues and how to resolve them.
 **What to do**:
 
 1. Check the server logs: the full error message is logged at error level but not exposed to the client.
-2. Use `log("message")` in your script to trace execution. Output appears in server logs at debug level (requires `RUST_LOG` to include debug).
+2. Use `require("internal.logging")` in your script to trace execution. `log.debug` output appears in server logs at debug level (requires `RUST_LOG` to include debug); `log.info` and above are also recorded as events.
 3. If you hit the execution limit, your script likely has an infinite loop or is processing too much data. See [Lua Scripting - Sandbox](../guides/lua-scripting.md#sandbox).
 
 See [Lua Scripting - Debugging](../guides/lua-scripting.md#debugging) for more.
@@ -90,11 +90,11 @@ See [Backfill](../guides/backfill.md) for how the process works.
 
 ## Lua script can't find records
 
-**Symptom**: `db.query` or `db.get` returns empty results inside a Lua script, even though the admin dashboard shows records exist.
+**Symptom**: a `happyview.db` chain or `db.get` returns empty results inside a Lua script, even though the admin dashboard shows records exist.
 
 **Causes**:
 
-- The `collection` global is only set when the lexicon has a `target_collection`. If you're using `db.raw` with a hardcoded collection name, double-check the spelling matches exactly.
+- `ctx.collection` is only set when the lexicon has a `target_collection`. If you're using a hardcoded collection name, double-check the spelling matches exactly.
 - `db.get` expects a full AT URI (`at://did:plc:abc/collection/rkey`), not just an rkey.
 - If querying by DID, make sure you're passing the full DID string including the `did:plc:` or `did:web:` prefix.
 

@@ -123,11 +123,11 @@ curl "http://127.0.0.1:3000/admin/scripts?suffix=xyz.statusphere.status" -H "$AU
   {
     "id": "record.index:xyz.statusphere.status",
     "script_type": "lua",
-    "body": "function handle()\n  return event\nend",
+    "body": "function handle(input, ctx)\n  return input.record\nend",
     "description": "Process indexed statuses",
     "created_at": "2026-01-01T00:00:00Z",
     "updated_at": "2026-01-01T00:00:00Z",
-    "needs_migration": ["event"]
+    "needs_migration": []
   }
 ]
 ```
@@ -177,11 +177,11 @@ curl "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status"
 {
   "id": "record.index:xyz.statusphere.status",
   "script_type": "lua",
-  "body": "function handle()\n  return event\nend",
+  "body": "function handle(input, ctx)\n  return input.record\nend",
   "description": "Process indexed statuses",
   "created_at": "2026-01-01T00:00:00Z",
   "updated_at": "2026-01-01T00:00:00Z",
-  "needs_migration": ["event"]
+  "needs_migration": []
 }
 ```
 
@@ -191,7 +191,7 @@ curl "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status"
 POST /admin/scripts
 ```
 
-Creates a new script or replaces an existing one by `id`. The trigger grammar and Lua body are validated at write-time.
+Creates a new script or replaces an existing one by `id`. The trigger grammar and Lua body are validated at write-time, and a body that still references a removed v2 global is [refused](#saving-an-unmigrated-script).
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch("http://127.0.0.1:3000/admin/scripts", {
@@ -203,7 +203,7 @@ const response = await fetch("http://127.0.0.1:3000/admin/scripts", {
   body: JSON.stringify({
     id: "record.index:xyz.statusphere.status",
     script_type: "lua",
-    body: "function handle()\n  return event\nend",
+    body: "function handle(input, ctx)\n  return input.record\nend",
     description: "Process indexed statuses",
   }),
 });
@@ -219,7 +219,7 @@ const response = await fetch("http://127.0.0.1:3000/admin/scripts", {
   body: JSON.stringify({
     id: "record.index:xyz.statusphere.status",
     script_type: "lua",
-    body: "function handle()\n  return event\nend",
+    body: "function handle(input, ctx)\n  return input.record\nend",
     description: "Process indexed statuses",
   }),
 });
@@ -232,7 +232,7 @@ let response = client
     .json(&serde_json::json!({
         "id": "record.index:xyz.statusphere.status",
         "script_type": "lua",
-        "body": "function handle()\n  return event\nend",
+        "body": "function handle(input, ctx)\n  return input.record\nend",
         "description": "Process indexed statuses"
     }))
     .send()
@@ -243,7 +243,7 @@ let data: serde_json::Value = response.json().await?;
 body := bytes.NewBufferString(`{
   "id": "record.index:xyz.statusphere.status",
   "script_type": "lua",
-  "body": "function handle()\n  return event\nend",
+  "body": "function handle(input, ctx)\n  return input.record\nend",
   "description": "Process indexed statuses"
 }`)
 req, _ := http.NewRequest("POST", "http://127.0.0.1:3000/admin/scripts", body)
@@ -258,7 +258,7 @@ curl -X POST http://127.0.0.1:3000/admin/scripts \
   -d '{
     "id": "record.index:xyz.statusphere.status",
     "script_type": "lua",
-    "body": "function handle()\n  return event\nend",
+    "body": "function handle(input, ctx)\n  return input.record\nend",
     "description": "Process indexed statuses"
   }'
 ```
@@ -276,11 +276,11 @@ curl -X POST http://127.0.0.1:3000/admin/scripts \
 {
   "id": "record.index:xyz.statusphere.status",
   "script_type": "lua",
-  "body": "function handle()\n  return event\nend",
+  "body": "function handle(input, ctx)\n  return input.record\nend",
   "description": "Process indexed statuses",
   "created_at": "2026-01-01T00:00:00Z",
   "updated_at": "2026-01-01T00:00:00Z",
-  "needs_migration": ["event"]
+  "needs_migration": []
 }
 ```
 
@@ -290,7 +290,7 @@ curl -X POST http://127.0.0.1:3000/admin/scripts \
 PATCH /admin/scripts/{id}
 ```
 
-Updates individual fields of an existing script. At least one field must be provided. Setting `description` to `null` in JSON clears it. If `script_type` is changed, `body` must also be provided so validation can run against the new type.
+Updates individual fields of an existing script. At least one field must be provided. Setting `description` to `null` in JSON clears it. If `script_type` is changed, `body` must also be provided so validation can run against the new type. A `body` that still references a removed v2 global is [refused](#saving-an-unmigrated-script).
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(
@@ -363,11 +363,11 @@ curl -X PATCH "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statuspher
 {
   "id": "record.index:xyz.statusphere.status",
   "script_type": "lua",
-  "body": "function handle()\n  return event\nend",
+  "body": "function handle(input, ctx)\n  return input.record\nend",
   "description": "Updated description for status processing",
   "created_at": "2026-01-01T00:00:00Z",
   "updated_at": "2026-01-01T00:00:00Z",
-  "needs_migration": ["event"]
+  "needs_migration": []
 }
 ```
 
@@ -519,6 +519,7 @@ curl -X POST "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere
 | --------------- | ------- | -------- | ---------------------------------------------------------------------------- |
 | `apply`         | boolean | no       | Defaults to `false` (preview only). `true` stores the rewritten body.        |
 | `allow_markers` | boolean | no       | Required alongside `apply: true` when the rewrite still leaves `-- codemod:` markers behind. |
+| `source`        | string  | no       | Lua text to rewrite in place of the stored body. Preview only.               |
 
 **Response**: `200 OK`
 
@@ -540,4 +541,28 @@ curl -X POST "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere
 
 `apply: true` on a rewrite that changed the script (`changed: true`) and still has one or more notes returns `409 Conflict` unless `allow_markers: true` is also set. Re-applying when the rewrite changes nothing (`changed: false`) is a no-op and returns `200 OK` regardless of `allow_markers`.
 
+`source` previews the rewrite of text the server doesn't hold, such as an editor's unsaved changes. No stored script is needed, so it works before a script is first saved: the `{id}` in the path then only tells the codemod which kind of script it is rewriting. Nothing is stored, `changed` compares against `source` rather than the stored body, and sending it with `apply: true` returns `400 Bad Request`.
+
 A non-Lua `script_type` returns `400 Bad Request`. A body that doesn't parse as Lua also returns `400 Bad Request` rather than a result — this is different from `needs_migration`'s `"unparseable"`, which is a value on the *script list/get* response, not this endpoint.
+
+### Saving an unmigrated script
+
+`POST /admin/scripts` and `PATCH /admin/scripts/{id}` refuse a Lua `body` that still references a removed v2 global, the same names `needs_migration` reports for the script's kind and in the same order:
+
+```json
+{
+  "error": "script references removed globals: db, params -- run the codemod first",
+  "removed_globals": ["db", "params"]
+}
+```
+
+```ts
+interface UnmigratedScriptError {
+  error: string;
+  removed_globals: string[];
+}
+```
+
+**Response**: `400 Bad Request`. Nothing is stored. `removed_globals` is present on this error and no other, so a client can key on it rather than on the wording of `error`. The check runs before the body is compiled, so a script that reads a removed global at file scope gets this answer rather than a compilation failure; a body that doesn't parse at all still gets the compilation failure. Such a script would fail on its first run, so it is turned away at the edit instead. A `PATCH` that sends no `body` is not checked, so the description of a stored script that is still waiting for the codemod stays editable.
+
+`apply: true` on this endpoint is the one write that can store a body with removed globals left in it: only the constructs it marked `-- codemod:` remain, and `allow_markers: true` is the explicit consent to store them. Saving that same body back through `POST` or `PATCH` is refused until the marked lines are rewritten by hand.

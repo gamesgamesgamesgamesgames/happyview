@@ -64,7 +64,7 @@ Returns a single job by ID.
 POST /admin/jobs/:id/cancel
 ```
 
-Request cancellation of a job. If the job is `pending` or `paused`, it's immediately set to `cancelled`. If the job is `running`, it's set to `cancelling` — the worker will stop the job when the script next calls `job.should_stop()`.
+Request cancellation of a job. If the job is `pending` or `paused`, it's immediately set to `cancelled`. If the job is `running`, it's set to `cancelling` — the worker will stop the job when the script next calls `ctx.job.should_stop()`.
 
 **Permission:** `jobs:manage`
 
@@ -89,7 +89,7 @@ Request cancellation of a job. If the job is `pending` or `paused`, it's immedia
 POST /admin/jobs/:id/pause
 ```
 
-Request pause of a running job. Sets the status to `pausing` — the worker will pause the job when the script next calls `job.should_stop()`.
+Request pause of a running job. Sets the status to `pausing` — the worker will pause the job when the script next calls `ctx.job.should_stop()`.
 
 **Permission:** `jobs:manage`
 
@@ -138,10 +138,10 @@ Resume a paused job. Sets the status back to `pending` so the worker picks it up
 | Field          | Type         | Description                                                                     |
 | -------------- | ------------ | ------------------------------------------------------------------------------- |
 | `id`           | string       | UUID                                                                            |
-| `job_type`     | string       | The type name passed to `jobs.create()`                                         |
+| `job_type`     | string       | The type name passed to `jobs.create`                                           |
 | `status`       | string       | Current status (see [lifecycle](../../guides/background-jobs.md#job-lifecycle)) |
-| `input`        | object       | Input data passed to `jobs.create()`                                            |
-| `progress`     | object       | Last progress update from `job.progress()`                                      |
+| `input`        | object       | Input data passed to `jobs.create`                                              |
+| `progress`     | object       | Last progress update from `ctx.job.progress()`                                  |
 | `result`       | object\|null | Return value of the script on completion                                        |
 | `error`        | string\|null | Error message on failure                                                        |
 | `created_by`   | string       | DID of the user who enqueued the job                                            |

@@ -194,13 +194,13 @@ Labels appear in the **Labels** column on the Records page as color-coded badges
 
 Self-labels (applied by the record author) use an outline badge style to distinguish them from external labels. Hover over a badge to see the source labeler's DID.
 
-Labels are also available in the records API response and in Lua scripts via the [`atproto.get_labels` and `atproto.get_labels_batch`](../api-reference/lua/atproto-api.md#atprotoget_labels) functions.
+Labels are also available in the records API response and in Lua scripts via `get_labels` and `get_labels_batch` on the [`happyview.atproto`](../api-reference/lua/libraries.md) library.
 
 ## Using labels in your AppView
 
 Labeler subscriptions give your AppView access to content moderation signals without building your own moderation system. Some ways to use them:
 
-- **Content filtering**: Use labels in query scripts to exclude or down-rank flagged content. Check labels with `atproto.get_labels` and filter results before returning them.
+- **Content filtering**: Use labels in query scripts to exclude or down-rank flagged content. Check labels with `get_labels` and filter results before returning them.
 - **Moderation dashboards**: Display labels alongside records in your admin dashboard to review flagged content. Labels appear automatically on the Records page once a labeler is subscribed.
 - **Custom labelers**: You can subscribe to any labeler that implements the atproto labeler spec, including community-run labelers or one you operate yourself for domain-specific moderation (e.g. labeling game content by age rating).
 
@@ -215,5 +215,5 @@ Labeler subscriptions give your AppView access to content moderation signals wit
 ## Next steps
 
 - [Admin API — Labelers](../api-reference/admin/labelers.md) — full endpoint documentation
-- [atproto API](../api-reference/lua/atproto-api.md) — access labels in Lua scripts with `get_labels` and `get_labels_batch`
+- [Libraries](../api-reference/lua/libraries.md) — `happyview.atproto`, which exposes `get_labels` and `get_labels_batch` to Lua scripts
 - [Permissions](./permissions.md) — manage user access to labeler operations

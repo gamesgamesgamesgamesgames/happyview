@@ -33,7 +33,7 @@ Jobs can also inherit the caller's PDS auth session by passing `{ auth = true }`
 
 There's a new dashboard page at `/dashboard/jobs` where you can filter by status, inspect input/progress/result, and manage running jobs. Scripts are authored in the script editor by selecting "Job" as the trigger source and adding a job type.
 
-Full docs: [Background Jobs](/api-reference/lua/jobs-api).
+Full docs: [Background Jobs](/guides/background-jobs).
 
 ## Space repo export
 

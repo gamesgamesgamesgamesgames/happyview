@@ -2,7 +2,7 @@
 title: "Linked Repos"
 ---
 
-Linked repos give your AppView durable write access to a specific atproto repo. Once an admin links a repo, any Lua script can write to it through the `linked_repos` global. You can think of these repos like service accounts: an account that your AppView may post on behalf of, a partner repo into which you mirror data, or an operator account your instance maintains on its own.
+Linked repos give your AppView durable write access to a specific atproto repo. Once an admin links a repo, any Lua script can write to it through the `happyview.linked_repos` library. You can think of these repos like service accounts: an account that your AppView may post on behalf of, a partner repo into which you mirror data, or an operator account your instance maintains on its own.
 
 This is different from writing on behalf of the user making a request. Those writes use the caller's own OAuth session and only work while that session is live. A linked repo belongs to the instance: HappyView stores the session, handles token refreshes in the background, and allows scripts to act as the linked repo rather than the caller.
 
@@ -59,10 +59,12 @@ A background worker refreshes each active grant's session periodically, so a rar
 
 ## Using a linked repo from a script
 
-The `linked_repos` global is available in every script context: procedures, queries, record scripts, label scripts, and job scripts.
+`happyview.linked_repos` acts as the linked repo rather than the caller, so it works from every script context: procedures, queries, record scripts, label scripts, and job scripts.
 
 ```lua
-function handle()
+local linked_repos = require("happyview.linked_repos")
+
+function handle(input, ctx)
   local repo = linked_repos.get("did:plc:abc123")
 
   repo:create_record{
@@ -78,7 +80,7 @@ Scope checks happen locally, before any network call. If a grant lacks the scope
 
 Every method re-reads the grant from the database. If a grant is revoked or flips to `needs_reauth` while a long-running script is working, the next call it makes is refused.
 
-See the [Linked Repos Lua API reference](../api-reference/lua/linked-repos-api.md) for the full surface.
+`linked_repos.get(did)` never fails on its own; an unlinked or revoked DID surfaces as `NOT_LINKED` on the first method called on it. The full surface is in the [library's README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-linked-repos); see [Libraries](../api-reference/lua/libraries.md) for the capability it needs.
 
 <Callout type="warn">
 Any script can use any linked repo. Scripts are already admin-authored code with database, HTTP, and environment access, and linked repos sit at the same trust level. Be deliberate about scripts that write to a linked repo in response to unauthenticated requests.
@@ -103,6 +105,6 @@ Deleting the grant on HappyView's side doesn't revoke the authorization at the P
 ## See also
 
 - [Linked Repos admin API](../api-reference/admin/linked-repos.md): Drive the whole lifecycle headlessly
-- [Linked Repos Lua API](../api-reference/lua/linked-repos-api.md): The full script surface
+- [Libraries](../api-reference/lua/libraries.md): `happyview.linked_repos` and the other script libraries
 - [Lua Scripting](./lua-scripting.md): Script contexts and triggers
 - [Permissions](./permissions.md): The full permission list

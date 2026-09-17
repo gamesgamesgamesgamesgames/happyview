@@ -7,28 +7,29 @@ This query handles both single-record lookups (when a `uri` param is provided) a
 **Lexicon type:** query
 
 ```lua
-function handle()
-  if params.uri then
-    local record = db.get(params.uri)
-    if not record then
+local db = require("happyview.db")
+
+function handle(input, ctx)
+  if input.uri then
+    local row = db.get(input.uri)
+    if not row then
       return { error = "record not found" }
     end
-    return { record = record }
+    return { record = row }
   end
 
-  return db.query({
-    collection = collection,
-    did = params.did,
-    limit = tonumber(params.limit) or 20,
-    cursor = params.cursor,
-  })
+  return db.records(ctx.collection)
+    :did(input.did)
+    :limit(tonumber(input.limit) or 20)
+    :cursor(input.cursor)
+    :run()
 end
 ```
 
 ## How it works
 
-1. If a `uri` query parameter is provided, fetch that single record with [`db.get`](../../api-reference/lua/database-api.md#dbget) and return it. If it doesn't exist, return a structured error (using `error()` would trigger a 500 response).
-2. Otherwise, list records from the target collection using [`db.query`](../../api-reference/lua/database-api.md#dbquery), with optional filtering by `did` and cursor-based pagination. The `cursor` is an opaque string from a previous response — pass it through directly. Since `limit` arrives as a string, `tonumber()` converts it to a number.
+1. If a `uri` query parameter is provided, fetch that single record with `db.get` and return it. If it doesn't exist, return a structured error (using `error()` would trigger a 500 response).
+2. Otherwise, list records from the target collection with a `db.records` chain, with optional filtering by `did` and cursor-based pagination. The `cursor` is an opaque string from a previous response — pass it through directly. A `limit` the lexicon declares as an `integer` arrives as a number already; `tonumber()` covers a lexicon that leaves it untyped, where it arrives as a string.
 
 ## Usage
 
