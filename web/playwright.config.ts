@@ -45,6 +45,7 @@ export default defineConfig({
         "link-invite-pages.spec.ts",
         "users-add.spec.ts",
         "confidential-client.spec.ts",
+        "api-client-duplicate.spec.ts",
         "dpop-session-revocation.spec.ts",
         // telemetry-settings was written but never listed here, so it
         // had never actually run.
