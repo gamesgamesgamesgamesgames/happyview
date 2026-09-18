@@ -2,7 +2,7 @@
 title: "atproto API"
 ---
 
-The `atproto` table provides atproto utility functions. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/label-scripts).
+The `atproto` table provides atproto utility functions. Available in all [Lua scripts](../../guides/lua-scripting.md) — queries, procedures, and [record/label scripts](../../guides/record-scripts).
 
 ## atproto.resolve_service_endpoint
 
