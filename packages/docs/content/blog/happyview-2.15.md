@@ -108,3 +108,9 @@ Thanks to the folks who found things this cycle:
 ## Go play
 
 Full changelog is on [GitHub](https://github.com/gamesgamesgamesgamesgames/happyview/releases/tag/v2.15.0). If you have questions, feature requests, or just need a little help, join the [Cartridge](https://cartridge.dev) [Discord Server](https://discord.gg/BUPnjaBwRZ) and hop into the `#happyview` channel.
+
+## A little sneaky peaky 👀
+
+If you're interested in development for v3, you can check out the [`next` branch](https://github.com/gamesgamesgamesgamesgames/happyview/tree/next). There's also a `next` branch on the [`happyview-plugins`](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/next) repo.
+
+I'll be publishing another article soon as a sort of State of the Software to make all of the changes easier to understand. 😉
