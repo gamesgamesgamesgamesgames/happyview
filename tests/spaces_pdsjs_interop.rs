@@ -363,10 +363,10 @@ async fn a_repo_with_typed_values_is_refused_rather_than_migrated_wrongly_to_pds
 
 #[tokio::test]
 #[ignore]
-async fn pdsjs_still_uses_the_pre_split_member_methods() {
-    // Detection only reports pds.js as supported because the required-method
-    // list accepts addMember as a spelling of putMember. If this starts
-    // failing, pds.js has caught up and that allowance can be reconsidered.
+async fn pdsjs_serves_both_member_method_spellings() {
+    // pds.js serves both spellings of the member method, so the allowance in
+    // REQUIRED_METHODS is not what detection matches it on. atproto-pds and ZDS
+    // serve the canonical name alone.
     let body: Value = client()
         .get(format!("{PDSJS}/xrpc/community.lexicon.service.describe"))
         .send()
@@ -381,30 +381,53 @@ async fn pdsjs_still_uses_the_pre_split_member_methods() {
         .iter()
         .filter_map(|m| m["value"].as_str())
         .collect();
+    assert!(methods.contains(&"com.atproto.simplespace.putMember"));
     assert!(methods.contains(&"com.atproto.simplespace.addMember"));
-    assert!(!methods.contains(&"com.atproto.simplespace.putMember"));
 }
 
 #[tokio::test]
 #[ignore]
-async fn pdsjs_ignores_split_read_and_write_policies() {
-    // pds.js accepts readPolicy/writePolicy without error and stores neither, so
-    // a space asked to be public comes back member-list.
+async fn pdsjs_answers_the_single_policy_field_from_the_read_policy_alone() {
+    // pds.js stores readPolicy and writePolicy as asked, then answers with the
+    // single `policy` field as well, taken from readPolicy and ignoring
+    // writePolicy. A space that is public to read and member-list to write
+    // comes back `policy: publicPolicy`, so a caller reading that field alone
+    // reads the space as more open than it is. A `config` object carries the
+    // same policy again as a bare string.
     //
-    // If this fails, pds.js has adopted the split and this can go.
+    // The reference and atproto-pds answer with the split alone.
     let account = Account::sign_in().await;
-    let requested = Policy::Public;
-    let space = account
-        .new_space(json!({ "readPolicy": requested, "writePolicy": requested }))
-        .await;
 
+    let space = account
+        .new_space(json!({ "readPolicy": Policy::Public, "writePolicy": Policy::Public }))
+        .await;
     let (status, body) = account
         .get("com.atproto.simplespace.getSpace", &[("space", space)])
         .await;
     assert_eq!(status, 200, "getSpace failed: {body}");
-    assert!(body.get("readPolicy").is_none(), "{body}");
-    let stored: Policy = serde_json::from_value(body["policy"].clone()).expect("policy");
-    assert_eq!(stored, Policy::MemberList, "{body}");
+    let read: Policy = serde_json::from_value(body["readPolicy"].clone()).expect("readPolicy");
+    let write: Policy = serde_json::from_value(body["writePolicy"].clone()).expect("writePolicy");
+    assert_eq!(read, Policy::Public, "{body}");
+    assert_eq!(write, Policy::Public, "{body}");
+    let mirrored: Policy = serde_json::from_value(body["policy"].clone()).expect("policy");
+    assert_eq!(mirrored, Policy::Public, "{body}");
+    assert_eq!(body["config"]["policy"], json!("public"), "{body}");
+
+    let space = account
+        .new_space(json!({ "readPolicy": Policy::Public, "writePolicy": Policy::MemberList }))
+        .await;
+    let (status, body) = account
+        .get("com.atproto.simplespace.getSpace", &[("space", space)])
+        .await;
+    assert_eq!(status, 200, "getSpace failed: {body}");
+    let write: Policy = serde_json::from_value(body["writePolicy"].clone()).expect("writePolicy");
+    assert_eq!(write, Policy::MemberList, "{body}");
+    let mirrored: Policy = serde_json::from_value(body["policy"].clone()).expect("policy");
+    assert_eq!(
+        mirrored,
+        Policy::Public,
+        "the single field no longer follows readPolicy: {body}"
+    );
 }
 
 #[tokio::test]

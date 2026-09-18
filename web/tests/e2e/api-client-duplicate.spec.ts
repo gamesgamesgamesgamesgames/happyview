@@ -53,7 +53,9 @@ test.describe("Duplicate API client", () => {
     expect(created.status()).toBe(201);
 
     await page.goto("/dashboard/settings/api-clients/");
-    await expect(page.getByRole("cell", { name: SOURCE_NAME })).toBeVisible();
+    await expect(
+      page.getByRole("cell", { name: SOURCE_NAME, exact: true }),
+    ).toBeVisible();
   });
 
   test.afterEach(async ({ page }) => {
