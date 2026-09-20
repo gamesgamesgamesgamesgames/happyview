@@ -390,6 +390,8 @@ interface RecordEntry {
   collection: string;
   rkey: string;
   cid: string;
+  // Only present when `includeValues` is `true`.
+  value?: Record<string, unknown>;
 }
 interface ListRecordsResponse {
   records: RecordEntry[];
@@ -448,14 +450,15 @@ curl 'https://happyview.example.com/xrpc/com.atproto.space.listRecords?space=at:
 
 **Parameters:**
 
-| Field        | Type    | Required | Default | Description                       |
-| ------------ | ------- | -------- | ------- | --------------------------------- |
-| `space`      | string  | Yes      |         | The space to list from            |
-| `repo`       | string  | No       |         | Filter by author DID              |
-| `collection` | string  | No       |         | Filter by collection NSID         |
-| `limit`      | integer | No       | 50      | Max records to return (1-100)     |
-| `cursor`     | string  | No       |         | Pagination cursor                 |
-| `reverse`    | boolean | No       | `false` | Reverse sort order (oldest first) |
+| Field           | Type    | Required | Default | Description                                   |
+| --------------- | ------- | -------- | ------- | --------------------------------------------- |
+| `space`         | string  | Yes      |         | The space to list from                        |
+| `repo`          | string  | No       |         | Filter by author DID                          |
+| `collection`    | string  | No       |         | Filter by collection NSID                     |
+| `limit`         | integer | No       | 50      | Max records to return (1-100)                 |
+| `cursor`        | string  | No       |         | Pagination cursor                             |
+| `reverse`       | boolean | No       | `false` | Reverse sort order (oldest first)             |
+| `includeValues` | boolean | No       | `false` | Include each record's `value` in the response |
 
 **Response:**
 
@@ -465,12 +468,19 @@ curl 'https://happyview.example.com/xrpc/com.atproto.space.listRecords?space=at:
     {
       "collection": "com.example.forum.post",
       "rkey": "3k2abc",
-      "cid": "bafyrei..."
+      "cid": "bafyrei...",
+      "value": {
+        "$type": "com.example.forum.post",
+        "text": "Hello from the forum!",
+        "createdAt": "2026-05-09T12:00:00Z"
+      }
     }
   ],
   "cursor": "MjAyNi0wNS0wOVQxMjowMDowMFp8YXRzOi8vZGlkOnBsYzphYmMxMjMvY29tLmV4YW1wbGUuZm9ydW0vbWFpbg"
 }
 ```
+
+`value` is only present when `includeValues` is `true`. By default each entry carries just `collection`, `rkey`, and `cid`.
 
 ## Deleting a record
 
