@@ -31,11 +31,16 @@ impl std::fmt::Display for ScriptErrorType {
 pub const LUA_AUTH_ERROR_PREFIX: &str = "AUTH_ERROR:";
 
 /// mlua errors look like:
-/// - `[string "..."]:42: attempt to index a nil value`
-/// - `runtime error: [string "..."]:10: bad argument`
+/// - `[string "script"]:42: attempt to index a nil value`
+/// - `runtime error: [string "script"]:10: bad argument`
 ///
-/// Returns `(Some(line), cleaned_message)` or `(None, original_message)`.
+/// followed, when the error left a running function, by a `stack traceback:`
+/// block. Returns `(Some(line), message)` or `(None, message)`, where the
+/// message stops before the traceback: the traceback names only chunk lines
+/// and library frames, which is noise to a client, and the raw string reaches
+/// the event log untouched for anyone debugging.
 pub fn parse_lua_line(raw: &str) -> (Option<u32>, String) {
+    let raw = raw.split("\nstack traceback:").next().unwrap_or(raw);
     if let Some(bracket_pos) = raw.find("]:") {
         let after_bracket = &raw[bracket_pos + 2..];
         if let Some(colon_pos) = after_bracket.find(": ") {
@@ -532,6 +537,43 @@ mod tests {
         let (line, msg) = parse_lua_line("runtime error: [string \"...\"]:10: bad argument");
         assert_eq!(line, Some(10));
         assert_eq!(msg, "bad argument");
+    }
+
+    #[test]
+    fn parse_lua_line_drops_the_traceback() {
+        let (line, msg) = parse_lua_line(
+            "runtime error: [string \"script\"]:4: boom\nstack traceback:\n\t[C]: in function 'error'\n\t[string \"script\"]:4: in function 'handle'",
+        );
+        assert_eq!(line, Some(4));
+        assert_eq!(msg, "boom");
+        let (line, msg) =
+            parse_lua_line("runtime error: bare\nstack traceback:\n\t[C]: in function 'error'");
+        assert_eq!(line, None);
+        assert_eq!(msg, "runtime error: bare");
+    }
+
+    /// The hand-written strings above pin the parser's shape; this pins that a
+    /// script run the way the runners run it produces that shape.
+    #[tokio::test]
+    async fn parse_lua_line_reads_the_line_of_a_real_script_error() {
+        use crate::lua::sandbox::{call_handle, create_sandbox, load_script};
+
+        let lua = create_sandbox().unwrap();
+        load_script(
+            &lua,
+            "function handle()\n  local t = nil\n  return t.x\nend",
+        )
+        .exec()
+        .unwrap();
+        let handle: mlua::Function = lua.globals().get("handle").unwrap();
+        let raw = call_handle(&lua, &handle, ())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        let (line, message) = parse_lua_line(&raw);
+        assert_eq!(line, Some(3), "{raw}");
+        assert_eq!(message, "attempt to index a nil value (local 't')");
     }
 
     #[test]

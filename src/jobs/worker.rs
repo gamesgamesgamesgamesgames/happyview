@@ -174,7 +174,10 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         }
     };
 
-    lua.remove_hook();
+    // A job is the one place a script is meant to run long: its budget is the
+    // operator's, spent through `should_stop`, and no clock or instruction
+    // count applies to `handle`.
+    sandbox::lift_execution_limit(&lua);
 
     // A job that did not inherit its creator's auth has nothing to act as, so
     // its library calls carry no session at all.
@@ -210,7 +213,7 @@ async fn execute_job(state: &AppState, job: &super::Job) {
 
     let env_vars = load_env_vars(&state.db, backend).await;
 
-    if let Err(e) = lua.load(script.body.as_str()).exec() {
+    if let Err(e) = sandbox::load_script(&lua, &script.body).exec() {
         let error = format!("script load failed: {e}");
         let _ = db::set_error(state, &job.id, &error).await;
         return;

@@ -401,7 +401,8 @@ pub async fn run_record_event_once(
             script.language.as_str()
         ));
     }
-    let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
+    let lua = sandbox::create_sandbox_with_limit(state.script_limits.instruction_limit())
+        .map_err(|e| format!("create sandbox: {e}"))?;
     install_require(&lua, state, &script.id, Some(payload.did)).await?;
 
     use mlua::LuaSerdeExt;
@@ -419,7 +420,7 @@ pub async fn run_record_event_once(
 
     let env_vars = load_env_vars(&state.db, state.db_backend).await;
 
-    lua.load(script.body.as_str())
+    sandbox::load_script(&lua, &script.body)
         .exec()
         .map_err(|e| format!("script load: {e}"))?;
     let handle: mlua::Function = lua
@@ -442,8 +443,7 @@ pub async fn run_record_event_once(
         },
     )
     .map_err(|e| format!("build ctx: {e}"))?;
-    let result: mlua::Value = handle
-        .call_async::<mlua::Value>((event_lua, ctx))
+    let result = sandbox::call_handle(&lua, &handle, (event_lua, ctx))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -604,7 +604,8 @@ async fn run_label_lua_once(
             script.language.as_str()
         ));
     }
-    let lua = sandbox::create_sandbox().map_err(|e| format!("create sandbox: {e}"))?;
+    let lua = sandbox::create_sandbox_with_limit(state.script_limits.instruction_limit())
+        .map_err(|e| format!("create sandbox: {e}"))?;
     install_require(&lua, state, &script.id, None).await?;
 
     use mlua::LuaSerdeExt;
@@ -614,7 +615,7 @@ async fn run_label_lua_once(
         .map_err(|e| format!("event lua-conv: {e}"))?;
     let env_vars = load_env_vars(&state.db, state.db_backend).await;
 
-    lua.load(script.body.as_str())
+    sandbox::load_script(&lua, &script.body)
         .exec()
         .map_err(|e| format!("script load: {e}"))?;
     let handle: mlua::Function = lua
@@ -637,8 +638,7 @@ async fn run_label_lua_once(
         },
     )
     .map_err(|e| format!("build ctx: {e}"))?;
-    let result: mlua::Value = handle
-        .call_async::<mlua::Value>((event_lua, ctx))
+    let result = sandbox::call_handle(&lua, &handle, (event_lua, ctx))
         .await
         .map_err(|e| e.to_string())?;
 
@@ -882,7 +882,128 @@ mod tests {
             verbose_event_logging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
+            script_limits: Arc::new(crate::lua::limits::ScriptLimits::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn a_record_script_cannot_swallow_the_limit_with_pcall() {
+        let state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        let script = lua_script(
+            "function handle() while true do pcall(function() while true do end end) end end",
+        );
+
+        let run = run_record_event_once(&state, &script, RECORD_PAYLOAD);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .expect("the instruction limit must end the run")
+            .expect_err("the run must fail");
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    fn lua_script(body: &str) -> ResolvedScript {
+        ResolvedScript {
+            id: "record.create:com.example.thing".into(),
+            language: ScriptLanguage::Lua,
+            body: body.into(),
+        }
+    }
+
+    const RECORD_PAYLOAD: RecordEventPayload<'static> = RecordEventPayload {
+        nsid: "com.example.thing",
+        action: "create",
+        uri: "at://did:plc:a/com.example.thing/1",
+        did: "did:plc:a",
+        rkey: "1",
+        record: None,
+    };
+
+    fn label_event() -> LabelAppliedEvent {
+        LabelAppliedEvent {
+            src: "did:plc:labeler".into(),
+            uri: "at://did:plc:a/app.bsky.feed.post/1".into(),
+            val: "spam".into(),
+            neg: false,
+            cts: "2026-01-01T00:00:00.000Z".into(),
+            exp: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_label_script_that_loops_fails_with_the_limit() {
+        let state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        let script = lua_script("function handle() while true do end end");
+        let event = label_event();
+
+        let run = run_label_lua_once(&state, &script, &event);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .expect("the instruction limit must end the run")
+            .expect_err("the run must fail");
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    const TEN_THOUSAND_ITERATIONS: &str =
+        "function handle() local n = 0; for i = 1, 10000 do n = n + 1 end; return { n = n } end";
+
+    async fn state_with_instruction_limit(limit: u32) -> AppState {
+        let mut state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        state.script_limits = Arc::new(crate::lua::limits::ScriptLimits::new(limit, 10));
+        state
+    }
+
+    #[tokio::test]
+    async fn a_record_script_runs_under_the_cached_instruction_limit() {
+        let state = state_with_instruction_limit(1_000).await;
+        let script = lua_script(TEN_THOUSAND_ITERATIONS);
+
+        let err = run_record_event_once(&state, &script, RECORD_PAYLOAD)
+            .await
+            .expect_err("the lowered budget must end the run");
+        assert!(err.contains("execution limit"), "{err}");
+
+        state.script_limits.set_instruction_limit(1_000_000);
+        run_record_event_once(&state, &script, RECORD_PAYLOAD)
+            .await
+            .expect("the restored budget must let the run finish");
+    }
+
+    #[tokio::test]
+    async fn a_label_script_runs_under_the_cached_instruction_limit() {
+        let state = state_with_instruction_limit(1_000).await;
+        let script = lua_script(TEN_THOUSAND_ITERATIONS);
+
+        let err = run_label_lua_once(&state, &script, &label_event())
+            .await
+            .expect_err("the lowered budget must end the run");
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_record_script_error_carries_its_line() {
+        let state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        let script = lua_script("function handle()\n  local t = nil\n  return t.x\nend");
+
+        let err = run_record_event_once(&state, &script, RECORD_PAYLOAD)
+            .await
+            .expect_err("indexing nil must raise");
+        assert_eq!(crate::error::parse_lua_line(&err).0, Some(3), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_label_script_error_carries_its_line() {
+        let state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        let script = lua_script("function handle()\n  local t = nil\n  return t.x\nend");
+
+        let err = run_label_lua_once(&state, &script, &label_event())
+            .await
+            .expect_err("indexing nil must raise");
+        assert_eq!(crate::error::parse_lua_line(&err).0, Some(3), "{err}");
     }
 
     #[tokio::test]

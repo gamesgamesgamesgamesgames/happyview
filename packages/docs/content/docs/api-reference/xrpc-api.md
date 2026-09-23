@@ -612,12 +612,15 @@ All error responses return JSON with an `error` field:
 
 ### Lua script errors
 
-When a Lua script fails, the response is `500` with one of:
+When a Lua script fails, the response is a `script_error` body:
 
-- `{"error": "script execution failed"}`: syntax error, runtime error, or missing `handle()` function
-- `{"error": "script exceeded execution time limit"}`: the script hit the 1,000,000 instruction limit
+```json
+{ "error": "script_error", "errorType": "runtime", "message": "attempt to index a nil value (local 't')", "method": "xyz.statusphere.getStatus", "line": 3 }
+```
 
-The full error details are logged server-side but not exposed to the client. See [Lua Scripting - Debugging](../guides/lua-scripting.md#debugging) for how to diagnose script issues.
+`errorType` is `syntax`, `runtime` or `missing_handle` with status `500`, or `timeout` with status `408` when the script hit the instruction limit or the wall clock, both set in Settings → General. `line` is the script line that raised, or `null`.
+
+The same error is logged server-side with the script source and the caller's input. See [Lua Scripting - Debugging](../guides/lua-scripting.md#debugging) for how to diagnose script issues.
 
 ### PDS errors
 

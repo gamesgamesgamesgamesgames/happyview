@@ -1,6 +1,57 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::task::{Context, Poll};
+use std::time::Duration;
+
 use mlua::{Lua, Result as LuaResult};
 
-const INSTRUCTION_LIMIT: u32 = 1_000_000;
+use super::limits::DEFAULT_INSTRUCTION_LIMIT;
+
+/// The name every script chunk is loaded under. Lua renders an error in a
+/// named chunk as `[string "script"]:12: message`, which is the form
+/// `error::parse_lua_line` reads the line out of; a chunk left unnamed is
+/// named after the Rust source location that loaded it and yields no line.
+const CHUNK_NAME: &str = "script";
+
+/// What the count hook and the runner share about a run: whether its budget
+/// is spent, and how many times the hook has fired since.
+#[derive(Default)]
+struct ExecutionLimit {
+    tripped: AtomicBool,
+    post_trip_triggers: AtomicU32,
+}
+
+fn execution_limit_error() -> mlua::Error {
+    mlua::Error::runtime("script exceeded execution limit")
+}
+
+/// Wraps every Lua function that can hand a script control it should no
+/// longer have. `pcall` and `xpcall` catch the hook's raise; `coroutine.resume`
+/// catches it too when it fires inside a script's own coroutine, and
+/// delivers the hook's yield to the script instead of the runner; a
+/// `coroutine.wrap` function does the same for the yield. Each wrapper
+/// re-raises the execution-limit error after the call it protects returns,
+/// whatever it returned, so the error walks out to the top of `handle`
+/// through every layer of catching. They are Lua so that yields, the host
+/// calls' and the hook's own, still cross them.
+const CATCH_GUARDS: &str = r#"
+local tripped, raise = ...
+local pack, unpack = table.pack, table.unpack
+local function guarded(f)
+    return function(...)
+        local results = pack(f(...))
+        if tripped() then raise() end
+        return unpack(results, 1, results.n)
+    end
+end
+pcall = guarded(pcall)
+xpcall = guarded(xpcall)
+coroutine.resume = guarded(coroutine.resume)
+local wrap = coroutine.wrap
+coroutine.wrap = function(f) return guarded(wrap(f)) end
+"#;
 
 /// The names a v2 script reached the host through. Reading one raises rather
 /// than yielding `nil`: a stored script that predates the codemod would
@@ -55,7 +106,9 @@ pub fn removed_global_message(name: &str) -> String {
     )
 }
 
-/// Create a fresh sandboxed Lua VM.
+/// Create a fresh sandboxed Lua VM under the default instruction budget, for
+/// validation and tests. The runners pass the operator's budget to
+/// [`create_sandbox_with_limit`].
 ///
 /// - Dangerous globals (`io`, `debug`, `package`, `require`, `dofile`, `loadfile`, `load`) are removed.
 /// - `os` is replaced with a safe subset exposing only `time`, `date`, `difftime`, and `clock`.
@@ -66,6 +119,11 @@ pub fn removed_global_message(name: &str) -> String {
 /// Everything else a script needs arrives through `require`, which the runner
 /// installs, and through the arguments of `handle(input, ctx)`.
 pub fn create_sandbox() -> LuaResult<Lua> {
+    create_sandbox_with_limit(DEFAULT_INSTRUCTION_LIMIT)
+}
+
+/// [`create_sandbox`] with an explicit instruction budget.
+pub fn create_sandbox_with_limit(instruction_limit: u32) -> LuaResult<Lua> {
     let lua = Lua::new();
 
     // Preserve safe os functions before removing the full os table
@@ -97,11 +155,39 @@ pub fn create_sandbox() -> LuaResult<Lua> {
     // Re-add os with only safe functions (time, date, difftime, clock)
     globals.set("os", safe_os)?;
 
-    // Instruction limit to prevent infinite loops
-    lua.set_hook(
-        mlua::HookTriggers::new().every_nth_instruction(INSTRUCTION_LIMIT),
-        |_lua, _debug| Err(mlua::Error::runtime("script exceeded execution limit")),
+    // The budget is spent the first time the hook fires, and that raise is all
+    // an honest script sees. After it, the hook alternates between yielding
+    // the coroutine to the runner, which ends the run at its next poll, and
+    // raising again: a yield takes effect only at a yieldable point, and the
+    // raise covers the stretches (a `gsub` callback, a sort comparator) where
+    // it cannot. The hook is global rather than per-thread because `handle`
+    // runs on a coroutine of its own, and a global hook is the only kind it
+    // inherits.
+    let limit = Arc::new(ExecutionLimit::default());
+    lua.set_app_data(Arc::clone(&limit));
+    let hook_limit = Arc::clone(&limit);
+    lua.set_global_hook(
+        mlua::HookTriggers::new().every_nth_instruction(instruction_limit),
+        move |_lua, _debug| {
+            if !hook_limit.tripped.swap(true, Ordering::Relaxed) {
+                return Err(execution_limit_error());
+            }
+            if hook_limit
+                .post_trip_triggers
+                .fetch_add(1, Ordering::Relaxed)
+                % 2
+                == 0
+            {
+                Ok(mlua::VmState::Yield)
+            } else {
+                Err(execution_limit_error())
+            }
+        },
     )?;
+
+    let tripped = lua.create_function(move |_, ()| Ok(limit.tripped.load(Ordering::Relaxed)))?;
+    let raise = lua.create_function(|_, ()| -> LuaResult<()> { Err(execution_limit_error()) })?;
+    lua.load(CATCH_GUARDS).call::<()>((tripped, raise))?;
 
     let guard = lua.create_table()?;
     guard.set(
@@ -121,12 +207,97 @@ pub fn create_sandbox() -> LuaResult<Lua> {
     Ok(lua)
 }
 
+/// Load a script body as the chunk every runner loads it as.
+pub fn load_script<'a>(lua: &'a Lua, source: &'a str) -> mlua::chunk::Chunk<'a> {
+    lua.load(source).set_name(CHUNK_NAME)
+}
+
+/// Take the instruction budget off a VM, for the runner whose scripts are
+/// meant to run long.
+pub fn lift_execution_limit(lua: &Lua) {
+    lua.remove_global_hook();
+    lua.remove_hook();
+}
+
+/// Whether this VM's budget is spent, by instructions or by the clock.
+pub fn limit_tripped(lua: &Lua) -> bool {
+    shared_limit(lua).is_some_and(|limit| limit.tripped.load(Ordering::Relaxed))
+}
+
+fn shared_limit(lua: &Lua) -> Option<Arc<ExecutionLimit>> {
+    lua.app_data_ref::<Arc<ExecutionLimit>>()
+        .map(|limit| Arc::clone(&limit))
+}
+
+/// Call `handle` under the instruction budget. Once the budget is spent the
+/// run ends with the execution-limit error at the first point the runner
+/// regains control: an error propagating out, a yield from the hook, or a
+/// normal return the script reached by catching the raise.
+pub async fn call_handle(
+    lua: &Lua,
+    handle: &mlua::Function,
+    args: impl mlua::IntoLuaMulti,
+) -> LuaResult<mlua::Value> {
+    Budgeted {
+        limit: shared_limit(lua),
+        inner: Box::pin(handle.call_async::<mlua::Value>(args)),
+    }
+    .await
+}
+
+/// [`call_handle`] with a wall clock on top, for the runners that answer a
+/// request. A run the clock ends is marked spent like any other.
+pub async fn call_handle_for_request(
+    lua: &Lua,
+    handle: &mlua::Function,
+    args: impl mlua::IntoLuaMulti,
+    wall_clock: Duration,
+) -> LuaResult<mlua::Value> {
+    match tokio::time::timeout(wall_clock, call_handle(lua, handle, args)).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            if let Some(limit) = shared_limit(lua) {
+                limit.tripped.store(true, Ordering::Relaxed);
+            }
+            Err(execution_limit_error())
+        }
+    }
+}
+
+struct Budgeted<F> {
+    limit: Option<Arc<ExecutionLimit>>,
+    inner: Pin<Box<F>>,
+}
+
+impl<F> Budgeted<F> {
+    fn tripped(&self) -> bool {
+        self.limit
+            .as_ref()
+            .is_some_and(|limit| limit.tripped.load(Ordering::Relaxed))
+    }
+}
+
+impl<F: Future<Output = LuaResult<mlua::Value>>> Future for Budgeted<F> {
+    type Output = LuaResult<mlua::Value>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.tripped() {
+            return Poll::Ready(Err(execution_limit_error()));
+        }
+        match this.inner.as_mut().poll(cx) {
+            Poll::Ready(Ok(_)) if this.tripped() => Poll::Ready(Err(execution_limit_error())),
+            other => other,
+        }
+    }
+}
+
 /// Validate that a script compiles and defines a `handle` function.
 pub fn validate_script(source: &str) -> Result<(), String> {
     let lua = create_sandbox().map_err(|e| format!("failed to create Lua VM: {e}"))?;
     super::require_api::register_require_stub(&lua)
         .map_err(|e| format!("failed to set require stub: {e}"))?;
-    lua.load(source)
+    load_script(&lua, source)
         .exec()
         .map_err(|e| format!("script compilation failed: {e}"))?;
 
@@ -351,5 +522,228 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// Runs `source` and calls its `handle` on a thread of its own, so a run
+    /// that never yields cannot hang the test process. `None` means the
+    /// deadline passed first.
+    fn run_handle_with_deadline(source: &'static str) -> Option<Result<serde_json::Value, String>> {
+        run_handle_on(source, create_sandbox)
+    }
+
+    fn run_handle_on(
+        source: &'static str,
+        vm: fn() -> LuaResult<Lua>,
+    ) -> Option<Result<serde_json::Value, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let outcome = rt.block_on(async {
+                let lua = vm().unwrap();
+                load_script(&lua, source)
+                    .exec()
+                    .map_err(|e| e.to_string())?;
+                let handle: mlua::Function = lua.globals().get("handle").unwrap();
+                let value = call_handle(&lua, &handle, ())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                mlua::LuaSerdeExt::from_value(&lua, value).map_err(|e| e.to_string())
+            });
+            let _ = tx.send(outcome);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).ok()
+    }
+
+    #[test]
+    fn the_limit_reaches_handle_called_through_call_async() {
+        let outcome = run_handle_with_deadline("function handle() while true do end end")
+            .expect("handle must stop within the deadline");
+        let err = outcome.unwrap_err();
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    #[test]
+    fn a_pcall_loop_cannot_swallow_the_limit() {
+        let outcome = run_handle_with_deadline(
+            "function handle() while true do pcall(function() while true do end end) end end",
+        )
+        .expect("handle must stop within the deadline");
+        let err = outcome.unwrap_err();
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    #[test]
+    fn a_script_that_catches_the_limit_and_returns_still_fails() {
+        let outcome = run_handle_with_deadline(
+            "function handle() pcall(function() while true do end end) return { ok = true } end",
+        )
+        .expect("handle must stop within the deadline");
+        let err = outcome.unwrap_err();
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    #[test]
+    fn a_caught_limit_followed_by_a_plain_loop_still_stops() {
+        let outcome = run_handle_with_deadline(
+            "function handle() pcall(function() while true do end end) while true do end end",
+        )
+        .expect("handle must stop within the deadline");
+        let err = outcome.unwrap_err();
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    #[test]
+    fn a_script_under_the_limit_is_unaffected() {
+        let outcome = run_handle_with_deadline(
+            "function handle() local n = 0; for i = 1, 10000 do n = n + i end; return n end",
+        )
+        .expect("handle must stop within the deadline");
+        assert_eq!(outcome.unwrap(), serde_json::json!(50_005_000));
+    }
+
+    #[test]
+    fn a_script_that_uses_coroutines_still_works() {
+        let outcome = run_handle_with_deadline(
+            r#"
+            function handle()
+                local gen = coroutine.wrap(function()
+                    for i = 1, 3 do coroutine.yield(i) end
+                end)
+                local sum = 0
+                for _ = 1, 3 do sum = sum + gen() end
+                local co = coroutine.create(function(a) local b = coroutine.yield(a + 1); return b * 2 end)
+                local _, first = coroutine.resume(co, 1)
+                local _, second = coroutine.resume(co, 10)
+                return sum * 100 + first * 10 + second
+            end
+            "#,
+        )
+        .expect("handle must stop within the deadline");
+        assert_eq!(outcome.unwrap(), serde_json::json!(640));
+    }
+
+    /// Pins the job worker's exemption at the call that matters: `handle`
+    /// runs on a coroutine, and only the global hook reaches one.
+    #[test]
+    fn a_lifted_vm_runs_handle_past_the_limit() {
+        fn lifted() -> LuaResult<Lua> {
+            let lua = create_sandbox()?;
+            lift_execution_limit(&lua);
+            Ok(lua)
+        }
+        let outcome = run_handle_on(
+            "function handle() local n = 0; for i = 1, 3000000 do n = n + 1 end; return n end",
+            lifted,
+        )
+        .expect("handle must finish within the deadline");
+        assert_eq!(outcome.unwrap(), serde_json::json!(3_000_000));
+    }
+
+    #[test]
+    fn a_coroutine_loop_cannot_absorb_the_limit() {
+        let outcome = run_handle_with_deadline(
+            "function handle() while true do coroutine.resume(coroutine.create(function() while true do end end)) end end",
+        )
+        .expect("handle must stop within the deadline");
+        let err = outcome.unwrap_err();
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    #[test]
+    fn a_wrapped_coroutine_loop_cannot_absorb_the_limit() {
+        let outcome = run_handle_with_deadline(
+            "function handle() while true do pcall(coroutine.wrap(function() while true do end end)) end end",
+        )
+        .expect("handle must stop within the deadline");
+        let err = outcome.unwrap_err();
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    #[test]
+    fn a_nested_coroutine_loop_cannot_absorb_the_limit() {
+        let outcome = run_handle_with_deadline(
+            r#"
+            function handle()
+                while true do
+                    coroutine.resume(coroutine.create(function()
+                        while true do
+                            coroutine.resume(coroutine.create(function() while true do end end))
+                        end
+                    end))
+                end
+            end
+            "#,
+        )
+        .expect("handle must stop within the deadline");
+        let err = outcome.unwrap_err();
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    #[test]
+    fn a_pcall_around_a_non_yieldable_loop_cannot_absorb_the_limit() {
+        let outcome = run_handle_with_deadline(
+            r#"
+            function handle()
+                while true do
+                    pcall(function()
+                        string.gsub("x", "x", function() while true do end end)
+                    end)
+                end
+            end
+            "#,
+        )
+        .expect("handle must stop within the deadline");
+        let err = outcome.unwrap_err();
+        assert!(err.contains("execution limit"), "{err}");
+    }
+
+    #[test]
+    fn a_script_under_the_limit_keeps_ordinary_pcall_and_xpcall() {
+        let outcome = run_handle_with_deadline(
+            r#"
+            function handle()
+                local ok, err = pcall(error, "boom")
+                local ok2, seen = xpcall(function() error("bang") end, function(m) return "handled " .. tostring(m) end)
+                local fine, value = pcall(function() return 7 end)
+                return { ok = ok, err = err, ok2 = ok2, seen = seen, fine = fine, value = value }
+            end
+            "#,
+        )
+        .expect("handle must stop within the deadline");
+        let value = outcome.unwrap();
+        assert_eq!(value["ok"], false);
+        assert!(value["err"].as_str().unwrap().ends_with("boom"), "{value}");
+        assert_eq!(value["ok2"], false);
+        assert!(
+            value["seen"].as_str().unwrap().starts_with("handled "),
+            "{value}"
+        );
+        assert_eq!(value["fine"], true);
+        assert_eq!(value["value"], 7);
+    }
+
+    #[test]
+    fn the_flag_reports_a_spent_budget() {
+        let lua = create_sandbox().unwrap();
+        assert!(!limit_tripped(&lua));
+        let _ = lua.load("while true do end").exec();
+        assert!(limit_tripped(&lua));
+    }
+
+    #[test]
+    fn an_explicit_limit_is_the_one_applied() {
+        fn small() -> LuaResult<Lua> {
+            create_sandbox_with_limit(1_000)
+        }
+        let outcome = run_handle_on(
+            "function handle() for i = 1, 10000 do end return 1 end",
+            small,
+        )
+        .expect("handle must stop within the deadline");
+        let err = outcome.unwrap_err();
+        assert!(err.contains("execution limit"), "{err}");
     }
 }

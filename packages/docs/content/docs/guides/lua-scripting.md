@@ -38,7 +38,7 @@ Lua's own `require` is removed too, but HappyView installs its own in its place:
 
 The `os` module is replaced with a safe subset exposing only `os.time`, `os.date`, `os.difftime`, and `os.clock`. Dangerous functions like `os.execute`, `os.remove`, `os.rename`, and `os.exit` are not available.
 
-An instruction limit of 1,000,000 prevents infinite loops. Exceeding it terminates the script with an error.
+An instruction limit prevents runaway scripts, and a query or procedure's `handle` is also held to a wall clock. Both are set in Settings → General and take effect on the next run; `SCRIPT_INSTRUCTION_LIMIT` and `SCRIPT_WALL_CLOCK_SECONDS` in the [configuration](../getting-started/configuration.md#environment-variables) apply when no setting is stored, and that table gives the defaults and the range each accepts. Exceeding either terminates the script with an error; `pcall` can catch it but cannot save the run.
 
 See the [Standard Libraries](../api-reference/lua/standard-libraries.md) reference for the full list of available Lua modules and builtins.
 
@@ -149,7 +149,7 @@ When a script fails, the client receives the Lua error message, its type and the
 - **Missing `handle` function**: Every script must define `handle(input, ctx)` at file scope. If it's missing or misspelled, every call fails with `errorType: missing_handle`.
 - **Reading a v2 global**: `db`, `params`, `caller_did`, `now()` and the other v2 globals raise an error naming the global. Read the value from `input` or `ctx`, or `require` the module — [Migrating Scripts](migrating-scripts.md) has the mapping and a codemod.
 - **Calling `error()` for expected conditions**: Lua's `error()` triggers a 500 response carrying the message. For expected conditions like "record not found", return a structured error response instead: `return { error = "not found" }`.
-- **Infinite loops**: The sandbox enforces a 1,000,000 instruction limit. If your script processes large data sets, paginate with `:limit()` and `:cursor()` instead of loading everything at once.
+- **Infinite loops**: The sandbox enforces the instruction limit and, for queries and procedures, the wall-clock limit. If your script processes large data sets, paginate with `:limit()` and `:cursor()` instead of loading everything at once.
 
 ## Example scripts
 

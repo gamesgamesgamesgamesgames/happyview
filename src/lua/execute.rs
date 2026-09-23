@@ -137,7 +137,7 @@ pub async fn execute_procedure_script(
             .map(|s| repo::PdsAuth::OAuth(Arc::new(s)))
     };
 
-    let lua = match sandbox::create_sandbox() {
+    let lua = match sandbox::create_sandbox_with_limit(state.script_limits.instruction_limit()) {
         Ok(l) => l,
         Err(e) => {
             let error_message = format!("failed to create Lua VM: {e}");
@@ -208,7 +208,7 @@ pub async fn execute_procedure_script(
     }
 
     let env_vars = load_env_vars(&state.db, backend).await;
-    if let Err(e) = lua.load(script).exec() {
+    if let Err(e) = sandbox::load_script(&lua, script).exec() {
         let error_message = format!("{e}");
         tracing::error!(method, error = %e, "lua script load failed");
         log_event(
@@ -301,7 +301,14 @@ pub async fn execute_procedure_script(
         }
     };
 
-    let result: mlua::Value = match handle.call_async((handle_input, handle_ctx)).await {
+    let called = sandbox::call_handle_for_request(
+        &lua,
+        &handle,
+        (handle_input, handle_ctx),
+        state.script_limits.wall_clock(),
+    )
+    .await;
+    let result: mlua::Value = match called {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
@@ -312,7 +319,7 @@ pub async fn execute_procedure_script(
             {
                 let auth_msg = auth_message_after_prefix(&clean_msg);
                 AppError::Auth(auth_msg)
-            } else if msg.contains("execution limit") {
+            } else if sandbox::limit_tripped(&lua) {
                 AppError::ScriptError {
                     error_type: ScriptErrorType::Timeout,
                     message: "script exceeded execution time limit".to_string(),
@@ -435,7 +442,7 @@ pub async fn execute_query_script(
     // Capture script source for error logging.
     let script_source = script.to_string();
 
-    let lua = match sandbox::create_sandbox() {
+    let lua = match sandbox::create_sandbox_with_limit(state.script_limits.instruction_limit()) {
         Ok(l) => l,
         Err(e) => {
             let error_message = format!("failed to create Lua VM: {e}");
@@ -489,7 +496,7 @@ pub async fn execute_query_script(
     }
 
     let env_vars = load_env_vars(&state.db, backend).await;
-    if let Err(e) = lua.load(script).exec() {
+    if let Err(e) = sandbox::load_script(&lua, script).exec() {
         let error_message = format!("{e}");
         tracing::error!(method, error = %e, "lua script load failed");
         log_event(
@@ -578,7 +585,14 @@ pub async fn execute_query_script(
         }
     };
 
-    let result: mlua::Value = match handle.call_async((handle_input, handle_ctx)).await {
+    let called = sandbox::call_handle_for_request(
+        &lua,
+        &handle,
+        (handle_input, handle_ctx),
+        state.script_limits.wall_clock(),
+    )
+    .await;
+    let result: mlua::Value = match called {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
@@ -589,7 +603,7 @@ pub async fn execute_query_script(
             {
                 let auth_msg = auth_message_after_prefix(&clean_msg);
                 AppError::Auth(auth_msg)
-            } else if msg.contains("execution limit") {
+            } else if sandbox::limit_tripped(&lua) {
                 AppError::ScriptError {
                     error_type: ScriptErrorType::Timeout,
                     message: "script exceeded execution time limit".to_string(),
@@ -688,7 +702,7 @@ pub async fn execute_query_script(
 mod tests {
     use super::*;
     use crate::lexicon::{LexiconType, ProcedureAction};
-    use crate::test_support::{memory_pool, test_state_with_pool};
+    use crate::test_support::{memory_pool, migrated_memory_pool, test_state_with_pool};
 
     fn query_lexicon() -> ParsedLexicon {
         ParsedLexicon {
@@ -937,5 +951,286 @@ mod tests {
             counters.script_runtime_us.load(Ordering::Relaxed) > 0,
             "20 script executions should accumulate measurable wall-clock time"
         );
+    }
+
+    #[tokio::test]
+    async fn a_query_runtime_error_carries_its_line_and_bare_message() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+
+        let err = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            "function handle()\n  local t = nil\n  return t.x\nend",
+            None,
+            None,
+        )
+        .await
+        .expect_err("indexing nil must raise");
+
+        match err {
+            AppError::ScriptError {
+                error_type: ScriptErrorType::Runtime,
+                message,
+                line,
+                ..
+            } => {
+                assert_eq!(line, Some(3));
+                assert_eq!(message, "attempt to index a nil value (local 't')");
+            }
+            other => panic!("expected a runtime script error, got {other:?}"),
+        }
+    }
+
+    fn assert_execution_limit(err: AppError) {
+        match err {
+            AppError::ScriptError {
+                error_type: ScriptErrorType::Timeout,
+                message,
+                ..
+            } => assert_eq!(message, "script exceeded execution time limit"),
+            other => panic!("expected the execution-limit error, got {other:?}"),
+        }
+    }
+
+    const PCALL_LOOP: &str =
+        "function handle() while true do pcall(function() while true do end end) end end";
+
+    #[tokio::test]
+    async fn a_query_cannot_swallow_the_limit_with_pcall() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+
+        let run = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            PCALL_LOOP,
+            None,
+            None,
+        );
+        let err = tokio::time::timeout(state.script_limits.wall_clock() * 2, run)
+            .await
+            .expect("the runner must end the run within its own limit")
+            .expect_err("the run must fail");
+        assert_execution_limit(err);
+    }
+
+    #[tokio::test]
+    async fn a_procedure_cannot_swallow_the_limit_with_pcall() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+        let claims = Claims::new_for_test("did:plc:test".to_string());
+        let input = serde_json::json!({});
+
+        let run = execute_procedure_script(
+            &state,
+            "com.example.probe",
+            &claims,
+            &input,
+            &params,
+            &lexicon,
+            PCALL_LOOP,
+            None,
+            None,
+        );
+        let err = tokio::time::timeout(state.script_limits.wall_clock() * 2, run)
+            .await
+            .expect("the runner must end the run within its own limit")
+            .expect_err("the run must fail");
+        assert_execution_limit(err);
+    }
+
+    /// Ten thousand iterations sit far under the default budget and far over
+    /// a thousand, so only the cached budget can decide this run.
+    const TEN_THOUSAND_ITERATIONS: &str =
+        "function handle() local n = 0; for i = 1, 10000 do n = n + 1 end; return { n = n } end";
+
+    async fn state_with_limits(instruction_limit: u32, wall_clock_seconds: u32) -> AppState {
+        let mut state = test_state_with_pool(migrated_memory_pool().await);
+        state.script_limits = Arc::new(crate::lua::limits::ScriptLimits::new(
+            instruction_limit,
+            wall_clock_seconds,
+        ));
+        state
+    }
+
+    #[tokio::test]
+    async fn a_query_runs_under_the_cached_instruction_limit() {
+        let state = state_with_limits(1_000, 10).await;
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+
+        let err = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            TEN_THOUSAND_ITERATIONS,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the lowered budget must end the run");
+        assert_execution_limit(err);
+
+        state.script_limits.set_instruction_limit(1_000_000);
+        execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            TEN_THOUSAND_ITERATIONS,
+            None,
+            None,
+        )
+        .await
+        .expect("the restored budget must let the run finish");
+    }
+
+    #[tokio::test]
+    async fn a_procedure_runs_under_the_cached_instruction_limit() {
+        let state = state_with_limits(1_000, 10).await;
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+        let claims = Claims::new_for_test("did:plc:test".to_string());
+        let input = serde_json::json!({});
+
+        let err = execute_procedure_script(
+            &state,
+            "com.example.probe",
+            &claims,
+            &input,
+            &params,
+            &lexicon,
+            TEN_THOUSAND_ITERATIONS,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the lowered budget must end the run");
+        assert_execution_limit(err);
+    }
+
+    /// A budget the hook never reaches, so the clock alone ends the run. The
+    /// clock can only fire at a yield, which each awaited host write provides.
+    const YIELDING_LOOP: &str = r#"
+        local log = require("internal.logging")
+        function handle()
+            while true do log.info("tick") end
+        end
+    "#;
+
+    #[tokio::test]
+    async fn a_query_is_ended_by_the_cached_wall_clock() {
+        let state = state_with_limits(u32::MAX, 1).await;
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+
+        let started = Instant::now();
+        let run = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            YIELDING_LOOP,
+            None,
+            None,
+        );
+        let err = tokio::time::timeout(std::time::Duration::from_secs(8), run)
+            .await
+            .expect("the one-second clock must end the run")
+            .expect_err("the run must fail");
+        assert_execution_limit(err);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the run outlived the one-second clock: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_procedure_is_ended_by_the_cached_wall_clock() {
+        let state = state_with_limits(u32::MAX, 1).await;
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+        let claims = Claims::new_for_test("did:plc:test".to_string());
+        let input = serde_json::json!({});
+
+        let started = Instant::now();
+        let run = execute_procedure_script(
+            &state,
+            "com.example.probe",
+            &claims,
+            &input,
+            &params,
+            &lexicon,
+            YIELDING_LOOP,
+            None,
+            None,
+        );
+        let err = tokio::time::timeout(std::time::Duration::from_secs(8), run)
+            .await
+            .expect("the one-second clock must end the run")
+            .expect_err("the run must fail");
+        assert_execution_limit(err);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the run outlived the one-second clock: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_script_error_that_mentions_the_limit_is_still_a_runtime_error() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+
+        let err = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            r#"function handle() error("execution limit hit") end"#,
+            None,
+            None,
+        )
+        .await
+        .expect_err("error() fails the run");
+        match err {
+            AppError::ScriptError {
+                error_type: ScriptErrorType::Runtime,
+                message,
+                ..
+            } => assert!(message.contains("execution limit hit"), "{message}"),
+            other => panic!("expected a runtime script error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_query_that_catches_the_limit_and_returns_still_fails() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+
+        let err = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            "function handle() pcall(function() while true do end end) return { ok = true } end",
+            None,
+            None,
+        )
+        .await
+        .expect_err("a spent budget fails the run even after a normal return");
+        assert_execution_limit(err);
     }
 }

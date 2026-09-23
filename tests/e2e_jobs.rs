@@ -483,6 +483,55 @@ async fn worker_runs_pending_job_to_completion() {
     assert_eq!(result["ok"], true);
 }
 
+/// A job's `handle` runs on a coroutine, and the instruction limit reaches a
+/// coroutine only through the sandbox's global hook; this pins that the
+/// worker lifts that hook, not just the main thread's.
+#[tokio::test]
+#[serial]
+async fn worker_runs_a_job_past_the_instruction_limit() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    seed_script(
+        &app,
+        "job.run:test.long",
+        "function handle() local n = 0; for i = 1, 3000000 do n = n + 1 end; return { n = n } end",
+    )
+    .await;
+    let id = seed_job(&app, "test.long", "pending").await;
+
+    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let (status, result, error) = await_terminal_status(&app, &id).await;
+    worker.abort();
+
+    assert_eq!(status, "completed", "job error: {error:?}");
+    let result: Value = serde_json::from_str(&result.expect("no result persisted")).unwrap();
+    assert_eq!(result["n"], 3_000_000);
+}
+
+#[tokio::test]
+#[serial]
+async fn worker_records_the_line_of_a_failing_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    seed_script(
+        &app,
+        "job.run:test.failing",
+        "function handle()\n  local t = nil\n  return t.x\nend",
+    )
+    .await;
+    let id = seed_job(&app, "test.failing", "pending").await;
+
+    let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
+    let (status, _result, error) = await_terminal_status(&app, &id).await;
+    worker.abort();
+
+    assert_eq!(status, "failed");
+    let error = error.expect("no error persisted");
+    assert!(error.contains("[string \"script\"]:3:"), "{error}");
+}
+
 // ---------------------------------------------------------------------------
 // Auth: unauthenticated requests
 // ---------------------------------------------------------------------------

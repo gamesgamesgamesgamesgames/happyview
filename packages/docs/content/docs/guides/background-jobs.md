@@ -195,7 +195,7 @@ Jobs survive server restarts. On startup, the worker checks for orphaned jobs:
 
 ## Worker
 
-The job worker runs as a background task inside the HappyView server process. It polls for pending jobs every 5 seconds and executes one job at a time. Job scripts have **no instruction count limit** (unlike XRPC and record scripts, which are capped at 1,000,000 instructions), so they can run arbitrarily long computations.
+The job worker runs as a background task inside the HappyView server process. It polls for pending jobs every 5 seconds and executes one job at a time. Job scripts have **no instruction count or wall-clock limit** (unlike XRPC, record and label scripts, which are capped by the instruction limit, and XRPC scripts by the wall clock, both set in Settings → General), so they can run arbitrarily long computations.
 
 ## Dashboard
 
