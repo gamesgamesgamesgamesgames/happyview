@@ -106,8 +106,13 @@ export type {
   InstanceOauthKeysResponse,
   RevokeInstanceKeyResult,
 } from "@/types/api-clients";
-export type { SettingEntry, InstanceSettings } from "@/types/settings";
-export { INSTANCE_SETTING_KEYS } from "@/types/settings";
+export type { SettingEntry, InstanceSettings, ScriptLimitSettings } from "@/types/settings";
+export {
+  INSTANCE_SETTING_KEYS,
+  SCRIPT_LIMIT_BOUNDS,
+  SCRIPT_LIMIT_DEFAULTS,
+  SCRIPT_LIMIT_SETTING_KEYS,
+} from "@/types/settings";
 export type {
   ExternalProvider,
   LinkedAccount,

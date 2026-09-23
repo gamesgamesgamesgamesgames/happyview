@@ -105,6 +105,7 @@ pub struct AppState {
     pub verbose_event_logging: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
+    pub script_limits: Arc<lua::limits::ScriptLimits>,
 }
 
 impl AppState {

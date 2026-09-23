@@ -183,6 +183,163 @@ async fn settings_crud() {
 
 #[tokio::test]
 #[serial]
+async fn a_script_budget_must_be_an_integer_inside_its_range() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let cases = [
+        (
+            "script_instruction_limit",
+            "1000",
+            "1000000000",
+            &["999", "1000000001", "4294967295"][..],
+        ),
+        (
+            "script_wall_clock_seconds",
+            "1",
+            "300",
+            &["0", "301", "600000"][..],
+        ),
+    ];
+    for (key, min, max, outside) in cases {
+        for bad in ["-1", "abc", "1.5", "", "1e6"].iter().chain(outside) {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": bad }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{key}={bad:?}");
+            let body = json_body(resp).await;
+            assert_eq!(
+                body["error"],
+                format!("{key} must be an integer from {min} to {max}")
+            );
+        }
+
+        for edge in [min, max] {
+            let resp = app
+                .router
+                .clone()
+                .oneshot(admin_put(
+                    &format!("/admin/settings/{key}"),
+                    app.admin_cookie(),
+                    &json!({ "value": edge }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT, "{key}={edge}");
+        }
+    }
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings", app.admin_cookie()))
+        .await
+        .unwrap();
+    let entries = json_body(resp).await;
+    for (key, _, max, _) in cases {
+        let entry = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["key"] == key)
+            .unwrap_or_else(|| panic!("{key} missing from {entries}"));
+        assert_eq!(entry["value"], max);
+        assert_eq!(entry["source"], "database");
+    }
+}
+
+/// The runner reads the budget from the in-process cache, so a change made
+/// through the settings API has to reach the cache without a restart.
+#[tokio::test]
+#[serial]
+async fn a_script_budget_change_reaches_the_next_run_without_restart() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/lexicons",
+            app.admin_cookie(),
+            &json!({
+                "lexicon_json": common::fixtures::list_games_query_lexicon(),
+                "target_collection": "games.gamesgamesgamesgames.game"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+
+    let now = happyview::db::now_rfc3339();
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) VALUES (?, ?, 'lua', ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind("xrpc.query:games.gamesgamesgamesgames.listGames")
+        .bind("function handle() local n = 0; for i = 1, 10000 do n = n + 1 end; return { n = n } end")
+        .bind(&now)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    let run = || {
+        app.router.clone().oneshot(
+            Request::builder()
+                .uri("/xrpc/games.gamesgamesgamesgames.listGames")
+                .header("x-client-key", "hvc_test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+
+    let resp = run().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["n"], 10_000);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_put(
+            "/admin/settings/script_instruction_limit",
+            app.admin_cookie(),
+            &json!({ "value": "1000" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = run().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(json_body(resp).await["errorType"], "timeout");
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            "/admin/settings/script_instruction_limit",
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = run().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["n"], 10_000);
+}
+
+#[tokio::test]
+#[serial]
 async fn settings_requires_auth() {
     common::require_db!();
     let app = TestApp::new().await;

@@ -1,6 +1,7 @@
 pub(crate) mod builtins;
 pub(crate) mod context;
 mod execute;
+pub mod limits;
 pub(crate) mod require_api;
 pub(crate) mod sandbox;
 pub mod scripts;

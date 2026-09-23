@@ -9,6 +9,7 @@ use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
+use crate::lua::limits as script_limits;
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -32,11 +33,33 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ("logo_uri", "LOGO_URI"),
     ("tos_uri", "TOS_URI"),
     ("policy_uri", "POLICY_URI"),
+    ("script_instruction_limit", "SCRIPT_INSTRUCTION_LIMIT"),
+    ("script_wall_clock_seconds", "SCRIPT_WALL_CLOCK_SECONDS"),
     ("verbose_event_logging", "VERBOSE_EVENT_LOGGING"),
 ];
 
+/// The environment variable a setting falls back to, if it has one.
+pub fn env_var_for(key: &str) -> Option<&'static str> {
+    ENV_FALLBACKS
+        .iter()
+        .find(|(setting_key, _)| *setting_key == key)
+        .map(|(_, env_var)| *env_var)
+}
+
 /// Resolve a setting value: check the DB first, then fall back to env var.
+/// A database that cannot be read counts as holding no row.
 pub async fn get_setting(pool: &AnyPool, key: &str, backend: DatabaseBackend) -> Option<String> {
+    try_get_setting(pool, key, backend).await.ok().flatten()
+}
+
+/// [`get_setting`] for a caller that must tell a missing row from a database
+/// it could not ask: the script budgets keep their cached values on the
+/// second, where the first means the env var or the default.
+pub async fn try_get_setting(
+    pool: &AnyPool,
+    key: &str,
+    backend: DatabaseBackend,
+) -> Result<Option<String>, sqlx::Error> {
     let sql = adapt_sql(
         "SELECT value FROM happyview_instance_settings WHERE key = ?",
         backend,
@@ -44,22 +67,25 @@ pub async fn get_setting(pool: &AnyPool, key: &str, backend: DatabaseBackend) ->
     let row: Option<(String,)> = crate::db::query_as(&sql)
         .bind(key)
         .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+        .await?;
 
     if let Some((value,)) = row {
-        return Some(value);
+        return Ok(Some(value));
     }
 
-    // Fall back to env var if one is mapped for this key.
-    for (setting_key, env_var) in ENV_FALLBACKS {
-        if *setting_key == key {
-            return env::var(env_var).ok();
-        }
-    }
+    Ok(env_var_for(key).and_then(|env_var| env::var(env_var).ok()))
+}
 
-    None
+/// The script budgets are read from a cache rather than the database on
+/// every run, so a write to one of them is folded in here instead of waiting
+/// for the next poll.
+async fn refresh_script_limits(state: &AppState, key: &str) {
+    if script_limits::is_limit_key(key) {
+        state
+            .script_limits
+            .refresh(&state.db, state.db_backend)
+            .await;
+    }
 }
 
 /// GET /admin/settings — list all settings with their source.
@@ -114,6 +140,7 @@ pub(super) async fn upsert(
     Json(body): Json<UpsertSettingBody>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::SettingsManage).await?;
+    script_limits::validate(&key, &body.value).map_err(AppError::BadRequest)?;
 
     let backend = state.db_backend;
     let now = now_rfc3339();
@@ -134,6 +161,7 @@ pub(super) async fn upsert(
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to upsert setting: {e}")))?;
+    refresh_script_limits(&state, &key).await;
 
     log_event(
         &state.db,
@@ -173,6 +201,7 @@ pub(super) async fn delete(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!("setting '{key}' not found")));
     }
+    refresh_script_limits(&state, &key).await;
 
     log_event(
         &state.db,

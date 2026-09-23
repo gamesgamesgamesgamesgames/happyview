@@ -14,6 +14,9 @@ import {
   deleteLogo,
   countEvents,
   purgeEvents,
+  SCRIPT_LIMIT_BOUNDS,
+  SCRIPT_LIMIT_DEFAULTS,
+  type ScriptLimitSettings,
   type SettingEntry,
   type DbInfo,
   type EventPurgeFilter,
@@ -35,6 +38,8 @@ const SETTING_KEYS = [
   "logo_uri",
   "tos_uri",
   "policy_uri",
+  "script_instruction_limit",
+  "script_wall_clock_seconds",
   "verbose_event_logging",
 ] as const;
 
@@ -83,6 +88,53 @@ const FIELDS: FieldConfig[] = [
   },
 ];
 
+const SCRIPT_LIMIT_FIELDS: {
+  key: keyof ScriptLimitSettings;
+  label: string;
+  description: string;
+}[] = [
+  {
+    key: "script_instruction_limit",
+    label: "Instruction limit",
+    description:
+      "Lua instructions a script may execute per run before it fails with a timeout; jobs are exempt.",
+  },
+  {
+    key: "script_wall_clock_seconds",
+    label: "Request wall clock (seconds)",
+    description:
+      "How long a query or procedure's handle may run by the clock, including time spent awaiting the host; jobs are exempt.",
+  },
+];
+
+// Every key the Save button writes, in the order it writes them. An empty
+// value clears the stored setting so the env var or the default applies.
+const SAVED_KEYS: readonly FieldKey[] = [
+  ...FIELDS.map((field) => field.key),
+  "backfill_concurrent_dids_per_pds",
+  "backfill_concurrent_pds",
+  "backfill_concurrent_resolution",
+  "backfill_retention_days",
+  "event_log_retention_days",
+  "script_instruction_limit",
+  "script_wall_clock_seconds",
+  "verbose_event_logging",
+];
+
+// A number input hands over "1e6", "1.5" and "-1" as typed, and the
+// min/max attributes only bite on a form submit this page never makes, so
+// the range is checked here, against the same bounds the server enforces.
+function scriptLimitError(
+  key: keyof ScriptLimitSettings,
+  value: string,
+): string | null {
+  if (value === "") return null;
+  const { min, max } = SCRIPT_LIMIT_BOUNDS[key];
+  const n = /^\d+$/.test(value.trim()) ? Number(value) : NaN;
+  if (n >= min && n <= max) return null;
+  return `Enter a whole number from ${min.toLocaleString()} to ${max.toLocaleString()}.`;
+}
+
 export default function GeneralSettingsPage() {
   const { hasPermission } = useCurrentUser();
   const canManage = hasPermission("settings:manage");
@@ -100,6 +152,8 @@ export default function GeneralSettingsPage() {
     logo_uri: "",
     tos_uri: "",
     policy_uri: "",
+    script_instruction_limit: "",
+    script_wall_clock_seconds: "",
     verbose_event_logging: "",
   });
   const [sources, setSources] = useState<
@@ -115,6 +169,8 @@ export default function GeneralSettingsPage() {
     logo_uri: "unset",
     tos_uri: "unset",
     policy_uri: "unset",
+    script_instruction_limit: "unset",
+    script_wall_clock_seconds: "unset",
     verbose_event_logging: "unset",
   });
   const [logoUploaded, setLogoUploaded] = useState(false);
@@ -156,6 +212,8 @@ export default function GeneralSettingsPage() {
         logo_uri: val("logo_uri", ""),
         tos_uri: val("tos_uri", ""),
         policy_uri: val("policy_uri", ""),
+        script_instruction_limit: val("script_instruction_limit", ""),
+        script_wall_clock_seconds: val("script_wall_clock_seconds", ""),
         verbose_event_logging: val("verbose_event_logging", ""),
       });
       setSources({
@@ -171,6 +229,8 @@ export default function GeneralSettingsPage() {
         logo_uri: src("logo_uri"),
         tos_uri: src("tos_uri"),
         policy_uri: src("policy_uri"),
+        script_instruction_limit: src("script_instruction_limit"),
+        script_wall_clock_seconds: src("script_wall_clock_seconds"),
         verbose_event_logging: src("verbose_event_logging"),
       });
       setLogoUploaded(byKey.has("logo_data"));
@@ -188,43 +248,52 @@ export default function GeneralSettingsPage() {
     load();
   }, [load]);
 
+  const fieldErrors = useMemo(() => {
+    const errors: Partial<Record<keyof ScriptLimitSettings, string>> = {};
+    for (const { key } of SCRIPT_LIMIT_FIELDS) {
+      const message = scriptLimitError(key, values[key]);
+      if (message) errors[key] = message;
+    }
+    return errors;
+  }, [values]);
+  const hasFieldErrors = Object.keys(fieldErrors).length > 0;
+
+  // Each key is its own request, so one rejection must not abandon the rest:
+  // the operator would read the banner as "nothing saved" while half the
+  // form had been. Every key is sent, the failures are named together, and
+  // their typed values survive the reload so they can be corrected and
+  // resent.
   async function handleSave() {
     setError(null);
     setNotice(null);
     setSaving(true);
-    try {
-      for (const field of FIELDS) {
-        const value = values[field.key];
+    const failed: { key: FieldKey; value: string; message: string }[] = [];
+    for (const key of SAVED_KEYS) {
+      const value = values[key];
+      try {
         if (value === "") {
-          if (sources[field.key] === "database") {
-            await deleteSetting(field.key);
-          }
-        } else {
-          await upsertSetting(field.key, value);
-        }
-      }
-      const extraKeys = [
-        "backfill_concurrent_dids_per_pds",
-        "backfill_concurrent_pds",
-        "backfill_concurrent_resolution",
-        "backfill_retention_days",
-        "event_log_retention_days",
-        "verbose_event_logging",
-      ] as const;
-      for (const key of extraKeys) {
-        const value = values[key];
-        if (value === "") {
-          if (sources[key] === "database") {
-            await deleteSetting(key);
-          }
+          if (sources[key] === "database") await deleteSetting(key);
         } else {
           await upsertSetting(key, value);
         }
+      } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : String(e);
+        failed.push({ key, value, message });
       }
-      setNotice("Settings saved.");
+    }
+    try {
       await load();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (failed.length === 0) {
+        setNotice("Settings saved.");
+      } else {
+        setValues((v) => ({
+          ...v,
+          ...Object.fromEntries(failed.map((f) => [f.key, f.value])),
+        }));
+        setError(
+          `Could not save ${failed.map((f) => `${f.key} (${f.message})`).join(", ")}. Every other setting was saved.`,
+        );
+      }
     } finally {
       setSaving(false);
     }
@@ -511,6 +580,55 @@ export default function GeneralSettingsPage() {
         ))}
 
         <div>
+          <h2 className="text-lg font-semibold">Scripts</h2>
+          <p className="text-muted-foreground text-sm">
+            Budgets for query, procedure, record and label scripts. Changes
+            apply to the next run. Jobs are exempt from both.
+          </p>
+        </div>
+
+        {SCRIPT_LIMIT_FIELDS.map((field) => (
+          <div key={field.key} className="flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <Label htmlFor={field.key}>{field.label}</Label>
+              {sources[field.key] === "env" && (
+                <span className="text-xs text-muted-foreground">
+                  from env var
+                </span>
+              )}
+              {sources[field.key] === "unset" && (
+                <span className="text-xs text-muted-foreground">
+                  default {SCRIPT_LIMIT_DEFAULTS[field.key]}
+                </span>
+              )}
+            </div>
+            <Input
+              id={field.key}
+              type="number"
+              min={SCRIPT_LIMIT_BOUNDS[field.key].min}
+              max={SCRIPT_LIMIT_BOUNDS[field.key].max}
+              step={1}
+              value={values[field.key]}
+              onChange={(e) =>
+                setValues((v) => ({ ...v, [field.key]: e.target.value }))
+              }
+              placeholder={SCRIPT_LIMIT_DEFAULTS[field.key]}
+              disabled={!canManage}
+              aria-invalid={fieldErrors[field.key] ? true : undefined}
+              aria-describedby={
+                fieldErrors[field.key] ? `${field.key}-error` : undefined
+              }
+            />
+            {fieldErrors[field.key] && (
+              <p id={`${field.key}-error`} className="text-destructive text-xs">
+                {fieldErrors[field.key]}
+              </p>
+            )}
+            <p className="text-muted-foreground text-xs">{field.description}</p>
+          </div>
+        ))}
+
+        <div>
           <h2 className="text-lg font-semibold">Event Logs</h2>
           <p className="text-muted-foreground text-sm">
             Configure event log verbosity and retention.
@@ -584,7 +702,9 @@ export default function GeneralSettingsPage() {
         <div className="flex justify-end pt-2">
           <Button
             onClick={handleSave}
-            disabled={!canManage || saving || !!connectionWarning}
+            disabled={
+              !canManage || saving || !!connectionWarning || hasFieldErrors
+            }
           >
             {saving ? "Saving..." : "Save changes"}
           </Button>

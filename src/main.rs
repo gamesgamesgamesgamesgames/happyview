@@ -898,6 +898,9 @@ async fn main() {
 
     let telemetry_counters = std::sync::Arc::new(happyview::telemetry::counters::Counters::new());
 
+    let script_limits =
+        std::sync::Arc::new(happyview::lua::limits::ScriptLimits::load(&db_pool, db_backend).await);
+
     let state = AppState {
         config: config.clone(),
         http,
@@ -924,7 +927,14 @@ async fn main() {
         verbose_event_logging,
         client_jwks,
         telemetry_counters,
+        script_limits,
     };
+
+    tokio::spawn(happyview::lua::limits::run_refresh_loop(
+        state.script_limits.clone(),
+        state.db.clone(),
+        state.db_backend,
+    ));
 
     jetstream::spawn(state.clone(), collections_rx);
 

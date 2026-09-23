@@ -212,6 +212,7 @@ impl TestApp {
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
+            script_limits: std::sync::Arc::new(happyview::lua::limits::ScriptLimits::default()),
         };
 
         if let Some(key) = state.config.token_encryption_key.as_ref() {

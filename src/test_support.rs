@@ -204,5 +204,6 @@ pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
         verbose_event_logging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         client_jwks: Vec::new(),
         telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
+        script_limits: Arc::new(crate::lua::limits::ScriptLimits::default()),
     }
 }
