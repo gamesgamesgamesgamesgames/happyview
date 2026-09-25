@@ -12,7 +12,7 @@ Building an AppView from scratch means wiring up real-time event streams, record
 
 - **Network sync built in:** Real-time record streaming via [Jetstream](https://github.com/bluesky-social/jetstream), historical [backfill](guides/backfill.md) from each user's PDS, and atproto OAuth with DPoP-bound proxy writes back to the PDS.
 
-- **Customize with Lua scripts and plugins:** Trigger-keyed [Lua scripts](guides/lua-scripting.md) for XRPC query/procedure logic and [record/label event handling](guides/label-scripts), WASM [plugins](guides/plugins.md) for external platform integration, and [labeler](guides/labelers.md) subscriptions for content moderation.
+- **Customize with Lua scripts and plugins:** Trigger-keyed [Lua scripts](guides/lua-scripting.md) for XRPC query/procedure logic and [record/label event handling](guides/record-scripts), WASM [plugins](guides/plugins.md) for external platform integration, and [labeler](guides/labelers.md) subscriptions for content moderation.
 
 - **Protocol-native:** Works with any PDS, resolves DIDs through the directory, and fetches [network lexicons](guides/lexicons.md#network-lexicons) via DNS authority resolution.
 
@@ -35,7 +35,7 @@ Building an AppView from scratch means wiring up real-time event streams, record
 - [Quickstart](getting-started/deployment/railway.md): Deploy HappyView on Railway or run it locally
 - [Lexicons](guides/lexicons.md): Upload lexicon schemas and start indexing records
 - [Lua Scripting](guides/lua-scripting.md): Write custom query and procedure logic
-- [Record & Label Scripts](guides/label-scripts): React to record changes and label events in real time
+- [Record & Label Scripts](guides/record-scripts): React to record changes and label events in real time
 - [Labelers](guides/labelers.md): Subscribe to external labelers and manage content labels
 - [Plugins](guides/plugins.md): Integrate with external platforms using WASM plugins
 - [Permissioned Spaces](experimental/spaces/index.md): Create membership-gated data containers with the atproto spaces API

@@ -33,7 +33,7 @@ Scripts are managed through the dashboard under **Settings > Scripts**, or via t
 
 **If you're upgrading from v2.x to v2.9:** existing index hooks and lexicon scripts will be migrated to the new system automatically.
 
-Full docs: [Record & Label Scripts](/guides/label-scripts), [Lua Scripting](/guides/lua-scripting), [Admin API — Scripts](/api-reference/admin/scripts).
+Full docs: [Record & Label Scripts](/guides/record-scripts), [Lua Scripting](/guides/lua-scripting), [Admin API — Scripts](/api-reference/admin/scripts).
 
 ## Backfill, but concurrent
 
