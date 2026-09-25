@@ -28,6 +28,122 @@ pub struct LoginQuery {
     client_id: Option<String>,
 }
 
+/// Enqueue a migration for every repo this account still keeps on HappyView.
+///
+/// Granting `space:` scope on the OAuth consent screen authorizes HappyView to
+/// write the user's permissioned repos, which is what migration does, so there
+/// is no separate in-app prompt.
+///
+/// Failures are logged and never fail the login. A session without `space:`
+/// scope, such as one from before those scopes existed, cannot migrate until the
+/// user re-authorizes. That is not an error, so it is not shown to the user.
+async fn enqueue_space_migrations(state: &AppState, did: &str) {
+    if !crate::feature_flags::is_enabled(
+        &state.db,
+        crate::feature_flags::FeatureFlag::SPACES_PDS_MIGRATION,
+        state.db_backend,
+    )
+    .await
+    {
+        return;
+    }
+
+    let scope = match crate::jobs::native::migrate_space_repo::granted_scope(state, did).await {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(did, error = %e, "could not read granted scope; skipping migration");
+            return;
+        }
+    };
+    if !scope.split_whitespace().any(|s| s.starts_with("space:")) {
+        return;
+    }
+
+    let repos =
+        match crate::spaces::db::list_polyfill_repos_for_author(&state.db, state.db_backend, did)
+            .await
+        {
+            Ok(repos) => repos,
+            Err(e) => {
+                tracing::warn!(did, error = %e, "could not list polyfill repos");
+                return;
+            }
+        };
+
+    for (space_id, author_did) in repos {
+        let input = serde_json::json!({ "space_id": space_id, "author_did": author_did });
+        match crate::jobs::db::create_job(
+            state,
+            crate::jobs::native::migrate_space_repo::JOB_TYPE,
+            &input,
+            did,
+            false,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(job_id) => tracing::info!(did, space_id, job_id, "enqueued space repo migration"),
+            Err(e) => tracing::warn!(did, space_id, error = %e, "failed to enqueue migration"),
+        }
+    }
+}
+
+/// Remove `space:` scopes when the user's PDS cannot serve spaces.
+///
+/// A handle that does not resolve, a DID document we cannot read, or a probe
+/// that times out all drop the scopes and continue. Detection problems never
+/// fail a login: the user gets a session without spaces instead of no session.
+async fn drop_space_scopes_if_unsupported(
+    state: &AppState,
+    handle: &str,
+    scopes: Vec<Scope>,
+) -> Vec<Scope> {
+    let asks_for_spaces = scopes.iter().any(is_space_scope);
+    if !asks_for_spaces {
+        return scopes;
+    }
+
+    let supported = space_support_for_handle(state, handle).await;
+    if supported {
+        return scopes;
+    }
+
+    tracing::info!(
+        handle,
+        "PDS does not serve spaces; dropping space: scopes from the authorization request"
+    );
+    scopes.into_iter().filter(|s| !is_space_scope(s)).collect()
+}
+
+fn is_space_scope(scope: &Scope) -> bool {
+    match scope {
+        Scope::Unknown(value) => value == "space" || value.starts_with("space:"),
+        _ => false,
+    }
+}
+
+/// Whether the account's PDS serves spaces. `false` on any resolution failure.
+async fn space_support_for_handle(state: &AppState, handle: &str) -> bool {
+    let Ok(resolved) = crate::identity::resolve_identifier(handle).await else {
+        return false;
+    };
+    let Ok(endpoint) = crate::spaces::auth::resolve_did_service_endpoint(
+        &state.http,
+        &state.config.plc_url,
+        &resolved.did,
+    )
+    .await
+    else {
+        return false;
+    };
+    crate::spaces::pds_support::get_support(state, &endpoint, false)
+        .await
+        .map(|s| s.supported)
+        .unwrap_or(false)
+}
+
 /// Parse a whitespace-separated OAuth scope string into typed `Scope` values.
 /// Known ATProto scope names are mapped to `Scope::Known`; anything else
 /// (e.g. `include:*` permission set references) becomes `Scope::Unknown`.
@@ -87,6 +203,11 @@ async fn login(
     } else {
         vec![Scope::Known(KnownScope::Atproto)]
     };
+
+    // A PDS that does not implement spaces rejects an authorization request
+    // carrying `space:` scopes, which fails the whole login. So unsupported
+    // scopes are removed before the request is built.
+    let scopes = drop_space_scopes_if_unsupported(&state, &query.handle, scopes).await;
 
     tracing::debug!(scopes = ?scopes, client_id = ?query.client_id, "resolved oauth scopes");
 
@@ -265,6 +386,8 @@ async fn callback(
             "failed to re-pin OAuth session signing_kid after re-authorization"
         );
     }
+
+    enqueue_space_migrations(&state, did.as_ref()).await;
 
     // Check if the user is authorized to access the dashboard.
     // Allow login when no users exist yet (first user will be bootstrapped as admin).
@@ -567,5 +690,246 @@ mod tests {
 
         let empty = parse_scope_string("   \n  \t  ");
         assert!(empty.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod space_scope_gate_tests {
+    use super::*;
+
+    fn scopes(values: &[&str]) -> Vec<Scope> {
+        values
+            .iter()
+            .map(|v| {
+                if *v == "atproto" {
+                    Scope::Known(KnownScope::Atproto)
+                } else {
+                    Scope::Unknown((*v).to_string())
+                }
+            })
+            .collect()
+    }
+
+    fn names(scopes: &[Scope]) -> Vec<String> {
+        scopes
+            .iter()
+            .map(|s| match s {
+                Scope::Known(KnownScope::Atproto) => "atproto".to_string(),
+                Scope::Unknown(v) => v.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn recognises_space_scopes() {
+        assert!(is_space_scope(&Scope::Unknown(
+            "space:com.example.forum".into()
+        )));
+        assert!(is_space_scope(&Scope::Unknown(
+            "space:com.example.forum?action=read".into()
+        )));
+        // `spaces:` is HappyView's internal admin permission prefix, not an
+        // OAuth scope.
+        assert!(!is_space_scope(&Scope::Unknown("spaces:manage".into())));
+        assert!(!is_space_scope(&Scope::Unknown(
+            "repo:com.example.post".into()
+        )));
+        assert!(!is_space_scope(&Scope::Known(KnownScope::Atproto)));
+    }
+
+    #[tokio::test]
+    async fn a_request_without_space_scopes_is_left_alone() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let input = scopes(&["atproto", "repo:com.example.post"]);
+        let out = drop_space_scopes_if_unsupported(&state, "alice.example", input.clone()).await;
+        assert_eq!(names(&out), names(&input));
+    }
+
+    #[tokio::test]
+    async fn space_scopes_are_dropped_when_detection_fails() {
+        // An unresolvable handle drops the space scopes rather than failing the
+        // login.
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let input = scopes(&[
+            "atproto",
+            "space:com.example.forum",
+            "repo:com.example.post",
+        ]);
+        let out = drop_space_scopes_if_unsupported(&state, "not a handle", input).await;
+
+        assert_eq!(names(&out), vec!["atproto", "repo:com.example.post"]);
+    }
+
+    async fn migration_state() -> AppState {
+        crate::test_support::test_state_with_pool(crate::test_support::migrated_memory_pool().await)
+    }
+
+    async fn seed_session(state: &AppState, did: &str, scope: Option<&str>) {
+        let token_set = match scope {
+            Some(s) => serde_json::json!({ "scope": s }),
+            None => serde_json::json!({ "scope": serde_json::Value::Null }),
+        };
+        let data = serde_json::json!({ "token_set": token_set }).to_string();
+        let sql = crate::db::adapt_sql(
+            "INSERT INTO happyview_oauth_sessions (did, session_data) VALUES (?, ?)",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(did)
+            .bind(&data)
+            .execute(&state.db)
+            .await
+            .expect("seed session");
+    }
+
+    async fn seed_polyfill_repo(state: &AppState, space_id: &str, did: &str) {
+        // repo_state has an FK to happyview_spaces.
+        let sql = crate::db::adapt_sql(
+            "INSERT INTO happyview_spaces (id, did, authority_did, creator_did, type_nsid, skey, read_policy, write_policy, app_access, config, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 'com.example.forum', ?, '{}', '{}', '{}', '{}', ?, ?)",
+            state.db_backend,
+        );
+        let now = crate::db::now_rfc3339();
+        crate::db::query(&sql)
+            .bind(space_id)
+            .bind(did)
+            .bind(did)
+            .bind(did)
+            .bind(space_id)
+            .bind(&now)
+            .bind(&now)
+            .execute(&state.db)
+            .await
+            .expect("seed space");
+
+        let sql = crate::db::adapt_sql(
+            "INSERT INTO happyview_space_repo_state (id, space_id, author_did, lthash_state, host_mode, updated_at) VALUES (?, ?, ?, ?, 'polyfill', ?)",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(space_id)
+            .bind(did)
+            .bind(vec![0u8; 2048])
+            .bind(crate::db::now_rfc3339())
+            .execute(&state.db)
+            .await
+            .expect("seed repo");
+    }
+
+    async fn enable_migration(state: &AppState) {
+        let sql = crate::db::adapt_sql(
+            "INSERT INTO happyview_instance_settings (key, value) VALUES (?, 'true')",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(crate::feature_flags::FeatureFlag::SPACES_PDS_MIGRATION)
+            .execute(&state.db)
+            .await
+            .expect("enable flag");
+    }
+
+    async fn pending_jobs(state: &AppState) -> i64 {
+        let sql = crate::db::adapt_sql(
+            "SELECT COUNT(*) FROM happyview_jobs WHERE job_type = ?",
+            state.db_backend,
+        );
+        let (count,): (i64,) = crate::db::query_as(&sql)
+            .bind(crate::jobs::native::migrate_space_repo::JOB_TYPE)
+            .fetch_one(&state.db)
+            .await
+            .expect("count jobs");
+        count
+    }
+
+    const MIGRATING_USER: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[tokio::test]
+    async fn a_granted_space_scope_enqueues_one_job_per_polyfill_repo() {
+        let state = migration_state().await;
+        enable_migration(&state).await;
+        seed_session(
+            &state,
+            MIGRATING_USER,
+            Some("atproto space:com.example.forum"),
+        )
+        .await;
+        seed_polyfill_repo(&state, "space-a", MIGRATING_USER).await;
+        seed_polyfill_repo(&state, "space-b", MIGRATING_USER).await;
+
+        enqueue_space_migrations(&state, MIGRATING_USER).await;
+        assert_eq!(pending_jobs(&state).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_session_without_space_scope_enqueues_nothing() {
+        let state = migration_state().await;
+        enable_migration(&state).await;
+        seed_session(
+            &state,
+            MIGRATING_USER,
+            Some("atproto repo:com.example.post"),
+        )
+        .await;
+        seed_polyfill_repo(&state, "space-a", MIGRATING_USER).await;
+
+        enqueue_space_migrations(&state, MIGRATING_USER).await;
+        assert_eq!(pending_jobs(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_enqueued_when_the_migration_flag_is_off() {
+        let state = migration_state().await;
+        seed_session(&state, MIGRATING_USER, Some("space:com.example.forum")).await;
+        seed_polyfill_repo(&state, "space-a", MIGRATING_USER).await;
+
+        enqueue_space_migrations(&state, MIGRATING_USER).await;
+        assert_eq!(pending_jobs(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn native_repos_are_not_re_enqueued() {
+        let state = migration_state().await;
+        enable_migration(&state).await;
+        seed_session(&state, MIGRATING_USER, Some("space:com.example.forum")).await;
+        seed_polyfill_repo(&state, "space-a", MIGRATING_USER).await;
+
+        let sql = crate::db::adapt_sql(
+            "UPDATE happyview_space_repo_state SET host_mode = 'native' WHERE space_id = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind("space-a")
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        enqueue_space_migrations(&state, MIGRATING_USER).await;
+        assert_eq!(pending_jobs(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_missing_session_is_not_an_error() {
+        let state = migration_state().await;
+        enable_migration(&state).await;
+        seed_polyfill_repo(&state, "space-a", MIGRATING_USER).await;
+
+        enqueue_space_migrations(&state, MIGRATING_USER).await;
+        assert_eq!(pending_jobs(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_space_scopes_never_empties_the_request() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let out =
+            drop_space_scopes_if_unsupported(&state, "not a handle", scopes(&["atproto"])).await;
+        assert_eq!(names(&out), vec!["atproto"]);
     }
 }

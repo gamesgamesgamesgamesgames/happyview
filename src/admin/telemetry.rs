@@ -73,6 +73,7 @@ pub(super) async fn get(
         "lexicon_documents": c.lexicon_documents,
         "instance_id": c.instance_id,
         "collector_url": state.config.telemetry_collector_url,
+        "prompted": c.prompted,
     })))
 }
 
@@ -108,6 +109,31 @@ pub(super) async fn update(
     }
 
     consent::ensure_instance_id(&state.db, state.db_backend).await;
+
+    // Saving anything here is an answer to the telemetry question, including
+    // saving "off". Without this, an operator who turned telemetry off from
+    // this page would still be prompted to turn it on.
+    if let Err(e) = consent::mark_prompted(&state.db, state.db_backend).await {
+        tracing::warn!(error = %e, "telemetry prompt marker write failed");
+    }
+
+    get(State(state), auth).await
+}
+
+/// `POST /admin/settings/telemetry/dismiss`
+///
+/// Records that the telemetry question has been answered without changing the
+/// answer. This is the declining path — the setup wizard's "off" choice, and
+/// the dashboard prompt's dismiss — neither of which writes a mode.
+pub(super) async fn dismiss(
+    State(state): State<AppState>,
+    auth: UserAuth,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::SettingsManage).await?;
+
+    consent::mark_prompted(&state.db, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to save telemetry setting: {e}")))?;
 
     get(State(state), auth).await
 }

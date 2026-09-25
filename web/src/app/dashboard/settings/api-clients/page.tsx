@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   AlertTriangle,
   Copy,
+  CopyPlus,
   Check,
   KeyRound,
   RefreshCw,
@@ -155,6 +156,56 @@ function MultiInput({
   );
 }
 
+function parseRedirectUris(uris: string[]): string[] {
+  return uris.length > 0 ? [...uris, ""] : [""];
+}
+
+// Parse existing scopes: separate "atproto" from user-added ones
+function parseScopes(scopeStr: string): string[] {
+  const parts = scopeStr.split(/\s+/).filter((s) => s && s !== "atproto");
+  return parts.length > 0 ? [...parts, ""] : [""];
+}
+
+function parseAllowedOrigins(origins: string[] | null): string[] {
+  if (!origins || origins.length === 0) return [""];
+  return [...origins, ""];
+}
+
+/**
+ * The values a Create sheet opens with. Given a `source` it describes a
+ * duplicate of that client: every field mirrors it except the Client ID URL,
+ * which is unique per client and so has to be supplied fresh.
+ */
+function initialClientForm(
+  source: ApiClientSummary | undefined,
+  config: {
+    default_rate_limit_capacity: number;
+    default_rate_limit_refill_rate: number;
+  },
+) {
+  return {
+    clientType: (source?.client_type === "public"
+      ? "public"
+      : "confidential") as "confidential" | "public",
+    name: source ? `${source.name} (copy)` : "",
+    clientIdUrl: "",
+    clientUri: source?.client_uri ?? "",
+    redirectUris: parseRedirectUris(source?.redirect_uris ?? []),
+    allowedOrigins: parseAllowedOrigins(source?.allowed_origins ?? null),
+    scopes: parseScopes(source?.scopes ?? ""),
+    rateLimitEnabled: source
+      ? source.rate_limit_capacity != null &&
+        source.rate_limit_refill_rate != null
+      : true,
+    rateLimitCapacity: String(
+      source?.rate_limit_capacity ?? config.default_rate_limit_capacity,
+    ),
+    rateLimitRefillRate: String(
+      source?.rate_limit_refill_rate ?? config.default_rate_limit_refill_rate,
+    ),
+  };
+}
+
 export default function ApiClientsPage() {
   const { hasPermission } = useCurrentUser();
   const [clients, setClients] = useState<ApiClientSummary[]>([]);
@@ -269,6 +320,12 @@ export default function ApiClientsPage() {
                       {hasPermission("api-clients:edit") && (
                         <EditApiClientDialog client={client} onSuccess={load} />
                       )}
+                      {hasPermission("api-clients:create") && (
+                        <CreateApiClientDialog
+                          source={client}
+                          onSuccess={load}
+                        />
+                      )}
                       {hasPermission("api-clients:delete") && (
                         <DeleteApiClientDialog
                           client={client}
@@ -287,24 +344,31 @@ export default function ApiClientsPage() {
   );
 }
 
-function CreateApiClientDialog({ onSuccess }: { onSuccess: () => void }) {
+function CreateApiClientDialog({
+  onSuccess,
+  source,
+}: {
+  onSuccess: () => void;
+  source?: ApiClientSummary;
+}) {
   const config = useConfig();
+  const initial = initialClientForm(source, config);
 
-  const [clientType, setClientType] = useState<"confidential" | "public">(
-    "confidential",
+  const [clientType, setClientType] = useState(initial.clientType);
+  const [name, setName] = useState(initial.name);
+  const [clientIdUrl, setClientIdUrl] = useState(initial.clientIdUrl);
+  const [clientUri, setClientUri] = useState(initial.clientUri);
+  const [redirectUris, setRedirectUris] = useState(initial.redirectUris);
+  const [allowedOrigins, setAllowedOrigins] = useState(initial.allowedOrigins);
+  const [scopes, setScopes] = useState(initial.scopes);
+  const [rateLimitEnabled, setRateLimitEnabled] = useState(
+    initial.rateLimitEnabled,
   );
-  const [name, setName] = useState("");
-  const [clientIdUrl, setClientIdUrl] = useState("");
-  const [clientUri, setClientUri] = useState("");
-  const [redirectUris, setRedirectUris] = useState<string[]>([""]);
-  const [allowedOrigins, setAllowedOrigins] = useState<string[]>([""]);
-  const [scopes, setScopes] = useState<string[]>([""]);
-  const [rateLimitEnabled, setRateLimitEnabled] = useState(true);
   const [rateLimitCapacity, setRateLimitCapacity] = useState(
-    String(config.default_rate_limit_capacity),
+    initial.rateLimitCapacity,
   );
   const [rateLimitRefillRate, setRateLimitRefillRate] = useState(
-    String(config.default_rate_limit_refill_rate),
+    initial.rateLimitRefillRate,
   );
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
@@ -313,22 +377,23 @@ function CreateApiClientDialog({ onSuccess }: { onSuccess: () => void }) {
 
   function handleOpenChange(nextOpen: boolean) {
     setOpen(nextOpen);
-    if (!nextOpen) {
-      setClientType("confidential");
-      setName("");
-      setClientIdUrl("");
-      setClientUri("");
-      setRedirectUris([""]);
-      setAllowedOrigins([""]);
-      setScopes([""]);
-      setRateLimitEnabled(true);
-      setRateLimitCapacity(String(config.default_rate_limit_capacity));
-      setRateLimitRefillRate(String(config.default_rate_limit_refill_rate));
-      setError(null);
-      if (created) {
-        setCreated(null);
-        onSuccess();
-      }
+
+    const next = initialClientForm(source, config);
+    setClientType(next.clientType);
+    setName(next.name);
+    setClientIdUrl(next.clientIdUrl);
+    setClientUri(next.clientUri);
+    setRedirectUris(next.redirectUris);
+    setAllowedOrigins(next.allowedOrigins);
+    setScopes(next.scopes);
+    setRateLimitEnabled(next.rateLimitEnabled);
+    setRateLimitCapacity(next.rateLimitCapacity);
+    setRateLimitRefillRate(next.rateLimitRefillRate);
+    setError(null);
+
+    if (!nextOpen && created) {
+      setCreated(null);
+      onSuccess();
     }
   }
 
@@ -383,19 +448,36 @@ function CreateApiClientDialog({ onSuccess }: { onSuccess: () => void }) {
   return (
     <Sheet open={open} onOpenChange={handleOpenChange}>
       <SheetTrigger asChild>
-        <Button>Create API Client</Button>
+        {source ? (
+          <Button
+            variant="outline"
+            size="icon"
+            className="size-8"
+            title="Duplicate"
+          >
+            <CopyPlus className="size-4" />
+          </Button>
+        ) : (
+          <Button>Create API Client</Button>
+        )}
       </SheetTrigger>
       <SheetContent className="sm:max-w-xl flex flex-col overflow-hidden">
         <SheetHeader>
           <SheetTitle>
-            {created ? "API Client Created" : "Create API Client"}
+            {created
+              ? "API Client Created"
+              : source
+                ? "Duplicate API Client"
+                : "Create API Client"}
           </SheetTitle>
           <SheetDescription>
             {created
               ? created.client_type === "public"
                 ? "Your public client has been created. Use PKCE for authentication."
                 : "Save the credentials below. The secret will not be shown again."
-              : "Register a new application that authenticates through this AppView."}
+              : source
+                ? `Copied from “${source.name}”. Client ID URLs are unique, so enter a new one.`
+                : "Register a new application that authenticates through this AppView."}
           </SheetDescription>
         </SheetHeader>
 
@@ -710,21 +792,6 @@ function EditApiClientDialog({
   onSuccess: () => void;
 }) {
   const config = useConfig();
-
-  function parseRedirectUris(uris: string[]): string[] {
-    return uris.length > 0 ? [...uris, ""] : [""];
-  }
-
-  // Parse existing scopes: separate "atproto" from user-added ones
-  function parseScopes(scopeStr: string): string[] {
-    const parts = scopeStr.split(/\s+/).filter((s) => s && s !== "atproto");
-    return parts.length > 0 ? [...parts, ""] : [""];
-  }
-
-  function parseAllowedOrigins(origins: string[] | null): string[] {
-    if (!origins || origins.length === 0) return [""];
-    return [...origins, ""];
-  }
 
   const [name, setName] = useState(client.name);
   const [redirectUris, setRedirectUris] = useState<string[]>(

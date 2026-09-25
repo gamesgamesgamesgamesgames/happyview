@@ -121,8 +121,13 @@ pub(super) async fn upload_lexicon(
 
     let backfill_job_id: Option<String> =
         if is_record && body.backfill && revision == 1 && auth.has(Permission::BackfillCreate) {
-            match crate::admin::backfill::start_backfill(&state, Some(id.clone()), None, &auth.did)
-                .await
+            match crate::admin::backfill::start_backfill(
+                &state,
+                Some(id.clone()),
+                Vec::new(),
+                &auth.did,
+            )
+            .await
             {
                 Ok(job_id) => Some(job_id),
                 Err(e) => {

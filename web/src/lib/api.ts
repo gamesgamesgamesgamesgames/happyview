@@ -2,6 +2,7 @@ import type { ApiKeySummary, CreateApiKeyResponse } from "@/types/api-keys";
 import type { StatsResponse } from "@/types/stats";
 import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
+import type { ResolvedIdentity } from "@/types/identity";
 import type {
   BackfillJob,
   BackfillReposResponse,
@@ -242,7 +243,7 @@ export function getBackfillJobs() {
   return apiFetch<BackfillJob[]>("/admin/backfill/status");
 }
 
-export function createBackfillJob(body: { collection?: string; did?: string }) {
+export function createBackfillJob(body: { collection?: string; dids?: string[] }) {
   return apiFetch<{ id: string; status: string }>("/admin/backfill", {
     method: "POST",
     body: JSON.stringify(body),
@@ -456,6 +457,11 @@ export function addUser(body: {
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+export function resolveIdentity(identifier: string) {
+  const qs = new URLSearchParams({ identifier }).toString();
+  return apiFetch<ResolvedIdentity>(`/admin/identity/resolve?${qs}`);
 }
 
 export function deleteUser(id: string) {
@@ -673,6 +679,10 @@ export interface TelemetrySettings {
   lexicon_documents: boolean;
   instance_id: string | null;
   collector_url: string;
+  /** Whether anyone has ever answered the telemetry question on this
+   * instance. False only for instances predating the setup wizard's
+   * telemetry step, which is what the dashboard prompt exists to catch. */
+  prompted: boolean;
 }
 
 export interface TelemetryBenchmarkEntry {
@@ -703,6 +713,15 @@ export function updateTelemetry(body: TelemetryUpdate) {
   return apiFetch<TelemetrySettings>("/admin/settings/telemetry", {
     method: "PUT",
     body: JSON.stringify(body),
+  });
+}
+
+/** Record that the telemetry question has been answered, without changing the
+ * answer. Saving any telemetry setting stamps this too; this is the path for
+ * declining — in the setup wizard or by dismissing the dashboard prompt. */
+export function dismissTelemetryPrompt() {
+  return apiFetch<TelemetrySettings>("/admin/settings/telemetry/dismiss", {
+    method: "POST",
   });
 }
 
@@ -1310,7 +1329,7 @@ export interface ResolveResult {
   avatar: string | null;
 }
 
-export function resolveIdentity(q: string) {
+export function resolveSetupIdentity(q: string) {
   return apiFetch<ResolveResult[]>(
     `/api/setup/resolve?q=${encodeURIComponent(q)}`,
   );

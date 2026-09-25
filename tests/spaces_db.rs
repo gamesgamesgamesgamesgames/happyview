@@ -29,9 +29,9 @@ fn make_space(id: &str, did: &str, type_nsid: &str, skey: &str) -> Space {
         skey: skey.to_string(),
         display_name: Some("Test Space".to_string()),
         description: None,
-        mint_policy: MintPolicy::MemberList,
+        read_policy: Policy::MemberList,
+        write_policy: Policy::MemberList,
         app_access: AppAccess::Open,
-        managing_app_did: None,
         config: SpaceConfig::default(),
         revision: None,
         created_at: now.clone(),
@@ -69,7 +69,8 @@ async fn create_and_get_space_roundtrip() {
     assert_eq!(fetched.type_nsid, "com.example.test");
     assert_eq!(fetched.skey, "myspace");
     assert_eq!(fetched.display_name, Some("Test Space".to_string()));
-    assert_eq!(fetched.mint_policy, MintPolicy::MemberList);
+    assert_eq!(fetched.read_policy, Policy::MemberList);
+    assert_eq!(fetched.write_policy, Policy::MemberList);
     assert!(matches!(fetched.app_access, AppAccess::Open));
 }
 
@@ -588,7 +589,7 @@ async fn add_and_get_member() {
         id: new_id(),
         space_id: space_id.clone(),
         did: member_did.to_string(),
-        access: SpaceAccess::Read,
+        access: MemberAccess::READ,
         is_delegation: false,
         granted_by: Some("did:plc:member-owner".to_string()),
         created_at: now_rfc3339(),
@@ -603,7 +604,7 @@ async fn add_and_get_member() {
         .expect("member not found");
 
     assert_eq!(fetched.did, member_did);
-    assert_eq!(fetched.access, SpaceAccess::Read);
+    assert_eq!(fetched.access, MemberAccess::READ);
     assert!(!fetched.is_delegation);
 }
 
@@ -634,7 +635,7 @@ async fn resolve_members_preserves_read_self() {
             id: new_id(),
             space_id: space_id.clone(),
             did: member_did.to_string(),
-            access: SpaceAccess::ReadSelf,
+            access: MemberAccess::READ_SELF,
             is_delegation: false,
             granted_by: Some("did:plc:rs-owner".to_string()),
             created_at: now_rfc3339(),
@@ -647,7 +648,7 @@ async fn resolve_members_preserves_read_self() {
     let access = happyview::spaces::members::is_member(&pool, backend, &space_id, member_did)
         .await
         .expect("is_member failed");
-    assert_eq!(access, Some(SpaceAccess::ReadSelf));
+    assert_eq!(access, Some(MemberAccess::READ_SELF));
 }
 
 #[tokio::test]
@@ -718,7 +719,7 @@ async fn remove_member() {
         id: new_id(),
         space_id: space_id.clone(),
         did: member_did.to_string(),
-        access: SpaceAccess::Write,
+        access: MemberAccess::WRITE,
         is_delegation: false,
         granted_by: None,
         created_at: now_rfc3339(),
@@ -891,4 +892,101 @@ async fn find_blob_author_did_treats_cid_wildcards_literally() {
         .await
         .unwrap();
     assert_eq!(underscore, None, "'_' leaked a record via a LIKE wildcard");
+}
+
+// ---------------------------------------------------------------------------
+// Read and write policies
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn managing_app_policy_survives_the_round_trip_with_its_app() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let mut space = make_space("s-policy-1", "did:plc:auth", "com.example.forum", "main");
+    space.read_policy = Policy::ManagingApp {
+        managing_app: "did:web:app#forum".into(),
+    };
+    space.write_policy = Policy::ManagingApp {
+        managing_app: "did:web:app#forum".into(),
+    };
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+    let back = spaces_db::get_space(&mut *conn, backend, "s-policy-1")
+        .await
+        .unwrap()
+        .expect("space exists");
+
+    // The app is stored inside the policy value, so a round-trip that loses it
+    // would disable managing-app gating.
+    assert_eq!(back.read_policy.managing_app(), Some("did:web:app#forum"));
+    assert_eq!(back.write_policy.managing_app(), Some("did:web:app#forum"));
+}
+
+#[tokio::test]
+#[serial]
+async fn read_and_write_policies_are_independent() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    // A space anyone may read but only members may write.
+    let mut space = make_space("s-policy-2", "did:plc:auth", "com.example.forum", "main");
+    space.read_policy = Policy::Public;
+    space.write_policy = Policy::MemberList;
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+    let back = spaces_db::get_space(&mut *conn, backend, "s-policy-2")
+        .await
+        .unwrap()
+        .expect("space exists");
+
+    assert_eq!(back.read_policy, Policy::Public);
+    assert_eq!(back.write_policy, Policy::MemberList);
+}
+
+#[tokio::test]
+#[serial]
+async fn an_unreadable_policy_column_falls_back_to_member_list() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let space = make_space("s-policy-3", "did:plc:auth", "com.example.forum", "main");
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .unwrap();
+
+    // Corrupt the stored policy directly.
+    let sql = happyview::db::adapt_sql(
+        "UPDATE happyview_spaces SET read_policy = ? WHERE id = ?",
+        backend,
+    );
+    happyview::db::query(&sql)
+        .bind("{not valid json")
+        .bind("s-policy-3")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+    let back = spaces_db::get_space(&mut *conn, backend, "s-policy-3")
+        .await
+        .unwrap()
+        .expect("a corrupt policy must not make the space unreadable");
+
+    // An unreadable policy must not open the space up, so it falls back to the
+    // restrictive policy rather than Public.
+    assert_eq!(back.read_policy, Policy::MemberList);
 }

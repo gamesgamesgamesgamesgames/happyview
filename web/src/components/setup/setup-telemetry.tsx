@@ -2,7 +2,11 @@
 
 import { useState } from "react";
 
-import { updateTelemetry, type TelemetrySettings } from "@/lib/api";
+import {
+  dismissTelemetryPrompt,
+  updateTelemetry,
+  type TelemetrySettings,
+} from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
@@ -33,13 +37,22 @@ export function SetupTelemetry({ onNext }: { onNext: () => void }) {
   async function submit() {
     setSaving(true);
     try {
-      // Only write when the operator chose something other than the default —
-      // "off" is already the absence of a setting, and writing it would mint
-      // nothing but a row.
-      if (mode !== "off") await updateTelemetry({ mode });
+      // Only write the mode when the operator chose something other than the
+      // default — "off" is already the absence of a setting, and writing it
+      // would mint nothing but a row. Declining is still an *answer* though,
+      // so it records that the question was asked; otherwise the dashboard
+      // prompt, which exists to catch instances that never saw this step,
+      // would ask again on the very next page load.
+      if (mode === "off") await dismissTelemetryPrompt();
+      else await updateTelemetry({ mode });
+    } catch {
+      // A telemetry failure must never block setup. The `finally` below
+      // already guaranteed that, but the rejection still escaped `void
+      // submit()` as an unhandled rejection — and the "off" branch, which
+      // previously made no request at all, is now the one most likely to
+      // reach it.
     } finally {
       setSaving(false);
-      // A telemetry failure must never block setup.
       onNext();
     }
   }

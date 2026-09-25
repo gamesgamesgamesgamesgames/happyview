@@ -9,6 +9,7 @@ mod dead_letters;
 mod domains;
 mod events;
 mod feature_flags;
+mod identity;
 mod jobs;
 mod labelers;
 mod lexicons;
@@ -23,6 +24,7 @@ mod scripts;
 mod service_entries;
 mod service_identity;
 pub mod settings;
+pub mod spaces_migration;
 mod stats;
 mod telemetry;
 pub(crate) mod types;
@@ -73,6 +75,10 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/backfill/{id}/details",
             delete(backfill::flush_backfill_details),
         )
+        .route(
+            "/spaces/migration-status",
+            get(spaces_migration::migration_status),
+        )
         .route("/jobs", get(jobs::list_jobs))
         .route("/jobs/{id}", get(jobs::get_job))
         .route("/jobs/{id}/cancel", post(jobs::cancel_job))
@@ -106,6 +112,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route("/events", get(events::list_events))
         .route("/events/count", get(events::count_events))
         .route("/events/purge", post(events::purge_events))
+        .route("/identity/resolve", get(identity::resolve_identity))
         .route("/users", post(users::create_user).get(users::list_users))
         .route("/users/transfer-super", post(users::transfer_super))
         .route(
@@ -173,6 +180,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/settings/telemetry",
             get(telemetry::get).put(telemetry::update),
         )
+        .route("/settings/telemetry/dismiss", post(telemetry::dismiss))
         .route("/settings/telemetry/preview", get(telemetry::preview))
         .route("/settings/telemetry/send", post(telemetry::send))
         .route(

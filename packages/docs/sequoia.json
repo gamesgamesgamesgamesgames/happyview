@@ -14,7 +14,7 @@
     "tags": "tags"
   },
   "bluesky": {
-    "enabled": true
+    "enabled": false
   },
   "autoSync": true,
   "publishContent": true

@@ -79,6 +79,7 @@ export class HappyViewOAuthClient {
     dpopKey: Key;
     rawJwk: JsonWebKey;
     pkceVerifier?: string;
+    confidential: boolean;
   }> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -119,6 +120,7 @@ export class HappyViewOAuthClient {
       dpopKey,
       rawJwk: data.dpop_key,
       pkceVerifier,
+      confidential: data.confidential ?? false,
     };
   }
 
@@ -128,6 +130,7 @@ export class HappyViewOAuthClient {
    */
   async getClientAssertion(
     issuer: string,
+    publicAuth?: { provisionId: string; pkceVerifier: string },
   ): Promise<{ clientAssertion: string; clientAssertionType: string }> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -137,12 +140,18 @@ export class HappyViewOAuthClient {
       headers["x-client-secret"] = this.clientSecret;
     }
 
+    const body: Record<string, unknown> = { issuer };
+    if (publicAuth) {
+      body.provision_id = publicAuth.provisionId;
+      body.pkce_verifier = publicAuth.pkceVerifier;
+    }
+
     const resp = await this._fetch(
       `${this.instanceUrl}/oauth/client-assertion`,
       {
         method: "POST",
         headers,
-        body: JSON.stringify({ issuer }),
+        body: JSON.stringify(body),
       },
     );
 

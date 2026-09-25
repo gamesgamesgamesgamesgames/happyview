@@ -39,6 +39,19 @@ export const ACTOR_SUFFIX = "_actor";
  */
 export const JOB_SOURCE = "_job";
 
+/**
+ * Where the script pages send the operator when they leave. The lexicon
+ * detail page links here with `?lexicon=<nsid>` so adding several triggers
+ * returns to that lexicon each time. The NSID is taken rather than a full
+ * URL so the param can't be used to redirect off the dashboard.
+ */
+export function scriptsReturnHref(searchParams: URLSearchParams): string {
+  const lexicon = searchParams.get("lexicon");
+  return lexicon
+    ? `/dashboard/lexicons/${encodeURIComponent(lexicon)}`
+    : "/dashboard/settings/scripts";
+}
+
 export interface ScriptFormState {
   /** Trigger kind selector value (e.g. `record.create`). */
   kind: TriggerKind;

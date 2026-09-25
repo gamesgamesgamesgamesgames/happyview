@@ -12,6 +12,11 @@ use uuid::Uuid;
 
 use common::db as test_db;
 
+/// Fixed signing key for the backfill's re-minted commits.
+fn backfill_key() -> p256::ecdsa::SigningKey {
+    p256::ecdsa::SigningKey::from_slice(&[0x31u8; 32]).expect("valid test key")
+}
+
 const COLLECTION: &str = "com.example.item";
 
 fn legacy_cid(record: &Value) -> String {
@@ -35,9 +40,9 @@ fn make_space(id: &str, did: &str, skey: &str) -> Space {
         skey: skey.to_string(),
         display_name: None,
         description: None,
-        mint_policy: MintPolicy::MemberList,
+        read_policy: Policy::MemberList,
+        write_policy: Policy::MemberList,
         app_access: AppAccess::Open,
-        managing_app_did: None,
         config: SpaceConfig::default(),
         revision: None,
         created_at: now.clone(),
@@ -117,9 +122,14 @@ async fn seed(
         "at://{}/space/{}/{}",
         space.did, space.type_nsid, space.skey
     );
-    let signed =
-        happyview::spaces::commit::sign_commit(&set_hash.hash(), &space_uri, &author, "rev-0001")
-            .expect("sign_commit failed");
+    let signed = happyview::spaces::commit::sign_commit(
+        &set_hash.hash(),
+        &space_uri,
+        &author,
+        "rev-0001",
+        &backfill_key(),
+    )
+    .expect("sign_commit failed");
     repo_state.lthash_state = set_hash.as_bytes().to_vec();
     repo_state.rev = Some(signed.rev);
     repo_state.hash = Some(signed.hash.to_vec());
@@ -162,7 +172,7 @@ async fn repairs_legacy_cids_oplog_and_repo_state() {
 
     let (space_id, author, records) = seed(&pool, backend).await;
 
-    let report = cid_backfill::run(&pool, backend, false)
+    let report = cid_backfill::run(&pool, backend, false, &backfill_key())
         .await
         .expect("backfill failed");
 
@@ -221,12 +231,12 @@ async fn repair_is_idempotent() {
 
     seed(&pool, backend).await;
 
-    let first = cid_backfill::run(&pool, backend, false)
+    let first = cid_backfill::run(&pool, backend, false, &backfill_key())
         .await
         .expect("first run failed");
     assert!(!first.is_noop());
 
-    let second = cid_backfill::run(&pool, backend, false)
+    let second = cid_backfill::run(&pool, backend, false, &backfill_key())
         .await
         .expect("second run failed");
     assert_eq!(second.records_updated, 0, "CIDs are already canonical");
@@ -247,7 +257,7 @@ async fn dry_run_changes_nothing() {
 
     let (space_id, _author, records) = seed(&pool, backend).await;
 
-    let report = cid_backfill::run(&pool, backend, true)
+    let report = cid_backfill::run(&pool, backend, true, &backfill_key())
         .await
         .expect("dry run failed");
     assert_eq!(
@@ -276,7 +286,7 @@ async fn run_if_needed_repairs_once_then_skips() {
     let (space_id, _author, records) = seed(&pool, backend).await;
 
     // First call: does the repair and reports it.
-    let first = cid_backfill::run_if_needed(&pool, backend)
+    let first = cid_backfill::run_if_needed(&pool, backend, &backfill_key())
         .await
         .expect("first run_if_needed failed")
         .expect("first call must actually run");
@@ -291,7 +301,7 @@ async fn run_if_needed_repairs_once_then_skips() {
     }
 
     // Second call: marker is set, so it skips entirely without scanning.
-    let second = cid_backfill::run_if_needed(&pool, backend)
+    let second = cid_backfill::run_if_needed(&pool, backend, &backfill_key())
         .await
         .expect("second run_if_needed failed");
     assert!(
@@ -308,13 +318,13 @@ async fn run_if_needed_marks_empty_database_done() {
     let backend = test_db::test_backend();
     test_db::truncate_all(&pool).await;
 
-    let first = cid_backfill::run_if_needed(&pool, backend)
+    let first = cid_backfill::run_if_needed(&pool, backend, &backfill_key())
         .await
         .expect("first run_if_needed failed")
         .expect("first call runs even on an empty database");
     assert!(first.is_noop());
 
-    let second = cid_backfill::run_if_needed(&pool, backend)
+    let second = cid_backfill::run_if_needed(&pool, backend, &backfill_key())
         .await
         .expect("second run_if_needed failed");
     assert!(second.is_none(), "empty database must be marked done");
@@ -330,14 +340,109 @@ async fn dry_run_does_not_set_the_marker() {
 
     seed(&pool, backend).await;
 
-    cid_backfill::run(&pool, backend, true)
+    cid_backfill::run(&pool, backend, true, &backfill_key())
         .await
         .expect("dry run failed");
 
     // The guarded entry point must still see work to do.
-    let report = cid_backfill::run_if_needed(&pool, backend)
+    let report = cid_backfill::run_if_needed(&pool, backend, &backfill_key())
         .await
         .expect("run_if_needed failed")
         .expect("dry run must not have set the marker");
     assert_eq!(report.records_updated, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Commit format rebuild
+//
+// `seed` writes repo state in the earlier commit format: hash, ikm and mac, but
+// no sig. That is the shape the rebuild repairs.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn commit_format_rebuild_signs_and_verifies() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let (space_id, author, _records) = seed(&pool, backend).await;
+
+    let mut conn = pool.acquire().await.expect("acquire failed");
+    let before = spaces_db::get_or_create_repo_state(&mut conn, backend, &space_id, &author)
+        .await
+        .expect("repo state");
+    drop(conn);
+    assert!(
+        before.sig.is_none(),
+        "seed must produce a row without a signature"
+    );
+    let rev_before = before.rev.clone().expect("seeded rev");
+
+    let rebuilt =
+        happyview::spaces::rebuild::run_commit_format_rebuild(&pool, backend, &backfill_key())
+            .await
+            .expect("rebuild failed")
+            .expect("rebuild must not have already been marked complete");
+    assert_eq!(rebuilt, 1);
+
+    let mut conn = pool.acquire().await.expect("acquire failed");
+    let after = spaces_db::get_or_create_repo_state(&mut conn, backend, &space_id, &author)
+        .await
+        .expect("repo state");
+    drop(conn);
+
+    let sig = after.sig.clone().expect("rebuild must produce a signature");
+    assert!(!sig.is_empty());
+    assert_eq!(
+        after.rev.as_deref(),
+        Some(rev_before.as_str()),
+        "the record set did not change, so the revision must be preserved"
+    );
+
+    // The rebuilt commit must verify end to end against the signing key.
+    let space = spaces_db::get_space(&pool, backend, &space_id)
+        .await
+        .expect("get_space failed")
+        .expect("space exists");
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    let commit = happyview::spaces::commit::SignedCommit {
+        ver: 1,
+        hash: after.hash.clone().unwrap().try_into().unwrap(),
+        ikm: after.ikm.clone().unwrap().try_into().unwrap(),
+        sig,
+        mac: after.mac.clone().unwrap().try_into().unwrap(),
+        rev: after.rev.clone().unwrap(),
+    };
+    let verifier =
+        happyview::spaces::commit::SpaceVerifyingKey::P256(*backfill_key().verifying_key());
+    happyview::spaces::commit::verify_commit(&commit, &space_uri, &author, &verifier)
+        .expect("rebuilt commit must verify");
+}
+
+#[tokio::test]
+#[serial]
+async fn commit_format_rebuild_runs_once() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    seed(&pool, backend).await;
+
+    let first =
+        happyview::spaces::rebuild::run_commit_format_rebuild(&pool, backend, &backfill_key())
+            .await
+            .expect("first rebuild failed");
+    assert_eq!(first, Some(1));
+
+    let second =
+        happyview::spaces::rebuild::run_commit_format_rebuild(&pool, backend, &backfill_key())
+            .await
+            .expect("second rebuild failed");
+    assert_eq!(second, None, "the marker must prevent a second pass");
 }

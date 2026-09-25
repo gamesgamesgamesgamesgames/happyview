@@ -86,10 +86,13 @@ curl -X POST http://127.0.0.1:3000/admin/backfill \
   -d '{ "collection": "xyz.statusphere.status" }'
 ```
 
-| Field        | Type   | Required | Description                                                |
-| ------------ | ------ | -------- | ---------------------------------------------------------- |
-| `collection` | string | no       | Limit to a single collection (backfills all if omitted)    |
-| `did`        | string | no       | Limit to a single DID (discovers all via relay if omitted) |
+| Field        | Type     | Required | Description                                                                 |
+| ------------ | -------- | -------- | ---------------------------------------------------------------------------- |
+| `collection` | string   | no       | Limit to a single collection (backfills all if omitted)                     |
+| `dids`       | string[] | no       | Accounts to backfill, as DIDs or handles (discovers all via relay if omitted) |
+| `did`        | string   | no       | A single account; kept for compatibility and added to `dids`                |
+
+Every entry in `dids` must resolve, or the request fails with `400` listing each entry that did not and no job is created. Duplicates are ignored. A request can name at most 500 accounts.
 
 **Response**: `201 Created`
 
@@ -208,6 +211,7 @@ interface BackfillJob {
   id: string;
   collection: string | null;
   did: string | null;
+  scope: "network" | "dids";
   status: string;
   stage: string;
   total_repos: number | null;
@@ -256,6 +260,7 @@ curl http://127.0.0.1:3000/admin/backfill/status -H "$AUTH"
     "id": "550e8400-e29b-41d4-a716-446655440000",
     "collection": "xyz.statusphere.status",
     "did": null,
+    "scope": "network",
     "status": "completed",
     "stage": "completed",
     "total_repos": 42,
@@ -271,6 +276,8 @@ curl http://127.0.0.1:3000/admin/backfill/status -H "$AUTH"
 ```
 
 The `status` field tracks the overall job state (`running`, `pausing`, `paused`, `cancelling`, `cancelled`, `completed`, `failed`). The `stage` field tracks the current processing phase (`pending`, `discovering_repos`, `resolving_and_fetching`, `completed`, `failed`, `cancelled`). The `resolved_repos` counter tracks PDS resolution progress during the pipelined phase, while `processed_repos` tracks record fetching progress.
+
+`scope` is `network` when repos are discovered through the relay and `dids` when the job targets specific accounts. `did` is set only when a job targets exactly one account.
 
 ## List repos for a job
 

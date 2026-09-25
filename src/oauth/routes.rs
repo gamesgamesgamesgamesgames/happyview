@@ -53,6 +53,15 @@ struct ClientAssertionBody {
     /// Sign with this specific key rather than whichever is current.
     #[serde(default)]
     kid: Option<String>,
+    /// Public-client authentication for the mint (see the handler): a public
+    /// browser client signing in has no client secret and no session yet, so it
+    /// proves it holds a live provision from this client by echoing the
+    /// `provision_id` it just received from `/oauth/dpop-keys` together with the
+    /// matching PKCE verifier. Both must be present to take that path.
+    #[serde(default)]
+    provision_id: Option<String>,
+    #[serde(default)]
+    pkce_verifier: Option<String>,
 }
 
 /// POST /oauth/client-assertion — mint a `private_key_jwt` assertion for the
@@ -68,13 +77,77 @@ async fn mint_client_assertion(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let request_path = original_request_path(&req);
     let headers = SessionAuthHeaders::from_request(&req);
-    let client = authenticate_request_client(&state, &headers, &request_path, "POST")
-        .await?
-        .resolved;
+    // Read before `Json::from_request` consumes `req`. Only the public path uses it.
+    let origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let Json(body): Json<ClientAssertionBody> = Json::from_request(req, &state)
         .await
         .map_err(|e| AppError::BadRequest(format!("invalid client-assertion request: {e}")))?;
+
+    // Three ways to authenticate a mint, resolving to the same client either way:
+    //
+    //   - a confidential client's `X-Client-Secret`, or an already-signed-in DPoP
+    //     session (both handled by `authenticate_request_client`); and
+    //   - ⚠ THE PUBLIC BROWSER PATH, added so a public client can be a *confidential
+    //     atproto client* to a user's PDS. During initial sign-in it has no secret
+    //     and no session, so neither branch above can carry it — that is the chicken
+    //     and egg. It instead proves it holds a live provision from this client by
+    //     echoing the `provision_id` from `/oauth/dpop-keys` and the matching PKCE
+    //     verifier, checked exactly the way `register_session` checks it. The
+    //     assertion only ever asserts the client's own identity — it grants no user
+    //     access without a code, that PKCE, and a DPoP proof — so this does not widen
+    //     the blast radius beyond the public-client trust `provision_dpop_key` already
+    //     extends on `X-Client-Key` + `Origin`.
+    let client = match (body.provision_id.as_deref(), body.pkce_verifier.as_deref()) {
+        (Some(provision_id), Some(pkce_verifier)) => {
+            let resolved = client_auth::authenticate_public(
+                &state.db,
+                state.db_backend,
+                &headers.client_key,
+                origin.as_deref(),
+            )
+            .await?;
+
+            let encryption_key =
+                state.config.token_encryption_key.as_ref().ok_or_else(|| {
+                    AppError::Internal("TOKEN_ENCRYPTION_KEY not configured".into())
+                })?;
+
+            let (_dpop_key_id, dpop_client_id, _private_jwk, _thumbprint, pkce_challenge) =
+                keys::get_dpop_key(&state.db, state.db_backend, encryption_key, provision_id)
+                    .await?;
+
+            if dpop_client_id != resolved.id {
+                return Err(AppError::Auth(
+                    "provision_id does not belong to this client".into(),
+                ));
+            }
+
+            let challenge = pkce_challenge.ok_or_else(|| {
+                AppError::BadRequest("no PKCE challenge found for this provision".into())
+            })?;
+
+            if !client_auth::verify_pkce(&challenge, pkce_verifier) {
+                return Err(AppError::Auth("PKCE verification failed".into()));
+            }
+
+            resolved
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(AppError::BadRequest(
+                "provision_id and pkce_verifier must be sent together".into(),
+            ));
+        }
+        (None, None) => {
+            authenticate_request_client(&state, &headers, &request_path, "POST")
+                .await?
+                .resolved
+        }
+    };
 
     let keys = super::client_keys::load_keys(
         &state.db,
@@ -168,6 +241,7 @@ struct ProvisionKeyBody {
 struct ProvisionKeyResponse {
     provision_id: String,
     dpop_key: serde_json::Value,
+    confidential: bool,
 }
 
 #[derive(Deserialize)]
@@ -282,6 +356,31 @@ async fn provision_dpop_key(
     )
     .await?;
 
+    let confidential =
+        match super::pds_write::lookup_client_id_url(&state.db, state.db_backend, &client.id).await
+        {
+            Ok(client_id_url) => state
+                .oauth
+                .refresh_client_confidentiality(&state, &client.id, &client_id_url)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        client_id = %client.id,
+                        error = %e,
+                        "confidentiality probe failed at provision; using the registered verdict"
+                    );
+                    state.oauth.is_confidential(&client_id_url)
+                }),
+            Err(e) => {
+                tracing::warn!(
+                    client_id = %client.id,
+                    error = %e,
+                    "could not resolve client_id_url at provision; treating as public"
+                );
+                false
+            }
+        };
+
     log_event(
         &state.db,
         EventLog {
@@ -292,6 +391,7 @@ async fn provision_dpop_key(
             detail: serde_json::json!({
                 "client_key": client.client_key,
                 "thumbprint": keypair.thumbprint,
+                "confidential": confidential,
             }),
         },
         state.db_backend,
@@ -303,6 +403,7 @@ async fn provision_dpop_key(
         Json(ProvisionKeyResponse {
             provision_id,
             dpop_key: keypair.private_jwk,
+            confidential,
         }),
     ))
 }

@@ -1,0 +1,340 @@
+name: Spaces interop
+
+# HappyView's spaces interop suites against real PDS implementations, whose
+# images happyproto/pds-test builds nightly.
+#
+# It runs in two modes:
+#
+#   - a new image from pds-test (repository_dispatch) is tested on its own. A
+#     pass opens a pull request moving that PDS's pin in interop/images.env; a
+#     failure opens or updates an issue. HappyView is held at its default
+#     branch, so a failure here means upstream changed.
+#   - a change to HappyView (pull_request, push) runs every suite against the
+#     pinned images, so a HappyView regression is not mistaken for an upstream
+#     change.
+
+on:
+  repository_dispatch:
+    types: [pds-test-image]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "pds-test target (a key of interop/suites.json)"
+        type: string
+        required: true
+      image:
+        description: "Image to test, by digest (blank for the pinned one)"
+        type: string
+        default: ""
+  pull_request:
+    paths: &interop-paths
+      - "src/spaces/**"
+      - "src/jobs/native/migrate_space_repo.rs"
+      - "src/cid_verify.rs"
+      - "crates/happyview-plc/**"
+      - "tests/spaces_*_interop.rs"
+      - "tests/spaces_reference_interop.rs"
+      - "tests/spaces_migration_e2e.rs"
+      - "tests/interop_support/**"
+      - "tests/common/**"
+      - "src/auth/routes.rs"
+      - "crates/happyview-scopes/**"
+      - "docker-compose.zds.yml"
+      - "docker-compose.spaces-alpha.yml"
+      - "docker-compose.pdsjs.yml"
+      - "docker-compose.atproto-pds.yml"
+      - "interop/**"
+      - ".github/workflows/interop.yml"
+  push:
+    branches: [main]
+    paths: *interop-paths
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer image for the same target supersedes one still under test.
+  group: interop-${{ github.event.client_payload.target || inputs.target || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: depot-ubuntu-24.04
+    outputs:
+      suites: ${{ steps.plan.outputs.suites }}
+      candidate: ${{ steps.plan.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Plan
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          PAYLOAD_TARGET: ${{ github.event.client_payload.target }}
+          PAYLOAD_IMAGE: ${{ github.event.client_payload.image }}
+          INPUT_TARGET: ${{ inputs.target }}
+          INPUT_IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          pinned() { sed -n "s/^$1=//p" interop/images.env; }
+
+          case "$EVENT" in
+            repository_dispatch) target="$PAYLOAD_TARGET"; image="$PAYLOAD_IMAGE" ;;
+            workflow_dispatch) target="$INPUT_TARGET"; image="$INPUT_IMAGE" ;;
+            *)
+              suites="$(jq -c 'del(._comment) | to_entries | map(.value + {target: .key})' interop/suites.json)"
+              suites="$(jq -c '.[]' <<<"$suites" | while IFS= read -r s; do
+                env_name="$(jq -r .env <<<"$s")"
+                jq -c --arg image "$(pinned "$env_name")" '. + {image: $image}' <<<"$s"
+              done | jq -cs .)"
+              echo "suites=$suites" >>"$GITHUB_OUTPUT"
+              echo "candidate=false" >>"$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if ! [[ "$target" =~ ^[a-z0-9-]+$ ]]; then
+            echo "malformed target: $target" >&2
+            exit 1
+          fi
+          suite="$(jq -c --arg t "$target" '.[$t] // empty | . + {target: $t}' interop/suites.json)"
+          if [ -z "$suite" ]; then
+            # pds-test also builds images HappyView has no suite for, such as
+            # plc and tranquil. Those are not an error.
+            echo "No suite for $target; nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "suites=[]" >>"$GITHUB_OUTPUT"
+            echo "candidate=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          candidate=true
+          if [ -z "$image" ]; then
+            image="$(pinned "$(jq -r .env <<<"$suite")")"
+            candidate=false
+          elif ! [[ "$image" =~ ^ghcr\.io/happyproto/pds-test/${target}@sha256:[0-9a-f]{64}$ ]]; then
+            echo "not testing $image: expected ghcr.io/happyproto/pds-test/$target@sha256:<digest>" >&2
+            exit 1
+          fi
+
+          echo "suites=[$(jq -c --arg image "$image" '. + {image: $image}' <<<"$suite")]" >>"$GITHUB_OUTPUT"
+          echo "candidate=$candidate" >>"$GITHUB_OUTPUT"
+
+  test:
+    needs: plan
+    if: needs.plan.outputs.suites != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.plan.outputs.suites) }}
+    name: ${{ matrix.suite.target }}
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 45
+    # The migration end-to-end test runs HappyView itself, which needs a
+    # database. The interop suites ignore it.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: happyview
+          POSTGRES_PASSWORD: happyview
+          POSTGRES_DB: happyview_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U happyview -d happyview_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      COMPOSE: ${{ matrix.suite.compose }}
+      TESTS: ${{ join(matrix.suite.tests, ' ') }}
+      TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
+      IMAGE_ENV: ${{ matrix.suite.env }}
+      IMAGE: ${{ matrix.suite.image }}
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: interop
+
+      # Compiled before the stack starts, so a slow build doesn't eat into the
+      # time the containers have been up.
+      - name: Build the suite
+        run: |
+          set -euo pipefail
+          targets=()
+          for t in $TESTS; do targets+=(--test "$t"); done
+          cargo test "${targets[@]}" --no-run
+
+      - name: Start the stack
+        run: |
+          set -euo pipefail
+          export "$IMAGE_ENV=$IMAGE"
+          echo "testing $TESTS against $IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
+          # Pulled explicitly: the image under test must come from the registry,
+          # never from the build fallback the compose files keep for local use.
+          docker pull "$IMAGE"
+          docker compose --env-file interop/images.env -f "$COMPOSE" up -d --wait \
+            || docker compose --env-file interop/images.env -f "$COMPOSE" up -d --wait
+
+      - name: Run the suite
+        run: |
+          set -euo pipefail
+          mkdir -p interop-logs
+          targets=()
+          for t in $TESTS; do targets+=(--test "$t"); done
+          cargo test "${targets[@]}" -- --ignored 2>&1 | tee interop-logs/suite.log
+
+      - name: Container logs
+        if: failure()
+        run: |
+          export "$IMAGE_ENV=$IMAGE"
+          mkdir -p interop-logs
+          docker compose --env-file interop/images.env -f "$COMPOSE" logs >interop-logs/containers.log 2>&1 || true
+          tail -n 200 interop-logs/containers.log
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: interop-${{ matrix.suite.target }}
+          path: interop-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # A pass moves the pin through a pull request; interop/images.env says why.
+  pin:
+    needs: [plan, test]
+    if: needs.plan.outputs.candidate == 'true' && needs.test.result == 'success'
+    runs-on: depot-ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      SUITE_JSON: ${{ needs.plan.outputs.suites }}
+      UPSTREAM: ${{ github.event.client_payload.upstream }}
+      UPSTREAM_REF: ${{ github.event.client_payload.ref }}
+      BUILD_RUN: ${{ github.event.client_payload.run }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Move the pin
+        id: pin
+        run: |
+          set -euo pipefail
+          target="$(jq -r '.[0].target' <<<"$SUITE_JSON")"
+          env_name="$(jq -r '.[0].env' <<<"$SUITE_JSON")"
+          image="$(jq -r '.[0].image' <<<"$SUITE_JSON")"
+          if ! grep -q "^$env_name=" interop/images.env; then
+            echo "interop/images.env has no $env_name line" >&2
+            exit 1
+          fi
+          awk -v key="$env_name" -v value="$image" \
+            'index($0, key "=") == 1 { print key "=" value; next } { print }' \
+            interop/images.env >interop/images.env.new
+          mv interop/images.env.new interop/images.env
+          {
+            echo "target=$target"
+            echo "image=$image"
+          } >>"$GITHUB_OUTPUT"
+
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.INTEROP_PR_TOKEN || secrets.GITHUB_TOKEN }}
+          branch: interop/pin-${{ steps.pin.outputs.target }}
+          commit-message: "chore(interop): pin ${{ steps.pin.outputs.target }} to its newest passing image"
+          title: "chore(interop): pin ${{ steps.pin.outputs.target }} to its newest passing image"
+          body: |
+            The spaces interop suite passed against a new `${{ steps.pin.outputs.target }}` image from happyproto/pds-test.
+
+            - Image: `${{ steps.pin.outputs.image }}`
+            - Upstream: `${{ env.UPSTREAM_REF }}` at `${{ env.UPSTREAM }}`
+            - Built by: ${{ env.BUILD_RUN }}
+            - Tested by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          add-paths: interop/images.env
+          delete-branch: true
+
+      - name: Close the failure issue, if one is open
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ steps.pin.outputs.target }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="[interop] $TARGET: newest pds-test image fails HappyView's suite"
+          number="$(gh issue list --state open --search "in:title \"$title\"" --json number,title \
+            | jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue close "$number" --comment "A newer image passes: $RUN_URL"
+          fi
+
+  report:
+    needs: [plan, test]
+    if: always() && needs.plan.outputs.candidate == 'true' && needs.test.result == 'failure'
+    runs-on: depot-ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    env:
+      SUITE_JSON: ${{ needs.plan.outputs.suites }}
+      UPSTREAM: ${{ github.event.client_payload.upstream }}
+      UPSTREAM_REF: ${{ github.event.client_payload.ref }}
+      BUILD_RUN: ${{ github.event.client_payload.run }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: interop-*
+          path: interop-logs
+          merge-multiple: true
+
+      # One open issue per target, commented on as new failing images arrive,
+      # so a PDS that stays broken is one thread rather than a new issue every night.
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          target="$(jq -r '.[0].target' <<<"$SUITE_JSON")"
+          image="$(jq -r '.[0].image' <<<"$SUITE_JSON")"
+          title="[interop] $target: newest pds-test image fails HappyView's suite"
+
+          failures="$(grep -E '^test .* FAILED$|^    [a-z_0-9]+$' interop-logs/suite.log 2>/dev/null | head -40 || true)"
+          body="$(cat <<BODY
+          HappyView's \`$target\` spaces interop suite fails against a new image from happyproto/pds-test.
+          HappyView was at its default branch, so this reflects a change upstream.
+
+          Not every failure is a regression: some tests pin divergences from the spec, and fail when upstream fixes them.
+          Read the failing test's comment before deciding which.
+
+          - Image: \`$image\`
+          - Upstream: \`$UPSTREAM_REF\` at \`$UPSTREAM\`
+          - Built by: $BUILD_RUN
+          - Tested by: $RUN_URL (logs are attached to the run)
+
+          Failing:
+
+          \`\`\`
+          ${failures:-see the run logs}
+          \`\`\`
+
+          The pin in \`interop/images.env\` has not moved. This closes itself when a newer image passes.
+          BODY
+          )"
+
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number,title \
+            | jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

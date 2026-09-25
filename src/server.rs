@@ -68,6 +68,9 @@ pub fn router(state: AppState) -> Router {
                 crate::feature_middleware::require_spaces,
             )),
         )
+        // Public and unauthenticated: detection happens before authorization,
+        // and must also answer on a build with spaces disabled.
+        .merge(crate::spaces::describe::describe_routes())
         .merge(crate::spaces::simplespace::simplespace_routes().layer(
             axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -334,10 +337,7 @@ async fn config_endpoint(
             .or_else(|| state.config.logo_uri.clone())
     };
 
-    let version: &str = match option_env!("HAPPYVIEW_VERSION") {
-        Some(v) if !v.is_empty() => v.trim_start_matches('v'),
-        _ => env!("CARGO_PKG_VERSION"),
-    };
+    let version: &str = crate::version::version();
 
     let spaces_enabled = crate::feature_flags::is_enabled(
         pool,
