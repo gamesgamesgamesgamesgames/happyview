@@ -199,7 +199,7 @@ export const HOVER_DOCS = new Map<string, HoverEntry>([
   ["Space:members", { signature: "space:members()", description: "List resolved members — returns array of {did, access}" }],
   ["Space:is_member", { signature: "space:is_member(did)", description: "Whether did is a member — returns boolean" }],
   ["Space:access", { signature: "space:access(did)", description: "Member's access level — returns 'read' | 'write' | nil" }],
-  ["Space:update", { signature: "space:update({display_name?, description?, mint_policy?, app_access?, managing_app_did?, config?})", description: "Update space metadata (space-admin only) — returns true" }],
+  ["Space:update", { signature: "space:update({display_name?, description?, read_policy?, write_policy?, app_access?, config?})", description: "Update space metadata (space-admin only). Policies are lexicon unions, e.g. { [\"$type\"] = \"com.atproto.simplespace.defs#publicPolicy\" } — returns true" }],
   ["Space:delete", { signature: "space:delete()", description: "Delete the space (space-admin only) — returns true" }],
   ["Space:query", { signature: "space:query({collection?, limit?, cursor?})", description: "List records in the space — returns {records, cursor}" }],
   ["Space:create_invite", { signature: "space:create_invite({access?, max_uses?, expires_at?})", description: "Create an invite token (space-admin only) — returns {invite_id, token, access, max_uses, expires_at}" }],

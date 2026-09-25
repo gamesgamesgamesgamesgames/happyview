@@ -11,8 +11,8 @@
 
 use happyview_scopes::{
     AccountAction, AccountPermission, BlobPermission, IdentityPermission, IncludeScope,
-    IncludedPermission, LexPermission, LexPermissionSet, LexValue, RepoAction, RepoPermission,
-    RpcPermission, ScopePermissions,
+    IncludedPermission, LexPermission, LexPermissionSet, LexValue, ManageOp, RepoAction,
+    RepoPermission, RpcPermission, ScopePermissions, SpaceAction, SpacePermission, SpaceTarget,
 };
 use serde_json::Value;
 
@@ -51,6 +51,7 @@ fn parse_verdicts_match_the_reference() {
             "identity" => IdentityPermission::parse(scope).is_some(),
             "account" => AccountPermission::parse(scope).is_some(),
             "include" => IncludeScope::parse(scope).is_some(),
+            "space" => SpacePermission::parse(scope).is_some(),
             other => panic!("corpus has unhandled prefix {other}"),
         };
 
@@ -203,4 +204,55 @@ fn lex_set(value: &Value) -> LexPermissionSet {
         .collect();
 
     LexPermissionSet { permissions }
+}
+
+/// Space grants resolve the same way the reference's matcher does.
+///
+/// A separate array because the space matcher takes a tagged target rather than
+/// the `(kind, collection, action)` triple the other resources share.
+#[test]
+fn space_match_verdicts_match_the_reference() {
+    let corpus = corpus();
+    let cases = corpus["space_matches"]
+        .as_array()
+        .expect("space_matches array");
+    assert!(
+        cases.len() >= 14,
+        "corpus shrank; re-check the vendored file"
+    );
+
+    for case in cases {
+        let grant = case["grant"].as_str().unwrap();
+        let space_type = case["type"].as_str().unwrap();
+        let authority = case["authority"].as_str().unwrap();
+        let skey = case["skey"].as_str().unwrap();
+        let expected = case["allowed"].as_bool().unwrap();
+        let raw_target = case["target"].as_str().unwrap();
+
+        let perm = SpacePermission::parse(grant)
+            .unwrap_or_else(|| panic!("corpus grant {grant:?} must parse"));
+
+        let target = match raw_target {
+            "read" => SpaceTarget::Read,
+            "read_self" => SpaceTarget::ReadSelf,
+            other if other.starts_with("manage:") => SpaceTarget::Manage(
+                ManageOp::parse(&other["manage:".len()..])
+                    .unwrap_or_else(|| panic!("corpus has unknown manage op {other}")),
+            ),
+            other => SpaceTarget::Write {
+                action: SpaceAction::parse(other)
+                    .unwrap_or_else(|| panic!("corpus has unknown space action {other}")),
+                collection: case["collection"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{grant:?} target {other} needs a collection")),
+            },
+        };
+
+        let actual = perm.matches(space_type, authority, skey, target);
+        assert_eq!(
+            actual, expected,
+            "grant {grant:?} against ({space_type}, {authority}, {skey}, {raw_target}): \
+             reference says {expected}, this crate says {actual}"
+        );
+    }
 }

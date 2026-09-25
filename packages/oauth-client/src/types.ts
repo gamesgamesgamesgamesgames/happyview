@@ -63,6 +63,7 @@ export interface TokenInfo {
 export interface ProvisionKeyResponse {
   provision_id: string;
   dpop_key: JsonWebKey;
+  confidential?: boolean;
 }
 
 export interface RegisterSessionResponse {

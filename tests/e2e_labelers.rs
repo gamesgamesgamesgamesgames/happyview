@@ -426,3 +426,60 @@ async fn labeler_no_auth_returns_401() {
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+#[serial]
+async fn label_gc_removes_orphaned_record_labels_but_keeps_account_labels() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let backend = app.state.db_backend;
+    let db = &app.state.db;
+
+    let indexed_uri = "at://did:plc:user/test.collection/indexed";
+    let orphan_uri = "at://did:plc:user/test.collection/orphan";
+    let account_did = "did:plc:user";
+
+    let sql = adapt_sql(
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        backend,
+    );
+    happyview::db::query(&sql)
+        .bind(indexed_uri)
+        .bind(account_did)
+        .bind("test.collection")
+        .bind("indexed")
+        .bind("{}")
+        .bind("bafytest")
+        .bind(now_rfc3339())
+        .execute(db)
+        .await
+        .unwrap();
+
+    let sql = adapt_sql(
+        "INSERT INTO happyview_labels (src, uri, val, cts) VALUES (?, ?, ?, ?)",
+        backend,
+    );
+    for uri in [indexed_uri, orphan_uri, account_did] {
+        happyview::db::query(&sql)
+            .bind("did:plc:lab1")
+            .bind(uri)
+            .bind("spam")
+            .bind(now_rfc3339())
+            .execute(db)
+            .await
+            .unwrap();
+    }
+
+    let (_, orphaned) = happyview::labeler::run_label_gc(db, backend).await;
+    assert_eq!(orphaned, 1);
+
+    let mut remaining: Vec<(String,)> = happyview::db::query_as("SELECT uri FROM happyview_labels")
+        .fetch_all(db)
+        .await
+        .unwrap();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        vec![(indexed_uri.to_string(),), (account_did.to_string(),)]
+    );
+}

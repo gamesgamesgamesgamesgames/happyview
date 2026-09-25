@@ -136,13 +136,12 @@ impl mlua::UserData for LuaSpace {
             let member_did: String = opts
                 .get("did")
                 .map_err(|_| mlua::Error::runtime("add_member: did is required"))?;
-            let access: Option<crate::spaces::types::SpaceAccess> =
+            // `access` is a single-word shorthand for the member booleans.
+            let access: Option<crate::spaces::types::MemberAccess> =
                 match opts.get::<Option<String>>("access").ok().flatten() {
-                    Some(s) => {
-                        Some(crate::spaces::types::SpaceAccess::parse(&s).ok_or_else(|| {
-                            mlua::Error::runtime(format!("add_member: invalid access '{s}'"))
-                        })?)
-                    }
+                    Some(s) => Some(member_access_from_str(&s).ok_or_else(|| {
+                        mlua::Error::runtime(format!("add_member: invalid access '{s}'"))
+                    })?),
                     None => None,
                 };
             let is_delegation: Option<bool> = opts.get("is_delegation").ok();
@@ -158,7 +157,7 @@ impl mlua::UserData for LuaSpace {
             .map_err(|e| mlua::Error::runtime(format!("add_member: {e}")))?;
             let result = lua.create_table()?;
             result.set("did", member.did)?;
-            result.set("access", member.access.as_str())?;
+            result.set("access", member.access.as_wire_str())?;
             Ok(mlua::Value::Table(result))
         });
 
@@ -200,7 +199,7 @@ impl mlua::UserData for LuaSpace {
             for (i, m) in members.iter().enumerate() {
                 let entry = lua.create_table()?;
                 entry.set("did", m.did.as_str())?;
-                entry.set("access", m.access.as_str())?;
+                entry.set("access", m.access.as_wire_str())?;
                 result.set(i + 1, entry)?;
             }
             Ok(mlua::Value::Table(result))
@@ -235,10 +234,10 @@ impl mlua::UserData for LuaSpace {
                 crate::spaces::members::is_member(&state.db, state.db_backend, &space.id, &did)
                     .await
                     .map_err(|e| mlua::Error::runtime(format!("access: {e}")))?;
-            Ok(access.map(|a| a.as_str().to_string()))
+            Ok(access.map(|a| a.as_wire_str().to_string()))
         });
 
-        // space:update{ display_name?, description?, mint_policy?, app_access?, managing_app_did?, config? } -> true
+        // space:update{ display_name?, description?, read_policy?, write_policy?, app_access?, config? } -> true
         // For nullable patch fields, a Lua `false` clears (sets to nil); omitting leaves unchanged.
         methods.add_async_method("update", |lua, this, opts: mlua::Table| async move {
             let state = this.state.clone();
@@ -260,16 +259,8 @@ impl mlua::UserData for LuaSpace {
             }
             let display_name = nullable(&opts, "display_name")?;
             let description = nullable(&opts, "description")?;
-            let managing_app_did = nullable(&opts, "managing_app_did")?;
-            let mint_policy: Option<crate::spaces::types::MintPolicy> =
-                match opts.get::<Option<String>>("mint_policy").ok().flatten() {
-                    Some(s) => {
-                        Some(crate::spaces::types::MintPolicy::parse(&s).ok_or_else(|| {
-                            mlua::Error::runtime(format!("update: invalid mint_policy '{s}'"))
-                        })?)
-                    }
-                    None => None,
-                };
+            let read_policy = policy_opt(&lua, &opts, "read_policy")?;
+            let write_policy = policy_opt(&lua, &opts, "write_policy")?;
             let app_access: Option<crate::spaces::types::AppAccess> =
                 match opts.get::<mlua::Value>("app_access") {
                     Ok(mlua::Value::Nil) | Err(_) => None,
@@ -286,9 +277,9 @@ impl mlua::UserData for LuaSpace {
                 &space_uri,
                 display_name,
                 description,
-                mint_policy,
+                read_policy,
+                write_policy,
                 app_access,
-                managing_app_did,
                 config,
             )
             .await
@@ -360,13 +351,11 @@ impl mlua::UserData for LuaSpace {
             if !spaces_enabled(&state).await {
                 return Err(mlua::Error::runtime("spaces feature is not enabled"));
             }
-            let access: Option<crate::spaces::types::SpaceAccess> =
+            let access: Option<crate::spaces::types::MemberAccess> =
                 match opts.get::<Option<String>>("access").ok().flatten() {
-                    Some(s) => {
-                        Some(crate::spaces::types::SpaceAccess::parse(&s).ok_or_else(|| {
-                            mlua::Error::runtime(format!("create_invite: invalid access '{s}'"))
-                        })?)
-                    }
+                    Some(s) => Some(member_access_from_str(&s).ok_or_else(|| {
+                        mlua::Error::runtime(format!("create_invite: invalid access '{s}'"))
+                    })?),
                     None => None,
                 };
             let max_uses: Option<i64> = opts.get("max_uses").ok();
@@ -378,11 +367,35 @@ impl mlua::UserData for LuaSpace {
             let result = lua.create_table()?;
             result.set("invite_id", invite.id)?;
             result.set("token", token)?;
-            result.set("access", invite.access.as_str())?;
+            result.set("access", invite.access.as_wire_str())?;
             result.set("max_uses", invite.max_uses)?;
             result.set("expires_at", invite.expires_at)?;
             Ok(mlua::Value::Table(result))
         });
+    }
+}
+
+/// Parse the Lua `access` shorthand into the member booleans.
+///
+/// Scripts pass a single word (`read`, `read_self`, `write` or `none`), which
+/// maps onto the read/write booleans.
+fn member_access_from_str(s: &str) -> Option<crate::spaces::types::MemberAccess> {
+    crate::spaces::types::MemberAccess::parse_wire(s)
+}
+
+/// Read an optional policy from a Lua table.
+///
+/// Policies are lexicon open unions (`{ ["$type"] = "...#publicPolicy" }`), so
+/// they come through as tables and are deserialized by serde, which also rejects
+/// any variant this host does not implement.
+fn policy_opt(
+    lua: &Lua,
+    opts: &mlua::Table,
+    key: &str,
+) -> mlua::Result<Option<crate::spaces::types::Policy>> {
+    match opts.get::<mlua::Value>(key) {
+        Ok(mlua::Value::Nil) | Err(_) => Ok(None),
+        Ok(value) => Ok(Some(lua.from_value(value)?)),
     }
 }
 
@@ -426,7 +439,7 @@ pub fn register_spaces_write_api(
     })?;
     spaces.set("get", get_fn)?;
 
-    // atproto.spaces.create{ type, skey, display_name?, description?, mint_policy?, app_access?, managing_app_did?, config? } -> LuaSpace
+    // atproto.spaces.create{ type, skey, display_name?, description?, read_policy?, write_policy?, app_access?, config? } -> LuaSpace
     let state_clone = state.clone();
     let caller_clone = caller_did.clone();
     let create_fn = lua.create_async_function(move |lua, opts: mlua::Table| {
@@ -445,16 +458,8 @@ pub fn register_spaces_write_api(
                 .map_err(|_| mlua::Error::runtime("create: skey is required"))?;
             let display_name: Option<String> = opts.get("display_name").ok();
             let description: Option<String> = opts.get("description").ok();
-            let mint_policy: Option<crate::spaces::types::MintPolicy> =
-                match opts.get::<Option<String>>("mint_policy").ok().flatten() {
-                    Some(s) => {
-                        Some(crate::spaces::types::MintPolicy::parse(&s).ok_or_else(|| {
-                            mlua::Error::runtime(format!("create: invalid mint_policy '{s}'"))
-                        })?)
-                    }
-                    None => None,
-                };
-            let managing_app_did: Option<String> = opts.get("managing_app_did").ok();
+            let read_policy = policy_opt(&lua, &opts, "read_policy")?;
+            let write_policy = policy_opt(&lua, &opts, "write_policy")?;
             // app_access and config accept structured tables; deserialize via serde.
             let app_access: Option<crate::spaces::types::AppAccess> =
                 match opts.get::<mlua::Value>("app_access") {
@@ -473,9 +478,9 @@ pub fn register_spaces_write_api(
                 &skey,
                 display_name,
                 description,
-                mint_policy,
+                read_policy,
+                write_policy,
                 app_access,
-                managing_app_did,
                 config,
             )
             .await
@@ -568,7 +573,9 @@ mod tests {
             logo_uri: None,
             tos_uri: None,
             policy_uri: None,
-            token_encryption_key: None,
+            // Spaces sign every commit with the `#atproto_space` key, which
+            // is stored encrypted, so space writes need this set.
+            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -777,7 +784,9 @@ mod tests {
             logo_uri: None,
             tos_uri: None,
             policy_uri: None,
-            token_encryption_key: None,
+            // Spaces sign every commit with the `#atproto_space` key, which
+            // is stored encrypted, so space writes need this set.
+            token_encryption_key: Some(crate::test_support::TEST_ENCRYPTION_KEY),
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
@@ -818,7 +827,7 @@ mod tests {
         })
         .expect("Failed to create test OAuth client");
 
-        AppState {
+        let state = AppState {
             config,
             http: reqwest::Client::new(),
             db: pool.clone(),
@@ -877,7 +886,11 @@ mod tests {
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
-        }
+        };
+
+        crate::test_support::provision_space_signing_key(&state).await;
+
+        state
     }
 
     /// Ensure the `spaces_enabled` feature flag reads `true` for this DB
@@ -953,9 +966,9 @@ mod tests {
             skey: skey.clone(),
             display_name: None,
             description: None,
-            mint_policy: crate::spaces::types::MintPolicy::MemberList,
+            read_policy: crate::spaces::types::Policy::MemberList,
+            write_policy: crate::spaces::types::Policy::MemberList,
             app_access: crate::spaces::types::AppAccess::default(),
-            managing_app_did: None,
             config: crate::spaces::types::SpaceConfig::default(),
             revision: None,
             created_at: crate::db::now_rfc3339(),
@@ -969,7 +982,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             space_id: space_id.clone(),
             did: member_did.clone(),
-            access: crate::spaces::types::SpaceAccess::Write,
+            access: crate::spaces::types::MemberAccess::WRITE,
             is_delegation: false,
             granted_by: None,
             created_at: crate::db::now_rfc3339(),
@@ -1354,17 +1367,17 @@ mod tests {
                     return atproto.spaces.create{{
                         type = "{type_nsid}",
                         skey = "{skey}-other",
-                        mint_policy = "not-a-real-policy",
+                        read_policy = {{ ["$type"] = "com.example.defs#notARealPolicy" }},
                     }}
                 end)
-                assert(not ok, "creating with an invalid mint_policy should fail")
+                assert(not ok, "creating with an unimplemented policy should fail")
                 return tostring(err)
             "#
         );
         let err: String = lua.load(&bad_policy_chunk).eval_async().await.unwrap();
         assert!(
-            err.to_lowercase().contains("invalid mint_policy"),
-            "expected an 'invalid mint_policy' error, got: {err}"
+            err.to_lowercase().contains("read_policy") || err.to_lowercase().contains("variant"),
+            "expected the error to name the offending policy, got: {err}"
         );
     }
 
@@ -1624,15 +1637,18 @@ mod tests {
         .unwrap();
         super::register_spaces_write_api(&lua, state_arc.clone(), Some(&authority_did)).unwrap();
 
-        // First SET managing_app_did to a real value and confirm it persisted, so
-        // the subsequent `false`-clear is a genuine round-trip (the seeded space
-        // has managing_app_did = None, so asserting None alone would pass even if
-        // the clear path were broken).
+        // Set a managing-app read policy and confirm it persisted, including the
+        // app nested inside the policy value rather than alongside it.
         let set_chunk = format!(
             r#"
                 local space = atproto.spaces.get("{space_uri}")
                 assert(space ~= nil, "space handle should not be nil")
-                assert(space:update{{ managing_app_did = "did:plc:managingapp" }} == true)
+                assert(space:update{{
+                    read_policy = {{
+                        ["$type"] = "com.atproto.simplespace.defs#managingAppPolicy",
+                        managingApp = "did:plc:managingapp",
+                    }},
+                }} == true)
             "#
         );
         lua.load(&set_chunk).exec_async().await.unwrap();
@@ -1640,9 +1656,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            after_set.managing_app_did,
-            Some("did:plc:managingapp".to_string()),
-            "expected managing_app_did to be set before the clear"
+            after_set.read_policy.managing_app(),
+            Some("did:plc:managingapp"),
+            "the managing app must round-trip inside the policy value"
         );
 
         let update_chunk = format!(
@@ -1650,10 +1666,12 @@ mod tests {
                 local space = atproto.spaces.get("{space_uri}")
                 assert(space ~= nil, "space handle should not be nil")
                 local ok = space:update{{
-                    app_access = {{ type = "allowList", allowed = {{ "did:plc:x" }} }},
+                    app_access = {{
+                        ["$type"] = "com.atproto.simplespace.defs#allowList",
+                        allowed = {{ "did:plc:x" }},
+                    }},
                     config = {{ membership_public = true, records_public = true, custom_flag = "yep" }},
-                    mint_policy = "public",
-                    managing_app_did = false,
+                    read_policy = {{ ["$type"] = "com.atproto.simplespace.defs#publicPolicy" }},
                 }}
                 assert(ok == true, "update should return true")
             "#
@@ -1683,13 +1701,11 @@ mod tests {
             Some(&serde_json::Value::String("yep".to_string())),
             "expected the flattened extra field to persist"
         );
+        assert_eq!(persisted.read_policy, crate::spaces::types::Policy::Public);
         assert_eq!(
-            persisted.mint_policy,
-            crate::spaces::types::MintPolicy::Public
-        );
-        assert_eq!(
-            persisted.managing_app_did, None,
-            "expected managing_app_did to be cleared by `false`"
+            persisted.read_policy.managing_app(),
+            None,
+            "replacing the policy wholesale drops the managing app with it"
         );
 
         // An invalid mint_policy raises before ever reaching the service layer.
@@ -1697,16 +1713,18 @@ mod tests {
             r#"
                 local space = atproto.spaces.get("{space_uri}")
                 local ok, err = pcall(function()
-                    return space:update{{ mint_policy = "bogus" }}
+                    return space:update{{
+                        read_policy = {{ ["$type"] = "com.example.defs#bespokePolicy" }},
+                    }}
                 end)
-                assert(not ok, "update with an invalid mint_policy should fail")
+                assert(not ok, "update with an unimplemented policy should fail")
                 return tostring(err)
             "#
         );
         let err: String = lua.load(&bad_policy_chunk).eval_async().await.unwrap();
         assert!(
-            err.to_lowercase().contains("invalid mint_policy"),
-            "expected an 'invalid mint_policy' error, got: {err}"
+            err.to_lowercase().contains("read_policy") || err.to_lowercase().contains("variant"),
+            "expected the error to name the offending policy, got: {err}"
         );
     }
 
@@ -1771,9 +1789,9 @@ mod tests {
             skey: skey.clone(),
             display_name: None,
             description: None,
-            mint_policy: crate::spaces::types::MintPolicy::MemberList,
+            read_policy: crate::spaces::types::Policy::MemberList,
+            write_policy: crate::spaces::types::Policy::MemberList,
             app_access: crate::spaces::types::AppAccess::default(),
-            managing_app_did: None,
             config: crate::spaces::types::SpaceConfig::default(),
             revision: None,
             created_at: crate::db::now_rfc3339(),

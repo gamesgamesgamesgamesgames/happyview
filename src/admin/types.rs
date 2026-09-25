@@ -62,6 +62,7 @@ pub(super) struct CollectionStat {
 pub(super) struct CreateBackfillBody {
     pub(super) collection: Option<String>,
     pub(super) did: Option<String>,
+    pub(super) dids: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -69,6 +70,7 @@ pub(crate) struct BackfillJob {
     pub(crate) id: String,
     pub(crate) collection: Option<String>,
     pub(crate) did: Option<String>,
+    pub(crate) scope: String,
     pub(crate) status: String,
     pub(crate) stage: String,
     pub(crate) total_repos: Option<i32>,

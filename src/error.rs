@@ -90,6 +90,16 @@ pub enum AppError {
     /// requested auth path is disabled until an operator fixes it. Renders as
     /// 503 so clients and the dashboard can distinguish it from a normal 401.
     ServerMisconfigured(String),
+    /// An XRPC error carrying a lexicon-defined code, e.g. `UnsupportedPolicy`.
+    ///
+    /// Clients switch on `error`, so a generic BadRequest is not
+    /// interchangeable: "this host will not enforce that policy" and "your
+    /// request was malformed" call for different handling.
+    XrpcError {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
     RateLimited {
         retry_after: u64,
         limit: u32,
@@ -107,6 +117,7 @@ impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AppError::Auth(msg) => write!(f, "auth error: {msg}"),
+            AppError::XrpcError { code, message, .. } => write!(f, "{code}: {message}"),
             AppError::AuthDpopNonce(nonce) => write!(f, "auth error: use_dpop_nonce ({nonce})"),
             AppError::BadGateway(msg) => write!(f, "bad gateway: {msg}"),
             AppError::BadRequest(msg) => write!(f, "bad request: {msg}"),
@@ -198,6 +209,17 @@ impl IntoResponse for AppError {
                 });
                 (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response()
             }
+            AppError::XrpcError {
+                status,
+                code,
+                message,
+            } => {
+                let body = serde_json::json!({
+                    "error": code,
+                    "message": message,
+                });
+                (status, axum::Json(body)).into_response()
+            }
             AppError::Internal(msg) => {
                 // Never leak internal details (SQL/driver errors, decryption
                 // failures, crypto/config state) to clients. Log the real message
@@ -244,6 +266,7 @@ impl IntoResponse for AppError {
                     | AppError::Internal(..)
                     | AppError::ServerMisconfigured(..)
                     | AppError::RateLimited { .. }
+                    | AppError::XrpcError { .. }
                     | AppError::ScriptError { .. } => unreachable!(),
                 };
 

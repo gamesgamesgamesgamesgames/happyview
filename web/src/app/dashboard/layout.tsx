@@ -8,6 +8,7 @@ import { useAuth } from "@/lib/auth-context"
 import { useConfig } from "@/lib/config-context"
 import { AppSidebar } from "@/components/app-sidebar"
 import { PluginUpdateProvider } from "@/components/plugin-update-provider"
+import { TelemetryPrompt } from "@/components/telemetry-prompt"
 import { VacuumPromptProvider } from "@/components/vacuum-prompt-provider"
 import { RestartProvider } from "@/lib/restart-context"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
@@ -70,6 +71,7 @@ export default function DashboardLayout({
             <SidebarInset>{children}</SidebarInset>
           </SidebarProvider>
         </VacuumPromptProvider>
+        <TelemetryPrompt />
         <Toaster />
       </RestartProvider>
     </PluginUpdateProvider>

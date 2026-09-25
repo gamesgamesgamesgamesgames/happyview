@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test"
+import { test, expect, type Page } from "@playwright/test"
 import pg from "pg"
 import { loginAsTestAdmin } from "./auth-helper"
 
@@ -22,6 +22,11 @@ async function enableSpacesFeature(): Promise<void> {
   }
 }
 
+const MEMBER_LIST_POLICY = {
+  $type: "com.atproto.simplespace.defs#memberListPolicy",
+}
+const PUBLIC_POLICY = { $type: "com.atproto.simplespace.defs#publicPolicy" }
+
 test.describe("Spaces API", () => {
   let createdSpaceUri: string | null = null
 
@@ -38,27 +43,35 @@ test.describe("Spaces API", () => {
     createdSpaceUri = null
   })
 
-  test("create space and verify it appears in listSpaces", async ({ page }) => {
-    const createResp = await page.request.post(
+  async function createSpace(
+    page: Page,
+    data: Record<string, unknown>,
+  ): Promise<string> {
+    const resp = await page.request.post(
       "/xrpc/com.atproto.simplespace.createSpace",
-      {
-        data: {
-          type: TEST_TYPE_NSID,
-          skey: TEST_SKEY,
-          displayName: "E2E Test Space",
-          mintPolicy: "member-list",
-        },
-      },
+      { data: { type: TEST_TYPE_NSID, ...data } },
     )
-
-    if (!createResp.ok()) {
-      const errBody = await createResp.text()
-      throw new Error(`createSpace failed (${createResp.status()}): ${errBody}`)
+    if (!resp.ok()) {
+      throw new Error(`createSpace failed (${resp.status()}): ${await resp.text()}`)
     }
-    const createBody = await createResp.json()
-    expect(createBody).toHaveProperty("uri")
-    expect(createBody.uri).toMatch(/^at:\/\/.+\/space\//)
-    createdSpaceUri = createBody.uri
+    return (await resp.json()).uri
+  }
+
+  async function getSpace(page: Page, uri: string) {
+    return page.request.get("/xrpc/com.atproto.simplespace.getSpace", {
+      params: { space: uri },
+    })
+  }
+
+  test("create space and verify it appears in listSpaces", async ({ page }) => {
+    const uri = await createSpace(page, {
+      skey: TEST_SKEY,
+      displayName: "E2E Test Space",
+      readPolicy: MEMBER_LIST_POLICY,
+      writePolicy: MEMBER_LIST_POLICY,
+    })
+    expect(uri).toMatch(/^at:\/\/.+\/space\//)
+    createdSpaceUri = uri
 
     const listResp = await page.request.get(
       "/xrpc/com.atproto.space.listSpaces",
@@ -74,41 +87,22 @@ test.describe("Spaces API", () => {
   })
 
   test("getSpace returns the created space", async ({ page }) => {
-    const createResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
-      {
-        data: {
-          type: TEST_TYPE_NSID,
-          skey: TEST_SKEY + "-get",
-          displayName: "GetSpace Test",
-        },
-      },
-    )
-    expect(createResp.ok()).toBe(true)
-    const { uri } = await createResp.json()
+    const uri = await createSpace(page, {
+      skey: TEST_SKEY + "-get",
+      displayName: "GetSpace Test",
+      readPolicy: MEMBER_LIST_POLICY,
+    })
     createdSpaceUri = uri
 
-    const getResp = await page.request.get("/xrpc/com.atproto.space.getSpace", {
-      params: { space: uri },
-    })
+    const getResp = await getSpace(page, uri)
     expect(getResp.ok()).toBe(true)
     const getBody = await getResp.json()
     expect(getBody.space.display_name).toBe("GetSpace Test")
-    expect(getBody.space.mint_policy).toBe("member-list")
+    expect(getBody.config.readPolicy).toEqual(MEMBER_LIST_POLICY)
   })
 
   test("create duplicate space returns conflict", async ({ page }) => {
-    const createResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
-      {
-        data: {
-          type: TEST_TYPE_NSID,
-          skey: TEST_SKEY + "-dup",
-        },
-      },
-    )
-    expect(createResp.ok()).toBe(true)
-    createdSpaceUri = (await createResp.json()).uri
+    createdSpaceUri = await createSpace(page, { skey: TEST_SKEY + "-dup" })
 
     const dupResp = await page.request.post(
       "/xrpc/com.atproto.simplespace.createSpace",
@@ -123,22 +117,10 @@ test.describe("Spaces API", () => {
   })
 
   test("updateSpace changes display name", async ({ page }) => {
-    const createResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
-      {
-        data: {
-          type: TEST_TYPE_NSID,
-          skey: TEST_SKEY + "-update",
-          displayName: "Before Update",
-        },
-      },
-    )
-    if (!createResp.ok()) {
-      throw new Error(
-        `createSpace failed (${createResp.status()}): ${await createResp.text()}`,
-      )
-    }
-    const { uri } = await createResp.json()
+    const uri = await createSpace(page, {
+      skey: TEST_SKEY + "-update",
+      displayName: "Before Update",
+    })
     createdSpaceUri = uri
 
     const updateResp = await page.request.post(
@@ -151,21 +133,7 @@ test.describe("Spaces API", () => {
   })
 
   test("deleteSpace removes the space", async ({ page }) => {
-    const createResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
-      {
-        data: {
-          type: TEST_TYPE_NSID,
-          skey: TEST_SKEY + "-delete",
-        },
-      },
-    )
-    if (!createResp.ok()) {
-      throw new Error(
-        `createSpace failed (${createResp.status()}): ${await createResp.text()}`,
-      )
-    }
-    const { uri } = await createResp.json()
+    const uri = await createSpace(page, { skey: TEST_SKEY + "-delete" })
 
     const deleteResp = await page.request.post(
       "/xrpc/com.atproto.simplespace.deleteSpace",
@@ -173,61 +141,46 @@ test.describe("Spaces API", () => {
     )
     expect(deleteResp.ok()).toBe(true)
 
-    const getResp = await page.request.get(
-      "/xrpc/com.atproto.space.getSpace",
-      { params: { space: uri } },
-    )
+    const getResp = await getSpace(page, uri)
     expect(getResp.status()).toBe(404)
   })
 
-  test("addMember returns 201", async ({ page }) => {
-    const createResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
+  test("putMember returns 201", async ({ page }) => {
+    const uri = await createSpace(page, { skey: TEST_SKEY + "-put-member" })
+    createdSpaceUri = uri
+
+    const putResp = await page.request.post(
+      "/xrpc/com.atproto.simplespace.putMember",
       {
         data: {
-          type: TEST_TYPE_NSID,
-          skey: TEST_SKEY + "-add-member",
+          space: uri,
+          did: "did:plc:test-member",
+          read: true,
+          write: false,
         },
       },
     )
-    if (!createResp.ok()) {
-      throw new Error(
-        `createSpace failed (${createResp.status()}): ${await createResp.text()}`,
-      )
-    }
-    const { uri } = await createResp.json()
-    createdSpaceUri = uri
-
-    const addResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.addMember",
-      { data: { space: uri, did: "did:plc:test-member", access: "read" } },
-    )
-    expect(addResp.status()).toBe(201)
-    const addBody = await addResp.json()
-    expect(addBody.member.did).toBe("did:plc:test-member")
+    expect(putResp.status()).toBe(201)
+    const putBody = await putResp.json()
+    expect(putBody.member.did).toBe("did:plc:test-member")
   })
 
   test("removeMember removes a previously added member", async ({ page }) => {
-    const createResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
+    const uri = await createSpace(page, { skey: TEST_SKEY + "-remove-member" })
+    createdSpaceUri = uri
+
+    const putResp = await page.request.post(
+      "/xrpc/com.atproto.simplespace.putMember",
       {
         data: {
-          type: TEST_TYPE_NSID,
-          skey: TEST_SKEY + "-remove-member",
+          space: uri,
+          did: "did:plc:test-member-rm",
+          read: true,
+          write: false,
         },
       },
     )
-    if (!createResp.ok()) {
-      throw new Error(
-        `createSpace failed (${createResp.status()}): ${await createResp.text()}`,
-      )
-    }
-    const { uri } = await createResp.json()
-    createdSpaceUri = uri
-
-    await page.request.post("/xrpc/com.atproto.simplespace.addMember", {
-      data: { space: uri, did: "did:plc:test-member-rm", access: "read" },
-    })
+    expect(putResp.ok()).toBe(true)
 
     const removeResp = await page.request.post(
       "/xrpc/com.atproto.simplespace.removeMember",
@@ -237,26 +190,21 @@ test.describe("Spaces API", () => {
   })
 
   test("listMembers includes added member", async ({ page }) => {
-    const createResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
+    const uri = await createSpace(page, { skey: TEST_SKEY + "-list-members" })
+    createdSpaceUri = uri
+
+    const putResp = await page.request.post(
+      "/xrpc/com.atproto.simplespace.putMember",
       {
         data: {
-          type: TEST_TYPE_NSID,
-          skey: TEST_SKEY + "-list-members",
+          space: uri,
+          did: "did:plc:test-member-list",
+          read: true,
+          write: true,
         },
       },
     )
-    if (!createResp.ok()) {
-      throw new Error(
-        `createSpace failed (${createResp.status()}): ${await createResp.text()}`,
-      )
-    }
-    const { uri } = await createResp.json()
-    createdSpaceUri = uri
-
-    await page.request.post("/xrpc/com.atproto.simplespace.addMember", {
-      data: { space: uri, did: "did:plc:test-member-list", access: "write" },
-    })
+    expect(putResp.ok()).toBe(true)
 
     const listResp = await page.request.get(
       "/xrpc/com.atproto.simplespace.listMembers",
@@ -265,72 +213,46 @@ test.describe("Spaces API", () => {
     expect(listResp.ok()).toBe(true)
     const listBody = await listResp.json()
     expect(listBody.members).toBeInstanceOf(Array)
-    const found = listBody.members.some(
+    const member = listBody.members.find(
       (m: { did: string }) => m.did === "did:plc:test-member-list",
     )
-    expect(found).toBe(true)
+    expect(member).toMatchObject({ read: true, write: true })
   })
 
-  test("getConfig returns space configuration", async ({ page }) => {
-    const createResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
-      {
-        data: {
-          type: TEST_TYPE_NSID,
-          skey: TEST_SKEY + "-get-config",
-          mintPolicy: "member-list",
-        },
-      },
-    )
-    if (!createResp.ok()) {
-      throw new Error(
-        `createSpace failed (${createResp.status()}): ${await createResp.text()}`,
-      )
-    }
-    const { uri } = await createResp.json()
+  test("getSpace returns the read and write policies", async ({ page }) => {
+    const uri = await createSpace(page, {
+      skey: TEST_SKEY + "-policies",
+      readPolicy: PUBLIC_POLICY,
+      writePolicy: MEMBER_LIST_POLICY,
+    })
     createdSpaceUri = uri
 
-    const configResp = await page.request.get(
-      "/xrpc/com.atproto.simplespace.getConfig",
-      { params: { space: uri } },
-    )
-    expect(configResp.ok()).toBe(true)
-    const configBody = await configResp.json()
-    expect(configBody.mintPolicy).toBe("member-list")
+    const getResp = await getSpace(page, uri)
+    expect(getResp.ok()).toBe(true)
+    const { config } = await getResp.json()
+    expect(config.readPolicy).toEqual(PUBLIC_POLICY)
+    expect(config.writePolicy).toEqual(MEMBER_LIST_POLICY)
   })
 
-  test("updateConfig changes mint policy", async ({ page }) => {
-    const createResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.createSpace",
-      {
-        data: {
-          type: TEST_TYPE_NSID,
-          skey: TEST_SKEY + "-update-config",
-          mintPolicy: "member-list",
-        },
-      },
-    )
-    if (!createResp.ok()) {
-      throw new Error(
-        `createSpace failed (${createResp.status()}): ${await createResp.text()}`,
-      )
-    }
-    const { uri } = await createResp.json()
+  test("updateSpace changes the read policy", async ({ page }) => {
+    const uri = await createSpace(page, {
+      skey: TEST_SKEY + "-update-policy",
+      readPolicy: MEMBER_LIST_POLICY,
+      writePolicy: MEMBER_LIST_POLICY,
+    })
     createdSpaceUri = uri
 
     const updateResp = await page.request.post(
-      "/xrpc/com.atproto.simplespace.updateConfig",
-      { data: { space: uri, mintPolicy: "public" } },
+      "/xrpc/com.atproto.simplespace.updateSpace",
+      { data: { space: uri, readPolicy: PUBLIC_POLICY } },
     )
     expect(updateResp.ok()).toBe(true)
 
-    const configResp = await page.request.get(
-      "/xrpc/com.atproto.simplespace.getConfig",
-      { params: { space: uri } },
-    )
-    expect(configResp.ok()).toBe(true)
-    const configBody = await configResp.json()
-    expect(configBody.mintPolicy).toBe("public")
+    const getResp = await getSpace(page, uri)
+    expect(getResp.ok()).toBe(true)
+    const { config } = await getResp.json()
+    expect(config.readPolicy).toEqual(PUBLIC_POLICY)
+    expect(config.writePolicy).toEqual(MEMBER_LIST_POLICY)
   })
 })
 

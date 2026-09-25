@@ -1,0 +1,32 @@
+{
+  "_comment": "Which tests check which happyproto/pds-test target. Keys are pds-test target names; tests are the cargo test targets run against its stack; env is the variable its compose file reads the image from, and the line in images.env that pins it.",
+  "zds": {
+    "compose": "docker-compose.zds.yml",
+    "tests": [
+      "spaces_zds_interop"
+    ],
+    "env": "ZDS_IMAGE"
+  },
+  "pdsjs": {
+    "compose": "docker-compose.pdsjs.yml",
+    "tests": [
+      "spaces_pdsjs_interop",
+      "spaces_migration_e2e"
+    ],
+    "env": "PDSJS_IMAGE"
+  },
+  "atproto-pds": {
+    "compose": "docker-compose.atproto-pds.yml",
+    "tests": [
+      "spaces_atproto_pds_interop"
+    ],
+    "env": "ATPROTO_PDS_IMAGE"
+  },
+  "pds-spaces-alpha": {
+    "compose": "docker-compose.spaces-alpha.yml",
+    "tests": [
+      "spaces_reference_interop"
+    ],
+    "env": "PDS_SPACES_ALPHA_IMAGE"
+  }
+}

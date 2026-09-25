@@ -56,7 +56,7 @@ pub fn build_user_agent(override_value: Option<String>, public_url: &str) -> Str
             return trimmed.to_string();
         }
     }
-    let version = env!("CARGO_PKG_VERSION");
+    let version = crate::version::version();
     let public_url = public_url.trim().trim_end_matches('/');
     if public_url.is_empty() {
         format!("HappyView/{version}")
@@ -69,7 +69,7 @@ pub fn build_user_agent(override_value: Option<String>, public_url: &str) -> Str
 /// (`Ok(None)` — encryption-dependent features are simply off) from "set but
 /// invalid" (`Err`), so a botched key is reported loudly at startup instead of
 /// being silently discarded and failing per-call later (M12).
-fn parse_token_encryption_key(raw: Option<&str>) -> Result<Option<[u8; 32]>, String> {
+pub fn parse_token_encryption_key(raw: Option<&str>) -> Result<Option<[u8; 32]>, String> {
     use base64::Engine;
     let raw = match raw {
         None | Some("") => return Ok(None),
@@ -723,17 +723,14 @@ mod tests {
             build_user_agent(None, "https://hv.example.com"),
             format!(
                 "HappyView/{} (+https://hv.example.com)",
-                env!("CARGO_PKG_VERSION")
+                crate::version::version()
             )
         );
     }
 
     #[test]
     fn user_agent_omits_url_when_public_url_is_empty() {
-        assert_eq!(
-            build_user_agent(None, ""),
-            format!("HappyView/{}", env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(build_user_agent(None, ""), crate::version::user_agent());
     }
 
     #[test]
