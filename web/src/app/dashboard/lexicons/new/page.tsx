@@ -67,12 +67,15 @@ export default function AddLexiconPage() {
   const canSuggest = nsid.length >= SUGGEST_MIN_QUERY_LENGTH;
   const suggestions = canSuggest ? fetchedSuggestions : [];
 
-  const mainType = resolved.nsid === nsid ? resolved.type : undefined;
   const networkJson = resolved.nsid === nsid ? resolved.json : "";
 
   const [lastValidType, setLastValidType] = useState<string | undefined>(
     undefined,
   );
+
+  const mainType = useMemo(() => {
+    return resolved.nsid === nsid ? resolved.type : undefined;
+  }, [resolved])
 
   const localMainType = useMemo(() => {
     try {
@@ -373,7 +376,18 @@ export default function AddLexiconPage() {
               )}
             </div>
 
-            <footer className="bg-sidebar-accent flex justify-end gap-2 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
+            <footer className="bg-sidebar-accent flex justify-end gap-6 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
+              {mainType === "record" && (
+                <div className="flex items-center gap-2">
+                  <Label htmlFor="backfill">Enable backfill for lexicon</Label>
+                  <Switch
+                    id="backfill"
+                    checked={backfill}
+                    onCheckedChange={setBackfill}
+                  />
+                </div>
+              )}
+
               <Button onClick={handleAddNetwork} disabled={submitting}>
                 {submitting ? "Adding..." : "Add"}
               </Button>
