@@ -22,19 +22,19 @@ use crate::resolve::resolve_nsid_authority;
 /// Single-value keys remain as JSON strings for backward compatibility.
 pub(crate) fn parse_query_params(query: &str) -> HashMap<String, Value> {
     let mut multi: HashMap<String, Vec<String>> = HashMap::new();
+    let decode = |raw: &str| {
+        let plus_decoded = raw.replace('+', " ");
+        urlencoding::decode(&plus_decoded)
+            .map(|decoded| decoded.into_owned())
+            .unwrap_or(plus_decoded)
+    };
     for pair in query.split('&') {
         if pair.is_empty() {
             continue;
         }
         let (key, value) = match pair.split_once('=') {
-            Some((k, v)) => (
-                urlencoding::decode(k).unwrap_or_default().into_owned(),
-                urlencoding::decode(v).unwrap_or_default().into_owned(),
-            ),
-            None => (
-                urlencoding::decode(pair).unwrap_or_default().into_owned(),
-                String::new(),
-            ),
+            Some((k, v)) => (decode(k), decode(v)),
+            None => (decode(pair), String::new()),
         };
         multi.entry(key).or_default().push(value);
     }
@@ -734,6 +734,32 @@ mod tests {
     fn parse_query_params_url_decodes() {
         let params = parse_query_params("uri=at%3A%2F%2Fdid%3Aplc%3Aabc%2Fcol%2Frkey");
         assert_eq!(params.get("uri").unwrap(), "at://did:plc:abc/col/rkey");
+    }
+
+    #[test]
+    fn parse_query_params_raw_plus_decodes_to_space() {
+        let key_params = parse_query_params("raw+key=value");
+        assert_eq!(key_params.keys().next().unwrap(), "raw key");
+
+        let value_params = parse_query_params("key=raw+value");
+        assert_eq!(value_params.get("key").unwrap(), "raw value");
+    }
+
+    #[test]
+    fn parse_query_params_encoded_plus_decodes_to_literal_plus() {
+        let key_params = parse_query_params("encoded%2Bkey=value");
+        assert_eq!(key_params.keys().next().unwrap(), "encoded+key");
+
+        let value_params = parse_query_params("key=encoded%2Bvalue");
+        assert_eq!(value_params.get("key").unwrap(), "encoded+value");
+    }
+
+    #[test]
+    fn parse_query_params_preserves_plus_normalized_input_on_decode_error() {
+        let params = parse_query_params("bad+%FF=value&key=bad+%FF&flag+%FF");
+        assert_eq!(params.get("bad %FF"), Some(&json!("value")));
+        assert_eq!(params.get("key"), Some(&json!("bad %FF")));
+        assert_eq!(params.get("flag %FF"), Some(&json!("")));
     }
 
     #[test]
