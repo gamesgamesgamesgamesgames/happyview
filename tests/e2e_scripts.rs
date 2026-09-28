@@ -809,6 +809,42 @@ async fn label_script_calling_record_save_dead_letters_with_clear_message() {
         "expected NO_PDS_AUTH message in dead-letter, got: {}",
         dl.0
     );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/dead-letters", app.admin_cookie()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list = json_body(resp).await;
+    let id = list["dead_letters"][0]["id"]
+        .as_str()
+        .expect("dead letter listed")
+        .to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get(
+            &format!("/admin/dead-letters/{id}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            &format!("/admin/dead-letters/{id}/retry"),
+            app.admin_cookie(),
+            &json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
