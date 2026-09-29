@@ -172,6 +172,20 @@ async fn count_records(app: &TestApp, uri: &str) -> i64 {
     count
 }
 
+/// A game-record event carrying the record's real CID, so it passes
+/// CID verification and reaches indexing.
+fn game_event(rkey: &str, action: &str, record: Value) -> RecordEvent {
+    let cid = happyview::cid_verify::compute_record_cid(&record).map(|c| c.to_string());
+    RecordEvent {
+        did: "did:plc:test".into(),
+        collection: "games.gamesgamesgamesgames.game".into(),
+        rkey: rkey.into(),
+        action: action.into(),
+        record: Some(record),
+        cid,
+    }
+}
+
 async fn fetch_record_body(app: &TestApp, uri: &str) -> Option<Value> {
     let row: Option<(String,)> = happyview::db::query_as(&adapt_sql(
         "SELECT record FROM happyview_records WHERE uri = ?",
@@ -407,14 +421,7 @@ async fn cascade_wildcard_runs_when_no_action_specific() {
 
     let _ = handle_record_event(
         &app.state,
-        &RecordEvent {
-            did: "did:plc:test".into(),
-            collection: "games.gamesgamesgamesgames.game".into(),
-            rkey: "rkey1".into(),
-            action: "create".into(),
-            record: Some(json!({"title": "test game"})),
-            cid: Some("bafy".into()),
-        },
+        &game_event("rkey1", "create", json!({"title": "test game"})),
     )
     .await;
 
@@ -450,14 +457,7 @@ async fn cascade_action_specific_wins_over_wildcard() {
     // Create action — specific should win.
     let _ = handle_record_event(
         &app.state,
-        &RecordEvent {
-            did: "did:plc:test".into(),
-            collection: "games.gamesgamesgamesgames.game".into(),
-            rkey: "rk-create".into(),
-            action: "create".into(),
-            record: Some(json!({"title": "x"})),
-            cid: Some("bafy".into()),
-        },
+        &game_event("rk-create", "create", json!({"title": "x"})),
     )
     .await;
     let body = fetch_record_body(
@@ -471,14 +471,7 @@ async fn cascade_action_specific_wins_over_wildcard() {
     // Update action — no record.update binding → cascades to wildcard.
     let _ = handle_record_event(
         &app.state,
-        &RecordEvent {
-            did: "did:plc:test".into(),
-            collection: "games.gamesgamesgamesgames.game".into(),
-            rkey: "rk-update".into(),
-            action: "update".into(),
-            record: Some(json!({"title": "x"})),
-            cid: Some("bafy".into()),
-        },
+        &game_event("rk-update", "update", json!({"title": "x"})),
     )
     .await;
     let body = fetch_record_body(
@@ -499,14 +492,7 @@ async fn no_script_passes_record_through_unchanged() {
 
     let _ = handle_record_event(
         &app.state,
-        &RecordEvent {
-            did: "did:plc:test".into(),
-            collection: "games.gamesgamesgamesgames.game".into(),
-            rkey: "rk1".into(),
-            action: "create".into(),
-            record: Some(json!({"title": "untouched"})),
-            cid: Some("bafy".into()),
-        },
+        &game_event("rk1", "create", json!({"title": "untouched"})),
     )
     .await;
     let body = fetch_record_body(
@@ -534,14 +520,7 @@ async fn record_create_returning_nil_skips_indexing() {
 
     let _ = handle_record_event(
         &app.state,
-        &RecordEvent {
-            did: "did:plc:test".into(),
-            collection: "games.gamesgamesgamesgames.game".into(),
-            rkey: "rk1".into(),
-            action: "create".into(),
-            record: Some(json!({"title": "doomed"})),
-            cid: Some("bafy".into()),
-        },
+        &game_event("rk1", "create", json!({"title": "doomed"})),
     )
     .await;
     assert_eq!(
@@ -575,14 +554,7 @@ async fn record_event_script_log_writes_event_log_row() {
 
     let _ = handle_record_event(
         &app.state,
-        &RecordEvent {
-            did: "did:plc:test".into(),
-            collection: "games.gamesgamesgamesgames.game".into(),
-            rkey: "rk1".into(),
-            action: "create".into(),
-            record: Some(json!({"title": "anything"})),
-            cid: Some("bafy".into()),
-        },
+        &game_event("rk1", "create", json!({"title": "anything"})),
     )
     .await;
 
@@ -706,6 +678,10 @@ async fn label_script_can_redact_record_via_save_local() {
 #[ignore]
 async fn label_script_uri_routes_actor_special_case() {
     let app = TestApp::new().await;
+    happyview::db::query("DROP TABLE IF EXISTS script_sentinel")
+        .execute(&app.state.db)
+        .await
+        .unwrap();
 
     create_script(
         &app,
@@ -714,7 +690,7 @@ async fn label_script_uri_routes_actor_special_case() {
         // internal HappyView tables) so we can detect that the script ran.
         "function handle() \
             db.raw('CREATE TABLE IF NOT EXISTS script_sentinel (k TEXT)') \
-            db.raw('INSERT INTO script_sentinel (k) VALUES (?)', {'fired'}) \
+            db.raw('INSERT INTO script_sentinel (k) VALUES (\\'fired\\')') \
             return event \
          end",
     )
@@ -877,14 +853,7 @@ async fn record_event_script_can_call_record_delete_local() {
 
     let _ = handle_record_event(
         &app.state,
-        &RecordEvent {
-            did: "did:plc:test".into(),
-            collection: "games.gamesgamesgamesgames.game".into(),
-            rkey: "new1".into(),
-            action: "create".into(),
-            record: Some(json!({"title": "fresh game"})),
-            cid: Some("bafy".into()),
-        },
+        &game_event("new1", "create", json!({"title": "fresh game"})),
     )
     .await;
 
