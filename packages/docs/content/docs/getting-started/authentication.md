@@ -133,8 +133,8 @@ Queries that don't care who is calling need nothing more than the client key. Pr
 XRPC routes accept several auth methods, resolved in this order:
 
 1. **DPoP auth** (`Authorization: DPoP <token>` + `DPoP` proof header + `X-Client-Key`) — used by third-party apps that went through the [DPoP key provisioning](#dpop-key-provisioning-for-third-party-apps) flow.
-2. **Bearer space credential** (`Authorization: Bearer <space_credential_jwt>`) — a signed JWT granting access to a specific space; accepted on space routes.
-3. **Bearer service auth JWT** (`Authorization: Bearer <service_auth_jwt>`) — a standard atproto inter-service JWT signed by a DID's atproto signing key; the caller is identified as the issuer DID.
+2. **Bearer service auth JWT** (`Authorization: Bearer <service_auth_jwt>`) — a standard atproto inter-service JWT signed by a DID's atproto signing key; the caller is identified as the issuer DID. The token's `lxm`, when present, must name the method being called.
+3. **Space credential** (`Authorization: Atproto-Space <credential>`) — a signed JWT granting read access to a specific space, sent with an `Atproto-Space-Audience` header and an HTTP Message Signature by the key the credential is bound to; accepted on space routes. See [Space credentials](../experimental/spaces/credentials.md).
 4. **Cookie session** — when no `Authorization` header is present, HappyView falls back to the signed session cookie set after dashboard login.
 5. **Anonymous** — if none of the above is present, the request proceeds with no identity. The endpoint's Lua script determines whether that is acceptable.
 

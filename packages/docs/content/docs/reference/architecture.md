@@ -294,17 +294,17 @@ sequenceDiagram
 | Column            | Type        | Description                                      |
 | ----------------- | ----------- | ------------------------------------------------ |
 | `id`              | text (PK)   | Internal space identifier                        |
-| `did`             | text        | The space's own DID                              |
-| `authority_did`   | text        | DID that controls the space                      |
-| `creator_did`     | text        | DID of the user who created the space            |
+| `did`             | text        | DID in the space URI; the authority's DID        |
+| `authority_did`   | text        | The space authority: the instance DID, or the creator's DID when the instance has no service identity |
+| `creator_did`     | text        | DID of the user who created and administers the space |
 | `type_nsid`       | text        | Space type as an NSID                            |
 | `skey`            | text        | Space key (differentiates spaces of the same type) |
 | `display_name`    | text        | Human-readable name (optional)                   |
 | `description`     | text        | Description (optional)                           |
-| `mint_policy`     | text        | `member-list`, `public`, or `managing-app`       |
-| `app_access`      | text (JSON) | `{"type":"open"}` or `{"type":"allowList","allowed":[...]}` |
-| `managing_app_did`| text        | DID of the managing app (optional)               |
-| `config`          | text (JSON) | Space config (`membershipPublic`, `recordsPublic`, extras) |
+| `read_policy`     | text (JSON) | Policy gating credential issuance (`$type`-tagged) |
+| `write_policy`    | text (JSON) | Policy gating which writers the space tracks (`$type`-tagged) |
+| `app_access`      | text (JSON) | `{"$type":"com.atproto.simplespace.defs#open"}` or `{"$type":"com.atproto.simplespace.defs#allowList","allowed":[...]}` |
+| `config`          | text (JSON) | Space config (`membership_public`, `records_public`, extras) |
 | `revision`        | text        | Current revision TID                             |
 | `created_at`      | text        |                                                  |
 | `updated_at`      | text        |                                                  |
@@ -316,7 +316,9 @@ sequenceDiagram
 | `id`           | text (PK)   |                                                  |
 | `space_id`     | text (FK)   | References `spaces.id`                           |
 | `did`          | text        | Member's DID (or space URI for delegation)       |
-| `access`       | text        | `read`, `read_self`, or `write`                  |
+| `can_read`     | boolean     | Whether the member can read the space            |
+| `can_write`    | boolean     | Whether the member can write to the space        |
+| `read_self`    | boolean     | Whether reads are limited to the member's own records |
 | `is_delegation`| boolean     | Whether this member is a delegated space         |
 | `granted_by`   | text        | DID of who granted membership                    |
 | `created_at`   | text        |                                                  |
@@ -372,10 +374,30 @@ sequenceDiagram
 | `id`           | text (PK)   |                                                  |
 | `space_id`     | text (FK)   | References `spaces.id`                           |
 | `service`      | text        | Subscribing service; one registration per space  |
-| `endpoint`     | text        | Notification endpoint URL                        |
+| `endpoint`     | text        | Resolved service endpoint, or webhook URL        |
+| `delivery`     | text        | `xrpc` (`notifyWrite` calls) or `webhook` (legacy payload) |
 | `registered_by`| text        | DID of who registered                            |
 | `expires_at`   | text        | When the registration expires                    |
 | `created_at`   | text        |                                                  |
+
+### `space_writers`
+
+| Column       | Type      | Description                                      |
+| ------------ | --------- | ------------------------------------------------ |
+| `space_id`   | text (FK) | References `spaces.id`                           |
+| `repo_did`   | text      | DID of a repo the space tracks                   |
+| `rev`        | text      | The repo's latest revision                       |
+| `hash`       | blob      | The repo's latest LtHash digest                  |
+| `space_rev`  | text      | Space revision assigned to this update           |
+| `updated_at` | text      |                                                  |
+
+### `space_delegation_uses`
+
+| Column       | Type      | Description                                      |
+| ------------ | --------- | ------------------------------------------------ |
+| `issuer`     | text      | Issuer of an exchanged delegation token          |
+| `jti`        | text      | The token's `jti`; a token is exchanged once     |
+| `expires_at` | text      | When the token expires                           |
 
 ### `space_invites`
 
@@ -400,7 +422,9 @@ sequenceDiagram
 | `space_id`   | text (FK) | References `spaces.id`                           |
 | `issued_to`  | text      | DID the credential was issued to                 |
 | `token_hash` | text      | Hash of the credential token                     |
+| `jti`        | text      | The credential's `jti` claim                     |
 | `expires_at` | text      | When the credential expires                      |
+| `revoked_at` | text?     | When the credential was revoked                  |
 | `created_at` | text      |                                                  |
 
 ### `space_dids`
