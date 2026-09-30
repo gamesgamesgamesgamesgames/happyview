@@ -204,8 +204,8 @@ async fn fetch_record_body(app: &TestApp, uri: &str) -> Option<Value> {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn create_then_get_script_round_trips() {
+    common::require_db!();
     let app = TestApp::new().await;
     let id = "record.create:com.example.thing";
     create_script(&app, id, "function handle() return event.record end").await;
@@ -227,8 +227,8 @@ async fn create_then_get_script_round_trips() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn list_scripts_returns_all_rows() {
+    common::require_db!();
     let app = TestApp::new().await;
     create_script(
         &app,
@@ -257,8 +257,8 @@ async fn list_scripts_returns_all_rows() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn create_rejects_invalid_trigger_prefix() {
+    common::require_db!();
     let app = TestApp::new().await;
     let resp = app
         .router
@@ -284,8 +284,8 @@ async fn create_rejects_invalid_trigger_prefix() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn create_rejects_invalid_nsid_suffix() {
+    common::require_db!();
     let app = TestApp::new().await;
     // Single-segment NSID — too few segments.
     let resp = app
@@ -306,8 +306,8 @@ async fn create_rejects_invalid_nsid_suffix() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn create_allows_labeler_apply_actor_special_case() {
+    common::require_db!();
     let app = TestApp::new().await;
     let resp = app
         .router
@@ -327,8 +327,8 @@ async fn create_allows_labeler_apply_actor_special_case() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn create_rejects_invalid_lua_body() {
+    common::require_db!();
     let app = TestApp::new().await;
     let resp = app
         .router
@@ -348,8 +348,8 @@ async fn create_rejects_invalid_lua_body() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn patch_updates_body() {
+    common::require_db!();
     let app = TestApp::new().await;
     let id = "record.create:com.example.thing";
     create_script(&app, id, "function handle() return event.record end").await;
@@ -371,8 +371,8 @@ async fn patch_updates_body() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn delete_removes_script() {
+    common::require_db!();
     let app = TestApp::new().await;
     let id = "record.delete:com.example.thing";
     create_script(&app, id, "function handle() return event.record end").await;
@@ -406,8 +406,8 @@ async fn delete_removes_script() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn cascade_wildcard_runs_when_no_action_specific() {
+    common::require_db!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
@@ -436,8 +436,8 @@ async fn cascade_wildcard_runs_when_no_action_specific() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn cascade_action_specific_wins_over_wildcard() {
+    common::require_db!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
@@ -485,8 +485,8 @@ async fn cascade_action_specific_wins_over_wildcard() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn no_script_passes_record_through_unchanged() {
+    common::require_db!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
@@ -506,8 +506,8 @@ async fn no_script_passes_record_through_unchanged() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_create_returning_nil_skips_indexing() {
+    common::require_db!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
@@ -540,8 +540,8 @@ async fn record_create_returning_nil_skips_indexing() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_event_script_log_writes_event_log_row() {
+    common::require_db!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
@@ -584,8 +584,8 @@ async fn record_event_script_log_writes_event_log_row() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn label_script_can_drop_record_via_record_delete_local() {
+    common::require_db!();
     let app = TestApp::new().await;
 
     let uri = "at://did:plc:victim/app.bsky.feed.post/rkey1";
@@ -627,8 +627,8 @@ async fn label_script_can_drop_record_via_record_delete_local() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn label_script_can_redact_record_via_save_local() {
+    common::require_db!();
     let app = TestApp::new().await;
 
     let uri = "at://did:plc:author/app.bsky.feed.post/rkey1";
@@ -675,8 +675,8 @@ async fn label_script_can_redact_record_via_save_local() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn label_script_uri_routes_actor_special_case() {
+    common::require_db!();
     let app = TestApp::new().await;
     happyview::db::query("DROP TABLE IF EXISTS script_sentinel")
         .execute(&app.state.db)
@@ -725,8 +725,8 @@ async fn label_script_uri_routes_actor_special_case() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn label_script_calling_record_save_dead_letters_with_clear_message() {
+    common::require_db!();
     let app = TestApp::new().await;
 
     let uri = "at://did:plc:author/app.bsky.feed.post/rkey1";
@@ -809,7 +809,7 @@ async fn label_script_calling_record_save_dead_letters_with_clear_message() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    
+
     let resp = app
         .router
         .clone()
@@ -825,8 +825,8 @@ async fn label_script_calling_record_save_dead_letters_with_clear_message() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_event_script_can_call_record_delete_local() {
+    common::require_db!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
@@ -874,8 +874,8 @@ async fn record_event_script_can_call_record_delete_local() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn no_auth_returns_401() {
+    common::require_db!();
     let app = TestApp::new().await;
     let resp = app
         .router
