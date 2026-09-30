@@ -92,38 +92,6 @@ fn check_raw_sql_tables(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_valid_json_field_path(path: &str) -> bool {
-    if path.is_empty() {
-        return false;
-    }
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            return false;
-        }
-        let bracket_start = segment.find('[').unwrap_or(segment.len());
-        let ident = &segment[..bracket_start];
-        if ident.is_empty() || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return false;
-        }
-        let mut rest = &segment[bracket_start..];
-        while !rest.is_empty() {
-            if !rest.starts_with('[') {
-                return false;
-            }
-            let close = match rest.find(']') {
-                Some(i) => i,
-                None => return false,
-            };
-            let idx = &rest[1..close];
-            if idx.is_empty() || !idx.chars().all(|c| c.is_ascii_digit()) {
-                return false;
-            }
-            rest = &rest[close + 1..];
-        }
-    }
-    true
-}
-
 #[derive(Debug)]
 enum FilterNode {
     Condition {
@@ -145,7 +113,7 @@ fn parse_filter_node(table: &mlua::Table, depth: u8) -> LuaResult<FilterNode> {
     }
 
     if let Ok(field) = table.get::<String>("field") {
-        if !is_valid_json_field_path(&field) {
+        if !crate::db::is_valid_json_field_path(&field) {
             return Err(mlua::Error::runtime(format!(
                 "invalid filter field '{field}': use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]')",
             )));
@@ -242,7 +210,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
             let cursor_str: Option<String> = opts.get("cursor").ok();
 
             if let Some(ref field) = sort
-                && !is_valid_json_field_path(field)
+                && !crate::db::is_valid_json_field_path(field)
             {
                 return Err(mlua::Error::runtime(
                     "invalid sort field: use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]')",
@@ -438,7 +406,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
             let query: String = opts.get("query")?;
             let limit: i64 = opts.get::<i64>("limit").unwrap_or(10).min(100);
 
-            if !is_valid_json_field_path(&field) {
+            if !crate::db::is_valid_json_field_path(&field) {
                 return Err(mlua::Error::runtime(
                     "invalid search field: use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]')",
                 ));
@@ -1049,27 +1017,29 @@ mod tests {
 
     #[test]
     fn valid_json_field_paths() {
-        assert!(super::is_valid_json_field_path("name"));
-        assert!(super::is_valid_json_field_path("author_name"));
-        assert!(super::is_valid_json_field_path("author.handle"));
-        assert!(super::is_valid_json_field_path("tags[0]"));
-        assert!(super::is_valid_json_field_path("data[0][1]"));
-        assert!(super::is_valid_json_field_path("author.websites[0].url"));
-        assert!(super::is_valid_json_field_path("a.b.c.d.e"));
+        assert!(crate::db::is_valid_json_field_path("name"));
+        assert!(crate::db::is_valid_json_field_path("author_name"));
+        assert!(crate::db::is_valid_json_field_path("author.handle"));
+        assert!(crate::db::is_valid_json_field_path("tags[0]"));
+        assert!(crate::db::is_valid_json_field_path("data[0][1]"));
+        assert!(crate::db::is_valid_json_field_path(
+            "author.websites[0].url"
+        ));
+        assert!(crate::db::is_valid_json_field_path("a.b.c.d.e"));
     }
 
     #[test]
     fn invalid_json_field_paths() {
-        assert!(!super::is_valid_json_field_path(""));
-        assert!(!super::is_valid_json_field_path(".name"));
-        assert!(!super::is_valid_json_field_path("name."));
-        assert!(!super::is_valid_json_field_path("name..foo"));
-        assert!(!super::is_valid_json_field_path("[0]"));
-        assert!(!super::is_valid_json_field_path("name[]"));
-        assert!(!super::is_valid_json_field_path("name[abc]"));
-        assert!(!super::is_valid_json_field_path("name; DROP TABLE"));
-        assert!(!super::is_valid_json_field_path("name'OR 1=1"));
-        assert!(!super::is_valid_json_field_path("na-me"));
+        assert!(!crate::db::is_valid_json_field_path(""));
+        assert!(!crate::db::is_valid_json_field_path(".name"));
+        assert!(!crate::db::is_valid_json_field_path("name."));
+        assert!(!crate::db::is_valid_json_field_path("name..foo"));
+        assert!(!crate::db::is_valid_json_field_path("[0]"));
+        assert!(!crate::db::is_valid_json_field_path("name[]"));
+        assert!(!crate::db::is_valid_json_field_path("name[abc]"));
+        assert!(!crate::db::is_valid_json_field_path("name; DROP TABLE"));
+        assert!(!crate::db::is_valid_json_field_path("name'OR 1=1"));
+        assert!(!crate::db::is_valid_json_field_path("na-me"));
     }
 
     #[tokio::test]
