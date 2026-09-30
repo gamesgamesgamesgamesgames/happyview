@@ -956,8 +956,8 @@ pub async fn register_notify(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO happyview_space_notify_registrations (id, space_id, service, endpoint, registered_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT (space_id, service) DO UPDATE SET id = excluded.id, endpoint = excluded.endpoint, registered_by = excluded.registered_by, expires_at = excluded.expires_at, created_at = excluded.created_at",
+        "INSERT INTO happyview_space_notify_registrations (id, space_id, service, endpoint, registered_by, expires_at, created_at, delivery) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (space_id, service) DO UPDATE SET id = excluded.id, endpoint = excluded.endpoint, registered_by = excluded.registered_by, expires_at = excluded.expires_at, created_at = excluded.created_at, delivery = excluded.delivery",
         backend,
     );
 
@@ -969,6 +969,7 @@ pub async fn register_notify(
         .bind(&reg.registered_by)
         .bind(&reg.expires_at)
         .bind(&now)
+        .bind(reg.delivery.as_str())
         .execute(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to register notify: {e}")))?;
@@ -983,7 +984,7 @@ pub async fn list_notify_registrations(
     space_id: &str,
 ) -> Result<Vec<NotifyRegistration>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, service, endpoint, registered_by, expires_at, created_at FROM happyview_space_notify_registrations WHERE space_id = ? AND expires_at > ? ORDER BY created_at ASC",
+        "SELECT id, space_id, service, endpoint, registered_by, expires_at, created_at, delivery FROM happyview_space_notify_registrations WHERE space_id = ? AND expires_at > ? ORDER BY created_at ASC",
         backend,
     );
 
@@ -1016,7 +1017,16 @@ pub async fn delete_notify_registration(
     Ok(result.rows_affected() > 0)
 }
 
-type NotifyRow = (String, String, String, String, String, String, String);
+type NotifyRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 fn parse_notify_row(r: NotifyRow) -> NotifyRegistration {
     NotifyRegistration {
@@ -1027,6 +1037,7 @@ fn parse_notify_row(r: NotifyRow) -> NotifyRegistration {
         registered_by: r.4,
         expires_at: r.5,
         created_at: r.6,
+        delivery: NotifyDelivery::parse(&r.7),
     }
 }
 

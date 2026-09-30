@@ -1,11 +1,12 @@
 use crate::db::{DatabaseBackend, now_rfc3339};
 use crate::error::AppError;
 use crate::spaces::db;
-use crate::spaces::types::NotifyRegistration;
+use crate::spaces::types::{NotifyDelivery, NotifyRegistration};
 use uuid::Uuid;
 
 const NOTIFY_REGISTRATION_TTL_SECS: u64 = 24 * 60 * 60; // 24 hours
 
+/// Store a registration, returning its id and expiry.
 pub async fn register(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -13,7 +14,8 @@ pub async fn register(
     service_did: &str,
     endpoint: &str,
     registered_by: &str,
-) -> Result<String, AppError> {
+    delivery: NotifyDelivery,
+) -> Result<(String, String), AppError> {
     let id = Uuid::new_v4().to_string();
     let now = now_rfc3339();
     let expires_at = {
@@ -32,11 +34,12 @@ pub async fn register(
         service: service_did.to_string(),
         endpoint: endpoint.to_string(),
         registered_by: registered_by.to_string(),
-        expires_at,
+        expires_at: expires_at.clone(),
         created_at: now,
+        delivery,
     };
     db::register_notify(pool, backend, &reg).await?;
-    Ok(id)
+    Ok((id, expires_at))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -60,7 +63,10 @@ pub async fn dispatch_write_notification(
         "cid": cid,
     });
 
-    for reg in &registrations {
+    for reg in registrations
+        .iter()
+        .filter(|r| r.delivery == NotifyDelivery::Webhook)
+    {
         let _ = http.post(&reg.endpoint).json(&payload).send().await;
     }
 

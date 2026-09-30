@@ -49,8 +49,11 @@ struct ListRepoOpsQuery {
 #[serde(rename_all = "camelCase")]
 struct RegisterNotifyInput {
     space: String,
-    service_did: String,
-    endpoint: String,
+    /// The subscribing service identifier, resolved to its endpoint.
+    service: Option<String>,
+    /// The legacy shape names a DID and a webhook URL. Accepted until v3.
+    service_did: Option<String>,
+    endpoint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1516,17 +1519,48 @@ async fn register_notify(
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &input.space).await?;
 
-    let id = notifications::register(
+    if let Some(service) = &input.service {
+        let endpoint = crate::spaces::auth::resolve_service_identifier(
+            &state.http,
+            &state.config.plc_url,
+            service,
+        )
+        .await
+        .ok_or_else(|| AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "ServiceNotResolvable",
+            message: format!("could not resolve a service endpoint for {service}"),
+        })?;
+        let (_, expires_at) = notifications::register(
+            &state.db,
+            state.db_backend,
+            &space.id,
+            service,
+            &endpoint,
+            &did,
+            NotifyDelivery::Xrpc,
+        )
+        .await?;
+        return Ok(Json(serde_json::json!({ "expiresAt": expires_at })));
+    }
+
+    let (Some(service_did), Some(endpoint)) = (&input.service_did, &input.endpoint) else {
+        return Err(AppError::BadRequest("service is required".into()));
+    };
+    let (id, expires_at) = notifications::register(
         &state.db,
         state.db_backend,
         &space.id,
-        &input.service_did,
-        &input.endpoint,
+        service_did,
+        endpoint,
         &did,
+        NotifyDelivery::Webhook,
     )
     .await?;
 
-    Ok(Json(serde_json::json!({ "id": id })))
+    Ok(Json(
+        serde_json::json!({ "id": id, "expiresAt": expires_at }),
+    ))
 }
 
 /// Withdraw a write-notification registration.

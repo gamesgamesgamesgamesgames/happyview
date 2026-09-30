@@ -494,13 +494,14 @@ async fn register_and_list_notify_registrations() {
     let endpoint = "https://service.example.com/notify";
     let registered_by = "did:plc:notify-owner";
 
-    let reg_id = notifications::register(
+    let (reg_id, _) = notifications::register(
         &pool,
         backend,
         &space_id,
         service_did,
         endpoint,
         registered_by,
+        NotifyDelivery::Webhook,
     )
     .await
     .expect("register failed");
@@ -534,13 +535,14 @@ async fn delete_notify_registration_removes_it() {
         .await
         .expect("create_space failed");
 
-    let reg_id = notifications::register(
+    let (reg_id, _) = notifications::register(
         &pool,
         backend,
         &space_id,
         "did:plc:svc",
         "https://svc.example.com/n",
         "did:plc:del-notify-owner",
+        NotifyDelivery::Webhook,
     )
     .await
     .expect("register failed");
@@ -592,6 +594,7 @@ async fn a_registered_syncer_is_notified_of_every_writer() {
         "did:web:syncer.example",
         &syncer.uri(),
         "did:web:syncer.example",
+        NotifyDelivery::Webhook,
     )
     .await
     .expect("register failed");
@@ -635,6 +638,7 @@ async fn registering_again_replaces_the_earlier_registration() {
             "did:web:syncer.example",
             endpoint,
             "did:web:syncer.example",
+            NotifyDelivery::Webhook,
         )
         .await
         .expect("register failed");
@@ -677,6 +681,7 @@ async fn expired_registrations_are_not_listed() {
             registered_by: "did:web:lapsed.example".into(),
             expires_at: "2020-01-01T00:00:00+00:00".into(),
             created_at: now_rfc3339(),
+            delivery: NotifyDelivery::Webhook,
         },
     )
     .await

@@ -539,6 +539,81 @@ async fn unregister_notify_refuses_another_services_registration() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+/// Publish a DID document naming `service` at `endpoint` on the mock PLC.
+async fn publish_service(app: &TestApp, did: &str, fragment: &str, endpoint: &str) {
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    plc_store.write().await.insert(
+        did.to_string(),
+        json!({
+            "id": did,
+            "verificationMethod": [],
+            "service": [{
+                "id": fragment,
+                "type": "AtprotoSpaceSyncer",
+                "serviceEndpoint": endpoint,
+            }],
+        }),
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn register_notify_accepts_a_service_identifier() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("auth");
+    let syncer = rand_did("syncer");
+    let space = create_space(&app, &authority, &rand_skey("s")).await;
+    publish_service(
+        &app,
+        &syncer,
+        "#atproto_space_syncer",
+        "https://syncer.example",
+    )
+    .await;
+
+    let resp = post(
+        &app,
+        "com.atproto.space.registerNotify",
+        &syncer,
+        json!({ "space": space, "service": format!("{syncer}#atproto_space_syncer") }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_of(resp).await["expiresAt"].is_string());
+}
+
+#[tokio::test]
+#[serial]
+async fn register_notify_rejects_a_service_it_cannot_resolve() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("auth");
+    let syncer = rand_did("syncer");
+    let space = create_space(&app, &authority, &rand_skey("s")).await;
+    publish_service(
+        &app,
+        &syncer,
+        "#atproto_space_syncer",
+        "https://syncer.example",
+    )
+    .await;
+
+    let resp = post(
+        &app,
+        "com.atproto.space.registerNotify",
+        &syncer,
+        json!({ "space": space, "service": format!("{syncer}#not_published") }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_of(resp).await["error"], json!("ServiceNotResolvable"));
+}
+
 // Real CIDs: record values must encode as DAG-CBOR, and a malformed `$link` is
 // rejected before the record is ever stored.
 const MY_BLOB_CID: &str = "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy";

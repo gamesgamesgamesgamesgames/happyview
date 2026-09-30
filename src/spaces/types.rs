@@ -289,6 +289,34 @@ pub struct NotifyRegistration {
     pub registered_by: String,
     pub expires_at: String,
     pub created_at: String,
+    pub delivery: NotifyDelivery,
+}
+
+/// How a registration receives notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyDelivery {
+    /// `com.atproto.space.notifyWrite` at the service's resolved endpoint.
+    Xrpc,
+    /// The legacy payload, posted to the URL given at registration. Accepted
+    /// until v3.
+    Webhook,
+}
+
+impl NotifyDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Xrpc => "xrpc",
+            Self::Webhook => "webhook",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "xrpc" => Self::Xrpc,
+            _ => Self::Webhook,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -338,6 +338,50 @@ pub(crate) async fn resolve_did_service_endpoint(
     plc_url: &str,
     did: &str,
 ) -> Result<String, AppError> {
+    find_service(
+        &fetch_did_services(http, plc_url, did).await?,
+        did,
+        "atproto_pds",
+    )
+    .ok_or_else(|| AppError::Internal(format!("no #atproto_pds service in DID doc for {did}")))
+}
+
+/// Resolve a service identifier, a DID with an optional service fragment such
+/// as `did:web:syncer.example#atproto_space_syncer`, to its endpoint. A bare DID
+/// names an account, which is served by its PDS.
+///
+/// `None` when the DID does not resolve or publishes no such service.
+pub(crate) async fn resolve_service_identifier(
+    http: &reqwest::Client,
+    plc_url: &str,
+    service: &str,
+) -> Option<String> {
+    let (did, fragment) = service.split_once('#').unwrap_or((service, "atproto_pds"));
+    match fetch_did_services(http, plc_url, did).await {
+        Ok(services) => find_service(&services, did, fragment),
+        Err(e) => {
+            tracing::warn!(service, error = %e, "could not resolve service identifier");
+            None
+        }
+    }
+}
+
+/// A service entry's id may be relative (`#frag`) or carry the DID.
+fn find_service(services: &[(String, String)], did: &str, fragment: &str) -> Option<String> {
+    let relative = format!("#{fragment}");
+    let absolute = format!("{did}#{fragment}");
+    services
+        .iter()
+        .find(|(id, _)| *id == relative || *id == absolute)
+        .map(|(_, endpoint)| endpoint.clone())
+}
+
+/// The `(id, serviceEndpoint)` pairs in a DID's document.
+async fn fetch_did_services(
+    http: &reqwest::Client,
+    plc_url: &str,
+    did: &str,
+) -> Result<Vec<(String, String)>, AppError> {
     let url = if did.starts_with("did:plc:") {
         format!("{}/{did}", plc_url.trim_end_matches('/'))
     } else if did.starts_with("did:web:") {
@@ -352,7 +396,7 @@ pub(crate) async fn resolve_did_service_endpoint(
         }
     } else {
         return Err(AppError::BadRequest(format!(
-            "unsupported DID method for managing app: {did}"
+            "unsupported DID method: {did}"
         )));
     };
 
@@ -386,11 +430,11 @@ pub(crate) async fn resolve_did_service_endpoint(
         .await
         .map_err(|e| AppError::Internal(format!("invalid DID document for {did}: {e}")))?;
 
-    doc.service
-        .iter()
-        .find(|s| s.id == "#atproto_pds" || s.id == format!("{did}#atproto_pds"))
-        .map(|s| s.service_endpoint.clone())
-        .ok_or_else(|| AppError::Internal(format!("no #atproto_pds service in DID doc for {did}")))
+    Ok(doc
+        .service
+        .into_iter()
+        .map(|s| (s.id, s.service_endpoint))
+        .collect())
 }
 
 pub fn check_app_access(space: &Space, attested_client_id: Option<&str>) -> Result<(), AppError> {
