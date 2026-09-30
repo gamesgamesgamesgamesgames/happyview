@@ -30,6 +30,14 @@ pub(crate) struct CreateSpaceInput {
     pub write_policy: Option<serde_json::Value>,
     pub app_access: Option<serde_json::Value>,
     pub config: Option<SpaceConfig>,
+    /// One policy for both reads and writes, as clients sent it before the
+    /// split: `policy` from earlier drafts, `mintPolicy` from HappyView.
+    /// Accepted until v3.
+    pub policy: Option<serde_json::Value>,
+    pub mint_policy: Option<serde_json::Value>,
+    /// The legacy policy's managing app, sent beside it rather than inside.
+    pub managing_app: Option<String>,
+    pub managing_app_did: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +62,14 @@ pub(crate) struct UpdateSpaceInput {
     pub write_policy: Option<serde_json::Value>,
     pub app_access: Option<serde_json::Value>,
     pub config: Option<SpaceConfig>,
+    /// One policy for both reads and writes, as clients sent it before the
+    /// split: `policy` from earlier drafts, `mintPolicy` from HappyView.
+    /// Accepted until v3.
+    pub policy: Option<serde_json::Value>,
+    pub mint_policy: Option<serde_json::Value>,
+    /// The legacy policy's managing app, sent beside it rather than inside.
+    pub managing_app: Option<String>,
+    pub managing_app_did: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -182,7 +198,52 @@ fn parse_policy(raw: Option<serde_json::Value>, field: &str) -> Result<Option<Po
     .transpose()
 }
 
+/// The single policy clients sent before reads and writes were split, which
+/// governed both.
+fn legacy_policy(
+    policy: Option<serde_json::Value>,
+    mint_policy: Option<serde_json::Value>,
+    managing_app: Option<String>,
+    managing_app_did: Option<String>,
+) -> Result<Option<Policy>, AppError> {
+    let Some(raw) = policy.or(mint_policy) else {
+        return Ok(None);
+    };
+    let unsupported = || AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code: "UnsupportedPolicy",
+        message: "policy names a policy this host does not implement".into(),
+    };
+    let Some(name) = raw.as_str() else {
+        return parse_policy(Some(raw), "policy");
+    };
+    match name {
+        "public" => Ok(Some(Policy::Public)),
+        "member-list" => Ok(Some(Policy::MemberList)),
+        "managing-app" => managing_app
+            .or(managing_app_did)
+            .map(|managing_app| Some(Policy::ManagingApp { managing_app }))
+            .ok_or_else(unsupported),
+        _ => Err(unsupported()),
+    }
+}
+
 fn parse_app_access(raw: Option<serde_json::Value>) -> Result<Option<AppAccess>, AppError> {
+    // Earlier HappyView tagged variants with `type` and a short name.
+    let raw = raw.map(|mut v| {
+        if let Some(obj) = v.as_object_mut()
+            && !obj.contains_key("$type")
+            && let Some(kind) = obj
+                .remove("type")
+                .and_then(|t| t.as_str().map(str::to_string))
+        {
+            obj.insert(
+                "$type".into(),
+                format!("com.atproto.simplespace.defs#{kind}").into(),
+            );
+        }
+        v
+    });
     raw.map(|v| {
         serde_json::from_value(v).map_err(|_| AppError::XrpcError {
             status: StatusCode::BAD_REQUEST,
@@ -199,6 +260,12 @@ async fn create_space(
     Json(input): Json<CreateSpaceInput>,
 ) -> Result<Response, AppError> {
     let claims = require_auth(&xrpc_claims)?;
+    let legacy = legacy_policy(
+        input.policy,
+        input.mint_policy,
+        input.managing_app,
+        input.managing_app_did,
+    )?;
     let space = service::create_space(
         &state,
         claims.did(),
@@ -206,8 +273,8 @@ async fn create_space(
         &input.skey,
         input.display_name,
         input.description,
-        parse_policy(input.read_policy, "readPolicy")?,
-        parse_policy(input.write_policy, "writePolicy")?,
+        parse_policy(input.read_policy, "readPolicy")?.or_else(|| legacy.clone()),
+        parse_policy(input.write_policy, "writePolicy")?.or(legacy),
         parse_app_access(input.app_access)?,
         input.config,
     )
@@ -237,14 +304,20 @@ async fn update_space(
     Json(input): Json<UpdateSpaceInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
+    let legacy = legacy_policy(
+        input.policy,
+        input.mint_policy,
+        input.managing_app,
+        input.managing_app_did,
+    )?;
     let space = service::update_space(
         &state,
         claims.did(),
         &input.space,
         input.display_name,
         input.description,
-        parse_policy(input.read_policy, "readPolicy")?,
-        parse_policy(input.write_policy, "writePolicy")?,
+        parse_policy(input.read_policy, "readPolicy")?.or_else(|| legacy.clone()),
+        parse_policy(input.write_policy, "writePolicy")?.or(legacy),
         parse_app_access(input.app_access)?,
         input.config,
     )

@@ -454,6 +454,95 @@ async fn a_managing_app_policy_round_trips_through_get_space() {
     assert_eq!(read_policy["managingApp"], "did:web:app.example.com#forum");
 }
 
+/// Create a space from a raw body and read back its config.
+async fn created_config(app: &TestApp, body: Value) -> Value {
+    let authority = rand_did("auth");
+    let mut body = body;
+    body["type"] = json!("com.example.forum");
+    body["skey"] = json!(rand_skey("s"));
+    let resp = post(app, "com.atproto.simplespace.createSpace", &authority, body).await;
+    assert!(
+        resp.status().is_success(),
+        "createSpace failed: {}",
+        resp.status()
+    );
+    let space = json_of(resp).await["uri"].as_str().unwrap().to_string();
+    json_of(
+        get(
+            app,
+            &format!(
+                "/xrpc/com.atproto.simplespace.getSpace?space={}",
+                urlencoding::encode(&space)
+            ),
+            &authority,
+        )
+        .await,
+    )
+    .await["config"]
+        .clone()
+}
+
+/// Clients written before the read/write split send one policy, which governed
+/// both, and HappyView's own earlier fields. Until v3 they keep working.
+#[tokio::test]
+#[serial]
+async fn a_single_legacy_policy_governs_reads_and_writes() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let config = created_config(
+        &app,
+        json!({ "mintPolicy": "public", "appAccess": { "type": "open" } }),
+    )
+    .await;
+    assert_eq!(
+        config["readPolicy"]["$type"],
+        "com.atproto.simplespace.defs#publicPolicy"
+    );
+    assert_eq!(
+        config["writePolicy"]["$type"],
+        "com.atproto.simplespace.defs#publicPolicy"
+    );
+
+    let config = created_config(
+        &app,
+        json!({ "policy": "managing-app", "managingApp": "did:web:app.example.com#forum" }),
+    )
+    .await;
+    assert_eq!(
+        config["readPolicy"]["managingApp"],
+        "did:web:app.example.com#forum"
+    );
+    assert_eq!(
+        config["writePolicy"]["managingApp"],
+        "did:web:app.example.com#forum"
+    );
+}
+
+/// The lexicon's own fields win over a legacy one sent alongside them.
+#[tokio::test]
+#[serial]
+async fn split_policies_take_precedence_over_a_legacy_policy() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let config = created_config(
+        &app,
+        json!({ "policy": "public", "writePolicy": member_list_policy() }),
+    )
+    .await;
+    assert_eq!(
+        config["readPolicy"]["$type"],
+        "com.atproto.simplespace.defs#publicPolicy"
+    );
+    assert_eq!(
+        config["writePolicy"]["$type"],
+        "com.atproto.simplespace.defs#memberListPolicy"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // unregisterNotify / listBlobs
 // ---------------------------------------------------------------------------
