@@ -50,6 +50,10 @@ Aligns credentials and sync with the latest [Proposal 0016](https://github.com/b
 - `com.atproto.simplespace.addMember` and `dev.happyview.space.addMember` accept an `access` word.
 - `registerNotify` accepts `{space, serviceDid, endpoint}` webhook registrations, returning `{id, expiresAt}`. `notifyWrite` accepts `{space, did, collection, rkey, cid}`.
 
+### Deprecated
+
+- **`config.records_public`.** It has never been enforced: setting it did not change who could read a space. Use a `public` `readPolicy` for a space anyone may read. It is still accepted and stored until v3.
+
 ### Lua
 
 - **`space:put_member{did, read, write, is_delegation?}`** sets a member's flags and returns `{did, read, write}`.

@@ -201,7 +201,7 @@ The `config` object supports:
 | Field               | Type    | Default | Description |
 | ------------------- | ------- | ------- | ----------- |
 | `membership_public` | boolean | `false` | Whether the space, its member list, and its repo list are visible without authentication |
-| `records_public`    | boolean | `false` | Stored with the space. HappyView does not enforce it. |
+| `records_public`    | boolean | `false` | Deprecated. Stored with the space but not enforced. Use a `public` `readPolicy` for a space anyone may read. Accepted until v3. |
 
 The field names are snake_case, unlike the rest of the request.
 

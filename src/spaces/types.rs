@@ -241,6 +241,9 @@ pub struct Space {
 pub struct SpaceConfig {
     #[serde(default)]
     pub membership_public: bool,
+    /// Deprecated and not enforced: no read path consults it. A space readable
+    /// by anyone uses a `public` read policy. Still accepted and stored until
+    /// v3, so clients that send it keep working.
     #[serde(default)]
     pub records_public: bool,
     #[serde(flatten)]

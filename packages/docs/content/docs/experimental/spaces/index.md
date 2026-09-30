@@ -162,7 +162,7 @@ HappyView implements [atproto Proposal 0016](https://github.com/bluesky-social/p
 - **Invite system**: `createInvite`, `acceptInvite`, `revokeInvite`, `listInvites` (under `dev.happyview.space.*`)
 - **`isDelegation` on members**: allows spaces to be members of other spaces
 - **`displayName`, `description` on spaces**: human-readable metadata
-- **`config` object**: `membership_public`, `records_public`, plus arbitrary extra fields
+- **`config` object**: `membership_public`, plus arbitrary extra fields. `records_public` is deprecated and not enforced.
 - **`read_self` access**: limits a member's reads to their own records
 
 ## Next steps
