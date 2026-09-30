@@ -151,9 +151,20 @@ async fn policy_allows(
     match policy {
         Policy::Public => Ok(true),
         Policy::MemberList => {
-            // Caller must already be a member; verified upstream by the credential issuance route.
-            // We trust that the delegation token proves membership was checked.
-            Ok(true)
+            let member = crate::spaces::members::is_member(
+                auth_ctx.pool,
+                auth_ctx.backend,
+                &space.id,
+                subject_did,
+            )
+            .await?;
+            Ok(match (member, access) {
+                // A credential reads the whole space, so own-records-only
+                // members do not qualify.
+                (Some(m), AccessKind::Read) => m.can_read() && !m.restricted_to_own_records(),
+                (Some(m), AccessKind::Write) => m.can_write(),
+                (None, _) => false,
+            })
         }
         Policy::ManagingApp { managing_app } => {
             let space_uri = format!(
@@ -520,7 +531,7 @@ async fn store_credential_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spaces::types::{AppAccess, Policy, Space, SpaceConfig};
+    use crate::spaces::types::{AppAccess, MemberAccess, Policy, Space, SpaceConfig};
 
     fn test_space(app_access: AppAccess) -> Space {
         Space {
@@ -600,6 +611,96 @@ mod tests {
                 .await
                 .expect("resolves");
         assert_eq!(endpoint, "http://pds.test");
+    }
+
+    async fn mint_for_member(access: MemberAccess) -> Result<IssuedCredential, AppError> {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let mut space = test_space(AppAccess::Open);
+        space.id = uuid::Uuid::new_v4().to_string();
+        crate::spaces::db::create_space(&pool, backend, &space)
+            .await
+            .unwrap();
+        crate::spaces::db::add_member(
+            &pool,
+            backend,
+            &crate::spaces::types::SpaceMember {
+                id: uuid::Uuid::new_v4().to_string(),
+                space_id: space.id.clone(),
+                did: "did:plc:member".into(),
+                access,
+                is_delegation: false,
+                granted_by: None,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+
+        issue_credential(
+            &pool,
+            backend,
+            &reqwest::Client::new(),
+            &crate::test_support::TEST_ENCRYPTION_KEY,
+            "http://happyview.test",
+            "http://plc.test",
+            &space,
+            "did:plc:member",
+            None,
+            &space.authority_did,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn member_list_mints_for_a_reader() {
+        assert!(mint_for_member(MemberAccess::READ).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn member_list_refuses_a_write_only_member() {
+        let write_only = MemberAccess {
+            read: false,
+            write: true,
+            read_self: false,
+        };
+        assert!(matches!(
+            mint_for_member(write_only).await,
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn member_list_refuses_an_own_records_only_member() {
+        // A credential reads the whole space, which is more than read_self grants.
+        assert!(matches!(
+            mint_for_member(MemberAccess::READ_SELF).await,
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn member_list_refuses_a_non_member() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let mut space = test_space(AppAccess::Open);
+        space.id = uuid::Uuid::new_v4().to_string();
+        crate::spaces::db::create_space(&pool, DatabaseBackend::Sqlite, &space)
+            .await
+            .unwrap();
+        let result = issue_credential(
+            &pool,
+            DatabaseBackend::Sqlite,
+            &reqwest::Client::new(),
+            &crate::test_support::TEST_ENCRYPTION_KEY,
+            "http://happyview.test",
+            "http://plc.test",
+            &space,
+            "did:plc:stranger",
+            None,
+            &space.authority_did,
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
     }
 
     #[test]

@@ -1733,11 +1733,6 @@ async fn get_space_credential(
 
     let space = service::resolve_space(&state, &delegation_claims.sub).await?;
 
-    // Re-verify current membership before minting. The `MemberList` mint policy
-    // is a no-op that trusts the delegation token, so a member removed within the
-    // token's 60s window would otherwise still be able to mint.
-    service::require_membership(&state, &space, &delegation_claims.iss, false, None).await?;
-
     let client_id = if let Some(key) = claims.client_key() {
         resolve_client_id_url(&state, key).await?
     } else {
