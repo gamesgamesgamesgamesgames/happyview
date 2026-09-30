@@ -79,15 +79,32 @@ struct ListBlobsQuery {
 #[serde(rename_all = "camelCase")]
 struct NotifyWriteInput {
     space: String,
-    /// The repo that advanced. The lexicon also carries its new `rev` and
-    /// `hash`.
+    /// The repo that advanced, with its new `rev` and `hash`.
     repo: Option<String>,
+    rev: Option<String>,
+    hash: Option<LexBytes>,
     /// The legacy shape names one record instead of the repo's new state.
     /// Accepted until v3.
     did: Option<String>,
     collection: Option<String>,
     rkey: Option<String>,
     cid: Option<String>,
+}
+
+/// A lexicon `bytes` value, encoded in JSON as `{"$bytes": "<base64>"}`.
+#[derive(Deserialize)]
+struct LexBytes {
+    #[serde(rename = "$bytes")]
+    bytes: String,
+}
+
+impl LexBytes {
+    fn decode(&self) -> Result<Vec<u8>, AppError> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(self.bytes.trim_end_matches('='))
+            .map_err(|_| AppError::BadRequest("hash is not valid base64".into()))
+    }
 }
 
 #[derive(Deserialize)]
@@ -888,7 +905,7 @@ async fn apply_writes(
         }
     }
 
-    service::commit_write(
+    let hash = service::commit_write(
         &mut tx,
         state.db_backend,
         &space,
@@ -902,7 +919,7 @@ async fn apply_writes(
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
 
-    service::notify_ops(&state, &space, &did, &ops).await;
+    service::notify_ops(&state, &space, &did, &ops, &rev, hash).await;
 
     Ok(Json(serde_json::json!({
         "results": results,
@@ -1697,6 +1714,19 @@ async fn notify_write(
             error = %e,
             "failed to sync a native repo after a write notification"
         ),
+    }
+
+    if let (Some(rev), Some(hash)) = (&input.rev, &input.hash) {
+        notifications::forward_repo_update(
+            &state,
+            &space.id,
+            notifications::RepoUpdate {
+                space_uri: input.space.clone(),
+                repo: writer.clone(),
+                rev: rev.clone(),
+                hash: hash.decode()?,
+            },
+        );
     }
 
     if let (Some(collection), Some(rkey)) = (&input.collection, &input.rkey) {

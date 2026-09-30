@@ -89,3 +89,106 @@ pub async fn dispatch_space_deleted(
 
     Ok(())
 }
+
+/// The method a forwarded write notification calls, and the `lxm` its service
+/// auth is bound to.
+const NOTIFY_WRITE_LXM: &str = "com.atproto.space.notifyWrite";
+
+/// A repo's new state, as `com.atproto.space.notifyWrite` reports it.
+#[derive(Debug, Clone)]
+pub struct RepoUpdate {
+    pub space_uri: String,
+    pub repo: String,
+    pub rev: String,
+    pub hash: Vec<u8>,
+}
+
+impl RepoUpdate {
+    fn body(&self) -> serde_json::Value {
+        use base64::Engine;
+        serde_json::json!({
+            "space": self.space_uri,
+            "repo": self.repo,
+            "rev": self.rev,
+            "hash": {
+                "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&self.hash),
+            },
+        })
+    }
+}
+
+/// Pass a repo update to the services registered for its space by identifier.
+///
+/// Runs in the background, so neither a write nor an inbound notification waits
+/// on syncers. Delivery is best effort: a syncer that misses one catches up
+/// through `listRepos`.
+pub fn forward_repo_update(state: &crate::AppState, space_id: &str, update: RepoUpdate) {
+    let state = state.clone();
+    let space_id = space_id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = deliver_repo_update(&state, &space_id, &update).await {
+            tracing::warn!(space_id, error = %e, "failed to forward a write notification");
+        }
+    });
+}
+
+async fn deliver_repo_update(
+    state: &crate::AppState,
+    space_id: &str,
+    update: &RepoUpdate,
+) -> Result<(), AppError> {
+    let registrations = db::list_notify_registrations(&state.db, state.db_backend, space_id)
+        .await?
+        .into_iter()
+        .filter(|r| r.delivery == NotifyDelivery::Xrpc)
+        .collect::<Vec<_>>();
+    if registrations.is_empty() {
+        return Ok(());
+    }
+
+    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+        AppError::Internal("TOKEN_ENCRYPTION_KEY is required to sign write notifications".into())
+    })?;
+    let body = update.body();
+
+    for reg in &registrations {
+        let token = match crate::auth::service_auth::mint_service_auth(
+            &state.db,
+            state.db_backend,
+            encryption_key,
+            &state.config.public_url,
+            &reg.service,
+            NOTIFY_WRITE_LXM,
+        )
+        .await
+        {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!(service = %reg.service, error = %e, "could not sign a write notification");
+                continue;
+            }
+        };
+        let url = format!(
+            "{}/xrpc/{NOTIFY_WRITE_LXM}",
+            reg.endpoint.trim_end_matches('/')
+        );
+        let result = state
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await;
+        match result {
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::warn!(service = %reg.service, status = %resp.status(), "syncer rejected a write notification");
+            }
+            Err(e) => {
+                tracing::warn!(service = %reg.service, error = %e, "could not deliver a write notification");
+            }
+            Ok(_) => {}
+        }
+    }
+
+    Ok(())
+}

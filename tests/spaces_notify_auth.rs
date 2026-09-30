@@ -220,3 +220,82 @@ async fn notify_write_rejects_a_notification_for_someone_elses_repo() {
     let status = notify_write_as("did:plc:intruder", "did:plc:writer").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+/// A notification accepted from a repo host is passed on to registered syncers
+/// in the lexicon's shape, signed by this instance.
+#[tokio::test]
+#[serial]
+async fn notify_write_forwards_to_registered_syncers() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+    let space_row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &instance_did,
+        SPACE_TYPE,
+        SPACE_SKEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let syncer = common::syncer::start().await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &space_row.id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Xrpc,
+    )
+    .await
+    .unwrap();
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            "did:plc:writer",
+            &instance_did,
+            "#atproto_space_host",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .header("host", "127.0.0.1:0")
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": "did:plc:writer",
+                "rev": "3lzq2b3k4c22a",
+                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let received = common::syncer::received(&syncer, 1).await;
+    assert_eq!(received.len(), 1, "the syncer should be notified once");
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(body["space"], json!(space));
+    assert_eq!(body["repo"], json!("did:plc:writer"));
+    assert_eq!(body["rev"], json!("3lzq2b3k4c22a"));
+    assert!(body["hash"]["$bytes"].is_string());
+    let authorization = received[0]
+        .headers
+        .get("authorization")
+        .expect("forwarded notifications carry service auth")
+        .to_str()
+        .unwrap();
+    assert!(authorization.starts_with("Bearer "));
+}
