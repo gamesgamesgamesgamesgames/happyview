@@ -413,7 +413,7 @@ async fn authorize_space_read(
     check_read_access(caller_did, target_repo_did, membership, has_credential)?;
 
     if has_credential {
-        return Ok(());
+        return require_audience(xrpc_claims, target_repo_did);
     }
     let Some(identity) = xrpc_claims.identity.as_ref() else {
         return Ok(());
@@ -428,6 +428,20 @@ async fn authorize_space_read(
         happyview_scopes::SpaceTarget::Read
     };
     crate::spaces::scope::require_space_scope(state, identity, space, target).await
+}
+
+/// A credential-authenticated request must be addressed to the DID it is for:
+/// the repo it reads, or the space authority for space-wide methods. Otherwise a
+/// host serving one repo could replay the request against another.
+fn require_audience(claims: &XrpcClaims, expected: &str) -> Result<(), AppError> {
+    if claims.space_credential.is_none() || claims.space_audience.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    Err(AppError::XrpcError {
+        status: StatusCode::UNAUTHORIZED,
+        code: "BadSpaceSignature",
+        message: format!("request is not addressed to {expected}"),
+    })
 }
 
 fn require_auth(claims: &XrpcClaims) -> Result<&crate::auth::Claims, AppError> {
@@ -460,15 +474,10 @@ async fn require_auth_or_credential(
     }
 
     if let Some(token) = &claims.space_credential {
-        let verified = crate::spaces::credential::verify_external_credential(
-            token,
-            &state.http,
-            &state.config.plc_url,
-        )
-        .await?;
-        if space_credential_revoked(state, token).await? {
-            return Err(AppError::Auth("space credential has been revoked".into()));
-        }
+        let space_uri = crate::spaces::credential::peek_credential_sub(token)
+            .ok_or_else(|| AppError::Auth("invalid space credential".into()))?;
+        let space = service::resolve_space(state, &space_uri).await?;
+        let verified = service::verify_space_credential(state, &space, token).await?;
         return Ok(verified.sub);
     }
 
@@ -979,6 +988,11 @@ async fn list_records(
         xrpc_claims.space_credential.as_deref(),
     )
     .await?;
+    // Listing one repo is a repo read; listing across repos is the space host's.
+    require_audience(
+        &xrpc_claims,
+        query.repo.as_deref().unwrap_or(&space.authority_did),
+    )?;
 
     // read_self members may only list their own records regardless of what the caller requests
     let repo = if !has_credential && membership.restricted_to_own_records() {
@@ -1422,6 +1436,7 @@ async fn list_repos(
     Query(params): Query<ListReposQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let space = service::resolve_space(&state, &params.space).await?;
+    require_audience(&claims, &space.authority_did)?;
 
     if !space.config.membership_public {
         let did = require_auth_or_credential(&state, &claims).await?;
@@ -1566,6 +1581,7 @@ async fn register_notify(
 ) -> Result<impl IntoResponse, AppError> {
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &input.space).await?;
+    require_audience(&claims, &space.authority_did)?;
 
     if let Some(service) = &input.service {
         let endpoint = crate::spaces::auth::resolve_service_identifier(
@@ -1621,6 +1637,7 @@ async fn unregister_notify(
 ) -> Result<impl IntoResponse, AppError> {
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &input.space).await?;
+    require_audience(&claims, &space.authority_did)?;
 
     // A registration belongs to the service that made it; anyone else removing
     // it would stop that service syncing. The space authority may also

@@ -68,6 +68,45 @@ pub(crate) fn check_collection_allowed(space: &Space, collection: &str) -> Resul
     Ok(())
 }
 
+/// Verify a space credential this instance issued for `space`, returning its
+/// claims.
+///
+/// Verified against the local key rather than through the authority's DID
+/// document: this instance is the space host, and the per-space keys of spaces
+/// anchored on their creator's DID are published nowhere.
+pub(crate) async fn verify_space_credential(
+    state: &AppState,
+    space: &Space,
+    token: &str,
+) -> Result<crate::spaces::credential::SpaceCredentialClaims, AppError> {
+    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+        AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
+    })?;
+    let key = crate::spaces::auth::space_verifying_key(
+        &state.db,
+        state.db_backend,
+        encryption_key,
+        &state.config.public_url,
+        space,
+    )
+    .await?;
+    let claims = crate::spaces::credential::verify_credential_with_key(token, &key)?;
+
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if claims.sub != space_uri {
+        return Err(AppError::Auth(
+            "space credential is for a different space".into(),
+        ));
+    }
+    if crate::spaces::routes::space_credential_revoked(state, token).await? {
+        return Err(AppError::Auth("space credential has been revoked".into()));
+    }
+    Ok(claims)
+}
+
 pub(crate) async fn require_membership(
     state: &AppState,
     space: &Space,
@@ -76,31 +115,13 @@ pub(crate) async fn require_membership(
     space_credential: Option<&str>,
 ) -> Result<MemberAccess, AppError> {
     if let Some(token) = space_credential {
-        let space_uri = format!(
-            "at://{}/space/{}/{}",
-            space.did, space.type_nsid, space.skey
-        );
-        match crate::spaces::credential::verify_external_credential(
-            token,
-            &state.http,
-            &state.config.plc_url,
-        )
-        .await
-        {
-            Ok(claims) if claims.sub == space_uri => {
-                if crate::spaces::routes::space_credential_revoked(state, token).await? {
-                    // fall through
-                } else if require_write {
-                    return Err(AppError::Forbidden(
-                        "Write access is required for this action".into(),
-                    ));
-                } else {
-                    return Ok(MemberAccess::READ);
-                }
-            }
-            Ok(_) => {}
-            Err(_) => {}
+        verify_space_credential(state, space, token).await?;
+        if require_write {
+            return Err(AppError::Forbidden(
+                "Write access is required for this action".into(),
+            ));
         }
+        return Ok(MemberAccess::READ);
     }
     let access = members::is_member(&state.db, state.db_backend, &space.id, did)
         .await?

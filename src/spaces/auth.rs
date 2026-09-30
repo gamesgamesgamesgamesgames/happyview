@@ -488,6 +488,48 @@ pub fn check_app_access(space: &Space, attested_client_id: Option<&str>) -> Resu
     }
 }
 
+/// The key this instance's credentials for a space verify against. Read-only:
+/// a space with no key has minted no credentials.
+pub(crate) async fn space_verifying_key(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+    public_url: &str,
+    space: &Space,
+) -> Result<crate::spaces::commit::SpaceVerifyingKey, AppError> {
+    if is_instance_authority(pool, backend, public_url, space).await {
+        let method =
+            crate::verification_methods::get_method_by_fragment(pool, backend, "#atproto_space")
+                .await?
+                .ok_or_else(|| AppError::Auth("this instance has no #atproto_space key".into()))?;
+        return crate::spaces::credential::multikey_to_space_key(&method.public_key_multibase);
+    }
+
+    let row: Option<(Vec<u8>,)> = crate::db::query_as(&adapt_sql(
+        "SELECT signing_key_enc FROM happyview_space_dids WHERE space_id = ?",
+        backend,
+    ))
+    .bind(&space.id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to look up space signing key: {e}")))?;
+    let (encrypted,) =
+        row.ok_or_else(|| AppError::Auth("this space has issued no credentials".into()))?;
+    let decrypted = decrypt(encryption_key, &encrypted)
+        .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
+    let jwk: serde_json::Value = serde_json::from_slice(&decrypted)
+        .map_err(|e| AppError::Internal(format!("failed to parse signing key: {e}")))?;
+    let d = jwk["d"]
+        .as_str()
+        .and_then(|d| URL_SAFE_NO_PAD.decode(d).ok())
+        .ok_or_else(|| AppError::Internal("space signing key missing d parameter".into()))?;
+    let signing_key = SigningKey::from_slice(&d)
+        .map_err(|e| AppError::Internal(format!("invalid space signing key: {e}")))?;
+    Ok(crate::spaces::commit::SpaceVerifyingKey::P256(
+        *signing_key.verifying_key(),
+    ))
+}
+
 async fn is_instance_authority(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,

@@ -266,15 +266,32 @@ pub async fn resolve_dpop_claims(
 
 /// XRPC-specific claims extractor.
 ///
-/// Accepts DPoP auth (`Authorization: DPoP <token>`), Bearer space credential
-/// JWTs (`Authorization: Bearer <space_credential>`), or Bearer service auth
-/// JWTs (`Authorization: Bearer <service_jwt>`). Cookie auth and Bearer API keys
+/// Accepts DPoP auth (`Authorization: DPoP <token>`), space credentials
+/// (`Authorization: Atproto-Space <credential>` with an HTTP Message Signature
+/// by the credential's bound key), or Bearer service auth JWTs
+/// (`Authorization: Bearer <service_jwt>`). Cookie auth and Bearer API keys
 /// are rejected on XRPC routes.
 #[derive(Debug, Clone)]
 pub struct XrpcClaims {
     pub identity: Option<Claims>,
+    /// A space credential whose bound key signed this request. The credential
+    /// itself is verified where it is used, against the space it names.
     pub space_credential: Option<String>,
+    /// The DID a credential-authenticated request is addressed to. Handlers
+    /// compare it with the repo or space they serve.
+    pub space_audience: Option<String>,
     pub service_auth: Option<ServiceAuthClaims>,
+}
+
+/// Whether a path serves space data, the only routes a space credential opens.
+fn is_space_route(path: &str) -> bool {
+    [
+        "/com.atproto.space.",
+        "/com.atproto.simplespace.",
+        "/dev.happyview.space.",
+    ]
+    .iter()
+    .any(|ns| path.contains(ns))
 }
 
 #[derive(Debug, Clone)]
@@ -302,13 +319,12 @@ impl FromRequestParts<AppState> for XrpcClaims {
                 Ok(XrpcClaims {
                     identity: Some(claims),
                     space_credential: None,
+                    space_audience: None,
                     service_auth: None,
                 })
             }
             Some(h) if h.starts_with("Bearer ") => {
                 let token = &h[7..];
-                let path = parts.uri.path();
-                let is_space_route = path.contains("/dev.happyview.space.");
 
                 // Try service auth first
                 let host = parts
@@ -321,26 +337,45 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     return Ok(XrpcClaims {
                         identity: None,
                         space_credential: None,
+                        space_audience: None,
                         service_auth: Some(service_claims),
                     });
                 }
 
-                // Existing space credential logic
                 match crate::spaces::credential::peek_jwt_typ(token) {
-                    Some(typ) if typ == "space_credential" && is_space_route => {
-                        Ok(XrpcClaims {
-                            identity: None,
-                            space_credential: Some(token.to_string()),
-                            service_auth: None,
-                        })
+                    Some(typ) if typ == crate::spaces::credential::SPACE_CREDENTIAL_TYP => {
+                        Err(AppError::Auth(
+                            "space credentials use the Atproto-Space authorization scheme".into(),
+                        ))
                     }
-                    Some(typ) if typ == "space_credential" => Err(AppError::Auth(
-                        "space credentials are only accepted on space routes".into(),
-                    )),
                     _ => Err(AppError::Auth(
                         "XRPC routes do not accept Bearer auth. Use DPoP auth, a space credential, or omit the Authorization header for anonymous access.".into(),
                     )),
                 }
+            }
+            Some(h) if h.starts_with("Atproto-Space ") => {
+                let token = &h["Atproto-Space ".len()..];
+                if !is_space_route(parts.uri.path()) {
+                    return Err(AppError::Auth(
+                        "space credentials are only accepted on space routes".into(),
+                    ));
+                }
+                let bound_key =
+                    crate::spaces::credential::peek_bound_key(token).ok_or_else(|| {
+                        AppError::Auth("space credential is not bound to a key".into())
+                    })?;
+                crate::spaces::http_signature::verify(&parts.headers, Some(&bound_key))?;
+                let audience = parts
+                    .headers
+                    .get(crate::spaces::http_signature::AUDIENCE_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                Ok(XrpcClaims {
+                    identity: None,
+                    space_credential: Some(token.to_string()),
+                    space_audience: audience,
+                    service_auth: None,
+                })
             }
             Some(_) => Err(AppError::Auth("invalid Authorization scheme".into())),
             None => {
@@ -369,6 +404,7 @@ impl FromRequestParts<AppState> for XrpcClaims {
                             dpop_key_id: None,
                         }),
                         space_credential: None,
+                        space_audience: None,
                         service_auth: None,
                     });
                 }
@@ -376,6 +412,7 @@ impl FromRequestParts<AppState> for XrpcClaims {
                 Ok(XrpcClaims {
                     identity: None,
                     space_credential: None,
+                    space_audience: None,
                     service_auth: None,
                 })
             }

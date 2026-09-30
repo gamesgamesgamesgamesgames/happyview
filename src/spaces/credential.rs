@@ -37,6 +37,12 @@ pub fn peek_delegation_sub(token: &str) -> Option<String> {
     Some(claims.sub)
 }
 
+/// The key an unverified credential is bound to, if any.
+pub fn peek_bound_key(token: &str) -> Option<String> {
+    let (_, claims) = peek_jwt::<SpaceCredentialClaims>(token)?;
+    claims.cnf.map(|cnf| cnf.kid)
+}
+
 /// Peek at a space credential JWT's payload to extract the `sub` (space URI) without verifying.
 pub fn peek_credential_sub(token: &str) -> Option<String> {
     let parts: Vec<&str> = token.split('.').collect();
