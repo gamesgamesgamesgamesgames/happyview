@@ -27,7 +27,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
   },
   body: JSON.stringify({
     space: "at://did:web:happyview.example.com/space/com.example.forum/main",
-    access: "write",
+    access: { read: true, write: true },
     maxUses: 10,
     expiresAt: "2026-06-01T00:00:00Z",
   }),
@@ -35,7 +35,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 interface CreateInviteResponse {
   inviteId: string;
   token: string;
-  access: string;
+  access: { read: boolean; write: boolean };
   maxUses: number;
   expiresAt: string;
 }
@@ -52,7 +52,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
   },
   body: JSON.stringify({
     space: "at://did:web:happyview.example.com/space/com.example.forum/main",
-    access: "write",
+    access: { read: true, write: true },
     maxUses: 10,
     expiresAt: "2026-06-01T00:00:00Z",
   }),
@@ -67,7 +67,7 @@ let response = client
     .header("DPoP", &dpop_proof)
     .json(&serde_json::json!({
         "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
-        "access": "write",
+        "access": { "read": true, "write": true },
         "maxUses": 10,
         "expiresAt": "2026-06-01T00:00:00Z"
     }))
@@ -78,7 +78,7 @@ let data: serde_json::Value = response.json().await?;
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
   "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
-  "access": "write",
+  "access": { "read": true, "write": true },
   "maxUses": 10,
   "expiresAt": "2026-06-01T00:00:00Z"
 }`)
@@ -98,7 +98,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createInvit
   -H 'Content-Type: application/json' \
   -d '{
     "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
-    "access": "write",
+    "access": { "read": true, "write": true },
     "maxUses": 10,
     "expiresAt": "2026-06-01T00:00:00Z"
   }'
@@ -109,7 +109,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createInvit
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `space` | string | Yes | | The space this invite is for |
-| `access` | string | No | `read` | Access level granted on acceptance (`read`, `read_self`, or `write`) |
+| `access` | object | No | `{ "read": true, "write": false }` | Access granted on acceptance: `read` and `write` booleans, both required when `access` is given |
 | `maxUses` | integer | No | unlimited | Maximum number of times the invite can be redeemed |
 | `expiresAt` | string (datetime) | No | never | When the invite expires |
 
@@ -119,7 +119,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createInvit
 {
   "inviteId": "uuid",
   "token": "a1b2c3d4e5f6...",
-  "access": "write",
+  "access": { "read": true, "write": true },
   "maxUses": 10,
   "expiresAt": "2026-06-01T00:00:00Z"
 }
@@ -148,7 +148,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 });
 interface AcceptInviteResponse {
   uri: string;
-  access: string;
+  access: { read: boolean; write: boolean };
 }
 const data: AcceptInviteResponse = await response.json();
 ```
@@ -206,7 +206,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.acceptInvit
 ```json
 {
   "uri": "at://did:web:happyview.example.com/space/com.example.forum/main",
-  "access": "write"
+  "access": { "read": true, "write": true }
 }
 ```
 
@@ -307,7 +307,7 @@ const response = await fetch(
 );
 interface Invite {
   id: string;
-  access: string;
+  access: { read: boolean; write: boolean };
   maxUses: number;
   uses: number;
   expiresAt: string;
@@ -370,7 +370,7 @@ curl 'https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=a
   "invites": [
     {
       "id": "uuid",
-      "access": "write",
+      "access": { "read": true, "write": true },
       "maxUses": 10,
       "uses": 3,
       "expiresAt": "2026-06-01T00:00:00Z",
