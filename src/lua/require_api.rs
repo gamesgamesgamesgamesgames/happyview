@@ -306,6 +306,13 @@ mod tests {
     const FIXTURE: &str =
         "tests/fixtures/test_library/target/wasm32-unknown-unknown/release/test_library.wasm";
 
+    /// False when a fixture's module is absent and the test is to skip. Every
+    /// fixture's `target/` is gitignored, so that is a build nobody ran rather
+    /// than a fault in the code under test.
+    fn fixture_built(name: &str) -> bool {
+        crate::plugin::loader::built_fixture(name, "wasm32-unknown-unknown").is_some()
+    }
+
     fn fixture_library(id: &str) -> LoadedPlugin {
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
             "id": id, "name": id, "version": "1.0.0", "api_version": "2",
@@ -351,6 +358,9 @@ mod tests {
 
     #[tokio::test]
     async fn require_returns_table_with_library_functions() {
+        if !fixture_built("test_library") {
+            return;
+        }
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_require(&lua, &state, &identity_with(Some("did:plc:me")), None)
@@ -378,6 +388,9 @@ mod tests {
 
     #[tokio::test]
     async fn null_results_arrive_as_nil() {
+        if !fixture_built("test_library") {
+            return;
+        }
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_require(&lua, &state, &identity_with(None), None)
@@ -403,6 +416,9 @@ mod tests {
 
     #[tokio::test]
     async fn require_unknown_library_names_the_plugin() {
+        if !fixture_built("test_library") {
+            return;
+        }
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_require(&lua, &state, &identity_with(None), None)
@@ -418,6 +434,9 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_builtin_names_the_builtins() {
+        if !fixture_built("test_library") {
+            return;
+        }
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_require(&lua, &state, &identity_with(None), None)
@@ -437,6 +456,9 @@ mod tests {
 
     #[tokio::test]
     async fn require_is_cached_per_vm() {
+        if !fixture_built("test_library") {
+            return;
+        }
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_require(&lua, &state, &identity_with(None), None)
@@ -451,6 +473,9 @@ mod tests {
 
     #[tokio::test]
     async fn library_errors_surface_as_lua_errors() {
+        if !fixture_built("test_library") {
+            return;
+        }
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_require(&lua, &state, &identity_with(None), None)
@@ -469,6 +494,9 @@ mod tests {
     /// `json.to_array({})` should read as `[]`.
     #[tokio::test]
     async fn empty_table_argument_stays_an_object() {
+        if !fixture_built("test_library") {
+            return;
+        }
         let state = state_with_library().await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
         register_require(&lua, &state, &identity_with(None), None)
@@ -532,6 +560,9 @@ mod tests {
 
     #[tokio::test]
     async fn constructor_chain_sends_one_document() {
+        if !fixture_built("sdk_objects") {
+            return;
+        }
         let state = test_state_with_pool(memory_pool().await);
         state.plugin_registry.register(objects_library()).await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
@@ -567,6 +598,9 @@ mod tests {
 
     #[tokio::test]
     async fn object_is_reusable_after_an_immediate_call() {
+        if !fixture_built("sdk_objects") {
+            return;
+        }
         let state = test_state_with_pool(memory_pool().await);
         state.plugin_registry.register(objects_library()).await;
         let lua = crate::lua::sandbox::create_sandbox().unwrap();
@@ -608,6 +642,9 @@ mod tests {
     /// itself declares.
     #[tokio::test]
     async fn unknown_mode_method_does_not_shift_a_later_methods_binding() {
+        if !fixture_built("sdk_objects") {
+            return;
+        }
         use happyview_plugin_sdk::wire::ApiMethod;
 
         let state = test_state_with_pool(memory_pool().await);

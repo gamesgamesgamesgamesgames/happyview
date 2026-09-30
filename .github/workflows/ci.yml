@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, next]
   pull_request:
-    branches: [main, dev]
+    branches: [main, dev, next]
   workflow_dispatch:
     inputs:
       server:
@@ -138,6 +138,14 @@ jobs:
         with:
           shared-key: test
 
+      # This job is deliberately database-free and fixture-free, so every test
+      # that loads a plugin module skips here and runs for real under
+      # `cargo test --tests` in e2e-tests. libtest captures the skip line of a
+      # passing test, so without this the log would not say which coverage the
+      # run left out. Reporting only: absent is the expected state here.
+      - name: Report unbuilt plugin fixtures
+        run: bash scripts/check-plugin-fixtures.sh
+
       - name: Run unit tests
         run: cargo test --lib
 
@@ -181,8 +189,10 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
 
-      - name: Add WASM target
-        run: rustup target add wasm32-unknown-unknown
+      # wasip1 is only for the two fixtures that link preview-1 imports; every
+      # other fixture is a bare wasm32 module.
+      - name: Add WASM targets
+        run: rustup target add wasm32-unknown-unknown wasm32-wasip1
 
       - name: Build test plugin
         run: cargo build --manifest-path tests/fixtures/test_plugin/Cargo.toml --target wasm32-unknown-unknown --release
@@ -210,6 +220,25 @@ jobs:
 
       - name: Build SDK spaces fixture
         run: cargo build --manifest-path tests/fixtures/sdk_spaces/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Build interpreter echo fixture
+        run: cargo build --manifest-path tests/fixtures/interpreter_echo/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Build differential library fixture
+        run: cargo build --manifest-path tests/fixtures/differential_library/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Build WASI probe fixture
+        run: cargo build --manifest-path tests/fixtures/wasi_probe/Cargo.toml --target wasm32-wasip1 --release
+
+      - name: Build WASI forbidden-import fixture
+        run: cargo build --manifest-path tests/fixtures/wasi_forbidden/Cargo.toml --target wasm32-wasip1 --release
+
+      # This is the job where the fixture-loading tests are supposed to run,
+      # so here a missing module is a failure and not a skip. Without it a
+      # build that stopped producing one would leave those tests skipping
+      # inside a green run — quieter than the panic it replaced.
+      - name: Verify plugin fixtures are built
+        run: bash scripts/check-plugin-fixtures.sh --require
 
       - name: Run plugin SDK tests
         run: cargo test -p happyview-plugin-sdk
