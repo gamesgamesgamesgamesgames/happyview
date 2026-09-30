@@ -145,6 +145,14 @@ const WRITER: &str = "did:plc:writer";
 /// A space whose authority is this instance, as spaces created here now are,
 /// with [`WRITER`] as its one writer.
 async fn create_instance_space(app: &TestApp, instance_did: &str) -> String {
+    create_instance_space_with(app, instance_did, Policy::MemberList).await
+}
+
+async fn create_instance_space_with(
+    app: &TestApp,
+    instance_did: &str,
+    write_policy: Policy,
+) -> String {
     let now = now_rfc3339();
     let space = Space {
         id: Uuid::new_v4().to_string(),
@@ -156,7 +164,7 @@ async fn create_instance_space(app: &TestApp, instance_did: &str) -> String {
         display_name: None,
         description: None,
         read_policy: Policy::MemberList,
-        write_policy: Policy::MemberList,
+        write_policy,
         app_access: AppAccess::Open,
         config: SpaceConfig::default(),
         revision: None,
@@ -350,4 +358,71 @@ async fn notify_write_forwards_to_registered_syncers() {
         .to_str()
         .unwrap();
     assert!(authorization.starts_with("Bearer "));
+}
+
+/// A managing app is named by a service identifier, and is asked at the
+/// endpoint that service publishes.
+#[tokio::test]
+#[serial]
+async fn a_managing_app_is_reached_through_its_service_entry() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+
+    let managing_app = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.simplespace.checkUserAccess"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "authorized": true })))
+        .expect(1)
+        .mount(&managing_app)
+        .await;
+    plc_store.write().await.insert(
+        "did:plc:forumapp".to_string(),
+        json!({
+            "id": "did:plc:forumapp",
+            "verificationMethod": [],
+            "service": [{ "id": "#forum", "type": "ForumApp", "serviceEndpoint": managing_app.uri() }],
+        }),
+    );
+    let space = create_instance_space_with(
+        &app,
+        &instance_did,
+        Policy::ManagingApp {
+            managing_app: "did:plc:forumapp#forum".into(),
+        },
+    )
+    .await;
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            "did:plc:newcomer",
+            &instance_did,
+            "#atproto_space_host",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .header("host", "127.0.0.1:0")
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": "did:plc:newcomer",
+                "rev": "3lzq2b3k4c22a",
+                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

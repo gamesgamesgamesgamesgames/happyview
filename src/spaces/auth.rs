@@ -277,24 +277,15 @@ async fn check_user_access_with_managing_app(
     authority_did: &str,
     access: AccessKind,
 ) -> Result<bool, AppError> {
-    // Parse DID#fragment — the fragment identifies the service endpoint in the DID doc.
-    // For outbound callback we derive the endpoint from the DID.
-    let (did, fragment) = if let Some(pos) = managing_app.find('#') {
-        (&managing_app[..pos], Some(&managing_app[pos + 1..]))
-    } else {
-        (managing_app, None)
-    };
-
-    if let Some(frag) = fragment
-        && frag != "atproto_pds"
-    {
-        return Err(AppError::BadRequest(format!(
-            "unsupported service fragment '#{frag}' for managing app"
-        )));
-    }
-
-    // Resolve the managing app's PDS/service endpoint from its DID document.
-    let endpoint = resolve_did_service_endpoint(http, auth_ctx.plc_url, did).await?;
+    // The managing app is a service identifier; its fragment names the service
+    // entry to call, and a bare DID means the account's PDS.
+    let endpoint = resolve_service_identifier(http, auth_ctx.plc_url, managing_app)
+        .await
+        .ok_or_else(|| {
+            AppError::BadGateway(format!(
+                "could not resolve the managing app {managing_app} to an endpoint"
+            ))
+        })?;
 
     let url = format!(
         "{}/xrpc/com.atproto.simplespace.checkUserAccess",
