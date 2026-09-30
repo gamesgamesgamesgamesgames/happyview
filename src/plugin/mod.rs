@@ -16,8 +16,24 @@ mod types;
 
 pub use executor::{ExecutionError, PluginExecutor, PluginInstance};
 pub use memory::{MemoryError, PluginEnvelopeError, PluginResponse};
-pub use runtime::WasmRuntime;
+pub use runtime::{
+    DEFAULT_SCRIPT_MEMORY_BYTES, EPOCH_TICK, GuestDeadline, LIBRARY_MEMORY_CEILING, MemoryLimiter,
+    UNBOUNDED_TICKS, WasmRuntime, fuel_for, memory_ceiling, script_memory_ceiling,
+};
 pub use types::*;
+
+/// The interpreter contract, under the host's names: what `execute` and
+/// `validate` take and return, and what the four `script:host` imports
+/// receive. Defined in the SDK the interpreter builds against, so the two
+/// sides cannot drift.
+pub use happyview_plugin_sdk::wire::{
+    ExecuteContext as ScriptExecuteContext, ExecuteInput as ScriptExecuteInput,
+    ExecuteLimits as ScriptExecuteLimits, ExecuteOutput as ScriptExecuteOutput, JobProgressRequest,
+    JobShouldStopRequest, JobWaitRequest, LibraryRef as ScriptLibraryRef, ScriptErrorKind,
+    ScriptJob, ScriptKind, ScriptLogRequest, ScriptSpace, ScriptValueKind,
+    ValidateError as ScriptValidateError, ValidateInput as ScriptValidateInput,
+    ValidateOutput as ScriptValidateOutput,
+};
 
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use graph::{GraphError, PluginNode};
@@ -31,6 +47,10 @@ pub struct PluginRegistry {
     db: Option<sqlx::AnyPool>,
     db_backend: DatabaseBackend,
     api_surfaces: RwLock<HashMap<String, Arc<library::ApiSurface>>>,
+    /// The runtime whose compiled-module cache is keyed by the ids this
+    /// registry hands out, so a registration that replaces an id also drops
+    /// the module compiled for the outgoing one.
+    runtime: Option<Arc<WasmRuntime>>,
 }
 
 impl Default for PluginRegistry {
@@ -40,6 +60,7 @@ impl Default for PluginRegistry {
             db: None,
             db_backend: DatabaseBackend::Sqlite,
             api_surfaces: RwLock::new(HashMap::new()),
+            runtime: None,
         }
     }
 }
@@ -56,12 +77,39 @@ impl PluginRegistry {
             db: Some(db),
             db_backend,
             api_surfaces: RwLock::new(HashMap::new()),
+            runtime: None,
         }
+    }
+
+    /// Evict a plugin's compiled module from `runtime` whenever its id is
+    /// re-registered or removed.
+    pub fn with_runtime(mut self, runtime: Arc<WasmRuntime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    fn evict_module(&self, id: &str) {
+        if let Some(runtime) = &self.runtime {
+            runtime.evict(id);
+        }
+    }
+
+    /// The wasm hashes of every installed plugin, as the module cache keys
+    /// them.
+    pub async fn live_wasm_sha256s(&self) -> std::collections::HashSet<String> {
+        use sha2::{Digest, Sha256};
+        self.plugins
+            .read()
+            .await
+            .values()
+            .map(|p| hex::encode(Sha256::digest(&p.wasm_bytes)))
+            .collect()
     }
 
     pub async fn register(&self, plugin: LoadedPlugin) {
         let id = plugin.info.id.clone();
         self.invalidate_api_surface(&id).await;
+        self.evict_module(&id);
 
         // Persist to database if configured
         if let Some(db) = &self.db
@@ -142,6 +190,7 @@ impl PluginRegistry {
 
     pub async fn remove(&self, id: &str) -> Option<Arc<LoadedPlugin>> {
         self.invalidate_api_surface(id).await;
+        self.evict_module(id);
         self.plugins.write().await.remove(id)
     }
 
@@ -252,6 +301,23 @@ impl PluginRegistry {
             }
         }
 
+        // A language resolves to one interpreter: `scripts.script_type` holds
+        // the id, so two claiming it would make that lookup ambiguous. The
+        // loader cannot see the other installed plugins, which is why the
+        // check is here.
+        if let Some(language_id) = plugin.language_id() {
+            let existing = self.plugins.read().await;
+            if let Some(other) = existing
+                .values()
+                .find(|p| p.info.id != plugin.info.id && p.language_id() == Some(language_id))
+            {
+                return Err(GraphError::LanguageIdTaken {
+                    language_id: language_id.to_string(),
+                    by: other.info.id.clone(),
+                });
+            }
+        }
+
         let candidate = PluginNode::from(&plugin);
         let installed = self.nodes().await;
         graph::validate_install(&installed, &candidate)?;
@@ -357,6 +423,70 @@ mod tests {
     use super::*;
     use crate::test_support::memory_pool;
 
+    /// Re-registering an id, or removing it, drops the module the runtime
+    /// compiled for it; the next instantiation compiles the new bytes.
+    #[tokio::test]
+    async fn re_registration_evicts_the_compiled_module() {
+        let runtime = Arc::new(WasmRuntime::without_ticker().unwrap());
+        let registry = PluginRegistry::new().with_runtime(runtime.clone());
+        let plugin = |value: i32| {
+            let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "version": "1.0.0", "api_version": "2",
+                "plugin_type": "library", "namespace": "p", "capabilities": [],
+            }))
+            .unwrap();
+            LoadedPlugin {
+                info: manifest.clone().into(),
+                source: PluginSource::File { path: "p".into() },
+                wasm_bytes: wat::parse_str(format!(
+                    r#"(module (func (export "answer") (result i32) i32.const {value}))"#
+                ))
+                .unwrap(),
+                manifest: Some(manifest),
+            }
+        };
+        let answer = |module: &wasmtime::Module| {
+            let mut store = wasmtime::Store::new(runtime.engine(), ());
+            store.set_fuel(1_000_000).unwrap();
+            store.set_epoch_deadline(UNBOUNDED_TICKS);
+            let instance = wasmtime::Instance::new(&mut store, module, &[]).unwrap();
+            instance
+                .get_typed_func::<(), i32>(&mut store, "answer")
+                .unwrap()
+                .call(&mut store, ())
+                .unwrap()
+        };
+
+        registry.register(plugin(1)).await;
+        assert_eq!(
+            answer(
+                &runtime
+                    .module_for(&registry.get("p").await.unwrap())
+                    .unwrap()
+            ),
+            1
+        );
+        assert_eq!(runtime.compile_count(), 1);
+
+        registry.register(plugin(2)).await;
+        assert_eq!(
+            answer(
+                &runtime
+                    .module_for(&registry.get("p").await.unwrap())
+                    .unwrap()
+            ),
+            2
+        );
+        assert_eq!(runtime.compile_count(), 2);
+
+        registry.remove("p").await;
+        registry.register(plugin(2)).await;
+        runtime
+            .module_for(&registry.get("p").await.unwrap())
+            .unwrap();
+        assert_eq!(runtime.compile_count(), 3);
+    }
+
     /// `enabled` is BOOLEAN on Postgres and INTEGER on SQLite, so the persist
     /// statement has to use a literal both backends accept.
     #[tokio::test]
@@ -401,5 +531,66 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(enabled, 1);
+    }
+
+    /// A language resolves to one interpreter, so a second one claiming an
+    /// installed `language_id` is refused naming the incumbent; the same
+    /// interpreter reinstalled keeps its own.
+    #[tokio::test]
+    async fn installing_a_second_interpreter_for_one_language_is_refused() {
+        let interpreter = |id: &str, language_id: &str| {
+            let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "version": "1.0.0", "api_version": "2",
+                "plugin_type": "interpreter", "language_id": language_id,
+                "capabilities": [],
+            }))
+            .unwrap();
+            LoadedPlugin {
+                info: manifest.clone().into(),
+                source: PluginSource::File { path: id.into() },
+                wasm_bytes: vec![],
+                manifest: Some(manifest),
+            }
+        };
+
+        let registry = PluginRegistry::new();
+        registry.install(interpreter("lua", "lua")).await.unwrap();
+
+        let err = registry
+            .install(interpreter("lua-fork", "lua"))
+            .await
+            .expect_err("two interpreters claimed one language");
+        assert_eq!(
+            err,
+            GraphError::LanguageIdTaken {
+                language_id: "lua".into(),
+                by: "lua".into(),
+            }
+        );
+        assert!(err.to_string().contains("lua"), "{err}");
+
+        // A different language installs beside it, and reinstalling the
+        // incumbent is an upgrade rather than a clash.
+        registry
+            .install(interpreter("lua-fork", "moon"))
+            .await
+            .unwrap();
+        registry.install(interpreter("lua", "lua")).await.unwrap();
+
+        // A library never claims a language, whatever its manifest says.
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "lib", "name": "lib", "version": "1.0.0", "api_version": "2",
+            "plugin_type": "library", "language_id": "lua", "capabilities": [],
+        }))
+        .unwrap();
+        registry
+            .install(LoadedPlugin {
+                info: manifest.clone().into(),
+                source: PluginSource::File { path: "lib".into() },
+                wasm_bytes: vec![],
+                manifest: Some(manifest),
+            })
+            .await
+            .unwrap();
     }
 }

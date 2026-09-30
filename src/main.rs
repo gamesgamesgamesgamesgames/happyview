@@ -266,15 +266,22 @@ async fn main() {
         );
     }
 
-    // Initialize plugin registry (with DB for persistence)
-    let plugin_registry = Arc::new(happyview::plugin::PluginRegistry::with_db(
-        db_pool.clone(),
-        db_backend,
-    ));
-
     // Initialize WASM runtime
-    let wasm_runtime =
-        Arc::new(happyview::plugin::WasmRuntime::new().expect("Failed to create WASM runtime"));
+    if config.plugin_cache_dir.is_none() {
+        tracing::info!(
+            "compiled plugin modules are cached in memory only; set PLUGIN_CACHE_DIR to a directory owned by this process to keep them across restarts"
+        );
+    }
+    let wasm_runtime = Arc::new(
+        happyview::plugin::WasmRuntime::with_cache_dir(config.plugin_cache_dir.clone())
+            .expect("Failed to create WASM runtime"),
+    );
+
+    // Initialize plugin registry (with DB for persistence)
+    let plugin_registry = Arc::new(
+        happyview::plugin::PluginRegistry::with_db(db_pool.clone(), db_backend)
+            .with_runtime(wasm_runtime.clone()),
+    );
 
     // Initialize attestation signer (auto-generates key if none exists)
     let attestation_signer = match happyview::plugin::attestation::load_or_generate(
@@ -365,6 +372,10 @@ async fn main() {
             tracing::error!(error = %e, "Failed to load plugins from database");
         }
     }
+
+    // Every plugin this boot will run is registered by now, so anything
+    // else in the cache directory is a module nothing will load.
+    wasm_runtime.sweep_cache_dir(&plugin_registry.live_wasm_sha256s().await);
 
     // Seed and load per-instance default token costs from instance_settings.
     let defaults = seed_and_load_rate_limit_defaults(&db_pool, db_backend).await;

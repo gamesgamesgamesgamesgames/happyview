@@ -9,6 +9,10 @@ pub enum ScriptErrorType {
     Syntax,
     Runtime,
     Timeout,
+    /// The guest grew its linear memory past the store's ceiling. Distinct
+    /// from `Runtime` because "out of memory" and "the script has a bug"
+    /// call for different fixes.
+    Memory,
     MissingHandle,
 }
 
@@ -18,7 +22,33 @@ impl std::fmt::Display for ScriptErrorType {
             ScriptErrorType::Syntax => write!(f, "syntax"),
             ScriptErrorType::Runtime => write!(f, "runtime"),
             ScriptErrorType::Timeout => write!(f, "timeout"),
+            ScriptErrorType::Memory => write!(f, "memory"),
             ScriptErrorType::MissingHandle => write!(f, "missing_handle"),
+        }
+    }
+}
+
+impl ScriptErrorType {
+    pub const ALL: [ScriptErrorType; 5] = [
+        ScriptErrorType::Syntax,
+        ScriptErrorType::Runtime,
+        ScriptErrorType::Timeout,
+        ScriptErrorType::Memory,
+        ScriptErrorType::MissingHandle,
+    ];
+}
+
+/// An interpreter's `kind` is this type one to one; the wire enum is the
+/// SDK's so a plugin cannot spell one the host does not know.
+impl From<crate::plugin::ScriptErrorKind> for ScriptErrorType {
+    fn from(kind: crate::plugin::ScriptErrorKind) -> Self {
+        use crate::plugin::ScriptErrorKind;
+        match kind {
+            ScriptErrorKind::Syntax => ScriptErrorType::Syntax,
+            ScriptErrorKind::Runtime => ScriptErrorType::Runtime,
+            ScriptErrorKind::Timeout => ScriptErrorType::Timeout,
+            ScriptErrorKind::Memory => ScriptErrorType::Memory,
+            ScriptErrorKind::MissingHandle => ScriptErrorType::MissingHandle,
         }
     }
 }
@@ -412,6 +442,22 @@ mod tests {
         assert!(body["line"].is_null());
     }
 
+    /// Only a timeout is the caller's 408; exhausting memory is the
+    /// instance's 500, with the type on the body for the client to read.
+    #[tokio::test]
+    async fn script_error_memory_returns_500_with_its_type() {
+        let (status, body) = response_parts(AppError::ScriptError {
+            error_type: ScriptErrorType::Memory,
+            message: "script exceeded its memory limit".into(),
+            method: "test.method".into(),
+            line: None,
+        })
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "script_error");
+        assert_eq!(body["errorType"], "memory");
+    }
+
     #[tokio::test]
     async fn script_error_syntax_returns_500() {
         let (status, body) = response_parts(AppError::ScriptError {
@@ -594,6 +640,35 @@ mod tests {
             serde_json::to_string(&ScriptErrorType::MissingHandle).unwrap(),
             "\"missing_handle\""
         );
+        assert_eq!(
+            serde_json::to_string(&ScriptErrorType::Memory).unwrap(),
+            "\"memory\""
+        );
+        assert_eq!(ScriptErrorType::Memory.to_string(), "memory");
+    }
+
+    #[test]
+    fn every_script_error_kind_has_exactly_one_script_error_type() {
+        use crate::plugin::ScriptErrorKind;
+        assert_eq!(ScriptErrorKind::ALL.len(), ScriptErrorType::ALL.len());
+        for kind in ScriptErrorKind::ALL {
+            let error_type = ScriptErrorType::from(kind);
+            assert_eq!(error_type.to_string(), kind.as_str());
+            assert_eq!(
+                serde_json::to_value(error_type).unwrap(),
+                serde_json::to_value(kind).unwrap()
+            );
+        }
+        for error_type in ScriptErrorType::ALL {
+            let kind: ScriptErrorKind = error_type
+                .to_string()
+                .parse()
+                .unwrap_or_else(|_| panic!("{error_type} has no wire kind"));
+            assert_eq!(
+                ScriptErrorType::from(kind).to_string(),
+                error_type.to_string()
+            );
+        }
     }
 
     #[test]

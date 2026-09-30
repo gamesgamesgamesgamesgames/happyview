@@ -29,16 +29,16 @@ use crate::wire::Response;
 use crate::wire::{
     ApiSurface, AtprotoBlobDownload, AttestSign, AttestVerify, BacklinksQuery, BlobData,
     CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
-    CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, Label, LabelsGet, LinkedRepoBlobUpload,
-    LinkedRepoCall, LinkedRepoInfo, LinkedRepoRecordCreate, LinkedRepoRecordDelete,
-    LinkedRepoRecordPut, PluginError, RecordRef, RecordsCount, RecordsPage, RecordsQuery,
-    RecordsSearch, SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd,
-    SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite,
-    SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo,
-    SpacesMembers, SpacesQuery, StrongRef, TableQuery,
+    CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, JobProgressRequest, Label, LabelsGet,
+    LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoInfo, LinkedRepoRecordCreate,
+    LinkedRepoRecordDelete, LinkedRepoRecordPut, PluginError, RecordRef, RecordsCount, RecordsPage,
+    RecordsQuery, RecordsSearch, ScriptLogRequest, SpaceDelete, SpaceInfo, SpaceInviteCreate,
+    SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete,
+    SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite,
+    SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers, SpacesQuery, StrongRef, TableQuery,
 };
 #[cfg(target_arch = "wasm32")]
-use crate::wire::{AtprotoResolveService, LexiconGet};
+use crate::wire::{AtprotoResolveService, JobShouldStopRequest, JobWaitRequest, LexiconGet};
 
 /// The wire types these wrappers send and receive. Defined in [`crate::wire`],
 /// which the host imports too; re-exported here as the import path plugins use.
@@ -86,6 +86,10 @@ extern "C" {
     fn host_labels_get(req_ptr: i32, req_len: i32) -> i64;
     fn host_attest_sign(req_ptr: i32, req_len: i32) -> i64;
     fn host_attest_verify(req_ptr: i32, req_len: i32) -> i64;
+    fn host_script_log(req_ptr: i32, req_len: i32) -> i64;
+    fn host_job_progress(req_ptr: i32, req_len: i32) -> i64;
+    fn host_job_should_stop(req_ptr: i32, req_len: i32) -> i64;
+    fn host_job_wait(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repos_list(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repo_create_record(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repo_put_record(req_ptr: i32, req_len: i32) -> i64;
@@ -966,6 +970,64 @@ pub fn library_surface(library: &str) -> Result<ApiSurface, PluginError> {
     }
 }
 
+/// Write a line to the log of the script run this interpreter is executing.
+/// The host attributes it to the run's trigger, caller and job, none of which
+/// the guest can name. Needs `script:host`.
+pub fn script_log(request: &ScriptLogRequest) -> Result<(), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_void(host_script_log, request)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = request;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Store the run's progress on its job row. The two payload-carrying script
+/// imports take their request struct, so the caller builds it once; the two
+/// below carry nothing worth a type at the call site. Needs `script:host`.
+pub fn job_progress(request: &JobProgressRequest) -> Result<(), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_void(host_job_progress, request)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = request;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Whether the run's job has been asked to stop. Cooperative: the script has
+/// to check and return. Needs `script:host`.
+pub fn job_should_stop() -> Result<bool, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_job_should_stop, &JobShouldStopRequest {})
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Sleep for `seconds`, which the host clamps to the range a job may wait.
+/// The wait is host time and is not charged to the run's execution budget.
+/// Needs `script:host`.
+pub fn job_wait(seconds: f64) -> Result<(), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_void(host_job_wait, &JobWaitRequest { seconds })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = seconds;
+        Err(HostError::NotWasm.into())
+    }
+}
+
 /// Run a read-only SQL query. Placeholders are backend-native: `?` on SQLite,
 /// `$1` on Postgres. Needs `database:read` or `database:write`.
 pub fn db_query(sql: &str, params: &[Value]) -> Result<Vec<Map<String, Value>>, PluginError> {
@@ -1074,6 +1136,27 @@ mod tests {
             Err(HostError::NotWasm)
         );
         log(Level::Warn, "no-op off target");
+    }
+
+    /// The four script imports answer like every other wrapper off target,
+    /// so an interpreter's pure logic stays unit-testable natively.
+    #[test]
+    fn the_script_run_wrappers_report_not_wasm_off_target() {
+        let not_wasm: PluginError = HostError::NotWasm.into();
+        assert_eq!(
+            script_log(&ScriptLogRequest {
+                level: Level::Info,
+                message: String::from("hello"),
+                fields: None,
+            }),
+            Err(not_wasm.clone())
+        );
+        assert_eq!(
+            job_progress(&JobProgressRequest { data: Value::Null }),
+            Err(not_wasm.clone())
+        );
+        assert_eq!(job_should_stop(), Err(not_wasm.clone()));
+        assert_eq!(job_wait(1.5), Err(not_wasm));
     }
 
     #[test]

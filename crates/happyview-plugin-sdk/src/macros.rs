@@ -12,14 +12,49 @@
 /// Use it directly only for a plugin that uses neither [`library_plugin!`] nor
 /// [`auth_plugin!`], both of which emit it already. Exactly one call per crate.
 ///
+/// The `alloc = system` form emits no allocator of its own: `alloc`/`dealloc`
+/// go to whichever global allocator the plugin crate links, and `dealloc`
+/// really frees. That is what an interpreter needs — it allocates and frees for
+/// the whole run, which a heap that never reuses memory cannot serve — and it
+/// requires the crate to bring an allocator, as a `std` target does.
+///
+/// It emits a `#[panic_handler]` everywhere but wasi, which is a proxy for
+/// "this crate does not link `std`" and not the same thing: a `std` plugin on
+/// `wasm32-unknown-unknown` gets two handlers and will not compile. There is
+/// no cfg for what actually matters, so such a plugin drops `alloc = system`
+/// and writes its own `alloc`/`dealloc` over
+/// [`alloc_bytes`](crate::abi::alloc_bytes) and
+/// [`free_bytes`](crate::abi::free_bytes). The interpreter this form exists
+/// for targets wasip1.
+///
 /// ```ignore
 /// happyview_plugin_sdk::export_abi!();            // 512 KiB heap
 /// happyview_plugin_sdk::export_abi!(heap = 1 << 20);
+/// happyview_plugin_sdk::export_abi!(alloc = system);
 /// ```
 #[macro_export]
 macro_rules! export_abi {
     () => {
         $crate::export_abi!(heap = $crate::abi::DEFAULT_HEAP_SIZE);
+    };
+    (alloc = system) => {
+        /// Trap rather than spin: a panic that looped here would burn the
+        /// host's fuel budget instead of surfacing as an execution error.
+        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[panic_handler]
+        fn __hv_panic(_info: &core::panic::PanicInfo) -> ! {
+            core::arch::wasm32::unreachable()
+        }
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn alloc(size: u32) -> u32 {
+            $crate::abi::alloc_bytes(size)
+        }
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn dealloc(ptr: u32, size: u32) {
+            $crate::abi::free_bytes(ptr, size)
+        }
     };
     (heap = $heap:expr) => {
         #[cfg(target_arch = "wasm32")]
@@ -233,4 +268,97 @@ macro_rules! auth_plugin {
             $crate::abi::dispatch_input(ptr, len, handler)
         }
     };
+}
+
+/// Emit every export an interpreter plugin needs: `alloc`, `dealloc`,
+/// `plugin_info`, `execute` and `validate`.
+///
+/// Each input-taking export decodes its own struct and wraps whatever the
+/// handler returns. Input it cannot parse becomes a `BAD_INPUT` error
+/// envelope — it never panics and never traps. A script that failed is an
+/// `Ok(ExecuteOutput::Error { .. })`, not a `PluginError`: the envelope's error
+/// half is for the interpreter itself failing.
+///
+/// The allocator is the crate's own, through
+/// [`export_abi!(alloc = system)`](export_abi) — no heap of a fixed size
+/// survives an interpreter — so an interpreter plugin links `std` or declares
+/// a `#[global_allocator]`.
+///
+/// ```ignore
+/// happyview_plugin_sdk::interpreter_plugin! {
+///     info: PluginInfo::new("lua", "Lua", "1.0.0"),
+///     execute: execute,
+///     validate: validate,
+/// }
+///
+/// fn execute(input: &ExecuteInput) -> Result<ExecuteOutput, PluginError> { todo!() }
+/// fn validate(input: &ValidateInput) -> Result<ValidateOutput, PluginError> { todo!() }
+/// ```
+#[macro_export]
+macro_rules! interpreter_plugin {
+    (info: $info:expr, execute: $execute:expr, validate: $validate:expr $(,)?) => {
+        $crate::export_abi!(alloc = system);
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn plugin_info() -> i64 {
+            let info: $crate::PluginInfo = $info;
+            $crate::abi::return_ok(&info)
+        }
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
+            let handler: fn(
+                &$crate::ExecuteInput,
+            )
+                -> core::result::Result<$crate::ExecuteOutput, $crate::PluginError> = $execute;
+            $crate::abi::dispatch_execute(ptr, len, handler)
+        }
+
+        #[cfg_attr(target_arch = "wasm32", no_mangle)]
+        pub extern "C" fn validate(ptr: u32, len: u32) -> i64 {
+            let handler: fn(
+                &$crate::ValidateInput,
+            )
+                -> core::result::Result<$crate::ValidateOutput, $crate::PluginError> = $validate;
+            $crate::abi::dispatch_validate(ptr, len, handler)
+        }
+    };
+}
+
+/// The macro's items, expanded in their own module so the export names cannot
+/// collide with anything else here. Off wasm32 they carry no `no_mangle` and
+/// linear memory is unavailable, so what this pins is that the expansion
+/// compiles against the handler signatures and answers when called.
+#[cfg(test)]
+mod interpreter_macro {
+    use crate::{
+        ExecuteInput, ExecuteOutput, PluginError, PluginInfo, ScriptValueKind, ValidateInput,
+        ValidateOutput,
+    };
+
+    crate::interpreter_plugin! {
+        info: PluginInfo::new("fixture", "Fixture", "1.0.0"),
+        execute: execute_script,
+        validate: validate_script,
+    }
+
+    fn execute_script(input: &ExecuteInput) -> Result<ExecuteOutput, PluginError> {
+        Ok(ExecuteOutput::Returned {
+            value: serde_json::Value::String(input.source.clone()),
+            value_kind: ScriptValueKind::Other,
+        })
+    }
+
+    fn validate_script(_input: &ValidateInput) -> Result<ValidateOutput, PluginError> {
+        Ok(ValidateOutput::valid())
+    }
+
+    #[test]
+    fn the_macro_emits_the_five_items_the_host_resolves() {
+        assert_eq!(alloc(16), 0);
+        dealloc(0, 0);
+        assert_eq!(plugin_info(), 0);
+        assert_eq!(execute(0, 0), 0);
+        assert_eq!(validate(0, 0), 0);
+    }
 }

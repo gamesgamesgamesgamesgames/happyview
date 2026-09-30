@@ -1,5 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 use crate::db::DatabaseBackend;
 
@@ -108,6 +109,24 @@ pub struct Config {
     pub token_encryption_key: Option<[u8; 32]>,
     pub default_rate_limit_capacity: u32,
     pub default_rate_limit_refill_rate: f64,
+    /// Where compiled plugin modules are kept between restarts, when there
+    /// is a directory this instance owns. `None` keeps the cache in memory.
+    pub plugin_cache_dir: Option<PathBuf>,
+}
+
+/// `PLUGIN_CACHE_DIR` when set; otherwise a `plugin-cache` directory beside
+/// the SQLite database, since that is where this instance already keeps
+/// state; otherwise none. There is no temp-directory fallback: the cache
+/// feeds `Module::deserialize`, which runs whatever it is handed as native
+/// code, so the directory has to be one nobody else can write to, and a
+/// shared temp directory can be pre-created and owned by any local user.
+pub fn plugin_cache_dir(override_dir: Option<String>, database_url: &str) -> Option<PathBuf> {
+    if let Some(dir) = override_dir.filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    let db_path = crate::db::sqlite_path_from_url(database_url)?;
+    let parent = db_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    Some(parent.join("plugin-cache"))
 }
 
 impl Config {
@@ -126,6 +145,7 @@ impl Config {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(3000),
+            plugin_cache_dir: plugin_cache_dir(env::var("PLUGIN_CACHE_DIR").ok(), &database_url),
             database_url,
             database_backend,
             sqlite_journal_size_limit: crate::db::journal_size_limit_bytes(),
@@ -268,6 +288,37 @@ mod tests {
         }
     }
 
+    /// The override wins; a SQLite instance keeps the cache beside its
+    /// database; anything else gets a directory of its own under temp.
+    #[test]
+    fn plugin_cache_dir_resolves_in_order() {
+        assert_eq!(
+            plugin_cache_dir(Some("/var/cache/hv".into()), "sqlite://data/happyview.db"),
+            Some(PathBuf::from("/var/cache/hv"))
+        );
+        assert_eq!(
+            plugin_cache_dir(Some(String::new()), "sqlite://data/happyview.db?mode=rwc"),
+            Some(PathBuf::from("data/plugin-cache"))
+        );
+        assert_eq!(
+            plugin_cache_dir(None, "sqlite:/var/lib/hv.db"),
+            Some(PathBuf::from("/var/lib/plugin-cache"))
+        );
+        assert_eq!(plugin_cache_dir(None, "postgres://localhost/hv"), None);
+        assert_eq!(plugin_cache_dir(None, "sqlite://:memory:"), None);
+    }
+
+    /// The override wins on every backend; without it a Postgres instance
+    /// has no directory of its own and keeps the cache in memory.
+    #[test]
+    fn plugin_cache_dir_has_no_temp_fallback() {
+        assert_eq!(
+            plugin_cache_dir(Some("/srv/cache".into()), "postgres://localhost/hv"),
+            Some(PathBuf::from("/srv/cache"))
+        );
+        assert_eq!(plugin_cache_dir(None, "postgres://localhost/hv"), None);
+    }
+
     #[test]
     fn listen_addr_combines_host_and_port() {
         let config = Config {
@@ -293,6 +344,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            plugin_cache_dir: None,
         };
         assert_eq!(
             config.listen_addr(),
@@ -623,6 +675,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            plugin_cache_dir: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com");
     }
@@ -652,6 +705,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            plugin_cache_dir: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -681,6 +735,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            plugin_cache_dir: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -710,6 +765,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            plugin_cache_dir: None,
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),
@@ -769,6 +825,7 @@ mod tests {
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
+            plugin_cache_dir: None,
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),

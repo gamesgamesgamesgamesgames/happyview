@@ -1,0 +1,12 @@
+{
+  "id": "wasi_probe",
+  "name": "WASI probe fixture",
+  "version": "1.0.0",
+  "api_version": "2",
+  "plugin_type": "library",
+  "namespace": "wasi_probe",
+  "capabilities": ["wasi:clock", "wasi:random", "wasi:stdio"],
+  "allowed_hosts": [],
+  "dependencies": [],
+  "wasm_file": "target/wasm32-wasip1/release/wasi_probe.wasm"
+}

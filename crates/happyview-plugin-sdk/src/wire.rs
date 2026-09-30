@@ -468,9 +468,30 @@ impl ObjectCall {
     }
 }
 
-/// One comparison in a record or table filter. `value` is the JSON value the
-/// script passed — a string, number or boolean. A record filter binds it as
-/// text; a table filter binds it by JSON type against the column.
+/// One comparison in a record or table filter. `value` is a string, number
+/// or boolean; a null is refused, since neither backend compares one the way
+/// a caller would read it.
+///
+/// **A record filter compares by the value's own JSON type.** `score > 100`
+/// asks a numeric question and gets a numeric answer, and `score = "100"`
+/// asks a different one — it matches a field holding the *string* `"100"`,
+/// not the number. A record body carries no schema, so the value is the only
+/// thing that can say which comparison was meant.
+///
+/// A type that does not match what the records hold is therefore an **empty
+/// result, not an error**: quoting a number is the mistake to look for first
+/// when a filter matches nothing it should. A field holding different JSON
+/// types in different rows is the one case the two backends order
+/// differently, and no ordering of a number against a string is more correct
+/// than another.
+///
+/// **A table filter compares against the column's type**, which the host
+/// reads from the table rather than guessing: a value the column cannot hold
+/// is refused, naming the column, instead of being coerced to something
+/// arbitrary.
+///
+/// `like`, `not like` and `ilike` compare as text on both, whatever the
+/// field or column holds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Condition {
     pub field: String,
@@ -1290,6 +1311,300 @@ impl ExternalProfile {
 }
 
 // ---------------------------------------------------------------------------
+// Interpreter exports
+// ---------------------------------------------------------------------------
+
+/// Which runner a script is executing for. Names are snake_case on the wire
+/// like every other name that crosses; the trigger id in the context says
+/// which event, this says which contract the result is read under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptKind {
+    XrpcQuery,
+    XrpcProcedure,
+    RecordEvent,
+    Label,
+    Job,
+}
+
+impl ScriptKind {
+    pub const ALL: [ScriptKind; 5] = [
+        ScriptKind::XrpcQuery,
+        ScriptKind::XrpcProcedure,
+        ScriptKind::RecordEvent,
+        ScriptKind::Label,
+        ScriptKind::Job,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScriptKind::XrpcQuery => "xrpc_query",
+            ScriptKind::XrpcProcedure => "xrpc_procedure",
+            ScriptKind::RecordEvent => "record_event",
+            ScriptKind::Label => "label",
+            ScriptKind::Job => "job",
+        }
+    }
+}
+
+/// A library a script may `require`. `require` resolves the namespace and
+/// `host_get_api_surface`/`host_call_library` take the id, so the pair is
+/// sent together and the interpreter never resolves a namespace itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryRef {
+    pub namespace: String,
+    pub id: String,
+}
+
+/// What `execute` receives. Every field is data: nothing in it is a handle
+/// or a credential, and the host holds the identity the four `script:host`
+/// imports act on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecuteInput {
+    pub source: String,
+    pub kind: ScriptKind,
+    /// The first argument of `handle`.
+    pub input: Value,
+    pub context: ExecuteContext,
+    #[serde(default)]
+    pub libraries: Vec<LibraryRef>,
+    pub limits: ExecuteLimits,
+    /// Names a free-variable read must refuse. They travel as data so the
+    /// guard and the host's codemod stay one list; a list baked into a
+    /// separately released plugin could not be pinned to it.
+    ///
+    /// Empty and absent both mean no guard, so an empty list is not sent —
+    /// the spelling [`ValidateInput::removed_globals`] uses, since one field
+    /// name spelled two ways across these types is the drift this module
+    /// exists to prevent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_globals: Vec<String>,
+}
+
+/// The data half of `ctx`. A field that does not apply to the script's kind
+/// is absent from the JSON, never null, so an interpreter for a language
+/// that distinguishes the two renders each correctly.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExecuteContext {
+    pub trigger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_did: Option<String>,
+    #[serde(default)]
+    pub has_pds_auth: bool,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate_did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<ScriptSpace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<ScriptJob>,
+}
+
+/// `ctx.space`, for a space-scoped query or procedure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptSpace {
+    pub uri: String,
+    pub id: String,
+    pub did: String,
+    pub authority_did: String,
+    pub type_nsid: String,
+    pub skey: String,
+}
+
+/// `ctx.job`'s data. Its three controls act on the job row while the script
+/// runs, so they are host imports rather than fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptJob {
+    pub id: String,
+}
+
+/// The budgets the interpreter enforces itself. Execution time is not here:
+/// the host owns it as an epoch deadline on the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteLimits {
+    /// `null` means no budget. The key is always present because absent and
+    /// null mean different things to the reader: an interpreter that finds
+    /// it missing is talking to a host that did not decide.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub instructions: Option<u32>,
+    pub memory_bytes: u64,
+}
+
+/// How a returned value should be read. The record-event runner branches
+/// three ways and a JSON `null` cannot tell a returned nothing from a
+/// returned null sentinel; the names are the host's branch rather than any
+/// language's type system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptValueKind {
+    /// The language's "returned nothing": Lua `nil`, JavaScript `undefined`.
+    None,
+    /// A key-value mapping.
+    Object,
+    /// Anything else, an explicit null included.
+    Other,
+}
+
+/// Why a script did not return. The host maps each onto its own error type
+/// one to one, and a test on the host side pins that neither list can gain a
+/// variant alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptErrorKind {
+    Syntax,
+    Runtime,
+    Timeout,
+    Memory,
+    MissingHandle,
+}
+
+impl ScriptErrorKind {
+    pub const ALL: [ScriptErrorKind; 5] = [
+        ScriptErrorKind::Syntax,
+        ScriptErrorKind::Runtime,
+        ScriptErrorKind::Timeout,
+        ScriptErrorKind::Memory,
+        ScriptErrorKind::MissingHandle,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScriptErrorKind::Syntax => "syntax",
+            ScriptErrorKind::Runtime => "runtime",
+            ScriptErrorKind::Timeout => "timeout",
+            ScriptErrorKind::Memory => "memory",
+            ScriptErrorKind::MissingHandle => "missing_handle",
+        }
+    }
+}
+
+/// What a string no `ScriptErrorKind` spells parses to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseScriptErrorKindError;
+
+impl core::fmt::Display for ParseScriptErrorKindError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("expected one of: syntax, runtime, timeout, memory, missing_handle")
+    }
+}
+
+impl core::error::Error for ParseScriptErrorKindError {}
+
+impl core::str::FromStr for ScriptErrorKind {
+    type Err = ParseScriptErrorKindError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ScriptErrorKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == s)
+            .ok_or(ParseScriptErrorKindError)
+    }
+}
+
+/// What `execute` returns inside the `{ok}` envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ExecuteOutput {
+    Returned {
+        value: Value,
+        value_kind: ScriptValueKind,
+    },
+    Error {
+        kind: ScriptErrorKind,
+        /// What a caller is shown. A `timeout` is the host's cue to write its
+        /// own sentence, and an `AUTH_ERROR:` prefix passes through untouched.
+        message: String,
+        /// Omitted rather than null when the interpreter could not place the
+        /// error on a line, the same spelling [`ValidateError`] uses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<u32>,
+        /// The interpreter's unparsed text, for the event log.
+        raw: String,
+    },
+}
+
+/// What `validate` receives.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidateInput {
+    pub source: String,
+    /// Names a free-variable read must refuse, as
+    /// [`ExecuteInput::removed_globals`] carries them. Validation loads the
+    /// chunk under the same guard a run does, so without this list the editor
+    /// would accept a top-level read of a name every run then refuses.
+    ///
+    /// Empty and absent mean the same thing here — no guard — so an empty
+    /// list is not sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_globals: Vec<String>,
+}
+
+/// What `validate` returns: `{valid: true}`, or `{valid: false, errors}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidateOutput {
+    pub valid: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<ValidateError>,
+}
+
+impl ValidateOutput {
+    pub fn valid() -> Self {
+        Self {
+            valid: true,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn invalid(errors: Vec<ValidateError>) -> Self {
+        Self {
+            valid: false,
+            errors,
+        }
+    }
+}
+
+/// One reason a script does not validate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidateError {
+    pub kind: ScriptErrorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub message: String,
+}
+
+/// What `host_script_log` receives. The host attributes the line to the
+/// run's trigger, caller and job, none of which the guest can name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScriptLogRequest {
+    pub level: Level,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Value>,
+}
+
+/// What `host_job_progress` receives: the value stored on the job row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobProgressRequest {
+    pub data: Value,
+}
+
+/// What `host_job_should_stop` receives. Empty: the run's job is the host's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobShouldStopRequest {}
+
+/// What `host_job_wait` receives. The host clamps the range.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct JobWaitRequest {
+    pub seconds: f64,
+}
+
+// ---------------------------------------------------------------------------
 // Host calls
 // ---------------------------------------------------------------------------
 
@@ -1489,8 +1804,10 @@ impl LookupRequest {
     }
 }
 
-/// Severity for `host::log`. The host parses these exact strings, and calls the
-/// type `LogLevel`.
+/// Severity for `host::log` and `host::script_log`. The host parses these
+/// exact strings, and calls the type `LogLevel`. On the wire it is the
+/// [`as_str`](Self::as_str) spelling, read back through `FromStr`, so the
+/// JSON form and the string form cannot disagree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Level {
     Debug,
@@ -1514,6 +1831,19 @@ impl Level {
 impl core::fmt::Display for Level {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for Level {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Level {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = Cow::<'de, str>::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -3175,6 +3505,469 @@ mod spaces_tests {
         assert_eq!(
             serde_json::from_value::<SpaceUpdate>(value).unwrap(),
             update
+        );
+    }
+}
+
+#[cfg(test)]
+mod interpreter_tests {
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn full_context(kind: ScriptKind) -> ExecuteContext {
+        let mut env = BTreeMap::new();
+        env.insert("API_KEY".to_string(), "k".to_string());
+        let mut ctx = ExecuteContext {
+            trigger: "xrpc.query:app.test.q".to_string(),
+            caller_did: Some("did:plc:me".to_string()),
+            has_pds_auth: true,
+            env,
+            method: None,
+            collection: None,
+            params: None,
+            delegate_did: None,
+            space: None,
+            job: None,
+        };
+        let mut params = Map::new();
+        params.insert("q".to_string(), json!("x"));
+        match kind {
+            ScriptKind::XrpcQuery => {
+                ctx.method = Some("app.test.q".to_string());
+                ctx.collection = Some("app.test.rec".to_string());
+                ctx.space = Some(space());
+            }
+            ScriptKind::XrpcProcedure => {
+                ctx.trigger = "xrpc.procedure:app.test.p".to_string();
+                ctx.method = Some("app.test.p".to_string());
+                ctx.collection = Some("app.test.rec".to_string());
+                ctx.params = Some(params);
+                ctx.delegate_did = Some("did:plc:delegate".to_string());
+                ctx.space = Some(space());
+            }
+            ScriptKind::RecordEvent => {
+                ctx.trigger = "record.created:app.test.rec".to_string();
+                ctx.collection = Some("app.test.rec".to_string());
+            }
+            ScriptKind::Label => {
+                ctx.trigger = "label.applied:spam".to_string();
+            }
+            ScriptKind::Job => {
+                ctx.trigger = "job.run:export".to_string();
+                ctx.job = Some(ScriptJob {
+                    id: "job-1".to_string(),
+                });
+            }
+        }
+        ctx
+    }
+
+    fn space() -> ScriptSpace {
+        ScriptSpace {
+            uri: "at://did:plc:owner/space/com.example.forum/main".to_string(),
+            id: "space-123".to_string(),
+            did: "did:plc:owner".to_string(),
+            authority_did: "did:plc:owner".to_string(),
+            type_nsid: "com.example.forum".to_string(),
+            skey: "main".to_string(),
+        }
+    }
+
+    fn full_input(kind: ScriptKind) -> ExecuteInput {
+        ExecuteInput {
+            source: "function handle(input, ctx) return input end".to_string(),
+            kind,
+            input: json!({"q": "x", "limit": 5}),
+            context: full_context(kind),
+            libraries: vec![LibraryRef {
+                namespace: "happyview.db".to_string(),
+                id: "happyview-db".to_string(),
+            }],
+            limits: ExecuteLimits {
+                instructions: if kind == ScriptKind::Job {
+                    None
+                } else {
+                    Some(1_000_000)
+                },
+                memory_bytes: 64 * 1024 * 1024,
+            },
+            removed_globals: vec!["Record".to_string(), "xrpc".to_string()],
+        }
+    }
+
+    #[test]
+    fn execute_input_round_trips_for_every_script_kind() {
+        for kind in ScriptKind::ALL {
+            let input = full_input(kind);
+            let text = serde_json::to_string(&input).unwrap();
+            std::eprintln!("{}: {text}", kind.as_str());
+            let back: ExecuteInput = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, input, "{}", kind.as_str());
+        }
+    }
+
+    #[test]
+    fn an_absent_context_field_is_missing_from_the_json_not_null() {
+        let query = serde_json::to_value(full_context(ScriptKind::XrpcQuery)).unwrap();
+        let query = query.as_object().unwrap();
+        for absent in ["params", "delegate_did", "job"] {
+            assert!(!query.contains_key(absent), "{absent} should be absent");
+        }
+        for present in [
+            "trigger",
+            "caller_did",
+            "has_pds_auth",
+            "env",
+            "method",
+            "collection",
+            "space",
+        ] {
+            assert!(query.contains_key(present), "{present} should be present");
+        }
+
+        let label = serde_json::to_value(full_context(ScriptKind::Label)).unwrap();
+        let label = label.as_object().unwrap();
+        for absent in [
+            "method",
+            "collection",
+            "params",
+            "delegate_did",
+            "space",
+            "job",
+        ] {
+            assert!(!label.contains_key(absent), "{absent} should be absent");
+        }
+
+        let anonymous = ExecuteContext {
+            trigger: "xrpc.query:app.test.q".to_string(),
+            ..ExecuteContext::default()
+        };
+        let anonymous = serde_json::to_value(anonymous).unwrap();
+        assert!(anonymous.get("caller_did").is_none());
+        assert_eq!(anonymous["has_pds_auth"], false);
+        assert_eq!(anonymous["env"], json!({}));
+    }
+
+    #[test]
+    fn a_missing_context_field_parses_as_absent() {
+        let ctx: ExecuteContext =
+            serde_json::from_value(json!({"trigger": "label.applied:spam"})).unwrap();
+        assert_eq!(ctx.caller_did, None);
+        assert!(!ctx.has_pds_auth);
+        assert!(ctx.env.is_empty());
+        assert_eq!(ctx.space, None);
+        assert_eq!(ctx.job, None);
+    }
+
+    #[test]
+    fn no_instruction_budget_is_emitted_as_null_and_an_omitted_key_is_refused() {
+        let unbounded = serde_json::to_value(ExecuteLimits {
+            instructions: None,
+            memory_bytes: 1,
+        })
+        .unwrap();
+        assert!(unbounded.as_object().unwrap().contains_key("instructions"));
+        assert_eq!(unbounded["instructions"], Value::Null);
+
+        let bounded = serde_json::to_value(ExecuteLimits {
+            instructions: Some(10),
+            memory_bytes: 1,
+        })
+        .unwrap();
+        assert_eq!(bounded["instructions"], 10);
+
+        let parsed: ExecuteLimits =
+            serde_json::from_value(json!({"instructions": null, "memory_bytes": 1})).unwrap();
+        assert_eq!(parsed.instructions, None);
+
+        let err = serde_json::from_value::<ExecuteLimits>(json!({"memory_bytes": 1})).unwrap_err();
+        assert!(
+            err.to_string().contains("instructions"),
+            "an omitted key must be refused by name: {err}"
+        );
+    }
+
+    #[test]
+    fn libraries_and_removed_globals_default_to_empty() {
+        let input: ExecuteInput = serde_json::from_value(json!({
+            "source": "",
+            "kind": "label",
+            "input": null,
+            "context": {"trigger": "label.applied:spam"},
+            "limits": {"instructions": 1, "memory_bytes": 1},
+        }))
+        .unwrap();
+        assert!(input.libraries.is_empty());
+        assert!(input.removed_globals.is_empty());
+
+        // An empty guard goes back out absent rather than as `[]`, the same
+        // way `ValidateInput` spells it.
+        let out = serde_json::to_value(&input).unwrap();
+        assert!(out.get("removed_globals").is_none(), "{out}");
+    }
+
+    #[test]
+    fn script_enums_serialize_snake_case() {
+        let kinds: Vec<Value> = ScriptKind::ALL
+            .iter()
+            .map(|k| serde_json::to_value(k).unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                json!("xrpc_query"),
+                json!("xrpc_procedure"),
+                json!("record_event"),
+                json!("label"),
+                json!("job")
+            ]
+        );
+        for kind in ScriptKind::ALL {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(kind.as_str()));
+        }
+
+        assert_eq!(
+            serde_json::to_value(ScriptValueKind::None).unwrap(),
+            json!("none")
+        );
+        assert_eq!(
+            serde_json::to_value(ScriptValueKind::Object).unwrap(),
+            json!("object")
+        );
+        assert_eq!(
+            serde_json::to_value(ScriptValueKind::Other).unwrap(),
+            json!("other")
+        );
+
+        let errors: Vec<Value> = ScriptErrorKind::ALL
+            .iter()
+            .map(|k| serde_json::to_value(k).unwrap())
+            .collect();
+        assert_eq!(
+            errors,
+            vec![
+                json!("syntax"),
+                json!("runtime"),
+                json!("timeout"),
+                json!("memory"),
+                json!("missing_handle")
+            ]
+        );
+        for kind in ScriptErrorKind::ALL {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(kind.as_str()));
+            assert_eq!(kind.as_str().parse::<ScriptErrorKind>().unwrap(), kind);
+        }
+        assert!("internal".parse::<ScriptErrorKind>().is_err());
+    }
+
+    #[test]
+    fn an_execute_output_parses_from_the_shape_the_prototype_emitted() {
+        let error: ExecuteOutput = serde_json::from_value(json!({
+            "status": "error",
+            "kind": "runtime",
+            "message": "attempt to index a nil value",
+            "line": 12,
+            "raw": "[string \"script\"]:12: attempt to index a nil value",
+        }))
+        .unwrap();
+        assert_eq!(
+            error,
+            ExecuteOutput::Error {
+                kind: ScriptErrorKind::Runtime,
+                message: "attempt to index a nil value".to_string(),
+                line: Some(12),
+                raw: "[string \"script\"]:12: attempt to index a nil value".to_string(),
+            }
+        );
+
+        let no_line: ExecuteOutput = serde_json::from_value(json!({
+            "status": "error",
+            "kind": "missing_handle",
+            "message": "script does not define a handle() function",
+            "line": null,
+            "raw": "script does not define a handle() function",
+        }))
+        .unwrap();
+        let ExecuteOutput::Error { kind, line, .. } = no_line else {
+            panic!("expected an error");
+        };
+        assert_eq!(kind, ScriptErrorKind::MissingHandle);
+        assert_eq!(line, None);
+
+        let returned: ExecuteOutput = serde_json::from_value(json!({
+            "status": "returned",
+            "value": {"a": 1},
+            "value_kind": "object",
+        }))
+        .unwrap();
+        assert_eq!(
+            returned,
+            ExecuteOutput::Returned {
+                value: json!({"a": 1}),
+                value_kind: ScriptValueKind::Object,
+            }
+        );
+    }
+
+    #[test]
+    fn execute_output_round_trips_and_is_tagged_on_status() {
+        let returned = ExecuteOutput::Returned {
+            value: Value::Null,
+            value_kind: ScriptValueKind::None,
+        };
+        let value = serde_json::to_value(&returned).unwrap();
+        assert_eq!(value["status"], "returned");
+        assert_eq!(value["value_kind"], "none");
+        assert_eq!(
+            serde_json::from_value::<ExecuteOutput>(value).unwrap(),
+            returned
+        );
+
+        let error = ExecuteOutput::Error {
+            kind: ScriptErrorKind::Timeout,
+            message: "script exceeded execution limit".to_string(),
+            line: None,
+            raw: "instruction limit".to_string(),
+        };
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["kind"], "timeout");
+        // An error with no line omits the key, the spelling `ValidateError`
+        // uses; a null parses back to the same thing either way.
+        assert!(value.get("line").is_none(), "{value}");
+        assert_eq!(
+            serde_json::from_value::<ExecuteOutput>(value).unwrap(),
+            error
+        );
+        assert_eq!(
+            serde_json::from_value::<ExecuteOutput>(
+                json!({"status": "error", "kind": "timeout", "message": "script exceeded execution limit",
+                       "line": null, "raw": "instruction limit"})
+            )
+            .unwrap(),
+            error
+        );
+    }
+
+    #[test]
+    fn validate_types_round_trip_in_both_shapes() {
+        let input = ValidateInput {
+            source: "function handle() end".to_string(),
+            removed_globals: vec!["env".to_string(), "Record".to_string()],
+        };
+        assert_eq!(
+            serde_json::to_value(&input).unwrap(),
+            json!({"source": "function handle() end", "removed_globals": ["env", "Record"]})
+        );
+        assert_eq!(
+            serde_json::from_value::<ValidateInput>(serde_json::to_value(&input).unwrap()).unwrap(),
+            input
+        );
+
+        // A host that names no removed globals is an empty guard, not a
+        // parse error, and an empty guard is absent rather than `[]`.
+        let bare = ValidateInput {
+            source: "function handle() end".to_string(),
+            removed_globals: Vec::new(),
+        };
+        let value = serde_json::to_value(&bare).unwrap();
+        assert_eq!(value, json!({"source": "function handle() end"}));
+        assert_eq!(
+            serde_json::from_value::<ValidateInput>(value).unwrap(),
+            bare
+        );
+
+        let valid = ValidateOutput::valid();
+        let value = serde_json::to_value(&valid).unwrap();
+        assert_eq!(value, json!({"valid": true}));
+        assert_eq!(
+            serde_json::from_value::<ValidateOutput>(value).unwrap(),
+            valid
+        );
+
+        let invalid = ValidateOutput::invalid(vec![ValidateError {
+            kind: ScriptErrorKind::Syntax,
+            line: Some(3),
+            message: "unexpected symbol".to_string(),
+        }]);
+        let value = serde_json::to_value(&invalid).unwrap();
+        assert_eq!(
+            value,
+            json!({"valid": false, "errors": [{"kind": "syntax", "line": 3, "message": "unexpected symbol"}]})
+        );
+        assert_eq!(
+            serde_json::from_value::<ValidateOutput>(value).unwrap(),
+            invalid
+        );
+
+        let prototype: ValidateOutput = serde_json::from_value(json!({
+            "valid": false,
+            "errors": [{"kind": "missing_handle", "message": "script must define a handle() function"}],
+        }))
+        .unwrap();
+        assert_eq!(prototype.errors[0].line, None);
+    }
+
+    #[test]
+    fn script_host_requests_round_trip() {
+        let log = ScriptLogRequest {
+            level: Level::Warn,
+            message: "careful".to_string(),
+            fields: Some(json!({"n": 1})),
+        };
+        let value = serde_json::to_value(&log).unwrap();
+        assert_eq!(
+            value,
+            json!({"level": "warn", "message": "careful", "fields": {"n": 1}})
+        );
+        assert_eq!(
+            serde_json::from_value::<ScriptLogRequest>(value).unwrap(),
+            log
+        );
+
+        let bare = ScriptLogRequest {
+            level: Level::Info,
+            message: "hi".to_string(),
+            fields: None,
+        };
+        let value = serde_json::to_value(&bare).unwrap();
+        assert_eq!(value, json!({"level": "info", "message": "hi"}));
+        assert_eq!(
+            serde_json::from_value::<ScriptLogRequest>(value).unwrap(),
+            bare
+        );
+        let lenient: ScriptLogRequest =
+            serde_json::from_value(json!({"level": "WARNING", "message": "m"})).unwrap();
+        assert_eq!(lenient.level, Level::Warn);
+        assert!(serde_json::from_value::<ScriptLogRequest>(
+            json!({"level": "loud", "message": "m"})
+        )
+        .is_err());
+
+        let progress = JobProgressRequest {
+            data: json!({"done": 3}),
+        };
+        let value = serde_json::to_value(&progress).unwrap();
+        assert_eq!(value, json!({"data": {"done": 3}}));
+        assert_eq!(
+            serde_json::from_value::<JobProgressRequest>(value).unwrap(),
+            progress
+        );
+
+        let value = serde_json::to_value(JobShouldStopRequest {}).unwrap();
+        assert_eq!(value, json!({}));
+        serde_json::from_value::<JobShouldStopRequest>(value).unwrap();
+
+        let wait = JobWaitRequest { seconds: 0.5 };
+        let value = serde_json::to_value(wait).unwrap();
+        assert_eq!(value, json!({"seconds": 0.5}));
+        assert_eq!(
+            serde_json::from_value::<JobWaitRequest>(value).unwrap(),
+            wait
         );
     }
 }

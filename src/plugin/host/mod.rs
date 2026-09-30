@@ -9,10 +9,14 @@ mod linked_repos;
 mod logging;
 mod lookup;
 mod records;
+pub mod script;
 mod secrets;
 mod spaces;
+mod wasi;
 
 pub use atproto::*;
+#[cfg(test)]
+pub(crate) use bindings::{HostImports, define_host_functions};
 pub use bindings::{PluginState, register_host_functions};
 pub use caller::*;
 pub use db::*;
@@ -21,7 +25,9 @@ pub use kv::*;
 pub use logging::*;
 pub use lookup::*;
 pub use records::*;
+pub use script::ScriptRun;
 pub use secrets::*;
+pub use wasi::build_context as build_wasi_context;
 
 // `jobs`, `linked_repos` and `spaces` are deliberately not glob-exported:
 // each defines functions sharing a name with another module's (`create`,

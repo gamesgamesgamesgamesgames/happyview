@@ -60,13 +60,25 @@ pub struct PluginManifest {
     pub file_extension: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monaco_language: Option<String>,
-    /// Interpreter only: library ids it can bridge; `["*"]` means any.
-    #[serde(default)]
+    /// Interpreter only: library ids it can bridge; `["*"]` means any, which
+    /// is what a generic bridge declares and therefore the default. Another
+    /// type's manifest carries the default too, since serde cannot see
+    /// `plugin_type`; read it through
+    /// [`LoadedPlugin::supports_libraries`](LoadedPlugin::supports_libraries),
+    /// which is empty for everything but an interpreter.
+    #[serde(default = "default_supports_libraries")]
     pub supports_libraries: Vec<String>,
 }
 
 fn default_wasm_file() -> String {
     "plugin.wasm".to_string()
+}
+
+/// The wildcard an interpreter declares to bridge whatever is installed.
+pub const ANY_LIBRARY: &str = "*";
+
+fn default_supports_libraries() -> Vec<String> {
+    vec![ANY_LIBRARY.to_string()]
 }
 
 /// What a plugin's `plugin_info()` export returns, and the SDK's definition of
@@ -212,6 +224,27 @@ impl LoadedPlugin {
             return None;
         }
         Some(m.namespace.as_deref().unwrap_or(&m.id))
+    }
+
+    /// The libraries an interpreter may bridge; empty for every other type,
+    /// which is what keeps a library's defaulted `["*"]` from being read as a
+    /// declaration it never made.
+    pub fn supports_libraries(&self) -> &[String] {
+        match self.manifest.as_ref() {
+            Some(m) if m.plugin_type == PluginType::Interpreter => &m.supports_libraries,
+            _ => &[],
+        }
+    }
+
+    /// The `scripts.script_type` an interpreter serves; `None` for every
+    /// other type. The loader requires it of an interpreter, so a plugin the
+    /// loader produced always has one.
+    pub fn language_id(&self) -> Option<&str> {
+        let m = self.manifest.as_ref()?;
+        if m.plugin_type != PluginType::Interpreter {
+            return None;
+        }
+        m.language_id.as_deref()
     }
 
     /// What the manifest says. `manifest: None` declares nothing; the loader

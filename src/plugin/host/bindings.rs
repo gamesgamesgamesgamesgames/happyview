@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use wasmtime::{Linker, Memory, TypedFunc};
+use wasmtime::{AsContextMut, Linker, Memory, TypedFunc};
 
 use crate::plugin::caller::CallerSession;
 use crate::plugin::capabilities::{PluginCapability, is_free_import, requirement_for_import};
@@ -30,12 +32,24 @@ pub struct PluginState {
     /// `host_caller_xrpc_query`, which a session-less query, record-event or
     /// label script can also reach.
     pub caller: Option<Arc<crate::plugin::caller::CallerSession>>,
+    /// The script run this instance is executing, for the four imports that
+    /// act on it. `None` for a library or auth instance, which is what makes
+    /// those imports refuse rather than act on a run they are not inside.
+    pub script_run: Option<super::script::ScriptRun>,
     /// The full instance, carried from `PluginExecutor::app_state` so a
     /// caller-acting import can run without a `CallerSession` to source it
     /// from. `Some` for every real instantiation; `None` only for the
     /// direct-construction test and external-auth call sites that never
     /// reach such an import.
     pub app_state: Option<crate::AppState>,
+    /// Answers the preview-1 imports of a module that links them. Built for
+    /// every instance, because the linker only reaches it through the store
+    /// and a module that imports nothing from it never calls in.
+    pub wasi: wasmtime_wasi::p1::WasiP1Ctx,
+    /// The guest-execution budget the store's epoch deadline is armed from.
+    pub deadline: crate::plugin::runtime::GuestDeadline,
+    /// The store's linear-memory ceiling, installed as its resource limiter.
+    pub limiter: crate::plugin::runtime::MemoryLimiter,
 }
 
 /// Check that a memory access is within bounds
@@ -78,71 +92,71 @@ fn error_envelope(code: &str, message: impl std::fmt::Display) -> Vec<u8> {
 
 /// Register all host functions with the linker
 pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), wasmtime::Error> {
+    define_host_functions(linker).map(|_| ())
+}
+
+/// Registers every async import through [`HostImports::define`], so none
+/// can be added without the guest-deadline accounting, and returns the
+/// names that went through it. `host_log` is synchronous and copies a few
+/// bytes; it is registered bare.
+pub(crate) fn define_host_functions(
+    linker: &mut Linker<PluginState>,
+) -> Result<Vec<&'static str>, wasmtime::Error> {
     // Sync functions
     linker.func_wrap("env", "host_log", host_log)?;
+    let mut imports = HostImports::new(linker);
 
     // host_get_secret must be async because it calls alloc on an async store
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_get_secret",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (name_ptr, name_len): (i32, i32)| {
-            Box::new(async move { host_get_secret_impl(&mut caller, name_ptr, name_len).await })
+        |caller, (name_ptr, name_len): (i32, i32)| {
+            Box::pin(async move { host_get_secret_impl(caller, name_ptr, name_len).await })
         },
     )?;
 
     // Async functions - HTTP
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_http_request",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move { host_http_request_impl(&mut caller, req_ptr, req_len).await })
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_http_request_impl(caller, req_ptr, req_len).await })
         },
     )?;
 
     // Async functions - KV
-    linker.func_wrap_async(
-        "env",
-        "host_kv_get",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (key_ptr, key_len): (i32, i32)| {
-            Box::new(async move { host_kv_get_impl(&mut caller, key_ptr, key_len).await })
-        },
-    )?;
+    imports.define("host_kv_get", |caller, (key_ptr, key_len): (i32, i32)| {
+        Box::pin(async move { host_kv_get_impl(caller, key_ptr, key_len).await })
+    })?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_kv_set",
-        |mut caller: wasmtime::Caller<'_, PluginState>,
-         (key_ptr, key_len, val_ptr, val_len, ttl): (i32, i32, i32, i32, i32)| {
-            Box::new(async move {
-                host_kv_set_impl(&mut caller, key_ptr, key_len, val_ptr, val_len, ttl).await
+        |caller, (key_ptr, key_len, val_ptr, val_len, ttl): (i32, i32, i32, i32, i32)| {
+            Box::pin(async move {
+                host_kv_set_impl(caller, key_ptr, key_len, val_ptr, val_len, ttl).await
             })
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_kv_delete",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (key_ptr, key_len): (i32, i32)| {
-            Box::new(async move { host_kv_delete_impl(&mut caller, key_ptr, key_len).await })
+        |caller, (key_ptr, key_len): (i32, i32)| {
+            Box::pin(async move { host_kv_delete_impl(caller, key_ptr, key_len).await })
         },
     )?;
 
     // Async functions - Record lookup
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_lookup_record",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move { host_lookup_record_impl(&mut caller, req_ptr, req_len).await })
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_lookup_record_impl(caller, req_ptr, req_len).await })
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_records_query",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_spec_impl(
-                    &mut caller,
+                    caller,
                     "host_records_query",
                     req_ptr,
                     req_len,
@@ -153,13 +167,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_records_count",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_spec_impl(
-                    &mut caller,
+                    caller,
                     "host_records_count",
                     req_ptr,
                     req_len,
@@ -170,13 +183,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_records_get",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_spec_impl(
-                    &mut caller,
+                    caller,
                     "host_records_get",
                     req_ptr,
                     req_len,
@@ -189,13 +201,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_records_search",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_spec_impl(
-                    &mut caller,
+                    caller,
                     "host_records_search",
                     req_ptr,
                     req_len,
@@ -206,13 +217,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_table_query",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_spec_impl(
-                    &mut caller,
+                    caller,
                     "host_table_query",
                     req_ptr,
                     req_len,
@@ -223,13 +233,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_backlinks_query",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_spec_impl(
-                    &mut caller,
+                    caller,
                     "host_backlinks_query",
                     req_ptr,
                     req_len,
@@ -241,13 +250,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
     )?;
 
     // Async functions - acting as the calling user
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_caller_create_record",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_caller_create_record",
                     req_ptr,
                     req_len,
@@ -258,13 +266,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_caller_put_record",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_caller_put_record",
                     req_ptr,
                     req_len,
@@ -275,13 +282,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_caller_delete_record",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_caller_delete_record",
                     req_ptr,
                     req_len,
@@ -292,13 +298,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_caller_upload_blob",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_caller_upload_blob",
                     req_ptr,
                     req_len,
@@ -309,21 +314,19 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_caller_xrpc_query",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move { host_caller_query_impl(&mut caller, req_ptr, req_len).await })
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_caller_query_impl(caller, req_ptr, req_len).await })
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_caller_xrpc_procedure",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_caller_xrpc_procedure",
                     req_ptr,
                     req_len,
@@ -335,13 +338,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
     )?;
 
     // Async functions - writing to a linked repo and enqueuing jobs
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_linked_repos_list",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_impl(
-                    &mut caller,
+                    caller,
                     "host_linked_repos_list",
                     req_ptr,
                     req_len,
@@ -355,13 +357,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_linked_repo_create_record",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_impl(
-                    &mut caller,
+                    caller,
                     "host_linked_repo_create_record",
                     req_ptr,
                     req_len,
@@ -375,13 +376,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_linked_repo_put_record",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_impl(
-                    &mut caller,
+                    caller,
                     "host_linked_repo_put_record",
                     req_ptr,
                     req_len,
@@ -395,13 +395,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_linked_repo_delete_record",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_impl(
-                    &mut caller,
+                    caller,
                     "host_linked_repo_delete_record",
                     req_ptr,
                     req_len,
@@ -415,13 +414,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_linked_repo_upload_blob",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_impl(
-                    &mut caller,
+                    caller,
                     "host_linked_repo_upload_blob",
                     req_ptr,
                     req_len,
@@ -435,13 +433,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_linked_repo_call",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_impl(
-                    &mut caller,
+                    caller,
                     "host_linked_repo_call",
                     req_ptr,
                     req_len,
@@ -455,13 +452,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_jobs_create",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_jobs_create",
                     req_ptr,
                     req_len,
@@ -479,13 +475,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
     // Async functions - spaces. Four reads need no caller; the eleven writes
     // act as `ctx.caller_did` and refuse before reaching the module when the
     // script context has none, via `require_spaces_caller`.
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_info",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_info",
                     req_ptr,
                     req_len,
@@ -499,13 +494,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_query",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_query",
                     req_ptr,
                     req_len,
@@ -519,13 +513,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_members",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_members",
                     req_ptr,
                     req_len,
@@ -539,13 +532,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_access",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_access",
                     req_ptr,
                     req_len,
@@ -559,13 +551,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_create",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_create",
                     req_ptr,
                     req_len,
@@ -583,13 +574,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_accept_invite",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_accept_invite",
                     req_ptr,
                     req_len,
@@ -607,13 +597,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_write_record",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_write_record",
                     req_ptr,
                     req_len,
@@ -631,13 +620,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_put_record",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_put_record",
                     req_ptr,
                     req_len,
@@ -655,13 +643,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_delete_record",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_delete_record",
                     req_ptr,
                     req_len,
@@ -679,13 +666,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_add_member",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_add_member",
                     req_ptr,
                     req_len,
@@ -703,13 +689,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_set_member",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_set_member",
                     req_ptr,
                     req_len,
@@ -727,13 +712,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_remove_member",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_remove_member",
                     req_ptr,
                     req_len,
@@ -751,13 +735,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_update",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_update",
                     req_ptr,
                     req_len,
@@ -772,13 +755,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_delete",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_delete",
                     req_ptr,
                     req_len,
@@ -793,13 +775,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_spaces_create_invite",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_app_caller_impl(
-                    &mut caller,
+                    caller,
                     "host_spaces_create_invite",
                     req_ptr,
                     req_len,
@@ -818,13 +799,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
     )?;
 
     // Async functions - local index writes and lexicon reads
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_records_index_put",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_spec_impl(
-                    &mut caller,
+                    caller,
                     "host_records_index_put",
                     req_ptr,
                     req_len,
@@ -835,13 +815,12 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_records_index_delete",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
                 host_spec_impl(
-                    &mut caller,
+                    caller,
                     "host_records_index_delete",
                     req_ptr,
                     req_len,
@@ -854,109 +833,281 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_lexicon_get",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move { host_lexicon_get_impl(&mut caller, req_ptr, req_len).await })
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_lexicon_get_impl(caller, req_ptr, req_len).await })
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_allowed_hosts",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move { host_allowed_hosts_impl(&mut caller, req_ptr, req_len).await })
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_allowed_hosts_impl(caller, req_ptr, req_len).await })
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_call_library",
-        |mut caller: wasmtime::Caller<'_, PluginState>,
+        |caller,
          (lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len): (i32, i32, i32, i32, i32, i32)| {
-            Box::new(async move {
-                host_call_library_impl(&mut caller, lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len)
+            Box::pin(async move {
+                host_call_library_impl(caller, lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len)
                     .await
             })
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_get_api_surface",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (lib_ptr, lib_len): (i32, i32)| {
-            Box::new(async move { host_get_api_surface_impl(&mut caller, lib_ptr, lib_len).await })
+        |caller, (lib_ptr, lib_len): (i32, i32)| {
+            Box::pin(async move { host_get_api_surface_impl(caller, lib_ptr, lib_len).await })
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_db_query",
-        |mut caller: wasmtime::Caller<'_, PluginState>,
-         (sql_ptr, sql_len, params_ptr, params_len): (i32, i32, i32, i32)| {
-            Box::new(async move {
-                host_db_impl(&mut caller, false, sql_ptr, sql_len, params_ptr, params_len).await
+        |caller, (sql_ptr, sql_len, params_ptr, params_len): (i32, i32, i32, i32)| {
+            Box::pin(async move {
+                host_db_impl(caller, false, sql_ptr, sql_len, params_ptr, params_len).await
             })
         },
     )?;
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_db_execute",
-        |mut caller: wasmtime::Caller<'_, PluginState>,
-         (sql_ptr, sql_len, params_ptr, params_len): (i32, i32, i32, i32)| {
-            Box::new(async move {
-                host_db_impl(&mut caller, true, sql_ptr, sql_len, params_ptr, params_len).await
+        |caller, (sql_ptr, sql_len, params_ptr, params_len): (i32, i32, i32, i32)| {
+            Box::pin(async move {
+                host_db_impl(caller, true, sql_ptr, sql_len, params_ptr, params_len).await
             })
         },
     )?;
 
     // Async functions - AT Protocol network reads and attestation
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_atproto_resolve_service",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move {
-                host_atproto_resolve_service_impl(&mut caller, req_ptr, req_len).await
-            })
-        },
-    )?;
-
-    linker.func_wrap_async(
-        "env",
-        "host_atproto_blob_download",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(
-                async move { host_atproto_blob_download_impl(&mut caller, req_ptr, req_len).await },
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(
+                async move { host_atproto_resolve_service_impl(caller, req_ptr, req_len).await },
             )
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
+        "host_atproto_blob_download",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_atproto_blob_download_impl(caller, req_ptr, req_len).await })
+        },
+    )?;
+
+    imports.define(
         "host_labels_get",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move { host_labels_get_impl(&mut caller, req_ptr, req_len).await })
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_labels_get_impl(caller, req_ptr, req_len).await })
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_attest_sign",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move { host_attest_sign_impl(&mut caller, req_ptr, req_len).await })
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_attest_sign_impl(caller, req_ptr, req_len).await })
         },
     )?;
 
-    linker.func_wrap_async(
-        "env",
+    imports.define(
         "host_attest_verify",
-        |mut caller: wasmtime::Caller<'_, PluginState>, (req_ptr, req_len): (i32, i32)| {
-            Box::new(async move { host_attest_verify_impl(&mut caller, req_ptr, req_len).await })
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_attest_verify_impl(caller, req_ptr, req_len).await })
         },
     )?;
 
-    Ok(())
+    // The imports only an interpreter reaches: they act on the script run in
+    // progress, so each refuses outside one.
+    imports.define(
+        "host_script_log",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_script_impl(
+                    caller,
+                    "host_script_log",
+                    req_ptr,
+                    req_len,
+                    |state, run, spec: happyview_plugin_sdk::wire::ScriptLogRequest| async move {
+                        super::script::log(&state, &run, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_job_progress",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_script_impl(
+                    caller,
+                    "host_job_progress",
+                    req_ptr,
+                    req_len,
+                    |state, run, spec: happyview_plugin_sdk::wire::JobProgressRequest| async move {
+                        super::script::progress(&state, &run, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_job_should_stop",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_script_impl(
+                    caller,
+                    "host_job_should_stop",
+                    req_ptr,
+                    req_len,
+                    |state,
+                     run,
+                     _spec: happyview_plugin_sdk::wire::JobShouldStopRequest| async move {
+                        super::script::should_stop(&state, &run).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define("host_job_wait", |caller, (req_ptr, req_len): (i32, i32)| {
+        Box::pin(async move {
+            host_script_impl(
+                caller,
+                "host_job_wait",
+                req_ptr,
+                req_len,
+                |state, run, spec: happyview_plugin_sdk::wire::JobWaitRequest| async move {
+                    super::script::wait(&state, &run, spec).await
+                },
+            )
+            .await
+        })
+    })?;
+
+    Ok(imports.wrapped)
+}
+
+pub(crate) struct HostImports<'l> {
+    linker: &'l mut Linker<PluginState>,
+    wrapped: Vec<&'static str>,
+}
+
+impl<'l> HostImports<'l> {
+    pub(crate) fn new(linker: &'l mut Linker<PluginState>) -> Self {
+        Self {
+            linker,
+            wrapped: Vec::new(),
+        }
+    }
+
+    /// One `env` import. The guest's deadline stops when it enters and
+    /// starts again when it returns, so an import's own latency is never
+    /// charged to the script.
+    pub(crate) fn define<Params, R, F>(
+        &mut self,
+        name: &'static str,
+        f: F,
+    ) -> Result<(), wasmtime::Error>
+    where
+        Params: wasmtime::WasmTyList + Send + 'static,
+        R: wasmtime::WasmRet + Send + 'static,
+        F: for<'a, 'c> Fn(
+                &'a mut wasmtime::Caller<'c, PluginState>,
+                Params,
+            ) -> Pin<Box<dyn Future<Output = R> + Send + 'a>>
+            + Copy
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.wrapped.push(name);
+        self.linker.func_wrap_async(
+            "env",
+            name,
+            move |mut caller: wasmtime::Caller<'_, PluginState>, params: Params| {
+                Box::new(async move {
+                    suspend_guest_deadline(&mut caller);
+                    let out = f(&mut caller, params).await;
+                    resume_guest_deadline(&mut caller);
+                    out
+                })
+            },
+        )?;
+        Ok(())
+    }
+}
+
+/// The guest has entered a host import: stop its clock.
+fn suspend_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
+    caller.data_mut().deadline.suspend();
+}
+
+/// The guest is about to run again: re-arm the store with what is left.
+fn resume_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
+    let remaining = caller.data_mut().deadline.resume();
+    caller.as_context_mut().set_epoch_deadline(remaining);
+}
+
+/// One entry point for the four imports that act on the script run in
+/// progress. The capability is checked before the run, so a plugin that never
+/// asked for `script:host` hears about the grant rather than about a run it
+/// could not have reached anyway.
+async fn host_script_impl<S, R, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    F: FnOnce(crate::AppState, super::script::ScriptRun, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, super::script::ScriptHostError>>,
+{
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(script_run) = caller.data().script_run.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "UNSUPPORTED",
+                format!("{import} acts on a script run, and no script run is in progress"),
+            ),
+        )
+        .await;
+    };
+    let Some(app_state) = caller.data().app_state.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope("HOST_ERROR", "this instance has no app state"),
+        )
+        .await;
+    };
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: S = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let response = match run(app_state, script_run, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(e.code(), e),
+    };
+    write_guest_response(caller, &response).await
 }
 
 /// Read a string from guest memory
@@ -996,6 +1147,9 @@ async fn write_guest_response(caller: &mut wasmtime::Caller<'_, PluginState>, da
         None => return 0,
     };
 
+    // The allocator is guest code: the clock has to be running again, and
+    // armed from what remains, before it is entered.
+    resume_guest_deadline(caller);
     let len = data.len() as u32;
     let ptr = match alloc.call_async(&mut *caller, len).await {
         Ok(p) if p != 0 => p,
@@ -1277,7 +1431,12 @@ async fn host_kv_set_impl(
     let usage = &mut caller.data_mut().usage;
     match super::kv_set(&ctx, usage, &key, value, ttl_secs).await {
         Ok(()) => 0,
-        Err(_) => -1,
+        // The import's return is a bare `i32`, so the reason cannot reach the
+        // guest; without this it reaches nobody.
+        Err(e) => {
+            tracing::warn!(plugin_id = %caller.data().plugin_id, error = %e, "host_kv_set failed");
+            -1
+        }
     }
 }
 
@@ -2170,7 +2329,19 @@ mod tests {
             call_ctx: crate::plugin::library::LibraryCallContext::default(),
             depth: 0,
             caller: None,
+            script_run: None,
             app_state: None,
+            wasi: super::super::build_wasi_context(
+                "test-plugin",
+                None,
+                crate::db::DatabaseBackend::Sqlite,
+            ),
+            deadline: crate::plugin::runtime::GuestDeadline::unbounded(Arc::new(
+                std::sync::atomic::AtomicU64::new(0),
+            )),
+            limiter: crate::plugin::runtime::MemoryLimiter::new(
+                crate::plugin::runtime::LIBRARY_MEMORY_CEILING,
+            ),
         }
     }
 

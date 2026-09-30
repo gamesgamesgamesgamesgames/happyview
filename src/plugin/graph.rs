@@ -52,6 +52,8 @@ pub enum GraphError {
     },
     #[error("namespace '{namespace}' is already provided by plugin '{by}'")]
     NamespaceTaken { namespace: String, by: String },
+    #[error("language '{language_id}' is already served by interpreter '{by}'")]
+    LanguageIdTaken { language_id: String, by: String },
 }
 
 fn check_edge(

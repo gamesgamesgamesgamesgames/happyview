@@ -62,6 +62,14 @@ pub enum PluginCapability {
     SpacesRead,
     #[serde(rename = "spaces:write")]
     SpacesWrite,
+    #[serde(rename = "wasi:clock")]
+    WasiClock,
+    #[serde(rename = "wasi:random")]
+    WasiRandom,
+    #[serde(rename = "wasi:stdio")]
+    WasiStdio,
+    #[serde(rename = "script:host")]
+    ScriptHost,
 }
 
 impl PluginCapability {
@@ -88,6 +96,10 @@ impl PluginCapability {
             JobsCreate,
             SpacesRead,
             SpacesWrite,
+            WasiClock,
+            WasiRandom,
+            WasiStdio,
+            ScriptHost,
         ]
     }
 
@@ -114,6 +126,10 @@ impl PluginCapability {
             JobsCreate => "jobs:create",
             SpacesRead => "spaces:read",
             SpacesWrite => "spaces:write",
+            WasiClock => "wasi:clock",
+            WasiRandom => "wasi:random",
+            WasiStdio => "wasi:stdio",
+            ScriptHost => "script:host",
         }
     }
 
@@ -124,14 +140,15 @@ impl PluginCapability {
     pub fn risk(&self) -> Risk {
         use PluginCapability::*;
         match self {
-            SecretsRead | KvRead | KvWrite => Risk::Low,
+            SecretsRead | KvRead | KvWrite | WasiClock | WasiRandom | ScriptHost => Risk::Low,
             RecordsRead
             | NetworkRequest
             | NetworkRequestDefined
             | LibraryCall
             | CallerRead
             | AtprotoRead
-            | JobsCreate => Risk::Medium,
+            | JobsCreate
+            | WasiStdio => Risk::Medium,
             NetworkRequestUnrestricted
             | DatabaseRead
             | CallerWrite
@@ -145,6 +162,11 @@ impl PluginCapability {
     }
 
     /// Operator-facing consequence, shown verbatim in the consent dialog.
+    ///
+    /// These sentences are also quoted, verbatim, in the Lua interpreter
+    /// plugin's README in the plugins repository, where its five are listed
+    /// for a script author. No test spans the two repositories, so a change
+    /// here has to be carried there by hand.
     pub fn description(&self) -> &'static str {
         use PluginCapability::*;
         match self {
@@ -197,6 +219,12 @@ impl PluginCapability {
             }
             SpacesWrite => {
                 "Create spaces, write records into them, and manage their members and invites, as the user who ran the script and with that user's access."
+            }
+            WasiClock => "Read the wall clock.",
+            WasiRandom => "Read secure random numbers.",
+            WasiStdio => "Write to this instance's plugin log.",
+            ScriptHost => {
+                "Log, report progress, check for a stop request and wait on behalf of the script run it is inside; the host supplies the run's identity and job."
             }
         }
     }
@@ -426,7 +454,73 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
         import: "host_spaces_create_invite",
         any_of: &[PluginCapability::SpacesWrite],
     },
+    Requirement {
+        import: "host_script_log",
+        any_of: &[PluginCapability::ScriptHost],
+    },
+    Requirement {
+        import: "host_job_progress",
+        any_of: &[PluginCapability::ScriptHost],
+    },
+    Requirement {
+        import: "host_job_should_stop",
+        any_of: &[PluginCapability::ScriptHost],
+    },
+    Requirement {
+        import: "host_job_wait",
+        any_of: &[PluginCapability::ScriptHost],
+    },
 ];
+
+/// The preview-1 imports a plugin may link, each behind the capability that
+/// names what it does. Everything else preview 1 offers — files, sockets,
+/// `fd_read` — has no row, so no manifest can declare its way to one.
+const WASI_IMPORT_REQUIREMENTS: &[Requirement] = &[
+    Requirement {
+        import: "clock_time_get",
+        any_of: &[PluginCapability::WasiClock],
+    },
+    Requirement {
+        import: "clock_res_get",
+        any_of: &[PluginCapability::WasiClock],
+    },
+    Requirement {
+        import: "random_get",
+        any_of: &[PluginCapability::WasiRandom],
+    },
+    Requirement {
+        import: "fd_write",
+        any_of: &[PluginCapability::WasiStdio],
+    },
+];
+
+/// Preview-1 imports a libc build links but that reach nothing against a
+/// context with no arguments, environment or preopens: they answer from
+/// empty tables, so declaring them costs a plugin nothing.
+const WASI_FREE_IMPORTS: &[&str] = &[
+    "proc_exit",
+    "sched_yield",
+    "fd_fdstat_get",
+    "fd_prestat_get",
+    "fd_prestat_dir_name",
+    "args_get",
+    "args_sizes_get",
+    "environ_get",
+    "environ_sizes_get",
+];
+
+pub const WASI_MODULE: &str = "wasi_snapshot_preview1";
+
+pub fn is_free_wasi_import(name: &str) -> bool {
+    WASI_FREE_IMPORTS.contains(&name)
+}
+
+pub fn requirement_for_wasi_import(name: &str) -> Option<Requirement> {
+    WASI_IMPORT_REQUIREMENTS
+        .iter()
+        .copied()
+        .find(|r| r.import == name)
+}
 
 /// Imports that cost a plugin nothing to declare: logging, reading a
 /// lexicon (published schema rather than anybody's data), and reading back
@@ -447,7 +541,8 @@ pub fn requirement_for_import(name: &str) -> Option<Requirement> {
 }
 
 /// Read the module's import section. Every `env.*` import must be a known
-/// host function — an unknown one would trap at instantiation anyway, and
+/// host function and every `wasi_snapshot_preview1.*` import one of the few
+/// the host answers — an unknown one would trap at instantiation anyway, and
 /// refusing it here gives the author a message that names it.
 pub fn analyze_imports(wasm: &[u8]) -> Result<Vec<Requirement>, String> {
     use wasmparser::{Parser, Payload};
@@ -457,25 +552,59 @@ pub fn analyze_imports(wasm: &[u8]) -> Result<Vec<Requirement>, String> {
         let Payload::ImportSection(reader) = payload else {
             continue;
         };
-        for import in reader {
-            let import = import.map_err(|e| format!("invalid import section: {e}"))?;
-            if import.module != "env" {
-                return Err(format!(
-                    "unsupported import module '{}' (only 'env' host functions are available)",
-                    import.module
-                ));
-            }
-            if FREE_IMPORTS.contains(&import.name) {
-                continue;
-            }
-            let req = requirement_for_import(import.name)
-                .ok_or_else(|| format!("unknown host function import '{}'", import.name))?;
-            if !out.contains(&req) {
-                out.push(req);
+        for group in reader {
+            let group = group.map_err(|e| format!("invalid import section: {e}"))?;
+            for (module, name) in import_names(group)? {
+                let req = match module {
+                    "env" => {
+                        if FREE_IMPORTS.contains(&name) {
+                            continue;
+                        }
+                        requirement_for_import(name)
+                            .ok_or_else(|| format!("unknown host function import '{name}'"))?
+                    }
+                    WASI_MODULE => {
+                        if is_free_wasi_import(name) {
+                            continue;
+                        }
+                        requirement_for_wasi_import(name).ok_or_else(|| {
+                            format!(
+                                "unsupported WASI import '{name}': plugins get the clock, randomness and the plugin log, never files, sockets or input"
+                            )
+                        })?
+                    }
+                    other => {
+                        return Err(format!(
+                            "unsupported import module '{other}' (only 'env' host functions and '{WASI_MODULE}' are available)"
+                        ));
+                    }
+                };
+                if !out.contains(&req) {
+                    out.push(req);
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// The `(module, name)` pairs one import-section entry names. The compact
+/// encodings group several imports under one module (and one type), and a
+/// capability check cares about each name, not how it was encoded.
+fn import_names(group: wasmparser::Imports<'_>) -> Result<Vec<(&str, &str)>, String> {
+    use wasmparser::Imports;
+    let invalid = |e: wasmparser::BinaryReaderError| format!("invalid import section: {e}");
+    Ok(match group {
+        Imports::Single(_, import) => vec![(import.module, import.name)],
+        Imports::Compact1 { module, items } => items
+            .into_iter()
+            .map(|item| item.map(|item| (module, item.name)).map_err(invalid))
+            .collect::<Result<_, _>>()?,
+        Imports::Compact2 { module, names, .. } => names
+            .into_iter()
+            .map(|name| name.map(|name| (module, name)).map_err(invalid))
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 /// The least-privilege set satisfying `requirements`: the first option of
@@ -630,6 +759,10 @@ mod tests {
             "host_spaces_delete",
             "host_spaces_create_invite",
             "host_allowed_hosts",
+            "host_script_log",
+            "host_job_progress",
+            "host_job_should_stop",
+            "host_job_wait",
         ] {
             // `None` is only right for the free imports.
             assert_eq!(
@@ -916,6 +1049,161 @@ mod tests {
         assert_eq!(
             PluginCapability::SpacesWrite.description(),
             "Create spaces, write records into them, and manage their members and invites, as the user who ran the script and with that user's access."
+        );
+    }
+
+    /// Smallest module importing the named functions from `wasi_snapshot_preview1`.
+    fn module_importing_wasi(names: &[&str]) -> Vec<u8> {
+        let imports: String = names
+            .iter()
+            .map(|n| format!(r#"(import "wasi_snapshot_preview1" "{n}" (func))"#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        wat::parse_str(format!("(module {imports} (memory (export \"memory\") 1))")).unwrap()
+    }
+
+    /// Each preview-1 import the host answers sits behind the capability
+    /// naming what it does, and `analyze_imports` reads them name by name so
+    /// the loader's cross-check covers them like any `env` import.
+    #[test]
+    fn wasi_imports_map_to_their_capability() {
+        for (import, expected) in [
+            ("clock_time_get", PluginCapability::WasiClock),
+            ("clock_res_get", PluginCapability::WasiClock),
+            ("random_get", PluginCapability::WasiRandom),
+            ("fd_write", PluginCapability::WasiStdio),
+        ] {
+            let req = requirement_for_wasi_import(import).expect(import);
+            assert_eq!(req.any_of, &[expected], "{import}");
+            let reqs = analyze_imports(&module_importing_wasi(&[import])).unwrap();
+            assert_eq!(minimal_set(&reqs), vec![expected], "{import}");
+            assert!(check_declared(&[expected], &reqs).is_ok(), "{import}");
+            assert!(check_declared(&[], &reqs).is_err(), "{import}");
+        }
+        let reqs = analyze_imports(&module_importing_wasi(&[
+            "clock_time_get",
+            "clock_res_get",
+            "random_get",
+            "fd_write",
+        ]))
+        .unwrap();
+        assert_eq!(
+            minimal_set(&reqs),
+            vec![
+                PluginCapability::WasiClock,
+                PluginCapability::WasiRandom,
+                PluginCapability::WasiStdio
+            ]
+        );
+    }
+
+    /// The lifecycle imports a libc build links answer from an empty
+    /// context, so a module naming them needs nothing declared.
+    #[test]
+    fn wasi_lifecycle_imports_are_free() {
+        let names = [
+            "proc_exit",
+            "sched_yield",
+            "fd_fdstat_get",
+            "fd_prestat_get",
+            "fd_prestat_dir_name",
+            "args_get",
+            "args_sizes_get",
+            "environ_get",
+            "environ_sizes_get",
+        ];
+        for name in names {
+            assert!(is_free_wasi_import(name), "{name}");
+            assert!(requirement_for_wasi_import(name).is_none(), "{name}");
+        }
+        let reqs = analyze_imports(&module_importing_wasi(&names)).unwrap();
+        assert!(reqs.is_empty());
+    }
+
+    /// No capability grants a file, socket or input import: the refusal
+    /// names the import so the author knows which one to drop.
+    #[test]
+    fn wasi_filesystem_socket_and_input_imports_are_refused() {
+        for name in [
+            "path_open",
+            "fd_read",
+            "fd_close",
+            "sock_accept",
+            "sock_recv",
+            "poll_oneoff",
+            "fd_seek",
+        ] {
+            assert!(!is_free_wasi_import(name), "{name}");
+            let err = analyze_imports(&module_importing_wasi(&[name])).unwrap_err();
+            assert!(err.contains(name), "{name}: {err}");
+        }
+        let err =
+            analyze_imports(&module_importing_wasi(&["clock_time_get", "path_open"])).unwrap_err();
+        assert!(err.contains("path_open"), "{err}");
+    }
+
+    /// Any import module other than `env` and preview 1 is still refused.
+    #[test]
+    fn other_import_modules_are_refused() {
+        let wasm = wat::parse_str(
+            r#"(module (import "wasi_snapshot_preview2" "clock_time_get" (func)) (memory (export "memory") 1))"#,
+        )
+        .unwrap();
+        let err = analyze_imports(&wasm).unwrap_err();
+        assert!(err.contains("wasi_snapshot_preview2"), "{err}");
+    }
+
+    /// The four `env` imports only an interpreter reaches share one Low
+    /// capability: each acts on the run it is inside, and the host supplies
+    /// the identity and the job id.
+    #[test]
+    fn interpreter_env_imports_need_script_host() {
+        for import in [
+            "host_script_log",
+            "host_job_progress",
+            "host_job_should_stop",
+            "host_job_wait",
+        ] {
+            let req = requirement_for_import(import).expect(import);
+            assert_eq!(req.any_of, &[PluginCapability::ScriptHost], "{import}");
+            let reqs = analyze_imports(&module_importing(&[import])).unwrap();
+            assert!(check_declared(&[], &reqs).is_err(), "{import}");
+            assert!(
+                check_declared(&[PluginCapability::ScriptHost], &reqs).is_ok(),
+                "{import}"
+            );
+        }
+        assert_eq!(PluginCapability::ScriptHost.risk(), Risk::Low);
+    }
+
+    /// The consent sentence for each preview-1 capability says what the
+    /// import does; the word WASI tells an operator nothing.
+    #[test]
+    fn wasi_capabilities_describe_the_consequence_not_the_mechanism() {
+        for (cap, name, risk) in [
+            (PluginCapability::WasiClock, "wasi:clock", Risk::Low),
+            (PluginCapability::WasiRandom, "wasi:random", Risk::Low),
+            (PluginCapability::WasiStdio, "wasi:stdio", Risk::Medium),
+            (PluginCapability::ScriptHost, "script:host", Risk::Low),
+        ] {
+            assert_eq!(cap.as_str(), name);
+            assert_eq!(PluginCapability::parse_str(name), Some(cap));
+            assert_eq!(cap.risk(), risk, "{name}");
+            let description = cap.description();
+            assert!(
+                !description.to_lowercase().contains("wasi"),
+                "{name}: {description}"
+            );
+            assert!(description.ends_with('.'), "{name}: {description}");
+            assert_eq!(description.matches(". ").count(), 0, "{name}: one sentence");
+        }
+        assert_eq!(
+            PluginCapability::WasiClock.description(),
+            "Read the wall clock."
+        );
+        assert_eq!(
+            PluginCapability::WasiStdio.description(),
+            "Write to this instance's plugin log."
         );
     }
 

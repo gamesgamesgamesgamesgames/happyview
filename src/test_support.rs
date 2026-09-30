@@ -89,14 +89,43 @@ pub async fn provision_space_signing_key(state: &AppState) {
         .expect("provision #atproto_space key");
 }
 
+/// A state on the database `TEST_DATABASE_URL` names, or `None` when it names
+/// none — which the caller reports as a skip, since a silent pass looks
+/// exactly like a test that ran.
+///
+/// The migrated in-memory pool covers SQLite everywhere; this is how the same
+/// assertions reach Postgres, whose dialect is the one `adapt_sql` has to
+/// build and the one nothing under `src/plugin/` had ever run against.
+pub async fn test_state_from_env() -> Option<AppState> {
+    let url = std::env::var("TEST_DATABASE_URL").ok()?;
+    let backend = crate::db::DatabaseBackend::from_url(&url);
+    Some(test_state_with_pool_on(
+        crate::db::connect(&url, backend).await,
+        backend,
+    ))
+}
+
 /// Build an `AppState` backed by `pool`, wired for SQLite with no network
 /// dependencies reachable (PLC and OAuth point at unroutable local ports).
 pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
+    test_state_with_pool_on(pool, crate::db::DatabaseBackend::Sqlite)
+}
+
+/// A [`test_state_with_pool`] told which backend `pool` actually is.
+///
+/// Every statement the host imports issue goes through `adapt_sql`, and its
+/// SQLite arm is a no-op, so a state that names the wrong backend exercises a
+/// dialect the pool does not speak — or, run against SQLite alone, never
+/// exercises Postgres's at all.
+pub fn test_state_with_pool_on(
+    pool: sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+) -> AppState {
     let config = Config {
         host: "127.0.0.1".into(),
         port: 3000,
         database_url: String::new(),
-        database_backend: crate::db::DatabaseBackend::Sqlite,
+        database_backend: backend,
         sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
         public_url: String::new(),
         user_agent: String::new(),
@@ -117,10 +146,10 @@ pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
         default_rate_limit_capacity: 100,
         default_rate_limit_refill_rate: 2.0,
         telemetry_collector_url: String::new(),
+        plugin_cache_dir: None,
     };
     let (tx, _) = watch::channel(vec![]);
     let (labeler_tx, _) = watch::channel(());
-    let backend = crate::db::DatabaseBackend::Sqlite;
     let atrium_http = Arc::new(crate::http_retry::HappyViewHttpClient::default());
     let did_resolver = atrium_identity::did::CommonDidResolver::new(
         atrium_identity::did::CommonDidResolverConfig {

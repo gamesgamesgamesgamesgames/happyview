@@ -164,6 +164,31 @@ const EXPECTED_SPACES_IMPORTS: &[&str] = &[
     "env::host_spaces_write_record",
 ];
 
+/// Exactly what the host calls on an interpreter plugin. `interpreter_plugin!`
+/// emits these names, and the `interpreter_echo` fixture declares the same set
+/// by hand; the macro's own expansion is checked against no artefact here,
+/// because the only module it builds is the interpreter plugin itself, which
+/// ships from the plugins repo.
+const EXPECTED_INTERPRETER_EXPORTS: &[&str] = &[
+    "alloc",
+    "dealloc",
+    "execute",
+    "memory",
+    "plugin_info",
+    "validate",
+];
+
+/// The `interpreter_echo` fixture reaches every import an interpreter may use:
+/// the two library imports and the four the `script:host` capability covers.
+const EXPECTED_INTERPRETER_IMPORTS: &[&str] = &[
+    "env::host_call_library",
+    "env::host_get_api_surface",
+    "env::host_job_progress",
+    "env::host_job_should_stop",
+    "env::host_job_wait",
+    "env::host_script_log",
+];
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
         "../../tests/fixtures/{name}/target/wasm32-unknown-unknown/release/{name}.wasm"
@@ -284,5 +309,14 @@ fn the_spaces_fixture_exports_the_library_abi_and_imports_only_what_it_uses() {
         "sdk_spaces",
         EXPECTED_SPACES_EXPORTS,
         EXPECTED_SPACES_IMPORTS,
+    );
+}
+
+#[test]
+fn the_interpreter_echo_fixture_exports_the_interpreter_abi_and_reaches_every_script_import() {
+    check_fixture(
+        "interpreter_echo",
+        EXPECTED_INTERPRETER_EXPORTS,
+        EXPECTED_INTERPRETER_IMPORTS,
     );
 }

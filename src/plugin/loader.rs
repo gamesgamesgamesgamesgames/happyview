@@ -52,6 +52,10 @@ pub enum LoadError {
     UnknownImport(String),
     #[error("namespace '{0}' is reserved for built-in modules")]
     ReservedNamespace(String),
+    #[error("interpreter '{id}' has an unusable language_id: {reason}")]
+    InvalidLanguageId { id: String, reason: String },
+    #[error("interpreter '{id}' declares an unusable supports_libraries: {reason}")]
+    InvalidSupportsLibraries { id: String, reason: String },
 }
 
 /// Preview result with manifest and derived WASM URL
@@ -237,6 +241,65 @@ pub fn is_valid_host_pattern(pattern: &str) -> bool {
         })
 }
 
+/// The shape a `language_id` may take: lowercase alphanumerics, `-` and `_`,
+/// starting with a letter. Conservative on purpose — the value is stored in
+/// `scripts.script_type` and shown as an editor mode, so it has to survive a
+/// column, a URL and a Monaco language name unchanged, and a leading digit is
+/// an identifier in too few of those places to be worth allowing.
+pub fn is_valid_language_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars.next().is_some_and(|first| first.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// An interpreter's own manifest rules. It bridges whatever is installed
+/// through the API surface, so it names a language and the libraries it can
+/// reach, and never a dependency it would not call by name.
+fn validate_interpreter(manifest: &PluginManifest) -> Result<(), LoadError> {
+    use crate::plugin::ANY_LIBRARY;
+
+    let id = manifest.id.clone();
+    let Some(language_id) = manifest.language_id.as_deref() else {
+        return Err(LoadError::InvalidLanguageId {
+            id,
+            reason: "the field is required and names the script_type this interpreter serves"
+                .into(),
+        });
+    };
+    if !is_valid_language_id(language_id) {
+        return Err(LoadError::InvalidLanguageId {
+            id,
+            reason: format!(
+                "'{language_id}' must be lowercase alphanumerics, '-' or '_', starting with a letter"
+            ),
+        });
+    }
+
+    let wildcard = manifest
+        .supports_libraries
+        .iter()
+        .any(|entry| entry == ANY_LIBRARY);
+    if wildcard && manifest.supports_libraries.len() > 1 {
+        return Err(LoadError::InvalidSupportsLibraries {
+            id,
+            reason: format!(
+                "'{ANY_LIBRARY}' already covers every library; listing ids beside it contradicts it"
+            ),
+        });
+    }
+    if manifest
+        .supports_libraries
+        .iter()
+        .any(|entry| entry.is_empty())
+    {
+        return Err(LoadError::InvalidSupportsLibraries {
+            id,
+            reason: format!("an entry must be '{ANY_LIBRARY}' or a plugin id, never empty"),
+        });
+    }
+    Ok(())
+}
+
 /// Structural checks that do not need the WASM bytes.
 pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), LoadError> {
     use crate::lua::builtins::BUILTIN_PREFIX;
@@ -261,9 +324,19 @@ pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), LoadError> {
             return Err(LoadError::ReservedNamespace(namespace.to_string()));
         }
     }
-    if manifest.plugin_type == PluginType::Auth && !manifest.dependencies.is_empty() {
+    if manifest.plugin_type == PluginType::Interpreter {
+        validate_interpreter(manifest)?;
+    }
+    // Neither an auth plugin nor an interpreter calls another plugin by name,
+    // so a dependency edge would pin one it never reaches.
+    if matches!(
+        manifest.plugin_type,
+        PluginType::Auth | PluginType::Interpreter
+    ) && !manifest.dependencies.is_empty()
+    {
         return Err(LoadError::InvalidDependency(format!(
-            "auth plugin '{}' cannot declare dependencies",
+            "{} plugin '{}' cannot declare dependencies",
+            manifest.plugin_type.as_str(),
             manifest.id
         )));
     }
@@ -370,6 +443,26 @@ pub fn parse_plugin_urls(env_value: &str) -> Vec<(String, String, Option<String>
             }
         })
         .collect()
+}
+
+/// A fixture directory whose module is built, or `None` having named the build
+/// that produces it. Every fixture's `target/` is gitignored, so an absent
+/// artefact is a step nobody ran, and panicking on one reports it as a
+/// regression in the code under test instead.
+#[cfg(test)]
+pub(crate) fn built_fixture(name: &str, target: &str) -> Option<std::path::PathBuf> {
+    let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).join(name);
+    if dir
+        .join(format!("target/{target}/release/{name}.wasm"))
+        .exists()
+    {
+        return Some(dir);
+    }
+    eprintln!(
+        "skipping: {name} fixture not built. Run: cargo build \
+         --manifest-path tests/fixtures/{name}/Cargo.toml --target {target} --release"
+    );
+    None
 }
 
 #[cfg(test)]
@@ -644,6 +737,89 @@ mod tests {
         assert!(validate_capabilities(&m, &module_importing_kv_get()).is_ok());
     }
 
+    fn module_importing_wasi(name: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(module (import "wasi_snapshot_preview1" "{name}" (func)) (memory (export "memory") 1))"#
+        ))
+        .unwrap()
+    }
+
+    /// A preview-1 import is cross-checked against the manifest exactly as
+    /// an `env` import is: refused undeclared, with the import and the
+    /// capability named, and accepted once declared.
+    #[test]
+    fn validate_capabilities_gates_each_wasi_import_on_its_capability() {
+        for (import, capability) in [
+            ("clock_time_get", "wasi:clock"),
+            ("clock_res_get", "wasi:clock"),
+            ("random_get", "wasi:random"),
+            ("fd_write", "wasi:stdio"),
+        ] {
+            let wasm = module_importing_wasi(import);
+            let undeclared = manifest(
+                r#"{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                    "capabilities":[]}"#,
+            );
+            let err = validate_capabilities(&undeclared, &wasm).unwrap_err();
+            assert!(
+                matches!(err, LoadError::CapabilityMismatch(_)),
+                "{import}: {err}"
+            );
+            assert!(err.to_string().contains(import), "{err}");
+            assert!(err.to_string().contains(capability), "{err}");
+
+            let declared = manifest(&format!(
+                r#"{{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                    "capabilities":["{capability}"]}}"#
+            ));
+            assert!(validate_capabilities(&declared, &wasm).is_ok(), "{import}");
+        }
+    }
+
+    /// A lifecycle import needs no capability; a filesystem import is
+    /// refused whatever the manifest declares.
+    #[test]
+    fn validate_capabilities_frees_lifecycle_and_refuses_filesystem_wasi_imports() {
+        let bare = manifest(
+            r#"{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                "capabilities":[]}"#,
+        );
+        assert!(validate_capabilities(&bare, &module_importing_wasi("proc_exit")).is_ok());
+
+        let everything = manifest(
+            r#"{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                "capabilities":["wasi:clock","wasi:random","wasi:stdio","script:host"]}"#,
+        );
+        let err =
+            validate_capabilities(&everything, &module_importing_wasi("path_open")).unwrap_err();
+        assert!(matches!(err, LoadError::UnknownImport(_)), "{err}");
+        assert!(err.to_string().contains("path_open"), "{err}");
+    }
+
+    /// The `wasi_forbidden` fixture links `path_open` and declares every
+    /// preview-1 capability there is; the loader still refuses it, naming
+    /// the import.
+    #[tokio::test]
+    async fn wasi_forbidden_fixture_is_refused_by_name() {
+        let Some(dir) = built_fixture("wasi_forbidden", "wasm32-wasip1") else {
+            return;
+        };
+        let Err(err) = load_from_file(&dir).await else {
+            panic!("a filesystem import was accepted");
+        };
+        assert!(matches!(err, LoadError::UnknownImport(_)), "{err}");
+        assert!(err.to_string().contains("path_open"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wasi_probe_fixture_loads_with_its_three_capabilities() {
+        let Some(dir) = built_fixture("wasi_probe", "wasm32-wasip1") else {
+            return;
+        };
+        let plugin = load_from_file(&dir).await.expect("the probe should load");
+        assert_eq!(plugin.info.id, "wasi_probe");
+    }
+
     #[test]
     fn internal_namespace_is_reserved() {
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
@@ -657,6 +833,133 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("reserved for built-in modules"));
+    }
+
+    fn interpreter_manifest(extra: &str) -> PluginManifest {
+        manifest(&format!(
+            r#"{{"id":"lua","name":"Lua","version":"1.0.0","api_version":"2",
+                "plugin_type":"interpreter","capabilities":["script:host"]{extra}}}"#
+        ))
+    }
+
+    #[test]
+    fn validate_manifest_accepts_an_interpreter_naming_its_language() {
+        let m = interpreter_manifest(r#","language_id":"lua54""#);
+        assert!(validate_manifest(&m).is_ok());
+        assert_eq!(m.supports_libraries, vec!["*".to_string()]);
+    }
+
+    #[test]
+    fn validate_manifest_refuses_an_interpreter_without_a_language_id() {
+        let err = validate_manifest(&interpreter_manifest("")).unwrap_err();
+        assert!(matches!(err, LoadError::InvalidLanguageId { .. }), "{err}");
+        assert!(err.to_string().contains("language_id"), "{err}");
+    }
+
+    /// The value reaches a stored column, a URL and an editor mode, so
+    /// anything but the conservative shape is refused rather than escaped.
+    #[test]
+    fn validate_manifest_refuses_a_language_id_outside_the_allowed_shape() {
+        for bad in ["Lua", "5lua", "lua.5", "lua 5", "lua/5", "", "-lua", "_lua"] {
+            let m = interpreter_manifest(&format!(r#","language_id":"{bad}""#));
+            let err = validate_manifest(&m).unwrap_err();
+            assert!(
+                matches!(err, LoadError::InvalidLanguageId { .. }),
+                "{bad}: {err}"
+            );
+        }
+        for good in ["lua", "lua54", "lua-5", "lua_5", "l"] {
+            let m = interpreter_manifest(&format!(r#","language_id":"{good}""#));
+            assert!(validate_manifest(&m).is_ok(), "{good}");
+        }
+    }
+
+    /// `*` already covers everything, so naming ids beside it says two
+    /// different things at once rather than widening the list.
+    #[test]
+    fn validate_manifest_refuses_a_wildcard_mixed_with_named_libraries() {
+        let m = interpreter_manifest(
+            r#","language_id":"lua","supports_libraries":["*","happyview-db"]"#,
+        );
+        let err = validate_manifest(&m).unwrap_err();
+        assert!(
+            matches!(err, LoadError::InvalidSupportsLibraries { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("supports_libraries"), "{err}");
+
+        let named =
+            interpreter_manifest(r#","language_id":"lua","supports_libraries":["happyview-db"]"#);
+        assert!(validate_manifest(&named).is_ok());
+        let only_wildcard =
+            interpreter_manifest(r#","language_id":"lua","supports_libraries":["*"]"#);
+        assert!(validate_manifest(&only_wildcard).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_refuses_an_empty_supports_libraries_entry() {
+        let m = interpreter_manifest(r#","language_id":"lua","supports_libraries":[""]"#);
+        assert!(matches!(
+            validate_manifest(&m),
+            Err(LoadError::InvalidSupportsLibraries { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_manifest_rejects_dependencies_on_interpreters() {
+        let m = interpreter_manifest(r#","language_id":"lua","dependencies":[{"id":"http"}]"#);
+        let err = validate_manifest(&m).unwrap_err();
+        assert!(matches!(err, LoadError::InvalidDependency(_)), "{err}");
+        assert!(err.to_string().contains("interpreter"), "{err}");
+    }
+
+    /// The interpreter arm is the only thing that changed: a library and an
+    /// auth manifest are still accepted with no `language_id` at all.
+    #[test]
+    fn validate_manifest_leaves_library_and_auth_manifests_alone() {
+        let library = manifest(
+            r#"{"id":"http","name":"HTTP","version":"1.0.0","api_version":"2",
+                "plugin_type":"library","capabilities":[]}"#,
+        );
+        assert!(validate_manifest(&library).is_ok());
+        assert!(library.language_id.is_none());
+
+        let auth = manifest(r#"{"id":"steam","name":"Steam","version":"1.0.0","api_version":"2"}"#);
+        assert!(validate_manifest(&auth).is_ok());
+    }
+
+    #[tokio::test]
+    async fn interpreter_echo_fixture_loads_with_its_language_id() {
+        let Some(dir) = built_fixture("interpreter_echo", "wasm32-unknown-unknown") else {
+            return;
+        };
+        let plugin = load_from_file(&dir).await.expect("the echo should load");
+        assert_eq!(plugin.language_id(), Some("echo"));
+        assert_eq!(plugin.supports_libraries(), ["*".to_string()]);
+    }
+
+    /// A library's manifest carries the defaulted wildcard, because serde
+    /// cannot see `plugin_type`; the accessor is what refuses to read it as a
+    /// declaration.
+    #[test]
+    fn only_an_interpreter_reports_the_libraries_it_supports() {
+        let loaded = |m: PluginManifest| LoadedPlugin {
+            info: m.clone().into(),
+            source: PluginSource::File { path: "x".into() },
+            wasm_bytes: vec![],
+            manifest: Some(m),
+        };
+
+        let interpreter = interpreter_manifest(r#","language_id":"lua""#);
+        assert_eq!(interpreter.supports_libraries, vec!["*".to_string()]);
+        assert_eq!(loaded(interpreter).supports_libraries(), ["*".to_string()]);
+
+        let library = manifest(
+            r#"{"id":"http","name":"HTTP","version":"1.0.0","api_version":"2",
+                "plugin_type":"library","capabilities":[]}"#,
+        );
+        assert_eq!(library.supports_libraries, vec!["*".to_string()]);
+        assert!(loaded(library).supports_libraries().is_empty());
     }
 
     #[test]
