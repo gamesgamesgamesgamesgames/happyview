@@ -181,6 +181,14 @@ pub fn sign_credential(
     let signing_key = SigningKey::from_slice(&d_bytes[..])
         .map_err(|e| AppError::Internal(format!("invalid signing key: {e}")))?;
 
+    sign_credential_with_key(claims, &signing_key)
+}
+
+/// Sign a credential with a P-256 key published as `#atproto_space`.
+pub fn sign_credential_with_key(
+    claims: &SpaceCredentialClaims,
+    signing_key: &SigningKey,
+) -> Result<String, AppError> {
     let header = serde_json::json!({
         "alg": "ES256",
         "typ": SPACE_CREDENTIAL_TYP,

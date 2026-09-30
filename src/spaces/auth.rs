@@ -54,8 +54,6 @@ pub async fn issue_credential(
     check_app_access(space, client_id)?;
     check_mint_policy(http, auth_ctx, space, subject_did, client_id, authority_did).await?;
 
-    let private_jwk = get_or_create_signing_key(pool, backend, encryption_key, space).await?;
-
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -73,7 +71,17 @@ pub async fn issue_credential(
         jti: make_jti(),
     };
 
-    let token = sign_credential(&claims, &private_jwk)?;
+    // A space this instance is authority for is verified against the
+    // `#atproto_space` key in the instance's DID document. Earlier spaces are
+    // anchored on their creator's DID and keep their per-space key.
+    let token = if is_instance_authority(pool, backend, public_url, space).await {
+        let signing_key =
+            crate::spaces::service::load_signing_key(pool, backend, encryption_key).await?;
+        crate::spaces::credential::sign_credential_with_key(&claims, &signing_key)?
+    } else {
+        let private_jwk = get_or_create_signing_key(pool, backend, encryption_key, space).await?;
+        sign_credential(&claims, &private_jwk)?
+    };
 
     let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
     store_credential_record(pool, backend, &space.id, subject_did, &token_hash, exp).await?;
@@ -402,6 +410,17 @@ pub fn check_app_access(space: &Space, attested_client_id: Option<&str>) -> Resu
     }
 }
 
+async fn is_instance_authority(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    public_url: &str,
+    space: &Space,
+) -> bool {
+    crate::auth::service_auth::instance_did(pool, backend, public_url)
+        .await
+        .is_ok_and(|did| did == space.authority_did)
+}
+
 async fn get_or_create_signing_key(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -677,6 +696,61 @@ mod tests {
             mint_for_member(MemberAccess::READ_SELF).await,
             Err(AppError::Forbidden(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn credentials_for_this_instances_spaces_verify_against_its_published_key() {
+        const INSTANCE_DID: &str = "did:plc:happyviewinstance";
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let key = crate::test_support::TEST_ENCRYPTION_KEY;
+        crate::service_identity::upsert_identity(
+            &pool,
+            backend,
+            &crate::service_identity::IdentityMode::DidPlc,
+            Some(INSTANCE_DID),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let published =
+            crate::verification_methods::ensure_atproto_space_method(&pool, backend, &key)
+                .await
+                .unwrap();
+
+        let mut space = test_space(AppAccess::Open);
+        space.id = uuid::Uuid::new_v4().to_string();
+        space.did = INSTANCE_DID.into();
+        space.authority_did = INSTANCE_DID.into();
+        space.read_policy = Policy::Public;
+        crate::spaces::db::create_space(&pool, backend, &space)
+            .await
+            .unwrap();
+
+        let issued = issue_credential(
+            &pool,
+            backend,
+            &reqwest::Client::new(),
+            &key,
+            "http://happyview.test",
+            "http://plc.test",
+            &space,
+            "did:plc:reader",
+            None,
+            &space.authority_did,
+        )
+        .await
+        .unwrap();
+
+        let verifying =
+            crate::spaces::credential::multikey_to_space_key(&published.public_key_multibase)
+                .unwrap();
+        let claims =
+            crate::spaces::credential::verify_credential_with_key(&issued.token, &verifying)
+                .expect("credential should verify against the published #atproto_space key");
+        assert_eq!(claims.iss, INSTANCE_DID);
     }
 
     #[tokio::test]
