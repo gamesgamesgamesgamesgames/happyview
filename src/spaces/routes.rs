@@ -494,7 +494,7 @@ pub(crate) async fn get_space(
     if !space.config.membership_public {
         let claims = require_auth(&xrpc_claims)?;
         let did = claims.did();
-        if space.authority_did != did {
+        if space.creator_did != did {
             members::is_member(&state.db, state.db_backend, &space.id, did)
                 .await?
                 .ok_or_else(|| AppError::NotFound("Space not found".into()))?;

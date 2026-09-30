@@ -93,15 +93,15 @@ pub async fn get_space_by_address(
 pub async fn list_spaces_by_owner(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    authority_did: &str,
+    creator_did: &str,
 ) -> Result<Vec<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE authority_did = ? ORDER BY created_at DESC",
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE creator_did = ? ORDER BY created_at DESC",
         backend,
     );
 
     let rows: Vec<SpaceRow> = crate::db::query_as(&sql)
-        .bind(authority_did)
+        .bind(creator_did)
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list spaces: {e}")))?;
@@ -126,12 +126,12 @@ pub async fn list_spaces_for_user(
 
     let sql = if decoded_cursor.is_some() {
         adapt_sql(
-            "SELECT s.did, s.authority_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? AND (sm.created_at > ? OR (sm.created_at = ? AND ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? AND (sm.created_at > ? OR (sm.created_at = ? AND ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
             backend,
         )
     } else {
         adapt_sql(
-            "SELECT s.did, s.authority_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
             backend,
         )
     };
@@ -150,9 +150,9 @@ pub async fn list_spaces_for_user(
     let views: Vec<SpaceView> = rows
         .into_iter()
         .map(
-            |(space_did, authority_did, type_nsid, skey, created_at)| SpaceView {
+            |(space_did, creator_did, type_nsid, skey, created_at)| SpaceView {
                 uri: format!("at://{}/space/{}/{}", space_did, type_nsid, skey),
-                is_owner: authority_did == did,
+                is_owner: creator_did == did,
                 created_at,
             },
         )
