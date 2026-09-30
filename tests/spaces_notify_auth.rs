@@ -249,6 +249,26 @@ async fn notify_write_rejects_a_notification_for_someone_elses_repo() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// `did:plc:writer`'s repo host reporting a fixed repo state.
+fn repo_host_notification(auth: &str, space: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .header("host", "127.0.0.1:0")
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": "did:plc:writer",
+                "rev": "3lzq2b3k4c22a",
+                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
 /// A notification accepted from a repo host is passed on to registered syncers
 /// in the lexicon's shape, signed by this instance.
 #[tokio::test]
@@ -293,23 +313,12 @@ async fn notify_write_forwards_to_registered_syncers() {
             Some("com.atproto.space.notifyWrite"),
         )
         .await;
-    let req = Request::builder()
-        .method("POST")
-        .uri("/xrpc/com.atproto.space.notifyWrite")
-        .header("content-type", "application/json")
-        .header("authorization", auth)
-        .header("host", "127.0.0.1:0")
-        .body(Body::from(
-            json!({
-                "space": space,
-                "repo": "did:plc:writer",
-                "rev": "3lzq2b3k4c22a",
-                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
-            })
-            .to_string(),
-        ))
+    let resp = app
+        .router
+        .clone()
+        .oneshot(repo_host_notification(&auth, &space))
+        .await
         .unwrap();
-    let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let received = common::syncer::received(&syncer, 1).await;
@@ -319,6 +328,21 @@ async fn notify_write_forwards_to_registered_syncers() {
     assert_eq!(body["repo"], json!("did:plc:writer"));
     assert_eq!(body["rev"], json!("3lzq2b3k4c22a"));
     assert!(body["hash"]["$bytes"].is_string());
+    assert!(
+        body["spaceRev"].is_string(),
+        "forwarded notifications carry the space revision"
+    );
+
+    // The same state reported again is not news to anyone.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(repo_host_notification(&auth, &space))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(common::syncer::received(&syncer, 2).await.len(), 1);
     let authorization = received[0]
         .headers
         .get("authorization")

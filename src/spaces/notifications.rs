@@ -94,6 +94,11 @@ pub async fn dispatch_space_deleted(
 /// auth is bound to.
 const NOTIFY_WRITE_LXM: &str = "com.atproto.space.notifyWrite";
 
+/// Where a forwarded notification carries the space revision that ordered it,
+/// and the one before. Proposal 0016 adds both without naming them yet.
+const SPACE_REV_FIELD: &str = "spaceRev";
+const PREV_SPACE_REV_FIELD: &str = "prevSpaceRev";
+
 /// A repo's new state, as `com.atproto.space.notifyWrite` reports it.
 #[derive(Debug, Clone)]
 pub struct RepoUpdate {
@@ -101,19 +106,26 @@ pub struct RepoUpdate {
     pub repo: String,
     pub rev: String,
     pub hash: Vec<u8>,
+    pub space_rev: String,
+    pub prev_space_rev: Option<String>,
 }
 
 impl RepoUpdate {
     fn body(&self) -> serde_json::Value {
         use base64::Engine;
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "space": self.space_uri,
             "repo": self.repo,
             "rev": self.rev,
             "hash": {
                 "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&self.hash),
             },
-        })
+        });
+        body[SPACE_REV_FIELD] = self.space_rev.clone().into();
+        if let Some(prev) = &self.prev_space_rev {
+            body[PREV_SPACE_REV_FIELD] = prev.clone().into();
+        }
+        body
     }
 }
 

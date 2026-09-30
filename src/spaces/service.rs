@@ -195,7 +195,7 @@ pub(crate) async fn commit_write(
     rev: &str,
     ops: &[AppliedOp],
     signing_key: &p256::ecdsa::SigningKey,
-) -> Result<Vec<u8>, AppError> {
+) -> Result<CommittedWrite, AppError> {
     let mut repo_state =
         db::get_or_create_repo_state(&mut *conn, backend, &space.id, author_did).await?;
 
@@ -250,7 +250,17 @@ pub(crate) async fn commit_write(
 
     db::update_space_revision(&mut *conn, backend, &space.id, rev).await?;
 
-    Ok(hash)
+    let recorded =
+        crate::spaces::writers::record(&mut *conn, backend, &space.id, author_did, rev, &hash)
+            .await?;
+
+    Ok(CommittedWrite { hash, recorded })
+}
+
+/// What a committed write reports to syncers.
+pub(crate) struct CommittedWrite {
+    pub hash: Vec<u8>,
+    pub recorded: crate::spaces::writers::Recorded,
 }
 
 /// Tell syncers about a committed write: once for the commit to services
@@ -261,21 +271,29 @@ pub(crate) async fn notify_ops(
     author_did: &str,
     ops: &[AppliedOp],
     rev: &str,
-    hash: Vec<u8>,
+    committed: CommittedWrite,
 ) {
-    notifications::forward_repo_update(
-        state,
-        &space.id,
-        notifications::RepoUpdate {
-            space_uri: format!(
-                "at://{}/space/{}/{}",
-                space.did, space.type_nsid, space.skey
-            ),
-            repo: author_did.to_string(),
-            rev: rev.to_string(),
-            hash,
-        },
-    );
+    if let crate::spaces::writers::Recorded::Advanced {
+        space_rev,
+        prev_space_rev,
+    } = committed.recorded
+    {
+        notifications::forward_repo_update(
+            state,
+            &space.id,
+            notifications::RepoUpdate {
+                space_uri: format!(
+                    "at://{}/space/{}/{}",
+                    space.did, space.type_nsid, space.skey
+                ),
+                repo: author_did.to_string(),
+                rev: rev.to_string(),
+                hash: committed.hash,
+                space_rev,
+                prev_space_rev,
+            },
+        );
+    }
 
     for op in ops {
         let _ = notifications::dispatch_write_notification(
@@ -446,7 +464,7 @@ pub(crate) async fn create_record(
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
     db::insert_space_record(&mut *tx, state.db_backend, &rec).await?;
-    let hash = commit_write(
+    let committed = commit_write(
         &mut tx,
         state.db_backend,
         &space,
@@ -460,7 +478,7 @@ pub(crate) async fn create_record(
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
 
-    notify_ops(state, &space, did, &ops, &rev, hash).await;
+    notify_ops(state, &space, did, &ops, &rev, committed).await;
 
     Ok((record_uri, cid))
 }
@@ -565,7 +583,7 @@ pub(crate) async fn put_record(
         new_cid: Some(cid.clone()),
         old_cid,
     }];
-    let hash = commit_write(
+    let committed = commit_write(
         &mut tx,
         state.db_backend,
         &space,
@@ -579,7 +597,7 @@ pub(crate) async fn put_record(
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
 
-    notify_ops(state, &space, did, &ops, &rev, hash).await;
+    notify_ops(state, &space, did, &ops, &rev, committed).await;
 
     Ok((record_uri, cid))
 }
@@ -659,7 +677,7 @@ pub(crate) async fn delete_record(
         new_cid: None,
         old_cid: Some(old_cid),
     }];
-    let hash = commit_write(
+    let committed = commit_write(
         &mut tx,
         state.db_backend,
         &space,
@@ -673,7 +691,7 @@ pub(crate) async fn delete_record(
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
 
-    notify_ops(state, &space, did, &ops, &rev, hash).await;
+    notify_ops(state, &space, did, &ops, &rev, committed).await;
 
     Ok(())
 }

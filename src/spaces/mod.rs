@@ -20,6 +20,7 @@ pub mod scope;
 pub mod service;
 pub mod simplespace;
 pub mod types;
+pub mod writers;
 
 #[cfg(test)]
 mod integration_tests;

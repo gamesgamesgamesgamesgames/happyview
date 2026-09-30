@@ -905,7 +905,7 @@ async fn apply_writes(
         }
     }
 
-    let hash = service::commit_write(
+    let committed = service::commit_write(
         &mut tx,
         state.db_backend,
         &space,
@@ -919,7 +919,7 @@ async fn apply_writes(
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
 
-    service::notify_ops(&state, &space, &did, &ops, &rev, hash).await;
+    service::notify_ops(&state, &space, &did, &ops, &rev, committed).await;
 
     Ok(Json(serde_json::json!({
         "results": results,
@@ -1727,16 +1727,45 @@ async fn notify_write(
     }
 
     if let (Some(rev), Some(hash)) = (&input.rev, &input.hash) {
-        notifications::forward_repo_update(
-            &state,
+        let hash = hash.decode()?;
+        let mut conn = state
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+        let recorded = crate::spaces::writers::record(
+            &mut conn,
+            state.db_backend,
             &space.id,
-            notifications::RepoUpdate {
-                space_uri: input.space.clone(),
-                repo: writer.clone(),
-                rev: rev.clone(),
-                hash: hash.decode()?,
-            },
-        );
+            &writer,
+            rev,
+            &hash,
+        )
+        .await?;
+        conn.commit()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
+
+        // A repeated or out-of-order report changes nothing, so nobody hears
+        // about it.
+        if let crate::spaces::writers::Recorded::Advanced {
+            space_rev,
+            prev_space_rev,
+        } = recorded
+        {
+            notifications::forward_repo_update(
+                &state,
+                &space.id,
+                notifications::RepoUpdate {
+                    space_uri: input.space.clone(),
+                    repo: writer.clone(),
+                    rev: rev.clone(),
+                    hash,
+                    space_rev,
+                    prev_space_rev,
+                },
+            );
+        }
     }
 
     if let (Some(collection), Some(rkey)) = (&input.collection, &input.rkey) {
