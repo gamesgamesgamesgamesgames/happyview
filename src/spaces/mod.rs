@@ -7,6 +7,7 @@ pub mod credential;
 pub mod db;
 pub mod describe;
 pub mod host_mode;
+pub mod http_signature;
 pub mod lthash;
 pub mod members;
 pub mod native_client;
