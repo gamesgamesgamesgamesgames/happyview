@@ -227,32 +227,52 @@ async fn put_member_requires_both_booleans() {
     );
 }
 
+/// `addMember` predates `putMember`. Clients still calling it keep working
+/// until v3.
 #[tokio::test]
 #[serial]
-async fn add_member_is_gone() {
+async fn add_member_still_adds_a_member() {
     common::require_db!();
     let app = TestApp::new().await;
     enable_spaces(&app).await;
 
     let authority = rand_did("auth");
+    let member = rand_did("m");
     let space = create_space(&app, &authority, &rand_skey("s")).await;
 
-    let body = json!({ "space": space, "did": rand_did("m"), "access": "read" });
-    let removed = post(
+    let added = post(
         &app,
         "com.atproto.simplespace.addMember",
         &authority,
-        body.clone(),
+        json!({ "space": space, "did": member, "access": "write" }),
     )
     .await;
-    let control = post(&app, CONTROL_METHOD, &authority, body).await;
-
-    assert_eq!(
-        removed.status(),
-        control.status(),
-        "addMember should behave like a method that was never served"
+    assert!(
+        added.status().is_success(),
+        "addMember failed: {}",
+        added.status()
     );
-    assert!(!removed.status().is_success());
+
+    let members = json_of(
+        get(
+            &app,
+            &format!(
+                "/xrpc/com.atproto.simplespace.listMembers?space={}",
+                urlencoding::encode(&space)
+            ),
+            &authority,
+        )
+        .await,
+    )
+    .await;
+    let entry = members["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["did"] == json!(member))
+        .expect("the added member is listed");
+    assert_eq!(entry["read"], json!(true));
+    assert_eq!(entry["write"], json!(true));
 }
 
 // ---------------------------------------------------------------------------

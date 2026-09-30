@@ -86,6 +86,17 @@ pub(crate) struct PutMemberInput {
     pub is_delegation: Option<bool>,
 }
 
+/// `addMember`, which predates `putMember`, names access with one word.
+/// Accepted until v3.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AddMemberInput {
+    pub space: String,
+    pub did: String,
+    pub access: Option<String>,
+    pub is_delegation: Option<bool>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RemoveMemberInput {
@@ -128,6 +139,11 @@ pub fn simplespace_routes() -> Router<AppState> {
 
     router
         // Backward-compatible aliases (dev.happyview.space.*) — kept until v3
+        .route("/xrpc/com.atproto.simplespace.addMember", post(add_member))
+        .route(
+            &format!("/xrpc/{LEGACY_NS}.space.addMember"),
+            post(add_member),
+        )
         .route(
             &format!("/xrpc/{LEGACY_NS}.space.createSpace"),
             post(create_space),
@@ -365,6 +381,34 @@ async fn put_member(
         read_self: false,
     };
     let member = service::put_member(
+        &state,
+        claims.did(),
+        &input.space,
+        &input.did,
+        access,
+        input.is_delegation,
+    )
+    .await?;
+    let mut response = Json(serde_json::json!({ "member": member })).into_response();
+    *response.status_mut() = StatusCode::CREATED;
+    Ok(response)
+}
+
+async fn add_member(
+    State(state): State<AppState>,
+    xrpc_claims: XrpcClaims,
+    Json(input): Json<AddMemberInput>,
+) -> Result<Response, AppError> {
+    let claims = require_auth(&xrpc_claims)?;
+    let access = input
+        .access
+        .as_deref()
+        .map(|word| {
+            MemberAccess::parse_wire(word)
+                .ok_or_else(|| AppError::BadRequest(format!("unknown access '{word}'")))
+        })
+        .transpose()?;
+    let member = service::add_member(
         &state,
         claims.did(),
         &input.space,
