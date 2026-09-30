@@ -9,6 +9,8 @@ pub use db::insert_oauth_session;
 #[allow(dead_code, unused_imports)]
 pub mod fixtures;
 #[allow(dead_code, unused_imports)]
+pub mod lua_plugin;
+#[allow(dead_code, unused_imports)]
 pub mod plc;
 #[allow(dead_code, unused_imports)]
 pub mod tls;
