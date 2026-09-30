@@ -531,7 +531,23 @@ pub async fn spawn_label_gc(db: sqlx::AnyPool, backend: DatabaseBackend) {
     loop {
         tokio::time::sleep(interval).await;
 
-        let (expired_count, orphaned_count) = run_label_gc(&db, backend).await;
+        // Each sweep is attempted independently: an expiry comparison that
+        // fails says nothing about whether a label's subject still exists.
+        let expired_count = match delete_expired_labels(&db, backend).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("failed to clean up expired labels: {e}");
+                0
+            }
+        };
+
+        let orphaned_count = match delete_orphaned_labels(&db).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("failed to clean up orphaned labels: {e}");
+                0
+            }
+        };
 
         let total = expired_count + orphaned_count;
         if total > 0 {
@@ -638,29 +654,6 @@ pub async fn delete_orphaned_labels(db: &sqlx::AnyPool) -> Result<u64, sqlx::Err
     .execute(db)
     .await
     .map(|r| r.rows_affected())
-}
-
-/// Run one garbage collection pass. Returns `(expired, orphaned)` row counts.
-pub async fn run_label_gc(db: &sqlx::AnyPool, backend: DatabaseBackend) -> (u64, u64) {
-    // Each sweep is attempted independently: an expiry comparison that fails
-    // says nothing about whether a label's subject still exists.
-    let expired_count = match delete_expired_labels(db, backend).await {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!("failed to clean up expired labels: {e}");
-            0
-        }
-    };
-
-    let orphaned_count = match delete_orphaned_labels(db).await {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!("failed to clean up orphaned labels: {e}");
-            0
-        }
-    };
-
-    (expired_count, orphaned_count)
 }
 
 #[cfg(test)]
