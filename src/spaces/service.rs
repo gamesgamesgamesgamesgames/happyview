@@ -726,6 +726,11 @@ pub(crate) async fn create_space(
     {
         tracing::warn!("failed to auto-provision #atproto_space verification method: {e}");
     }
+    if let Err(e) =
+        crate::service_entries::ensure_space_host_entry(&state.db, state.db_backend).await
+    {
+        tracing::warn!("failed to auto-provision #atproto_space_host service entry: {e}");
+    }
     let member = SpaceMember {
         id: uuid::Uuid::new_v4().to_string(),
         space_id: space.id.clone(),
@@ -1753,6 +1758,46 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(access, Some(crate::spaces::types::MemberAccess::WRITE));
+    }
+
+    async fn create_in_memory(
+        state: &AppState,
+        creator: &str,
+        skey: &str,
+    ) -> Result<Space, AppError> {
+        super::create_space(
+            state,
+            creator,
+            "com.example.chat",
+            skey,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn creating_a_space_advertises_this_instance_as_space_host() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("create should succeed");
+
+        let entries = crate::service_entries::list_entries(&state.db, state.db_backend)
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.fragment_id == "#atproto_space_host"),
+            "no #atproto_space_host service entry: {entries:?}"
+        );
     }
 
     #[tokio::test]
