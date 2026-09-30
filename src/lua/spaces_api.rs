@@ -161,6 +161,47 @@ impl mlua::UserData for LuaSpace {
             Ok(mlua::Value::Table(result))
         });
 
+        // space:put_member{ did, read, write, is_delegation? } -> { did, read, write }
+        methods.add_async_method("put_member", |lua, this, opts: mlua::Table| async move {
+            let state = this.state.clone();
+            let space_uri = this.space_uri.clone();
+            let actor = this.require_caller()?;
+            if !spaces_enabled(&state).await {
+                return Err(mlua::Error::runtime("spaces feature is not enabled"));
+            }
+            let member_did: String = opts
+                .get("did")
+                .map_err(|_| mlua::Error::runtime("put_member: did is required"))?;
+            // Both required: putMember replaces the pair, so a default would grant
+            // or withdraw access the script never named.
+            let read: bool = opts
+                .get("read")
+                .map_err(|_| mlua::Error::runtime("put_member: read is required"))?;
+            let write: bool = opts
+                .get("write")
+                .map_err(|_| mlua::Error::runtime("put_member: write is required"))?;
+            let is_delegation: Option<bool> = opts.get("is_delegation").ok();
+            let member = service::put_member(
+                &state,
+                &actor,
+                &space_uri,
+                &member_did,
+                crate::spaces::types::MemberAccess {
+                    read,
+                    write,
+                    read_self: false,
+                },
+                is_delegation,
+            )
+            .await
+            .map_err(|e| mlua::Error::runtime(format!("put_member: {e}")))?;
+            let result = lua.create_table()?;
+            result.set("did", member.did)?;
+            result.set("read", member.access.read)?;
+            result.set("write", member.access.write)?;
+            Ok(mlua::Value::Table(result))
+        });
+
         // space:remove_member{ did } -> true
         methods.add_async_method(
             "remove_member",
@@ -181,7 +222,7 @@ impl mlua::UserData for LuaSpace {
             },
         );
 
-        // space:members() -> [{ did, access }]
+        // space:members() -> [{ did, read, write, access }]
         methods.add_async_method("members", |lua, this, ()| async move {
             let state = this.state.clone();
             let space_uri = this.space_uri.clone();
@@ -199,6 +240,8 @@ impl mlua::UserData for LuaSpace {
             for (i, m) in members.iter().enumerate() {
                 let entry = lua.create_table()?;
                 entry.set("did", m.did.as_str())?;
+                entry.set("read", m.access.read)?;
+                entry.set("write", m.access.write)?;
                 entry.set("access", m.access.as_wire_str())?;
                 result.set(i + 1, entry)?;
             }
@@ -1144,6 +1187,42 @@ mod tests {
             uri.contains(&new_member_did),
             "expected record uri to be authored by the new member, got: {uri}"
         );
+    }
+
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn put_member_sets_read_and_write_independently() {
+        require_test_db!();
+        let (state, space_uri, authority_did) = db_seeded_space().await;
+        let member_did = format!("did:plc:writeonly{}", uuid::Uuid::new_v4().simple());
+
+        let lua = mlua::Lua::new();
+        let state_arc = std::sync::Arc::new(state);
+        crate::lua::atproto_api::register_atproto_api(
+            &lua,
+            state_arc.clone(),
+            Some(&authority_did),
+        )
+        .unwrap();
+        super::register_spaces_write_api(&lua, state_arc.clone(), Some(&authority_did)).unwrap();
+
+        let chunk = format!(
+            r#"
+                local space = atproto.spaces.get("{space_uri}")
+                local member = space:put_member{{ did = "{member_did}", read = false, write = true }}
+                assert(member.read == false, "put_member should report read")
+                assert(member.write == true, "put_member should report write")
+                for _, m in ipairs(space:members()) do
+                    if m.did == "{member_did}" then
+                        assert(m.read == false and m.write == true, "members should report both")
+                        return true
+                    end
+                end
+                error("the member is not listed")
+            "#
+        );
+        let listed: bool = lua.load(&chunk).eval_async().await.unwrap();
+        assert!(listed);
     }
 
     #[tokio::test]
