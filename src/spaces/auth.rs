@@ -43,6 +43,7 @@ pub async fn issue_credential(
     subject_did: &str,
     client_id: Option<&str>,
     authority_did: &str,
+    bound_key: Option<&str>,
 ) -> Result<IssuedCredential, AppError> {
     let auth_ctx = ServiceAuthCtx {
         pool,
@@ -69,6 +70,9 @@ pub async fn issue_credential(
         iat: now,
         exp,
         jti: make_jti(),
+        cnf: bound_key.map(|kid| crate::spaces::credential::Confirmation {
+            kid: kid.to_string(),
+        }),
     };
 
     // A space this instance is authority for is verified against the
@@ -741,6 +745,7 @@ mod tests {
             "did:plc:member",
             None,
             &space.authority_did,
+            None,
         )
         .await
     }
@@ -814,6 +819,7 @@ mod tests {
             "did:plc:reader",
             None,
             &space.authority_did,
+            None,
         )
         .await
         .unwrap();
@@ -846,6 +852,7 @@ mod tests {
             "did:plc:stranger",
             None,
             &space.authority_did,
+            None,
         )
         .await;
         assert!(matches!(result, Err(AppError::Forbidden(_))));

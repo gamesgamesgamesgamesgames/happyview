@@ -88,6 +88,58 @@ pub fn verify_delegation_token(
     verifying_key: &K256VerifyingKey,
     accepted_aud: &[&str],
 ) -> Result<DelegationTokenClaims, AppError> {
+    verify_delegation_token_with_key(
+        token,
+        &SpaceVerifyingKey::K256(*verifying_key),
+        accepted_aud,
+    )
+}
+
+/// Verify a delegation token minted by the account itself, as a PDS that serves
+/// spaces does, against the key its DID document names in the token's `kid`.
+pub async fn verify_account_delegation_token(
+    token: &str,
+    http: &reqwest::Client,
+    plc_url: &str,
+    accepted_aud: &[&str],
+) -> Result<DelegationTokenClaims, AppError> {
+    let (header, claims) = peek_jwt::<DelegationTokenClaims>(token)
+        .ok_or_else(|| AppError::Auth("invalid delegation token format".into()))?;
+    let fragment = header["kid"].as_str().unwrap_or("#atproto");
+    let fragment = if fragment.starts_with('#') {
+        fragment.to_string()
+    } else {
+        format!("#{fragment}")
+    };
+
+    let did_doc = profile::resolve_did_document(http, plc_url, &claims.iss).await?;
+    let method = did_doc
+        .verification_method
+        .iter()
+        .find(|v| v.id == fragment || v.id == format!("{}{fragment}", claims.iss))
+        .ok_or_else(|| AppError::Auth(format!("delegation token signer has no {fragment} key")))?;
+    let multibase = method.public_key_multibase.as_deref().ok_or_else(|| {
+        AppError::Auth(format!(
+            "{fragment} verification method missing publicKeyMultibase"
+        ))
+    })?;
+    verify_delegation_token_with_key(token, &multikey_to_space_key(multibase)?, accepted_aud)
+}
+
+/// An unverified JWT's header and claims.
+fn peek_jwt<T: serde::de::DeserializeOwned>(token: &str) -> Option<(serde_json::Value, T)> {
+    let mut parts = token.split('.');
+    let header = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    let claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    Some((header, claims))
+}
+
+/// Verify a delegation token against a known key of either curve.
+pub fn verify_delegation_token_with_key(
+    token: &str,
+    verifying_key: &SpaceVerifyingKey,
+    accepted_aud: &[&str],
+) -> Result<DelegationTokenClaims, AppError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(AppError::Auth("invalid delegation token format".into()));
@@ -99,8 +151,14 @@ pub fn verify_delegation_token(
     let header: serde_json::Value = serde_json::from_slice(&header_bytes)
         .map_err(|_| AppError::Auth("invalid delegation token header".into()))?;
 
-    if header["alg"].as_str() != Some("ES256K") {
-        return Err(AppError::Auth("delegation token alg must be ES256K".into()));
+    let expected_alg = match verifying_key {
+        SpaceVerifyingKey::P256(_) => "ES256",
+        SpaceVerifyingKey::K256(_) => "ES256K",
+    };
+    if header["alg"].as_str() != Some(expected_alg) {
+        return Err(AppError::Auth(format!(
+            "delegation token alg must be {expected_alg} for the signer's key"
+        )));
     }
 
     if header["typ"].as_str() != Some(DELEGATION_TOKEN_TYP) {
@@ -113,25 +171,9 @@ pub fn verify_delegation_token(
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(parts[2])
         .map_err(|_| AppError::Auth("invalid delegation token signature encoding".into()))?;
-
-    // Try direct verify, then with low-S normalization
-    let verified = if let Ok(sig) = K256Signature::from_slice(sig_bytes.as_slice()) {
-        if verifying_key.verify(message.as_bytes(), &sig).is_ok() {
-            true
-        } else {
-            verifying_key
-                .verify(message.as_bytes(), &sig.normalize_s())
-                .is_ok()
-        }
-    } else {
-        false
-    };
-
-    if !verified {
-        return Err(AppError::Auth(
-            "delegation token signature verification failed".into(),
-        ));
-    }
+    verifying_key
+        .verify(message.as_bytes(), &sig_bytes)
+        .map_err(|_| AppError::Auth("delegation token signature verification failed".into()))?;
 
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
@@ -164,6 +206,17 @@ pub struct SpaceCredentialClaims {
     pub iat: u64,
     pub exp: u64,
     pub jti: String, // Random nonce
+    /// The key the credential is bound to. Requests using the credential must be
+    /// signed by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Confirmation>,
+}
+
+/// An RFC 7800 confirmation claim naming the bound key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confirmation {
+    /// A P-256 `did:key`.
+    pub kid: String,
 }
 
 pub fn sign_credential(
@@ -486,6 +539,7 @@ mod tests {
             .unwrap()
             .as_secs();
         SpaceCredentialClaims {
+            cnf: None,
             iss: "did:plc:spaceowner".into(),
             sub: "at://did:plc:spaceowner/space/com.example.forum/main".into(),
             iat: now,
@@ -544,6 +598,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let claims = SpaceCredentialClaims {
+            cnf: None,
             iss: "did:plc:owner".into(),
             sub: "at://did:plc:owner/space/com.example.test/main".into(),
             iat: now - 7200,

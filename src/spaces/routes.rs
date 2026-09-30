@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::AppState;
 use crate::auth::XrpcClaims;
-use crate::db::{adapt_sql, now_rfc3339};
+use crate::db::now_rfc3339;
 use crate::error::AppError;
 use crate::lua::tid::generate_tid;
 use crate::spaces::scope::{check_delegation_token_access, check_read_access};
@@ -207,7 +207,9 @@ struct RevokeInviteInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GetSpaceCredentialInput {
-    grant: String,
+    space: String,
+    /// Identifies the app, for spaces that gate on it.
+    client_attestation: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -368,10 +370,6 @@ pub fn space_routes() -> Router<AppState> {
             get(get_delegation_token),
         )
         .route(
-            &format!("/xrpc/{LEGACY_NS}.space.getSpaceCredential"),
-            post(get_space_credential),
-        )
-        .route(
             &format!("/xrpc/{LEGACY_NS}.space.createRecord"),
             post(create_record),
         )
@@ -493,22 +491,6 @@ fn require_notify_caller(claims: &XrpcClaims) -> Result<String, AppError> {
     Err(AppError::Auth(
         "This endpoint requires authentication".into(),
     ))
-}
-
-async fn resolve_client_id_url(
-    state: &AppState,
-    client_key: &str,
-) -> Result<Option<String>, AppError> {
-    let sql = adapt_sql(
-        "SELECT client_id_url FROM happyview_api_clients WHERE client_key = ?",
-        state.db_backend,
-    );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(client_key)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to look up API client: {e}")))?;
-    Ok(row.map(|(url,)| url))
 }
 
 // ---------------------------------------------------------------------------
@@ -1851,60 +1833,86 @@ async fn notify_space_deleted(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// Exchange a delegation token for a space credential bound to the caller's key.
+///
+/// The delegation token is the request's authorization token, and an
+/// `atproto-space` HTTP Message Signature over it proves possession of the key
+/// the credential is bound to. No account session is involved: the delegation
+/// token is the account's consent, and the credential goes to whoever holds the
+/// key.
 async fn get_space_credential(
     State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
+    headers: HeaderMap,
     Json(input): Json<GetSpaceCredentialInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| AppError::Auth("a delegation token is required".into()))?
+        .to_string();
+    let bound_key = crate::spaces::http_signature::verify(&headers, None)?;
 
     let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
-    let verifying_key = {
-        let signing_key = k256::ecdsa::SigningKey::from_slice(encryption_key).map_err(|e| {
-            AppError::Internal(format!("failed to derive delegation signing key: {e}"))
-        })?;
-        k256::ecdsa::VerifyingKey::from(&signing_key)
-    };
+    let space = service::resolve_space(&state, &input.space).await?;
+    // An authority that publishes no #atproto_space_host is reached at its
+    // #atproto_pds endpoint, so a token may name either.
+    let space_host_aud = format!("{}#atproto_space_host", space.did);
+    let pds_aud = format!("{}#atproto_pds", space.did);
+    let accepted_aud = [space_host_aud.as_str(), pds_aud.as_str()];
 
-    let delegation_claims = {
-        let unverified_sub = crate::spaces::credential::peek_delegation_sub(&input.grant)
-            .ok_or_else(|| AppError::Auth("invalid delegation token".into()))?;
-        let space_did = crate::spaces::SpaceUri::parse(&unverified_sub)
-            .map(|u| u.did.clone())
-            .unwrap_or_default();
-        // An authority that publishes no #atproto_space_host is reached at its
-        // #atproto_pds endpoint, so a token may name either.
-        let space_host_aud = format!("{space_did}#atproto_space_host");
-        let pds_aud = format!("{space_did}#atproto_pds");
-        crate::spaces::credential::verify_delegation_token(
-            &input.grant,
-            &verifying_key,
-            &[space_host_aud.as_str(), pds_aud.as_str()],
-        )?
-    };
-
-    // The credential is minted for the delegation token's subject (`iss`).
-    // Require the authenticated caller to *be* that subject — otherwise anyone
-    // who captures a member's short-lived (60s) delegation token could mint a 2h
-    // credential in that member's name (M4). The documented flow has the same
-    // member's app perform both steps; only the final credential is handed to an
-    // external service.
-    if claims.did() != delegation_claims.iss.as_str() {
-        return Err(AppError::Forbidden(
-            "delegation token was issued to a different account".into(),
-        ));
+    // A PDS that serves spaces mints delegation tokens with the account's own
+    // key. For accounts on one that does not, HappyView mints them with its own
+    // delegation key.
+    let delegation_claims =
+        match verify_local_delegation_token(encryption_key, &token, &accepted_aud) {
+            Ok(claims) => claims,
+            Err(_) => crate::spaces::credential::verify_account_delegation_token(
+                &token,
+                &state.http,
+                &state.config.plc_url,
+                &accepted_aud,
+            )
+            .await
+            .map_err(|e| AppError::XrpcError {
+                status: StatusCode::BAD_REQUEST,
+                code: "InvalidDelegationToken",
+                message: e.to_string(),
+            })?,
+        };
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if delegation_claims.sub != space_uri {
+        return Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidDelegationToken",
+            message: "delegation token is for a different space".into(),
+        });
     }
 
-    let space = service::resolve_space(&state, &delegation_claims.sub).await?;
-
-    let client_id = if let Some(key) = claims.client_key() {
-        resolve_client_id_url(&state, key).await?
-    } else {
-        None
+    let client_id = match &input.client_attestation {
+        Some(attestation) => Some(
+            crate::spaces::client_attestation::verify_client_attestation(
+                attestation,
+                &space.authority_did,
+                &state.http,
+            )
+            .await
+            .map_err(|e| AppError::XrpcError {
+                status: StatusCode::BAD_REQUEST,
+                code: "InvalidClientAttestation",
+                message: e.to_string(),
+            })?
+            .client_id,
+        ),
+        None => None,
     };
+
     let issued = crate::spaces::auth::issue_credential(
         &state.db,
         state.db_backend,
@@ -1916,6 +1924,7 @@ async fn get_space_credential(
         &delegation_claims.iss,
         client_id.as_deref(),
         &space.authority_did,
+        Some(&bound_key),
     )
     .await?;
 
@@ -1923,6 +1932,21 @@ async fn get_space_credential(
         "credential": issued.token,
         "expiresAt": issued.expires_at,
     })))
+}
+
+/// Verify a delegation token HappyView minted with its own delegation key.
+fn verify_local_delegation_token(
+    encryption_key: &[u8; 32],
+    token: &str,
+    accepted_aud: &[&str],
+) -> Result<crate::spaces::credential::DelegationTokenClaims, AppError> {
+    let signing_key = k256::ecdsa::SigningKey::from_slice(encryption_key)
+        .map_err(|e| AppError::Internal(format!("failed to derive delegation signing key: {e}")))?;
+    crate::spaces::credential::verify_delegation_token(
+        token,
+        &k256::ecdsa::VerifyingKey::from(&signing_key),
+        accepted_aud,
+    )
 }
 
 #[cfg(test)]

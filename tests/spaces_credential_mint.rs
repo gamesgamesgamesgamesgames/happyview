@@ -15,7 +15,6 @@ use common::app::TestApp;
 
 const AUTHORITY: &str = "did:plc:mint-authority";
 const MEMBER: &str = "did:plc:mint-member";
-const ATTACKER: &str = "did:plc:mint-attacker";
 
 fn space_uri() -> String {
     format!("at://{AUTHORITY}/space/com.example.mint/main")
@@ -113,56 +112,144 @@ async fn setup_and_get_delegation_token(app: &TestApp) -> String {
         .to_string()
 }
 
-fn get_credential_req(grant: &str, cookie: (HeaderName, HeaderValue)) -> Request<Body> {
-    Request::builder()
+/// A fresh key for a syncer to bind a credential to.
+fn syncer_key() -> p256::ecdsa::SigningKey {
+    use rand::Rng;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    p256::ecdsa::SigningKey::from_slice(&bytes).unwrap()
+}
+
+/// `getSpaceCredential` as the spec shapes it: the delegation token as the
+/// authorization token, signed by the key to bind the credential to.
+fn credential_req(delegation_token: &str, key: Option<&p256::ecdsa::SigningKey>) -> Request<Body> {
+    let authorization = format!("Bearer {delegation_token}");
+    let mut req = Request::builder()
         .method("POST")
         .uri("/xrpc/com.atproto.space.getSpaceCredential")
-        .header(cookie.0, cookie.1)
         .header("content-type", "application/json")
-        .body(Body::from(json!({ "grant": grant }).to_string()))
+        .header("authorization", &authorization);
+    if let Some(key) = key {
+        let signed = happyview::spaces::http_signature::sign(key, &authorization, None);
+        for name in ["signature-input", "signature"] {
+            req = req.header(name, signed[name].clone());
+        }
+    }
+    req.body(Body::from(json!({ "space": space_uri() }).to_string()))
         .unwrap()
 }
 
-/// An attacker who captures a member's delegation token cannot mint a credential
-/// in the member's name. Before the fix this returned 200.
-#[tokio::test]
-#[serial]
-async fn get_space_credential_rejects_foreign_caller() {
-    common::require_db!();
-    let app = TestApp::new_with_encryption().await;
-    let grant = setup_and_get_delegation_token(&app).await;
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(get_credential_req(&grant, cookie_for(&app, ATTACKER)))
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "a caller must not mint a credential from another member's delegation token"
-    );
+/// The claims of a JWT, unverified.
+fn claims_of(jwt: &str) -> Value {
+    use base64::Engine;
+    let payload = jwt.split('.').nth(1).unwrap();
+    serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .unwrap(),
+    )
+    .unwrap()
 }
 
-/// The member the delegation token was issued to can mint their own credential.
 #[tokio::test]
 #[serial]
-async fn get_space_credential_allows_own_caller() {
+async fn mints_a_credential_bound_to_the_key_that_signed_for_it() {
     common::require_db!();
     let app = TestApp::new_with_encryption().await;
-    let grant = setup_and_get_delegation_token(&app).await;
+    let token = setup_and_get_delegation_token(&app).await;
+    let key = syncer_key();
 
     let resp = app
         .router
         .clone()
-        .oneshot(get_credential_req(&grant, cookie_for(&app, MEMBER)))
+        .oneshot(credential_req(&token, Some(&key)))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = json_of(resp).await;
-    assert!(
-        body["credential"].as_str().is_some(),
-        "expected a credential"
+    let credential = json_of(resp).await["credential"]
+        .as_str()
+        .expect("a credential")
+        .to_string();
+    assert_eq!(
+        claims_of(&credential)["cnf"]["kid"],
+        json!(happyview::spaces::http_signature::did_key(
+            key.verifying_key()
+        ))
     );
+}
+
+/// A delegation token alone is not enough: without a signature there is no key
+/// to bind, and the credential would be a bearer token.
+#[tokio::test]
+#[serial]
+async fn refuses_a_delegation_token_without_a_signature() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let token = setup_and_get_delegation_token(&app).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(credential_req(&token, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("BadSpaceSignature"));
+}
+
+/// A PDS that serves spaces mints delegation tokens with the account's own
+/// signing key, which is found through the account's DID document.
+#[tokio::test]
+#[serial]
+async fn accepts_a_delegation_token_signed_by_the_account() {
+    use happyview::spaces::credential::{DelegationTokenClaims, sign_delegation_token};
+
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    setup_and_get_delegation_token(&app).await;
+
+    let mut bytes = [0u8; 32];
+    {
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut bytes);
+    }
+    let account_key = k256::ecdsa::SigningKey::from_slice(&bytes).unwrap();
+    let mut multikey = vec![0xe7, 0x01];
+    multikey.extend_from_slice(account_key.verifying_key().to_sec1_point(true).as_bytes());
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    plc_store.write().await.insert(
+        MEMBER.to_string(),
+        json!({
+            "id": MEMBER,
+            "verificationMethod": [{
+                "id": format!("{MEMBER}#atproto"),
+                "type": "Multikey",
+                "controller": MEMBER,
+                "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, multikey),
+            }],
+            "service": [],
+        }),
+    );
+
+    let now = chrono::Utc::now().timestamp() as u64;
+    let token = sign_delegation_token(
+        &DelegationTokenClaims {
+            iss: MEMBER.to_string(),
+            sub: space_uri(),
+            aud: format!("{AUTHORITY}#atproto_space_host"),
+            iat: now,
+            exp: now + 60,
+            jti: Uuid::new_v4().to_string(),
+        },
+        &account_key,
+    )
+    .unwrap();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(credential_req(&token, Some(&syncer_key())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
