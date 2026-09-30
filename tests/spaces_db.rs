@@ -506,18 +506,13 @@ async fn register_and_list_notify_registrations() {
     .expect("register failed");
     assert!(!reg_id.is_empty());
 
-    let all_regs = spaces_db::list_notify_registrations(&pool, backend, &space_id, None)
+    let all_regs = spaces_db::list_notify_registrations(&pool, backend, &space_id)
         .await
         .expect("list_notify_registrations failed");
     assert_eq!(all_regs.len(), 1);
     assert_eq!(all_regs[0].id, reg_id);
     assert_eq!(all_regs[0].endpoint, endpoint);
-    assert_eq!(all_regs[0].author_did, Some(service_did.to_string()));
-
-    let by_did = spaces_db::list_notify_registrations(&pool, backend, &space_id, Some(service_did))
-        .await
-        .expect("list_notify_registrations by did failed");
-    assert_eq!(by_did.len(), 1);
+    assert_eq!(all_regs[0].service, service_did);
 }
 
 #[tokio::test]
@@ -555,10 +550,142 @@ async fn delete_notify_registration_removes_it() {
         .expect("delete_notify_registration failed");
     assert!(deleted);
 
-    let remaining = spaces_db::list_notify_registrations(&pool, backend, &space_id, None)
+    let remaining = spaces_db::list_notify_registrations(&pool, backend, &space_id)
         .await
         .expect("list after delete failed");
     assert!(remaining.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn a_registered_syncer_is_notified_of_every_writer() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let space_id = new_id();
+    let space = make_space(
+        &space_id,
+        "did:plc:fanout-owner",
+        "com.example.fanout",
+        "fo-skey",
+    );
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .expect("create_space failed");
+
+    let syncer = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&syncer)
+        .await;
+
+    notifications::register(
+        &pool,
+        backend,
+        &space_id,
+        "did:web:syncer.example",
+        &syncer.uri(),
+        "did:web:syncer.example",
+    )
+    .await
+    .expect("register failed");
+
+    let http = reqwest::Client::new();
+    for author in ["did:plc:alice", "did:plc:bob"] {
+        notifications::dispatch_write_notification(
+            &pool,
+            backend,
+            &http,
+            &space_id,
+            author,
+            "com.example.post",
+            "rk",
+            None,
+        )
+        .await
+        .expect("dispatch failed");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn registering_again_replaces_the_earlier_registration() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let space_id = new_id();
+    let space = make_space(&space_id, "did:plc:rereg-owner", "com.example.rereg", "rr");
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .expect("create_space failed");
+
+    for endpoint in ["https://old.example/n", "https://new.example/n"] {
+        notifications::register(
+            &pool,
+            backend,
+            &space_id,
+            "did:web:syncer.example",
+            endpoint,
+            "did:web:syncer.example",
+        )
+        .await
+        .expect("register failed");
+    }
+
+    let regs = spaces_db::list_notify_registrations(&pool, backend, &space_id)
+        .await
+        .expect("list failed");
+    assert_eq!(regs.len(), 1);
+    assert_eq!(regs[0].endpoint, "https://new.example/n");
+}
+
+#[tokio::test]
+#[serial]
+async fn expired_registrations_are_not_listed() {
+    common::require_db!();
+    let pool = test_db::test_pool().await;
+    let backend = test_db::test_backend();
+    test_db::truncate_all(&pool).await;
+
+    let space_id = new_id();
+    let space = make_space(
+        &space_id,
+        "did:plc:expiry-owner",
+        "com.example.expiry",
+        "ex",
+    );
+    spaces_db::create_space(&pool, backend, &space)
+        .await
+        .expect("create_space failed");
+
+    spaces_db::register_notify(
+        &pool,
+        backend,
+        &NotifyRegistration {
+            id: new_id(),
+            space_id: space_id.clone(),
+            service: "did:web:lapsed.example".into(),
+            endpoint: "https://lapsed.example/n".into(),
+            registered_by: "did:web:lapsed.example".into(),
+            expires_at: "2020-01-01T00:00:00+00:00".into(),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("register_notify failed");
+
+    let regs = spaces_db::list_notify_registrations(&pool, backend, &space_id)
+        .await
+        .expect("list failed");
+    assert!(regs.is_empty());
 }
 
 // ---------------------------------------------------------------------------

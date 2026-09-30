@@ -283,7 +283,8 @@ pub struct SpaceRecord {
 pub struct NotifyRegistration {
     pub id: String,
     pub space_id: String,
-    pub author_did: Option<String>,
+    /// The subscribing service. A service holds one registration per space.
+    pub service: String,
     pub endpoint: String,
     pub registered_by: String,
     pub expires_at: String,

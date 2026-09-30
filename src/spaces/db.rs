@@ -918,7 +918,7 @@ pub async fn delete_notify_registrations_for_service(
     service: &str,
 ) -> Result<u64, AppError> {
     let sql = adapt_sql(
-        "DELETE FROM happyview_space_notify_registrations WHERE space_id = ? AND registered_by = ?",
+        "DELETE FROM happyview_space_notify_registrations WHERE space_id = ? AND service = ?",
         backend,
     );
     let result = crate::db::query(&sql)
@@ -948,6 +948,7 @@ pub async fn list_polyfill_repos_for_author(
         .map_err(|e| AppError::Internal(format!("failed to list polyfill repos: {e}")))
 }
 
+/// Store a registration, replacing the service's earlier one for this space.
 pub async fn register_notify(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -955,14 +956,15 @@ pub async fn register_notify(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO happyview_space_notify_registrations (id, space_id, author_did, endpoint, registered_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_notify_registrations (id, space_id, service, endpoint, registered_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (space_id, service) DO UPDATE SET id = excluded.id, endpoint = excluded.endpoint, registered_by = excluded.registered_by, expires_at = excluded.expires_at, created_at = excluded.created_at",
         backend,
     );
 
     crate::db::query(&sql)
         .bind(&reg.id)
         .bind(&reg.space_id)
-        .bind(&reg.author_did)
+        .bind(&reg.service)
         .bind(&reg.endpoint)
         .bind(&reg.registered_by)
         .bind(&reg.expires_at)
@@ -974,30 +976,20 @@ pub async fn register_notify(
     Ok(())
 }
 
+/// The registrations for a space that have not expired.
 pub async fn list_notify_registrations(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     space_id: &str,
-    author_did: Option<&str>,
 ) -> Result<Vec<NotifyRegistration>, AppError> {
-    let sql = if author_did.is_some() {
-        adapt_sql(
-            "SELECT id, space_id, author_did, endpoint, registered_by, expires_at, created_at FROM happyview_space_notify_registrations WHERE space_id = ? AND author_did = ? ORDER BY created_at ASC",
-            backend,
-        )
-    } else {
-        adapt_sql(
-            "SELECT id, space_id, author_did, endpoint, registered_by, expires_at, created_at FROM happyview_space_notify_registrations WHERE space_id = ? ORDER BY created_at ASC",
-            backend,
-        )
-    };
+    let sql = adapt_sql(
+        "SELECT id, space_id, service, endpoint, registered_by, expires_at, created_at FROM happyview_space_notify_registrations WHERE space_id = ? AND expires_at > ? ORDER BY created_at ASC",
+        backend,
+    );
 
-    let mut query = crate::db::query_as::<NotifyRow>(&sql).bind(space_id);
-    if let Some(did) = author_did {
-        query = query.bind(did);
-    }
-
-    let rows = query
+    let rows = crate::db::query_as::<NotifyRow>(&sql)
+        .bind(space_id)
+        .bind(now_rfc3339())
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list notify registrations: {e}")))?;
@@ -1024,21 +1016,13 @@ pub async fn delete_notify_registration(
     Ok(result.rows_affected() > 0)
 }
 
-type NotifyRow = (
-    String,
-    String,
-    Option<String>,
-    String,
-    String,
-    String,
-    String,
-);
+type NotifyRow = (String, String, String, String, String, String, String);
 
 fn parse_notify_row(r: NotifyRow) -> NotifyRegistration {
     NotifyRegistration {
         id: r.0,
         space_id: r.1,
-        author_did: r.2,
+        service: r.2,
         endpoint: r.3,
         registered_by: r.4,
         expires_at: r.5,

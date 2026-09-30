@@ -29,7 +29,7 @@ pub async fn register(
     let reg = NotifyRegistration {
         id: id.clone(),
         space_id: space_id.to_string(),
-        author_did: Some(service_did.to_string()),
+        service: service_did.to_string(),
         endpoint: endpoint.to_string(),
         registered_by: registered_by.to_string(),
         expires_at,
@@ -50,15 +50,7 @@ pub async fn dispatch_write_notification(
     rkey: &str,
     cid: Option<&str>,
 ) -> Result<(), AppError> {
-    let registrations =
-        db::list_notify_registrations(pool, backend, space_id, Some(author_did)).await?;
-    // Also include space-wide registrations (no author_did filter)
-    let space_wide = db::list_notify_registrations(pool, backend, space_id, None).await?;
-
-    let all: Vec<&NotifyRegistration> = registrations
-        .iter()
-        .chain(space_wide.iter().filter(|r| r.author_did.is_none()))
-        .collect();
+    let registrations = db::list_notify_registrations(pool, backend, space_id).await?;
 
     let payload = serde_json::json!({
         "space": space_id,
@@ -68,7 +60,7 @@ pub async fn dispatch_write_notification(
         "cid": cid,
     });
 
-    for reg in all {
+    for reg in &registrations {
         let _ = http.post(&reg.endpoint).json(&payload).send().await;
     }
 
@@ -81,7 +73,7 @@ pub async fn dispatch_space_deleted(
     http: &reqwest::Client,
     space_id: &str,
 ) -> Result<(), AppError> {
-    let registrations = db::list_notify_registrations(pool, backend, space_id, None).await?;
+    let registrations = db::list_notify_registrations(pool, backend, space_id).await?;
 
     let payload = serde_json::json!({ "space": space_id });
 

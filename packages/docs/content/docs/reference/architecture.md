@@ -371,7 +371,7 @@ sequenceDiagram
 | -------------- | ----------- | ------------------------------------------------ |
 | `id`           | text (PK)   |                                                  |
 | `space_id`     | text (FK)   | References `spaces.id`                           |
-| `author_did`   | text        | Filter by author DID (optional)                  |
+| `service`      | text        | Subscribing service; one registration per space  |
 | `endpoint`     | text        | Notification endpoint URL                        |
 | `registered_by`| text        | DID of who registered                            |
 | `expires_at`   | text        | When the registration expires                    |
