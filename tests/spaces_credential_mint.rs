@@ -253,3 +253,33 @@ async fn accepts_a_delegation_token_signed_by_the_account() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// A delegation token is single-use, so one captured in transit cannot be
+/// exchanged again for a credential bound to someone else's key.
+#[tokio::test]
+#[serial]
+async fn refuses_a_delegation_token_that_was_already_exchanged() {
+    common::require_db!();
+    let app = TestApp::new_with_encryption().await;
+    let token = setup_and_get_delegation_token(&app).await;
+
+    let first = app
+        .router
+        .clone()
+        .oneshot(credential_req(&token, Some(&syncer_key())))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let replay = app
+        .router
+        .clone()
+        .oneshot(credential_req(&token, Some(&syncer_key())))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json_of(replay).await["error"],
+        json!("InvalidDelegationToken")
+    );
+}

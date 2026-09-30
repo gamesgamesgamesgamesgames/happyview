@@ -1894,6 +1894,21 @@ async fn get_space_credential(
             message: "delegation token is for a different space".into(),
         });
     }
+    if !db::consume_delegation_token(
+        &state.db,
+        state.db_backend,
+        &delegation_claims.iss,
+        &delegation_claims.jti,
+        delegation_claims.exp,
+    )
+    .await?
+    {
+        return Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidDelegationToken",
+            message: "delegation token has already been used".into(),
+        });
+    }
 
     let client_id = match &input.client_attestation {
         Some(attestation) => Some(

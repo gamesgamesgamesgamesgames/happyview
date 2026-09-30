@@ -1098,6 +1098,44 @@ pub async fn find_blob_author_did(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// Delegation token uses
+// ---------------------------------------------------------------------------
+
+/// Record a delegation token as used, returning `false` if it already was.
+pub async fn consume_delegation_token(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    issuer: &str,
+    jti: &str,
+    exp: u64,
+) -> Result<bool, AppError> {
+    let now = now_rfc3339();
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_delegation_uses WHERE expires_at < ?",
+        backend,
+    ))
+    .bind(&now)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to prune delegation token uses: {e}")))?;
+
+    let expires_at = chrono::DateTime::from_timestamp(exp as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or(now);
+    let result = crate::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_delegation_uses (issuer, jti, expires_at) VALUES (?, ?, ?) ON CONFLICT (issuer, jti) DO NOTHING",
+        backend,
+    ))
+    .bind(issuer)
+    .bind(jti)
+    .bind(&expires_at)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to record delegation token use: {e}")))?;
+    Ok(result.rows_affected() == 1)
+}
+
+// ---------------------------------------------------------------------------
 // Space Invites
 // ---------------------------------------------------------------------------
 
