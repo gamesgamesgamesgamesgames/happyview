@@ -40,7 +40,11 @@ pub async fn record(
     let rev_micros = tid::tid_to_unix_microseconds(rev)
         .ok_or_else(|| AppError::BadRequest("rev is not a TID".into()))?;
     if rev_micros > chrono::Utc::now().timestamp_micros() + MAX_REV_CLOCK_SKEW_MICROS {
-        return Err(AppError::BadRequest("rev is in the future".into()));
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "FutureRev",
+            message: "the repo revision exceeds the permitted clock skew".into(),
+        });
     }
 
     // Postgres runs concurrent writers in parallel, so hold the space row to
@@ -379,6 +383,12 @@ mod tests {
         let err = record_on(&pool, &space_id, "did:plc:alice", &future)
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)));
+        assert!(matches!(
+            err,
+            AppError::XrpcError {
+                code: "FutureRev",
+                ..
+            }
+        ));
     }
 }

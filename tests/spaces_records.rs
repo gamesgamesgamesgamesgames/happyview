@@ -1442,6 +1442,6 @@ async fn a_local_write_notifies_registered_syncers_once_per_commit() {
     let body: Value = serde_json::from_slice(&received[0].body).unwrap();
     assert_eq!(body["space"], json!(space_uri));
     assert_eq!(body["repo"], json!(writer));
-    assert!(body["rev"].is_string());
+    assert!(body["repoRev"].is_string());
     assert!(body["hash"]["$bytes"].is_string());
 }

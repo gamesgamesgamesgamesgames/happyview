@@ -174,6 +174,8 @@ impl RepoUpdate {
         let mut body = serde_json::json!({
             "space": self.space_uri,
             "repo": self.repo,
+            "repoRev": self.rev,
+            // The alpha lexicon's name for `repoRev`. Sent until v3.
             "rev": self.rev,
             "hash": {
                 "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&self.hash),

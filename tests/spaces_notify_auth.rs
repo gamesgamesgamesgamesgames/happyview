@@ -195,6 +195,19 @@ async fn create_instance_space_with(
 /// Send `notifyWrite` in the lexicon's shape, as a repo host does, with service
 /// auth signed by `signer` and addressed to this instance's space host.
 async fn notify_write_as(signer: &str, repo: &str) -> StatusCode {
+    notify_write_with(signer, repo, "repoRev", "3lzq2b3k4c22a")
+        .await
+        .0
+}
+
+/// `notify_write_as`, naming the revision field and value, returning the
+/// status and body.
+async fn notify_write_with(
+    signer: &str,
+    repo: &str,
+    rev_field: &str,
+    rev: &str,
+) -> (StatusCode, serde_json::Value) {
     let mut app = TestApp::new().await;
     let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
     let instance_did = app.setup_did_web().await;
@@ -221,13 +234,49 @@ async fn notify_write_as(signer: &str, repo: &str) -> StatusCode {
             json!({
                 "space": space,
                 "repo": repo,
-                "rev": "3lzq2b3k4c22a",
+                rev_field: rev,
                 "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
             })
             .to_string(),
         ))
         .unwrap();
-    app.router.clone().oneshot(req).await.unwrap().status()
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// Repo hosts on the alpha lexicon name the repo revision `rev`. Accepted
+/// until v3.
+#[tokio::test]
+#[serial]
+async fn notify_write_accepts_the_alpha_rev_field() {
+    common::require_db!();
+    let (status, _) =
+        notify_write_with("did:plc:writer", "did:plc:writer", "rev", "3lzq2b3k4c22a").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A repo revision further ahead than clock skew allows is refused by name.
+#[tokio::test]
+#[serial]
+async fn notify_write_refuses_a_future_repo_rev() {
+    common::require_db!();
+    // A TID in the year 2100.
+    let (status, body) = notify_write_with(
+        "did:plc:writer",
+        "did:plc:writer",
+        "repoRev",
+        "7zzzzzzzzzzzz",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], json!("FutureRev"));
 }
 
 /// A repo host notifies with service auth signed as the account that wrote.
@@ -269,7 +318,7 @@ fn repo_host_notification(auth: &str, space: &str) -> Request<Body> {
             json!({
                 "space": space,
                 "repo": "did:plc:writer",
-                "rev": "3lzq2b3k4c22a",
+                "repoRev": "3lzq2b3k4c22a",
                 "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
             })
             .to_string(),
@@ -334,6 +383,8 @@ async fn notify_write_forwards_to_registered_syncers() {
     let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
     assert_eq!(body["space"], json!(space));
     assert_eq!(body["repo"], json!("did:plc:writer"));
+    assert_eq!(body["repoRev"], json!("3lzq2b3k4c22a"));
+    // Syncers on the alpha lexicon read `rev`. Sent until v3.
     assert_eq!(body["rev"], json!("3lzq2b3k4c22a"));
     assert!(body["hash"]["$bytes"].is_string());
     assert!(
@@ -417,7 +468,7 @@ async fn a_managing_app_is_reached_through_its_service_entry() {
             json!({
                 "space": space,
                 "repo": "did:plc:newcomer",
-                "rev": "3lzq2b3k4c22a",
+                "repoRev": "3lzq2b3k4c22a",
                 "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
             })
             .to_string(),

@@ -78,8 +78,10 @@ struct ListBlobsQuery {
 #[serde(rename_all = "camelCase")]
 struct NotifyWriteInput {
     space: String,
-    /// The repo that advanced, with its new `rev` and `hash`.
+    /// The repo that advanced, with its new `repoRev` and `hash`.
     repo: Option<String>,
+    repo_rev: Option<String>,
+    /// The alpha lexicon's name for `repoRev`. Accepted until v3.
     rev: Option<String>,
     hash: Option<LexBytes>,
     /// The legacy shape names one record instead of the repo's new state.
@@ -1761,7 +1763,7 @@ async fn notify_write(
         ),
     }
 
-    if let (Some(rev), Some(hash)) = (&input.rev, &input.hash) {
+    if let (Some(rev), Some(hash)) = (input.repo_rev.as_ref().or(input.rev.as_ref()), &input.hash) {
         let hash = hash.decode()?;
         let mut conn = state
             .db
