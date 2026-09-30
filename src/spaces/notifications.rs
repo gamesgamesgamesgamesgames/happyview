@@ -204,3 +204,101 @@ async fn deliver_repo_update(
 
     Ok(())
 }
+
+/// The method that tells a repo host a credential is revoked, and the `lxm` its
+/// service auth is bound to.
+const NOTIFY_CREDENTIAL_REVOKED_LXM: &str = "com.atproto.space.notifyCredentialRevoked";
+
+/// How many `jti`s one `notifyCredentialRevoked` call may carry.
+const MAX_REVOKED_PER_CALL: usize = 100;
+
+/// Tell the hosts of a space's native repos that credentials were revoked.
+///
+/// Those hosts verify this instance's credentials without asking it, so until
+/// they hear, a revoked credential keeps working there until it expires. Only
+/// sent for spaces this instance is the authority for: the call is service
+/// auth from the authority, which this instance can only sign as itself.
+/// Best effort, and a host that does not implement the method is skipped.
+pub fn announce_revoked_credentials(
+    state: &crate::AppState,
+    space: &crate::spaces::types::Space,
+    jtis: Vec<String>,
+) {
+    let state = state.clone();
+    let space = space.clone();
+    tokio::spawn(async move {
+        if let Err(e) = deliver_revocations(&state, &space, &jtis).await {
+            tracing::warn!(space_id = %space.id, error = %e, "failed to announce revoked credentials");
+        }
+    });
+}
+
+async fn deliver_revocations(
+    state: &crate::AppState,
+    space: &crate::spaces::types::Space,
+    jtis: &[String],
+) -> Result<(), AppError> {
+    let instance = crate::auth::service_auth::instance_did(
+        &state.db,
+        state.db_backend,
+        &state.config.public_url,
+    )
+    .await;
+    if instance.ok().as_deref() != Some(space.authority_did.as_str()) {
+        return Ok(());
+    }
+    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+        AppError::Internal("TOKEN_ENCRYPTION_KEY is required to sign revocations".into())
+    })?;
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+
+    for repo in db::list_native_repo_authors(&state.db, state.db_backend, &space.id).await? {
+        let Some(endpoint) = crate::spaces::auth::resolve_service_identifier(
+            &state.http,
+            &state.config.plc_url,
+            &repo,
+        )
+        .await
+        else {
+            tracing::warn!(
+                repo,
+                "could not resolve a native repo's host to revoke credentials"
+            );
+            continue;
+        };
+        let url = format!(
+            "{}/xrpc/{NOTIFY_CREDENTIAL_REVOKED_LXM}",
+            endpoint.trim_end_matches('/')
+        );
+        for batch in jtis.chunks(MAX_REVOKED_PER_CALL) {
+            // Addressed to the repo, which is what its host accepts service auth for.
+            let token = crate::auth::service_auth::mint_service_auth(
+                &state.db,
+                state.db_backend,
+                encryption_key,
+                &state.config.public_url,
+                &repo,
+                NOTIFY_CREDENTIAL_REVOKED_LXM,
+            )
+            .await?;
+            let result = state
+                .http
+                .post(&url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({ "space": space_uri, "credentials": batch }))
+                .send()
+                .await;
+            match result {
+                Ok(resp) if !resp.status().is_success() => {
+                    tracing::warn!(repo, status = %resp.status(), "repo host did not accept a revocation");
+                }
+                Err(e) => tracing::warn!(repo, error = %e, "could not deliver a revocation"),
+                Ok(_) => {}
+            }
+        }
+    }
+    Ok(())
+}

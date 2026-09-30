@@ -834,6 +834,22 @@ pub(crate) async fn create_space(
 /// `read_self` is HappyView-local and never sent over the wire, so a caller
 /// replacing read/write access has not asked to lift an own-records-only
 /// restriction.
+/// Revoke a member's credentials, and tell the hosts that verify them.
+async fn revoke_member_credentials(
+    state: &AppState,
+    space: &Space,
+    member_did: &str,
+) -> Result<(), AppError> {
+    let jtis =
+        db::outstanding_credential_jtis(&state.db, state.db_backend, &space.id, member_did).await?;
+    db::revoke_space_credentials_for_member(&state.db, state.db_backend, &space.id, member_did)
+        .await?;
+    if !jtis.is_empty() {
+        notifications::announce_revoked_credentials(state, space, jtis);
+    }
+    Ok(())
+}
+
 pub(crate) async fn put_member(
     state: &AppState,
     actor_did: &str,
@@ -851,7 +867,7 @@ pub(crate) async fn put_member(
             .as_ref()
             .map(|m| m.id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        space_id: space.id,
+        space_id: space.id.clone(),
         did: member_did.to_string(),
         access: MemberAccess {
             read_self: existing.map(|m| m.access.read_self).unwrap_or(false),
@@ -864,13 +880,7 @@ pub(crate) async fn put_member(
     db::add_member(&state.db, state.db_backend, &member).await?;
     // A credential is the member's read access, so it goes when that does.
     if !member.access.read {
-        db::revoke_space_credentials_for_member(
-            &state.db,
-            state.db_backend,
-            &member.space_id,
-            member_did,
-        )
-        .await?;
+        revoke_member_credentials(state, &space, member_did).await?;
     }
     Ok(member)
 }
@@ -962,8 +972,7 @@ pub(crate) async fn remove_member(
 ) -> Result<(), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
-    db::revoke_space_credentials_for_member(&state.db, state.db_backend, &space.id, member_did)
-        .await?;
+    revoke_member_credentials(state, &space, member_did).await?;
     let removed = db::remove_member(&state.db, state.db_backend, &space.id, member_did).await?;
     if !removed {
         return Err(AppError::NotFound("Member not found in this space".into()));

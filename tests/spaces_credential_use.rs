@@ -182,7 +182,12 @@ async fn reads_a_repo_with_a_credential_addressed_to_it() {
 
     let resp = call(
         &app,
-        read(&latest_commit_path(&space, MEMBER), &credential, &key, MEMBER),
+        read(
+            &latest_commit_path(&space, MEMBER),
+            &credential,
+            &key,
+            MEMBER,
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -198,7 +203,12 @@ async fn refuses_a_credential_addressed_to_another_repo() {
 
     let resp = call(
         &app,
-        read(&latest_commit_path(&space, MEMBER), &credential, &key, CREATOR),
+        read(
+            &latest_commit_path(&space, MEMBER),
+            &credential,
+            &key,
+            CREATOR,
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -214,7 +224,12 @@ async fn refuses_a_credential_signed_by_another_key() {
 
     let resp = call(
         &app,
-        read(&latest_commit_path(&space, MEMBER), &credential, &self::key(), MEMBER),
+        read(
+            &latest_commit_path(&space, MEMBER),
+            &credential,
+            &self::key(),
+            MEMBER,
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -248,7 +263,11 @@ async fn lists_a_spaces_repos_with_a_credential_addressed_to_its_authority() {
 
 async fn space_admin(app: &TestApp, nsid: &str, body: Value) {
     let resp = call(app, post_as(app, CREATOR, nsid, body)).await;
-    assert!(resp.status().is_success(), "{nsid} failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "{nsid} failed: {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
@@ -268,7 +287,12 @@ async fn a_credential_stops_working_when_its_member_loses_read_access() {
 
     let resp = call(
         &app,
-        read(&latest_commit_path(&space, MEMBER), &credential, &key, MEMBER),
+        read(
+            &latest_commit_path(&space, MEMBER),
+            &credential,
+            &key,
+            MEMBER,
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -291,8 +315,113 @@ async fn a_credential_stops_working_when_its_member_is_removed() {
 
     let resp = call(
         &app,
-        read(&latest_commit_path(&space, MEMBER), &credential, &key, MEMBER),
+        read(
+            &latest_commit_path(&space, MEMBER),
+            &credential,
+            &key,
+            MEMBER,
+        ),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The PDSes hosting native repos verify this instance's credentials, so they
+/// are told when one is revoked instead of honouring it until it expires.
+#[tokio::test]
+#[serial]
+async fn revoking_a_credential_notifies_the_hosts_of_native_repos() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (space, credential) = setup(&mut app, &key).await;
+
+    let pds = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.notifyCredentialRevoked"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&pds)
+        .await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    plc_store.write().await.insert(
+        MEMBER.to_string(),
+        json!({
+            "id": MEMBER,
+            "verificationMethod": [],
+            "service": [{ "id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": pds.uri() }],
+        }),
+    );
+
+    let mut parts = space.strip_prefix("at://").unwrap().split('/');
+    let (authority, _, space_type, skey) = (
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+        parts.next().unwrap(),
+    );
+    let space_row = happyview::spaces::db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        authority,
+        space_type,
+        skey,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let mut conn = app.state.db.acquire().await.unwrap();
+    let mut repo_state = happyview::spaces::db::get_or_create_repo_state(
+        &mut conn,
+        app.state.db_backend,
+        &space_row.id,
+        MEMBER,
+    )
+    .await
+    .unwrap();
+    repo_state.host_mode = happyview::spaces::host_mode::HostMode::Native;
+    happyview::spaces::db::update_repo_state(&mut *conn, app.state.db_backend, &repo_state)
+        .await
+        .unwrap();
+    drop(conn);
+
+    space_admin(
+        &app,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": space, "did": MEMBER, "read": false, "write": true }),
+    )
+    .await;
+
+    let mut received = Vec::new();
+    for _ in 0..50 {
+        received = pds.received_requests().await.unwrap_or_default();
+        if !received.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(received.len(), 1, "the native repo's host should hear once");
+    let body: Value = serde_json::from_slice(&received[0].body).unwrap();
+    let jti = {
+        use base64::Engine;
+        let payload = credential.split('.').nth(1).unwrap();
+        let claims: Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap();
+        claims["jti"].clone()
+    };
+    assert_eq!(body["space"], json!(space));
+    assert_eq!(body["credentials"], json!([jti]));
+    assert!(
+        received[0]
+            .headers
+            .get("authorization")
+            .is_some_and(|v| v.to_str().unwrap().starts_with("Bearer ")),
+        "revocations carry service auth from the authority"
+    );
 }

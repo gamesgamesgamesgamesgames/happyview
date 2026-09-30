@@ -384,6 +384,43 @@ pub async fn is_space_credential_jti_revoked(
     Ok(row.is_some())
 }
 
+/// The `jti`s of a member's credentials that are neither revoked nor expired.
+pub async fn outstanding_credential_jtis(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    did: &str,
+) -> Result<Vec<String>, AppError> {
+    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT jti FROM happyview_space_credentials WHERE space_id = ? AND issued_to = ? AND revoked_at IS NULL AND jti IS NOT NULL AND expires_at > ?",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(did)
+    .bind(now_rfc3339())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list outstanding credentials: {e}")))?;
+    Ok(rows.into_iter().map(|(jti,)| jti).collect())
+}
+
+/// The members whose repos in a space are hosted on their own PDS.
+pub async fn list_native_repo_authors(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT author_did FROM happyview_space_repo_state WHERE space_id = ? AND host_mode = 'native'",
+        backend,
+    ))
+    .bind(space_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list native repos: {e}")))?;
+    Ok(rows.into_iter().map(|(did,)| did).collect())
+}
+
 /// Revoke all active space credentials issued to `did` within `space_id`.
 /// Returns the number of credentials revoked.
 pub async fn revoke_space_credentials_for_member(
