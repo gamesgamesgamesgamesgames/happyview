@@ -76,9 +76,14 @@ struct ListBlobsQuery {
 #[serde(rename_all = "camelCase")]
 struct NotifyWriteInput {
     space: String,
-    did: String,
-    collection: String,
-    rkey: String,
+    /// The repo that advanced. The lexicon also carries its new `rev` and
+    /// `hash`.
+    repo: Option<String>,
+    /// The legacy shape names one record instead of the repo's new state.
+    /// Accepted until v3.
+    did: Option<String>,
+    collection: Option<String>,
+    rkey: Option<String>,
     cid: Option<String>,
 }
 
@@ -1619,25 +1624,33 @@ async fn notify_write(
     claims: XrpcClaims,
     Json(input): Json<NotifyWriteInput>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Inter-service route: only the space authority (or a super admin) may fire
-    // write notifications. Previously this ignored the caller entirely, letting
-    // anyone spam/forge notifications to registered endpoints (M1).
-    let did = require_notify_caller(&claims)?;
+    let writer = input
+        .repo
+        .clone()
+        .or_else(|| input.did.clone())
+        .ok_or_else(|| AppError::BadRequest("repo is required".into()))?;
+
+    // A repo host notifies with service auth signed as the account that wrote,
+    // so the caller must be that account. The space's creator and super admins
+    // may also notify, as the legacy shape expects.
+    let caller = require_notify_caller(&claims)?;
     let space = service::resolve_space(&state, &input.space).await?;
-    service::require_space_admin(&state, &space, &did).await?;
+    if caller != writer {
+        service::require_space_admin(&state, &space, &caller).await?;
+    }
 
     // A notification for a repo hosted on the author's own PDS is our cue to
     // pull: the write happened there, and our index has not seen it yet. This
     // is a no-op for polyfill repos, where HappyView is the source of truth and
     // there is nothing upstream.
-    match crate::spaces::native_sync::sync_repo(&state, &space, &input.did).await {
+    match crate::spaces::native_sync::sync_repo(&state, &space, &writer).await {
         Ok(crate::spaces::native_sync::SyncOutcome::Diverged { expected, ours }) => {
             // Incremental sync closed no gap. The sender did nothing wrong, so
             // the notification still succeeds, and the divergence is logged as
             // an error.
             tracing::error!(
                 space_id = %space.id,
-                author_did = %input.did,
+                author_did = %writer,
                 expected,
                 ours,
                 "native repo diverged after sync; full recovery needed"
@@ -1646,23 +1659,25 @@ async fn notify_write(
         Ok(_) => {}
         Err(e) => tracing::warn!(
             space_id = %space.id,
-            author_did = %input.did,
+            author_did = %writer,
             error = %e,
             "failed to sync a native repo after a write notification"
         ),
     }
 
-    notifications::dispatch_write_notification(
-        &state.db,
-        state.db_backend,
-        &state.http,
-        &space.id,
-        &input.did,
-        &input.collection,
-        &input.rkey,
-        input.cid.as_deref(),
-    )
-    .await?;
+    if let (Some(collection), Some(rkey)) = (&input.collection, &input.rkey) {
+        notifications::dispatch_write_notification(
+            &state.db,
+            state.db_backend,
+            &state.http,
+            &space.id,
+            &writer,
+            collection,
+            rkey,
+            input.cid.as_deref(),
+        )
+        .await?;
+    }
 
     Ok(Json(serde_json::json!({ "success": true })))
 }

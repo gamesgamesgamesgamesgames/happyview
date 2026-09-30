@@ -138,3 +138,85 @@ async fn notify_space_deleted_rejects_unauthenticated() {
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// A space whose authority is this instance, as spaces created here now are.
+async fn create_instance_space(app: &TestApp, instance_did: &str) -> String {
+    let now = now_rfc3339();
+    let space = Space {
+        id: Uuid::new_v4().to_string(),
+        did: instance_did.to_string(),
+        authority_did: instance_did.to_string(),
+        creator_did: "did:plc:creator".to_string(),
+        type_nsid: SPACE_TYPE.to_string(),
+        skey: SPACE_SKEY.to_string(),
+        display_name: None,
+        description: None,
+        read_policy: Policy::MemberList,
+        write_policy: Policy::MemberList,
+        app_access: AppAccess::Open,
+        config: SpaceConfig::default(),
+        revision: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    spaces_db::create_space(&app.state.db, app.state.db_backend, &space)
+        .await
+        .expect("create_space failed");
+    format!("at://{instance_did}/space/{SPACE_TYPE}/{SPACE_SKEY}")
+}
+
+/// Send `notifyWrite` in the lexicon's shape, as a repo host does, with service
+/// auth signed by `signer` and addressed to this instance's space host.
+async fn notify_write_as(signer: &str, repo: &str) -> StatusCode {
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            signer,
+            &instance_did,
+            "#atproto_space_host",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.space.notifyWrite")
+        .header("content-type", "application/json")
+        .header("authorization", auth)
+        .header("host", "127.0.0.1:0")
+        .body(Body::from(
+            json!({
+                "space": space,
+                "repo": repo,
+                "rev": "3lzq2b3k4c22a",
+                "hash": { "$bytes": "q83vEjRWeJq83vEjRWeJq83vEjRWeJq83vEjRWeJq80" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.router.clone().oneshot(req).await.unwrap().status()
+}
+
+/// A repo host notifies with service auth signed as the account that wrote.
+#[tokio::test]
+#[serial]
+async fn notify_write_accepts_the_writers_repo_host() {
+    common::require_db!();
+    let status = notify_write_as("did:plc:writer", "did:plc:writer").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// One account cannot report writes to another account's repo.
+#[tokio::test]
+#[serial]
+async fn notify_write_rejects_a_notification_for_someone_elses_repo() {
+    common::require_db!();
+    let status = notify_write_as("did:plc:intruder", "did:plc:writer").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
