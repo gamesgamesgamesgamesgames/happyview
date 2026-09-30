@@ -12,7 +12,8 @@ use crate::error::AppError;
 use crate::profile;
 use crate::spaces::commit::SpaceVerifyingKey;
 
-pub const DEFAULT_CREDENTIAL_TTL_SECS: u64 = 2 * 60 * 60; // 2 hours
+/// Proposal 0016 sets 10 minutes as the default and 60 as the maximum.
+pub const DEFAULT_CREDENTIAL_TTL_SECS: u64 = 10 * 60;
 pub const DELEGATION_TOKEN_TTL_SECS: u64 = 60; // 60 seconds
 
 pub const DELEGATION_TOKEN_TYP: &str = "atproto-space-delegation+jwt";

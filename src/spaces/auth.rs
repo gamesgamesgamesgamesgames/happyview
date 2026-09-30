@@ -798,6 +798,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credentials_last_ten_minutes() {
+        let issued = mint_for_member(MemberAccess::READ).await.unwrap();
+        let claims: crate::spaces::credential::SpaceCredentialClaims = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(issued.token.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims.exp - claims.iat, 600);
+    }
+
+    #[tokio::test]
     async fn member_list_refuses_a_write_only_member() {
         let write_only = MemberAccess {
             read: false,
