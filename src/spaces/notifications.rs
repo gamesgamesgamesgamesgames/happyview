@@ -73,22 +73,80 @@ pub async fn dispatch_write_notification(
     Ok(())
 }
 
-pub async fn dispatch_space_deleted(
-    pool: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-    http: &reqwest::Client,
-    space_id: &str,
-) -> Result<(), AppError> {
-    let registrations = db::list_notify_registrations(pool, backend, space_id).await?;
-
-    let payload = serde_json::json!({ "space": space_id });
-
-    for reg in &registrations {
-        let _ = http.post(&reg.endpoint).json(&payload).send().await;
+/// Tell the services registered for a space that it was deleted.
+///
+/// Takes the registrations rather than reading them, because they are deleted
+/// with the space. Services registered by identifier receive
+/// `com.atproto.space.notifySpaceDeleted` signed by this instance; webhooks
+/// receive the legacy payload. Runs in the background and is best effort.
+pub fn announce_space_deleted(
+    state: &crate::AppState,
+    space: &crate::spaces::types::Space,
+    registrations: Vec<NotifyRegistration>,
+) {
+    if registrations.is_empty() {
+        return;
     }
-
-    Ok(())
+    let state = state.clone();
+    let space = space.clone();
+    tokio::spawn(async move {
+        let space_uri = format!(
+            "at://{}/space/{}/{}",
+            space.did, space.type_nsid, space.skey
+        );
+        for reg in &registrations {
+            let result = match reg.delivery {
+                NotifyDelivery::Webhook => {
+                    state
+                        .http
+                        .post(&reg.endpoint)
+                        .json(&serde_json::json!({ "space": space.id }))
+                        .send()
+                        .await
+                }
+                NotifyDelivery::Xrpc => {
+                    let Some(key) = state.config.token_encryption_key.as_ref() else {
+                        tracing::warn!("TOKEN_ENCRYPTION_KEY is required to sign a space deletion");
+                        continue;
+                    };
+                    let token = match crate::auth::service_auth::mint_service_auth(
+                        &state.db,
+                        state.db_backend,
+                        key,
+                        &state.config.public_url,
+                        &reg.service,
+                        NOTIFY_SPACE_DELETED_LXM,
+                    )
+                    .await
+                    {
+                        Ok(token) => token,
+                        Err(e) => {
+                            tracing::warn!(service = %reg.service, error = %e, "could not sign a space deletion");
+                            continue;
+                        }
+                    };
+                    state
+                        .http
+                        .post(format!(
+                            "{}/xrpc/{NOTIFY_SPACE_DELETED_LXM}",
+                            reg.endpoint.trim_end_matches('/')
+                        ))
+                        .bearer_auth(token)
+                        .json(&serde_json::json!({ "space": space_uri }))
+                        .send()
+                        .await
+                }
+            };
+            if let Err(e) = result {
+                tracing::warn!(service = %reg.service, error = %e, "could not deliver a space deletion");
+            }
+        }
+    });
 }
+
+/// The method that tells a syncer a space was deleted, and the `lxm` its
+/// service auth is bound to.
+const NOTIFY_SPACE_DELETED_LXM: &str = "com.atproto.space.notifySpaceDeleted";
 
 /// The method a forwarded write notification calls, and the `lxm` its service
 /// auth is bound to.

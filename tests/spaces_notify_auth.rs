@@ -426,3 +426,74 @@ async fn a_managing_app_is_reached_through_its_service_entry() {
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// Services registered by identifier hear about a deleted space through the
+/// lexicon method, signed by this instance, at their service endpoint.
+#[tokio::test]
+#[serial]
+async fn deleting_a_space_notifies_registered_syncers() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+    let space_row = spaces_db::get_space_by_address(
+        &app.state.db,
+        app.state.db_backend,
+        &instance_did,
+        SPACE_TYPE,
+        SPACE_SKEY,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let syncer = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/xrpc/com.atproto.space.notifySpaceDeleted"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&syncer)
+        .await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &space_row.id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Xrpc,
+    )
+    .await
+    .unwrap();
+
+    let (name, value) = common::auth::admin_cookie_header("did:plc:creator", &app.state.cookie_key);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/xrpc/com.atproto.simplespace.deleteSpace")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "space": space }).to_string()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status().is_success(),
+        "deleteSpace failed: {}",
+        resp.status()
+    );
+
+    let mut received = Vec::new();
+    for _ in 0..50 {
+        received = syncer.received_requests().await.unwrap_or_default();
+        if !received.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(received.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(body["space"], json!(space));
+    assert!(received[0].headers.get("authorization").is_some());
+}

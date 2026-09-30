@@ -960,7 +960,10 @@ pub(crate) async fn delete_space(
 ) -> Result<(), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
+    let registrations =
+        db::list_notify_registrations(&state.db, state.db_backend, &space.id).await?;
     db::delete_space(&state.db, state.db_backend, &space.id).await?;
+    notifications::announce_space_deleted(state, &space, registrations);
     Ok(())
 }
 

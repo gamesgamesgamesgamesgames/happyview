@@ -1831,8 +1831,9 @@ async fn notify_space_deleted(
     let space = service::resolve_space(&state, &input.space).await?;
     service::require_space_admin(&state, &space, &did).await?;
 
-    notifications::dispatch_space_deleted(&state.db, state.db_backend, &state.http, &space.id)
-        .await?;
+    let registrations =
+        db::list_notify_registrations(&state.db, state.db_backend, &space.id).await?;
+    notifications::announce_space_deleted(&state, &space, registrations);
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
