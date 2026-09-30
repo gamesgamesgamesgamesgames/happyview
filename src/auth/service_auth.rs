@@ -36,8 +36,6 @@ struct JwtPayload {
     iss: String,
     aud: String,
     exp: u64,
-    #[serde(default)]
-    lxm: Option<String>,
 }
 
 // DID document types
@@ -155,10 +153,8 @@ fn verify_service_jwt<'a>(
         // rejected rather than trusted here.
         let _ = &payload.aud;
 
-        // Check lxm if present (optional validation).
-        if let Some(ref _lxm) = payload.lxm {
-            // Allow any lxm for now — HappyView serves many different XRPC methods.
-        }
+        // `lxm` is likewise checked by the caller, which knows the method being
+        // called.
 
         // Resolve the issuer's DID document to get their signing key.
         let signing_key = resolve_signing_key(&payload.iss, state).await?;
@@ -289,6 +285,7 @@ pub struct PublicJwtPayload {
     pub iss: String,
     pub aud: Option<String>,
     pub exp: u64,
+    pub lxm: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

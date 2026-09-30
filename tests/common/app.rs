@@ -478,6 +478,19 @@ impl TestApp {
         instance_did: &str,
         aud_fragment: &str,
     ) -> String {
+        self.service_auth_jwt_for(plc_store, issuer_did, instance_did, aud_fragment, None)
+            .await
+    }
+
+    /// A service-auth token bound to one XRPC method through `lxm`.
+    pub async fn service_auth_jwt_for(
+        &self,
+        plc_store: &crate::common::plc::PlcStore,
+        issuer_did: &str,
+        instance_did: &str,
+        aud_fragment: &str,
+        lxm: Option<&str>,
+    ) -> String {
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use p256::ecdsa::{SigningKey, signature::Signer};
@@ -496,11 +509,14 @@ impl TestApp {
             .insert(issuer_did.to_string(), did_doc);
 
         let header = serde_json::json!({"alg": "ES256"});
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "iss": issuer_did,
             "aud": format!("{}{}", instance_did, aud_fragment),
             "exp": chrono::Utc::now().timestamp() as u64 + 60,
         });
+        if let Some(lxm) = lxm {
+            payload["lxm"] = serde_json::json!(lxm);
+        }
 
         let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
         let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());

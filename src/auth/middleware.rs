@@ -143,7 +143,8 @@ impl FromRequestParts<AppState> for Claims {
                 .headers
                 .get(axum::http::header::HOST)
                 .and_then(|v| v.to_str().ok());
-            let service_claims = try_parse_service_auth(token, state, host).await?;
+            let service_claims =
+                try_parse_service_auth(token, state, host, parts.uri.path()).await?;
             return Ok(Claims {
                 did: service_claims.did,
                 client_key: None,
@@ -314,7 +315,9 @@ impl FromRequestParts<AppState> for XrpcClaims {
                     .headers
                     .get(axum::http::header::HOST)
                     .and_then(|v| v.to_str().ok());
-                if let Ok(service_claims) = try_parse_service_auth(token, state, host).await {
+                if let Ok(service_claims) =
+                    try_parse_service_auth(token, state, host, parts.uri.path()).await
+                {
                     return Ok(XrpcClaims {
                         identity: None,
                         space_credential: None,
@@ -384,6 +387,7 @@ async fn try_parse_service_auth(
     token: &str,
     state: &AppState,
     host: Option<&str>,
+    path: &str,
 ) -> Result<ServiceAuthClaims, AppError> {
     // 1. Check if service identity is configured and not "not_exposed"
     let identity = crate::service_identity::get_identity(&state.db, state.db_backend).await?;
@@ -423,6 +427,15 @@ async fn try_parse_service_auth(
         return Err(AppError::Auth(format!(
             "JWT aud '{}' does not match instance DID '{}'",
             aud, instance_did
+        )));
+    }
+
+    // 5. A token bound to one method must not authorize another.
+    if let (Some(lxm), Some(method)) = (payload.lxm.as_deref(), path.strip_prefix("/xrpc/"))
+        && lxm != method
+    {
+        return Err(AppError::Auth(format!(
+            "JWT lxm '{lxm}' does not match the called method '{method}'"
         )));
     }
 
