@@ -1202,7 +1202,7 @@ pub async fn create_invite(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO happyview_space_invites (id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_invites (id, space_id, token_hash, created_by, can_read, can_write, read_self, max_uses, uses, expires_at, revoked, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -1211,7 +1211,9 @@ pub async fn create_invite(
         .bind(&invite.space_id)
         .bind(&invite.token_hash)
         .bind(&invite.created_by)
-        .bind(invite.access.as_wire_str())
+        .bind(invite.access.read as i32)
+        .bind(invite.access.write as i32)
+        .bind(invite.access.read_self as i32)
         .bind(invite.max_uses)
         .bind(invite.uses)
         .bind(&invite.expires_at)
@@ -1230,7 +1232,7 @@ pub async fn get_invite_by_token_hash(
     token_hash: &str,
 ) -> Result<Option<SpaceInvite>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at FROM happyview_space_invites WHERE token_hash = ?",
+        "SELECT id, space_id, token_hash, created_by, can_read, can_write, read_self, max_uses, uses, expires_at, revoked, created_at FROM happyview_space_invites WHERE token_hash = ?",
         backend,
     );
 
@@ -1287,7 +1289,7 @@ pub async fn list_invites(
     space_id: &str,
 ) -> Result<Vec<SpaceInvite>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at FROM happyview_space_invites WHERE space_id = ? ORDER BY created_at DESC",
+        "SELECT id, space_id, token_hash, created_by, can_read, can_write, read_self, max_uses, uses, expires_at, revoked, created_at FROM happyview_space_invites WHERE space_id = ? ORDER BY created_at DESC",
         backend,
     );
 
@@ -1305,7 +1307,9 @@ type InviteRow = (
     String,
     String,
     String,
-    String,
+    i32,
+    i32,
+    i32,
     Option<i64>,
     i64,
     Option<String>,
@@ -1314,19 +1318,20 @@ type InviteRow = (
 );
 
 fn parse_invite_row(r: InviteRow) -> Result<SpaceInvite, AppError> {
-    let access = MemberAccess::parse_wire(&r.4)
-        .ok_or_else(|| AppError::Internal(format!("invalid invite access: {}", r.4)))?;
-
     Ok(SpaceInvite {
         id: r.0,
         space_id: r.1,
         token_hash: r.2,
         created_by: r.3,
-        access,
-        max_uses: r.5,
-        uses: r.6,
-        expires_at: r.7,
-        revoked: r.8 != 0,
-        created_at: r.9,
+        access: MemberAccess {
+            read: r.4 != 0,
+            write: r.5 != 0,
+            read_self: r.6 != 0,
+        },
+        max_uses: r.7,
+        uses: r.8,
+        expires_at: r.9,
+        revoked: r.10 != 0,
+        created_at: r.11,
     })
 }
