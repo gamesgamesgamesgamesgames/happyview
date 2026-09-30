@@ -2175,3 +2175,156 @@ mod native_write_bridge_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod invite_access_tests {
+    use super::*;
+    use crate::spaces::types::{AppAccess, Policy, SpaceConfig};
+
+    const ADMIN: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    const JOINER: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+
+    async fn state_with_space() -> (AppState, Space) {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let state = crate::test_support::test_state_with_pool(pool);
+
+        let space = Space {
+            id: "sp-invite".into(),
+            did: ADMIN.into(),
+            authority_did: ADMIN.into(),
+            creator_did: ADMIN.into(),
+            type_nsid: "com.example.forum".into(),
+            skey: "main".into(),
+            display_name: None,
+            description: None,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
+            app_access: AppAccess::Open,
+            config: SpaceConfig::default(),
+            revision: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+        db::create_space(&state.db, state.db_backend, &space)
+            .await
+            .expect("seed space");
+        (state, space)
+    }
+
+    fn space_uri(space: &Space) -> String {
+        format!(
+            "at://{}/space/{}/{}",
+            space.did, space.type_nsid, space.skey
+        )
+    }
+
+    fn write_only() -> MemberAccess {
+        MemberAccess {
+            read: false,
+            write: true,
+            read_self: false,
+        }
+    }
+
+    /// The combination the single access word could not hold: `as_wire_str`
+    /// rendered any `write` as `"write"` and `parse_wire` read that back as
+    /// read *and* write, so the row silently granted the read the caller
+    /// withheld.
+    ///
+    /// Three reads, because they failed independently. `create_invite` returns
+    /// the struct it built and so was right all along, which is what made this
+    /// invisible: the caller was told the truth and the stored invite said
+    /// something else.
+    #[tokio::test]
+    async fn a_write_only_invite_survives_storage() {
+        let (state, space) = state_with_space().await;
+
+        let (created, token) = create_invite(
+            &state,
+            ADMIN,
+            &space_uri(&space),
+            Some(write_only()),
+            None,
+            None,
+        )
+        .await
+        .expect("mint the invite");
+        assert_eq!(created.access, write_only(), "the create response");
+
+        let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
+        let fetched = db::get_invite_by_token_hash(&state.db, state.db_backend, &token_hash)
+            .await
+            .expect("read the invite back")
+            .expect("the invite exists");
+        assert_eq!(fetched.access, write_only(), "the stored row");
+
+        let listed = db::list_invites(&state.db, state.db_backend, &space.id)
+            .await
+            .expect("list the invites");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].access, write_only(), "the invite list");
+    }
+
+    /// Redemption reads the row, so this is where the collapse actually cost
+    /// something: the joiner became a full read/write member of a space whose
+    /// admin had granted write alone.
+    #[tokio::test]
+    async fn redeeming_a_write_only_invite_grants_write_alone() {
+        let (state, space) = state_with_space().await;
+
+        let (_, token) = create_invite(
+            &state,
+            ADMIN,
+            &space_uri(&space),
+            Some(write_only()),
+            None,
+            None,
+        )
+        .await
+        .expect("mint the invite");
+
+        let (joined, granted) = accept_invite(&state, JOINER, &token)
+            .await
+            .expect("redeem the invite");
+        assert_eq!(joined, space_uri(&space), "redemption names the space");
+        assert_eq!(granted, write_only(), "the access redemption reports");
+
+        let member = db::get_member(&state.db, state.db_backend, &space.id, JOINER)
+            .await
+            .expect("read the new member")
+            .expect("the joiner is a member");
+        assert_eq!(member.access, write_only(), "the membership row");
+    }
+
+    /// Every other combination the word could express still round-trips, so
+    /// the migration's backfill has nothing left to get wrong. `read_self` is
+    /// HappyView-local and reachable only through the script access word, but
+    /// it is stored, so it is checked.
+    #[tokio::test]
+    async fn every_access_combination_round_trips() {
+        let (state, space) = state_with_space().await;
+
+        for access in [
+            MemberAccess::READ,
+            MemberAccess::WRITE,
+            MemberAccess::READ_SELF,
+            MemberAccess {
+                read: false,
+                write: false,
+                read_self: false,
+            },
+            write_only(),
+        ] {
+            let (_, token) =
+                create_invite(&state, ADMIN, &space_uri(&space), Some(access), None, None)
+                    .await
+                    .expect("mint the invite");
+            let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
+            let fetched = db::get_invite_by_token_hash(&state.db, state.db_backend, &token_hash)
+                .await
+                .expect("read the invite back")
+                .expect("the invite exists");
+            assert_eq!(fetched.access, access, "round-trip of {access:?}");
+        }
+    }
+}

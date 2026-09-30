@@ -94,6 +94,14 @@ impl Store<Did, Session> for DbSessionStore {
 
     async fn set(&self, key: Did, value: Session) -> Result<(), Self::Error> {
         let json = serde_json::to_string(&value)?;
+        // `updated_at` is TEXT, and `adapt_sql` turns `datetime('now')` into
+        // Postgres's `NOW()`, whose assignment cast stores a space-separated
+        // `+00` form — so the column holds one shape on SQLite and another on
+        // Postgres, and neither is the `+00:00` RFC 3339 every other time
+        // column here carries. Nothing compares or orders it, so that costs
+        // nothing; anything that starts to must bind `now_rfc3339()` here
+        // first, since the two shapes do not sort against each other and a
+        // SQL clock cannot be compared against TEXT on Postgres at all.
         crate::db::query(&adapt_sql(
             &format!(
                 "INSERT INTO {} (did, session_data, signing_kid, updated_at) VALUES (?, ?, ?, datetime('now')) \

@@ -470,7 +470,9 @@ async fn label_gc_removes_orphaned_record_labels_but_keeps_account_labels() {
             .unwrap();
     }
 
-    let (_, orphaned) = happyview::labeler::run_label_gc(db, backend).await;
+    let orphaned = happyview::labeler::delete_orphaned_labels(db)
+        .await
+        .expect("the orphan sweep should run");
     assert_eq!(orphaned, 1);
 
     let mut remaining: Vec<(String,)> = happyview::db::query_as("SELECT uri FROM happyview_labels")

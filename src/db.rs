@@ -162,6 +162,46 @@ pub fn adapt_sql(sql: &str, backend: DatabaseBackend) -> String {
     }
 }
 
+/// Whether a JSON field path is one `adapt_json_extract_to_postgres` can
+/// rewrite: dot-separated identifiers of ASCII alphanumerics and underscores,
+/// each optionally subscripted by decimal indices.
+///
+/// The charset is what makes such a path safe to interpolate into a statement
+/// rather than bind. Binding is not an option: the rewriter reads the path out
+/// of the SQL text to build the Postgres arrow chain, so a bound path leaves
+/// `json_extract` in a statement Postgres has no such function for.
+pub fn is_valid_json_field_path(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return false;
+        }
+        let bracket_start = segment.find('[').unwrap_or(segment.len());
+        let ident = &segment[..bracket_start];
+        if ident.is_empty() || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        let mut rest = &segment[bracket_start..];
+        while !rest.is_empty() {
+            if !rest.starts_with('[') {
+                return false;
+            }
+            let close = match rest.find(']') {
+                Some(i) => i,
+                None => return false,
+            };
+            let idx = &rest[1..close];
+            if idx.is_empty() || !idx.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            rest = &rest[close + 1..];
+        }
+    }
+    true
+}
+
 /// Convert `json_extract(col, '$.seg1.seg2.leaf')` to Postgres `col::jsonb->'seg1'->'seg2'->>'leaf'`.
 /// Handles array indices: `seg[0].leaf` becomes `->seg->0->>'leaf'`.
 fn adapt_json_extract_to_postgres(sql: &str) -> String {
