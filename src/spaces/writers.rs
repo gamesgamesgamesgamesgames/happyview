@@ -98,6 +98,81 @@ pub async fn record(
     })
 }
 
+/// A repo in a space's writer set.
+#[derive(Debug, Clone)]
+pub struct Writer {
+    pub repo_did: String,
+    pub rev: String,
+    pub hash: Vec<u8>,
+    pub space_rev: String,
+}
+
+/// One page of a space's writers.
+///
+/// Without `since` the whole set is listed by DID, and `cursor` is the last DID
+/// seen. With `since` only repos updated after that space revision are listed,
+/// in the order they were updated, and `cursor` is the last space revision seen.
+pub async fn list(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    since: Option<&str>,
+    cursor: Option<&str>,
+    limit: i64,
+) -> Result<Vec<Writer>, AppError> {
+    let (sql, after) = match since {
+        Some(since) => (
+            "SELECT repo_did, rev, hash, space_rev FROM happyview_space_writers WHERE space_id = ? AND space_rev > ? ORDER BY space_rev ASC LIMIT ?",
+            Some(cursor.unwrap_or(since)),
+        ),
+        None if cursor.is_some() => (
+            "SELECT repo_did, rev, hash, space_rev FROM happyview_space_writers WHERE space_id = ? AND repo_did > ? ORDER BY repo_did ASC LIMIT ?",
+            cursor,
+        ),
+        None => (
+            "SELECT repo_did, rev, hash, space_rev FROM happyview_space_writers WHERE space_id = ? ORDER BY repo_did ASC LIMIT ?",
+            None,
+        ),
+    };
+    let sql = adapt_sql(sql, backend);
+    let mut query = crate::db::query_as::<(String, String, Vec<u8>, String)>(&sql).bind(space_id);
+    if let Some(after) = after {
+        query = query.bind(after);
+    }
+    let rows = query
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list space writers: {e}")))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(repo_did, rev, hash, space_rev)| Writer {
+            repo_did,
+            rev,
+            hash,
+            space_rev,
+        })
+        .collect())
+}
+
+/// The latest space revision, or `None` if nothing has been written.
+pub async fn current_space_rev(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Option<String>, AppError> {
+    let (rev,): (Option<String>,) = crate::db::query_as(&adapt_sql(
+        "SELECT MAX(space_rev) FROM happyview_space_writers WHERE space_id = ?",
+        backend,
+    ))
+    .bind(space_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read space revision: {e}")))?;
+    Ok(rev)
+}
+
 /// Replace a writer's hash without moving the space revision, for a commit
 /// re-minted at the same `rev`. Nothing new was written, so nothing is sequenced.
 pub async fn replace_hash(

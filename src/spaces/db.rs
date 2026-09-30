@@ -1097,28 +1097,6 @@ pub async fn find_blob_author_did(
 // Space Repos
 // ---------------------------------------------------------------------------
 
-pub async fn list_space_repos(
-    pool: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-    space_id: &str,
-) -> Result<Vec<serde_json::Value>, AppError> {
-    let sql = adapt_sql(
-        "SELECT DISTINCT r.author_did, s.rev FROM happyview_space_records r LEFT JOIN happyview_space_repo_state s ON s.space_id = r.space_id AND s.author_did = r.author_did WHERE r.space_id = ? ORDER BY r.author_did ASC",
-        backend,
-    );
-
-    let rows: Vec<(String, Option<String>)> = crate::db::query_as(&sql)
-        .bind(space_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list space repos: {e}")))?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(did, rev)| serde_json::json!({ "did": did, "rev": rev }))
-        .collect())
-}
-
 // ---------------------------------------------------------------------------
 // Space Invites
 // ---------------------------------------------------------------------------

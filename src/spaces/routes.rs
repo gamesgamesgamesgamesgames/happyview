@@ -109,6 +109,16 @@ impl LexBytes {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ListReposQuery {
+    space: String,
+    limit: Option<i64>,
+    cursor: Option<String>,
+    /// A space revision: list only repos updated after it.
+    since: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NotifySpaceDeletedInput {
     space: String,
 }
@@ -1427,7 +1437,7 @@ async fn list_repo_ops(
 async fn list_repos(
     State(state): State<AppState>,
     claims: XrpcClaims,
-    Query(params): Query<SpaceUriQuery>,
+    Query(params): Query<ListReposQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let space = service::resolve_space(&state, &params.space).await?;
 
@@ -1443,8 +1453,47 @@ async fn list_repos(
         .await?;
     }
 
-    let repos = db::list_space_repos(&state.db, state.db_backend, &space.id).await?;
-    Ok(Json(serde_json::json!({ "repos": repos })))
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+    let writers = crate::spaces::writers::list(
+        &state.db,
+        state.db_backend,
+        &space.id,
+        params.since.as_deref(),
+        params.cursor.as_deref(),
+        limit,
+    )
+    .await?;
+
+    let next_cursor = (writers.len() as i64 == limit).then(|| {
+        let last = writers.last().expect("a full page is not empty");
+        if params.since.is_some() {
+            last.space_rev.clone()
+        } else {
+            last.repo_did.clone()
+        }
+    });
+    let repos: Vec<serde_json::Value> = writers
+        .iter()
+        .map(|w| {
+            use base64::Engine;
+            serde_json::json!({
+                "did": w.repo_did,
+                "rev": w.rev,
+                "hash": { "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&w.hash) },
+            })
+        })
+        .collect();
+
+    let mut body = serde_json::json!({ "repos": repos });
+    if let Some(cursor) = next_cursor {
+        body["cursor"] = cursor.into();
+    }
+    if let Some(space_rev) =
+        crate::spaces::writers::current_space_rev(&state.db, state.db_backend, &space.id).await?
+    {
+        body[notifications::SPACE_REV_FIELD] = space_rev.into();
+    }
+    Ok(Json(body))
 }
 
 async fn get_space_blob(
