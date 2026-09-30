@@ -88,7 +88,16 @@ pub async fn issue_credential(
     };
 
     let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
-    store_credential_record(pool, backend, &space.id, subject_did, &token_hash, exp).await?;
+    store_credential_record(
+        pool,
+        backend,
+        &space.id,
+        subject_did,
+        &token_hash,
+        &claims.jti,
+        exp,
+    )
+    .await?;
 
     let expires_at = chrono::DateTime::from_timestamp(exp as i64, 0)
         .map(|dt| dt.to_rfc3339())
@@ -641,6 +650,7 @@ async fn store_credential_record(
     space_id: &str,
     issued_to: &str,
     token_hash: &str,
+    jti: &str,
     expires_at_epoch: u64,
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
@@ -649,7 +659,7 @@ async fn store_credential_record(
         .unwrap_or_default();
 
     let sql = adapt_sql(
-        "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -658,6 +668,7 @@ async fn store_credential_record(
         .bind(space_id)
         .bind(issued_to)
         .bind(token_hash)
+        .bind(jti)
         .bind(&expires_at)
         .bind(&now)
         .execute(pool)

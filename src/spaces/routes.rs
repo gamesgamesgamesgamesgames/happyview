@@ -5,7 +5,6 @@ use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use k256;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::AppState;
 use crate::auth::XrpcClaims;
@@ -452,19 +451,7 @@ fn require_auth(claims: &XrpcClaims) -> Result<&crate::auth::Claims, AppError> {
 }
 
 /// Like `require_auth`, but also accepts a verified space credential as an
-/// identity source. Use this in space endpoints that support `Bearer
-/// <space_credential>` in addition to DPoP auth.
-/// Whether a verified space credential has been revoked (e.g. its holder was
-/// removed from the space). Consulted after signature/exp verification so a
-/// leaked or stale credential can be invalidated before its TTL expires (M3).
-pub(crate) async fn space_credential_revoked(
-    state: &AppState,
-    token: &str,
-) -> Result<bool, AppError> {
-    let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
-    db::is_space_credential_revoked(&state.db, state.db_backend, &token_hash).await
-}
-
+/// identity source, for space endpoints that serve syncers as well as accounts.
 async fn require_auth_or_credential(
     state: &AppState,
     claims: &XrpcClaims,

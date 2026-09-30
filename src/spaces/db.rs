@@ -365,6 +365,25 @@ pub async fn is_space_credential_revoked(
     Ok(row.is_some())
 }
 
+/// Whether the credential with this `jti` in `space_id` has been revoked.
+pub async fn is_space_credential_jti_revoked(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    jti: &str,
+) -> Result<bool, AppError> {
+    let row: Option<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT revoked_at FROM happyview_space_credentials WHERE space_id = ? AND jti = ? AND revoked_at IS NOT NULL LIMIT 1",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(jti)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to check credential revocation: {e}")))?;
+    Ok(row.is_some())
+}
+
 /// Revoke all active space credentials issued to `did` within `space_id`.
 /// Returns the number of credentials revoked.
 pub async fn revoke_space_credentials_for_member(

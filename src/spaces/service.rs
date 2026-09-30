@@ -101,7 +101,9 @@ pub(crate) async fn verify_space_credential(
             "space credential is for a different space".into(),
         ));
     }
-    if crate::spaces::routes::space_credential_revoked(state, token).await? {
+    if db::is_space_credential_jti_revoked(&state.db, state.db_backend, &space.id, &claims.jti)
+        .await?
+    {
         return Err(AppError::Auth("space credential has been revoked".into()));
     }
     Ok(claims)
@@ -860,6 +862,16 @@ pub(crate) async fn put_member(
         created_at: now_rfc3339(),
     };
     db::add_member(&state.db, state.db_backend, &member).await?;
+    // A credential is the member's read access, so it goes when that does.
+    if !member.access.read {
+        db::revoke_space_credentials_for_member(
+            &state.db,
+            state.db_backend,
+            &member.space_id,
+            member_did,
+        )
+        .await?;
+    }
     Ok(member)
 }
 

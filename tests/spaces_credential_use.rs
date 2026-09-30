@@ -245,3 +245,54 @@ async fn lists_a_spaces_repos_with_a_credential_addressed_to_its_authority() {
     let resp = call(&app, read(&path, &credential, &key, MEMBER)).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+async fn space_admin(app: &TestApp, nsid: &str, body: Value) {
+    let resp = call(app, post_as(app, CREATOR, nsid, body)).await;
+    assert!(resp.status().is_success(), "{nsid} failed: {}", resp.status());
+}
+
+#[tokio::test]
+#[serial]
+async fn a_credential_stops_working_when_its_member_loses_read_access() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (space, credential) = setup(&mut app, &key).await;
+
+    space_admin(
+        &app,
+        "com.atproto.simplespace.putMember",
+        json!({ "space": space, "did": MEMBER, "read": false, "write": true }),
+    )
+    .await;
+
+    let resp = call(
+        &app,
+        read(&latest_commit_path(&space, MEMBER), &credential, &key, MEMBER),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_credential_stops_working_when_its_member_is_removed() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (space, credential) = setup(&mut app, &key).await;
+
+    space_admin(
+        &app,
+        "com.atproto.simplespace.removeMember",
+        json!({ "space": space, "did": MEMBER }),
+    )
+    .await;
+
+    let resp = call(
+        &app,
+        read(&latest_commit_path(&space, MEMBER), &credential, &key, MEMBER),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
