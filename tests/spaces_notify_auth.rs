@@ -142,8 +142,8 @@ async fn notify_space_deleted_rejects_unauthenticated() {
 /// The member allowed to write in [`create_instance_space`] spaces.
 const WRITER: &str = "did:plc:writer";
 
-/// A space whose authority is this instance, as spaces created here now are,
-/// with [`WRITER`] as its one writer.
+/// A space whose authority is this instance, with [`WRITER`] as its one
+/// writer.
 async fn create_instance_space(app: &TestApp, instance_did: &str) -> String {
     create_instance_space_with(app, instance_did, Policy::MemberList).await
 }

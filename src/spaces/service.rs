@@ -724,7 +724,7 @@ pub(crate) async fn delete_record(
 /// Peers find a space's credential key and host through its authority's DID
 /// document, so the authority must be a DID whose document points here: this
 /// instance's own. Without a published identity nothing resolves to this
-/// instance, and the creator's DID is used as before.
+/// instance, and the space is anchored on the creator's DID.
 async fn space_authority_for_new_space(state: &AppState, creator_did: &str) -> String {
     match crate::auth::service_auth::instance_did(
         &state.db,
