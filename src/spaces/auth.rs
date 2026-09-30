@@ -194,6 +194,36 @@ async fn policy_allows(
     }
 }
 
+/// Whether the authority tracks this writer and forwards their notifications,
+/// per `write_policy`.
+pub(crate) async fn writer_admitted(
+    state: &crate::AppState,
+    space: &Space,
+    writer_did: &str,
+) -> Result<bool, AppError> {
+    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+        AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space policy checks".into())
+    })?;
+    let auth_ctx = ServiceAuthCtx {
+        pool: &state.db,
+        backend: state.db_backend,
+        encryption_key,
+        public_url: &state.config.public_url,
+        plc_url: &state.config.plc_url,
+    };
+    policy_allows(
+        &state.http,
+        auth_ctx,
+        &space.write_policy,
+        space,
+        writer_did,
+        None,
+        &space.authority_did,
+        AccessKind::Write,
+    )
+    .await
+}
+
 /// Whether a space credential may be minted for this user, per `read_policy`.
 async fn check_mint_policy(
     http: &reqwest::Client,

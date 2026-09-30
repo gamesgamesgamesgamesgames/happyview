@@ -139,7 +139,11 @@ async fn notify_space_deleted_rejects_unauthenticated() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// A space whose authority is this instance, as spaces created here now are.
+/// The member allowed to write in [`create_instance_space`] spaces.
+const WRITER: &str = "did:plc:writer";
+
+/// A space whose authority is this instance, as spaces created here now are,
+/// with [`WRITER`] as its one writer.
 async fn create_instance_space(app: &TestApp, instance_did: &str) -> String {
     let now = now_rfc3339();
     let space = Space {
@@ -162,6 +166,21 @@ async fn create_instance_space(app: &TestApp, instance_did: &str) -> String {
     spaces_db::create_space(&app.state.db, app.state.db_backend, &space)
         .await
         .expect("create_space failed");
+    spaces_db::add_member(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceMember {
+            id: Uuid::new_v4().to_string(),
+            space_id: space.id.clone(),
+            did: WRITER.to_string(),
+            access: MemberAccess::WRITE,
+            is_delegation: false,
+            granted_by: None,
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .expect("add_member failed");
     format!("at://{instance_did}/space/{SPACE_TYPE}/{SPACE_SKEY}")
 }
 
@@ -210,6 +229,15 @@ async fn notify_write_accepts_the_writers_repo_host() {
     common::require_db!();
     let status = notify_write_as("did:plc:writer", "did:plc:writer").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// The space tracks only writers its write policy admits.
+#[tokio::test]
+#[serial]
+async fn notify_write_rejects_a_writer_the_space_does_not_admit() {
+    common::require_db!();
+    let status = notify_write_as("did:plc:outsider", "did:plc:outsider").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 /// One account cannot report writes to another account's repo.

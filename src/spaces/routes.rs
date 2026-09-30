@@ -1690,6 +1690,16 @@ async fn notify_write(
         service::require_space_admin(&state, &space, &caller).await?;
     }
 
+    // Spec-shaped notifications come from repo hosts, and the authority tracks
+    // only the writers its write policy admits.
+    if input.repo.is_some()
+        && !crate::spaces::auth::writer_admitted(&state, &space, &writer).await?
+    {
+        return Err(AppError::Forbidden(
+            "this space does not accept writes from this account".into(),
+        ));
+    }
+
     // A notification for a repo hosted on the author's own PDS is our cue to
     // pull: the write happened there, and our index has not seen it yet. This
     // is a no-op for polyfill repos, where HappyView is the source of truth and
