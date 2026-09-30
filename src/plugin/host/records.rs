@@ -3,16 +3,23 @@
 //! here, so a plugin never writes SQL for records and the schema can change
 //! in one place.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use super::db::row_to_json;
-use crate::db::{DatabaseBackend, adapt_sql, decode_cursor, encode_cursor};
+use crate::db::{
+    DatabaseBackend, MAX_FIELD_PATH_LEN, adapt_sql, decode_cursor, encode_cursor,
+    is_valid_json_field_path, postgres_json_chain,
+};
 use crate::raw_sql_guard::check_raw_sql_tables;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use happyview_plugin_sdk::wire::{
     BacklinksQuery, Filter, IndexPut, RecordEnvelope, RecordRef, RecordsCount, RecordsPage,
     RecordsQuery, RecordsSearch, Sort, TableQuery,
 };
+use sqlx::any::AnyTypeInfoKind;
+use sqlx::{AssertSqlSafe, Executor, SqlSafeStr};
 
 pub const MAX_FILTER_DEPTH: u8 = 5;
 pub const DEFAULT_LIMIT: u32 = 20;
@@ -21,6 +28,11 @@ pub const MAX_LIMIT: u32 = 100;
 /// Columns `records_query`'s sort accepts bare, as opposed to a JSON path
 /// evaluated inside `record`.
 const TOP_LEVEL_COLUMNS: [&str; 3] = ["indexed_at", "did", "uri"];
+
+/// Those of [`TOP_LEVEL_COLUMNS`] the schema lets be null, and so the only
+/// ones whose sort needs a null placement. `uri` and `did` are `NOT NULL` on
+/// both backends.
+const NULLABLE_TOP_LEVEL_COLUMNS: [&str; 1] = ["indexed_at"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecordsError {
@@ -32,42 +44,6 @@ pub enum RecordsError {
 
 fn invalid(msg: impl Into<String>) -> RecordsError {
     RecordsError::InvalidSpec(msg.into())
-}
-
-/// A JSON field path as used in a record filter or sort: dot-separated
-/// identifier segments with optional numeric array indices (`author.handle`,
-/// `tags[0]`). Guards against SQL injection since the path is interpolated
-/// directly into a `json_extract`/`->` expression rather than bound.
-pub fn is_valid_json_field_path(path: &str) -> bool {
-    if path.is_empty() {
-        return false;
-    }
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            return false;
-        }
-        let bracket_start = segment.find('[').unwrap_or(segment.len());
-        let ident = &segment[..bracket_start];
-        if ident.is_empty() || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return false;
-        }
-        let mut rest = &segment[bracket_start..];
-        while !rest.is_empty() {
-            if !rest.starts_with('[') {
-                return false;
-            }
-            let close = match rest.find(']') {
-                Some(i) => i,
-                None => return false,
-            };
-            let idx = &rest[1..close];
-            if idx.is_empty() || !idx.chars().all(|c| c.is_ascii_digit()) {
-                return false;
-            }
-            rest = &rest[close + 1..];
-        }
-    }
-    true
 }
 
 /// A bare SQL identifier: a table or column name used unquoted, as opposed to
@@ -102,14 +78,21 @@ pub fn normalize_op(op: &str, backend: DatabaseBackend) -> Result<&'static str, 
     })
 }
 
+/// Renders one condition: the whole predicate, with a single `?` where the
+/// value binds, and the value to bind there.
+///
+/// The callback owns the entire predicate rather than just the left side,
+/// because the operator and the field together decide both operands — a JSON
+/// path and a real column need different expressions, the bound value's type
+/// has to suit whichever the field names, and one backend needs a cast around
+/// the placeholder itself.
+type FieldBind<'a> = dyn Fn(&str, &str, Value) -> Result<(String, Value), RecordsError> + 'a;
+
 /// Render a filter tree to SQL, pushing bind values in placeholder order.
-/// `field_sql` turns a field name into the column or JSON-path expression
-/// for whatever table the caller is querying, and rejects names it does not
-/// accept.
 pub fn filter_sql(
     filter: &Filter,
     backend: DatabaseBackend,
-    field_sql: &dyn Fn(&str) -> Result<String, RecordsError>,
+    field_bind: &FieldBind<'_>,
     depth: u8,
     binds: &mut Vec<Value>,
 ) -> Result<String, RecordsError> {
@@ -120,10 +103,10 @@ pub fn filter_sql(
     }
     match filter {
         Filter::Condition(c) => {
-            let column = field_sql(&c.field)?;
             let op = normalize_op(&c.op, backend)?;
-            binds.push(c.value.clone());
-            Ok(format!("{column} {op} ?"))
+            let (predicate, value) = field_bind(&c.field, op, c.value.clone())?;
+            binds.push(value);
+            Ok(predicate)
         }
         Filter::Group {
             combine,
@@ -143,7 +126,7 @@ pub fn filter_sql(
             }
             let parts = conditions
                 .iter()
-                .map(|c| filter_sql(c, backend, field_sql, depth + 1, binds))
+                .map(|c| filter_sql(c, backend, field_bind, depth + 1, binds))
                 .collect::<Result<Vec<_>, _>>()?;
             if parts.len() == 1 {
                 Ok(parts.into_iter().next().expect("one part"))
@@ -154,13 +137,83 @@ pub fn filter_sql(
     }
 }
 
+fn invalid_field(path: &str) -> RecordsError {
+    invalid(format!(
+        "invalid field '{path}': use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]'), at most {MAX_FIELD_PATH_LEN} characters"
+    ))
+}
+
+/// The JSON value at `path` inside the `record` column, in whatever type the
+/// stored JSON gives it.
 fn record_field_sql(path: &str) -> Result<String, RecordsError> {
     if !is_valid_json_field_path(path) {
-        return Err(invalid(format!(
-            "invalid field '{path}': use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]')"
-        )));
+        return Err(invalid_field(path));
     }
     Ok(format!("json_extract(record, '$.{path}')"))
+}
+
+/// The JSON value at `path` as text, which is what a pattern match compares.
+///
+/// The cast names on both backends the type only one of them would pick:
+/// SQLite's `json_extract` hands back the value's own JSON type, while
+/// Postgres's `->>` is already text.
+pub fn record_text_field_sql(path: &str) -> Result<String, RecordsError> {
+    Ok(format!("CAST({} AS TEXT)", record_field_sql(path)?))
+}
+
+/// A record filter's expression and bind.
+///
+/// The filter value's own JSON type is the comparison type: a number compares
+/// as a number and a string as a string, so `score > 100` answers the
+/// question it asks. Comparing as text instead would answer a different one —
+/// `'50' > '100'` is true — and a record body carries no schema to overrule
+/// the value with.
+///
+/// Each backend needs its own form to express that. SQLite's `json_extract`
+/// already yields the stored value's type, so a typed bind compares against
+/// it directly. Postgres's `->>` yields text, so the comparison is against
+/// the `jsonb` value from `->`, whose ordering is numeric within numbers; the
+/// bound value is its own JSON encoding, cast back to `jsonb`. The encoding
+/// comes from `serde_json`, so it is always valid JSON — a malformed literal
+/// would fail the cast. A `::numeric` cast on the column is the alternative
+/// and is unusable: it evaluates per row, so one row holding a string fails
+/// the whole query.
+///
+/// The two agree exactly for a field holding one JSON type per row. They
+/// disagree about a number against a string, which is the same ill-defined
+/// shape [`record_sort_sql`] documents for ordering.
+///
+/// A pattern match is textual by definition, so there both sides go to text.
+fn record_bind_on(
+    backend: DatabaseBackend,
+) -> impl Fn(&str, &str, Value) -> Result<(String, Value), RecordsError> {
+    move |path, op, value| record_field_bind(path, op, value, backend)
+}
+
+fn record_field_bind(
+    path: &str,
+    op: &str,
+    value: Value,
+    backend: DatabaseBackend,
+) -> Result<(String, Value), RecordsError> {
+    if value.is_null() {
+        return Err(invalid(format!(
+            "filter on '{path}' has a null value: compare against a string, number or boolean"
+        )));
+    }
+    if is_text_op(op) {
+        return Ok((
+            format!("{} {op} ?", record_text_field_sql(path)?),
+            Value::String(bind_as_text(value)),
+        ));
+    }
+    Ok(match backend {
+        DatabaseBackend::Sqlite => (format!("{} {op} ?", record_field_sql(path)?), value),
+        DatabaseBackend::Postgres => (
+            format!("{} {op} CAST(? AS jsonb)", postgres_jsonb_chain(path)?),
+            Value::String(value.to_string()),
+        ),
+    })
 }
 
 fn column_sql(name: &str) -> Result<String, RecordsError> {
@@ -168,6 +221,179 @@ fn column_sql(name: &str) -> Result<String, RecordsError> {
         return Err(invalid(format!("invalid column name '{name}'")));
     }
     Ok(name.to_string())
+}
+
+/// The Postgres `jsonb` chain for a record field, validated here because
+/// this is where a caller's path becomes part of a statement.
+fn postgres_jsonb_chain(path: &str) -> Result<String, RecordsError> {
+    if !is_valid_json_field_path(path) {
+        return Err(invalid_field(path));
+    }
+    Ok(postgres_json_chain("record", path, "->"))
+}
+
+/// The sort key for a record field: the JSON value in the form each backend
+/// orders by the value's own type rather than as text.
+///
+/// Text ordering puts 100 before 2, so a numeric field has to sort as a
+/// number. SQLite's `json_extract` already yields one; Postgres's `->>`
+/// yields text, and `jsonb` from `->` is the form whose ordering is numeric
+/// within numbers. A `(… ->> …)::numeric` cast would also order numerically
+/// and is the wrong tool: it evaluates for every row, so a single row whose
+/// value is not a number fails the whole query.
+///
+/// The two orderings agree for a field that is numeric in every row. They do
+/// not agree when one field holds several JSON types across rows, which is a
+/// sort with no correct answer; both are at least deterministic.
+fn record_sort_sql(path: &str, backend: DatabaseBackend) -> Result<String, RecordsError> {
+    match backend {
+        DatabaseBackend::Sqlite => record_field_sql(path),
+        DatabaseBackend::Postgres => postgres_jsonb_chain(path),
+    }
+}
+
+/// An `ORDER BY` term, with a null placement only where the expression can
+/// actually be null.
+///
+/// The placement restates SQLite's own defaults so that Postgres, whose
+/// defaults are the opposite, puts an absent value in the same place. Stating
+/// it on an expression that is never null changes no answer and costs the
+/// index: Postgres will not use a `NOT NULL` constraint to prove the two
+/// orderings equivalent, so `ORDER BY uri ASC NULLS FIRST` sorts the whole
+/// collection where `ORDER BY uri ASC` walks twenty rows of the primary key.
+///
+/// Where it is stated the cost is real and accepted, not absent: every query
+/// here carries a collection predicate, which lets the
+/// `(collection, indexed_at DESC)` index serve an `indexed_at` ordering, and
+/// the placement defeats that in both directions. It buys agreement between
+/// the backends about where a row with no arrival time sorts, which is worth
+/// more than the plan.
+fn order_by(expression: &str, direction: &str, nullable: bool) -> String {
+    if !nullable {
+        return format!("{expression} {direction}");
+    }
+    let nulls = match direction {
+        "ASC" => "NULLS FIRST",
+        _ => "NULLS LAST",
+    };
+    format!("{expression} {direction} {nulls}")
+}
+
+/// Whether an operator compares its operands as text rather than by their own
+/// type.
+fn is_text_op(op: &str) -> bool {
+    matches!(op, "LIKE" | "NOT LIKE" | "ILIKE")
+}
+
+/// A table filter's expression and bind, given the types `column_types`
+/// reports for the table's columns.
+///
+/// A table filter names a real column whose SQL type the guest never states,
+/// and the two backends disagree about what to do when the JSON value's type
+/// is not that column's: SQLite applies the column's affinity and compares
+/// anyway, Postgres refuses to compare the two types at all. Binding from the
+/// JSON type alone is therefore right on one backend only, so the value is
+/// brought to the column's own type first. A pattern match is textual by
+/// definition, so there the column goes to text instead.
+///
+/// The lookup is case-folded because both backends report a column's
+/// *declared* name whatever case the query asked for, while identifiers
+/// themselves are case-insensitive. Matching exactly would miss the type for
+/// a filter on `Score` against a column named `score` and leave Postgres
+/// raising the very type error this coercion exists to prevent.
+fn table_field_bind(
+    column_types: &BTreeMap<String, AnyTypeInfoKind>,
+    name: &str,
+    op: &str,
+    value: Value,
+) -> Result<(String, Value), RecordsError> {
+    let column = column_sql(name)?;
+    if is_text_op(op) {
+        return Ok((
+            format!("CAST({column} AS TEXT) {op} ?"),
+            Value::String(bind_as_text(value)),
+        ));
+    }
+    if value.is_null() {
+        return Err(invalid(format!(
+            "filter on '{column}' has a null value: compare against a string, number or boolean"
+        )));
+    }
+    let value = match column_types.get(&column.to_ascii_lowercase()) {
+        Some(kind) => coerce_to_column(&column, *kind, value)?,
+        None => value,
+    };
+    Ok((format!("{column} {op} ?"), value))
+}
+
+/// Re-type a filter value as `kind`, or refuse it as unsuitable for the
+/// column. Refusing is the one answer both backends can give: SQLite would
+/// coerce a mismatch to something arbitrary and Postgres would fail deep in
+/// the driver with a type error naming neither the column nor the filter.
+fn coerce_to_column(
+    column: &str,
+    kind: AnyTypeInfoKind,
+    value: Value,
+) -> Result<Value, RecordsError> {
+    let integral = |f: f64| (f.fract() == 0.0 && f.is_finite()).then_some(f as i64);
+    let coerced = match kind {
+        AnyTypeInfoKind::Bool => match &value {
+            Value::Bool(_) => Some(value.clone()),
+            Value::Number(n) => match n.as_i64() {
+                Some(0) => Some(json!(false)),
+                Some(1) => Some(json!(true)),
+                _ => None,
+            },
+            Value::String(s) => match s.as_str() {
+                "true" | "t" | "1" => Some(json!(true)),
+                "false" | "f" | "0" => Some(json!(false)),
+                _ => None,
+            },
+            _ => None,
+        },
+        AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt => {
+            match &value {
+                Value::Number(n) if n.is_i64() => Some(value.clone()),
+                Value::Number(n) => n.as_f64().and_then(integral).map(|i| json!(i)),
+                Value::Bool(b) => Some(json!(i64::from(*b))),
+                Value::String(s) => s.trim().parse::<i64>().ok().map(|i| json!(i)),
+                _ => None,
+            }
+        }
+        AnyTypeInfoKind::Real | AnyTypeInfoKind::Double => match &value {
+            Value::Number(n) => n.as_f64().filter(|f| f.is_finite()).map(|f| json!(f)),
+            Value::String(s) => s
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map(|f| json!(f)),
+            _ => None,
+        },
+        AnyTypeInfoKind::Text => Some(Value::String(bind_as_text(value.clone()))),
+        // A blob or an untyped expression has no JSON counterpart to convert
+        // towards, so the value's own type is the best available guess.
+        AnyTypeInfoKind::Blob | AnyTypeInfoKind::Null => Some(value.clone()),
+    };
+    coerced.ok_or_else(|| {
+        invalid(format!(
+            "filter value {value} does not fit column '{column}', which holds {}",
+            kind_name(kind)
+        ))
+    })
+}
+
+fn kind_name(kind: AnyTypeInfoKind) -> &'static str {
+    match kind {
+        AnyTypeInfoKind::Bool => "a boolean",
+        AnyTypeInfoKind::SmallInt | AnyTypeInfoKind::Integer | AnyTypeInfoKind::BigInt => {
+            "an integer"
+        }
+        AnyTypeInfoKind::Real | AnyTypeInfoKind::Double => "a number",
+        AnyTypeInfoKind::Text => "text",
+        AnyTypeInfoKind::Blob => "a blob",
+        AnyTypeInfoKind::Null => "no type",
+    }
 }
 
 fn direction_sql(direction: &str) -> Result<&'static str, RecordsError> {
@@ -184,7 +410,8 @@ fn clamp_limit(limit: Option<u32>) -> i64 {
     i64::from(limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT))
 }
 
-/// Record filters bind as text; the rationale is on the SDK's `Condition`.
+/// A value as the text a pattern match compares against. A JSON string is
+/// its own contents; anything else is its JSON encoding.
 fn bind_as_text(value: Value) -> String {
     match value {
         Value::String(s) => s,
@@ -193,11 +420,15 @@ fn bind_as_text(value: Value) -> String {
 }
 
 type AnyQuery<'q> = sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments>;
-type AnyCountQuery<'q> = sqlx::query::QueryAs<'q, sqlx::Any, (i64,), sqlx::any::AnyArguments>;
+type AnyQueryAs<'q, O> = sqlx::query::QueryAs<'q, sqlx::Any, O, sqlx::any::AnyArguments>;
 
-/// Table filters bind by JSON type: a number as `i64`, or `f64` when it does
-/// not fit; a boolean as `bool`; a string as text. The rationale is on the
-/// SDK's `Condition`.
+/// Bind one value as the SQL type its JSON type names: a number as `i64`, or
+/// `f64` when it does not fit; a boolean as `bool`; a string as text.
+///
+/// Where a bound value has to be some *other* type — the column's, or a
+/// backend's JSON encoding — the caller has already converted it, so this
+/// stays a faithful mapping of JSON onto SQL rather than a second place
+/// deciding types. See [`table_field_bind`] and [`record_field_bind`].
 fn bind_value<'q>(query: AnyQuery<'q>, value: &Value) -> AnyQuery<'q> {
     match value {
         Value::Number(n) if n.is_i64() => query.bind(n.as_i64().expect("checked is_i64")),
@@ -208,8 +439,8 @@ fn bind_value<'q>(query: AnyQuery<'q>, value: &Value) -> AnyQuery<'q> {
     }
 }
 
-/// As [`bind_value`], for the `COUNT(*)` query shape.
-fn bind_count_value<'q>(query: AnyCountQuery<'q>, value: &Value) -> AnyCountQuery<'q> {
+/// As [`bind_value`], for the query shapes that decode into a row type.
+fn bind_value_as<'q, O>(query: AnyQueryAs<'q, O>, value: &Value) -> AnyQueryAs<'q, O> {
     match value {
         Value::Number(n) if n.is_i64() => query.bind(n.as_i64().expect("checked is_i64")),
         Value::Number(n) => query.bind(n.as_f64().unwrap_or_default()),
@@ -274,7 +505,7 @@ fn envelope(row: RecordRow) -> Value {
 pub fn records_query_sql(
     spec: &RecordsQuery,
     backend: DatabaseBackend,
-) -> Result<(String, Vec<String>), RecordsError> {
+) -> Result<(String, Vec<Value>), RecordsError> {
     let mut binds = vec![Value::String(spec.collection.clone())];
     let mut where_clause = String::from("WHERE collection = ?");
     if let Some(did) = &spec.did {
@@ -283,19 +514,25 @@ pub fn records_query_sql(
     }
 
     let sql = if let Some(Sort { field, direction }) = &spec.sort {
-        let column = if TOP_LEVEL_COLUMNS.contains(&field.as_str()) {
-            column_sql(field)?
+        // A JSON path is null wherever the field is absent, which no row of a
+        // schemaless body guarantees; a bare column is null only where the
+        // schema lets it be.
+        let (column, nullable) = if TOP_LEVEL_COLUMNS.contains(&field.as_str()) {
+            (
+                column_sql(field)?,
+                NULLABLE_TOP_LEVEL_COLUMNS.contains(&field.as_str()),
+            )
         } else {
-            record_field_sql(field)?
+            (record_sort_sql(field, backend)?, true)
         };
-        let direction = direction_sql(direction)?;
+        let order = order_by(&column, direction_sql(direction)?, nullable);
         if let Some(filter) = &spec.filter {
-            let clause = filter_sql(filter, backend, &record_field_sql, 0, &mut binds)?;
+            let clause = filter_sql(filter, backend, &record_bind_on(backend), 0, &mut binds)?;
             where_clause.push_str(" AND ");
             where_clause.push_str(&clause);
         }
         format!(
-            "SELECT {} FROM happyview_records {where_clause} ORDER BY {column} {direction} LIMIT ? OFFSET ?",
+            "SELECT {} FROM happyview_records {where_clause} ORDER BY {order} LIMIT ? OFFSET ?",
             record_columns("")
         )
     } else {
@@ -307,7 +544,7 @@ pub fn records_query_sql(
             binds.push(Value::String(cursor_uri.clone()));
         }
         if let Some(filter) = &spec.filter {
-            let clause = filter_sql(filter, backend, &record_field_sql, 0, &mut binds)?;
+            let clause = filter_sql(filter, backend, &record_bind_on(backend), 0, &mut binds)?;
             where_clause.push_str(" AND ");
             where_clause.push_str(&clause);
         }
@@ -317,7 +554,6 @@ pub fn records_query_sql(
         )
     };
 
-    let binds = binds.into_iter().map(bind_as_text).collect();
     Ok((adapt_sql(&sql, backend), binds))
 }
 
@@ -335,7 +571,7 @@ pub async fn records_query(
 
     let mut q = crate::db::query_as::<RecordRow>(&sql);
     for bind in &binds {
-        q = q.bind(bind);
+        q = bind_value_as(q, bind);
     }
 
     if custom_sort {
@@ -381,15 +617,14 @@ pub async fn records_count(
         binds.push(Value::String(did.clone()));
     }
     if let Some(filter) = &spec.filter {
-        let clause = filter_sql(filter, backend, &record_field_sql, 0, &mut binds)?;
+        let clause = filter_sql(filter, backend, &record_bind_on(backend), 0, &mut binds)?;
         sql.push_str(" AND ");
         sql.push_str(&clause);
     }
     let sql = adapt_sql(&sql, backend);
-    let binds: Vec<String> = binds.into_iter().map(bind_as_text).collect();
     let mut q = crate::db::query_as::<(i64,)>(&sql);
     for bind in &binds {
-        q = q.bind(bind);
+        q = bind_value_as(q, bind);
     }
     let (count,) = q.fetch_one(db).await?;
     Ok(count)
@@ -426,58 +661,39 @@ pub async fn records_search(
     }
     let limit = i64::from(spec.limit.unwrap_or(10).clamp(1, MAX_LIMIT));
     let like_pattern = format!("%{}%", spec.query);
-    let field = &spec.field;
     let columns = record_columns("");
 
-    // Cannot use adapt_sql: Postgres reuses $3 for two bind positions, while
-    // SQLite needs separate ? for each. Different bind counts.
-    let rows: Vec<RecordRow> = match backend {
-        DatabaseBackend::Sqlite => {
-            let sql = format!(
-                "SELECT {columns} FROM happyview_records \
-                 WHERE collection = ? \
-                   AND json_extract(record, '$.{field}') LIKE ? COLLATE NOCASE \
-                 ORDER BY \
-                   CASE \
-                     WHEN LOWER(json_extract(record, '$.{field}')) = LOWER(?) THEN 0 \
-                     WHEN LOWER(json_extract(record, '$.{field}')) LIKE LOWER(?) || '%' THEN 1 \
-                     ELSE 2 \
-                   END, \
-                   json_extract(record, '$.{field}') \
-                 LIMIT ?"
-            );
-            crate::db::query_as(&sql)
-                .bind(&spec.collection)
-                .bind(&like_pattern)
-                .bind(&spec.query)
-                .bind(&spec.query)
-                .bind(limit)
-                .fetch_all(db)
-                .await?
-        }
-        DatabaseBackend::Postgres => {
-            let sql = format!(
-                "SELECT {columns} FROM happyview_records \
-                 WHERE collection = $1 \
-                   AND record::jsonb->>'{field}' ILIKE $2 \
-                 ORDER BY \
-                   CASE \
-                     WHEN LOWER(record::jsonb->>'{field}') = LOWER($3) THEN 0 \
-                     WHEN LOWER(record::jsonb->>'{field}') LIKE LOWER($3) || '%' THEN 1 \
-                     ELSE 2 \
-                   END, \
-                   record::jsonb->>'{field}' \
-                 LIMIT $4"
-            );
-            crate::db::query_as(&sql)
-                .bind(&spec.collection)
-                .bind(&like_pattern)
-                .bind(&spec.query)
-                .bind(limit)
-                .fetch_all(db)
-                .await?
-        }
-    };
+    // The field goes through `record_field_sql` so `adapt_sql` can rewrite it:
+    // a hand-written `record::jsonb->>'author.handle'` reads a top-level key
+    // of that literal name and matches nothing, where the rewriter builds the
+    // chain a dotted path means. `ilike` is the one token the two dialects
+    // spell differently, and `normalize_op` already knows which.
+    let field = record_field_sql(&spec.field)?;
+    let ilike = normalize_op("ilike", backend)?;
+    let sql = adapt_sql(
+        &format!(
+            "SELECT {columns} FROM happyview_records \
+             WHERE collection = ? \
+               AND {field} {ilike} ? \
+             ORDER BY \
+               CASE \
+                 WHEN LOWER({field}) = LOWER(?) THEN 0 \
+                 WHEN LOWER({field}) LIKE LOWER(?) || '%' THEN 1 \
+                 ELSE 2 \
+               END, \
+               {field} \
+             LIMIT ?"
+        ),
+        backend,
+    );
+    let rows: Vec<RecordRow> = crate::db::query_as(&sql)
+        .bind(&spec.collection)
+        .bind(&like_pattern)
+        .bind(&spec.query)
+        .bind(&spec.query)
+        .bind(limit)
+        .fetch_all(db)
+        .await?;
 
     Ok(rows.into_iter().map(envelope).collect())
 }
@@ -529,6 +745,7 @@ pub async fn backlinks_query(
 pub fn table_query_sql(
     spec: &TableQuery,
     backend: DatabaseBackend,
+    column_types: &BTreeMap<String, AnyTypeInfoKind>,
 ) -> Result<(String, Vec<Value>), RecordsError> {
     if !is_valid_identifier(&spec.table) {
         return Err(invalid(format!("invalid table name '{}'", spec.table)));
@@ -540,7 +757,9 @@ pub fn table_query_sql(
         format!("SELECT * FROM {}", spec.table)
     };
     if let Some(filter) = &spec.filter {
-        let clause = filter_sql(filter, backend, &column_sql, 0, &mut binds)?;
+        let bind =
+            |name: &str, op: &str, value: Value| table_field_bind(column_types, name, op, value);
+        let clause = filter_sql(filter, backend, &bind, 0, &mut binds)?;
         sql.push_str(" WHERE ");
         sql.push_str(&clause);
     }
@@ -558,18 +777,88 @@ pub fn table_query_sql(
     Ok((adapt_sql(&sql, backend), binds))
 }
 
+/// Every distinct column a filter names, in the order first mentioned.
+fn filter_columns(filter: &Filter, into: &mut Vec<String>) {
+    match filter {
+        Filter::Condition(c) => {
+            if is_valid_identifier(&c.field) && !into.contains(&c.field) {
+                into.push(c.field.clone());
+            }
+        }
+        Filter::Group { conditions, .. } => {
+            for condition in conditions {
+                filter_columns(condition, into);
+            }
+        }
+    }
+}
+
+/// The type each of `columns` holds in `table`, as the database reports it
+/// for a prepared `SELECT` naming exactly those columns, keyed by the
+/// lower-cased column name.
+///
+/// Only the filtered columns are named: a `SELECT *` would also have to
+/// describe siblings, and a column of a type the `Any` driver has no
+/// counterpart for fails the whole preparation. An unanswerable one yields no
+/// types rather than an error, leaving the filter to bind by JSON type as it
+/// would with no database to ask.
+///
+/// Preparation, not description: `Executor::describe` carries the same column
+/// types but is `#[doc(hidden)]` and compiled only under a sqlx feature this
+/// crate never asks for, arriving by way of the default `macros` feature it
+/// does not use. It also costs more than it gives here — a `pg_attribute`
+/// join for nullability on Postgres, an `EXPLAIN` bytecode walk on SQLite —
+/// when only the column types are read.
+async fn column_types_for(
+    db: &sqlx::AnyPool,
+    table: &str,
+    columns: &[String],
+) -> BTreeMap<String, AnyTypeInfoKind> {
+    let empty = BTreeMap::new();
+    if columns.is_empty() || !is_valid_identifier(table) {
+        return empty;
+    }
+    let sql = format!("SELECT {} FROM {table}", columns.join(", "));
+    if check_raw_sql_tables(&sql).is_err() {
+        return empty;
+    }
+    let Ok(prepared) = db
+        .prepare_with(AssertSqlSafe(sql).into_sql_str(), &[])
+        .await
+    else {
+        return empty;
+    };
+    sqlx::Statement::columns(&prepared)
+        .iter()
+        .map(|column| {
+            (
+                sqlx::Column::name(column).to_ascii_lowercase(),
+                sqlx::Column::type_info(column).kind(),
+            )
+        })
+        .collect()
+}
+
 pub async fn table_query(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
     spec: TableQuery,
 ) -> Result<Value, RecordsError> {
     let count = spec.count;
-    let (sql, binds) = table_query_sql(&spec, backend)?;
+    let column_types = match &spec.filter {
+        Some(filter) => {
+            let mut columns = Vec::new();
+            filter_columns(filter, &mut columns);
+            column_types_for(db, &spec.table, &columns).await
+        }
+        None => BTreeMap::new(),
+    };
+    let (sql, binds) = table_query_sql(&spec, backend, &column_types)?;
 
     if count {
         let mut q = crate::db::query_as::<(i64,)>(&sql);
         for bind in &binds {
-            q = bind_count_value(q, bind);
+            q = bind_value_as(q, bind);
         }
         let (n,) = q.fetch_one(db).await?;
         Ok(json!(n))
@@ -747,6 +1036,13 @@ mod tests {
         BacklinksQuery, Condition, Filter, RecordsCount, RecordsQuery, RecordsSearch, Sort,
         TableQuery,
     };
+    use serial_test::serial;
+
+    /// A field expression that is the field name itself, for the tests that
+    /// exercise the tree walk rather than any one table's columns.
+    fn bare_field(field: &str, op: &str, value: Value) -> Result<(String, Value), RecordsError> {
+        Ok((format!("{field} {op} ?"), value))
+    }
 
     fn cond(field: &str, op: &str, value: Value) -> Filter {
         Filter::Condition(Condition {
@@ -754,30 +1050,6 @@ mod tests {
             op: op.into(),
             value,
         })
-    }
-
-    #[test]
-    fn json_field_paths() {
-        assert!(is_valid_json_field_path("name"));
-        assert!(is_valid_json_field_path("author_name"));
-        assert!(is_valid_json_field_path("author.handle"));
-        assert!(is_valid_json_field_path("tags[0]"));
-        assert!(is_valid_json_field_path("data[0][1]"));
-        assert!(is_valid_json_field_path("author.websites[0].url"));
-        assert!(is_valid_json_field_path("a.b.c.d.e"));
-        assert!(!is_valid_json_field_path(""));
-        assert!(!is_valid_json_field_path(".name"));
-        assert!(!is_valid_json_field_path("name."));
-        assert!(!is_valid_json_field_path("name..foo"));
-        assert!(!is_valid_json_field_path("a..b"));
-        assert!(!is_valid_json_field_path("[0]"));
-        assert!(!is_valid_json_field_path("name[]"));
-        assert!(!is_valid_json_field_path("name[abc]"));
-        assert!(!is_valid_json_field_path("tags[x]"));
-        assert!(!is_valid_json_field_path("name; DROP TABLE"));
-        assert!(!is_valid_json_field_path("name'OR 1=1"));
-        assert!(!is_valid_json_field_path("a'b"));
-        assert!(!is_valid_json_field_path("na-me"));
     }
 
     #[test]
@@ -829,12 +1101,12 @@ mod tests {
         assert_eq!(
             binds,
             vec![
-                "c",
-                "did:plc:a",
-                "2026-01-01T00:00:00Z",
-                "2026-01-01T00:00:00Z",
-                "at://x",
-                "active"
+                json!("c"),
+                json!("did:plc:a"),
+                json!("2026-01-01T00:00:00Z"),
+                json!("2026-01-01T00:00:00Z"),
+                json!("at://x"),
+                json!("active")
             ]
         );
     }
@@ -854,10 +1126,57 @@ mod tests {
         };
         let (sql, binds) = records_query_sql(&spec, Sqlite).unwrap();
         assert!(
-            sql.ends_with("ORDER BY json_extract(record, '$.createdAt') ASC LIMIT ? OFFSET ?"),
+            sql.ends_with(
+                "ORDER BY json_extract(record, '$.createdAt') ASC NULLS FIRST LIMIT ? OFFSET ?"
+            ),
             "{sql}"
         );
-        assert_eq!(binds, vec!["c"]);
+        assert_eq!(binds, vec![json!("c")]);
+    }
+
+    /// A null placement only where the expression can be null. On a `NOT
+    /// NULL` column it changes no answer, and Postgres will not use the
+    /// constraint to prove the two orderings equivalent — `ORDER BY uri ASC
+    /// NULLS FIRST` sorts the whole collection where `ORDER BY uri ASC` walks
+    /// twenty rows of the primary key.
+    #[test]
+    fn a_sort_states_null_placement_only_for_a_nullable_expression() {
+        let sorted = |field: &str, direction: &str| {
+            let spec = RecordsQuery {
+                collection: "c".into(),
+                did: None,
+                filter: None,
+                sort: Some(Sort {
+                    field: field.into(),
+                    direction: direction.into(),
+                }),
+                limit: None,
+                cursor: None,
+            };
+            records_query_sql(&spec, Sqlite).unwrap().0
+        };
+
+        for (field, direction) in [("uri", "asc"), ("did", "asc"), ("uri", "desc")] {
+            let sql = sorted(field, direction);
+            assert!(!sql.contains("NULLS"), "{field} {direction}: {sql}");
+        }
+
+        assert!(
+            sorted("indexed_at", "asc").contains("ORDER BY indexed_at ASC NULLS FIRST"),
+            "{}",
+            sorted("indexed_at", "asc")
+        );
+        assert!(
+            sorted("indexed_at", "desc").contains("ORDER BY indexed_at DESC NULLS LAST"),
+            "{}",
+            sorted("indexed_at", "desc")
+        );
+        // A JSON path is null wherever the field is absent, whatever the row.
+        assert!(
+            sorted("score", "asc").contains("ASC NULLS FIRST"),
+            "{}",
+            sorted("score", "asc")
+        );
     }
 
     #[test]
@@ -927,7 +1246,7 @@ mod tests {
         let sql = filter_sql(
             &f,
             Sqlite,
-            &|p| Ok(format!("json_extract(record, '$.{p}')")),
+            &|p: &str, op: &str, v: Value| Ok((format!("json_extract(record, '$.{p}') {op} ?"), v)),
             0,
             &mut binds,
         )
@@ -945,8 +1264,7 @@ mod tests {
                 conditions: vec![deep],
             };
         }
-        let err =
-            filter_sql(&deep, Sqlite, &|p| Ok(p.to_string()), 0, &mut Vec::new()).unwrap_err();
+        let err = filter_sql(&deep, Sqlite, &bare_field, 0, &mut Vec::new()).unwrap_err();
         assert!(err.to_string().contains("nesting"), "{err}");
     }
 
@@ -956,12 +1274,12 @@ mod tests {
             combine: "xor".into(),
             conditions: vec![cond("a", "=", json!("1"))],
         };
-        assert!(filter_sql(&bad, Sqlite, &|p| Ok(p.to_string()), 0, &mut Vec::new()).is_err());
+        assert!(filter_sql(&bad, Sqlite, &bare_field, 0, &mut Vec::new()).is_err());
         let empty = Filter::Group {
             combine: "and".into(),
             conditions: vec![],
         };
-        assert!(filter_sql(&empty, Sqlite, &|p| Ok(p.to_string()), 0, &mut Vec::new()).is_err());
+        assert!(filter_sql(&empty, Sqlite, &bare_field, 0, &mut Vec::new()).is_err());
     }
 
     #[test]
@@ -976,7 +1294,7 @@ mod tests {
             limit: Some(5),
             count: false,
         };
-        let (sql, binds) = table_query_sql(&spec, Sqlite).unwrap();
+        let (sql, binds) = table_query_sql(&spec, Sqlite, &BTreeMap::new()).unwrap();
         assert_eq!(
             sql,
             "SELECT * FROM leaderboard WHERE score > ? ORDER BY score DESC LIMIT ?"
@@ -990,7 +1308,7 @@ mod tests {
             limit: None,
             count: true,
         };
-        let (sql, _) = table_query_sql(&count, Sqlite).unwrap();
+        let (sql, _) = table_query_sql(&count, Sqlite, &BTreeMap::new()).unwrap();
         assert_eq!(sql, "SELECT COUNT(*) FROM leaderboard");
 
         let bad = TableQuery {
@@ -1001,7 +1319,7 @@ mod tests {
             count: false,
         };
         assert!(matches!(
-            table_query_sql(&bad, Sqlite),
+            table_query_sql(&bad, Sqlite, &BTreeMap::new()),
             Err(RecordsError::InvalidSpec(_))
         ));
         let bad_col = TableQuery {
@@ -1012,7 +1330,7 @@ mod tests {
             count: false,
         };
         assert!(matches!(
-            table_query_sql(&bad_col, Sqlite),
+            table_query_sql(&bad_col, Sqlite, &BTreeMap::new()),
             Err(RecordsError::InvalidSpec(_))
         ));
     }
@@ -1026,7 +1344,7 @@ mod tests {
             limit: None,
             count: false,
         };
-        let err = table_query_sql(&spec, Sqlite).unwrap_err();
+        let err = table_query_sql(&spec, Sqlite, &BTreeMap::new()).unwrap_err();
         assert!(matches!(err, RecordsError::InvalidSpec(_)), "{err}");
     }
 
@@ -1654,5 +1972,614 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Every backend the suite can reach: the migrated in-memory SQLite
+    /// database always, plus whatever `TEST_DATABASE_URL` names. A read whose
+    /// statement `adapt_sql` rewrites is half-tested by either alone, and the
+    /// SQLite half is the one that needs no rewriting.
+    async fn backends() -> Vec<(sqlx::AnyPool, DatabaseBackend)> {
+        let mut out = vec![(crate::test_support::migrated_memory_pool().await, Sqlite)];
+        match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => {
+                let backend = DatabaseBackend::from_url(&url);
+                out.push((crate::db::connect(&url, backend).await, backend));
+            }
+            Err(_) => eprintln!("TEST_DATABASE_URL unset: the Postgres half is skipped"),
+        }
+        out
+    }
+
+    /// Two records under a collection of this test's own, so a shared
+    /// database cannot mix them with another suite's rows.
+    async fn seed_records(db: &sqlx::AnyPool, backend: DatabaseBackend, collection: &str) {
+        crate::db::query(&adapt_sql(
+            "DELETE FROM happyview_records WHERE collection = ?",
+            backend,
+        ))
+        .bind(collection)
+        .execute(db)
+        .await
+        .expect("clear the collection");
+        let insert = adapt_sql(
+            "INSERT INTO happyview_records \
+             (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+            backend,
+        );
+        for (rkey, body) in [
+            (
+                "1",
+                json!({"n": "one", "score": 50, "author": {"handle": "alice"}}),
+            ),
+            (
+                "2",
+                json!({"n": "two", "score": 150, "author": {"handle": "bob"}}),
+            ),
+        ] {
+            crate::db::query(&insert)
+                .bind(format!("at://did:plc:seed/{collection}/{rkey}"))
+                .bind("did:plc:seed")
+                .bind(collection)
+                .bind(rkey)
+                .bind(body.to_string())
+                .bind(format!("cid{rkey}"))
+                .bind(format!("2026-01-01T00:00:0{rkey}+00:00"))
+                .execute(db)
+                .await
+                .expect("seed a record");
+        }
+    }
+
+    /// A table with one column of each type a filter has to compare against.
+    async fn seed_scores(db: &sqlx::AnyPool, table: &str) {
+        crate::db::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {table} (name TEXT, score INTEGER)"
+        ))
+        .execute(db)
+        .await
+        .expect("create the table");
+        crate::db::query(&format!("DELETE FROM {table}"))
+            .execute(db)
+            .await
+            .expect("clear the table");
+        for (name, score) in [("x", 50), ("y", 150), ("150", 7)] {
+            crate::db::query(&format!(
+                "INSERT INTO {table} (name, score) VALUES ('{name}', {score})"
+            ))
+            .execute(db)
+            .await
+            .expect("seed a row");
+        }
+    }
+
+    fn one_filter(field: &str, op: &str, value: Value) -> Option<Filter> {
+        Some(cond(field, op, value))
+    }
+
+    /// Equality on a numeric record field. The filter value's JSON type is
+    /// the comparison type, so the JSON number `150` matches a stored `150`
+    /// and the JSON string `"150"` does not — the caller asked about a
+    /// string, and the record holds a number. Both readings have to be the
+    /// same on either backend, which is the part that was broken: SQLite's
+    /// `json_extract` hands back the stored number, so a filter binding text
+    /// matched nothing there while Postgres's `->>` is text and matched.
+    #[tokio::test]
+    #[serial]
+    async fn record_equality_follows_the_filter_values_json_type_on_both_backends() {
+        let collection = "host.records.numeric";
+        for (db, backend) in backends().await {
+            seed_records(&db, backend, collection).await;
+            let matching = |value: Value| async {
+                records_query(
+                    &db,
+                    backend,
+                    RecordsQuery {
+                        collection: collection.into(),
+                        did: None,
+                        filter: one_filter("score", "=", value),
+                        sort: None,
+                        limit: None,
+                        cursor: None,
+                    },
+                )
+                .await
+                .expect("the query should run")
+                .records
+            };
+
+            let number = matching(json!(150)).await;
+            assert_eq!(
+                number.len(),
+                1,
+                "score = 150 on {backend:?} should match one record"
+            );
+            assert_eq!(number[0]["record"]["n"], "two");
+
+            assert!(
+                matching(json!("150")).await.is_empty(),
+                "score = \"150\" on {backend:?} should match no record, since the stored value is a number"
+            );
+
+            // A string field answers the mirror image: the string matches and
+            // a number does not.
+            let name = matching_field(&db, backend, collection, "n", json!("two")).await;
+            assert_eq!(name.len(), 1, "n = \"two\" on {backend:?}");
+
+            let n = records_count(
+                &db,
+                backend,
+                RecordsCount {
+                    collection: collection.into(),
+                    did: None,
+                    filter: one_filter("score", "=", json!(50)),
+                },
+            )
+            .await
+            .expect("the count should run");
+            assert_eq!(n, 1, "score = 50 on {backend:?} should count one record");
+        }
+    }
+
+    /// The records an equality filter on `field` matches.
+    async fn matching_field(
+        db: &sqlx::AnyPool,
+        backend: DatabaseBackend,
+        collection: &str,
+        field: &str,
+        value: Value,
+    ) -> Vec<Value> {
+        records_query(
+            db,
+            backend,
+            RecordsQuery {
+                collection: collection.into(),
+                did: None,
+                filter: one_filter(field, "=", value),
+                sort: None,
+                limit: None,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("the query should run")
+        .records
+    }
+
+    /// A search on a dotted field, which needs the JSON access `adapt_sql`
+    /// builds: a Postgres `->>'author.handle'` reads a top-level key of that
+    /// literal name and matches nothing. A single-segment field is the one
+    /// case where the two forms agree, so it cannot show this.
+    #[tokio::test]
+    #[serial]
+    async fn record_search_matches_a_nested_field_on_both_backends() {
+        let collection = "host.records.nested";
+        for (db, backend) in backends().await {
+            seed_records(&db, backend, collection).await;
+            let found = records_search(
+                &db,
+                backend,
+                RecordsSearch {
+                    collection: collection.into(),
+                    field: "author.handle".into(),
+                    query: "ALI".into(),
+                    limit: None,
+                },
+            )
+            .await
+            .expect("the search should run");
+            assert_eq!(
+                found.len(),
+                1,
+                "author.handle on {backend:?} should match one record"
+            );
+            assert_eq!(found[0]["record"]["n"], "one");
+        }
+    }
+
+    /// A table filter whose JSON type is not the column's. Postgres refuses
+    /// to compare the two at all and SQLite coerces to whatever the column's
+    /// affinity says, so the value is brought to the column's own type first
+    /// and both backends answer alike.
+    #[tokio::test]
+    #[serial]
+    async fn table_filters_compare_against_the_column_type_on_both_backends() {
+        let table = "host_records_scores";
+        for (db, backend) in backends().await {
+            seed_scores(&db, table).await;
+            let rows = |filter: Option<Filter>| TableQuery {
+                table: table.into(),
+                filter,
+                sort: None,
+                limit: None,
+                count: false,
+            };
+
+            // A string against an integer column, and a number against the
+            // same column: one shape that only SQLite's affinity accepts,
+            // and one that both do.
+            for value in [json!("100"), json!(100)] {
+                let got = table_query(&db, backend, rows(one_filter("score", ">", value.clone())))
+                    .await
+                    .expect("the query should run");
+                assert_eq!(
+                    got.as_array().expect("an array of rows").len(),
+                    1,
+                    "score > {value} on {backend:?} should match one row"
+                );
+                assert_eq!(got[0]["name"], "y");
+            }
+
+            // A number against a text column, the converse mismatch.
+            let got = table_query(&db, backend, rows(one_filter("name", "=", json!(150))))
+                .await
+                .expect("the query should run");
+            assert_eq!(got.as_array().expect("an array of rows").len(), 1);
+            assert_eq!(got[0]["score"], 7);
+
+            // A pattern match is textual whatever the column holds.
+            let got = table_query(&db, backend, rows(one_filter("score", "like", json!("1%"))))
+                .await
+                .expect("the query should run");
+            assert_eq!(got.as_array().expect("an array of rows").len(), 1);
+            assert_eq!(got[0]["name"], "y");
+        }
+    }
+
+    /// A value no shape of the column can hold. Refusing by name is the one
+    /// answer both backends can give: Postgres fails in the driver on a type
+    /// it will not compare, and SQLite coerces to whatever the column's
+    /// affinity says and returns an empty result that reads as "no matches".
+    #[tokio::test]
+    #[serial]
+    async fn a_table_filter_value_the_column_cannot_hold_is_refused_by_name() {
+        let table = "host_records_scores";
+        for (db, backend) in backends().await {
+            seed_scores(&db, table).await;
+            let err = table_query(
+                &db,
+                backend,
+                TableQuery {
+                    table: table.into(),
+                    filter: one_filter("score", "=", json!("abc")),
+                    sort: None,
+                    limit: None,
+                    count: false,
+                },
+            )
+            .await
+            .expect_err("a value that does not fit should be refused");
+            assert!(
+                matches!(err, RecordsError::InvalidSpec(_)),
+                "on {backend:?}: {err}"
+            );
+            assert!(err.to_string().contains("score"), "{err}");
+        }
+    }
+
+    /// The four shapes a record field takes across rows, seeded under a
+    /// collection per shape so each sort is over that shape alone.
+    async fn seed_sort_rows(
+        db: &sqlx::AnyPool,
+        backend: DatabaseBackend,
+        collection: &str,
+        rows: &[(&str, &str)],
+    ) {
+        crate::db::query(&adapt_sql(
+            "DELETE FROM happyview_records WHERE collection = ?",
+            backend,
+        ))
+        .bind(collection)
+        .execute(db)
+        .await
+        .expect("clear the collection");
+        let insert = adapt_sql(
+            "INSERT INTO happyview_records \
+             (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+            backend,
+        );
+        for (rkey, body) in rows {
+            crate::db::query(&insert)
+                .bind(format!("at://did:plc:seed/{collection}/{rkey}"))
+                .bind("did:plc:seed")
+                .bind(collection)
+                .bind(*rkey)
+                .bind(*body)
+                .bind("cidsort")
+                .bind("2026-01-01T00:00:00+00:00")
+                .execute(db)
+                .await
+                .expect("seed a record");
+        }
+    }
+
+    /// The rkeys a sort on `field` returns, in order.
+    async fn sorted_rkeys(
+        db: &sqlx::AnyPool,
+        backend: DatabaseBackend,
+        collection: &str,
+        field: &str,
+        direction: &str,
+    ) -> Vec<String> {
+        let page = records_query(
+            db,
+            backend,
+            RecordsQuery {
+                collection: collection.into(),
+                did: None,
+                filter: None,
+                sort: Some(Sort {
+                    field: field.into(),
+                    direction: direction.into(),
+                }),
+                limit: Some(MAX_LIMIT),
+                cursor: None,
+            },
+        )
+        .await
+        .expect("the sorted query should run");
+        page.records
+            .into_iter()
+            .map(|r| r["rkey"].as_str().expect("an rkey").to_string())
+            .collect()
+    }
+
+    /// A field numeric in every row, the case that has a correct answer.
+    /// Postgres's `->>` yields text, which puts 100 before 2; the `jsonb`
+    /// value from `->` orders numerically, as SQLite's `json_extract`
+    /// already does.
+    #[tokio::test]
+    #[serial]
+    async fn a_numeric_field_sorts_numerically_on_both_backends() {
+        let collection = "host.records.sort.numeric";
+        let rows = [
+            ("2", r#"{"f": 2}"#),
+            ("10", r#"{"f": 10}"#),
+            ("1p5", r#"{"f": 1.5}"#),
+            ("100", r#"{"f": 100}"#),
+            ("neg3", r#"{"f": -3}"#),
+        ];
+        for (db, backend) in backends().await {
+            seed_sort_rows(&db, backend, collection, &rows).await;
+            assert_eq!(
+                sorted_rkeys(&db, backend, collection, "f", "asc").await,
+                ["neg3", "1p5", "2", "10", "100"],
+                "ascending on {backend:?}"
+            );
+            assert_eq!(
+                sorted_rkeys(&db, backend, collection, "f", "desc").await,
+                ["100", "10", "2", "1p5", "neg3"],
+                "descending on {backend:?}"
+            );
+        }
+    }
+
+    /// A field absent from some rows, and JSON null in others. Both read as
+    /// no value, and both sort at the ascending end on either backend:
+    /// SQLite puts a SQL NULL first by default and Postgres puts one last,
+    /// so the placement is stated rather than inherited.
+    #[tokio::test]
+    #[serial]
+    async fn a_missing_or_null_field_sorts_at_the_ascending_end_on_both_backends() {
+        let collection = "host.records.sort.absent";
+        let rows = [
+            ("absent", r#"{"other": 1}"#),
+            ("null", r#"{"f": null}"#),
+            ("one", r#"{"f": 1}"#),
+            ("two", r#"{"f": 2}"#),
+        ];
+        for (db, backend) in backends().await {
+            seed_sort_rows(&db, backend, collection, &rows).await;
+
+            let asc = sorted_rkeys(&db, backend, collection, "f", "asc").await;
+            assert_eq!(
+                &asc[2..],
+                ["one", "two"],
+                "ascending on {backend:?}: {asc:?}"
+            );
+            assert!(
+                asc[..2].contains(&"absent".to_string()) && asc[..2].contains(&"null".to_string()),
+                "a missing and a null value lead on {backend:?}: {asc:?}"
+            );
+
+            let desc = sorted_rkeys(&db, backend, collection, "f", "desc").await;
+            assert_eq!(
+                &desc[..2],
+                ["two", "one"],
+                "descending on {backend:?}: {desc:?}"
+            );
+        }
+    }
+
+    /// A field holding several JSON types across rows. The two orders below
+    /// differ, and that is the expectation rather than a fault left standing:
+    /// a field that is a number in one row and a string in another has no
+    /// correct ordering to converge on, and each backend is at least
+    /// deterministic. SQLite compares storage classes, putting every number
+    /// before every string; Postgres compares `jsonb`, whose class order runs
+    /// null, string, number, boolean. Converging them would cost a second
+    /// dialect branch — a `CASE` over `jsonb_typeof` against `json_type` — to
+    /// pick one arbitrary answer over another, and a divergent path per
+    /// backend is what every fault this file's dual-backend tests cover grew
+    /// out of. A field with one type per row is the case that has an answer,
+    /// and `a_numeric_field_sorts_numerically_on_both_backends` holds it.
+    #[tokio::test]
+    #[serial]
+    async fn a_mixed_type_field_sorts_deterministically_and_differently_per_backend() {
+        let collection = "host.records.sort.mixed";
+        let rows = [
+            ("num2", r#"{"f": 2}"#),
+            ("num10", r#"{"f": 10}"#),
+            ("strA", r#"{"f": "Apple"}"#),
+            ("strZ", r#"{"f": "Zebra"}"#),
+            ("yes", r#"{"f": true}"#),
+        ];
+        for (db, backend) in backends().await {
+            seed_sort_rows(&db, backend, collection, &rows).await;
+            let asc = sorted_rkeys(&db, backend, collection, "f", "asc").await;
+            match backend {
+                // `true` extracts as the integer 1, so it sorts among the
+                // numbers rather than as a class of its own.
+                DatabaseBackend::Sqlite => {
+                    assert_eq!(asc, ["yes", "num2", "num10", "strA", "strZ"], "{asc:?}")
+                }
+                DatabaseBackend::Postgres => {
+                    assert_eq!(asc, ["strA", "strZ", "num2", "num10", "yes"], "{asc:?}")
+                }
+            }
+        }
+    }
+
+    /// Ordering comparisons on a numeric record field, the operators nothing
+    /// covered. Comparing as text answers a different question — `'50'` is
+    /// above `'100'` — so a filter that means "above 100" has to compare as a
+    /// number, and has to give the same answer on both backends.
+    #[tokio::test]
+    #[serial]
+    async fn ordering_a_numeric_record_field_compares_numerically_on_both_backends() {
+        let collection = "host.records.ordering";
+        for (db, backend) in backends().await {
+            seed_records(&db, backend, collection).await;
+            // Seeded scores are 50 and 150, on records "one" and "two".
+            for (op, value, expected) in [
+                (">", 100, vec!["two"]),
+                (">=", 150, vec!["two"]),
+                ("<", 100, vec!["one"]),
+                ("<=", 50, vec!["one"]),
+                (">", 200, vec![]),
+                ("<", 10, vec![]),
+            ] {
+                let page = records_query(
+                    &db,
+                    backend,
+                    RecordsQuery {
+                        collection: collection.into(),
+                        did: None,
+                        filter: one_filter("score", op, json!(value)),
+                        sort: None,
+                        limit: None,
+                        cursor: None,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("score {op} {value} on {backend:?}: {e}"));
+                let got: Vec<&str> = page
+                    .records
+                    .iter()
+                    .map(|r| r["record"]["n"].as_str().expect("a name"))
+                    .collect();
+                assert_eq!(got, expected, "score {op} {value} on {backend:?}");
+            }
+
+            let n = records_count(
+                &db,
+                backend,
+                RecordsCount {
+                    collection: collection.into(),
+                    did: None,
+                    filter: one_filter("score", ">", json!(100)),
+                },
+            )
+            .await
+            .expect("the count should run");
+            assert_eq!(n, 1, "counting score > 100 on {backend:?}");
+        }
+    }
+
+    /// A sort field the validator refuses, pinned at the call site rather
+    /// than only in the validator: the Postgres arm interpolates its path, so
+    /// the refusal has to survive someone rearranging how the two arms get
+    /// their expression.
+    #[test]
+    fn records_sql_refuses_an_invalid_sort_field_on_every_backend() {
+        for backend in [Sqlite, Postgres] {
+            for field in [
+                "a'||(SELECT 1)||'",
+                "a'--",
+                "a..b",
+                "",
+                "tags[x]",
+                "tags[3000000000]",
+            ] {
+                let spec = RecordsQuery {
+                    collection: "c".into(),
+                    did: None,
+                    filter: None,
+                    sort: Some(Sort {
+                        field: field.into(),
+                        direction: "asc".into(),
+                    }),
+                    limit: None,
+                    cursor: None,
+                };
+                assert!(
+                    matches!(
+                        records_query_sql(&spec, backend),
+                        Err(RecordsError::InvalidSpec(_))
+                    ),
+                    "sort on {field:?} should be refused on {backend:?}"
+                );
+            }
+        }
+    }
+
+    /// A filter naming a column in another case. Identifiers are
+    /// case-insensitive on both backends, but each reports a column's
+    /// declared name, so an exact-match type lookup misses and leaves
+    /// Postgres refusing to compare the column against the JSON type.
+    #[tokio::test]
+    #[serial]
+    async fn a_table_filter_finds_the_column_type_whatever_case_it_names() {
+        let table = "host_records_scores";
+        for (db, backend) in backends().await {
+            seed_scores(&db, table).await;
+            let rows = table_query(
+                &db,
+                backend,
+                TableQuery {
+                    table: table.into(),
+                    filter: one_filter("SCORE", ">", json!("100")),
+                    sort: None,
+                    limit: None,
+                    count: false,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("a filter on SCORE on {backend:?}: {e}"));
+            assert_eq!(rows.as_array().expect("an array of rows").len(), 1);
+            assert_eq!(rows[0]["name"], "y");
+        }
+    }
+
+    /// A null filter value, which neither backend can compare the way a
+    /// caller would read it: SQLite's `NULL = NULL` is never true, while
+    /// Postgres's `jsonb` null is an ordinary value that matches.
+    #[tokio::test]
+    #[serial]
+    async fn a_null_filter_value_is_refused_by_name_on_both_backends() {
+        let collection = "host.records.nullvalue";
+        for (db, backend) in backends().await {
+            seed_records(&db, backend, collection).await;
+            let err = records_query(
+                &db,
+                backend,
+                RecordsQuery {
+                    collection: collection.into(),
+                    did: None,
+                    filter: one_filter("score", "=", Value::Null),
+                    sort: None,
+                    limit: None,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect_err("a null filter value should be refused");
+            assert!(
+                matches!(err, RecordsError::InvalidSpec(_)),
+                "on {backend:?}: {err}"
+            );
+            assert!(err.to_string().contains("score"), "{err}");
+        }
     }
 }

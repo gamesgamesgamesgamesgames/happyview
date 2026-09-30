@@ -33,11 +33,26 @@ pub const NO_INDEXED_AT: Option<&str> = None;
 //
 // sqlx 0.9 requires the SQL passed to `query*` to implement `SqlSafeStr`, which
 // only `&'static str` satisfies directly — runtime strings must be wrapped in
-// `AssertSqlSafe`. HappyView builds every query from a static SQLite template
-// run through `adapt_sql` (only bound `?` placeholders vary; no user input is
-// concatenated into the SQL), so the strings are safe to assert. Routing all
-// dynamic queries through these three helpers keeps that assertion in one
-// audited place instead of at ~460 call sites. Backend is always `Any`.
+// `AssertSqlSafe`. Almost every query here is a static SQLite template run
+// through `adapt_sql`, where no user-supplied *value* is concatenated, since
+// values vary only as bound `?` placeholders. Two kinds of exception make the
+// assertion a claim about validation rather than about the absence of
+// interpolation:
+//
+//   * Identifiers and JSON field paths are interpolated, because `adapt_sql`
+//     rewrites SQL text and cannot reach a bound path. Each passes a
+//     validating helper first — `plugin::host::records::is_valid_identifier`
+//     and this module's `is_valid_json_field_path`, which admit only letters,
+//     digits, underscore, dot and a bracketed numeric index — and
+//     `records.rs` is the only module that interpolates caller-controlled
+//     text at all.
+//   * `plugin::host::db`'s `run_query` and `run_execute` pass a plugin's
+//     entire statement through untranslated. There is no template there: what
+//     stands in for one is `raw_sql_guard::check_raw_sql_tables` plus the
+//     `database:read`/`database:write` capability.
+//
+// Routing all dynamic queries through these three helpers keeps that assertion
+// in one audited place instead of at ~460 call sites. Backend is always `Any`.
 
 /// `sqlx::query` for a runtime-built (adapted) SQL string.
 pub fn query<'q>(sql: &str) -> Query<'q, Any, AnyArguments> {
@@ -162,44 +177,113 @@ pub fn adapt_sql(sql: &str, backend: DatabaseBackend) -> String {
     }
 }
 
+/// The longest JSON field path [`is_valid_json_field_path`] accepts. A path
+/// is interpolated, and one caller repeats it five times in a statement while
+/// the Postgres rewrite expands every segment, so an unbounded path lets a
+/// caller turn its own input into orders of magnitude more SQL.
+pub const MAX_FIELD_PATH_LEN: usize = 512;
+
+/// A JSON field path as used in a record filter, sort or search:
+/// dot-separated identifier segments with optional numeric array indices
+/// (`author.handle`, `tags[0]`).
+///
+/// This is the guard that makes interpolating a path sound, and it lives
+/// beside [`postgres_json_chain`], the thing that interpolates: a validator
+/// far from its interpolation is a validator someone removes.
+pub fn is_valid_json_field_path(path: &str) -> bool {
+    if path.is_empty() || path.len() > MAX_FIELD_PATH_LEN {
+        return false;
+    }
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return false;
+        }
+        let bracket_start = segment.find('[').unwrap_or(segment.len());
+        let ident = &segment[..bracket_start];
+        if ident.is_empty() || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        let mut rest = &segment[bracket_start..];
+        while !rest.is_empty() {
+            if !rest.starts_with('[') {
+                return false;
+            }
+            let close = match rest.find(']') {
+                Some(i) => i,
+                None => return false,
+            };
+            let idx = &rest[1..close];
+            if idx.is_empty() || !idx.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            // Postgres's `->` takes an `int4` subscript and refuses a wider
+            // one, where SQLite reads an out-of-range index as no match. An
+            // index neither backend can address is not a path either answers.
+            if idx.parse::<i32>().is_err() {
+                return false;
+            }
+            rest = &rest[close + 1..];
+        }
+    }
+    true
+}
+
+/// The Postgres access chain for a JSON path inside `col`: one arrow per path
+/// segment, with `leaf` as the last. `->>` yields the leaf as text, `->` as
+/// `jsonb`, whose comparison and ordering follow the JSON type rather than
+/// the text.
+///
+/// The only place such a chain is built. Two constructions of it drifted
+/// apart while both were correct for every input they saw — one broke out of
+/// an unterminated bracket, the other never checked for one — and a
+/// difference no caller can reach is a difference no reader will notice.
+///
+/// Total, not validating: `adapt_sql` runs over statements this module did
+/// not build, so the walk has to terminate on any input. Callers that
+/// interpolate a caller-controlled path guard it with
+/// [`is_valid_json_field_path`] first.
+pub fn postgres_json_chain(col: &str, path: &str, leaf: &str) -> String {
+    let mut parts: Vec<(String, bool)> = Vec::new();
+    for segment in path.split('.') {
+        let bracket_start = segment.find('[').unwrap_or(segment.len());
+        let field_name = &segment[..bracket_start];
+        if !field_name.is_empty() {
+            parts.push((field_name.to_string(), false));
+        }
+        let mut rest = &segment[bracket_start..];
+        while rest.starts_with('[') {
+            if let Some(close) = rest.find(']') {
+                parts.push((rest[1..close].to_string(), true));
+                rest = &rest[close + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+
+    let mut chain = format!("{col}::jsonb");
+    let last = parts.len().saturating_sub(1);
+    for (i, (text, is_index)) in parts.iter().enumerate() {
+        let arrow = if i == last { leaf } else { "->" };
+        if *is_index {
+            chain.push_str(&format!("{arrow}{text}"));
+        } else {
+            chain.push_str(&format!("{arrow}'{text}'"));
+        }
+    }
+    chain
+}
+
 /// Convert `json_extract(col, '$.seg1.seg2.leaf')` to Postgres `col::jsonb->'seg1'->'seg2'->>'leaf'`.
 /// Handles array indices: `seg[0].leaf` becomes `->seg->0->>'leaf'`.
+///
+/// Terminating in `->>` is what a rewritten `json_extract` means: its readers
+/// want the value as text. A caller wanting the `jsonb` value calls
+/// [`postgres_json_chain`] with `->` instead.
 fn adapt_json_extract_to_postgres(sql: &str) -> String {
     JSON_EXTRACT_RE
         .replace_all(sql, |caps: &regex::Captures| {
-            let col = &caps[1];
-            let path = &caps[2];
-
-            let mut parts: Vec<(String, bool)> = Vec::new();
-            for segment in path.split('.') {
-                let bracket_start = segment.find('[').unwrap_or(segment.len());
-                let field_name = &segment[..bracket_start];
-                if !field_name.is_empty() {
-                    parts.push((field_name.to_string(), false));
-                }
-                let mut rest = &segment[bracket_start..];
-                while rest.starts_with('[') {
-                    if let Some(close) = rest.find(']') {
-                        parts.push((rest[1..close].to_string(), true));
-                        rest = &rest[close + 1..];
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            let mut chain = format!("{col}::jsonb");
-            let last = parts.len().saturating_sub(1);
-            for (i, (text, is_index)) in parts.iter().enumerate() {
-                let arrow = if i == last { "->>" } else { "->" };
-                if *is_index {
-                    chain.push_str(&format!("{arrow}{text}"));
-                } else {
-                    chain.push_str(&format!("{arrow}'{text}'"));
-                }
-            }
-
-            chain
+            postgres_json_chain(&caps[1], &caps[2], "->>")
         })
         .to_string()
 }
@@ -501,6 +585,67 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use serial_test::serial;
+
+    #[test]
+    fn json_field_paths() {
+        assert!(is_valid_json_field_path("name"));
+        assert!(is_valid_json_field_path("author_name"));
+        assert!(is_valid_json_field_path("author.handle"));
+        assert!(is_valid_json_field_path("tags[0]"));
+        assert!(is_valid_json_field_path("data[0][1]"));
+        assert!(is_valid_json_field_path("author.websites[0].url"));
+        assert!(is_valid_json_field_path("a.b.c.d.e"));
+        assert!(!is_valid_json_field_path(""));
+        assert!(!is_valid_json_field_path(".name"));
+        assert!(!is_valid_json_field_path("name."));
+        assert!(!is_valid_json_field_path("name..foo"));
+        assert!(!is_valid_json_field_path("a..b"));
+        assert!(!is_valid_json_field_path("[0]"));
+        assert!(!is_valid_json_field_path("name[]"));
+        assert!(!is_valid_json_field_path("name[abc]"));
+        assert!(!is_valid_json_field_path("tags[x]"));
+        assert!(!is_valid_json_field_path("name; DROP TABLE"));
+        assert!(!is_valid_json_field_path("name'OR 1=1"));
+        assert!(!is_valid_json_field_path("a'b"));
+        assert!(!is_valid_json_field_path("na-me"));
+        // The bounds that keep a path addressable on both backends.
+        assert!(!is_valid_json_field_path("tags[3000000000]"));
+        assert!(is_valid_json_field_path("tags[2147483647]"));
+        assert!(!is_valid_json_field_path(
+            &"a".repeat(MAX_FIELD_PATH_LEN + 1)
+        ));
+        assert!(is_valid_json_field_path(&"a".repeat(MAX_FIELD_PATH_LEN)));
+    }
+
+    /// The one walk, at both leaves. A path's segments and indices render the
+    /// same either way; only the final arrow differs, which is the whole
+    /// reason two callers need it.
+    #[test]
+    fn a_json_path_renders_one_chain_with_either_leaf() {
+        assert_eq!(
+            postgres_json_chain("record", "author.handle", "->>"),
+            "record::jsonb->'author'->>'handle'"
+        );
+        assert_eq!(
+            postgres_json_chain("record", "author.handle", "->"),
+            "record::jsonb->'author'->'handle'"
+        );
+        assert_eq!(
+            postgres_json_chain("record", "tags[0]", "->>"),
+            "record::jsonb->'tags'->>0"
+        );
+        assert_eq!(postgres_json_chain("r", "n", "->"), "r::jsonb->'n'");
+    }
+
+    /// The walk terminates on input no validator passed, because `adapt_sql`
+    /// runs over statements this module did not build.
+    #[test]
+    fn the_chain_walk_terminates_on_an_unterminated_bracket() {
+        assert_eq!(
+            postgres_json_chain("record", "tags[0", "->>"),
+            "record::jsonb->>'tags'"
+        );
+    }
 
     const CAST_ON_READ: &[&str] = &[
         "service_identity.setup_complete",

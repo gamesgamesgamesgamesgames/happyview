@@ -16,7 +16,10 @@ fn bind_params<'q>(
             Value::String(s) => query.bind(s.as_str()),
             Value::Number(n) if n.is_i64() => query.bind(n.as_i64().unwrap()),
             Value::Number(n) => query.bind(n.as_f64().unwrap_or(0.0)),
-            Value::Bool(b) => query.bind(if *b { 1_i32 } else { 0_i32 }),
+            // A boolean binds as one: Postgres will not compare its own
+            // `boolean` against an integer, and SQLite stores the bind as the
+            // 0/1 an integer column already holds.
+            Value::Bool(b) => query.bind(*b),
             Value::Null => query.bind(Option::<String>::None),
             other => return Err(format!("unsupported parameter type: {other}")),
         };
@@ -70,4 +73,86 @@ pub async fn run_execute(db: &sqlx::AnyPool, sql: &str, params: &[Value]) -> Res
         .await
         .map_err(|e| format!("execute failed: {e}"))?;
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DatabaseBackend;
+    use serde_json::json;
+    use serial_test::serial;
+
+    /// Every backend the suite can reach; the Postgres half needs a database
+    /// to be pointed at and says so when there is none.
+    async fn backends() -> Vec<(sqlx::AnyPool, DatabaseBackend)> {
+        let mut out = vec![(
+            crate::test_support::migrated_memory_pool().await,
+            DatabaseBackend::Sqlite,
+        )];
+        match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => {
+                let backend = DatabaseBackend::from_url(&url);
+                out.push((crate::db::connect(&url, backend).await, backend));
+            }
+            Err(_) => eprintln!("TEST_DATABASE_URL unset: the Postgres half is skipped"),
+        }
+        out
+    }
+
+    /// Raw SQL is passed through untranslated, so a test writes each
+    /// backend's own placeholder exactly as a plugin would.
+    fn placeholder(backend: DatabaseBackend, position: usize) -> String {
+        match backend {
+            DatabaseBackend::Sqlite => "?".to_string(),
+            DatabaseBackend::Postgres => format!("${position}"),
+        }
+    }
+
+    /// A boolean parameter against a boolean column. Binding it as an integer
+    /// is well-typed on SQLite, which has no boolean of its own, and leaves
+    /// Postgres comparing `boolean = integer`, which it refuses.
+    #[tokio::test]
+    #[serial]
+    async fn a_boolean_parameter_compares_against_a_boolean_column() {
+        for (db, backend) in backends().await {
+            crate::db::query(
+                "CREATE TABLE IF NOT EXISTS host_db_flags (name TEXT, active BOOLEAN)",
+            )
+            .execute(&db)
+            .await
+            .expect("create the table");
+            crate::db::query("DELETE FROM host_db_flags")
+                .execute(&db)
+                .await
+                .expect("clear the table");
+
+            let inserted = run_execute(
+                &db,
+                &format!(
+                    "INSERT INTO host_db_flags (name, active) VALUES ({}, {}), ({}, {})",
+                    placeholder(backend, 1),
+                    placeholder(backend, 2),
+                    placeholder(backend, 3),
+                    placeholder(backend, 4),
+                ),
+                &[json!("on"), json!(true), json!("off"), json!(false)],
+            )
+            .await
+            .expect("the insert should run");
+            assert_eq!(inserted, 2);
+
+            let rows = run_query(
+                &db,
+                &format!(
+                    "SELECT name FROM host_db_flags WHERE active = {}",
+                    placeholder(backend, 1)
+                ),
+                &[json!(true)],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("the query should run on {backend:?}: {e}"));
+            assert_eq!(rows.len(), 1, "on {backend:?}");
+            assert_eq!(rows[0]["name"], json!("on"));
+        }
+    }
 }

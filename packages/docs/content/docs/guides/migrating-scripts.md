@@ -84,6 +84,23 @@ Three things in v2 have no direct v3 equivalent: two globals whose return shapes
 
 A name bound from `atproto.blob_download(...)` changes shape: `.handle` becomes `.bytes`, and `.mimeType` becomes `.mime_type`. `atproto.blob_upload(a, b)` keeps its argument order — it becomes `record.upload_blob(a, b)` unchanged.
 
+## Filter comparisons
+
+A record filter compares by the **filter value's own JSON type**, and the codemod cannot rewrite this for you because whether a change is needed depends on what your records hold.
+
+`{ field = "score", op = ">", value = 100 }` asks a numeric question and gets a numeric answer. `value = "100"` asks a different one: it matches a field holding the *string* `"100"`, not the number. A record body carries no schema, so the value is the only thing that can say which comparison was meant.
+
+Two things to check in a migrated script:
+
+- **A number quoted as a string.** `value = "150"` against a field your records store as a number now matches nothing. Drop the quotes. This is the change most likely to bite, because a mismatch is an **empty result, not an error** — there is nothing in the log to tell you the filter was the problem.
+- **An ordering comparison.** `op = ">"` on a numeric field now compares numerically, so `> 100` no longer matches a record scoring 50. If a script relied on the old answer, it was relying on a text comparison in which `'50'` sorts above `'100'`.
+
+Both readings are now the same on SQLite and Postgres. Before v3 they were not: a string filter against a stored number matched nothing on SQLite and everything on Postgres, so the strict rule is what SQLite already did and Postgres is the backend whose answer changes.
+
+`like`, `not like` and `ilike` compare as text on both backends whatever the field holds, and are unaffected.
+
+A table filter (`db.table`) compares against the **column's** type instead, which HappyView reads from the table rather than guessing. A value the column cannot hold — `"abc"` against an integer column — is now refused with an error naming the column, where v2 coerced it to something arbitrary on SQLite and failed inside the driver on Postgres.
+
 ## Markers
 
 Some constructs have no mechanical equivalent. The codemod leaves them exactly as written, precedes them with a `-- codemod:` comment naming what to do, and lists them in its notes. **A script with markers is not finished** until you rewrite those lines by hand and remove the comment. Every marker reads `-- codemod: <what changed> -- <what to do>`.
