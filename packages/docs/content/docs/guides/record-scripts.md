@@ -161,7 +161,7 @@ The `happyview_dead_letter_scripts` table stores events that failed all retry at
 | `host_kind`  | text      | `'record'` or `'label'`                               |
 | `host_id`    | text      | Identifies the specific event source                  |
 | `collection` | text      | The collection NSID of the failed event               |
-| `payload`    | jsonb     | The full event payload                                |
+| `payload`    | text      | The full event payload (JSON)                         |
 | `error`      | text      | The error message from the last attempt               |
 | `attempts`   | int       | Total number of attempts made                         |
 | `created_at` | text      | When the failure was recorded (ISO 8601)              |

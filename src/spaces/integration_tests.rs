@@ -172,6 +172,7 @@ mod tests {
         // Step 3: space host issues a space credential (using P-256 key)
         let keypair = generate_dpop_keypair().unwrap();
         let cred_claims = SpaceCredentialClaims {
+            cnf: None,
             iss: "did:plc:space".into(),
             sub: verified_delegation.sub.clone(),
             iat: now,
@@ -542,6 +543,7 @@ mod tests {
         let now = now_secs();
 
         let claims = SpaceCredentialClaims {
+            cnf: None,
             iss: "did:plc:owner".into(),
             sub: "at://did:plc:owner/space/com.example.forum/main".into(),
             iat: now,
@@ -564,6 +566,7 @@ mod tests {
         let now = now_secs();
 
         let claims = SpaceCredentialClaims {
+            cnf: None,
             iss: "did:plc:owner".into(),
             sub: "at://did:plc:owner/space/com.example.forum/main".into(),
             iat: now,

@@ -40,8 +40,8 @@ const CONTROL_METHOD: &str = "com.atproto.space.zzzProbeControlDoesNotExist";
 /// Methods a repo host must serve for migration to be worth attempting.
 ///
 /// Each entry is a set of accepted spellings, and one match is enough.
-/// Implementations lag renames: ZDS advertises `getRepoState`, and `addMember`
-/// predates `putMember`.
+/// Implementations lag renames: `getRepoState` predates `getLatestCommit`, and
+/// pds.js still offers `addMember` rather than `putMember`.
 const REQUIRED_METHODS: &[&[&str]] = &[
     &["com.atproto.simplespace.createSpace"],
     &[

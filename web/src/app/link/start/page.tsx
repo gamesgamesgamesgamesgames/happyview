@@ -3,11 +3,16 @@
 import { Suspense, useEffect, useState } from "react";
 import Image from "next/image";
 import { useSearchParams } from "next/navigation";
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { AlertTriangle, ChevronRight, Loader2 } from "lucide-react";
 
 import { getLinkedRepoInvite, type LinkedRepoInviteInfo } from "@/lib/api";
-import { describeScope } from "@/lib/linked-repo-scopes";
+import { describeScope, groupScopes } from "@/lib/linked-repo-scopes";
 import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   Card,
   CardContent,
@@ -141,6 +146,7 @@ function LinkStartInner() {
 
   const descriptions = info.scopes.map(describeScope);
   const capabilities = descriptions.filter((d) => !d.quiet);
+  const groups = groupScopes(capabilities);
   const hasBasicAccess = descriptions.some((d) => d.quiet);
   const canContinue =
     Boolean(info.pinned_identifier) || handle.trim().length > 0;
@@ -184,21 +190,34 @@ function LinkStartInner() {
           <h2 className="text-sm font-medium">
             What this will let {info.app_name} do
           </h2>
-          {capabilities.length === 0 ? (
+          {groups.length === 0 ? (
             <p className="text-muted-foreground text-sm">
               No specific record or file access was requested.
             </p>
           ) : (
+            /* Grouped by what the app may do rather than one row per scope: a
+               grant routinely repeats the same permission across a dozen
+               collections, and the verb is the part worth weighing. */
             <ul className="flex flex-col gap-2">
-              {capabilities.map((cap) => (
+              {groups.map((group) => (
                 <li
-                  key={cap.raw}
-                  className="flex flex-col gap-0.5 rounded-md border px-3 py-2"
+                  key={group.heading}
+                  className="flex flex-col gap-1.5 rounded-md border px-3 py-2.5"
                 >
-                  <span className="text-sm">{cap.text}</span>
-                  <span className="font-mono text-xs text-muted-foreground break-all">
-                    {cap.raw}
-                  </span>
+                  <span className="text-sm font-medium">{group.heading}</span>
+                  {group.targets.length > 0 && (
+                    <ul className="flex flex-col gap-1">
+                      {group.targets.map((target) => (
+                        <li
+                          key={target}
+                          className="text-muted-foreground flex gap-2 font-mono text-xs"
+                        >
+                          <span aria-hidden="true">·</span>
+                          <span className="break-words">{target}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </li>
               ))}
             </ul>
@@ -208,6 +227,28 @@ function LinkStartInner() {
               Basic account access is also included — that only identifies which
               account is linked, it isn&apos;t a separate permission.
             </p>
+          )}
+          {capabilities.length > 0 && (
+            /* The raw strings are what a technical reader verifies against, but
+               they're noise for everyone else — available, not in the way. */
+            <Collapsible>
+              <CollapsibleTrigger className="text-muted-foreground hover:text-foreground group flex items-center gap-1 text-xs">
+                <ChevronRight className="size-3 transition-transform group-data-[state=open]:rotate-90" />
+                Show raw scope strings
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <ul className="mt-2 flex flex-col gap-1">
+                  {capabilities.map((cap) => (
+                    <li
+                      key={cap.raw}
+                      className="text-muted-foreground font-mono text-xs break-words"
+                    >
+                      {cap.raw}
+                    </li>
+                  ))}
+                </ul>
+              </CollapsibleContent>
+            </Collapsible>
           )}
         </div>
 

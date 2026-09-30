@@ -606,9 +606,15 @@ pub async fn delete_expired_labels(
 
 /// Delete every label whose subject is no longer indexed, returning how many
 /// went.
+///
+/// Only record labels can be orphaned, so the sweep is confined to `at://`
+/// subjects. An account label's subject is a bare DID, which matches no record
+/// URI and so read as orphaned on its first pass — every account-level label an
+/// instance held was deleted within the hour. Account labels are retained until
+/// they expire or are negated.
 pub async fn delete_orphaned_labels(db: &sqlx::AnyPool) -> Result<u64, sqlx::Error> {
     crate::db::query(
-        "DELETE FROM happyview_labels WHERE NOT EXISTS (SELECT 1 FROM happyview_records WHERE happyview_records.uri = happyview_labels.uri)",
+        "DELETE FROM happyview_labels WHERE uri LIKE 'at://%' AND NOT EXISTS (SELECT 1 FROM happyview_records WHERE happyview_records.uri = happyview_labels.uri)",
     )
     .execute(db)
     .await

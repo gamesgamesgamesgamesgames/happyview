@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
@@ -2408,7 +2409,16 @@ pub(super) async fn create_backfill(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     admin.require(Permission::BackfillCreate).await?;
 
-    let job_id = start_backfill(&state, body.collection, body.did, &admin.did).await?;
+    let mut inputs = body.dids.unwrap_or_default();
+    inputs.extend(body.did);
+    let dids = resolve_backfill_accounts(inputs, |input| async move {
+        crate::identity::resolve_identifier(&input)
+            .await
+            .map(|resolved| resolved.did)
+    })
+    .await?;
+
+    let job_id = start_backfill(&state, body.collection, dids, &admin.did).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -2419,30 +2429,195 @@ pub(super) async fn create_backfill(
     ))
 }
 
-pub(crate) async fn start_backfill(
+pub(crate) const MAX_BACKFILL_ACCOUNTS: usize = 500;
+
+/// Resolve every requested account to a DID, all or nothing.
+///
+/// A partial job would silently skip accounts the operator asked for, so one
+/// bad entry fails the request and the error lists every bad entry at once.
+/// The cap is checked before resolving so an oversized request costs no
+/// lookups.
+///
+/// An empty `inputs` means no accounts were asked for, which is a network
+/// backfill. Entries that are all blank are refused instead: treating them as
+/// "no accounts" would turn a malformed targeted request into a backfill of
+/// the whole network.
+pub(crate) async fn resolve_backfill_accounts<F, Fut>(
+    inputs: Vec<String>,
+    resolve: F,
+) -> Result<Vec<String>, AppError>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, AppError>>,
+{
+    let supplied_any = !inputs.is_empty();
+    let mut seen_inputs = HashSet::new();
+    let unique: Vec<String> = inputs
+        .into_iter()
+        .map(|input| input.trim().to_string())
+        .filter(|input| !input.is_empty() && seen_inputs.insert(input.clone()))
+        .collect();
+
+    if supplied_any && unique.is_empty() {
+        return Err(AppError::BadRequest(
+            "no valid accounts given: every entry was blank".into(),
+        ));
+    }
+
+    if unique.len() > MAX_BACKFILL_ACCOUNTS {
+        return Err(AppError::BadRequest(format!(
+            "a backfill can target at most {MAX_BACKFILL_ACCOUNTS} accounts, got {}",
+            unique.len()
+        )));
+    }
+
+    let results: Vec<Result<String, AppError>> = stream::iter(unique)
+        .map(&resolve)
+        .buffered(8)
+        .collect()
+        .await;
+
+    let mut seen_dids = HashSet::new();
+    let mut dids = Vec::new();
+    let mut failures = Vec::new();
+    for result in results {
+        match result {
+            Ok(did) => {
+                if seen_dids.insert(did.clone()) {
+                    dids.push(did);
+                }
+            }
+            Err(AppError::BadRequest(msg)) => failures.push(msg),
+            Err(other) => failures.push(other.to_string()),
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "could not resolve {} account(s): {}",
+            failures.len(),
+            failures.join("; ")
+        )));
+    }
+
+    Ok(dids)
+}
+
+/// Insert a job whose repos are known up front, together with those repos.
+///
+/// The job row and its repos must appear together or not at all: a failure
+/// partway through the chunked insert must not leave behind a job marked
+/// `running` with no worker and no (or partial) repos to work on,
+/// indistinguishable from a live job until the next restart's
+/// `resume_backfill_jobs` sweep notices it. Callers spawn the worker only
+/// after this returns, since a worker started inside the transaction could
+/// observe rows that later roll back.
+///
+/// `stage = 'resolving_pds'` makes `run_backfill_job` skip discovery, both on
+/// first run and on resume.
+async fn insert_targeted_job(
     state: &AppState,
-    collection: Option<String>,
-    did: Option<String>,
-    actor_did: &str,
-) -> Result<String, AppError> {
+    job_id: &str,
+    collection: Option<&str>,
+    dids: &[String],
+) -> Result<(), AppError> {
     let backend = state.db_backend;
     let now = now_rfc3339();
-    let job_id = Uuid::new_v4().to_string();
+    let single_did = match dids {
+        [did] => Some(did.as_str()),
+        _ => None,
+    };
+    let total = i32::try_from(dids.len()).unwrap_or(i32::MAX);
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
     let sql = adapt_sql(
-        "INSERT INTO happyview_backfill_jobs (id, collection, did, status, stage, started_at, created_at) VALUES (?, ?, ?, 'running', 'pending', ?, ?) RETURNING id",
+        "INSERT INTO happyview_backfill_jobs \
+         (id, collection, did, scope, status, stage, total_repos, started_at, created_at) \
+         VALUES (?, ?, ?, 'dids', 'running', 'resolving_pds', ?, ?, ?)",
         backend,
     );
-    let row: (String,) = crate::db::query_as(&sql)
-        .bind(&job_id)
-        .bind(&collection)
-        .bind(&did)
+    crate::db::query(&sql)
+        .bind(job_id)
+        .bind(collection)
+        .bind(single_did)
+        .bind(total)
         .bind(&now)
         .bind(&now)
-        .fetch_one(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("failed to create backfill job: {e}")))?;
 
-    let job_id = row.0.clone();
+    // SQLite has a 999 bound-parameter limit; each row uses 2 params.
+    let chunk_size = if backend == crate::db::DatabaseBackend::Sqlite {
+        499
+    } else {
+        1000
+    };
+    for chunk in dids.chunks(chunk_size) {
+        let placeholders = vec!["(?, ?)"; chunk.len()].join(", ");
+        let sql_str = format!(
+            "INSERT INTO happyview_backfill_repos (job_id, did) VALUES {placeholders} ON CONFLICT DO NOTHING",
+        );
+        let sql = adapt_sql(&sql_str, backend);
+        let mut insert = crate::db::query(&sql);
+        for did in chunk {
+            insert = insert.bind(job_id).bind(did);
+        }
+        insert
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to seed backfill repos: {e}")))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit backfill job: {e}")))
+}
+
+/// Insert a backfill job without starting it. With no `dids` the job
+/// discovers repos through the relay; otherwise it targets exactly those.
+pub(crate) async fn create_backfill_job(
+    state: &AppState,
+    collection: Option<&str>,
+    dids: &[String],
+) -> Result<String, AppError> {
+    let job_id = Uuid::new_v4().to_string();
+
+    if !dids.is_empty() {
+        insert_targeted_job(state, &job_id, collection, dids).await?;
+        return Ok(job_id);
+    }
+
+    let now = now_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_backfill_jobs (id, collection, did, scope, status, stage, started_at, created_at) VALUES (?, ?, NULL, 'network', 'running', 'pending', ?, ?)",
+        state.db_backend,
+    );
+    crate::db::query(&sql)
+        .bind(&job_id)
+        .bind(collection)
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to create backfill job: {e}")))?;
+
+    Ok(job_id)
+}
+
+pub(crate) async fn start_backfill(
+    state: &AppState,
+    collection: Option<String>,
+    dids: Vec<String>,
+    actor_did: &str,
+) -> Result<String, AppError> {
+    let job_id = create_backfill_job(state, collection.as_deref(), &dids).await?;
+    let scope = if dids.is_empty() { "network" } else { "dids" };
 
     log_event(
         &state.db,
@@ -2453,9 +2628,11 @@ pub(crate) async fn start_backfill(
             subject: collection.clone(),
             detail: serde_json::json!({
                 "job_id": job_id.clone(),
+                "scope": scope,
+                "account_count": dids.len(),
             }),
         },
-        backend,
+        state.db_backend,
     )
     .await;
 
@@ -2647,7 +2824,7 @@ pub(super) async fn backfill_status(
     let backend = state.db_backend;
 
     let sql = adapt_sql(
-        "SELECT id, collection, did, status, stage, total_repos, resolved_repos, processed_repos, total_records, error, started_at, completed_at, created_at FROM happyview_backfill_jobs ORDER BY created_at DESC",
+        "SELECT id, collection, did, scope, status, stage, total_repos, resolved_repos, processed_repos, total_records, error, started_at, completed_at, created_at FROM happyview_backfill_jobs ORDER BY created_at DESC",
         backend,
     );
     #[allow(clippy::type_complexity)]
@@ -2655,6 +2832,7 @@ pub(super) async fn backfill_status(
         String,
         Option<String>,
         Option<String>,
+        String,
         String,
         String,
         Option<i32>,
@@ -2677,6 +2855,7 @@ pub(super) async fn backfill_status(
                 id,
                 collection,
                 did,
+                scope,
                 status,
                 stage,
                 total_repos,
@@ -2692,6 +2871,7 @@ pub(super) async fn backfill_status(
                     id,
                     collection,
                     did,
+                    scope,
                     status,
                     stage,
                     total_repos,
@@ -3070,16 +3250,16 @@ pub(super) async fn retry_failed_backfill(
     let backend = state.db_backend;
 
     let sql = adapt_sql(
-        "SELECT collection, did FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT collection FROM happyview_backfill_jobs WHERE id = ?",
         backend,
     );
-    let row: Option<(Option<String>, Option<String>)> = crate::db::query_as(&sql)
+    let row: Option<(Option<String>,)> = crate::db::query_as(&sql)
         .bind(&job_id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to query backfill job: {e}")))?;
 
-    let Some((collection, did)) = row else {
+    let Some((collection,)) = row else {
         return Err(AppError::NotFound("backfill job not found".into()));
     };
 
@@ -3122,63 +3302,9 @@ pub(super) async fn retry_failed_backfill(
         ));
     }
 
-    let now = now_rfc3339();
+    let dids: Vec<String> = dids.into_iter().map(|(did,)| did).collect();
     let new_job_id = Uuid::new_v4().to_string();
-
-    // The job row and its seeded repos must appear together or not at all: a
-    // failure partway through the chunked insert must not leave behind a job
-    // marked `running` with no worker and no (or partial) repos to work on,
-    // indistinguishable from a live job until the next restart's
-    // `resume_backfill_jobs` sweep notices it. Committing before spawning the
-    // worker also matters — spawning inside the transaction would let the
-    // worker observe rows that could still roll back.
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
-
-    let sql = adapt_sql(
-        "INSERT INTO happyview_backfill_jobs \
-         (id, collection, did, status, stage, started_at, created_at) \
-         VALUES (?, ?, ?, 'running', 'resolving_pds', ?, ?)",
-        backend,
-    );
-    crate::db::query(&sql)
-        .bind(&new_job_id)
-        .bind(&collection)
-        .bind(&did)
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to create retry job: {e}")))?;
-
-    // SQLite has a 999 bound-parameter limit; each row uses 2 params.
-    let chunk_size = if backend == crate::db::DatabaseBackend::Sqlite {
-        499
-    } else {
-        1000
-    };
-    for chunk in dids.chunks(chunk_size) {
-        let placeholders = vec!["(?, ?)"; chunk.len()].join(", ");
-        let sql_str = format!(
-            "INSERT INTO happyview_backfill_repos (job_id, did) VALUES {placeholders} ON CONFLICT DO NOTHING",
-        );
-        let sql = adapt_sql(&sql_str, backend);
-        let mut insert = crate::db::query(&sql);
-        for (did,) in chunk {
-            insert = insert.bind(&new_job_id).bind(did);
-        }
-        insert
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to seed retry repos: {e}")))?;
-    }
-
-    tx.commit()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to commit retry job: {e}")))?;
+    insert_targeted_job(&state, &new_job_id, collection.as_deref(), &dids).await?;
 
     log_event(
         &state.db,
@@ -3347,6 +3473,224 @@ mod tests {
 
     use crate::test_support::{memory_pool, test_state_with_pool};
 
+    // -----------------------------------------------------------------------
+    // Account-targeted jobs
+    // -----------------------------------------------------------------------
+
+    async fn migrated_state() -> AppState {
+        test_state_with_pool(crate::test_support::migrated_memory_pool().await)
+    }
+
+    /// Resolves `did:` entries to themselves and `<name>.test` handles to
+    /// `did:plc:<name>`; anything else fails.
+    fn fake_resolve(input: String) -> std::future::Ready<Result<String, AppError>> {
+        let result = if input.starts_with("did:") {
+            Ok(input)
+        } else if let Some(name) = input.trim_start_matches('@').strip_suffix(".test") {
+            Ok(format!("did:plc:{name}"))
+        } else {
+            Err(AppError::BadRequest(format!(
+                "could not resolve handle {input}"
+            )))
+        };
+        std::future::ready(result)
+    }
+
+    #[tokio::test]
+    async fn accounts_are_resolved_and_deduplicated_in_order() {
+        let dids = resolve_backfill_accounts(
+            vec![
+                " did:plc:bob ".into(),
+                "alice.test".into(),
+                "did:plc:alice".into(),
+                "did:plc:bob".into(),
+                "".into(),
+            ],
+            fake_resolve,
+        )
+        .await
+        .expect("resolve accounts");
+
+        assert_eq!(
+            dids,
+            vec!["did:plc:bob".to_string(), "did:plc:alice".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_only_dids_are_refused() {
+        let result = resolve_backfill_accounts(vec!["  ".into(), "".into()], fake_resolve).await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "got {result:?}"
+        );
+    }
+
+    /// `create_backfill` appends `did` to the `dids` list, so a blank `did`
+    /// on its own arrives as a single blank entry.
+    #[tokio::test]
+    async fn a_blank_did_alone_is_refused() {
+        let result = resolve_backfill_accounts(vec!["".into()], fake_resolve).await;
+        assert!(
+            matches!(result, Err(AppError::BadRequest(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_accounts_resolves_to_no_dids() {
+        let dids = resolve_backfill_accounts(Vec::new(), fake_resolve)
+            .await
+            .expect("empty list is a network backfill");
+        assert!(dids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn any_unresolvable_account_fails_the_request_naming_each_one() {
+        let err = resolve_backfill_accounts(
+            vec![
+                "alice.test".into(),
+                "nope.example".into(),
+                "also-bad.example".into(),
+            ],
+            fake_resolve,
+        )
+        .await
+        .expect_err("should refuse");
+
+        let AppError::BadRequest(msg) = err else {
+            panic!("expected BadRequest, got {err:?}");
+        };
+        assert!(msg.contains("nope.example"), "{msg}");
+        assert!(msg.contains("also-bad.example"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn more_than_the_account_cap_is_refused_before_resolving() {
+        let inputs: Vec<String> = (0..=MAX_BACKFILL_ACCOUNTS)
+            .map(|i| format!("did:plc:a{i}"))
+            .collect();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let result = resolve_backfill_accounts(inputs, |input| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            fake_resolve(input)
+        })
+        .await;
+
+        assert!(matches!(result, Err(AppError::BadRequest(_))));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_multi_account_job_is_seeded_and_skips_discovery() {
+        let state = migrated_state().await;
+        let dids = vec!["did:plc:a".to_string(), "did:plc:b".to_string()];
+
+        let job_id = create_backfill_job(&state, Some("dummy.collection"), &dids)
+            .await
+            .expect("create job");
+
+        let (did, scope, stage, total): (Option<String>, String, String, Option<i32>) =
+            crate::db::query_as(
+                "SELECT did, scope, stage, total_repos FROM happyview_backfill_jobs WHERE id = ?",
+            )
+            .bind(&job_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("job row");
+        assert_eq!(did, None);
+        assert_eq!(scope, "dids");
+        assert_eq!(stage, "resolving_pds");
+        assert_eq!(total, Some(2));
+
+        let repos: Vec<(String,)> = crate::db::query_as(
+            "SELECT did FROM happyview_backfill_repos WHERE job_id = ? ORDER BY did",
+        )
+        .bind(&job_id)
+        .fetch_all(&state.db)
+        .await
+        .expect("repo rows");
+        assert_eq!(repos.into_iter().map(|(d,)| d).collect::<Vec<_>>(), dids);
+    }
+
+    #[tokio::test]
+    async fn a_single_account_job_records_its_did() {
+        let state = migrated_state().await;
+
+        let job_id = create_backfill_job(&state, None, &["did:plc:solo".to_string()])
+            .await
+            .expect("create job");
+
+        let (did, scope): (Option<String>, String) =
+            crate::db::query_as("SELECT did, scope FROM happyview_backfill_jobs WHERE id = ?")
+                .bind(&job_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("job row");
+        assert_eq!(did.as_deref(), Some("did:plc:solo"));
+        assert_eq!(scope, "dids");
+    }
+
+    #[tokio::test]
+    async fn a_job_without_accounts_discovers_across_the_network() {
+        let state = migrated_state().await;
+
+        let job_id = create_backfill_job(&state, Some("dummy.collection"), &[])
+            .await
+            .expect("create job");
+
+        let (did, scope, stage): (Option<String>, String, String) = crate::db::query_as(
+            "SELECT did, scope, stage FROM happyview_backfill_jobs WHERE id = ?",
+        )
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("job row");
+        assert_eq!(did, None);
+        assert_eq!(scope, "network");
+        assert_eq!(stage, "pending");
+    }
+
+    #[tokio::test]
+    async fn the_legacy_did_field_is_merged_into_dids() {
+        let state = migrated_state().await;
+
+        let (status, Json(body)) = create_backfill(
+            State(state.clone()),
+            super_auth(&state),
+            Json(CreateBackfillBody {
+                collection: None,
+                did: Some("did:plc:legacy".into()),
+                dids: Some(vec!["did:plc:other".into()]),
+            }),
+        )
+        .await
+        .expect("create backfill");
+        assert_eq!(status, StatusCode::CREATED);
+        let job_id = body["id"].as_str().expect("id").to_string();
+
+        let (scope,): (String,) =
+            crate::db::query_as("SELECT scope FROM happyview_backfill_jobs WHERE id = ?")
+                .bind(&job_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("job row");
+        assert_eq!(scope, "dids");
+
+        let repos: Vec<(String,)> = crate::db::query_as(
+            "SELECT did FROM happyview_backfill_repos WHERE job_id = ? ORDER BY did",
+        )
+        .bind(&job_id)
+        .fetch_all(&state.db)
+        .await
+        .expect("repo rows");
+        assert_eq!(
+            repos.into_iter().map(|(d,)| d).collect::<Vec<_>>(),
+            vec!["did:plc:legacy".to_string(), "did:plc:other".to_string()]
+        );
+    }
+
     async fn state_with_job(
         job_id: &str,
         status: &str,
@@ -3466,6 +3810,7 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 collection TEXT,
                 did TEXT,
+                scope TEXT NOT NULL DEFAULT 'network',
                 status TEXT NOT NULL,
                 stage TEXT NOT NULL,
                 total_repos INTEGER,
@@ -3895,13 +4240,14 @@ mod tests {
         let new_job_id = body["id"].as_str().expect("id field").to_string();
         assert_ne!(new_job_id, "job-retry-1");
 
-        let (stage,): (String,) =
-            crate::db::query_as("SELECT stage FROM happyview_backfill_jobs WHERE id = ?")
+        let (stage, scope): (String, String) =
+            crate::db::query_as("SELECT stage, scope FROM happyview_backfill_jobs WHERE id = ?")
                 .bind(&new_job_id)
                 .fetch_one(&state.backfill_db)
                 .await
                 .expect("new job row");
         assert_eq!(stage, "resolving_pds");
+        assert_eq!(scope, "dids");
 
         let mut repo_dids: Vec<String> = crate::db::query_as::<(String,)>(
             "SELECT did FROM happyview_backfill_repos WHERE job_id = ? ORDER BY did",

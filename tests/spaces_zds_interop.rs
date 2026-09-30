@@ -16,6 +16,7 @@ use base64::Engine;
 use happyview::spaces::commit::{SpaceVerifyingKey, verify_commit};
 use happyview::spaces::lthash::{LtHashState, record_element};
 use happyview::spaces::native_client::parse_signed_commit;
+use happyview::spaces::types::{AppAccess, MemberAccess, Policy, ResolvedMember};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -83,6 +84,35 @@ async fn new_account() -> (String, String) {
     )
 }
 
+/// A space created with HappyView's own policy and app-access types, so ZDS
+/// accepting it checks how we encode the unions.
+async fn create_space(token: &str, read: &Policy, write: &Policy, app: &AppAccess) -> String {
+    let (status, body) = post_json(
+        &format!("{ZDS}/xrpc/com.atproto.simplespace.createSpace"),
+        Some(token),
+        json!({
+            "type": "com.example.forum",
+            "skey": "self",
+            "readPolicy": read,
+            "writePolicy": write,
+            "appAccess": app,
+        }),
+    )
+    .await;
+    assert!(status < 300, "createSpace failed ({status}): {body}");
+    body["uri"].as_str().expect("space uri").to_string()
+}
+
+async fn default_space(token: &str) -> String {
+    create_space(
+        token,
+        &Policy::MemberList,
+        &Policy::MemberList,
+        &AppAccess::Open,
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Capability detection
 // ---------------------------------------------------------------------------
@@ -115,14 +145,9 @@ async fn detection_reports_the_same_build_with_spaces_off_as_unsupported() {
 
 #[tokio::test]
 #[ignore]
-async fn zds_still_uses_the_pre_split_method_spellings() {
-    // Detection only reports ZDS as supported because the required-method list
-    // accepts alternate spellings. ZDS predates the 2026-09-10 rename and
-    // offers addMember rather than putMember; without the allowance a fully
-    // capable PDS would read as unsupported.
-    //
-    // If this starts failing, ZDS has caught up and the allowance can be
-    // reconsidered. It is a prompt to revisit, not a breakage.
+async fn zds_advertises_put_member_under_its_current_name() {
+    // Detection still accepts addMember for pds.js, but ZDS should satisfy the
+    // required list with canonical spellings alone.
     let (status, body) = get_json(
         &format!("{ZDS}/xrpc/community.lexicon.service.describe"),
         None,
@@ -137,8 +162,94 @@ async fn zds_still_uses_the_pre_split_method_spellings() {
         .map(|m| m["value"].as_str().unwrap())
         .collect();
 
-    assert!(methods.contains(&"com.atproto.simplespace.addMember"));
-    assert!(!methods.contains(&"com.atproto.simplespace.putMember"));
+    assert!(methods.contains(&"com.atproto.simplespace.putMember"));
+}
+
+// ---------------------------------------------------------------------------
+// simplespace: HappyView's types against ZDS
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn our_policy_and_app_access_unions_round_trip_through_zds() {
+    let (_, token) = new_account().await;
+    let read = Policy::Public;
+    let write = Policy::ManagingApp {
+        managing_app: "did:web:app.example#atproto_space".into(),
+    };
+    let app = AppAccess::AllowList {
+        allowed: vec!["https://app.example/client-metadata.json".into()],
+    };
+    let space = create_space(&token, &read, &write, &app).await;
+
+    let (status, body) = get_json(
+        &format!(
+            "{ZDS}/xrpc/com.atproto.simplespace.getSpace?space={}",
+            enc(&space)
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, 200, "getSpace failed: {body}");
+
+    let got_read: Policy = serde_json::from_value(body["readPolicy"].clone()).expect("readPolicy");
+    let got_write: Policy =
+        serde_json::from_value(body["writePolicy"].clone()).expect("writePolicy");
+    let got_app: AppAccess = serde_json::from_value(body["appAccess"].clone()).expect("appAccess");
+    assert_eq!(got_read, read);
+    assert_eq!(got_write, write);
+    assert_eq!(got_app, app);
+}
+
+#[tokio::test]
+#[ignore]
+async fn our_member_shape_round_trips_through_put_member_and_list_members() {
+    let (_, token) = new_account().await;
+    let space = default_space(&token).await;
+    let (other, _) = new_account().await;
+
+    let put = |access: MemberAccess| {
+        let (space, token, other) = (space.clone(), token.clone(), other.clone());
+        async move {
+            let mut body = serde_json::to_value(ResolvedMember { did: other, access }).unwrap();
+            body["space"] = json!(space);
+            post_json(
+                &format!("{ZDS}/xrpc/com.atproto.simplespace.putMember"),
+                Some(&token),
+                body,
+            )
+            .await
+        }
+    };
+
+    let (status, resp) = put(MemberAccess::READ).await;
+    assert!(status < 300, "putMember failed ({status}): {resp}");
+
+    // putMember is an upsert: granting write afterwards must replace, not
+    // duplicate or reject.
+    let (status, resp) = put(MemberAccess {
+        read: true,
+        write: true,
+        read_self: false,
+    })
+    .await;
+    assert!(status < 300, "second putMember failed ({status}): {resp}");
+
+    let (status, body) = get_json(
+        &format!(
+            "{ZDS}/xrpc/com.atproto.simplespace.listMembers?space={}",
+            enc(&space)
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, 200, "listMembers failed: {body}");
+
+    let members: Vec<ResolvedMember> =
+        serde_json::from_value(body["members"].clone()).expect("members parse as ours");
+    let found: Vec<_> = members.iter().filter(|m| m.did == other).collect();
+    assert_eq!(found.len(), 1, "putMember must upsert");
+    assert!(found[0].access.read && found[0].access.write);
 }
 
 // ---------------------------------------------------------------------------
@@ -149,22 +260,7 @@ async fn zds_still_uses_the_pre_split_method_spellings() {
 #[ignore]
 async fn a_commit_written_by_zds_verifies_and_agrees_with_our_set_hash() {
     let (did, token) = new_account().await;
-
-    // ZDS predates the readPolicy/writePolicy split and takes a single
-    // `policy`. This test is about commits, not space creation.
-    let (status, body) = post_json(
-        &format!("{ZDS}/xrpc/com.atproto.simplespace.createSpace"),
-        Some(&token),
-        json!({
-            "type": "com.example.forum",
-            "skey": "self",
-            "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
-        }),
-    )
-    .await;
-    assert!(status < 300, "createSpace failed ({status}): {body}");
-    let space_uri = body["uri"].as_str().expect("space uri").to_string();
+    let space_uri = default_space(&token).await;
 
     // Two records, so the set hash is over more than a trivial case.
     let mut expected = LtHashState::new();
@@ -246,18 +342,7 @@ async fn replaying_the_zds_oplog_across_pages_reproduces_its_commit() {
     // sends no `action`. A page limit of 2 forces the collector to follow
     // cursors.
     let (did, token) = new_account().await;
-    let (_, body) = post_json(
-        &format!("{ZDS}/xrpc/com.atproto.simplespace.createSpace"),
-        Some(&token),
-        json!({
-            "type": "com.example.forum",
-            "skey": "self",
-            "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
-        }),
-    )
-    .await;
-    let space_uri = body["uri"].as_str().expect("space uri").to_string();
+    let space_uri = default_space(&token).await;
 
     let write = |method: &'static str, body: Value| {
         let (space_uri, did, token) = (space_uri.clone(), did.clone(), token.clone());
@@ -343,19 +428,7 @@ async fn zds_encodes_commit_bytes_as_lexicon_bytes_not_bare_strings() {
     // The lexicon types these fields as `bytes`, which atproto renders as
     // {"$bytes": "<standard base64>"}, not as a bare base64url string.
     let (did, token) = new_account().await;
-
-    let (_, body) = post_json(
-        &format!("{ZDS}/xrpc/com.atproto.simplespace.createSpace"),
-        Some(&token),
-        json!({
-            "type": "com.example.forum",
-            "skey": "self",
-            "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
-        }),
-    )
-    .await;
-    let space_uri = body["uri"].as_str().expect("space uri").to_string();
+    let space_uri = default_space(&token).await;
 
     post_json(
         &format!("{ZDS}/xrpc/com.atproto.space.createRecord"),
@@ -398,18 +471,7 @@ async fn zds_encodes_commit_bytes_as_lexicon_bytes_not_bare_strings() {
 #[ignore]
 async fn the_migration_replay_lands_on_zds_with_the_hash_it_expects() {
     let (did, token) = new_account().await;
-    let (_, body) = post_json(
-        &format!("{ZDS}/xrpc/com.atproto.simplespace.createSpace"),
-        Some(&token),
-        json!({
-            "type": "com.example.forum",
-            "skey": "self",
-            "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
-            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
-        }),
-    )
-    .await;
-    let space = body["uri"].as_str().expect("space uri").to_string();
+    let space = default_space(&token).await;
 
     let records =
         interop_support::records_awaiting_migration(&space, &did, interop_support::Sample::Full);

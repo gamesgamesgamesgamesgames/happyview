@@ -195,6 +195,34 @@ pub async fn update_entry(
     Ok(parse_service_entry_row(row))
 }
 
+/// The fragment spec peers resolve to find a space authority's space host.
+pub const SPACE_HOST_FRAGMENT: &str = "#atproto_space_host";
+
+/// Publish `#atproto_space_host`, so peers resolving this instance as a space
+/// authority reach it. Leaves an existing entry alone, including one an
+/// operator has edited.
+pub async fn ensure_space_host_entry(
+    db: &AnyPool,
+    backend: DatabaseBackend,
+) -> Result<(), AppError> {
+    let now = Utc::now().to_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_service_entries (fragment_id, service_type, access_mode, created_at, updated_at) VALUES (?, 'AtprotoSpaceHost', 'all', ?, ?) \
+         ON CONFLICT (fragment_id) DO NOTHING",
+        backend,
+    );
+
+    crate::db::query(&sql)
+        .bind(SPACE_HOST_FRAGMENT)
+        .bind(&now)
+        .bind(&now)
+        .execute(db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to create space host entry: {e}")))?;
+
+    Ok(())
+}
+
 /// DELETE a service entry by id.
 pub async fn delete_entry(
     db: &AnyPool,

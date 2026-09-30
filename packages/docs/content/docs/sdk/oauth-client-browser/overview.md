@@ -52,11 +52,17 @@ The API client must be registered as a **public** client (no secret) with your a
 
 ## Sign in
 
-`signIn()` resolves the user's handle, discovers their PDS, provisions a DPoP key, and redirects the browser to the PDS authorization server:
+`signIn()` resolves the user's identifier, discovers their PDS, provisions a DPoP key, and redirects the browser to the PDS authorization server:
 
 ```typescript
 await client.signIn("alice.bsky.social");
 // Browser redirects — code stops here
+```
+
+Every sign-in method accepts either a handle or a DID as the identifier:
+
+```typescript
+await client.signIn("did:plc:abcdefghijklmnopqrstuvwx");
 ```
 
 To sign in via a popup window instead:
@@ -90,7 +96,7 @@ const { authorizationUrl, did, state } =
 
 ### What happens during sign in
 
-1. The handle is resolved to a DID via `resolveHandleToDid`.
+1. The identifier is resolved to a DID via `resolveHandleToDid`, unless it is already a DID.
 2. The DID document is fetched to find the PDS URL.
 3. The PDS's OAuth authorization server metadata is fetched.
 4. A DPoP key is provisioned from HappyView.

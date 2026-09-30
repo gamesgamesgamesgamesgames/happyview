@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { usePathname, useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { AlertTriangle, Wand2 } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
@@ -35,6 +35,7 @@ import { Button } from "@/components/ui/button";
 import {
   ScriptForm,
   type ScriptFormState,
+  scriptsReturnHref,
   stateFromScript,
 } from "../script-form";
 import { MigrateScriptDialog } from "../migrate-dialog";
@@ -49,6 +50,7 @@ export default function ScriptDetail() {
   );
   const { hasPermission } = useCurrentUser();
   const router = useRouter();
+  const returnHref = scriptsReturnHref(useSearchParams());
   const [script, setScript] = useState<Script | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refused, setRefused] = useState(false);
@@ -133,7 +135,7 @@ export default function ScriptDetail() {
     setDeleting(true);
     try {
       await deleteScript(script.id);
-      router.push("/dashboard/settings/scripts");
+      router.push(returnHref);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
       setDeleting(false);
@@ -143,7 +145,7 @@ export default function ScriptDetail() {
   if (error && !state) {
     return (
       <>
-        <SiteHeader title="Script" backHref="/dashboard/settings/scripts" />
+        <SiteHeader title="Script" backHref={returnHref} />
         <div className="p-4 md:p-6">
           <p className="text-destructive text-sm">{error}</p>
         </div>
@@ -154,7 +156,7 @@ export default function ScriptDetail() {
   if (!state) {
     return (
       <>
-        <SiteHeader title="Script" backHref="/dashboard/settings/scripts" />
+        <SiteHeader title="Script" backHref={returnHref} />
         <div className="p-4 md:p-6">
           <p className="text-muted-foreground text-sm">Loading...</p>
         </div>
@@ -173,7 +175,7 @@ export default function ScriptDetail() {
 
   return (
     <>
-      <SiteHeader title={`Script: ${id}`} backHref="/dashboard/settings/scripts" />
+      <SiteHeader title={`Script: ${id}`} backHref={returnHref} />
 
       <div className="flex flex-col flex-1 min-h-0">
         <div className="flex flex-col flex-1 min-h-0 gap-6 p-4 md:p-6">

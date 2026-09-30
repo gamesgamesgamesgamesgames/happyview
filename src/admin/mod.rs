@@ -9,6 +9,7 @@ mod dead_letters;
 mod domains;
 mod events;
 mod feature_flags;
+mod identity;
 mod jobs;
 mod labelers;
 mod lexicons;
@@ -111,6 +112,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route("/events", get(events::list_events))
         .route("/events/count", get(events::count_events))
         .route("/events/purge", post(events::purge_events))
+        .route("/identity/resolve", get(identity::resolve_identity))
         .route("/users", post(users::create_user).get(users::list_users))
         .route("/users/transfer-super", post(users::transfer_super))
         .route(

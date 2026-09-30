@@ -5,11 +5,10 @@ use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use k256;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::AppState;
 use crate::auth::XrpcClaims;
-use crate::db::{adapt_sql, now_rfc3339};
+use crate::db::now_rfc3339;
 use crate::error::AppError;
 use crate::spaces::scope::{check_delegation_token_access, check_read_access};
 use crate::spaces::service;
@@ -49,8 +48,11 @@ struct ListRepoOpsQuery {
 #[serde(rename_all = "camelCase")]
 struct RegisterNotifyInput {
     space: String,
-    service_did: String,
-    endpoint: String,
+    /// The subscribing service identifier, resolved to its endpoint.
+    service: Option<String>,
+    /// The legacy shape names a DID and a webhook URL. Accepted until v3.
+    service_did: Option<String>,
+    endpoint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -76,10 +78,42 @@ struct ListBlobsQuery {
 #[serde(rename_all = "camelCase")]
 struct NotifyWriteInput {
     space: String,
-    did: String,
-    collection: String,
-    rkey: String,
+    /// The repo that advanced, with its new `rev` and `hash`.
+    repo: Option<String>,
+    rev: Option<String>,
+    hash: Option<LexBytes>,
+    /// The legacy shape names one record instead of the repo's new state.
+    /// Accepted until v3.
+    did: Option<String>,
+    collection: Option<String>,
+    rkey: Option<String>,
     cid: Option<String>,
+}
+
+/// A lexicon `bytes` value, encoded in JSON as `{"$bytes": "<base64>"}`.
+#[derive(Deserialize)]
+struct LexBytes {
+    #[serde(rename = "$bytes")]
+    bytes: String,
+}
+
+impl LexBytes {
+    fn decode(&self) -> Result<Vec<u8>, AppError> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(self.bytes.trim_end_matches('='))
+            .map_err(|_| AppError::BadRequest("hash is not valid base64".into()))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListReposQuery {
+    space: String,
+    limit: Option<i64>,
+    cursor: Option<String>,
+    /// A space revision: list only repos updated after it.
+    since: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -144,6 +178,7 @@ struct ListRecordsQuery {
     limit: Option<i64>,
     cursor: Option<String>,
     reverse: Option<bool>,
+    include_values: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -171,7 +206,9 @@ struct RevokeInviteInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GetSpaceCredentialInput {
-    grant: String,
+    space: String,
+    /// Identifies the app, for spaces that gate on it.
+    client_attestation: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -332,10 +369,6 @@ pub fn space_routes() -> Router<AppState> {
             get(get_delegation_token),
         )
         .route(
-            &format!("/xrpc/{LEGACY_NS}.space.getSpaceCredential"),
-            post(get_space_credential),
-        )
-        .route(
             &format!("/xrpc/{LEGACY_NS}.space.createRecord"),
             post(create_record),
         )
@@ -379,7 +412,7 @@ async fn authorize_space_read(
     check_read_access(caller_did, target_repo_did, membership, has_credential)?;
 
     if has_credential {
-        return Ok(());
+        return require_audience(xrpc_claims, target_repo_did);
     }
     let Some(identity) = xrpc_claims.identity.as_ref() else {
         return Ok(());
@@ -396,6 +429,20 @@ async fn authorize_space_read(
     crate::spaces::scope::require_space_scope(state, identity, space, target).await
 }
 
+/// A credential-authenticated request must be addressed to the DID it is for:
+/// the repo it reads, or the space authority for space-wide methods. Otherwise a
+/// host serving one repo could replay the request against another.
+fn require_audience(claims: &XrpcClaims, expected: &str) -> Result<(), AppError> {
+    if claims.space_credential.is_none() || claims.space_audience.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    Err(AppError::XrpcError {
+        status: StatusCode::UNAUTHORIZED,
+        code: "BadSpaceSignature",
+        message: format!("request is not addressed to {expected}"),
+    })
+}
+
 fn require_auth(claims: &XrpcClaims) -> Result<&crate::auth::Claims, AppError> {
     claims
         .identity
@@ -404,19 +451,7 @@ fn require_auth(claims: &XrpcClaims) -> Result<&crate::auth::Claims, AppError> {
 }
 
 /// Like `require_auth`, but also accepts a verified space credential as an
-/// identity source. Use this in space endpoints that support `Bearer
-/// <space_credential>` in addition to DPoP auth.
-/// Whether a verified space credential has been revoked (e.g. its holder was
-/// removed from the space). Consulted after signature/exp verification so a
-/// leaked or stale credential can be invalidated before its TTL expires (M3).
-pub(crate) async fn space_credential_revoked(
-    state: &AppState,
-    token: &str,
-) -> Result<bool, AppError> {
-    let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
-    db::is_space_credential_revoked(&state.db, state.db_backend, &token_hash).await
-}
-
+/// identity source, for space endpoints that serve syncers as well as accounts.
 async fn require_auth_or_credential(
     state: &AppState,
     claims: &XrpcClaims,
@@ -426,15 +461,10 @@ async fn require_auth_or_credential(
     }
 
     if let Some(token) = &claims.space_credential {
-        let verified = crate::spaces::credential::verify_external_credential(
-            token,
-            &state.http,
-            &state.config.plc_url,
-        )
-        .await?;
-        if space_credential_revoked(state, token).await? {
-            return Err(AppError::Auth("space credential has been revoked".into()));
-        }
+        let space_uri = crate::spaces::credential::peek_credential_sub(token)
+            .ok_or_else(|| AppError::Auth("invalid space credential".into()))?;
+        let space = service::resolve_space(state, &space_uri).await?;
+        let verified = service::verify_space_credential(state, &space, token).await?;
         return Ok(verified.sub);
     }
 
@@ -459,22 +489,6 @@ fn require_notify_caller(claims: &XrpcClaims) -> Result<String, AppError> {
     ))
 }
 
-async fn resolve_client_id_url(
-    state: &AppState,
-    client_key: &str,
-) -> Result<Option<String>, AppError> {
-    let sql = adapt_sql(
-        "SELECT client_id_url FROM happyview_api_clients WHERE client_key = ?",
-        state.db_backend,
-    );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(client_key)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to look up API client: {e}")))?;
-    Ok(row.map(|(url,)| url))
-}
-
 // ---------------------------------------------------------------------------
 // Space read handlers
 // ---------------------------------------------------------------------------
@@ -493,7 +507,7 @@ pub(crate) async fn get_space(
     if !space.config.membership_public {
         let claims = require_auth(&xrpc_claims)?;
         let did = claims.did();
-        if space.authority_did != did {
+        if space.creator_did != did {
             members::is_member(&state.db, state.db_backend, &space.id, did)
                 .await?
                 .ok_or_else(|| AppError::NotFound("Space not found".into()))?;
@@ -879,7 +893,7 @@ async fn apply_writes(
         }
     }
 
-    service::commit_write(
+    let committed = service::commit_write(
         &mut tx,
         state.db_backend,
         &space,
@@ -893,7 +907,7 @@ async fn apply_writes(
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
 
-    service::notify_ops(&state, &space, &did, &ops).await;
+    service::notify_ops(&state, &space, &did, &ops, &rev, committed).await;
 
     Ok(Json(serde_json::json!({
         "results": results,
@@ -961,6 +975,11 @@ async fn list_records(
         xrpc_claims.space_credential.as_deref(),
     )
     .await?;
+    // Listing one repo is a repo read; listing across repos is the space host's.
+    require_audience(
+        &xrpc_claims,
+        query.repo.as_deref().unwrap_or(&space.authority_did),
+    )?;
 
     // read_self members may only list their own records regardless of what the caller requests
     let repo = if !has_credential && membership.restricted_to_own_records() {
@@ -987,14 +1006,19 @@ async fn list_records(
     )
     .await?;
 
+    let include_values = query.include_values.unwrap_or(false);
     let records_json: Vec<serde_json::Value> = records
         .into_iter()
         .map(|r| {
-            serde_json::json!({
+            let mut rec = serde_json::json!({
                 "collection": r.collection,
                 "rkey": r.rkey,
                 "cid": r.cid,
-            })
+            });
+            if include_values {
+                rec["value"] = r.record;
+            }
+            rec
         })
         .collect();
 
@@ -1396,9 +1420,10 @@ async fn list_repo_ops(
 async fn list_repos(
     State(state): State<AppState>,
     claims: XrpcClaims,
-    Query(params): Query<SpaceUriQuery>,
+    Query(params): Query<ListReposQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let space = service::resolve_space(&state, &params.space).await?;
+    require_audience(&claims, &space.authority_did)?;
 
     if !space.config.membership_public {
         let did = require_auth_or_credential(&state, &claims).await?;
@@ -1412,8 +1437,47 @@ async fn list_repos(
         .await?;
     }
 
-    let repos = db::list_space_repos(&state.db, state.db_backend, &space.id).await?;
-    Ok(Json(serde_json::json!({ "repos": repos })))
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+    let writers = crate::spaces::writers::list(
+        &state.db,
+        state.db_backend,
+        &space.id,
+        params.since.as_deref(),
+        params.cursor.as_deref(),
+        limit,
+    )
+    .await?;
+
+    let next_cursor = (writers.len() as i64 == limit).then(|| {
+        let last = writers.last().expect("a full page is not empty");
+        if params.since.is_some() {
+            last.space_rev.clone()
+        } else {
+            last.repo_did.clone()
+        }
+    });
+    let repos: Vec<serde_json::Value> = writers
+        .iter()
+        .map(|w| {
+            use base64::Engine;
+            serde_json::json!({
+                "did": w.repo_did,
+                "rev": w.rev,
+                "hash": { "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&w.hash) },
+            })
+        })
+        .collect();
+
+    let mut body = serde_json::json!({ "repos": repos });
+    if let Some(cursor) = next_cursor {
+        body["cursor"] = cursor.into();
+    }
+    if let Some(space_rev) =
+        crate::spaces::writers::current_space_rev(&state.db, state.db_backend, &space.id).await?
+    {
+        body[notifications::SPACE_REV_FIELD] = space_rev.into();
+    }
+    Ok(Json(body))
 }
 
 async fn get_space_blob(
@@ -1504,18 +1568,50 @@ async fn register_notify(
 ) -> Result<impl IntoResponse, AppError> {
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &input.space).await?;
+    require_audience(&claims, &space.authority_did)?;
 
-    let id = notifications::register(
+    if let Some(service) = &input.service {
+        let endpoint = crate::spaces::auth::resolve_service_identifier(
+            &state.http,
+            &state.config.plc_url,
+            service,
+        )
+        .await
+        .ok_or_else(|| AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "ServiceNotResolvable",
+            message: format!("could not resolve a service endpoint for {service}"),
+        })?;
+        let (_, expires_at) = notifications::register(
+            &state.db,
+            state.db_backend,
+            &space.id,
+            service,
+            &endpoint,
+            &did,
+            NotifyDelivery::Xrpc,
+        )
+        .await?;
+        return Ok(Json(serde_json::json!({ "expiresAt": expires_at })));
+    }
+
+    let (Some(service_did), Some(endpoint)) = (&input.service_did, &input.endpoint) else {
+        return Err(AppError::BadRequest("service is required".into()));
+    };
+    let (id, expires_at) = notifications::register(
         &state.db,
         state.db_backend,
         &space.id,
-        &input.service_did,
-        &input.endpoint,
+        service_did,
+        endpoint,
         &did,
+        NotifyDelivery::Webhook,
     )
     .await?;
 
-    Ok(Json(serde_json::json!({ "id": id })))
+    Ok(Json(
+        serde_json::json!({ "id": id, "expiresAt": expires_at }),
+    ))
 }
 
 /// Withdraw a write-notification registration.
@@ -1528,6 +1624,7 @@ async fn unregister_notify(
 ) -> Result<impl IntoResponse, AppError> {
     let did = require_auth_or_credential(&state, &claims).await?;
     let space = service::resolve_space(&state, &input.space).await?;
+    require_audience(&claims, &space.authority_did)?;
 
     // A registration belongs to the service that made it; anyone else removing
     // it would stop that service syncing. The space authority may also
@@ -1613,25 +1710,43 @@ async fn notify_write(
     claims: XrpcClaims,
     Json(input): Json<NotifyWriteInput>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Inter-service route: only the space authority (or a super admin) may fire
-    // write notifications. Previously this ignored the caller entirely, letting
-    // anyone spam/forge notifications to registered endpoints (M1).
-    let did = require_notify_caller(&claims)?;
+    let writer = input
+        .repo
+        .clone()
+        .or_else(|| input.did.clone())
+        .ok_or_else(|| AppError::BadRequest("repo is required".into()))?;
+
+    // A repo host notifies with service auth signed as the account that wrote,
+    // so the caller must be that account. The space's creator and super admins
+    // may also notify, as the legacy shape expects.
+    let caller = require_notify_caller(&claims)?;
     let space = service::resolve_space(&state, &input.space).await?;
-    service::require_space_admin(&state, &space, &did).await?;
+    if caller != writer {
+        service::require_space_admin(&state, &space, &caller).await?;
+    }
+
+    // Spec-shaped notifications come from repo hosts, and the authority tracks
+    // only the writers its write policy admits.
+    if input.repo.is_some()
+        && !crate::spaces::auth::writer_admitted(&state, &space, &writer).await?
+    {
+        return Err(AppError::Forbidden(
+            "this space does not accept writes from this account".into(),
+        ));
+    }
 
     // A notification for a repo hosted on the author's own PDS is our cue to
     // pull: the write happened there, and our index has not seen it yet. This
     // is a no-op for polyfill repos, where HappyView is the source of truth and
     // there is nothing upstream.
-    match crate::spaces::native_sync::sync_repo(&state, &space, &input.did).await {
+    match crate::spaces::native_sync::sync_repo(&state, &space, &writer).await {
         Ok(crate::spaces::native_sync::SyncOutcome::Diverged { expected, ours }) => {
             // Incremental sync closed no gap. The sender did nothing wrong, so
             // the notification still succeeds, and the divergence is logged as
             // an error.
             tracing::error!(
                 space_id = %space.id,
-                author_did = %input.did,
+                author_did = %writer,
                 expected,
                 ours,
                 "native repo diverged after sync; full recovery needed"
@@ -1640,23 +1755,67 @@ async fn notify_write(
         Ok(_) => {}
         Err(e) => tracing::warn!(
             space_id = %space.id,
-            author_did = %input.did,
+            author_did = %writer,
             error = %e,
             "failed to sync a native repo after a write notification"
         ),
     }
 
-    notifications::dispatch_write_notification(
-        &state.db,
-        state.db_backend,
-        &state.http,
-        &space.id,
-        &input.did,
-        &input.collection,
-        &input.rkey,
-        input.cid.as_deref(),
-    )
-    .await?;
+    if let (Some(rev), Some(hash)) = (&input.rev, &input.hash) {
+        let hash = hash.decode()?;
+        let mut conn = state
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+        let recorded = crate::spaces::writers::record(
+            &mut conn,
+            state.db_backend,
+            &space.id,
+            &writer,
+            rev,
+            &hash,
+        )
+        .await?;
+        conn.commit()
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
+
+        // A repeated or out-of-order report changes nothing, so nobody hears
+        // about it.
+        if let crate::spaces::writers::Recorded::Advanced {
+            space_rev,
+            prev_space_rev,
+        } = recorded
+        {
+            notifications::forward_repo_update(
+                &state,
+                &space.id,
+                notifications::RepoUpdate {
+                    space_uri: input.space.clone(),
+                    repo: writer.clone(),
+                    rev: rev.clone(),
+                    hash,
+                    space_rev,
+                    prev_space_rev,
+                },
+            );
+        }
+    }
+
+    if let (Some(collection), Some(rkey)) = (&input.collection, &input.rkey) {
+        notifications::dispatch_write_notification(
+            &state.db,
+            state.db_backend,
+            &state.http,
+            &space.id,
+            &writer,
+            collection,
+            rkey,
+            input.cid.as_deref(),
+        )
+        .await?;
+    }
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
@@ -1672,71 +1831,108 @@ async fn notify_space_deleted(
     let space = service::resolve_space(&state, &input.space).await?;
     service::require_space_admin(&state, &space, &did).await?;
 
-    notifications::dispatch_space_deleted(&state.db, state.db_backend, &state.http, &space.id)
-        .await?;
+    let registrations =
+        db::list_notify_registrations(&state.db, state.db_backend, &space.id).await?;
+    notifications::announce_space_deleted(&state, &space, registrations);
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// Exchange a delegation token for a space credential bound to the caller's key.
+///
+/// The delegation token is the request's authorization token, and an
+/// `atproto-space` HTTP Message Signature over it proves possession of the key
+/// the credential is bound to. No account session is involved: the delegation
+/// token is the account's consent, and the credential goes to whoever holds the
+/// key.
 async fn get_space_credential(
     State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
+    headers: HeaderMap,
     Json(input): Json<GetSpaceCredentialInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| AppError::Auth("a delegation token is required".into()))?
+        .to_string();
+    let bound_key = crate::spaces::http_signature::verify(&headers, None)?;
 
     let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
         AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
     })?;
 
-    let verifying_key = {
-        let signing_key = k256::ecdsa::SigningKey::from_slice(encryption_key).map_err(|e| {
-            AppError::Internal(format!("failed to derive delegation signing key: {e}"))
-        })?;
-        k256::ecdsa::VerifyingKey::from(&signing_key)
-    };
+    let space = service::resolve_space(&state, &input.space).await?;
+    // An authority that publishes no #atproto_space_host is reached at its
+    // #atproto_pds endpoint, so a token may name either.
+    let space_host_aud = format!("{}#atproto_space_host", space.did);
+    let pds_aud = format!("{}#atproto_pds", space.did);
+    let accepted_aud = [space_host_aud.as_str(), pds_aud.as_str()];
 
-    let delegation_claims = {
-        let unverified_sub = crate::spaces::credential::peek_delegation_sub(&input.grant)
-            .ok_or_else(|| AppError::Auth("invalid delegation token".into()))?;
-        let space_did = crate::spaces::SpaceUri::parse(&unverified_sub)
-            .map(|u| u.did.clone())
-            .unwrap_or_default();
-        // An authority that publishes no #atproto_space_host is reached at its
-        // #atproto_pds endpoint, so a token may name either.
-        let space_host_aud = format!("{space_did}#atproto_space_host");
-        let pds_aud = format!("{space_did}#atproto_pds");
-        crate::spaces::credential::verify_delegation_token(
-            &input.grant,
-            &verifying_key,
-            &[space_host_aud.as_str(), pds_aud.as_str()],
-        )?
-    };
-
-    // The credential is minted for the delegation token's subject (`iss`).
-    // Require the authenticated caller to *be* that subject — otherwise anyone
-    // who captures a member's short-lived (60s) delegation token could mint a 2h
-    // credential in that member's name (M4). The documented flow has the same
-    // member's app perform both steps; only the final credential is handed to an
-    // external service.
-    if claims.did() != delegation_claims.iss.as_str() {
-        return Err(AppError::Forbidden(
-            "delegation token was issued to a different account".into(),
-        ));
+    // A PDS that serves spaces mints delegation tokens with the account's own
+    // key. For accounts on one that does not, HappyView mints them with its own
+    // delegation key.
+    let delegation_claims =
+        match verify_local_delegation_token(encryption_key, &token, &accepted_aud) {
+            Ok(claims) => claims,
+            Err(_) => crate::spaces::credential::verify_account_delegation_token(
+                &token,
+                &state.http,
+                &state.config.plc_url,
+                &accepted_aud,
+            )
+            .await
+            .map_err(|e| AppError::XrpcError {
+                status: StatusCode::BAD_REQUEST,
+                code: "InvalidDelegationToken",
+                message: e.to_string(),
+            })?,
+        };
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if delegation_claims.sub != space_uri {
+        return Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidDelegationToken",
+            message: "delegation token is for a different space".into(),
+        });
+    }
+    if !db::consume_delegation_token(
+        &state.db,
+        state.db_backend,
+        &delegation_claims.iss,
+        &delegation_claims.jti,
+        delegation_claims.exp,
+    )
+    .await?
+    {
+        return Err(AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "InvalidDelegationToken",
+            message: "delegation token has already been used".into(),
+        });
     }
 
-    let space = service::resolve_space(&state, &delegation_claims.sub).await?;
-
-    // Re-verify current membership before minting. The `MemberList` mint policy
-    // is a no-op that trusts the delegation token, so a member removed within the
-    // token's 60s window would otherwise still be able to mint.
-    service::require_membership(&state, &space, &delegation_claims.iss, false, None).await?;
-
-    let client_id = if let Some(key) = claims.client_key() {
-        resolve_client_id_url(&state, key).await?
-    } else {
-        None
+    let client_id = match &input.client_attestation {
+        Some(attestation) => Some(
+            crate::spaces::client_attestation::verify_client_attestation(
+                attestation,
+                &space.authority_did,
+                &state.http,
+            )
+            .await
+            .map_err(|e| AppError::XrpcError {
+                status: StatusCode::BAD_REQUEST,
+                code: "InvalidClientAttestation",
+                message: e.to_string(),
+            })?
+            .client_id,
+        ),
+        None => None,
     };
+
     let issued = crate::spaces::auth::issue_credential(
         &state.db,
         state.db_backend,
@@ -1748,6 +1944,7 @@ async fn get_space_credential(
         &delegation_claims.iss,
         client_id.as_deref(),
         &space.authority_did,
+        Some(&bound_key),
     )
     .await?;
 
@@ -1755,6 +1952,21 @@ async fn get_space_credential(
         "credential": issued.token,
         "expiresAt": issued.expires_at,
     })))
+}
+
+/// Verify a delegation token HappyView minted with its own delegation key.
+fn verify_local_delegation_token(
+    encryption_key: &[u8; 32],
+    token: &str,
+    accepted_aud: &[&str],
+) -> Result<crate::spaces::credential::DelegationTokenClaims, AppError> {
+    let signing_key = k256::ecdsa::SigningKey::from_slice(encryption_key)
+        .map_err(|e| AppError::Internal(format!("failed to derive delegation signing key: {e}")))?;
+    crate::spaces::credential::verify_delegation_token(
+        token,
+        &k256::ecdsa::VerifyingKey::from(&signing_key),
+        accepted_aud,
+    )
 }
 
 #[cfg(test)]

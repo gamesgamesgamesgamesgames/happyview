@@ -94,6 +94,18 @@ pub async fn rebuild_repo_state(
 
     if rev_policy == RevPolicy::Advance {
         db::update_space_revision(&mut *tx, backend, space_id, &rev).await?;
+        crate::spaces::writers::record(&mut *tx, backend, space_id, author_did, &rev, &signed.hash)
+            .await?;
+    } else {
+        crate::spaces::writers::replace_hash(
+            &mut *tx,
+            backend,
+            space_id,
+            author_did,
+            &rev,
+            &signed.hash,
+        )
+        .await?;
     }
 
     Ok(true)

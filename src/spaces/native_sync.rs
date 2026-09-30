@@ -169,6 +169,135 @@ pub async fn sync_repo(
     })
 }
 
+/// Record a commit pulled from a repo's host as the space's view of that
+/// repo, and tell syncers if it moved the repo forward.
+pub async fn adopt_synced_commit(
+    state: &AppState,
+    space: &Space,
+    author_did: &str,
+    rev: &str,
+    hash: &[u8],
+) -> Result<(), AppError> {
+    let mut conn = state
+        .db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to acquire connection: {e}")))?;
+    let recorded = crate::spaces::writers::record(
+        &mut conn,
+        state.db_backend,
+        &space.id,
+        author_did,
+        rev,
+        hash,
+    )
+    .await?;
+    if let crate::spaces::writers::Recorded::Advanced {
+        space_rev,
+        prev_space_rev,
+    } = recorded
+    {
+        crate::spaces::notifications::forward_repo_update(
+            state,
+            &space.id,
+            crate::spaces::notifications::RepoUpdate {
+                space_uri: space_uri(space),
+                repo: author_did.to_string(),
+                rev: rev.to_string(),
+                hash: hash.to_vec(),
+                space_rev,
+                prev_space_rev,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// How a sweep went.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SweepSummary {
+    pub visited: usize,
+    pub failed: usize,
+}
+
+/// How often every native repo is pulled regardless of notifications.
+pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Pull every native repo, catching writes whose notification never arrived.
+///
+/// Repo hosts are meant to retry notifications until the space host has them,
+/// but hosts that predate that rule deliver once and move on. This is what
+/// keeps a dropped notification from leaving a repo stale indefinitely.
+pub async fn sweep(state: &AppState) -> Result<SweepSummary, AppError> {
+    let sql = crate::db::adapt_sql(
+        "SELECT space_id, author_did FROM happyview_space_repo_state WHERE host_mode = 'native'",
+        state.db_backend,
+    );
+    let repos: Vec<(String, String)> = crate::db::query_as(&sql)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list native repos: {e}")))?;
+
+    let mut summary = SweepSummary::default();
+    for (space_id, author_did) in repos {
+        summary.visited += 1;
+        if let Err(e) = sweep_repo(state, &space_id, &author_did).await {
+            summary.failed += 1;
+            tracing::warn!(space_id, author_did, error = %e, "sweep could not sync a native repo");
+        }
+    }
+    Ok(summary)
+}
+
+async fn sweep_repo(state: &AppState, space_id: &str, author_did: &str) -> Result<(), AppError> {
+    let Some(space) = db::get_space(&state.db, state.db_backend, space_id).await? else {
+        return Ok(());
+    };
+    match sync_repo(state, &space, author_did).await? {
+        SyncOutcome::Applied { .. } => {
+            let mut conn =
+                state.db.acquire().await.map_err(|e| {
+                    AppError::Internal(format!("failed to acquire connection: {e}"))
+                })?;
+            let repo_state =
+                db::get_or_create_repo_state(&mut conn, state.db_backend, space_id, author_did)
+                    .await?;
+            drop(conn);
+            if let (Some(rev), Some(hash)) = (repo_state.rev, repo_state.hash) {
+                adopt_synced_commit(state, &space, author_did, &rev, &hash).await?;
+            }
+            Ok(())
+        }
+        SyncOutcome::Diverged { expected, ours } => Err(AppError::Internal(format!(
+            "native repo diverged: host has {expected}, index has {ours}"
+        ))),
+        SyncOutcome::NotNative | SyncOutcome::UpToDate => Ok(()),
+    }
+}
+
+/// Run [`sweep`] every [`SWEEP_INTERVAL`] while spaces are enabled.
+pub async fn run_sweeper(state: AppState) {
+    loop {
+        tokio::time::sleep(SWEEP_INTERVAL).await;
+        if !crate::feature_flags::is_enabled(
+            &state.db,
+            crate::feature_flags::FeatureFlag::SPACES_ENABLED,
+            state.db_backend,
+        )
+        .await
+        {
+            continue;
+        }
+        match sweep(&state).await {
+            Ok(summary) if summary.failed > 0 => {
+                tracing::warn!(?summary, "native repo sweep finished with failures");
+            }
+            Ok(summary) => tracing::debug!(?summary, "native repo sweep finished"),
+            Err(e) => tracing::warn!(error = %e, "native repo sweep failed"),
+        }
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -201,6 +330,85 @@ mod tests {
             record_uri(&space, "did:plc:me", "com.example.note", "abc"),
             "at://did:plc:auth/space/com.example.forum/main/did:plc:me/com.example.note/abc"
         );
+    }
+
+    fn test_space(id: &str) -> Space {
+        Space {
+            id: id.into(),
+            did: "did:plc:auth".into(),
+            authority_did: "did:plc:auth".into(),
+            creator_did: "did:plc:auth".into(),
+            type_nsid: "com.example.forum".into(),
+            skey: id.into(),
+            display_name: None,
+            description: None,
+            read_policy: crate::spaces::types::Policy::MemberList,
+            write_policy: crate::spaces::types::Policy::MemberList,
+            app_access: crate::spaces::types::AppAccess::Open,
+            config: crate::spaces::types::SpaceConfig::default(),
+            revision: None,
+            created_at: crate::db::now_rfc3339(),
+            updated_at: crate::db::now_rfc3339(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_adopted_commit_joins_the_writer_set() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let space = test_space("sp-adopt");
+        db::create_space(&state.db, state.db_backend, &space)
+            .await
+            .unwrap();
+
+        let rev = crate::tid::generate_tid();
+        adopt_synced_commit(&state, &space, "did:plc:me", &rev, &[4; 32])
+            .await
+            .unwrap();
+
+        let writers =
+            crate::spaces::writers::list(&state.db, state.db_backend, &space.id, None, None, 10)
+                .await
+                .unwrap();
+        assert_eq!(writers.len(), 1);
+        assert_eq!(writers[0].repo_did, "did:plc:me");
+        assert_eq!(writers[0].rev, rev);
+    }
+
+    #[tokio::test]
+    async fn a_sweep_visits_every_native_repo_and_survives_failures() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        for (space_id, author) in [("sp-a", "did:plc:a"), ("sp-b", "did:plc:b")] {
+            db::create_space(&state.db, state.db_backend, &test_space(space_id))
+                .await
+                .unwrap();
+            let mut conn = state.db.acquire().await.unwrap();
+            let mut repo_state =
+                db::get_or_create_repo_state(&mut conn, state.db_backend, space_id, author)
+                    .await
+                    .unwrap();
+            repo_state.host_mode = HostMode::Native;
+            db::update_repo_state(&mut *conn, state.db_backend, &repo_state)
+                .await
+                .unwrap();
+        }
+        db::create_space(&state.db, state.db_backend, &test_space("sp-poly"))
+            .await
+            .unwrap();
+        let mut conn = state.db.acquire().await.unwrap();
+        db::get_or_create_repo_state(&mut conn, state.db_backend, "sp-poly", "did:plc:p")
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Neither native repo has an OAuth session, so each sync fails, and the
+        // failure of the first must not stop the second being tried.
+        let summary = sweep(&state).await.unwrap();
+        assert_eq!(summary.visited, 2);
+        assert_eq!(summary.failed, 2);
     }
 
     #[tokio::test]

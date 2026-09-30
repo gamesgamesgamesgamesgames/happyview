@@ -2,6 +2,7 @@ export interface BackfillJob {
   id: string
   collection: string | null
   did: string | null
+  scope: "network" | "dids"
   status: string
   stage: string
   total_repos: number | null

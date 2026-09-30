@@ -104,6 +104,7 @@ hkdf = "0.13"
 hmac = "0.13"
 sqlparser = "0.62.0"
 subtle = "2"
+sfv = "0.15"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

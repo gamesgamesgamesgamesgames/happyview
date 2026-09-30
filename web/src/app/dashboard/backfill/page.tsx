@@ -6,6 +6,8 @@ import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { toastError } from "@/lib/format";
+import { backfillTargetLabel } from "@/lib/backfill-target";
+import { AccountInput } from "@/components/account-input/account-input";
 import {
   cancelBackfillJob,
   pauseBackfillJob,
@@ -67,7 +69,6 @@ import {
   ResponsiveDialogTitle,
   ResponsiveDialogTrigger,
 } from "@/components/ui/responsive-dialog";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Sheet,
@@ -587,7 +588,7 @@ export default function BackfillPage() {
               <TableRow>
                 <TableHead>ID</TableHead>
                 <TableHead>Collection</TableHead>
-                <TableHead>DID</TableHead>
+                <TableHead>Accounts</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Started</TableHead>
               </TableRow>
@@ -624,7 +625,7 @@ export default function BackfillPage() {
                     {job.collection ?? "All"}
                   </TableCell>
                   <TableCell className="font-mono text-sm">
-                    {job.did ?? "All"}
+                    {backfillTargetLabel(job)}
                   </TableCell>
                   <TableCell>{statusBadge(job)}</TableCell>
                   <TableCell>
@@ -975,8 +976,10 @@ function JobDetail({
             <p className="font-mono text-xs">{job.collection ?? "All"}</p>
           </div>
           <div>
-            <span className="text-muted-foreground">DID</span>
-            <p className="font-mono text-xs break-all">{job.did ?? "All"}</p>
+            <span className="text-muted-foreground">Accounts</span>
+            <p className="font-mono text-xs break-all">
+              {backfillTargetLabel(job)}
+            </p>
           </div>
           <div>
             <span className="text-muted-foreground">Created</span>
@@ -1415,7 +1418,8 @@ function ProgressRow({
 
 function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
   const [collection, setCollection] = useState<string | null>(null);
-  const [did, setDid] = useState("");
+  const [dids, setDids] = useState<string[]>([]);
+  const [accountsBlocked, setAccountsBlocked] = useState(false);
   const [open, setOpen] = useState(false);
   const [recordLexicons, setRecordLexicons] = useState<string[]>([]);
 
@@ -1438,11 +1442,11 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
     try {
       await createBackfillJob({
         collection: collection || undefined,
-        did: did || undefined,
+        dids: dids.length > 0 ? dids : undefined,
       });
       toast.success("Backfill job created");
       setCollection(null);
-      setDid("");
+      setDids([]);
       setOpen(false);
       onSuccess();
     } catch (e: unknown) {
@@ -1470,8 +1474,9 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
         <ResponsiveDialogHeader>
           <ResponsiveDialogTitle>Create Backfill Job</ResponsiveDialogTitle>
           <ResponsiveDialogDescription>
-            Start a backfill for a collection or specific DID. Leave both empty
-            to backfill all collections.
+            Backfill a collection, specific accounts, or both. Without
+            accounts, every repo on the network with matching records is
+            backfilled; without a collection, every record collection is.
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
         <div className="flex flex-col gap-4">
@@ -1499,20 +1504,25 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
             </Combobox>
           </div>
           <div className="flex flex-col gap-2">
-            <Label htmlFor="bf-did">DID (optional)</Label>
-            <Input
-              id="bf-did"
-              value={did}
-              onChange={(e) => setDid(e.target.value)}
-              placeholder="did:plc:..."
+            <Label htmlFor="bf-accounts">Accounts (optional)</Label>
+            <AccountInput
+              id="bf-accounts"
+              onChange={setDids}
+              onBlockedChange={setAccountsBlocked}
             />
+            <p className="text-muted-foreground text-xs">
+              Search by handle, or paste handles and DIDs separated by commas
+              or spaces.
+            </p>
           </div>
         </div>
         <ResponsiveDialogFooter>
           <ResponsiveDialogClose asChild>
             <Button variant="outline">Cancel</Button>
           </ResponsiveDialogClose>
-          <Button onClick={handleCreate}>Create</Button>
+          <Button onClick={handleCreate} disabled={accountsBlocked}>
+            Create
+          </Button>
         </ResponsiveDialogFooter>
       </ResponsiveDialogContent>
     </ResponsiveDialog>

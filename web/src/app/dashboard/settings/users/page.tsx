@@ -6,6 +6,7 @@ import { toast } from "sonner";
 
 import { useAuth } from "@/lib/auth-context";
 import { toastError } from "@/lib/format";
+import { AccountInput } from "@/components/account-input/account-input";
 import {
   getUsers,
   addUser,
@@ -789,19 +790,20 @@ function AddUserDialog({
   templates: PermissionTemplate[];
   templatePermissions: Record<string, string[]>;
 }) {
-  const [identifier, setIdentifier] = useState("");
+  const [dids, setDids] = useState<string[]>([]);
+  const [accountBlocked, setAccountBlocked] = useState(false);
   const [template, setTemplate] = useState<string>("");
   const [open, setOpen] = useState(false);
 
   async function handleAdd() {
+    const [did] = dids;
+    if (!did) return;
     try {
-      const body: { did: string; template?: string } = {
-        did: identifier.trim(),
-      };
+      const body: { did: string; template?: string } = { did };
       if (template) body.template = template;
       await addUser(body);
       toast.success("User added");
-      setIdentifier("");
+      setDids([]);
       setTemplate("");
       setOpen(false);
       onSuccess();
@@ -815,7 +817,18 @@ function AddUserDialog({
       <ResponsiveDialogTrigger asChild>
         <Button>Add User</Button>
       </ResponsiveDialogTrigger>
-      <ResponsiveDialogContent>
+      <ResponsiveDialogContent
+        onInteractOutside={(e) => {
+          const target = e.target as HTMLElement;
+          if (
+            target.closest(
+              "[data-slot='combobox-item'], [data-slot='combobox-content']",
+            )
+          ) {
+            e.preventDefault();
+          }
+        }}
+      >
         <ResponsiveDialogHeader>
           <ResponsiveDialogTitle>Add User</ResponsiveDialogTitle>
           <ResponsiveDialogDescription>
@@ -826,14 +839,14 @@ function AddUserDialog({
         <div className="flex flex-col gap-4">
           <div className="flex flex-col gap-2">
             <Label htmlFor="user-did">Handle or DID</Label>
-            <Input
+            <AccountInput
               id="user-did"
-              value={identifier}
-              onChange={(e) => setIdentifier(e.target.value)}
-              placeholder="alice.bsky.social or did:plc:..."
+              max={1}
+              onChange={setDids}
+              onBlockedChange={setAccountBlocked}
             />
             <p className="text-muted-foreground text-xs">
-              Handles are resolved to a DID when the user is added.
+              Search by handle, or paste a DID.
             </p>
           </div>
           <div className="flex flex-col gap-2">
@@ -861,7 +874,7 @@ function AddUserDialog({
           <ResponsiveDialogClose asChild>
             <Button variant="outline">Cancel</Button>
           </ResponsiveDialogClose>
-          <Button onClick={handleAdd} disabled={!identifier.trim()}>
+          <Button onClick={handleAdd} disabled={dids.length === 0 || accountBlocked}>
             Add
           </Button>
         </ResponsiveDialogFooter>

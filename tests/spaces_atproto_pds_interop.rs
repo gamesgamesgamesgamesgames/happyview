@@ -366,15 +366,17 @@ async fn the_migration_replay_lands_on_atproto_pds_with_the_hash_it_expects() {
 }
 
 // ---------------------------------------------------------------------------
-// Where atproto-pds diverges from the current spec
+// The member method and the read/write policy split
 //
-// Not HappyView bugs: HappyView sends a PDS no simplespace calls. Pinned so a
-// change in atproto-pds is noticed.
+// HappyView sends a PDS no simplespace calls, so none of this reaches it.
+// Pinned so a change in atproto-pds is noticed.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore]
-async fn atproto_pds_still_uses_the_pre_split_member_methods() {
+async fn atproto_pds_serves_only_the_canonical_member_method() {
+    // pds.js serves both spellings; this server serves the canonical one alone,
+    // so the alternate spelling REQUIRED_METHODS accepts is not what matches it.
     let body: Value = client()
         .get(format!("{PDS}/xrpc/community.lexicon.service.describe"))
         .send()
@@ -389,15 +391,16 @@ async fn atproto_pds_still_uses_the_pre_split_member_methods() {
         .iter()
         .filter_map(|m| m["value"].as_str())
         .collect();
-    assert!(methods.contains(&"com.atproto.simplespace.addMember"));
-    assert!(!methods.contains(&"com.atproto.simplespace.putMember"));
+    assert!(methods.contains(&"com.atproto.simplespace.putMember"));
+    assert!(!methods.contains(&"com.atproto.simplespace.addMember"));
 }
 
 #[tokio::test]
 #[ignore]
-async fn atproto_pds_does_not_take_split_read_and_write_policies() {
-    // This server refuses a request that carries only the split fields, where
-    // pds.js accepts them and stores member-list.
+async fn atproto_pds_stores_split_read_and_write_policies() {
+    // A space carrying only the split fields keeps them, and getSpace answers
+    // with the split alone: the single `policy` field is not echoed back, where
+    // pds.js mirrors one into it.
     let account = Account::new().await;
     let (status, body) = account
         .post(
@@ -411,15 +414,17 @@ async fn atproto_pds_does_not_take_split_read_and_write_policies() {
             }),
         )
         .await;
-    assert_eq!(
-        status, 400,
-        "atproto-pds now accepts the split; check it stores it and drop this: {body}"
-    );
-    assert!(
-        body["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("policy"),
-        "rejected, but not for lacking a policy: {body}"
-    );
+    assert_eq!(status, 200, "createSpace failed: {body}");
+
+    let space = body["uri"].as_str().expect("space uri").to_string();
+    let (status, body) = account
+        .get("com.atproto.simplespace.getSpace", &[("space", space)])
+        .await;
+    assert_eq!(status, 200, "getSpace failed: {body}");
+
+    let read: Policy = serde_json::from_value(body["readPolicy"].clone()).expect("readPolicy");
+    let write: Policy = serde_json::from_value(body["writePolicy"].clone()).expect("writePolicy");
+    assert_eq!(read, Policy::Public, "{body}");
+    assert_eq!(write, Policy::Public, "{body}");
+    assert!(body.get("policy").is_none(), "{body}");
 }
