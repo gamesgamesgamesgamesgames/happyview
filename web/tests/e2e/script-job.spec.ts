@@ -88,7 +88,11 @@ test.describe("Job Script Creation", () => {
     await page.locator("#source-pick").click()
     await page.getByRole("option", { name: /Job/ }).click()
 
-    await expect(page.getByText("job.input").first()).toBeVisible({
+    // Both are reached through `ctx.job` and neither appears in another
+    // template, so together they say the editor loaded this one. The job's
+    // input arrives as `handle`'s first argument, which every template shares
+    // and so cannot identify this one.
+    await expect(page.getByText("job.progress").first()).toBeVisible({
       timeout: 3000,
     })
     await expect(page.getByText("job.should_stop").first()).toBeVisible()
