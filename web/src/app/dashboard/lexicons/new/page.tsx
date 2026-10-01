@@ -75,7 +75,7 @@ export default function AddLexiconPage() {
 
   const mainType = useMemo(() => {
     return resolved.nsid === nsid ? resolved.type : undefined;
-  }, [resolved])
+  }, [resolved, nsid]);
 
   const localMainType = useMemo(() => {
     try {
@@ -200,6 +200,7 @@ export default function AddLexiconPage() {
     try {
       const added = await addNetworkLexicon({
         nsid,
+        backfill: mainType === "record" && backfill,
         target_collection: showNetworkTargetCollection
           ? networkTargetCollection || undefined
           : undefined,
@@ -299,7 +300,7 @@ export default function AddLexiconPage() {
                     items={suggestions}
                     filter={null}
                     inputValue={nsid}
-                    onInputValueChange={setNsid}
+                    onInputValueChange={setNsid}                  
                     onValueChange={(suggestion: LexiconSuggestion | null) => {
                       if (suggestion) setNsid(suggestion.nsid);
                     }}
