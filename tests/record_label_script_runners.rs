@@ -557,8 +557,10 @@ async fn four_failed_attempts_dead_letter_a_delete_and_let_it_through() {
             "record": Value::Null,
         })
     );
-    // The interpreter's unparsed text, line prefix included, since every
-    // reader of this column is an operator debugging the script.
+    // The category the failure arrived with and the interpreter's unparsed
+    // text, line prefix included, since every reader of this column is an
+    // operator debugging the script.
+    assert!(row.error.starts_with("runtime: "), "{}", row.error);
     assert_eq!(happyview::error::parse_lua_line(&row.error).0, Some(7));
 
     let rows = events(&app, "script.dead_lettered").await;
@@ -596,6 +598,7 @@ async fn four_failed_attempts_dead_letter_a_label_and_persist_the_original() {
     assert_eq!(row.host_id, LABELER);
     assert_eq!(row.attempts, 4);
     assert_eq!(row.collection.as_deref(), Some("app.bsky.feed.post"));
+    assert!(row.error.starts_with("runtime: "), "{}", row.error);
     assert_eq!(
         row.payload,
         json!({
@@ -612,6 +615,40 @@ async fn four_failed_attempts_dead_letter_a_label_and_persist_the_original() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].1.as_deref(), Some(LABEL_URI));
     assert_eq!(rows[0].2["host_kind"], "label");
+}
+
+/// The dead-letter table has one error column and no category of its own, so
+/// the category the failure arrived with has to be in that column's text. A
+/// timeout and an exhausted heap are the two that describe themselves in no
+/// prose, so they are the two that become unreadable without it.
+#[tokio::test]
+async fn a_dead_lettered_failure_keeps_its_category_in_the_error_column() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    seed_script(&app, &format!("record.create:{NSID}"), "error:timeout").await;
+    seed_script(&app, "labeler.apply:app.bsky.feed.post", "error:memory").await;
+
+    run_record_event_script(&app.state, record_payload("create")).await;
+    run_label_applied_script(&app.state, label_event()).await;
+
+    let rows = dead_letters(&app).await;
+    assert_eq!(rows.len(), 2);
+    let categories: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            row.error
+                .split_once(": ")
+                .expect("the category leads the text")
+                .0
+        })
+        .collect();
+    assert_eq!(categories, ["timeout", "memory"]);
+    // The line still points at the script, which is what reads that column
+    // for the other end.
+    for row in &rows {
+        assert_eq!(happyview::error::parse_lua_line(&row.error).0, Some(7));
+    }
 }
 
 /// Nothing is installed that claims the row's language, so the run produces no

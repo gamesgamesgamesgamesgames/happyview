@@ -422,10 +422,7 @@ pub async fn run_record_event_once(
             ScriptValueKind::Object => RecordHookOutcome::Replace(value),
             ScriptValueKind::Other => RecordHookOutcome::Proceed,
         }),
-        // The unparsed text: every reader of this failure is an operator —
-        // the retry's warn, the dead-letter row, the event row — and the line
-        // it carries is what points them at the script.
-        ScriptExecuteOutput::Error { raw, .. } => Err(raw),
+        ScriptExecuteOutput::Error { kind, raw, .. } => Err(failure_text(kind, &raw)),
     }
 }
 
@@ -606,8 +603,21 @@ async fn run_label_once(
             }),
             ScriptValueKind::Other => LabelHookOutcome::Continue(event.clone()),
         }),
-        ScriptExecuteOutput::Error { raw, .. } => Err(raw),
+        ScriptExecuteOutput::Error { kind, raw, .. } => Err(failure_text(kind, &raw)),
     }
+}
+
+/// How a failed run reads to an operator: the category it arrived with, then
+/// the interpreter's unparsed text.
+///
+/// Every reader of this is an operator — the retry's warn, the dead-letter
+/// row's only error column, the `script.dead_lettered` row — and neither half
+/// is recoverable from the other. The text carries the line that points at the
+/// script and no category; a spent budget and an exhausted heap describe
+/// themselves in no text at all, so without the category they read as any
+/// other runtime failure.
+fn failure_text(kind: crate::plugin::ScriptErrorKind, raw: &str) -> String {
+    format!("{}: {raw}", kind.as_str())
 }
 
 fn extract_string(v: &Value, key: &str) -> Option<String> {

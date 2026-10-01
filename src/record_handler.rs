@@ -437,10 +437,8 @@ mod tests {
     const NSID: &str = "com.example.thing";
     const URI: &str = "at://did:plc:abc/com.example.thing/rkey1";
 
-    const ECHO: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/interpreter_echo/target/wasm32-unknown-unknown/release/interpreter_echo.wasm"
-    );
+    const ECHO_FIXTURE: &str = "interpreter_echo";
+    const ECHO_TARGET: &str = "wasm32-unknown-unknown";
 
     /// The echo fixture installed as the interpreter for `lua`, the language a
     /// seeded script row names. Its `source` is a directive rather than a
@@ -449,9 +447,12 @@ mod tests {
     ///
     /// `false` when the module is unbuilt and the test is to skip.
     async fn echo_interpreter(state: &AppState) -> bool {
-        if loader::built_fixture("interpreter_echo", "wasm32-unknown-unknown").is_none() {
+        // The check answers the fixture's own directory, so the module is
+        // reached through it rather than spelled a second time.
+        let Some(dir) = loader::built_fixture(ECHO_FIXTURE, ECHO_TARGET) else {
             return false;
-        }
+        };
+        let module = dir.join(format!("target/{ECHO_TARGET}/release/{ECHO_FIXTURE}.wasm"));
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
             "id": "echo", "name": "echo", "version": "1.0.0", "api_version": "2",
             "plugin_type": "interpreter", "language_id": "lua",
@@ -462,10 +463,8 @@ mod tests {
             .plugin_registry
             .register(LoadedPlugin {
                 info: manifest.clone().into(),
-                source: PluginSource::File {
-                    path: "tests/fixtures/interpreter_echo".into(),
-                },
-                wasm_bytes: std::fs::read(ECHO).expect("the echo module should read"),
+                source: PluginSource::File { path: dir },
+                wasm_bytes: std::fs::read(&module).expect("the echo module should read"),
                 manifest: Some(manifest),
             })
             .await;
@@ -627,11 +626,11 @@ mod tests {
     }
 
     /// A value that is neither a table nor nothing is the documented
-    /// "proceed, I only had side effects" answer. On a delete it used to fall
-    /// through to the original record body — which is nil for a delete — and
-    /// abort.
+    /// "proceed, I only had side effects" answer, and on a delete it must
+    /// reach the delete rather than the original record body — which a delete
+    /// does not carry.
     #[tokio::test]
-    async fn delete_with_a_script_returning_true_removes_the_record() {
+    async fn delete_with_a_script_that_proceeds_removes_the_record() {
         let Some(state) = tracked_state_with_interpreter().await else {
             return;
         };
