@@ -56,7 +56,10 @@ What still ran, so the gap is only the real interpreter's half of it:
 To make them run, point HAPPYVIEW_LUA_PLUGIN at a directory holding the
 plugin's manifest.json beside the .wasm it names, and HAPPYVIEW_LUA_SRC at
 the plugin crate's src/ so a stale artefact fails rather than reporting.
-CLAUDE.md's "The Lua interpreter plugin" section has the build.
+The plugin is built from the happyview-plugins repository, not this one:
+its crate needs wasi-sdk on CC_wasm32_wasip1 and builds for
+wasm32-wasip1. Copy its manifest.json and the built .wasm into one
+directory and point the variable there.
 MESSAGE
 
 if [ "${1:-}" = "--require" ]; then
