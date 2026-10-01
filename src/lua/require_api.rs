@@ -711,4 +711,55 @@ mod tests {
             .unwrap();
         assert!(ms > 0);
     }
+
+    /// `require` is the whole surface: a script reaches the host through it
+    /// and through nothing standing on the globals table beside it.
+    #[tokio::test]
+    async fn only_require_lands_on_the_globals_table() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_require(&lua, &state, &identity_with(None), None)
+            .await
+            .unwrap();
+
+        let globals = lua.globals();
+        assert!(globals.get::<mlua::Function>("require").is_ok());
+        for name in [
+            "db",
+            "http",
+            "xrpc",
+            "atproto",
+            "linked_repos",
+            "jobs",
+            "Record",
+            "log",
+            "env",
+            "event",
+        ] {
+            let raw: mlua::Value = globals.raw_get(name).unwrap();
+            assert!(raw.is_nil(), "{name} is defined on the globals table");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_built_ins_serve_a_script_that_asks_for_them() {
+        let state = test_state_with_pool(memory_pool().await);
+        let lua = crate::lua::sandbox::create_sandbox().unwrap();
+        register_require(&lua, &state, &identity_with(None), None)
+            .await
+            .unwrap();
+
+        let ok: bool = lua
+            .load(
+                r#"
+                local time = require("internal.time")
+                local json = require("internal.json")
+                return type(time.now()) == "number" and json.encode({ a = 1 }) == '{"a":1}'
+                "#,
+            )
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(ok);
+    }
 }

@@ -431,10 +431,54 @@ mod tests {
     use super::*;
 
     use crate::lexicon::ProcedureAction;
+    use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
     use crate::test_support::{memory_pool, test_state_with_pool};
 
     const NSID: &str = "com.example.thing";
     const URI: &str = "at://did:plc:abc/com.example.thing/rkey1";
+
+    const ECHO: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/interpreter_echo/target/wasm32-unknown-unknown/release/interpreter_echo.wasm"
+    );
+
+    /// The echo fixture installed as the interpreter for `lua`, the language a
+    /// seeded script row names. Its `source` is a directive rather than a
+    /// script, so a test here varies what a run returns without depending on a
+    /// language to produce it.
+    ///
+    /// `false` when the module is unbuilt and the test is to skip.
+    async fn echo_interpreter(state: &AppState) -> bool {
+        if loader::built_fixture("interpreter_echo", "wasm32-unknown-unknown").is_none() {
+            return false;
+        }
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "echo", "name": "echo", "version": "1.0.0", "api_version": "2",
+            "plugin_type": "interpreter", "language_id": "lua",
+            "capabilities": ["library:call", "script:host"],
+        }))
+        .unwrap();
+        state
+            .plugin_registry
+            .register(LoadedPlugin {
+                info: manifest.clone().into(),
+                source: PluginSource::File {
+                    path: "tests/fixtures/interpreter_echo".into(),
+                },
+                wasm_bytes: std::fs::read(ECHO).expect("the echo module should read"),
+                manifest: Some(manifest),
+            })
+            .await;
+        true
+    }
+
+    /// A state with an interpreter for the language a seeded row names, or
+    /// `None` when the fixture's module is unbuilt. Every fixture's `target/`
+    /// is gitignored, so that is a build nobody ran rather than a fault here.
+    async fn tracked_state_with_interpreter() -> Option<AppState> {
+        let state = tracked_state().await;
+        echo_interpreter(&state).await.then_some(state)
+    }
 
     /// A state with the record/script/event-log tables and `NSID` registered as
     /// a record-type lexicon, so `handle_record_event` treats it as tracked.
@@ -582,18 +626,16 @@ mod tests {
         );
     }
 
-    /// `return true` is the documented "proceed, I only had side effects"
-    /// return. On a delete it used to fall through to the original record
-    /// body — which is nil for a delete — and abort.
+    /// A value that is neither a table nor nothing is the documented
+    /// "proceed, I only had side effects" answer. On a delete it used to fall
+    /// through to the original record body — which is nil for a delete — and
+    /// abort.
     #[tokio::test]
     async fn delete_with_a_script_returning_true_removes_the_record() {
-        let state = tracked_state().await;
-        install_script(
-            &state,
-            &format!("record.delete:{NSID}"),
-            "function handle() return true end",
-        )
-        .await;
+        let Some(state) = tracked_state_with_interpreter().await else {
+            return;
+        };
+        install_script(&state, &format!("record.delete:{NSID}"), "value:other").await;
         insert_record(&state).await;
 
         let _ = handle_record_event(&state, &delete_event()).await;
@@ -608,13 +650,10 @@ mod tests {
     /// still keeps the record. This is the one case that must NOT delete.
     #[tokio::test]
     async fn delete_with_a_script_returning_nil_keeps_the_record() {
-        let state = tracked_state().await;
-        install_script(
-            &state,
-            &format!("record.delete:{NSID}"),
-            "function handle() return nil end",
-        )
-        .await;
+        let Some(state) = tracked_state_with_interpreter().await else {
+            return;
+        };
+        install_script(&state, &format!("record.delete:{NSID}"), "value:none").await;
         insert_record(&state).await;
 
         let _ = handle_record_event(&state, &delete_event()).await;
@@ -657,13 +696,10 @@ mod tests {
     /// 5.8M rows in `happyview_event_logs`, ~2.7 GB, against 397 `record.created`.
     #[tokio::test]
     async fn create_skip_is_not_logged_while_verbose_logging_is_off() {
-        let state = tracked_state().await;
-        install_script(
-            &state,
-            &format!("record.create:{NSID}"),
-            "function handle() return nil end",
-        )
-        .await;
+        let Some(state) = tracked_state_with_interpreter().await else {
+            return;
+        };
+        install_script(&state, &format!("record.create:{NSID}"), "value:none").await;
 
         let _ = handle_record_event(&state, &create_event()).await;
 
@@ -680,13 +716,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_skip_is_not_logged_while_verbose_logging_is_off() {
-        let state = tracked_state().await;
-        install_script(
-            &state,
-            &format!("record.delete:{NSID}"),
-            "function handle() return nil end",
-        )
-        .await;
+        let Some(state) = tracked_state_with_interpreter().await else {
+            return;
+        };
+        install_script(&state, &format!("record.delete:{NSID}"), "value:none").await;
         insert_record(&state).await;
 
         let _ = handle_record_event(&state, &delete_event()).await;
@@ -706,14 +739,11 @@ mod tests {
     /// both skip paths still report.
     #[tokio::test]
     async fn create_skip_is_logged_when_verbose_logging_is_on() {
-        let state = tracked_state().await;
+        let Some(state) = tracked_state_with_interpreter().await else {
+            return;
+        };
         state.verbose_event_logging.store(true, Ordering::Relaxed);
-        install_script(
-            &state,
-            &format!("record.create:{NSID}"),
-            "function handle() return nil end",
-        )
-        .await;
+        install_script(&state, &format!("record.create:{NSID}"), "value:none").await;
 
         let _ = handle_record_event(&state, &create_event()).await;
 
@@ -726,14 +756,11 @@ mod tests {
 
     #[tokio::test]
     async fn delete_skip_is_logged_when_verbose_logging_is_on() {
-        let state = tracked_state().await;
+        let Some(state) = tracked_state_with_interpreter().await else {
+            return;
+        };
         state.verbose_event_logging.store(true, Ordering::Relaxed);
-        install_script(
-            &state,
-            &format!("record.delete:{NSID}"),
-            "function handle() return nil end",
-        )
-        .await;
+        install_script(&state, &format!("record.delete:{NSID}"), "value:none").await;
         insert_record(&state).await;
 
         let _ = handle_record_event(&state, &delete_event()).await;

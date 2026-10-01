@@ -307,6 +307,12 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
 
     let out = if let Some(kind) = source.strip_prefix("error:") {
         failed(kind)
+    } else if let Some(literal) = source.strip_prefix("returns:") {
+        // A value chosen by the caller, for a host branch that reads the
+        // returned value's own fields rather than only its kind.
+        let value: Value = serde_json::from_str(literal).unwrap_or(Value::Null);
+        let kind = if value.is_object() { "object" } else { "other" };
+        returned(value, kind)
     } else if let Some(kind) = source.strip_prefix("value:") {
         let value = match kind {
             "none" => Value::Null,

@@ -28,7 +28,20 @@ use serial_test::serial;
 use tower::ServiceExt;
 
 use common::app::TestApp;
+use common::echo_interpreter;
 use common::fixtures;
+
+/// Skips the caller when the echo fixture's module is absent, naming the build
+/// that produces it. Every fixture's `target/` is gitignored, so that is a step
+/// nobody ran rather than a fault in what is under test.
+macro_rules! require_fixture {
+    () => {
+        if !echo_interpreter::is_built() {
+            eprintln!("skipping: {}", echo_interpreter::BUILD);
+            return;
+        }
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -108,6 +121,30 @@ async fn seed_lexicon(app: &TestApp, lexicon: Value) {
         "seeding lexicon failed: {:?}",
         resp.status()
     );
+}
+
+/// The echo fixture as the interpreter for `lua`, plus a row it runs. Seeded
+/// directly rather than through `POST /admin/scripts`, which validates what it
+/// stores and a directive is not a script.
+async fn seed_directive(app: &TestApp, id: &str, source: &str) {
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
+    let now = now_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) \
+         VALUES (?, ?, 'lua', ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(id)
+        .bind(source)
+        .bind(&now)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .expect("seed a script row");
 }
 
 /// Create a script via the admin API. Returns the created row.
@@ -414,14 +451,15 @@ async fn delete_removes_script() {
 #[serial]
 async fn cascade_wildcard_runs_when_no_action_specific() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
-    create_script(
+    // Wildcard — rewrites the title for any action.
+    seed_directive(
         &app,
         "record.index:games.gamesgamesgamesgames.game",
-        // Wildcard — uppercases the title for any action.
-        "function handle(input) input.record.title = string.upper(input.record.title); return input.record end",
+        r#"returns:{"title":"TEST GAME"}"#,
     )
     .await;
 
@@ -444,19 +482,20 @@ async fn cascade_wildcard_runs_when_no_action_specific() {
 #[serial]
 async fn cascade_action_specific_wins_over_wildcard() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
-    create_script(
+    seed_directive(
         &app,
         "record.index:games.gamesgamesgamesgames.game",
-        "function handle(input) input.record.title = 'WILDCARD'; return input.record end",
+        r#"returns:{"title":"WILDCARD"}"#,
     )
     .await;
-    create_script(
+    seed_directive(
         &app,
         "record.create:games.gamesgamesgamesgames.game",
-        "function handle(input) input.record.title = 'CREATE-SPECIFIC'; return input.record end",
+        r#"returns:{"title":"CREATE-SPECIFIC"}"#,
     )
     .await;
 
@@ -514,13 +553,14 @@ async fn no_script_passes_record_through_unchanged() {
 #[serial]
 async fn record_create_returning_nil_skips_indexing() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
-    create_script(
+    seed_directive(
         &app,
         "record.create:games.gamesgamesgamesgames.game",
-        "function handle() return nil end",
+        "value:none",
     )
     .await;
 
@@ -548,13 +588,14 @@ async fn record_create_returning_nil_skips_indexing() {
 #[serial]
 async fn record_event_script_log_writes_event_log_row() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 
-    create_script(
+    seed_directive(
         &app,
         "record.create:games.gamesgamesgamesgames.game",
-        "local log = require('internal.logging')\nfunction handle(input) log.info('hello from script'); return input.record end",
+        "host:script_log",
     )
     .await;
 
@@ -564,8 +605,8 @@ async fn record_event_script_log_writes_event_log_row() {
     )
     .await;
 
-    // The script's log.info("hello from script") should land in event_logs
-    // as a `script.log` row whose subject is the trigger id.
+    // A line written during the run lands in event_logs as a `script.log` row
+    // whose subject is the trigger id.
     let row: (String, String) = happyview::db::query_as(&adapt_sql(
         "SELECT subject, detail FROM happyview_event_logs
          WHERE event_type = 'script.log'
@@ -577,7 +618,7 @@ async fn record_event_script_log_writes_event_log_row() {
     .expect("expected a script.log row");
     assert_eq!(row.0, "record.create:games.gamesgamesgamesgames.game");
     let detail: Value = serde_json::from_str(&row.1).unwrap();
-    assert_eq!(detail["message"], "hello from script");
+    assert_eq!(detail["message"], "from the fixture");
     assert_eq!(
         detail["trigger"],
         "record.create:games.gamesgamesgamesgames.game"

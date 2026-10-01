@@ -46,6 +46,36 @@ const CAPABILITIES: [&str; 5] = [
     "wasi:stdio",
 ];
 
+/// The raw-ABI library fixture, under a namespace `require` resolves the way
+/// it resolves a real library.
+const LIBRARY_NAMESPACE: &str = "happyview.testlib";
+const LIBRARY_MODULE: &str =
+    "tests/fixtures/test_library/target/wasm32-unknown-unknown/release/test_library.wasm";
+const LIBRARY_BUILD: &str = "test_library fixture not built. Run: cargo build --manifest-path \
+                             tests/fixtures/test_library/Cargo.toml --target \
+                             wasm32-unknown-unknown --release";
+
+fn library_fixture_built() -> bool {
+    std::path::Path::new(LIBRARY_MODULE).exists()
+}
+
+fn library() -> happyview::plugin::LoadedPlugin {
+    let manifest: happyview::plugin::PluginManifest = serde_json::from_value(json!({
+        "id": LIBRARY_NAMESPACE, "name": LIBRARY_NAMESPACE, "version": "1.0.0",
+        "api_version": "2", "plugin_type": "library", "namespace": LIBRARY_NAMESPACE,
+        "capabilities": ["library:call", "database:read", "database:write"],
+    }))
+    .expect("the fixture manifest should parse");
+    happyview::plugin::LoadedPlugin {
+        info: manifest.clone().into(),
+        source: happyview::plugin::PluginSource::File {
+            path: "tests/fixtures/test_library".into(),
+        },
+        wasm_bytes: std::fs::read(LIBRARY_MODULE).expect(LIBRARY_BUILD),
+        manifest: Some(manifest),
+    }
+}
+
 /// The plugin registered under its own id, ready to run scripts.
 ///
 /// The module it loaded is named in the output, because eight green tests
@@ -413,5 +443,147 @@ async fn a_spinning_script_is_interrupted_by_the_host_deadline() {
     assert!(
         elapsed < std::time::Duration::from_secs(60),
         "interrupted after {elapsed:?}"
+    );
+}
+
+/// The record-event runner's three-way branch reads `value_kind`, so the
+/// interpreter's half of it is what makes the host's half mean anything:
+/// `handle` returning nothing and returning `nil` are the same answer, and an
+/// explicit null sentinel is not that answer.
+#[tokio::test]
+async fn the_value_kinds_a_record_event_branches_on() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let Some(id) = registered(&app).await else {
+        return;
+    };
+
+    for (source, expected) in [
+        ("function handle() end", ScriptValueKind::None),
+        ("function handle() return nil end", ScriptValueKind::None),
+        (
+            "function handle() return { a = 1 } end",
+            ScriptValueKind::Object,
+        ),
+        ("function handle() return true end", ScriptValueKind::Other),
+        (
+            "function handle(input) return input.absent_key_is_nil end",
+            ScriptValueKind::None,
+        ),
+    ] {
+        let output = app
+            .state
+            .plugin_executor()
+            .execute_script(&id, &input(source, ScriptKind::RecordEvent))
+            .await
+            .expect("execute should answer");
+        match output {
+            ScriptExecuteOutput::Returned { value_kind, .. } => {
+                assert_eq!(value_kind, expected, "{source}")
+            }
+            other => panic!("{source}: {other:?}"),
+        }
+    }
+}
+
+/// A table handed to `os.time` is read as UTC, because the guest has no zone
+/// to read. Two runs of one script on two machines therefore agree, which is
+/// the property an indexer wants; a script that needs its server's zone adds
+/// its own offset.
+#[tokio::test]
+async fn os_time_on_a_table_is_read_as_utc_whatever_zone_the_host_is_in() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let Some(id) = registered(&app).await else {
+        return;
+    };
+
+    let output = app
+        .state
+        .plugin_executor()
+        .execute_script(
+            &id,
+            &input(
+                "function handle() return { at = os.time({ year = 2026, month = 9, \
+                 day = 17, hour = 12, min = 30, sec = 15 }) } end",
+                ScriptKind::RecordEvent,
+            ),
+        )
+        .await
+        .expect("execute should answer");
+
+    let civil = (2026, 9, 17, 12, 30, 15);
+    let as_utc = chrono::TimeZone::with_ymd_and_hms(
+        &chrono::Utc,
+        civil.0,
+        civil.1,
+        civil.2,
+        civil.3,
+        civil.4,
+        civil.5,
+    )
+    .unwrap()
+    .timestamp();
+    let as_local = chrono::TimeZone::with_ymd_and_hms(
+        &chrono::Local,
+        civil.0,
+        civil.1,
+        civil.2,
+        civil.3,
+        civil.4,
+        civil.5,
+    )
+    .unwrap()
+    .timestamp();
+    println!("host zone offset from UTC: {} seconds", as_utc - as_local);
+
+    match output {
+        ScriptExecuteOutput::Returned { value, .. } => assert_eq!(value, json!({ "at": as_utc })),
+        other => panic!("expected an instant, got {other:?}"),
+    }
+}
+
+/// A library call from inside a coroutine answers its value: every host import
+/// is a plain blocking call in the guest, where an async one would have to
+/// yield through a coroutine that is not the host's to resume.
+#[tokio::test]
+async fn a_library_call_from_inside_a_coroutine_answers_its_value() {
+    common::require_db!();
+    if !library_fixture_built() {
+        eprintln!("skipping: {LIBRARY_BUILD}");
+        return;
+    }
+    let app = TestApp::new().await;
+    let Some(id) = registered(&app).await else {
+        return;
+    };
+    app.state.plugin_registry.register(library()).await;
+
+    let mut sent = input(
+        r#"local lib = require("happyview.testlib")
+           function handle()
+             local gen = coroutine.wrap(function() coroutine.yield(lib.add(2, 3)) end)
+             return { sum = gen() }
+           end"#,
+        ScriptKind::RecordEvent,
+    );
+    sent.libraries = vec![happyview::plugin::ScriptLibraryRef {
+        namespace: LIBRARY_NAMESPACE.into(),
+        id: LIBRARY_NAMESPACE.into(),
+    }];
+
+    let output = app
+        .state
+        .plugin_executor()
+        .execute_script(&id, &sent)
+        .await
+        .expect("execute should answer");
+
+    assert_eq!(
+        output,
+        ScriptExecuteOutput::Returned {
+            value: json!({ "sum": 5.0 }),
+            value_kind: ScriptValueKind::Object,
+        }
     );
 }

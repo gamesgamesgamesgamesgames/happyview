@@ -36,10 +36,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::AppState;
-use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
+use crate::db::{adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
-
-use super::{context, sandbox};
+use crate::plugin::{ScriptExecuteOutput, ScriptValueKind};
+use crate::script::{Invocation, Trigger, dispatch};
 
 /// Number of attempts (1 initial + 3 retries) before dead-lettering.
 const MAX_ATTEMPTS: u32 = 4;
@@ -165,9 +165,9 @@ pub struct ResolvedScript {
 }
 
 impl ResolvedScript {
-    /// Whether this row's body is for the VM this module runs. Resolution
-    /// reports a row's language rather than filtering on it, so a caller asks
-    /// before handing a body to a Lua VM.
+    /// Whether this row's body is in the language this binary expects an
+    /// interpreter for. Resolution reports a row's language rather than
+    /// filtering on it, so a caller asks before running the body.
     pub fn is_native(&self) -> bool {
         self.script_type == NATIVE_LANGUAGE
     }
@@ -269,7 +269,7 @@ pub enum RecordHookOutcome {
     /// Index this body in place of the one that arrived. Only meaningful for
     /// create/update — a delete has no body to replace.
     Replace(Value),
-    /// Skip the event entirely — the script returned `nil`. Only ever
+    /// Skip the event entirely — the script returned nothing. Only ever
     /// produced by a script that actually ran.
     Skip,
 }
@@ -375,29 +375,18 @@ pub async fn run_record_event_script(
     RecordHookOutcome::Proceed
 }
 
-/// Single attempt at the record-event Lua script. Used internally by the
-/// retry loop and externally by admin retry endpoints.
+/// Single attempt at the record-event script. Used internally by the retry
+/// loop and externally by admin retry endpoints.
 ///
 /// Returns `Ok(Replace(value))` to continue indexing with `value`,
-/// `Ok(Skip)` when the script returned `nil`, `Ok(Proceed)` when it waved
+/// `Ok(Skip)` when the script returned nothing, `Ok(Proceed)` when it waved
 /// the event through, or `Err(msg)` on any execution failure.
 pub async fn run_record_event_once(
     state: &AppState,
     script: &ResolvedScript,
     payload: RecordEventPayload<'_>,
 ) -> Result<RecordHookOutcome, String> {
-    if !script.is_native() {
-        return Err(format!(
-            "this binary cannot run {} scripts",
-            script.script_type
-        ));
-    }
-    let lua = sandbox::create_sandbox_with_limit(state.script_limits.instruction_limit())
-        .map_err(|e| format!("create sandbox: {e}"))?;
-    install_require(&lua, state, &script.id, Some(payload.did)).await?;
-
-    use mlua::LuaSerdeExt;
-    let event_value = serde_json::json!({
+    let event = serde_json::json!({
         "action": payload.action,
         "uri": payload.uri,
         "did": payload.did,
@@ -405,49 +394,38 @@ pub async fn run_record_event_once(
         "rkey": payload.rkey,
         "record": payload.record,
     });
-    let event_lua = lua
-        .to_value(&event_value)
-        .map_err(|e| format!("event lua-conv: {e}"))?;
-
-    let env_vars = load_env_vars(&state.db, state.db_backend).await;
-
-    sandbox::load_script(&lua, &script.body)
-        .exec()
-        .map_err(|e| format!("script load: {e}"))?;
-    let handle: mlua::Function = lua
-        .globals()
-        .get("handle")
-        .map_err(|e| format!("missing handle(): {e}"))?;
-    let ctx = context::build_ctx(
-        &lua,
-        &context::Invocation {
+    let outcome = dispatch(
+        state,
+        &Invocation {
             trigger_id: &script.id,
+            trigger: Trigger::RecordEvent,
+            language: &script.script_type,
+            source: &script.body,
+            input: &event,
+            // The record's author is who a library reads as the caller, and a
+            // firehose event carries none of their credentials.
             caller_did: Some(payload.did),
             has_pds_auth: false,
-            env: &env_vars,
             method: None,
             collection: Some(payload.nsid),
             params: None,
             delegate_did: None,
             space: None,
-            job: None,
         },
+        None,
     )
-    .map_err(|e| format!("build ctx: {e}"))?;
-    let result = sandbox::call_handle(&lua, &handle, (event_lua, ctx))
-        .await
-        .map_err(|e| e.to_string())?;
+    .await;
 
-    match result {
-        mlua::Value::Nil => Ok(RecordHookOutcome::Skip),
-        mlua::Value::Table(_) => {
-            let v: Value = lua
-                .from_value(result)
-                .map_err(|e| format!("convert lua return to JSON: {e}"))?;
-            Ok(RecordHookOutcome::Replace(v))
-        }
-        // Non-nil, non-table return (`return true`) — pass-through.
-        _ => Ok(RecordHookOutcome::Proceed),
+    match outcome.map_err(|e| e.to_string())? {
+        ScriptExecuteOutput::Returned { value, value_kind } => Ok(match value_kind {
+            ScriptValueKind::None => RecordHookOutcome::Skip,
+            ScriptValueKind::Object => RecordHookOutcome::Replace(value),
+            ScriptValueKind::Other => RecordHookOutcome::Proceed,
+        }),
+        // The unparsed text: every reader of this failure is an operator —
+        // the retry's warn, the dead-letter row, the event row — and the line
+        // it carries is what points them at the script.
+        ScriptExecuteOutput::Error { raw, .. } => Err(raw),
     }
 }
 
@@ -474,7 +452,7 @@ pub struct LabelAppliedEvent {
 pub enum LabelHookOutcome {
     /// Persist the (possibly rewritten) label.
     Continue(LabelAppliedEvent),
-    /// Skip persistence — the script returned `nil`.
+    /// Skip persistence — the script returned nothing.
     Skip,
 }
 
@@ -514,7 +492,7 @@ pub async fn run_label_applied_script(
             let delay = std::time::Duration::from_secs(1 << (attempt - 1));
             tokio::time::sleep(delay).await;
         }
-        match run_label_lua_once(state, &resolved, &event).await {
+        match run_label_once(state, &resolved, &event).await {
             Ok(outcome) => {
                 log_event(
                     &state.db,
@@ -584,76 +562,51 @@ pub async fn run_label_applied_script(
     LabelHookOutcome::Continue(original)
 }
 
-async fn run_label_lua_once(
+async fn run_label_once(
     state: &AppState,
     script: &ResolvedScript,
     event: &LabelAppliedEvent,
 ) -> Result<LabelHookOutcome, String> {
-    if !script.is_native() {
-        return Err(format!(
-            "this binary cannot run {} scripts",
-            script.script_type
-        ));
-    }
-    let lua = sandbox::create_sandbox_with_limit(state.script_limits.instruction_limit())
-        .map_err(|e| format!("create sandbox: {e}"))?;
-    install_require(&lua, state, &script.id, None).await?;
-
-    use mlua::LuaSerdeExt;
-    let event_value = serde_json::to_value(event).map_err(|e| format!("encode event: {e}"))?;
-    let event_lua = lua
-        .to_value(&event_value)
-        .map_err(|e| format!("event lua-conv: {e}"))?;
-    let env_vars = load_env_vars(&state.db, state.db_backend).await;
-
-    sandbox::load_script(&lua, &script.body)
-        .exec()
-        .map_err(|e| format!("script load: {e}"))?;
-    let handle: mlua::Function = lua
-        .globals()
-        .get("handle")
-        .map_err(|e| format!("missing handle(): {e}"))?;
-    let ctx = context::build_ctx(
-        &lua,
-        &context::Invocation {
+    let input = serde_json::to_value(event).map_err(|e| format!("encode event: {e}"))?;
+    let outcome = dispatch(
+        state,
+        &Invocation {
             trigger_id: &script.id,
+            trigger: Trigger::Label,
+            language: &script.script_type,
+            source: &script.body,
+            input: &input,
+            // A label arrives from a subscription, so there is nobody for the
+            // run to act as and no collection of its own to read.
             caller_did: None,
             has_pds_auth: false,
-            env: &env_vars,
             method: None,
             collection: None,
             params: None,
             delegate_did: None,
             space: None,
-            job: None,
         },
+        None,
     )
-    .map_err(|e| format!("build ctx: {e}"))?;
-    let result = sandbox::call_handle(&lua, &handle, (event_lua, ctx))
-        .await
-        .map_err(|e| e.to_string())?;
+    .await;
 
-    match result {
-        mlua::Value::Nil => Ok(LabelHookOutcome::Skip),
-        mlua::Value::Table(_) => {
-            let v: Value = lua
-                .from_value(result)
-                .map_err(|e| format!("convert lua return: {e}"))?;
-            // Merge: any field the script omitted falls back to the
-            // original. This makes "filter only" scripts (return `event`)
-            // and "rewrite val" scripts (return `{ val = "..." }`) both
-            // ergonomic.
-            let next = LabelAppliedEvent {
-                src: extract_string(&v, "src").unwrap_or_else(|| event.src.clone()),
-                uri: extract_string(&v, "uri").unwrap_or_else(|| event.uri.clone()),
-                val: extract_string(&v, "val").unwrap_or_else(|| event.val.clone()),
-                neg: extract_bool(&v, "neg").unwrap_or(event.neg),
-                cts: extract_string(&v, "cts").unwrap_or_else(|| event.cts.clone()),
-                exp: extract_string(&v, "exp").or_else(|| event.exp.clone()),
-            };
-            Ok(LabelHookOutcome::Continue(next))
-        }
-        _ => Ok(LabelHookOutcome::Continue(event.clone())),
+    match outcome.map_err(|e| e.to_string())? {
+        ScriptExecuteOutput::Returned { value, value_kind } => Ok(match value_kind {
+            ScriptValueKind::None => LabelHookOutcome::Skip,
+            // Any field the script omitted falls back to the original. This
+            // makes "filter only" scripts (return `event`) and "rewrite val"
+            // scripts (return `{ val = "..." }`) both ergonomic.
+            ScriptValueKind::Object => LabelHookOutcome::Continue(LabelAppliedEvent {
+                src: extract_string(&value, "src").unwrap_or_else(|| event.src.clone()),
+                uri: extract_string(&value, "uri").unwrap_or_else(|| event.uri.clone()),
+                val: extract_string(&value, "val").unwrap_or_else(|| event.val.clone()),
+                neg: extract_bool(&value, "neg").unwrap_or(event.neg),
+                cts: extract_string(&value, "cts").unwrap_or_else(|| event.cts.clone()),
+                exp: extract_string(&value, "exp").or_else(|| event.exp.clone()),
+            }),
+            ScriptValueKind::Other => LabelHookOutcome::Continue(event.clone()),
+        }),
+        ScriptExecuteOutput::Error { raw, .. } => Err(raw),
     }
 }
 
@@ -668,38 +621,6 @@ fn extract_bool(v: &Value, key: &str) -> Option<bool> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Install `require` on a fresh sandbox: the one way a script reaches the
-/// host. `caller_did` is who the script logs as and who a library reads as
-/// the caller; a record-event script runs as the record's author, a label
-/// script as nobody. Neither holds PDS credentials, so no session is passed.
-async fn install_require(
-    lua: &mlua::Lua,
-    state: &AppState,
-    trigger_id: &str,
-    caller_did: Option<&str>,
-) -> Result<(), String> {
-    let identity = crate::lua::builtins::ScriptIdentity {
-        trigger_id: trigger_id.to_string(),
-        caller_did: caller_did.map(String::from),
-        job_id: None,
-    };
-    crate::lua::require_api::register_require(lua, state, &identity, None).await
-}
-
-/// Load `script_variables` as a flat key→value map for `ctx.env`.
-async fn load_env_vars(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-) -> std::collections::HashMap<String, String> {
-    let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
-    crate::db::query_as::<(String, String)>(&sql)
-        .fetch_all(db)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
-}
 
 struct DeadLetterEntry<'a> {
     script: &'a ResolvedScript,
@@ -748,152 +669,6 @@ async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
 mod tests {
     use super::*;
 
-    use crate::AppState;
-    use crate::config::Config;
-    use crate::lexicon::LexiconRegistry;
-    use std::sync::Arc;
-    use tokio::sync::watch;
-
-    fn registration_test_state() -> AppState {
-        let config = Config {
-            host: "127.0.0.1".into(),
-            port: 3000,
-            database_url: String::new(),
-            database_backend: crate::db::DatabaseBackend::Sqlite,
-            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
-            public_url: String::new(),
-            user_agent: String::new(),
-            session_secret: "test-secret".into(),
-            jetstream_url: String::new(),
-            relay_url: String::new(),
-            plc_url: String::new(),
-            static_dir: String::new(),
-            base_path: None,
-            event_log_retention_days: 30,
-            app_name: None,
-            logo_uri: None,
-            tos_uri: None,
-            policy_uri: None,
-            token_encryption_key: None,
-            default_rate_limit_capacity: 100,
-            default_rate_limit_refill_rate: 2.0,
-            telemetry_collector_url: String::new(),
-            plugin_cache_dir: None,
-        };
-        let (tx, _) = watch::channel(vec![]);
-        let (labeler_tx, _) = watch::channel(());
-        sqlx::any::install_default_drivers();
-        let test_db = sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap();
-        let backend = crate::db::DatabaseBackend::Sqlite;
-        let atrium_http = Arc::new(crate::http_retry::HappyViewHttpClient::default());
-        let did_resolver = atrium_identity::did::CommonDidResolver::new(
-            atrium_identity::did::CommonDidResolverConfig {
-                plc_directory_url: "https://plc.directory".into(),
-                http_client: Arc::clone(&atrium_http),
-            },
-        );
-        let handle_resolver = atrium_identity::handle::AtprotoHandleResolver::new(
-            atrium_identity::handle::AtprotoHandleResolverConfig {
-                dns_txt_resolver: crate::dns::NativeDnsResolver::new(),
-                http_client: atrium_http,
-            },
-        );
-        let scopes = vec![atrium_oauth::Scope::Known(
-            atrium_oauth::KnownScope::Atproto,
-        )];
-        let oauth = atrium_oauth::OAuthClient::new(atrium_oauth::OAuthClientConfig {
-            client_metadata: atrium_oauth::AtprotoLocalhostClientMetadata {
-                redirect_uris: Some(vec!["http://127.0.0.1:0/auth/callback".into()]),
-                scopes: Some(scopes.clone()),
-            },
-            keys: None,
-            state_store: crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend),
-            session_store: crate::auth::oauth_store::DbSessionStore::new(test_db.clone(), backend),
-            resolver: atrium_oauth::OAuthResolverConfig {
-                did_resolver,
-                handle_resolver,
-                authorization_server_metadata: Default::default(),
-                protected_resource_metadata: Default::default(),
-            },
-            http_client: crate::http_retry::HappyViewHttpClient::default(),
-        })
-        .expect("test OAuth client");
-        AppState {
-            config,
-            http: reqwest::Client::new(),
-            db: test_db.clone(),
-            backfill_db: test_db.clone(),
-            db_backend: backend,
-            domain_cache: crate::domain::DomainCache::new(),
-            lexicons: LexiconRegistry::new(),
-            collections_tx: tx,
-            labeler_subscriptions_tx: labeler_tx,
-            rate_limiter: crate::rate_limit::RateLimiter::new(
-                crate::rate_limit::RateLimitDefaults {
-                    query_cost: 1,
-                    procedure_cost: 1,
-                    proxy_cost: 1,
-                },
-            ),
-            oauth: Arc::new(crate::auth::OAuthClientRegistry::new(Arc::new(oauth))),
-            oauth_state_store: crate::auth::oauth_store::DbStateStore::new(
-                test_db.clone(),
-                backend,
-            ),
-            linked_repos_client: Arc::new(
-                crate::linked_repos::client::build(
-                    "https://plc.directory",
-                    "http://127.0.0.1:0/oauth-client-metadata.json",
-                    "http://127.0.0.1:0",
-                    "http://127.0.0.1:0/auth/callback".into(),
-                    true,
-                    scopes,
-                    crate::auth::oauth_store::DbStateStore::new(test_db.clone(), backend),
-                    test_db.clone(),
-                    backend,
-                    None,
-                )
-                .expect("test linked-repo OAuth client"),
-            ),
-            linked_repos_client_kid: None,
-            cookie_key: axum_extra::extract::cookie::Key::derive_from(
-                b"test-secret-that-is-at-least-32-bytes-long",
-            ),
-            plugin_registry: Arc::new(crate::plugin::PluginRegistry::new()),
-            wasm_runtime: Arc::new(crate::plugin::WasmRuntime::new().expect("wasm runtime")),
-            attestation_signer: None,
-            official_registry: Arc::new(tokio::sync::RwLock::new(
-                crate::plugin::official_registry::OfficialRegistryState::default(),
-            )),
-            official_registry_config: crate::plugin::official_registry::RegistryConfig::production(
-            ),
-            proxy_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(
-                crate::proxy_config::ProxyConfig::default(),
-            ))),
-            backfill_events_tx: tokio::sync::broadcast::channel(16).0,
-            verbose_event_logging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            client_jwks: Vec::new(),
-            telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
-            script_limits: Arc::new(crate::lua::limits::ScriptLimits::default()),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_record_script_cannot_swallow_the_limit_with_pcall() {
-        let state =
-            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
-        let script = lua_script(
-            "function handle() while true do pcall(function() while true do end end) end end",
-        );
-
-        let run = run_record_event_once(&state, &script, RECORD_PAYLOAD);
-        let err = tokio::time::timeout(std::time::Duration::from_secs(20), run)
-            .await
-            .expect("the instruction limit must end the run")
-            .expect_err("the run must fail");
-        assert!(err.contains("execution limit"), "{err}");
-    }
-
     /// A row for a language this binary does not run reads as no row at all,
     /// so the cascade passes over it to `record.index` rather than firing a
     /// runner that can only spend its retry budget and dead-letter.
@@ -935,161 +710,6 @@ mod tests {
             .await
             .expect("the cascade reaches the native record.index row");
         assert_eq!(cascaded.id, "record.index:com.example.thing");
-    }
-
-    fn lua_script(body: &str) -> ResolvedScript {
-        ResolvedScript {
-            id: "record.create:com.example.thing".into(),
-            script_type: NATIVE_LANGUAGE.into(),
-            body: body.into(),
-        }
-    }
-
-    const RECORD_PAYLOAD: RecordEventPayload<'static> = RecordEventPayload {
-        nsid: "com.example.thing",
-        action: "create",
-        uri: "at://did:plc:a/com.example.thing/1",
-        did: "did:plc:a",
-        rkey: "1",
-        record: None,
-    };
-
-    fn label_event() -> LabelAppliedEvent {
-        LabelAppliedEvent {
-            src: "did:plc:labeler".into(),
-            uri: "at://did:plc:a/app.bsky.feed.post/1".into(),
-            val: "spam".into(),
-            neg: false,
-            cts: "2026-01-01T00:00:00.000Z".into(),
-            exp: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn a_label_script_that_loops_fails_with_the_limit() {
-        let state =
-            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
-        let script = lua_script("function handle() while true do end end");
-        let event = label_event();
-
-        let run = run_label_lua_once(&state, &script, &event);
-        let err = tokio::time::timeout(std::time::Duration::from_secs(20), run)
-            .await
-            .expect("the instruction limit must end the run")
-            .expect_err("the run must fail");
-        assert!(err.contains("execution limit"), "{err}");
-    }
-
-    const TEN_THOUSAND_ITERATIONS: &str =
-        "function handle() local n = 0; for i = 1, 10000 do n = n + 1 end; return { n = n } end";
-
-    async fn state_with_instruction_limit(limit: u32) -> AppState {
-        let mut state =
-            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
-        state.script_limits = Arc::new(crate::lua::limits::ScriptLimits::new(limit, 10));
-        state
-    }
-
-    #[tokio::test]
-    async fn a_record_script_runs_under_the_cached_instruction_limit() {
-        let state = state_with_instruction_limit(1_000).await;
-        let script = lua_script(TEN_THOUSAND_ITERATIONS);
-
-        let err = run_record_event_once(&state, &script, RECORD_PAYLOAD)
-            .await
-            .expect_err("the lowered budget must end the run");
-        assert!(err.contains("execution limit"), "{err}");
-
-        state.script_limits.set_instruction_limit(1_000_000);
-        run_record_event_once(&state, &script, RECORD_PAYLOAD)
-            .await
-            .expect("the restored budget must let the run finish");
-    }
-
-    #[tokio::test]
-    async fn a_label_script_runs_under_the_cached_instruction_limit() {
-        let state = state_with_instruction_limit(1_000).await;
-        let script = lua_script(TEN_THOUSAND_ITERATIONS);
-
-        let err = run_label_lua_once(&state, &script, &label_event())
-            .await
-            .expect_err("the lowered budget must end the run");
-        assert!(err.contains("execution limit"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_record_script_error_carries_its_line() {
-        let state =
-            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
-        let script = lua_script("function handle()\n  local t = nil\n  return t.x\nend");
-
-        let err = run_record_event_once(&state, &script, RECORD_PAYLOAD)
-            .await
-            .expect_err("indexing nil must raise");
-        assert_eq!(crate::error::parse_lua_line(&err).0, Some(3), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_label_script_error_carries_its_line() {
-        let state =
-            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
-        let script = lua_script("function handle()\n  local t = nil\n  return t.x\nend");
-
-        let err = run_label_lua_once(&state, &script, &label_event())
-            .await
-            .expect_err("indexing nil must raise");
-        assert_eq!(crate::error::parse_lua_line(&err).0, Some(3), "{err}");
-    }
-
-    #[tokio::test]
-    async fn install_require_installs_only_require() {
-        let state = registration_test_state();
-        let lua = sandbox::create_sandbox().unwrap();
-
-        install_require(&lua, &state, "record.create:com.example.thing", None)
-            .await
-            .expect("require should install");
-
-        let globals = lua.globals();
-        assert!(globals.get::<mlua::Function>("require").is_ok());
-        for name in [
-            "db",
-            "http",
-            "xrpc",
-            "atproto",
-            "linked_repos",
-            "jobs",
-            "Record",
-            "log",
-            "env",
-            "event",
-        ] {
-            let raw: mlua::Value = globals.raw_get(name).unwrap();
-            assert!(raw.is_nil(), "{name} is defined on the globals table");
-        }
-    }
-
-    #[tokio::test]
-    async fn install_require_serves_the_builtins() {
-        let state = registration_test_state();
-        let lua = sandbox::create_sandbox().unwrap();
-
-        install_require(&lua, &state, "labeler.apply:app.bsky.feed.post", None)
-            .await
-            .expect("require should install");
-
-        let ok: bool = lua
-            .load(
-                r#"
-                local time = require("internal.time")
-                local json = require("internal.json")
-                return type(time.now()) == "number" and json.encode({ a = 1 }) == '{"a":1}'
-                "#,
-            )
-            .eval_async()
-            .await
-            .unwrap();
-        assert!(ok);
     }
 
     #[test]
