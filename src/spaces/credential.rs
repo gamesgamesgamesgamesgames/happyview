@@ -259,7 +259,9 @@ pub fn sign_credential_with_key(
     let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
 
     let message = format!("{}.{}", header_b64, payload_b64);
+    // @atproto/crypto refuses high-S signatures, and peers verify with it.
     let signature: Signature = signing_key.sign(message.as_bytes());
+    let signature = signature.normalize_s();
     let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     Ok(format!("{}.{}.{}", header_b64, payload_b64, sig_b64))
@@ -576,6 +578,21 @@ mod tests {
             iat: now,
             exp: now + DEFAULT_CREDENTIAL_TTL_SECS,
             jti: make_jti(),
+        }
+    }
+
+    /// @atproto/crypto refuses high-S signatures unless a caller opts out,
+    /// and the reference PDS verifies credentials without opting out.
+    #[test]
+    fn credential_signatures_are_low_s() {
+        let keypair = generate_dpop_keypair().unwrap();
+        for _ in 0..64 {
+            let token = sign_credential(&make_claims(), &keypair.private_jwk).unwrap();
+            let sig_bytes = URL_SAFE_NO_PAD
+                .decode(token.rsplit('.').next().unwrap())
+                .unwrap();
+            let sig = Signature::from_slice(&sig_bytes).unwrap();
+            assert_eq!(sig.normalize_s().to_bytes(), sig.to_bytes(), "high-S signature");
         }
     }
 
