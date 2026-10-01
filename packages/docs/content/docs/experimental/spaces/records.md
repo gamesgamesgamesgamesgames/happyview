@@ -1069,13 +1069,13 @@ const response = await fetch(
 );
 interface Repo {
   did: string;
-  rev: string;
+  repoRev: string;
   hash: { $bytes: string };
+  spaceRev: string;
 }
 interface ListReposResponse {
   repos: Repo[];
   cursor?: string;
-  spaceRev?: string;
 }
 const data: ListReposResponse = await response.json();
 ```
@@ -1125,29 +1125,40 @@ curl 'https://happyview.example.com/xrpc/com.atproto.space.listRepos?space=at://
 | -------- | ------- | -------- | ------- | ----------- |
 | `space`  | string  | Yes      |         | The space URI |
 | `limit`  | integer | No       | 100     | Max repos to return (1-1000) |
-| `cursor` | string  | No       |         | Pagination cursor from a previous response |
-| `since`  | string  | No       |         | A space revision. Lists only repos updated after it, in the order they were updated. |
+| `cursor` | string  | No       |         | A space revision. Lists only repos updated after it. Pass a previous response's `cursor`, or the last `spaceRev` already processed. |
 
 **Response:**
 
 ```json
 {
   "repos": [
-    { "did": "did:plc:author1", "rev": "3l2tkbx7225co", "hash": { "$bytes": "q83vEjRWeJC..." } },
-    { "did": "did:plc:author2", "rev": "3l2tkbwz4fa2k", "hash": { "$bytes": "3q2+7wABAgM..." } }
+    {
+      "did": "did:plc:author1",
+      "repoRev": "3l2tkbx7225co",
+      "rev": "3l2tkbx7225co",
+      "hash": { "$bytes": "q83vEjRWeJC..." },
+      "spaceRev": "3l2tkbx7a2v4s"
+    },
+    {
+      "did": "did:plc:author2",
+      "repoRev": "3l2tkbwz4fa2k",
+      "rev": "3l2tkbwz4fa2k",
+      "hash": { "$bytes": "3q2+7wABAgM..." },
+      "spaceRev": "3l2tkbx7a3k2s"
+    }
   ],
-  "cursor": "did:plc:author2",
-  "spaceRev": "3l2tkbx7a3k2s"
+  "cursor": "3l2tkbx7a3k2s"
 }
 ```
 
 | Field      | Type    | Description |
 | ---------- | ------- | ----------- |
-| `repos`    | array   | The repos on this page. Without `since`, ordered by DID. |
-| `cursor`   | string? | Present when the page is full. Pass it back to get the next page. |
-| `spaceRev` | string? | The space's current revision. Absent until the space has a writer. |
+| `repos`  | array   | The repos on this page, in the order their updates were sequenced. A repo updated while paging can appear again on a later page. |
+| `cursor` | string? | The `spaceRev` of the last repo on the page. Absent when the page is empty. |
 
-To stay in sync, a syncer records `spaceRev` from a full listing, then passes it as `since` on the next call. `spaceRev` is a provisional field name. See [Receiving notifications](./notifications.md#receiving-notifications).
+Each repo carries `did`, `repoRev` (its revision as last reported to HappyView), `hash`, and `spaceRev` (the space revision of its last update). `rev` repeats `repoRev` under the alpha lexicon's name until v3.
+
+To stay in sync, a syncer keeps the last `spaceRev` it processed and passes it as `cursor` on the next call. See [Receiving notifications](./notifications.md#receiving-notifications).
 
 ## Getting a blob
 

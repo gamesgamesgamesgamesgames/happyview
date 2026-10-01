@@ -153,7 +153,7 @@ const NOTIFY_SPACE_DELETED_LXM: &str = "com.atproto.space.notifySpaceDeleted";
 const NOTIFY_WRITE_LXM: &str = "com.atproto.space.notifyWrite";
 
 /// Where a forwarded notification carries the space revision that ordered it,
-/// and the one before. Proposal 0016 adds both without naming them yet.
+/// and the one before. A syncer that sees a gap between them missed an update.
 const SPACE_REV_FIELD: &str = "spaceRev";
 const PREV_SPACE_REV_FIELD: &str = "prevSpaceRev";
 

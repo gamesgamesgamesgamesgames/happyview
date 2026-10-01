@@ -138,6 +138,7 @@ For each commit to a repo in the space, HappyView POSTs to `<endpoint>/xrpc/com.
 {
   "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
   "repo": "did:plc:author456",
+  "repoRev": "3l2tkbx7225co",
   "rev": "3l2tkbx7225co",
   "hash": { "$bytes": "q83vEjRWeJC..." },
   "spaceRev": "3l2tkbx7a3k2s",
@@ -149,14 +150,13 @@ For each commit to a repo in the space, HappyView POSTs to `<endpoint>/xrpc/com.
 | -------------- | ------- | ----------- |
 | `space`        | string  | The space URI |
 | `repo`         | string  | DID of the repo that changed |
-| `rev`          | string  | The repo's new revision (TID) |
+| `repoRev`      | string  | The repo's new revision (TID) |
+| `rev`          | string  | The same value as `repoRev`, under the alpha lexicon's name. Sent until v3. |
 | `hash`         | bytes   | The repo's new LtHash digest |
 | `spaceRev`     | string  | The space revision this update was assigned |
 | `prevSpaceRev` | string? | The space revision before it. Absent on the first update in the space. |
 
-Proposal 0016 adds a space-wide revision to these notifications but has not named its fields yet. `spaceRev` and `prevSpaceRev` are provisional names and may change.
-
-Every accepted update advances the space revision, a TID that increases across all repos in the space. A syncer that receives a `prevSpaceRev` newer than the last `spaceRev` it saw has missed a notification. It catches up by calling [`listRepos`](./records.md#listing-repos) with `since` set to the last space revision it saw.
+Every accepted update advances the space revision, a TID that increases across all repos in the space. A syncer that receives a `prevSpaceRev` newer than the last `spaceRev` it saw has missed a notification. It catches up by calling [`listRepos`](./records.md#listing-repos) with `cursor` set to the last space revision it processed.
 
 Delivery is best effort. HappyView does not retry a failed call.
 
@@ -176,7 +176,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.spa
   body: JSON.stringify({
     space: "at://did:web:happyview.example.com/space/com.example.forum/main",
     repo: "did:plc:author456",
-    rev: "3l2tkbx7225co",
+    repoRev: "3l2tkbx7225co",
     hash: { $bytes: "q83vEjRWeJC..." },
   }),
 });
@@ -193,7 +193,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.spa
   body: JSON.stringify({
     space: "at://did:web:happyview.example.com/space/com.example.forum/main",
     repo: "did:plc:author456",
-    rev: "3l2tkbx7225co",
+    repoRev: "3l2tkbx7225co",
     hash: { $bytes: "q83vEjRWeJC..." },
   }),
 });
@@ -207,7 +207,7 @@ let response = client
     .json(&serde_json::json!({
         "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
         "repo": "did:plc:author456",
-        "rev": "3l2tkbx7225co",
+        "repoRev": "3l2tkbx7225co",
         "hash": { "$bytes": "q83vEjRWeJC..." }
     }))
     .send()
@@ -218,7 +218,7 @@ let data: serde_json::Value = response.json().await?;
 body := bytes.NewBufferString(`{
   "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
   "repo": "did:plc:author456",
-  "rev": "3l2tkbx7225co",
+  "repoRev": "3l2tkbx7225co",
   "hash": {"$bytes": "q83vEjRWeJC..."}
 }`)
 req, _ := http.NewRequest("POST",
@@ -234,7 +234,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.notifyWrite' 
   -d '{
     "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
     "repo": "did:plc:author456",
-    "rev": "3l2tkbx7225co",
+    "repoRev": "3l2tkbx7225co",
     "hash": {"$bytes": "q83vEjRWeJC..."}
   }'
 ```
@@ -245,15 +245,15 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.space.notifyWrite' 
 | ------- | ------ | -------- | ----------- |
 | `space` | string | Yes      | Space URI (`at://...`) |
 | `repo`  | string | Yes      | DID of the repo that changed. Must match the service auth issuer. |
-| `rev`   | string | Yes      | The repo's new revision (TID) |
+| `repoRev` | string | Yes    | The repo's new revision (TID). `rev`, the alpha lexicon's name, is accepted in its place until v3. |
 | `hash`  | bytes  | Yes      | The repo's new LtHash digest |
 
 HappyView handles the notification as follows:
 
 - The writer must pass the space's [write policy](./managing-spaces.md#policies). Otherwise the call fails with `403`.
-- A `rev` that is not newer than the last one recorded for the repo is accepted and ignored.
-- A `rev` more than 5 minutes in the future fails with `400`.
-- A newer `rev` joins the repo to the space's writer set, advances the space revision, and is forwarded to registered syncers.
+- A `repoRev` that is not newer than the last one recorded for the repo is accepted and ignored.
+- A `repoRev` more than 5 minutes in the future fails with `400 FutureRev`.
+- A newer `repoRev` joins the repo to the space's writer set, advances the space revision, and is forwarded to registered syncers.
 
 **Response (200):**
 
