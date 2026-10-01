@@ -86,7 +86,7 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     }
 
     let trigger_id = format!("job.run:{}", job.job_type);
-    let script = match scripts::resolve_native(state, &trigger_id).await {
+    let script = match scripts::resolve(state, &trigger_id).await {
         Some(s) => s,
         None => {
             let error = format!("no script found for trigger: {trigger_id}");

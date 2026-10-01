@@ -139,9 +139,10 @@ impl ParsedTrigger {
 // Script row + resolution
 // ---------------------------------------------------------------------------
 
-/// The language the runners in this module implement. Which other languages a
-/// script may be written in is a question about installed interpreters, so
-/// only this one is a constant.
+/// The language the reference implementation in this crate reads, which is
+/// what the codemod and the save-time compile check are written against.
+/// Which other languages a script may be written in is a question about
+/// installed interpreters, so only this one is a constant.
 pub const NATIVE_LANGUAGE: &str = "lua";
 
 /// A row from the `scripts` table — the wire shape the admin API returns.
@@ -164,16 +165,12 @@ pub struct ResolvedScript {
     pub body: String,
 }
 
-impl ResolvedScript {
-    /// Whether this row's body is in the language this binary expects an
-    /// interpreter for. Resolution reports a row's language rather than
-    /// filtering on it, so a caller asks before running the body.
-    pub fn is_native(&self) -> bool {
-        self.script_type == NATIVE_LANGUAGE
-    }
-}
-
 /// Look up a single trigger id. Returns `None` when no row matches.
+///
+/// Which language the row names is not a filter here. A trigger an operator
+/// bound to a script must resolve to that script whether or not its
+/// interpreter is installed, so that the answer is the dispatcher's refusal
+/// rather than a different script's output or silence.
 pub async fn resolve(state: &AppState, trigger_id: &str) -> Option<ResolvedScript> {
     let sql = adapt_sql(
         "SELECT id, body, script_type FROM happyview_scripts WHERE id = ?",
@@ -198,24 +195,6 @@ pub async fn resolve(state: &AppState, trigger_id: &str) -> Option<ResolvedScrip
     })
 }
 
-/// Look up a single trigger id, keeping the row only when this module can run
-/// it. A row stamped with another language reads as no row at all, so a
-/// trigger neither fires nor consumes a retry budget on a body nothing here
-/// can execute; the warn is what tells an operator their script was skipped
-/// and why.
-pub async fn resolve_native(state: &AppState, trigger_id: &str) -> Option<ResolvedScript> {
-    let script = resolve(state, trigger_id).await?;
-    if script.is_native() {
-        return Some(script);
-    }
-    tracing::warn!(
-        id = script.id,
-        script_type = script.script_type,
-        "skipping script; this binary runs {NATIVE_LANGUAGE} scripts"
-    );
-    None
-}
-
 /// Resolve a record-event trigger with the cascade rule:
 /// `record.<action>:<nsid>` first, then `record.index:<nsid>`.
 pub async fn resolve_record_event(
@@ -230,11 +209,11 @@ pub async fn resolve_record_event(
         _ => None,
     };
     if let Some(t) = action_trigger
-        && let Some(s) = resolve_native(state, &t).await
+        && let Some(s) = resolve(state, &t).await
     {
         return Some(s);
     }
-    resolve_native(state, &format!("record.index:{nsid}")).await
+    resolve(state, &format!("record.index:{nsid}")).await
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +453,7 @@ pub async fn run_label_applied_script(
     event: LabelAppliedEvent,
 ) -> LabelHookOutcome {
     let trigger = trigger_for_label_uri(&event.uri);
-    let resolved = match resolve_native(state, &trigger).await {
+    let resolved = match resolve(state, &trigger).await {
         Some(s) => s,
         None => return LabelHookOutcome::Continue(event),
     };
@@ -679,11 +658,12 @@ async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
 mod tests {
     use super::*;
 
-    /// A row for a language this binary does not run reads as no row at all,
-    /// so the cascade passes over it to `record.index` rather than firing a
-    /// runner that can only spend its retry budget and dead-letter.
+    /// The cascade reads trigger ids and nothing else. Skipping a row whose
+    /// language has no interpreter would answer an event with a different
+    /// script than the one its operator bound to that action, which is a
+    /// quieter wrong answer than the failure the runner records instead.
     #[tokio::test]
-    async fn a_row_for_another_language_does_not_shadow_the_cascade() {
+    async fn the_cascade_prefers_the_action_trigger_whatever_language_it_names() {
         let state = crate::test_support::test_state_with_pool(
             crate::test_support::migrated_memory_pool().await,
         );
@@ -710,15 +690,15 @@ mod tests {
         seed("record.create:com.example.thing", "typescript").await;
         seed("record.index:com.example.thing", NATIVE_LANGUAGE).await;
 
-        assert!(
-            resolve_native(&state, "record.create:com.example.thing")
-                .await
-                .is_none(),
-            "a typescript row is not resolvable by this binary"
-        );
         let cascaded = resolve_record_event(&state, "com.example.thing", "create")
             .await
-            .expect("the cascade reaches the native record.index row");
+            .expect("the cascade resolves the action trigger");
+        assert_eq!(cascaded.id, "record.create:com.example.thing");
+        assert_eq!(cascaded.script_type, "typescript");
+
+        let cascaded = resolve_record_event(&state, "com.example.thing", "update")
+            .await
+            .expect("no update trigger, so the wildcard answers");
         assert_eq!(cascaded.id, "record.index:com.example.thing");
     }
 

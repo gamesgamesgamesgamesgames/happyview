@@ -18,7 +18,7 @@ pub(crate) async fn handle_query(
     // Trigger-keyed dispatch: a script bound at `xrpc.query:<id>`
     // overrides the default list / get-record flow.
     let trigger = format!("xrpc.query:{}", lexicon.id);
-    if let Some(resolved) = crate::lua::resolve_native(state, &trigger).await {
+    if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
         return crate::lua::execute_query_script(
             state,
             method,

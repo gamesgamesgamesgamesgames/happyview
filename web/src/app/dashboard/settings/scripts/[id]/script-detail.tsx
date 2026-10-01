@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { AlertTriangle, Wand2 } from "lucide-react";
 
@@ -199,6 +200,26 @@ export default function ScriptDetail() {
                   }}
                 />
               )}
+            </div>
+          )}
+
+          {script?.runnable === false && (
+            <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
+              <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
+              <p className="text-xs text-amber-500">
+                No interpreter is installed for{" "}
+                <span className="font-mono">{script.script_type}</span>{" "}
+                scripts, so this one does not run — every trigger it is bound
+                to refuses until one is. It is otherwise intact and still
+                editable. Install an interpreter from the{" "}
+                <Link
+                  href="/dashboard/settings/plugins"
+                  className="underline font-medium"
+                >
+                  plugins page
+                </Link>
+                .
+              </p>
             </div>
           )}
 

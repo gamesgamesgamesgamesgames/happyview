@@ -208,6 +208,26 @@ export default function ScriptsPage() {
         enableSorting: true,
       },
       {
+        id: "runnable",
+        accessorFn: (row) => row.runnable,
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} label="Runtime" />
+        ),
+        // Muted rather than destructive: the row is intact, and what is
+        // missing is an install the operator has not done yet.
+        cell: ({ row }) =>
+          row.original.runnable ? null : (
+            <Badge
+              variant="outline"
+              className="text-muted-foreground"
+              title={`No interpreter installed for ${row.original.script_type} scripts`}
+            >
+              Inert
+            </Badge>
+          ),
+        enableSorting: true,
+      },
+      {
         id: "updated_at",
         accessorKey: "updated_at",
         header: ({ column }) => (

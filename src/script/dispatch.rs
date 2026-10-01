@@ -24,12 +24,20 @@ pub enum DispatchError {
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoInterpreter { language } => {
-                write!(f, "no interpreter installed for '{language}' scripts")
-            }
+            Self::NoInterpreter { language } => f.write_str(&no_interpreter_message(language)),
             Self::Execution(e) => e.fmt(f),
         }
     }
+}
+
+/// What an operator is told when nothing installed claims `language`.
+///
+/// Five surfaces say it — a query's and a procedure's 503, a dead-letter row,
+/// a job's error column, and a save's refusal — and all five are read by the
+/// one person who can act on it, so they say the same thing in the same words
+/// rather than each describing the gap from its own side.
+pub fn no_interpreter_message(language: &str) -> String {
+    format!("no interpreter installed for '{language}' scripts; install one from the plugins page")
 }
 
 impl std::error::Error for DispatchError {}

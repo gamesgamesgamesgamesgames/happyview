@@ -10,6 +10,8 @@
 //! - On create / patch the body is parsed against the script_type
 //!   (lua → [`crate::lua::validate_script`]). Invalid bodies are
 //!   rejected at write-time with a 400.
+//! - A script_type no installed interpreter claims is rejected with a 400
+//!   (see [`validate_body_for_type`]).
 //! - A Lua body that still reaches a removed global is refused with a 400
 //!   (see [`refuse_unmigrated`]), ahead of the compile check.
 //! - The trigger id is parsed against
@@ -23,6 +25,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::AppState;
 use crate::codemod::{self, ScriptKind};
@@ -39,6 +42,20 @@ const MAX_DESCRIPTION_LEN: usize = 300;
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
+
+/// The columns a script read selects, in the order both reads select them:
+/// `(id, script_type, body, description, outbound_xrpcs, created_at,
+/// updated_at)`. Named so the two queries and
+/// [`ScriptResponse::from_row`] cannot disagree about the order.
+type ScriptColumns = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
 
 /// One row from the `scripts` table — what GET endpoints return.
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +80,11 @@ pub(super) struct ScriptResponse {
     /// The single entry `"unparseable"` is not a global, as
     /// `codemod::needs_migration` explains.
     pub needs_migration: Vec<String>,
+    /// `false` when no installed interpreter claims this row's language, so
+    /// the script is stored and inert. A client says so rather than showing
+    /// the row as broken: the row is intact and installing the interpreter is
+    /// the whole fix.
+    pub runnable: bool,
 }
 
 impl ScriptResponse {
@@ -71,15 +93,11 @@ impl ScriptResponse {
     /// `recreatable` and `outbound_xrpcs` are derived here rather than passed
     /// in, so a new call site cannot forget them. `recreatable` is `false`
     /// when the row's own trigger id would be refused if submitted today.
-    fn from_row(
-        id: String,
-        script_type: String,
-        body: String,
-        description: Option<String>,
-        outbound_xrpcs_json: Option<String>,
-        created_at: String,
-        updated_at: String,
-    ) -> Self {
+    ///
+    /// `installed` is passed in because it is one read of the plugin registry
+    /// for a whole listing rather than one per row.
+    fn from_row(row: ScriptColumns, installed: &HashSet<String>) -> Self {
+        let (id, script_type, body, description, outbound_xrpcs_json, created_at, updated_at) = row;
         let outbound_xrpcs: Option<Vec<String>> =
             outbound_xrpcs_json.and_then(|j| serde_json::from_str(&j).ok());
         let recreatable = ParsedTrigger::parse(&id).is_ok();
@@ -92,6 +110,7 @@ impl ScriptResponse {
             Vec::new()
         };
         Self {
+            runnable: installed.contains(&script_type),
             id,
             script_type,
             body,
@@ -206,16 +225,7 @@ pub(super) async fn list(
     sql.push_str(" ORDER BY id");
 
     let sql = adapt_sql(&sql, backend);
-    #[allow(clippy::type_complexity)]
-    let mut q = crate::db::query_as::<(
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-    )>(&sql);
+    let mut q = crate::db::query_as::<ScriptColumns>(&sql);
     if let Some(ref suffix) = query.suffix {
         q = q.bind(format!("%:{suffix}"));
     }
@@ -224,21 +234,10 @@ pub(super) async fn list(
         .await
         .map_err(|e| AppError::Internal(format!("failed to list scripts: {e}")))?;
 
+    let installed = installed_languages(&state).await;
     let scripts: Vec<ScriptResponse> = rows
         .into_iter()
-        .map(
-            |(id, script_type, body, description, outbound_xrpcs_json, created_at, updated_at)| {
-                ScriptResponse::from_row(
-                    id,
-                    script_type,
-                    body,
-                    description,
-                    outbound_xrpcs_json,
-                    created_at,
-                    updated_at,
-                )
-            },
-        )
+        .map(|row| ScriptResponse::from_row(row, &installed))
         .collect();
 
     Ok(Json(scripts))
@@ -626,30 +625,15 @@ async fn fetch_one(state: &AppState, id: &str) -> Result<ScriptResponse, AppErro
          FROM happyview_scripts WHERE id = ?",
         backend,
     );
-    #[allow(clippy::type_complexity)]
-    let row: Option<(
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-    )> = crate::db::query_as(&sql)
+    let row: Option<ScriptColumns> = crate::db::query_as(&sql)
         .bind(id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to fetch script: {e}")))?;
-    let (id, script_type, body, description, outbound_xrpcs_json, created_at, updated_at) =
-        row.ok_or_else(|| AppError::NotFound(format!("script '{id}' not found")))?;
+    let row = row.ok_or_else(|| AppError::NotFound(format!("script '{id}' not found")))?;
     Ok(ScriptResponse::from_row(
-        id,
-        script_type,
-        body,
-        description,
-        outbound_xrpcs_json,
-        created_at,
-        updated_at,
+        row,
+        &installed_languages(state).await,
     ))
 }
 
@@ -688,10 +672,14 @@ fn refuse_unmigrated(id: &str, script_type: &str, body: &str) -> Result<(), AppE
 /// Validate the script body against its declared language, rejecting an
 /// invalid body with a 400 at write-time.
 ///
-/// Which languages a script may declare is a question about which interpreters
-/// are installed, so an unrecognised one is answered with the list this
-/// instance can actually run rather than with a list compiled in. A body for an
-/// installed interpreter is that interpreter's to check.
+/// A language no installed interpreter claims is refused outright: nothing
+/// could check the body and nothing could run it, so storing it would accept a
+/// script on no authority at all. The refusal borrows the dispatcher's own
+/// sentence, since the gap and the fix are the same ones a run reports.
+///
+/// [`NATIVE_LANGUAGE`] is checked by the reference implementation compiled in
+/// here; a body for any other installed interpreter is that interpreter's to
+/// check.
 async fn validate_body_for_type(
     state: &AppState,
     body: &str,
@@ -700,21 +688,16 @@ async fn validate_body_for_type(
     if language == NATIVE_LANGUAGE {
         return crate::lua::validate_script(body).map_err(AppError::BadRequest);
     }
-    let mut available = installed_languages(state).await;
-    if available.iter().any(|l| l == language) {
+    if installed_languages(state).await.contains(language) {
         return Ok(());
     }
-    available.push(NATIVE_LANGUAGE.to_string());
-    available.sort();
-    available.dedup();
-    Err(AppError::BadRequest(format!(
-        "unknown script_type '{language}'; this instance can run: {}",
-        available.join(", ")
+    Err(AppError::BadRequest(crate::script::no_interpreter_message(
+        language,
     )))
 }
 
 /// The languages installed interpreters claim.
-async fn installed_languages(state: &AppState) -> Vec<String> {
+async fn installed_languages(state: &AppState) -> HashSet<String> {
     state
         .plugin_registry
         .list_by_type(crate::plugin::PluginType::Interpreter)
@@ -734,16 +717,49 @@ mod tests {
     // exercising the full HTTP handlers needs a database (see
     // `tests/e2e_scripts.rs`, which is `#[ignore]`-gated).
 
+    fn lua_installed() -> HashSet<String> {
+        HashSet::from([NATIVE_LANGUAGE.to_string()])
+    }
+
+    /// `runnable` answers for the instance, not for the row: the same stored
+    /// script is runnable or inert depending only on what is installed.
+    #[test]
+    fn from_row_reads_runnable_off_the_installed_interpreters() {
+        let row = |installed: &HashSet<String>| {
+            ScriptResponse::from_row(
+                (
+                    "xrpc.query:com.example.list".into(),
+                    "typescript".into(),
+                    "function handle() {}".into(),
+                    None,
+                    None,
+                    "2026-01-01T00:00:00+00:00".into(),
+                    "2026-01-01T00:00:00+00:00".into(),
+                ),
+                installed,
+            )
+            .runnable
+        };
+        assert!(!row(&lua_installed()));
+        assert!(row(&HashSet::from([
+            "lua".to_string(),
+            "typescript".to_string()
+        ])));
+    }
+
     #[test]
     fn from_row_marks_a_valid_trigger_id_recreatable() {
         let r = ScriptResponse::from_row(
-            "record.create:com.example.thing".into(),
-            "lua".into(),
-            "function handle() end".into(),
-            None,
-            None,
-            "2026-01-01T00:00:00+00:00".into(),
-            "2026-01-01T00:00:00+00:00".into(),
+            (
+                "record.create:com.example.thing".into(),
+                "lua".into(),
+                "function handle() end".into(),
+                None,
+                None,
+                "2026-01-01T00:00:00+00:00".into(),
+                "2026-01-01T00:00:00+00:00".into(),
+            ),
+            &lua_installed(),
         );
         assert!(r.recreatable);
     }
@@ -753,13 +769,16 @@ mod tests {
         // Hyphen in the name segment: accepted before the NSID consolidation,
         // refused now. The script still fires, but cannot be recreated.
         let r = ScriptResponse::from_row(
-            "xrpc.query:com.example.get-photos".into(),
-            "lua".into(),
-            "function handle() end".into(),
-            None,
-            None,
-            "2026-01-01T00:00:00+00:00".into(),
-            "2026-01-01T00:00:00+00:00".into(),
+            (
+                "xrpc.query:com.example.get-photos".into(),
+                "lua".into(),
+                "function handle() end".into(),
+                None,
+                None,
+                "2026-01-01T00:00:00+00:00".into(),
+                "2026-01-01T00:00:00+00:00".into(),
+            ),
+            &lua_installed(),
         );
         assert!(!r.recreatable);
     }
@@ -767,13 +786,16 @@ mod tests {
     #[test]
     fn from_row_parses_outbound_xrpcs_and_tolerates_garbage() {
         let ok = ScriptResponse::from_row(
-            "record.create:com.example.thing".into(),
-            "lua".into(),
-            String::new(),
-            None,
-            Some(r#"["com.example.foo"]"#.into()),
-            "2026-01-01T00:00:00+00:00".into(),
-            "2026-01-01T00:00:00+00:00".into(),
+            (
+                "record.create:com.example.thing".into(),
+                "lua".into(),
+                String::new(),
+                None,
+                Some(r#"["com.example.foo"]"#.into()),
+                "2026-01-01T00:00:00+00:00".into(),
+                "2026-01-01T00:00:00+00:00".into(),
+            ),
+            &lua_installed(),
         );
         assert_eq!(
             ok.outbound_xrpcs.as_deref(),
@@ -781,13 +803,16 @@ mod tests {
         );
 
         let garbage = ScriptResponse::from_row(
-            "record.create:com.example.thing".into(),
-            "lua".into(),
-            String::new(),
-            None,
-            Some("not json".into()),
-            "2026-01-01T00:00:00+00:00".into(),
-            "2026-01-01T00:00:00+00:00".into(),
+            (
+                "record.create:com.example.thing".into(),
+                "lua".into(),
+                String::new(),
+                None,
+                Some("not json".into()),
+                "2026-01-01T00:00:00+00:00".into(),
+                "2026-01-01T00:00:00+00:00".into(),
+            ),
+            &lua_installed(),
         );
         assert_eq!(garbage.outbound_xrpcs, None);
     }
@@ -795,13 +820,16 @@ mod tests {
     #[test]
     fn from_row_reports_needs_migration_for_a_lua_script() {
         let r = ScriptResponse::from_row(
-            "xrpc.query:com.example.list".into(),
-            "lua".into(),
-            "function handle()\n  return params.q\nend\n".into(),
-            None,
-            None,
-            "2026-01-01T00:00:00+00:00".into(),
-            "2026-01-01T00:00:00+00:00".into(),
+            (
+                "xrpc.query:com.example.list".into(),
+                "lua".into(),
+                "function handle()\n  return params.q\nend\n".into(),
+                None,
+                None,
+                "2026-01-01T00:00:00+00:00".into(),
+                "2026-01-01T00:00:00+00:00".into(),
+            ),
+            &lua_installed(),
         );
         assert_eq!(r.needs_migration, vec!["params".to_string()]);
     }
@@ -809,13 +837,16 @@ mod tests {
     #[test]
     fn from_row_needs_migration_is_empty_for_a_non_lua_script() {
         let r = ScriptResponse::from_row(
-            "xrpc.query:com.example.list".into(),
-            "javascript".into(),
-            "function handle() { return params.q; }".into(),
-            None,
-            None,
-            "2026-01-01T00:00:00+00:00".into(),
-            "2026-01-01T00:00:00+00:00".into(),
+            (
+                "xrpc.query:com.example.list".into(),
+                "javascript".into(),
+                "function handle() { return params.q; }".into(),
+                None,
+                None,
+                "2026-01-01T00:00:00+00:00".into(),
+                "2026-01-01T00:00:00+00:00".into(),
+            ),
+            &lua_installed(),
         );
         assert!(r.needs_migration.is_empty());
     }

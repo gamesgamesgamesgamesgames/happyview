@@ -100,8 +100,14 @@ async fn seed_script(app: &TestApp, trigger_id: &str, body: &str) {
 
 /// A query endpoint bound to `source`, ready to call.
 async fn query_app(source: &str) -> TestApp {
-    let app = TestApp::new().await;
+    let app = query_app_without_interpreter(source).await;
     interpreter(&app).await;
+    app
+}
+
+/// The same endpoint with nothing installed that claims the row's language.
+async fn query_app_without_interpreter(source: &str) -> TestApp {
+    let app = TestApp::new().await;
     upload_lexicon(&app, common::fixtures::list_games_query_lexicon()).await;
     seed_script(&app, &format!("xrpc.query:{QUERY}"), source).await;
     app
@@ -109,8 +115,13 @@ async fn query_app(source: &str) -> TestApp {
 
 /// A procedure endpoint bound to `source`, ready to call.
 async fn procedure_app(source: &str) -> TestApp {
-    let app = TestApp::new().await;
+    let app = procedure_app_without_interpreter(source).await;
     interpreter(&app).await;
+    app
+}
+
+async fn procedure_app_without_interpreter(source: &str) -> TestApp {
+    let app = TestApp::new().await;
     upload_lexicon(&app, common::fixtures::create_game_procedure_lexicon()).await;
     seed_script(&app, &format!("xrpc.procedure:{PROCEDURE}"), source).await;
     app
@@ -376,6 +387,55 @@ async fn an_interpreter_that_traps_answers_a_correlation_id() {
             .is_some_and(|text| text.contains("trap")),
         "{detail}"
     );
+}
+
+/// Nothing claims the row's language, so no answer this endpoint could give
+/// would be the one the script defines. The operator's fix is named in the
+/// body: there is nobody else who can act on it, and no secret in it.
+#[tokio::test]
+async fn a_query_whose_language_has_no_interpreter_is_a_503_naming_it() {
+    common::require_db!();
+    let app = query_app_without_interpreter("value:other").await;
+
+    let resp = call_query(&app, "").await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(resp).await;
+    assert_eq!(body["error"], "ServerMisconfigured");
+    let message = body["message"].as_str().expect("a message");
+    assert!(message.contains("lua"), "{body}");
+    assert!(message.contains("plugins page"), "{body}");
+}
+
+#[tokio::test]
+async fn a_procedure_whose_language_has_no_interpreter_is_a_503_naming_it() {
+    common::require_db!();
+    let app = procedure_app_without_interpreter("value:other").await;
+
+    let resp = call_procedure(&app, &json!({ "title": "hello" })).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(resp).await;
+    assert_eq!(body["error"], "ServerMisconfigured");
+    let message = body["message"].as_str().expect("a message");
+    assert!(message.contains("lua"), "{body}");
+    assert!(message.contains("plugins page"), "{body}");
+}
+
+/// Installing the interpreter is the whole fix: the same request answers the
+/// script's own value with nothing else changed.
+#[tokio::test]
+async fn installing_the_interpreter_makes_the_same_query_answer() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app_without_interpreter("value:other").await;
+    assert_eq!(
+        call_query(&app, "?limit=5").await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    interpreter(&app).await;
+    let resp = call_query(&app, "?limit=5").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await, json!({ "limit": 5 }));
 }
 
 // ---------------------------------------------------------------------------

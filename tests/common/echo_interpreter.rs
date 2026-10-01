@@ -27,6 +27,17 @@ pub fn is_built() -> bool {
 
 /// The fixture, claiming `language`.
 pub fn plugin(language: &str) -> LoadedPlugin {
+    LoadedPlugin {
+        wasm_bytes: std::fs::read(MODULE).expect(BUILD),
+        ..claiming(language)
+    }
+}
+
+/// An interpreter claiming `language` with no module behind it, for a caller
+/// that only needs the registry to answer which languages are installed.
+/// Saving a script is such a caller, and making it read a built module would
+/// put a skip in front of a target that never runs one.
+pub fn claiming(language: &str) -> LoadedPlugin {
     let manifest: PluginManifest = serde_json::from_value(json!({
         "id": "interpreter_echo",
         "name": "interpreter_echo",
@@ -42,7 +53,7 @@ pub fn plugin(language: &str) -> LoadedPlugin {
         source: PluginSource::File {
             path: "tests/fixtures/interpreter_echo".into(),
         },
-        wasm_bytes: std::fs::read(MODULE).expect(BUILD),
+        wasm_bytes: Vec::new(),
         manifest: Some(manifest),
     }
 }

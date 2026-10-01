@@ -53,15 +53,20 @@ async fn app() -> TestApp {
 /// Seed a job script row directly. `POST /admin/scripts` validates what it
 /// stores, and a directive is not a script in the language the row names.
 async fn seed_script(app: &TestApp, job_type: &str, body: &str) {
+    seed_script_as(app, job_type, body, "lua").await;
+}
+
+async fn seed_script_as(app: &TestApp, job_type: &str, body: &str, script_type: &str) {
     let now = happyview::db::now_rfc3339();
     let sql = happyview::db::adapt_sql(
         "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) \
-         VALUES (?, ?, 'lua', ?, ?)",
+         VALUES (?, ?, ?, ?, ?)",
         app.state.db_backend,
     );
     happyview::db::query(&sql)
         .bind(format!("job.run:{job_type}"))
         .bind(body)
+        .bind(script_type)
         .bind(&now)
         .bind(&now)
         .execute(&app.state.db)
@@ -316,20 +321,25 @@ async fn a_failed_run_fails_the_job_keeping_its_category_and_its_line() {
     assert_eq!(categories, ["runtime", "timeout", "memory"]);
 }
 
-/// A language nothing installed claims fails the job naming it, rather than
-/// leaving the row running with nobody to run it.
+/// A job nothing can run fails rather than reporting a missing script or
+/// staying queued: a job that silently never runs tells an operator nothing.
+/// Whichever language the row names, the error column holds the sentence that
+/// names it and the fix.
 #[tokio::test]
 #[serial]
 async fn a_job_whose_language_has_no_interpreter_fails_naming_it() {
     common::require_db!();
-    let app = TestApp::new().await;
-    seed_script(&app, TYPE, "probe").await;
-    let id = seed_job(&app, TYPE, &json!({})).await;
+    for language in ["lua", "typescript"] {
+        let app = TestApp::new().await;
+        seed_script_as(&app, TYPE, "probe", language).await;
+        let id = seed_job(&app, TYPE, &json!({})).await;
 
-    let row = run_to_completion(&app, &id).await;
-    assert_eq!(row.status, "failed");
-    let error = row.error.expect("no error persisted");
-    assert!(error.contains("lua"), "{error}");
+        let row = run_to_completion(&app, &id).await;
+        assert_eq!(row.status, "failed", "{language}");
+        let error = row.error.expect("no error persisted");
+        assert!(error.contains(language), "{language}: {error}");
+        assert!(error.contains("plugins page"), "{language}: {error}");
+    }
 }
 
 // ---------------------------------------------------------------------------

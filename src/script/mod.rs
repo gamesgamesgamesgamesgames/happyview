@@ -9,5 +9,5 @@
 pub mod dispatch;
 pub mod input;
 
-pub use dispatch::{DispatchError, dispatch};
+pub use dispatch::{DispatchError, dispatch, no_interpreter_message};
 pub use input::{Invocation, Trigger, build_input};

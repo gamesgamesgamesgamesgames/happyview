@@ -106,7 +106,7 @@ pub(crate) async fn handle_procedure(
             }
         }
     }
-    if let Some(resolved) = crate::lua::resolve_native(state, &trigger).await {
+    if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
         // Delegation guard preserved from origin/dev: scripts that run
         // under a `delegateDid` must come from a caller who is an
         // active write-capable delegate of that account, scoped to the

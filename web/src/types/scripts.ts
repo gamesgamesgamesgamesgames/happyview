@@ -1,9 +1,11 @@
 /**
- * Scripting language a script is written for. The backend stamps this
- * on every row so a future runtime (e.g. `"typescript"`) can land
- * without a schema migration. Today only `"lua"` ships.
+ * Scripting language a script is written for. The set is whatever the
+ * installed interpreter plugins declare, which is a runtime fact about one
+ * instance — so no literal union can state it, and a saved language the
+ * instance cannot run is reported by `Script.runnable` rather than refused
+ * by this type.
  */
-export type ScriptLanguage = "lua"
+export type ScriptLanguage = string
 
 /**
  * One row from the `scripts` table — what the admin API returns.
@@ -46,6 +48,12 @@ export interface Script {
    * off it.
    */
   needs_migration: string[]
+  /**
+   * `false` when no installed interpreter claims `script_type`. The script is
+   * stored and intact but inert: every trigger it is bound to refuses until
+   * the interpreter is installed.
+   */
+  runnable: boolean
 }
 
 /** One construct the codemod could not rewrite mechanically. */

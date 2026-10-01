@@ -106,6 +106,15 @@ fn returned_value(
                 .unwrap_or_else(|| script_error(method, kind.into(), message, line));
             Err((raw, error))
         }
+        // An endpoint whose interpreter is absent cannot answer until an
+        // operator installs one, which is what 503 says. Answering anything
+        // else would hand a caller a reply the script never shaped; a
+        // correlation id would hide a sentence that names only the language
+        // the row asked for and nothing about this instance.
+        Err(e @ DispatchError::NoInterpreter { .. }) => {
+            let raw = e.to_string();
+            Err((raw.clone(), AppError::ServerMisconfigured(raw)))
+        }
         // A run that produced no result at all is told apart by whose failure
         // it describes, not by how bad it is. The two limits describe the
         // script's own run and keep its envelope; every other way an
@@ -624,9 +633,6 @@ mod tests {
             DispatchError::Execution(ExecutionError::MissingExport(SECRET.into())),
             DispatchError::Execution(ExecutionError::NotAnInterpreter(SECRET.into())),
             DispatchError::Execution(ExecutionError::InvalidResponse(SECRET.into())),
-            DispatchError::NoInterpreter {
-                language: SECRET.into(),
-            },
         ] {
             let label = error.to_string();
             let (logged, app_error) = returned_value("com.example.probe", Err(error))
@@ -655,6 +661,36 @@ mod tests {
                 "{label}: {body} leaks the host's own text"
             );
         }
+    }
+
+    /// An absent interpreter is the one host-origin failure whose text a
+    /// caller gets in full. It names no internals — only the language the row
+    /// asked for — and an operator reading a correlation id would learn less
+    /// than the sentence itself says.
+    #[tokio::test]
+    async fn an_absent_interpreter_answers_a_503_naming_the_language() {
+        let (logged, app_error) = returned_value(
+            "com.example.probe",
+            Err(DispatchError::NoInterpreter {
+                language: "typescript".into(),
+            }),
+        )
+        .expect_err("a run that did not happen has no value");
+        assert!(logged.contains("typescript"), "{logged}");
+
+        let response = app_error.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let body: Value = serde_json::from_slice(&body).expect("a JSON body");
+        assert_eq!(body["error"], "ServerMisconfigured");
+        let message = body["message"].as_str().expect("a message");
+        assert!(message.contains("typescript"), "{body}");
+        assert!(message.contains("plugins page"), "{body}");
     }
 
     /// The guard reports a run whatever became of it, so a counter cannot be

@@ -396,6 +396,37 @@ async fn the_cascade_prefers_the_action_trigger_over_the_index_one() {
     assert_eq!(context["trigger"], format!("record.index:{NSID}"));
 }
 
+/// The cascade is about which trigger an event matches, not about which rows
+/// happen to be runnable. An operator who bound this action to a script gets
+/// that script's failure recorded, rather than the quietly different answer a
+/// fall-through to the wildcard row would give.
+#[tokio::test]
+async fn the_action_trigger_still_wins_when_its_language_has_no_interpreter() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    seed_script_as(
+        &app,
+        &format!("record.create:{NSID}"),
+        "value:object",
+        "typescript",
+    )
+    .await;
+    seed_script(&app, &format!("record.index:{NSID}"), "value:none").await;
+
+    let outcome = run_record_event_script(&app.state, record_payload("create")).await;
+    assert_eq!(
+        outcome,
+        RecordHookOutcome::Proceed,
+        "the wildcard row's `value:none` would have skipped the event"
+    );
+
+    let rows = dead_letters(&app).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].script_ref, format!("record.create:{NSID}"));
+    assert!(rows[0].error.contains("typescript"), "{}", rows[0].error);
+}
+
 // ---------------------------------------------------------------------------
 // The branch a label reads
 // ---------------------------------------------------------------------------
@@ -449,13 +480,13 @@ async fn a_label_value_that_is_neither_persists_the_original() {
     assert!(dead_letters(&app).await.is_empty());
 }
 
-/// A row stamped with a language this binary cannot run reads as no row at
-/// all: the label is persisted unchanged, and nothing is recorded against a
-/// script that never ran.
+/// Nothing claims the row's language, so the run produces no result at all.
+/// The label is still persisted — a subscription must not stall on a plugin
+/// an operator has not installed — and the dead letter is the trace that says
+/// why the script did not shape it.
 #[tokio::test]
-async fn a_label_row_for_another_language_falls_through_silently() {
+async fn a_label_row_whose_language_has_no_interpreter_dead_letters_and_persists() {
     common::require_db!();
-    require_fixture!();
     let app = app().await;
     seed_script_as(
         &app,
@@ -467,9 +498,13 @@ async fn a_label_row_for_another_language_falls_through_silently() {
 
     let event = continued(run_label_applied_script(&app.state, label_event()).await);
     assert_eq!(event.val, "spam");
-    assert!(dead_letters(&app).await.is_empty());
     assert!(events(&app, "script.executed").await.is_empty());
-    assert!(events(&app, "script.dead_lettered").await.is_empty());
+
+    let rows = dead_letters(&app).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].script_ref, "labeler.apply:app.bsky.feed.post");
+    assert!(rows[0].error.contains("typescript"), "{}", rows[0].error);
+    assert_eq!(events(&app, "script.dead_lettered").await.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
