@@ -10,7 +10,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use common::app::TestApp;
-use common::echo_interpreter;
+use common::{burn, echo_interpreter};
 
 /// Skips the caller when the echo fixture's module is absent, naming the build
 /// that produces it. Every fixture's `target/` is gitignored, so that is a step
@@ -499,16 +499,13 @@ async fn worker_runs_pending_job_to_completion() {
     assert_eq!(result["ok"], true);
 }
 
-/// How much guest CPU `burn:` spends. Sized to outlast a one-second budget
-/// several times over, so this measures the branch rather than this machine
-/// against another; the run asserts its own premise and says so when a faster
-/// machine outgrows the number.
-const BURN_ITERATIONS: u64 = 5_000_000_000;
-
 /// Running long is what a job is for, so the wall clock every other kind of
-/// run is bounded by is lifted for one. Only guest CPU that outlasts the
-/// budget *and then returns* can tell the two arms apart — a host wait stops
-/// the guest's clock for its whole duration and so costs nothing either way.
+/// run is bounded by is lifted for one — and the worker is what has to reach
+/// that branch. Only guest CPU that outlasts the budget *and then returns*
+/// can tell the two arms apart: a host wait stops the guest's clock for its
+/// whole duration and so costs nothing either way. The burn is sized to this
+/// machine, since no one count outlasts a one-second budget on every machine
+/// without costing seconds on some.
 #[tokio::test]
 #[serial]
 async fn worker_runs_a_job_past_the_budget_that_would_end_a_query() {
@@ -517,12 +514,12 @@ async fn worker_runs_a_job_past_the_budget_that_would_end_a_query() {
     let app = TestApp::new().await;
     app.state.script_limits.set_wall_clock_seconds(1);
 
-    seed_script(
-        &app,
-        "job.run:test.long",
-        &format!("burn:{BURN_ITERATIONS}"),
-    )
-    .await;
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
+    let burn = burn::calibrate(&app.state, "interpreter_echo").await;
+    seed_script(&app, "job.run:test.long", &burn.source()).await;
     let id = seed_job(&app, "test.long", "pending").await;
 
     let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
@@ -532,11 +529,7 @@ async fn worker_runs_a_job_past_the_budget_that_would_end_a_query() {
     worker.abort();
 
     assert_eq!(status, "completed", "job error: {error:?}");
-    assert!(
-        burned > std::time::Duration::from_secs(3),
-        "the burn finished in {burned:?}, too close to the one-second budget for this to \
-         mean anything: raise BURN_ITERATIONS"
-    );
+    burn.assert_outlasted(burned);
 }
 
 #[tokio::test]

@@ -338,18 +338,19 @@ async fn a_spinning_script_is_interrupted_at_the_wall_clock_and_classifies_as_ti
     );
 }
 
-/// How much guest CPU `burn:` spends. Sized to outlast a one-second budget
-/// several times over, so the pair below measures the branch rather than this
-/// machine against another; the run asserts its own premise and says so when
-/// a faster machine outgrows the number.
-const BURN_ITERATIONS: u64 = 10_000_000_000;
-
 /// The job exemption, both arms, which nothing else pins. `host:job_wait`
 /// cannot: the import wrapper stops the guest's clock for the whole sleep, so
 /// its seconds are host time under either arm and the guest's own execution is
 /// microseconds. Only guest CPU that outlasts the budget *and then returns*
 /// tells the two apart — swap the arms, or arm unconditionally, and one half
 /// of this fails.
+///
+/// The burn is sized to this machine, since no one count outlasts the budget
+/// on every machine without costing seconds on some. The non-job arms prove
+/// it outlasted the budget whatever it was sized to — a burn too short comes
+/// back from them returned rather than timed out — and the floor below is
+/// checked first only so a burn the guest never spent is reported as that
+/// rather than as a deadline that stopped working.
 #[tokio::test]
 async fn only_a_job_run_outlives_the_wall_clock() {
     common::require_db!();
@@ -357,7 +358,8 @@ async fn only_a_job_run_outlives_the_wall_clock() {
     let app = TestApp::new().await;
     let id = interpreter(&app).await;
     app.state.script_limits.set_wall_clock_seconds(1);
-    let source = format!("burn:{BURN_ITERATIONS}");
+    let burn = common::burn::calibrate(&app.state, id).await;
+    let source = burn.source();
 
     let mut job_run = input(&source, ScriptKind::Job);
     job_run.context.job = Some(ScriptJob {
@@ -373,9 +375,7 @@ async fn only_a_job_run_outlives_the_wall_clock() {
     );
     let burned = started.elapsed();
     assert_eq!(value["source"], source);
-    // `cargo test --test plugin_interpreter only_a_job -- --nocapture` prints
-    // what the burn costs here, which is how BURN_ITERATIONS gets re-sized.
-    println!("burn of {BURN_ITERATIONS} iterations took {burned:?}");
+    burn.assert_outlasted(burned);
 
     for kind in [ScriptKind::XrpcQuery, ScriptKind::RecordEvent] {
         let err = app
@@ -386,12 +386,6 @@ async fn only_a_job_run_outlives_the_wall_clock() {
             .expect_err("a run that is not a job must be bounded by the wall clock");
         assert!(matches!(err, ExecutionError::Timeout), "{kind:?}: {err}");
     }
-
-    assert!(
-        burned > std::time::Duration::from_secs(3),
-        "the burn finished in {burned:?}, too close to the one-second budget for the \
-         assertions above to mean anything: raise BURN_ITERATIONS"
-    );
 }
 
 /// Running long is what a job is for, so the wall clock is lifted for one.
