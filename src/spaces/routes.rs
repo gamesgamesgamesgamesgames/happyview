@@ -139,6 +139,10 @@ pub(crate) struct SpaceUriQuery {
 #[serde(rename_all = "camelCase")]
 struct ListSpacesQuery {
     did: Option<String>,
+    /// Lists only spaces of this type. `type` is the earlier name, accepted
+    /// until v3.
+    #[serde(rename = "spaceType", alias = "type")]
+    space_type: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
@@ -545,6 +549,7 @@ async fn list_spaces(
         &state.db,
         state.db_backend,
         &did,
+        query.space_type.as_deref(),
         limit,
         query.cursor.as_deref(),
     )

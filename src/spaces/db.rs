@@ -119,24 +119,37 @@ pub async fn list_spaces_for_user(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     did: &str,
+    space_type: Option<&str>,
     limit: i64,
     cursor: Option<&str>,
 ) -> Result<(Vec<SpaceView>, Option<String>), AppError> {
     let decoded_cursor = cursor.and_then(decode_cursor);
+    let type_clause = if space_type.is_some() {
+        " AND s.type_nsid = ?"
+    } else {
+        ""
+    };
 
     let sql = if decoded_cursor.is_some() {
         adapt_sql(
-            "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? AND (sm.created_at > ? OR (sm.created_at = ? AND ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            &format!(
+                "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ?{type_clause} AND (sm.created_at > ? OR (sm.created_at = ? AND ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?"
+            ),
             backend,
         )
     } else {
         adapt_sql(
-            "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            &format!(
+                "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ?{type_clause} ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?"
+            ),
             backend,
         )
     };
 
     let mut query = crate::db::query_as::<(String, String, String, String, String)>(&sql).bind(did);
+    if let Some(space_type) = space_type {
+        query = query.bind(space_type);
+    }
     if let Some((ref ts, ref uri)) = decoded_cursor {
         query = query.bind(ts.as_str()).bind(ts.as_str()).bind(uri.as_str());
     }
