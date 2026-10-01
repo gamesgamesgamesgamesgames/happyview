@@ -956,45 +956,73 @@ mod tests {
         }
     }
 
-    /// What each kind an interpreter can report reads as. This runs wherever
-    /// the crate builds, so it is what holds the rendering while the real
-    /// interpreter's own refusals are asserted only where it is installed.
+    /// What each kind an interpreter can report reads as, with a line and
+    /// without one. This runs wherever the crate builds, so it is what holds
+    /// the rendering while the real interpreter's own refusals are asserted
+    /// only where it is installed.
+    ///
+    /// The rows are checked against `ScriptErrorKind::ALL`, so a new kind
+    /// fails here rather than falling outside a test that claims to cover
+    /// every one. A row's message is the sentence that kind really carries,
+    /// since the sentence is half of what an operator reads.
     #[test]
     fn each_kind_is_rendered_as_the_operator_reads_it() {
-        assert_eq!(
-            refusal_message(&[validate_error(
-                ScriptErrorKind::MissingHandle,
-                None,
-                "script must define a handle() function",
-            )]),
-            "script must define a handle() function"
-        );
-        assert_eq!(
-            refusal_message(&[validate_error(
+        let rows = [
+            (
                 ScriptErrorKind::Syntax,
-                Some(1),
                 "<name> expected near <eof>",
-            )]),
-            "script compilation failed at line 1: <name> expected near <eof>"
-        );
-        // A read of a removed global fails while the chunk loads, which is a
-        // runtime failure rather than a syntax one.
-        assert_eq!(
-            refusal_message(&[validate_error(
+                "script compilation failed at line 7: <name> expected near <eof>",
+                "script compilation failed: <name> expected near <eof>",
+            ),
+            // A read of a removed global fails while the chunk loads, which
+            // is a runtime failure rather than a syntax one.
+            (
                 ScriptErrorKind::Runtime,
-                Some(2),
                 "the 'input' global was removed in v3",
-            )]),
-            "script compilation failed at line 2: the 'input' global was removed in v3"
-        );
-        assert_eq!(
-            refusal_message(&[validate_error(
+                "script compilation failed at line 7: the 'input' global was removed in v3",
+                "script compilation failed: the 'input' global was removed in v3",
+            ),
+            (
                 ScriptErrorKind::Timeout,
-                None,
                 "script exceeded its instruction limit",
-            )]),
-            "script compilation failed: script exceeded its instruction limit"
+                "script compilation failed at line 7: script exceeded its instruction limit",
+                "script compilation failed: script exceeded its instruction limit",
+            ),
+            (
+                ScriptErrorKind::Memory,
+                "not enough memory",
+                "script compilation failed at line 7: not enough memory",
+                "script compilation failed: not enough memory",
+            ),
+            // A whole sentence about the script's shape, so it stands alone
+            // and a line would say nothing about where to look.
+            (
+                ScriptErrorKind::MissingHandle,
+                "script must define a handle() function",
+                "script must define a handle() function",
+                "script must define a handle() function",
+            ),
+        ];
+
+        let covered: Vec<ScriptErrorKind> = rows.iter().map(|(kind, ..)| *kind).collect();
+        assert_eq!(
+            covered,
+            ScriptErrorKind::ALL,
+            "every kind an interpreter can report needs a row here"
         );
+
+        for (kind, message, with_line, without_line) in rows {
+            assert_eq!(
+                refusal_message(&[validate_error(kind, Some(7), message)]),
+                with_line,
+                "{kind:?} with a line"
+            );
+            assert_eq!(
+                refusal_message(&[validate_error(kind, None, message)]),
+                without_line,
+                "{kind:?} with no line"
+            );
+        }
     }
 
     /// Two shapes no interpreter in the suite produces, and both are shapes

@@ -368,10 +368,10 @@ jobs:
       # The stack's `lua` interpreter is this fixture, bind-mounted by
       # docker-compose.e2e.yml, and saving a script asks the interpreter its
       # language names whether the body is one it can run. The artefact is
-      # gitignored and this job builds no Rust otherwise, so without these two
-      # steps the mount is empty, every save is refused and `globalSetup`
-      # stops the run. Named rather than `--require` alone: this job builds
-      # one fixture, not all thirteen.
+      # gitignored and this job builds no Rust otherwise, so without the three
+      # steps below the mount is empty, every save is refused and
+      # `globalSetup` stops the run. The fixture is named rather than left to
+      # `--require` alone: this job builds one, not all thirteen.
       - name: Add WASM target
         run: rustup target add wasm32-unknown-unknown
 

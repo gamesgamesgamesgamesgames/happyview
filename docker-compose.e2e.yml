@@ -112,6 +112,13 @@ services:
       # `validate`, and not enough to judge a body. `globalSetup` refuses a
       # run where the fixture is unbuilt, because an empty directory here
       # reads as three broken specs.
+      #
+      # The second bind needs the fixture's own `manifest.json` to exist as
+      # its mountpoint: the parent bind is read-only, so a path the runtime
+      # has to create inside it fails the container. Deleting that manifest
+      # as the redundant-looking one of a pair is therefore what breaks this.
+      # `tests/e2e_stack_interpreter.rs` is what keeps the overlaid manifest
+      # from drifting out of step with the module.
       - ./tests/fixtures/interpreter_echo:/app/plugins/lua:ro
       - ./scripts/e2e-lua-stand-in-manifest.json:/app/plugins/lua/manifest.json:ro
     depends_on:
