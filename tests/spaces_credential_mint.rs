@@ -106,10 +106,10 @@ async fn setup_and_get_delegation_token(app: &TestApp) -> String {
         .unwrap();
     let resp = app.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "getDelegationToken failed");
-    json_of(resp).await["delegationToken"]
-        .as_str()
-        .expect("delegationToken")
-        .to_string()
+    let body = json_of(resp).await;
+    // `delegationToken` is the earlier name, returned until v3.
+    assert_eq!(body["delegationToken"], body["token"]);
+    body["token"].as_str().expect("token").to_string()
 }
 
 /// A fresh key for a syncer to bind a credential to.

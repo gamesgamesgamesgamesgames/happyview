@@ -58,7 +58,7 @@ const response = await fetch(`https://happyview.example.com/xrpc/com.atproto.spa
   },
 });
 interface DelegationTokenResponse {
-  delegationToken: string;
+  token: string;
   expiresAt: string;
 }
 const data: DelegationTokenResponse = await response.json();
@@ -107,10 +107,12 @@ curl 'https://happyview.example.com/xrpc/com.atproto.space.getDelegationToken?sp
 
 ```json
 {
-  "delegationToken": "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0In0...",
+  "token": "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0In0...",
   "expiresAt": "2026-09-30T12:01:00Z"
 }
 ```
+
+The response also carries the token as `delegationToken`, its earlier name, until v3.
 
 The OAuth session must hold a `space:` scope with the full `read` action for the space. See [OAuth scopes](./managing-spaces.md#oauth-scopes).
 

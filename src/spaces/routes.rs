@@ -1191,6 +1191,8 @@ async fn get_delegation_token(
         .unwrap_or_default();
 
     Ok(Json(serde_json::json!({
+        "token": grant,
+        // The earlier name for `token`. Returned until v3.
         "delegationToken": grant,
         "expiresAt": expires_at,
     })))

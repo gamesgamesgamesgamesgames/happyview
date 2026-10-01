@@ -125,7 +125,7 @@ async fn setup(app: &mut TestApp, key: &SigningKey) -> (String, String) {
     )
     .await;
     assert_eq!(delegation.status(), StatusCode::OK);
-    let token = json_of(delegation).await["delegationToken"]
+    let token = json_of(delegation).await["token"]
         .as_str()
         .unwrap()
         .to_string();
