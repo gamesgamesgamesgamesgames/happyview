@@ -198,6 +198,24 @@ pub async fn resolve(state: &AppState, trigger_id: &str) -> Option<ResolvedScrip
     })
 }
 
+/// Look up a single trigger id, keeping the row only when this module can run
+/// it. A row stamped with another language reads as no row at all, so a
+/// trigger neither fires nor consumes a retry budget on a body nothing here
+/// can execute; the warn is what tells an operator their script was skipped
+/// and why.
+pub async fn resolve_native(state: &AppState, trigger_id: &str) -> Option<ResolvedScript> {
+    let script = resolve(state, trigger_id).await?;
+    if script.is_native() {
+        return Some(script);
+    }
+    tracing::warn!(
+        id = script.id,
+        script_type = script.script_type,
+        "skipping script; this binary runs {NATIVE_LANGUAGE} scripts"
+    );
+    None
+}
+
 /// Resolve a record-event trigger with the cascade rule:
 /// `record.<action>:<nsid>` first, then `record.index:<nsid>`.
 pub async fn resolve_record_event(
@@ -212,11 +230,11 @@ pub async fn resolve_record_event(
         _ => None,
     };
     if let Some(t) = action_trigger
-        && let Some(s) = resolve(state, &t).await
+        && let Some(s) = resolve_native(state, &t).await
     {
         return Some(s);
     }
-    resolve(state, &format!("record.index:{nsid}")).await
+    resolve_native(state, &format!("record.index:{nsid}")).await
 }
 
 // ---------------------------------------------------------------------------
@@ -481,7 +499,7 @@ pub async fn run_label_applied_script(
     event: LabelAppliedEvent,
 ) -> LabelHookOutcome {
     let trigger = trigger_for_label_uri(&event.uri);
-    let resolved = match resolve(state, &trigger).await {
+    let resolved = match resolve_native(state, &trigger).await {
         Some(s) => s,
         None => return LabelHookOutcome::Continue(event),
     };
@@ -874,6 +892,49 @@ mod tests {
             .expect("the instruction limit must end the run")
             .expect_err("the run must fail");
         assert!(err.contains("execution limit"), "{err}");
+    }
+
+    /// A row for a language this binary does not run reads as no row at all,
+    /// so the cascade passes over it to `record.index` rather than firing a
+    /// runner that can only spend its retry budget and dead-letter.
+    #[tokio::test]
+    async fn a_row_for_another_language_does_not_shadow_the_cascade() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let seed = |id: &'static str, script_type: &'static str| {
+            let state = state.clone();
+            async move {
+                let now = now_rfc3339();
+                let sql = adapt_sql(
+                    "INSERT INTO happyview_scripts (id, script_type, body, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?)",
+                    state.db_backend,
+                );
+                crate::db::query(&sql)
+                    .bind(id)
+                    .bind(script_type)
+                    .bind("function handle() end")
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(&state.db)
+                    .await
+                    .expect("seed a script row");
+            }
+        };
+        seed("record.create:com.example.thing", "typescript").await;
+        seed("record.index:com.example.thing", NATIVE_LANGUAGE).await;
+
+        assert!(
+            resolve_native(&state, "record.create:com.example.thing")
+                .await
+                .is_none(),
+            "a typescript row is not resolvable by this binary"
+        );
+        let cascaded = resolve_record_event(&state, "com.example.thing", "create")
+            .await
+            .expect("the cascade reaches the native record.index row");
+        assert_eq!(cascaded.id, "record.index:com.example.thing");
     }
 
     fn lua_script(body: &str) -> ResolvedScript {

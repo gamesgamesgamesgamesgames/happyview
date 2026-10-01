@@ -111,7 +111,8 @@ async fn seed_stored_script(app: &TestApp, id: &str, body: &str) -> Value {
 
 /// Seed a script row with an arbitrary `script_type`, bypassing
 /// `POST /admin/scripts` — the only way to get a non-Lua row into the table,
-/// since `ScriptLanguage` has no such variant to submit through the API.
+/// since that endpoint refuses a language no installed interpreter claims and
+/// this harness installs none.
 async fn seed_script_with_type(app: &TestApp, id: &str, script_type: &str, body: &str) {
     let now = happyview::db::now_rfc3339();
     let sql = happyview::db::adapt_sql(

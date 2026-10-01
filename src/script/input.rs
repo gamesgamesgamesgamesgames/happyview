@@ -83,6 +83,8 @@ pub struct Invocation<'a> {
 /// per run by `execute_script_as`.
 pub async fn build_input(state: &AppState, inv: &Invocation<'_>) -> ScriptExecuteInput {
     let kind = inv.trigger.kind();
+    // `require` resolves the namespace and `host_call_library` takes the id, so
+    // the pair travels together and no interpreter resolves a namespace itself.
     let libraries = state
         .plugin_executor()
         .library_index()
@@ -163,6 +165,40 @@ mod tests {
         state
     }
 
+    /// Install a library under `id` and `namespace`. Its surface is seeded into
+    /// the registry's cache, which `library_index` reads ahead of instantiating
+    /// anything, so the entry needs no compiled module.
+    async fn install_library(state: &AppState, id: &str, namespace: &str) {
+        let manifest: crate::plugin::PluginManifest = serde_json::from_value(json!({
+            "id": id, "name": id, "version": "1.0.0", "api_version": "2",
+            "plugin_type": "library", "namespace": namespace, "capabilities": [],
+        }))
+        .expect("a library manifest");
+        state
+            .plugin_registry
+            .install(crate::plugin::LoadedPlugin {
+                info: manifest.clone().into(),
+                source: crate::plugin::PluginSource::File { path: id.into() },
+                wasm_bytes: vec![],
+                manifest: Some(manifest),
+            })
+            .await
+            .expect("install the library");
+        state
+            .plugin_registry
+            .cache_api_surface(
+                id,
+                std::sync::Arc::new(crate::plugin::library::ApiSurface {
+                    namespace: namespace.to_string(),
+                    import_path: None,
+                    description: None,
+                    exports: Vec::new(),
+                    types: Vec::new(),
+                }),
+            )
+            .await;
+    }
+
     fn space() -> ScriptSpace {
         ScriptSpace {
             uri: "at://did:plc:a/space/com.example.type/sk".into(),
@@ -229,6 +265,7 @@ mod tests {
     #[tokio::test]
     async fn a_procedure_input_carries_the_request_and_the_budgets() {
         let state = state_with_one_variable().await;
+        install_library(&state, "happyview-http", "happyview.http").await;
         let input = json!({ "text": "hi" });
         let params = HashMap::from([("limit".to_string(), json!(10))]);
         let space = space();
@@ -280,9 +317,12 @@ mod tests {
             built.limits.memory_bytes,
             DEFAULT_SCRIPT_MEMORY_BYTES as u64
         );
-        assert!(
-            built.libraries.is_empty(),
-            "no library is installed in this instance"
+        assert_eq!(
+            built.libraries,
+            vec![ScriptLibraryRef {
+                namespace: "happyview.http".into(),
+                id: "happyview-http".into(),
+            }]
         );
         assert!(
             built.removed_globals.is_empty(),
