@@ -35,8 +35,8 @@ pub fn plugin(language: &str) -> LoadedPlugin {
 
 /// An interpreter claiming `language` with no module behind it, for a caller
 /// that only needs the registry to answer which languages are installed.
-/// Saving a script is such a caller, and making it read a built module would
-/// put a skip in front of a target that never runs one.
+/// Reading a stored row is such a caller, and making it read a built module
+/// would put a skip in front of a target that runs nothing.
 pub fn claiming(language: &str) -> LoadedPlugin {
     let manifest: PluginManifest = serde_json::from_value(json!({
         "id": "interpreter_echo",

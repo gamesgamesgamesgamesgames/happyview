@@ -37,6 +37,7 @@ export default defineConfig({
         "script-delete.spec.ts",
         "script-job.spec.ts",
         "script-unload-guard.spec.ts",
+        "script-validate.spec.ts",
         "record-delete.spec.ts",
         "proxy-config.spec.ts",
         "spaces.spec.ts",

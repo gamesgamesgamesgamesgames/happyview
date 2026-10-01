@@ -88,7 +88,19 @@ async fn seed_procedure_lexicon(app: &TestApp) {
         .unwrap();
 }
 
+/// The interpreter `lua` names, which a save consults and a run goes
+/// through. The subject of every test here is the access check in front of
+/// the script, so the echo fixture is enough: it accepts any body and answers
+/// any run.
+async fn install_lua_interpreter(app: &TestApp) {
+    app.state
+        .plugin_registry
+        .register(common::echo_interpreter::plugin("lua"))
+        .await;
+}
+
 async fn seed_procedure_script(app: &TestApp, body: &str) {
+    install_lua_interpreter(app).await;
     let resp = app
         .router
         .clone()
@@ -468,12 +480,6 @@ async fn service_auth_procedure_allowed() {
 
     seed_procedure_lexicon(&app).await;
     seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
-    // The subject here is the access check in front of the script, so the run
-    // only has to happen: the echo fixture answers any body at all.
-    app.state
-        .plugin_registry
-        .register(common::echo_interpreter::plugin("lua"))
-        .await;
 
     let entry_id = app
         .create_service_entry("#chess", "ChessAppView", "specific")
@@ -991,6 +997,7 @@ async fn anonymous_access_still_works() {
 async fn static_analysis_persistence() {
     common::require_db!();
     let app = TestApp::new().await;
+    install_lua_interpreter(&app).await;
 
     app.router
         .clone()

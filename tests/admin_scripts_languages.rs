@@ -2,9 +2,10 @@
 //! store a body no installed interpreter could check or run, and reporting
 //! whether a stored row can run at all.
 //!
-//! The interpreter here claims a language and carries no module, because
-//! nothing under test runs a script — the save path and the read path both
-//! only ask the registry which languages are installed.
+//! The read path only asks the registry which languages are installed, so the
+//! interpreter it sees claims a language and carries no module. The save path
+//! asks the interpreter itself whether the body is one it can run, so the one
+//! test that gets as far as storing a row carries the fixture's module.
 
 mod common;
 
@@ -173,10 +174,14 @@ async fn a_patch_onto_a_language_with_no_interpreter_is_refused_and_stores_nothi
 #[serial]
 async fn installing_the_interpreter_lets_the_same_body_save() {
     common::require_db!();
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
     let app = TestApp::new().await;
     app.state
         .plugin_registry
-        .register(echo_interpreter::claiming("typescript"))
+        .register(echo_interpreter::plugin("typescript"))
         .await;
 
     let resp = post_script(

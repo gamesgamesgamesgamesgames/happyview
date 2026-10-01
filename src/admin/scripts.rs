@@ -7,13 +7,13 @@
 //! operators CRUD those rows.
 //!
 //! Validation:
-//! - On create / patch the body is parsed against the script_type
-//!   (lua → [`crate::lua::validate_script`]). Invalid bodies are
-//!   rejected at write-time with a 400.
+//! - On create / patch the body is checked by the interpreter the script_type
+//!   names, through its `validate` export. A body it refuses is rejected at
+//!   write-time with a 400 carrying what it said.
 //! - A script_type no installed interpreter claims is rejected with a 400
 //!   (see [`validate_body_for_type`]).
 //! - A Lua body that still reaches a removed global is refused with a 400
-//!   (see [`refuse_unmigrated`]), ahead of the compile check.
+//!   (see [`refuse_unmigrated`]), ahead of the interpreter's check.
 //! - The trigger id is parsed against
 //!   [`crate::lua::ParsedTrigger::parse`]; unknown prefixes / invalid
 //!   NSIDs are rejected at write-time with a 400.
@@ -33,6 +33,7 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lua::{NATIVE_LANGUAGE, ParsedTrigger};
+use crate::plugin::{ScriptErrorKind, ScriptValidateError};
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -382,13 +383,16 @@ pub(super) async fn patch(
             "patching script_type requires body alongside (so the server can re-validate)".into(),
         ));
     }
+    // Existence check + fetch current values. Ahead of the body check,
+    // because a patch that does not name a language is a patch under the
+    // stored one, and the alternative — the compiled-in default — hands one
+    // interpreter's body to another.
+    let existing = fetch_one(&state, &id).await?;
+
     if let Some(ref new_body) = body.body {
-        let lang = body
-            .script_type
-            .clone()
-            .unwrap_or_else(|| NATIVE_LANGUAGE.to_string());
-        refuse_unmigrated(&id, &lang, new_body)?;
-        validate_body_for_type(&state, new_body, &lang).await?;
+        let lang = body.script_type.as_deref().unwrap_or(&existing.script_type);
+        refuse_unmigrated(&id, lang, new_body)?;
+        validate_body_for_type(&state, new_body, lang).await?;
     }
     if let Some(Some(ref desc)) = body.description
         && desc.len() > MAX_DESCRIPTION_LEN
@@ -397,9 +401,6 @@ pub(super) async fn patch(
             "description must be at most {MAX_DESCRIPTION_LEN} characters"
         )));
     }
-
-    // Existence check + fetch current values.
-    let existing = fetch_one(&state, &id).await?;
 
     let backend = state.db_backend;
     let now = now_rfc3339();
@@ -646,7 +647,7 @@ fn rewrite_lua(source: &str, kind: ScriptKind) -> Result<codemod::Rewrite, AppEr
 /// `needs_migration`'s order. Such a script would save cleanly and then fail
 /// on its first run, far from the edit that caused it.
 ///
-/// It runs ahead of the compile check. That check loads the chunk under the
+/// It runs ahead of the interpreter's check, which loads the chunk under the
 /// removed-name guard, so a read at file scope would otherwise answer as a
 /// compilation failure, which offers no way to the codemod.
 ///
@@ -672,28 +673,69 @@ fn refuse_unmigrated(id: &str, script_type: &str, body: &str) -> Result<(), AppE
 /// Validate the script body against its declared language, rejecting an
 /// invalid body with a 400 at write-time.
 ///
-/// A language no installed interpreter claims is refused outright: nothing
-/// could check the body and nothing could run it, so storing it would accept a
-/// script on no authority at all. The refusal borrows the dispatcher's own
-/// sentence, since the gap and the fix are the same ones a run reports.
+/// The check belongs to the interpreter that would run the body, so the
+/// editor and a run agree about what the language accepts by asking the same
+/// thing. A language no installed interpreter claims is refused outright:
+/// nothing could check the body and nothing could run it, so storing it would
+/// accept a script on no authority at all. That refusal borrows the
+/// dispatcher's own sentence, since the gap and the fix are the same ones a
+/// run reports.
 ///
-/// [`NATIVE_LANGUAGE`] is checked by the reference implementation compiled in
-/// here; a body for any other installed interpreter is that interpreter's to
-/// check.
+/// An interpreter that cannot answer at all is a 500: the body may be
+/// perfectly good, and refusing it would blame the operator for a broken
+/// plugin.
 async fn validate_body_for_type(
     state: &AppState,
     body: &str,
     language: &str,
 ) -> Result<(), AppError> {
-    if language == NATIVE_LANGUAGE {
-        return crate::lua::validate_script(body).map_err(AppError::BadRequest);
-    }
-    if installed_languages(state).await.contains(language) {
+    let interpreter = state
+        .plugin_registry
+        .get_interpreter_by_language(language)
+        .await
+        .ok_or_else(|| AppError::BadRequest(crate::script::no_interpreter_message(language)))?;
+    let validated = state
+        .plugin_executor()
+        .validate_script(&interpreter.info.id, body)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "interpreter '{}' could not check the script: {e}",
+                interpreter.info.id
+            ))
+        })?;
+    if validated.valid {
         return Ok(());
     }
-    Err(AppError::BadRequest(crate::script::no_interpreter_message(
-        language,
-    )))
+    Err(AppError::BadRequest(refusal_message(&validated.errors)))
+}
+
+/// What a refusal says, from what the interpreter reported.
+///
+/// A missing `handle` is a whole sentence about the script's shape, so it
+/// stands alone. Everything else is a failure at a position, and the line is
+/// the half an operator needs: an interpreter reports it as a field rather
+/// than inside the message, since the chunk name it would otherwise sit
+/// behind names nothing an operator can open. An interpreter free to report
+/// several reasons has all of them said rather than the rest dropped.
+fn refusal_message(errors: &[ScriptValidateError]) -> String {
+    if errors.is_empty() {
+        return "the interpreter refused the script without saying why".to_string();
+    }
+    errors
+        .iter()
+        .map(|error| match (error.kind, error.line) {
+            (ScriptErrorKind::MissingHandle, _) => error.message.clone(),
+            (_, Some(line)) => {
+                format!(
+                    "script compilation failed at line {line}: {}",
+                    error.message
+                )
+            }
+            (_, None) => format!("script compilation failed: {}", error.message),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The languages installed interpreters claim.
@@ -899,6 +941,36 @@ mod tests {
         assert_eq!(
             refusal("xrpc.query:com.example.list", "lua", "function handle( end"),
             None
+        );
+    }
+
+    fn validate_error(
+        kind: ScriptErrorKind,
+        line: Option<u32>,
+        message: &str,
+    ) -> ScriptValidateError {
+        ScriptValidateError {
+            kind,
+            line,
+            message: message.to_string(),
+        }
+    }
+
+    /// Two shapes no interpreter in the suite produces, and both are shapes
+    /// the contract permits: an interpreter may report several reasons, and
+    /// may report none at all.
+    #[test]
+    fn every_reason_an_interpreter_gave_is_said() {
+        assert_eq!(
+            refusal_message(&[
+                validate_error(ScriptErrorKind::Syntax, Some(3), "unexpected ')'"),
+                validate_error(ScriptErrorKind::MissingHandle, None, "no handle"),
+            ]),
+            "script compilation failed at line 3: unexpected ')'; no handle"
+        );
+        assert_eq!(
+            refusal_message(&[]),
+            "the interpreter refused the script without saying why"
         );
     }
 }

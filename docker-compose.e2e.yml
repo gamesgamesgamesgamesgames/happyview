@@ -104,6 +104,16 @@ services:
     volumes:
       - ./scripts/e2e-entrypoint.sh:/e2e-entrypoint.sh:ro
       - caddy_data:/caddy-data:ro
+      # Saving a script asks the interpreter its language names whether the
+      # body is one it can run, so a stack with nothing claiming `lua`
+      # refuses every save and the three script specs fail. The real Lua
+      # interpreter is built elsewhere and needs a C toolchain, so the echo
+      # fixture stands in under a manifest claiming `lua`: enough to answer
+      # `validate`, and not enough to judge a body. `globalSetup` refuses a
+      # run where the fixture is unbuilt, because an empty directory here
+      # reads as three broken specs.
+      - ./tests/fixtures/interpreter_echo:/app/plugins/lua:ro
+      - ./scripts/e2e-lua-stand-in-manifest.json:/app/plugins/lua/manifest.json:ro
     depends_on:
       postgres:
         condition: service_healthy

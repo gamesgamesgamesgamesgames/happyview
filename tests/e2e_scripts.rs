@@ -148,7 +148,14 @@ async fn seed_directive(app: &TestApp, id: &str, source: &str) {
 }
 
 /// Create a script via the admin API. Returns the created row.
+///
+/// The interpreter is installed first because a save is checked by the one
+/// the row's language names.
 async fn create_script(app: &TestApp, id: &str, body: &str) -> Value {
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
     let resp = app
         .router
         .clone()
@@ -249,6 +256,7 @@ async fn fetch_record_body(app: &TestApp, uri: &str) -> Option<Value> {
 #[serial]
 async fn create_then_get_script_round_trips() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
     let id = "record.create:com.example.thing";
     create_script(&app, id, "function handle(input) return input.record end").await;
@@ -272,6 +280,7 @@ async fn create_then_get_script_round_trips() {
 #[serial]
 async fn list_scripts_returns_all_rows() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
     create_script(
         &app,
@@ -351,7 +360,12 @@ async fn create_rejects_invalid_nsid_suffix() {
 #[serial]
 async fn create_allows_labeler_apply_actor_special_case() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
     let resp = app
         .router
         .clone()
@@ -368,11 +382,19 @@ async fn create_allows_labeler_apply_actor_special_case() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
+/// The body the interpreter is sent is the body it judges, and a refusal is
+/// the operator's 400. Which Lua is valid Lua is the real plugin's to say, so
+/// the fixture's own directive stands for a body it will not take.
 #[tokio::test]
 #[serial]
-async fn create_rejects_invalid_lua_body() {
+async fn create_rejects_a_body_the_interpreter_refuses() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
     let resp = app
         .router
         .clone()
@@ -381,7 +403,7 @@ async fn create_rejects_invalid_lua_body() {
             app.admin_cookie(),
             &json!({
                 "id": "record.create:com.example.thing",
-                "body": "function handle(", // syntax error
+                "body": "invalid, says the body",
             }),
         ))
         .await
@@ -393,6 +415,7 @@ async fn create_rejects_invalid_lua_body() {
 #[serial]
 async fn patch_updates_body() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
     let id = "record.create:com.example.thing";
     create_script(&app, id, "function handle(input) return input.record end").await;
@@ -416,6 +439,7 @@ async fn patch_updates_body() {
 #[serial]
 async fn delete_removes_script() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
     let id = "record.delete:com.example.thing";
     create_script(&app, id, "function handle(input) return input.record end").await;
@@ -634,6 +658,7 @@ async fn record_event_script_log_writes_event_log_row() {
 #[ignore = "needs a library plugin this harness does not install"]
 async fn label_script_can_drop_record_via_record_delete_local() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
 
     let uri = "at://did:plc:victim/app.bsky.feed.post/rkey1";
@@ -679,6 +704,7 @@ async fn label_script_can_drop_record_via_record_delete_local() {
 #[ignore = "needs a library plugin this harness does not install"]
 async fn label_script_can_redact_record_via_save_local() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
 
     let uri = "at://did:plc:author/app.bsky.feed.post/rkey1";
@@ -732,6 +758,7 @@ async fn label_script_can_redact_record_via_save_local() {
 #[ignore = "needs a library plugin this harness does not install"]
 async fn label_script_uri_routes_actor_special_case() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
     happyview::db::query("DROP TABLE IF EXISTS script_sentinel")
         .execute(&app.state.db)
@@ -787,6 +814,7 @@ async fn label_script_uri_routes_actor_special_case() {
 #[ignore = "needs a library plugin this harness does not install"]
 async fn label_script_calling_record_put_dead_letters_with_clear_message() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
 
     let uri = "at://did:plc:author/app.bsky.feed.post/rkey1";
@@ -889,6 +917,7 @@ async fn label_script_calling_record_put_dead_letters_with_clear_message() {
 #[ignore = "needs a library plugin this harness does not install"]
 async fn record_event_script_can_call_record_delete_local() {
     common::require_db!();
+    require_fixture!();
     let app = TestApp::new().await;
     seed_lexicon(&app, fixtures::game_record_lexicon()).await;
 

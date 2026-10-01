@@ -7,7 +7,10 @@ pub(crate) mod sandbox;
 pub mod scripts;
 
 pub(crate) use execute::{execute_procedure_script, execute_query_script};
-pub(crate) use sandbox::validate_script;
+/// The reference editor check. Its own tests are what say what an
+/// interpreter's `validate` has to agree with.
+#[doc(hidden)]
+pub use sandbox::validate_script;
 pub use scripts::{
     LabelAppliedEvent, LabelHookOutcome, NATIVE_LANGUAGE, ParsedTrigger, RecordEventPayload,
     RecordHookOutcome, ResolvedScript, ScriptRow, TriggerKind, resolve, resolve_record_event,

@@ -14,6 +14,7 @@ use serial_test::serial;
 use tower::ServiceExt;
 
 use common::app::TestApp;
+use common::echo_interpreter;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -562,6 +563,23 @@ async fn codemod_refuses_apply_with_a_supplied_source() {
 
 const CLEAN_SOURCE: &str = "function handle(input, ctx)\n  return input.q\nend\n";
 
+/// A `lua` interpreter, for the cases that get past the scanner and so need
+/// something to check the body. The fixture rather than the real plugin: the
+/// scanner's refusal is the subject, and the one case that needs a body
+/// judged says so through the fixture's directive. `false` when the fixture
+/// is not built.
+async fn with_an_interpreter(app: &TestApp) -> bool {
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return false;
+    }
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
+    true
+}
+
 #[tokio::test]
 #[serial]
 async fn create_refuses_an_unmigrated_body_naming_its_globals_in_order() {
@@ -638,13 +656,18 @@ async fn a_file_scope_read_is_refused_as_unmigrated_rather_than_as_a_compile_fai
     assert_eq!(err["removed_globals"], json!(["db"]));
 }
 
-/// A body that does not parse names no global, so the compile check's message
-/// is the one that reaches the client.
+/// A body the scanner reads as unparseable names no global, so what reaches
+/// the client is the interpreter's own refusal — and that refusal carries no
+/// `removed_globals`, which is the field the dashboard keys its Migrate offer
+/// on.
 #[tokio::test]
 #[serial]
-async fn a_body_that_does_not_parse_is_a_compile_failure_with_no_globals_field() {
+async fn an_interpreters_refusal_carries_no_globals_field() {
     common::require_db!();
     let app = TestApp::new().await;
+    if !with_an_interpreter(&app).await {
+        return;
+    }
 
     let resp = app
         .router
@@ -652,7 +675,7 @@ async fn a_body_that_does_not_parse_is_a_compile_failure_with_no_globals_field()
         .oneshot(admin_post(
             "/admin/scripts",
             app.admin_cookie(),
-            &json!({ "id": "xrpc.query:com.example.list", "body": "function handle( end" }),
+            &json!({ "id": "xrpc.query:com.example.list", "body": "invalid, says the body" }),
         ))
         .await
         .unwrap();
@@ -673,6 +696,9 @@ async fn a_body_that_does_not_parse_is_a_compile_failure_with_no_globals_field()
 async fn create_stores_a_migrated_body() {
     common::require_db!();
     let app = TestApp::new().await;
+    if !with_an_interpreter(&app).await {
+        return;
+    }
     let id = "xrpc.query:com.example.list";
 
     let resp = app
@@ -720,6 +746,9 @@ async fn create_refuses_to_replace_a_stored_script_with_an_unmigrated_body() {
 async fn patch_refuses_an_unmigrated_body_and_stores_a_migrated_one() {
     common::require_db!();
     let app = TestApp::new().await;
+    if !with_an_interpreter(&app).await {
+        return;
+    }
     let id = "record.index:com.example.thing";
     seed_stored_script(&app, id, CLEAN_SOURCE).await;
 

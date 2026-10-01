@@ -1,4 +1,18 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+/**
+ * The module `docker-compose.e2e.yml` mounts as the stack's `lua`
+ * interpreter. Nothing in the stack builds it, and without it HappyView
+ * refuses every script save — which surfaces as three unrelated-looking spec
+ * failures rather than as a missing file.
+ */
+const STAND_IN = join(
+  __dirname,
+  "../../../tests/fixtures/interpreter_echo/target/wasm32-unknown-unknown/release/interpreter_echo.wasm",
+);
 
 async function waitForService(url: string, name: string, timeoutMs = 60000) {
   const start = Date.now();
@@ -15,6 +29,14 @@ async function waitForService(url: string, name: string, timeoutMs = 60000) {
 }
 
 async function globalSetup() {
+  if (!existsSync(STAND_IN)) {
+    throw new Error(
+      `The stack's Lua interpreter is not built, so every script save will be refused. Run:\n` +
+        `  cargo build --manifest-path tests/fixtures/interpreter_echo/Cargo.toml --target wasm32-unknown-unknown --release\n` +
+        `then restart the e2e stack. Expected: ${STAND_IN}`,
+    );
+  }
+
   const baseURL =
     process.env.PLAYWRIGHT_BASE_URL || "https://happyview.127-0-0-1.sslip.io";
 
