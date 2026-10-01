@@ -22,7 +22,14 @@ COPY crates/happyview-plugin-sdk/Cargo.toml crates/happyview-plugin-sdk/
 COPY crates/happyview-scopes/Cargo.toml crates/happyview-scopes/
 RUN mkdir -p crates/happyview-nsid/src crates/happyview-plc/src crates/happyview-plugin-sdk/src crates/happyview-scopes/src \
     && touch crates/happyview-nsid/src/lib.rs crates/happyview-plc/src/lib.rs crates/happyview-plugin-sdk/src/lib.rs crates/happyview-scopes/src/lib.rs
-RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && touch src/lib.rs && echo "fn main() {}" > src/bin/migrate_lua_sql.rs && echo "fn main() {}" > src/bin/migrate_space_cids.rs
+# Every target `Cargo.toml` declares needs a stub here, because cargo resolves
+# targets before it compiles anything: a declared `[[bin]]` with no file on disk
+# fails this layer with `can't find bin`, which surfaces as an image that never
+# built rather than as a missing file. Adding a binary means adding its stub.
+RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && touch src/lib.rs \
+    && echo "fn main() {}" > src/bin/migrate_lua_sql.rs \
+    && echo "fn main() {}" > src/bin/migrate_space_cids.rs \
+    && echo "fn main() {}" > src/bin/codemod.rs
 ENV SQLX_OFFLINE=true
 RUN cargo build --release && rm -rf src target/release/.fingerprint/happyview-*
 
