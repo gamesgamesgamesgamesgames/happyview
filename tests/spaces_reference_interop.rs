@@ -104,6 +104,9 @@ impl Account {
             "com.atproto.simplespace.createSpace",
             Some(&self.token),
             json!({
+                // `spaceType` for the October 2026 alpha and later, `type` for
+                // the image before it. Each ignores the other.
+                "spaceType": "com.example.forum",
                 "type": "com.example.forum",
                 "skey": "self",
                 // Serialized from HappyView's own types, so acceptance here is a
