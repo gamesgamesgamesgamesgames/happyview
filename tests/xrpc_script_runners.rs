@@ -213,8 +213,6 @@ async fn a_query_hands_the_interpreter_its_params_and_its_context() {
     );
     assert_eq!(sent["context"]["has_pds_auth"], false);
     assert_eq!(sent["context"]["env"]["API_KEY"], "k");
-    // The parameters are the first argument, so carrying them twice would
-    // leave a script author guessing which one a runner fills.
     assert!(sent["context"].get("params").is_none(), "{sent}");
     assert!(sent["context"].get("caller_did").is_none(), "{sent}");
     assert!(sent["context"].get("job").is_none(), "{sent}");
@@ -349,6 +347,34 @@ async fn a_script_that_never_returns_is_a_408() {
         started.elapsed() < std::time::Duration::from_secs(30),
         "the run outlived the one-second clock: {:?}",
         started.elapsed()
+    );
+}
+
+/// An interpreter that traps rather than answering has failed on its own
+/// account, and what it says about itself names wasmtime internals and paths
+/// inside this instance. A caller gets a correlation id; the text is the
+/// operator's, in the log and in the `script.error` row.
+#[tokio::test]
+async fn an_interpreter_that_traps_answers_a_correlation_id() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("grow:1").await;
+
+    let resp = call_query(&app, "").await;
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = json_body(resp).await;
+    assert!(body["correlationId"].is_string(), "{body}");
+    assert!(
+        body.get("errorType").is_none() && body.get("message").is_none(),
+        "a trap is not the script's failure to report: {body}"
+    );
+
+    let (_, _, detail) = one_event(&app, "script.error").await;
+    assert!(
+        detail["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("trap")),
+        "{detail}"
     );
 }
 

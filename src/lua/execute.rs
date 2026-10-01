@@ -11,7 +11,7 @@ use crate::auth::Claims;
 use crate::error::{AppError, LUA_AUTH_ERROR_PREFIX, ScriptErrorType};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::ParsedLexicon;
-use crate::plugin::{ScriptExecuteOutput, ScriptSpace};
+use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptSpace};
 use crate::repo;
 use crate::script::{DispatchError, Invocation, Trigger, dispatch};
 use crate::telemetry::counters::Counters;
@@ -49,20 +49,30 @@ fn auth_message_after_prefix(msg: &str) -> String {
     }
 }
 
-/// The error a caller sees for a run that produced no value.
+/// The 401 an `AUTH_ERROR:` prefix recovers: a library's credential failure,
+/// raised through the script, which a caller can act on rather than report.
 ///
-/// An `AUTH_ERROR:`-prefixed message is a credential failure raised through the
-/// script, and is read ahead of every other kind so that it keeps its 401
-/// instead of arriving as a script failure.
-fn caller_error(
+/// Every text a failure carries is searched, because which of them keeps the
+/// prefix is the interpreter's choice: one that trims its `message` to the
+/// line's own text may still carry the prefix in `raw`, and a 401 that
+/// degraded to a 500 would read as this instance being broken.
+fn auth_error(texts: &[&str]) -> Option<AppError> {
+    texts
+        .iter()
+        .find(|text| text.contains(LUA_AUTH_ERROR_PREFIX))
+        .map(|text| AppError::Auth(auth_message_after_prefix(text)))
+}
+
+/// A failure the script owns: its kind, its own text and its line reach the
+/// caller, which is what [`AppError::ScriptError`] exists to allow. A spent
+/// budget carries [`EXECUTION_LIMIT_MESSAGE`] instead, since the limit is the
+/// host's rather than the script's.
+fn script_error(
     method: &str,
     error_type: ScriptErrorType,
     message: String,
     line: Option<u32>,
 ) -> AppError {
-    if message.contains(LUA_AUTH_ERROR_PREFIX) {
-        return AppError::Auth(auth_message_after_prefix(&message));
-    }
     AppError::ScriptError {
         error_type,
         message: match error_type {
@@ -91,14 +101,33 @@ fn returned_value(
             message,
             line,
             raw,
-        }) => Err((raw, caller_error(method, kind.into(), message, line))),
+        }) => {
+            let error = auth_error(&[&message, &raw])
+                .unwrap_or_else(|| script_error(method, kind.into(), message, line));
+            Err((raw, error))
+        }
+        // A run that produced no result at all is told apart by whose failure
+        // it describes, not by how bad it is. The two limits describe the
+        // script's own run and keep its envelope; every other way an
+        // interpreter fails to answer describes this instance, and a wasmtime
+        // trap or an instantiation failure is an operator's text rather than a
+        // stranger's. Those travel as a correlation id, and the text itself
+        // reaches the operator through the log and the event row below.
+        //
+        // "Your script failed" and "we could not run anything" are also
+        // different claims, so they do not share an envelope.
         Err(e) => {
             let raw = e.to_string();
-            let error_type = match &e {
-                DispatchError::Execution(e) => e.script_error_type(),
-                DispatchError::NoInterpreter { .. } => ScriptErrorType::Runtime,
-            };
-            Err((raw.clone(), caller_error(method, error_type, raw, None)))
+            let error = auth_error(&[&raw]).unwrap_or_else(|| match &e {
+                DispatchError::Execution(ExecutionError::Timeout) => {
+                    script_error(method, ScriptErrorType::Timeout, raw.clone(), None)
+                }
+                DispatchError::Execution(ExecutionError::MemoryLimit { .. }) => {
+                    script_error(method, ScriptErrorType::Memory, raw.clone(), None)
+                }
+                _ => AppError::Internal(raw.clone()),
+            });
+            Err((raw, error))
         }
     }
 }
@@ -524,8 +553,30 @@ mod tests {
         }
     }
 
-    /// An interpreter that does not answer at all is read through the same two
-    /// limits a run inside it reports.
+    /// An interpreter that trims its `message` keeps the prefix in `raw`, and
+    /// the 401 has to survive either spelling.
+    #[test]
+    fn an_auth_error_is_recovered_from_the_unparsed_text_alone() {
+        let (_, error) = returned_value(
+            "com.example.probe",
+            Ok(ScriptExecuteOutput::Error {
+                kind: ScriptErrorKind::Runtime,
+                message: "caller.create_record failed".into(),
+                line: Some(4),
+                raw: format!(
+                    "[string \"script\"]:4: {LUA_AUTH_ERROR_PREFIX}DPoP session not found"
+                ),
+            }),
+        )
+        .expect_err("a failed run has no value");
+        match error {
+            AppError::Auth(message) => assert_eq!(message, "DPoP session not found"),
+            other => panic!("expected an auth error, got {other:?}"),
+        }
+    }
+
+    /// The two limits describe the script's own run, so they keep its envelope
+    /// and its `errorType`.
     #[test]
     fn an_interpreter_that_does_not_answer_keeps_the_two_limits_apart() {
         for (error, expected) in [
@@ -536,10 +587,6 @@ mod tests {
                     ceiling: 1,
                 },
                 ScriptErrorType::Memory,
-            ),
-            (
-                ExecutionError::MissingExport("execute".into()),
-                ScriptErrorType::Runtime,
             ),
         ] {
             let raw = error.to_string();
@@ -562,18 +609,52 @@ mod tests {
         }
     }
 
-    /// The language is in the text an operator reads, since the fix is to
-    /// install the interpreter that claims it.
-    #[test]
-    fn a_missing_interpreter_names_the_language_it_was_asked_for() {
-        let (raw, _) = returned_value(
-            "com.example.probe",
-            Err(DispatchError::NoInterpreter {
-                language: "typescript".into(),
-            }),
-        )
-        .expect_err("a run that did not happen has no value");
-        assert!(raw.contains("typescript"), "{raw}");
+    /// A failure that describes this instance rather than the script reaches a
+    /// caller as a correlation id and nothing else. Its text is an operator's:
+    /// it names wasmtime internals, a missing export, a plugin id — none of
+    /// which is a stranger's to read, and none of which a script author could
+    /// act on. The text still reaches the operator, through the log line
+    /// `AppError::Internal` writes and through the `script.error` row.
+    #[tokio::test]
+    async fn a_host_origin_failure_answers_a_correlation_id_rather_than_its_text() {
+        const SECRET: &str = "wasm trap: wasm backtrace at /srv/happyview/probe.wasm";
+        for error in [
+            DispatchError::Execution(ExecutionError::Trap(wasmtime::Error::msg(SECRET))),
+            DispatchError::Execution(ExecutionError::Instantiation(anyhow::anyhow!(SECRET))),
+            DispatchError::Execution(ExecutionError::MissingExport(SECRET.into())),
+            DispatchError::Execution(ExecutionError::NotAnInterpreter(SECRET.into())),
+            DispatchError::Execution(ExecutionError::InvalidResponse(SECRET.into())),
+            DispatchError::NoInterpreter {
+                language: SECRET.into(),
+            },
+        ] {
+            let label = error.to_string();
+            let (logged, app_error) = returned_value("com.example.probe", Err(error))
+                .expect_err("a run that did not happen has no value");
+            assert!(
+                logged.contains(SECRET),
+                "{label}: the operator's record must keep the text"
+            );
+
+            let response = app_error.into_response();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "{label}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("a body");
+            let body: Value = serde_json::from_slice(&body).expect("a JSON body");
+            assert!(
+                body["correlationId"].is_string(),
+                "{label}: {body} carries no correlation id"
+            );
+            assert!(
+                !body.to_string().contains(SECRET),
+                "{label}: {body} leaks the host's own text"
+            );
+        }
     }
 
     /// The guard reports a run whatever became of it, so a counter cannot be

@@ -85,6 +85,32 @@ mod tests {
     use crate::lua::sandbox::create_sandbox;
     use serde_json::json;
 
+    /// Six same-typed strings, where `space`/`space_id` and `uri`/`id` are the
+    /// pair that do not share a name: a swap would compile and surface only as
+    /// a space a script cannot find.
+    #[test]
+    fn a_space_context_maps_field_for_field_onto_the_wire_shape() {
+        let sent = crate::plugin::ScriptSpace::from(&SpaceContext {
+            space: "at://did:plc:a/space/com.example.type/sk".into(),
+            space_id: "sid".into(),
+            did: "did:plc:a".into(),
+            authority_did: "did:plc:auth".into(),
+            type_nsid: "com.example.type".into(),
+            skey: "sk".into(),
+        });
+        assert_eq!(
+            sent,
+            crate::plugin::ScriptSpace {
+                uri: "at://did:plc:a/space/com.example.type/sk".into(),
+                id: "sid".into(),
+                did: "did:plc:a".into(),
+                authority_did: "did:plc:auth".into(),
+                type_nsid: "com.example.type".into(),
+                skey: "sk".into(),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn ctx_carries_snake_case_keys_and_nils() {
         let lua = create_sandbox().unwrap();
