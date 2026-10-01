@@ -12,7 +12,7 @@ use crate::error::AppError;
 use crate::profile;
 use crate::spaces::commit::SpaceVerifyingKey;
 
-/// Proposal 0016 sets 10 minutes as the default and 60 as the maximum.
+/// The lifetime of a credential this instance issues.
 pub const DEFAULT_CREDENTIAL_TTL_SECS: u64 = 10 * 60;
 pub const DELEGATION_TOKEN_TTL_SECS: u64 = 60; // 60 seconds
 
@@ -265,6 +265,28 @@ pub fn sign_credential_with_key(
     Ok(format!("{}.{}.{}", header_b64, payload_b64, sig_b64))
 }
 
+/// How far ahead of this clock a credential's `iat` may be.
+pub const CREDENTIAL_CLOCK_SKEW_SECS: u64 = 5;
+
+/// The longest lifetime a space credential may have.
+pub const MAX_CREDENTIAL_TTL_SECS: u64 = 60 * 60;
+
+/// Proposal 0016's limits on a credential beyond its expiry: issued no later
+/// than now, give or take clock skew, for at most an hour, and revocable by a
+/// non-empty `jti`.
+fn check_credential_lifetime(claims: &SpaceCredentialClaims, now: u64) -> Result<(), AppError> {
+    if claims.jti.is_empty() {
+        return Err(AppError::Auth("credential has no jti".into()));
+    }
+    if claims.iat > now + CREDENTIAL_CLOCK_SKEW_SECS {
+        return Err(AppError::Auth("credential was issued in the future".into()));
+    }
+    if claims.exp <= claims.iat || claims.exp - claims.iat > MAX_CREDENTIAL_TTL_SECS {
+        return Err(AppError::Auth("credential lifetime is invalid".into()));
+    }
+    Ok(())
+}
+
 /// Verify a space credential against a key resolved from a DID document.
 ///
 /// Accepts `ES256` or `ES256K` according to the curve of the key. An authority
@@ -321,6 +343,7 @@ pub fn verify_credential_with_key(
     if now >= claims.exp {
         return Err(AppError::Auth("credential has expired".into()));
     }
+    check_credential_lifetime(&claims, now)?;
 
     Ok(claims)
 }
@@ -377,6 +400,7 @@ pub fn verify_credential(
     if now >= claims.exp {
         return Err(AppError::Auth("credential has expired".into()));
     }
+    check_credential_lifetime(&claims, now)?;
 
     Ok(claims)
 }
@@ -617,6 +641,58 @@ mod tests {
         let result = verify_credential(&token, &keypair.public_jwk);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expired"));
+    }
+
+    fn verify_with_times(
+        iat_offset: i64,
+        lifetime: i64,
+        jti: &str,
+    ) -> Result<SpaceCredentialClaims, AppError> {
+        let keypair = generate_dpop_keypair().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let iat = now + iat_offset;
+        let claims = SpaceCredentialClaims {
+            cnf: None,
+            iss: "did:plc:owner".into(),
+            sub: "at://did:plc:owner/space/com.example.test/main".into(),
+            iat: iat as u64,
+            exp: (iat + lifetime) as u64,
+            jti: jti.into(),
+        };
+        let token = sign_credential(&claims, &keypair.private_jwk).unwrap();
+        verify_credential(&token, &keypair.public_jwk)
+    }
+
+    #[test]
+    fn verify_accepts_an_hour_long_credential() {
+        assert!(verify_with_times(0, 3600, "jti").is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_a_credential_longer_than_an_hour() {
+        assert!(verify_with_times(0, 3601, "jti").is_err());
+    }
+
+    #[test]
+    fn verify_rejects_a_credential_that_expires_before_it_is_issued() {
+        assert!(verify_with_times(2, 0, "jti").is_err());
+    }
+
+    #[test]
+    fn verify_rejects_a_credential_issued_in_the_future() {
+        assert!(verify_with_times(60, 600, "jti").is_err());
+        assert!(
+            verify_with_times(3, 600, "jti").is_ok(),
+            "within clock skew"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_credential_without_a_jti() {
+        assert!(verify_with_times(0, 600, "").is_err());
     }
 
     #[test]
