@@ -113,9 +113,8 @@ impl LexBytes {
 struct ListReposQuery {
     space: String,
     limit: Option<i64>,
-    cursor: Option<String>,
     /// A space revision: list only repos updated after it.
-    since: Option<String>,
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1444,28 +1443,25 @@ async fn list_repos(
         &state.db,
         state.db_backend,
         &space.id,
-        params.since.as_deref(),
         params.cursor.as_deref(),
         limit,
     )
     .await?;
 
-    let next_cursor = (writers.len() as i64 == limit).then(|| {
-        let last = writers.last().expect("a full page is not empty");
-        if params.since.is_some() {
-            last.space_rev.clone()
-        } else {
-            last.repo_did.clone()
-        }
-    });
+    // The cursor is the last space revision returned, so a syncer can also
+    // resume from any space revision it has already processed.
+    let next_cursor = writers.last().map(|w| w.space_rev.clone());
     let repos: Vec<serde_json::Value> = writers
         .iter()
         .map(|w| {
             use base64::Engine;
             serde_json::json!({
                 "did": w.repo_did,
+                "repoRev": w.rev,
+                // The alpha lexicon's name for `repoRev`. Sent until v3.
                 "rev": w.rev,
                 "hash": { "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&w.hash) },
+                "spaceRev": w.space_rev,
             })
         })
         .collect();
@@ -1473,11 +1469,6 @@ async fn list_repos(
     let mut body = serde_json::json!({ "repos": repos });
     if let Some(cursor) = next_cursor {
         body["cursor"] = cursor.into();
-    }
-    if let Some(space_rev) =
-        crate::spaces::writers::current_space_rev(&state.db, state.db_backend, &space.id).await?
-    {
-        body[notifications::SPACE_REV_FIELD] = space_rev.into();
     }
     Ok(Json(body))
 }

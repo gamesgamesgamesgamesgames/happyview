@@ -154,7 +154,7 @@ const NOTIFY_WRITE_LXM: &str = "com.atproto.space.notifyWrite";
 
 /// Where a forwarded notification carries the space revision that ordered it,
 /// and the one before. Proposal 0016 adds both without naming them yet.
-pub(crate) const SPACE_REV_FIELD: &str = "spaceRev";
+const SPACE_REV_FIELD: &str = "spaceRev";
 const PREV_SPACE_REV_FIELD: &str = "prevSpaceRev";
 
 /// A repo's new state, as `com.atproto.space.notifyWrite` reports it.

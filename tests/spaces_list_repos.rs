@@ -125,63 +125,71 @@ fn dids(body: &Value) -> Vec<String> {
 
 #[tokio::test]
 #[serial]
-async fn lists_each_writer_with_its_rev_and_hash() {
+async fn lists_each_writer_with_its_revisions_and_hash() {
     common::require_db!();
     let app = TestApp::new().await;
     enable_spaces(&app).await;
     let (space_id, space) = create_space(&app).await;
-    write(&app, &space_id, "did:plc:alice").await;
+    let space_rev = write(&app, &space_id, "did:plc:alice").await;
 
     let body = list(&app, &format!("space={}", urlencoding::encode(&space))).await;
     let repo = &body["repos"][0];
     assert_eq!(repo["did"], json!("did:plc:alice"));
-    assert!(repo["rev"].is_string());
+    assert!(repo["repoRev"].is_string());
     assert!(repo["hash"]["$bytes"].is_string());
+    assert_eq!(repo["spaceRev"], json!(space_rev));
+    // Syncers on the alpha lexicon read `rev`. Sent until v3.
+    assert_eq!(repo["rev"], repo["repoRev"]);
 }
 
+/// Writers come back in the order the space host sequenced their updates, and
+/// the cursor is the space revision to resume after.
 #[tokio::test]
 #[serial]
-async fn pages_through_writers_with_a_cursor() {
+async fn pages_through_writers_in_space_revision_order() {
     common::require_db!();
     let app = TestApp::new().await;
     enable_spaces(&app).await;
     let (space_id, space) = create_space(&app).await;
-    for did in ["did:plc:a", "did:plc:b", "did:plc:c"] {
+    for did in ["did:plc:c", "did:plc:a", "did:plc:b"] {
         write(&app, &space_id, did).await;
     }
 
     let space = urlencoding::encode(&space);
     let first = list(&app, &format!("space={space}&limit=2")).await;
-    assert_eq!(dids(&first), ["did:plc:a", "did:plc:b"]);
-    let cursor = first["cursor"].as_str().expect("a full page has a cursor");
+    assert_eq!(dids(&first), ["did:plc:c", "did:plc:a"]);
+    let cursor = first["cursor"]
+        .as_str()
+        .expect("a page with repos has a cursor");
+    assert_eq!(first["repos"][1]["spaceRev"], json!(cursor));
 
-    let second = list(
-        &app,
-        &format!(
-            "space={space}&limit=2&cursor={}",
-            urlencoding::encode(cursor)
-        ),
-    )
-    .await;
-    assert_eq!(dids(&second), ["did:plc:c"]);
+    let second = list(&app, &format!("space={space}&limit=2&cursor={cursor}")).await;
+    assert_eq!(dids(&second), ["did:plc:b"]);
+    let cursor = second["cursor"]
+        .as_str()
+        .expect("a page with repos has a cursor");
+
+    let third = list(&app, &format!("space={space}&limit=2&cursor={cursor}")).await;
+    assert!(dids(&third).is_empty());
+    assert!(third.get("cursor").is_none(), "an empty page has no cursor");
 }
 
+/// A syncer that saw a gap resumes from the last space revision it processed.
 #[tokio::test]
 #[serial]
-async fn since_lists_only_repos_updated_after_a_space_revision() {
+async fn a_cursor_lists_only_repos_updated_after_it() {
     common::require_db!();
     let app = TestApp::new().await;
     enable_spaces(&app).await;
     let (space_id, space) = create_space(&app).await;
     write(&app, &space_id, "did:plc:early").await;
     let seen = write(&app, &space_id, "did:plc:middle").await;
-    let latest = write(&app, &space_id, "did:plc:late").await;
+    write(&app, &space_id, "did:plc:late").await;
 
     let body = list(
         &app,
-        &format!("space={}&since={seen}", urlencoding::encode(&space)),
+        &format!("space={}&cursor={seen}", urlencoding::encode(&space)),
     )
     .await;
     assert_eq!(dids(&body), ["did:plc:late"]);
-    assert_eq!(body["spaceRev"], json!(latest));
 }
