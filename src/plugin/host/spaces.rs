@@ -91,6 +91,55 @@ pub fn parse_access(s: &str) -> Result<MemberAccess, SpacesError> {
         .ok_or_else(|| SpacesError::BadInput(format!("invalid access '{s}'")))
 }
 
+/// The access a member-or-invite write asks for: the `read`/`write` pair, or
+/// the `access` word, or neither. `None` means the caller named no access at
+/// all, which each operation reads for itself — see `set_member`.
+///
+/// The pair is all-or-nothing. Defaulting the missing half would grant or
+/// withdraw access the caller never named, which is why
+/// `com.atproto.simplespace.putMember` requires both; and a pair alongside a
+/// word is a contradiction with no reading better than the other, so both are
+/// refused rather than resolved silently.
+///
+/// `read_self` is HappyView-local and stays off the pair, which is why the
+/// pair leaves it false: `service::put_member` carries an existing member's
+/// value forward, since replacing read and write is not a request to lift an
+/// own-records-only restriction.
+fn resolve_access(
+    access: Option<&str>,
+    read: Option<bool>,
+    write: Option<bool>,
+) -> Result<Option<MemberAccess>, SpacesError> {
+    match (access, read, write) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(SpacesError::BadInput(
+            "pass either access or the read/write pair, not both".into(),
+        )),
+        (None, Some(read), Some(write)) => Ok(Some(MemberAccess {
+            read,
+            write,
+            read_self: false,
+        })),
+        (None, Some(_), None) => Err(SpacesError::BadInput(
+            "write is required when read is given".into(),
+        )),
+        (None, None, Some(_)) => Err(SpacesError::BadInput(
+            "read is required when write is given".into(),
+        )),
+        (Some(word), None, None) => parse_access(word).map(Some),
+        (None, None, None) => Ok(None),
+    }
+}
+
+/// The wire form of a member's access: the pair, plus the nearest word for it.
+fn member_info(did: String, access: MemberAccess) -> SpaceMemberInfo {
+    SpaceMemberInfo {
+        did,
+        access: access.as_wire_str().to_string(),
+        read: access.read,
+        write: access.write,
+    }
+}
+
 /// `Space` plus the `at://` URI a script needs to address it again — the one
 /// field `Space`'s own serialization doesn't carry.
 pub fn space_info(space: &Space) -> SpaceInfo {
@@ -205,10 +254,7 @@ pub async fn members(
         crate::spaces::members::resolve_members(&state.db, state.db_backend, &space.id).await?;
     Ok(resolved
         .into_iter()
-        .map(|m| SpaceMemberInfo {
-            did: m.did,
-            access: m.access.as_wire_str().to_string(),
-        })
+        .map(|m| member_info(m.did, m.access))
         .collect())
 }
 
@@ -334,7 +380,7 @@ pub async fn add_member(
     spec: SpaceMemberAdd,
 ) -> Result<SpaceMemberInfo, SpacesError> {
     require_enabled(state).await?;
-    let access = spec.access.as_deref().map(parse_access).transpose()?;
+    let access = resolve_access(spec.access.as_deref(), spec.read, spec.write)?;
     let member = service::add_member(
         state,
         caller_did,
@@ -344,25 +390,26 @@ pub async fn add_member(
         spec.is_delegation,
     )
     .await?;
-    Ok(SpaceMemberInfo {
-        did: member.did,
-        access: member.access.as_wire_str().to_string(),
-    })
+    Ok(member_info(member.did, member.access))
 }
 
 /// The upsert form of `add_member`: a repeat call updates rather than
-/// conflicts, and `service::put_member` preserves an existing member's
-/// `read_self`. An absent `access` defaults to read, same as `add_member`.
+/// conflicts.
+///
+/// An absent access leaves an existing member's read and write alone, and
+/// gives a new member read. `add_member` can default an absent access to read
+/// outright because it refuses an existing member, so there is no prior access
+/// for the default to destroy; here there is, and a default would grant the
+/// read and withdraw the write of a caller who named only a DID — or only
+/// `is_delegation`. Restating access to avoid that is how a script grants
+/// something by accident, so omitted means unchanged instead.
 pub async fn set_member(
     state: &AppState,
     caller_did: &str,
     spec: SpaceMemberAdd,
 ) -> Result<SpaceMemberInfo, SpacesError> {
     require_enabled(state).await?;
-    let access = match spec.access.as_deref() {
-        Some(s) => parse_access(s)?,
-        None => MemberAccess::READ,
-    };
+    let access = resolve_access(spec.access.as_deref(), spec.read, spec.write)?;
     let member = service::put_member(
         state,
         caller_did,
@@ -372,10 +419,7 @@ pub async fn set_member(
         spec.is_delegation,
     )
     .await?;
-    Ok(SpaceMemberInfo {
-        did: member.did,
-        access: member.access.as_wire_str().to_string(),
-    })
+    Ok(member_info(member.did, member.access))
 }
 
 pub async fn remove_member(
@@ -436,7 +480,7 @@ pub async fn create_invite(
     spec: happyview_plugin_sdk::wire::SpaceInviteCreate,
 ) -> Result<SpaceInviteInfo, SpacesError> {
     require_enabled(state).await?;
-    let access = spec.access.as_deref().map(parse_access).transpose()?;
+    let access = resolve_access(spec.access.as_deref(), spec.read, spec.write)?;
     let (invite, token) = service::create_invite(
         state,
         caller_did,
@@ -450,6 +494,8 @@ pub async fn create_invite(
         invite_id: invite.id,
         token,
         access: invite.access.as_wire_str().to_string(),
+        read: invite.access.read,
+        write: invite.access.write,
         max_uses: invite.max_uses,
         expires_at: invite.expires_at,
     })
@@ -659,7 +705,39 @@ mod tests {
     async fn seeded_space() -> (AppState, String, String) {
         let state = db_test_state().await;
         enable_spaces_feature(&state).await;
+        let (space_uri, admin_did) = seed_space_in(&state).await;
+        (state, space_uri, admin_did)
+    }
 
+    /// A migrated in-memory SQLite `AppState`.
+    async fn sqlite_state() -> AppState {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let state = crate::test_support::test_state_with_pool(pool);
+        crate::test_support::provision_space_signing_key(&state).await;
+        state
+    }
+
+    /// One state per backend, flag on: SQLite always, plus Postgres when
+    /// `TEST_DATABASE_URL` names one.
+    ///
+    /// `adapt_sql`'s SQLite arm is a no-op, so a statement exercised only
+    /// against Postgres and one exercised only against SQLite are different
+    /// statements. The SQLite arm is also what gives these assertions signal
+    /// under a bare `cargo test --lib`, where a `TEST_DATABASE_URL` guard
+    /// would make them pass by not running.
+    async fn each_backend() -> Vec<AppState> {
+        let mut states = vec![sqlite_state().await];
+        if std::env::var("TEST_DATABASE_URL").is_ok() {
+            states.push(db_test_state().await);
+        }
+        for state in &states {
+            enable_spaces_feature(state).await;
+        }
+        states
+    }
+
+    /// One space whose creator — the returned DID — is its admin.
+    async fn seed_space_in(state: &AppState) -> (String, String) {
         let unique = uuid::Uuid::new_v4().simple().to_string();
         let space_id = uuid::Uuid::new_v4().to_string();
         let member_did = format!("did:plc:hostwriter{unique}");
@@ -702,7 +780,22 @@ mod tests {
             .expect("failed to seed test member");
 
         let space_uri = format!("at://{space_did}/space/{type_nsid}/{skey}");
-        (state, space_uri, member_did)
+        (space_uri, member_did)
+    }
+
+    fn write_only() -> MemberAccess {
+        MemberAccess {
+            read: false,
+            write: true,
+            read_self: false,
+        }
+    }
+
+    fn backend_name(state: &AppState) -> &'static str {
+        match state.db_backend {
+            DatabaseBackend::Sqlite => "sqlite",
+            DatabaseBackend::Postgres => "postgres",
+        }
     }
 
     #[tokio::test]
@@ -903,6 +996,8 @@ mod tests {
                 uri: space_uri.clone(),
                 did: target.into(),
                 access: Some("read_self".into()),
+                read: None,
+                write: None,
                 is_delegation: None,
             },
         )
@@ -916,6 +1011,8 @@ mod tests {
                 uri: space_uri.clone(),
                 did: target.into(),
                 access: Some("read".into()),
+                read: None,
+                write: None,
                 is_delegation: None,
             },
         )
@@ -940,6 +1037,8 @@ mod tests {
                 uri: space_uri.clone(),
                 did: target.into(),
                 access: Some("read".into()),
+                read: None,
+                write: None,
                 is_delegation: None,
             },
         )
@@ -1030,6 +1129,8 @@ mod tests {
             happyview_plugin_sdk::wire::SpaceInviteCreate {
                 uri: space_uri.clone(),
                 access: Some("write".into()),
+                read: None,
+                write: None,
                 max_uses: None,
                 expires_at: None,
             },
@@ -1106,5 +1207,427 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, SpacesError::Disabled), "{err}");
         assert_eq!(err.code(), "SPACES_DISABLED");
+    }
+
+    /// The combination the `access` word cannot express: `as_wire_str`
+    /// renders any `write` as `"write"`, which `parse_wire` reads back as
+    /// read *and* write. Both the write's own answer and a later read are
+    /// checked, because either could collapse the pair on its own.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn a_write_only_member_keeps_read_off_through_the_library() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (space_uri, admin_did) = seed_space_in(&state).await;
+            let target = format!("did:plc:target{}", uuid::Uuid::new_v4().simple());
+
+            let set = set_member(
+                &state,
+                &admin_did,
+                SpaceMemberAdd {
+                    uri: space_uri.clone(),
+                    did: target.clone(),
+                    access: None,
+                    read: Some(false),
+                    write: Some(true),
+                    is_delegation: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("set_member on {on}: {e}"));
+            assert!(!set.read, "set_member's own answer on {on}");
+            assert!(set.write, "set_member's own answer on {on}");
+
+            let listed = members(
+                &state,
+                SpacesMembers {
+                    uri: space_uri.clone(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("members on {on}: {e}"))
+            .into_iter()
+            .find(|m| m.did == target)
+            .unwrap_or_else(|| panic!("the member is listed on {on}"));
+            assert!(!listed.read, "the member list on {on}");
+            assert!(listed.write, "the member list on {on}");
+        }
+    }
+
+    /// Seeded past the library, so a write path that dropped the pair cannot
+    /// hide a read path that does the same.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn members_reports_a_write_only_member_the_service_already_holds() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (space_uri, admin_did) = seed_space_in(&state).await;
+            let target = format!("did:plc:target{}", uuid::Uuid::new_v4().simple());
+
+            service::put_member(
+                &state,
+                &admin_did,
+                &space_uri,
+                &target,
+                Some(write_only()),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("seed the member on {on}: {e}"));
+
+            let listed = members(
+                &state,
+                SpacesMembers {
+                    uri: space_uri.clone(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("members on {on}: {e}"))
+            .into_iter()
+            .find(|m| m.did == target)
+            .unwrap_or_else(|| panic!("the member is listed on {on}"));
+            assert!(!listed.read, "the member list on {on}");
+            assert!(listed.write, "the member list on {on}");
+            assert_eq!(listed.access, "write", "the nearest word on {on}");
+        }
+    }
+
+    /// Every word the shorthand can name still resolves to the pair it always
+    /// meant, so adding the booleans moved nothing.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn every_access_word_still_names_the_same_pair() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (space_uri, admin_did) = seed_space_in(&state).await;
+
+            for (word, read, write) in [
+                ("read", true, false),
+                ("write", true, true),
+                ("read_self", true, false),
+                ("none", false, false),
+            ] {
+                let target = format!("did:plc:word{}", uuid::Uuid::new_v4().simple());
+                let member = set_member(
+                    &state,
+                    &admin_did,
+                    SpaceMemberAdd {
+                        uri: space_uri.clone(),
+                        did: target,
+                        access: Some(word.into()),
+                        read: None,
+                        write: None,
+                        is_delegation: None,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("set_member '{word}' on {on}: {e}"));
+                assert_eq!(member.read, read, "'{word}' read on {on}");
+                assert_eq!(member.write, write, "'{word}' write on {on}");
+            }
+        }
+    }
+
+    /// Refused rather than resolved: the three writes that take access all
+    /// reach the same resolver, and each names what is wrong.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn half_a_pair_and_a_pair_beside_a_word_are_both_refused() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (space_uri, admin_did) = seed_space_in(&state).await;
+            let target = format!("did:plc:target{}", uuid::Uuid::new_v4().simple());
+
+            let member_spec = |access: Option<&str>, read, write| SpaceMemberAdd {
+                uri: space_uri.clone(),
+                did: target.clone(),
+                access: access.map(ToString::to_string),
+                read,
+                write,
+                is_delegation: None,
+            };
+            let invite_spec =
+                |access: Option<&str>, read, write| happyview_plugin_sdk::wire::SpaceInviteCreate {
+                    uri: space_uri.clone(),
+                    access: access.map(ToString::to_string),
+                    read,
+                    write,
+                    max_uses: None,
+                    expires_at: None,
+                };
+
+            for (label, read, write, names) in [
+                ("read without write", Some(true), None, "write"),
+                ("write without read", None, Some(true), "read"),
+            ] {
+                for (op, err) in [
+                    (
+                        "add_member",
+                        add_member(&state, &admin_did, member_spec(None, read, write))
+                            .await
+                            .unwrap_err(),
+                    ),
+                    (
+                        "set_member",
+                        set_member(&state, &admin_did, member_spec(None, read, write))
+                            .await
+                            .unwrap_err(),
+                    ),
+                    (
+                        "create_invite",
+                        create_invite(&state, &admin_did, invite_spec(None, read, write))
+                            .await
+                            .unwrap_err(),
+                    ),
+                ] {
+                    assert_eq!(err.code(), "BAD_INPUT", "{op}, {label}, on {on}");
+                    assert!(
+                        err.to_string().contains(names),
+                        "{op}, {label}, on {on} should name {names}: {err}"
+                    );
+                }
+            }
+
+            for (op, err) in [
+                (
+                    "add_member",
+                    add_member(
+                        &state,
+                        &admin_did,
+                        member_spec(Some("write"), Some(false), Some(true)),
+                    )
+                    .await
+                    .unwrap_err(),
+                ),
+                (
+                    "set_member",
+                    set_member(
+                        &state,
+                        &admin_did,
+                        member_spec(Some("write"), Some(false), Some(true)),
+                    )
+                    .await
+                    .unwrap_err(),
+                ),
+                (
+                    "create_invite",
+                    create_invite(
+                        &state,
+                        &admin_did,
+                        invite_spec(Some("write"), Some(false), Some(true)),
+                    )
+                    .await
+                    .unwrap_err(),
+                ),
+            ] {
+                assert_eq!(err.code(), "BAD_INPUT", "{op}, pair beside a word, on {on}");
+                assert!(
+                    err.to_string().contains("not both"),
+                    "{op}, pair beside a word, on {on}: {err}"
+                );
+            }
+        }
+    }
+
+    /// Redemption reads the stored row, so this is where a collapsed invite
+    /// would actually cost something: a joiner made readable in a space whose
+    /// admin granted write alone.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn a_write_only_invite_grants_write_alone_on_redemption() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (space_uri, admin_did) = seed_space_in(&state).await;
+            let joiner = format!("did:plc:joiner{}", uuid::Uuid::new_v4().simple());
+
+            let invite = create_invite(
+                &state,
+                &admin_did,
+                happyview_plugin_sdk::wire::SpaceInviteCreate {
+                    uri: space_uri.clone(),
+                    access: None,
+                    read: Some(false),
+                    write: Some(true),
+                    max_uses: None,
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create_invite on {on}: {e}"));
+            assert!(!invite.read, "the mint's own answer on {on}");
+            assert!(invite.write, "the mint's own answer on {on}");
+
+            accept_invite(
+                &state,
+                &joiner,
+                SpacesAcceptInvite {
+                    token: invite.token,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("accept_invite on {on}: {e}"));
+
+            let listed = members(
+                &state,
+                SpacesMembers {
+                    uri: space_uri.clone(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("members on {on}: {e}"))
+            .into_iter()
+            .find(|m| m.did == joiner)
+            .unwrap_or_else(|| panic!("the joiner is a member on {on}"));
+            assert!(!listed.read, "the redeemed access on {on}");
+            assert!(listed.write, "the redeemed access on {on}");
+        }
+    }
+
+    #[test]
+    fn resolve_access_takes_the_pair_and_leaves_read_self_alone() {
+        assert_eq!(
+            resolve_access(None, Some(false), Some(true)).unwrap(),
+            Some(write_only())
+        );
+        assert_eq!(
+            resolve_access(Some("read_self"), None, None).unwrap(),
+            Some(MemberAccess::READ_SELF)
+        );
+        assert_eq!(resolve_access(None, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_access_names_the_missing_half_of_a_pair() {
+        let err = resolve_access(None, Some(true), None).unwrap_err();
+        assert!(err.to_string().contains("write"), "{err}");
+        let err = resolve_access(None, None, Some(true)).unwrap_err();
+        assert!(err.to_string().contains("read"), "{err}");
+    }
+
+    #[test]
+    fn resolve_access_rejects_an_unknown_word() {
+        let err = resolve_access(Some("admin"), None, None).unwrap_err();
+        assert_eq!(err.code(), "BAD_INPUT");
+        assert!(err.to_string().contains("admin"), "{err}");
+    }
+
+    /// An omitted access neither grants nor withdraws. The default this
+    /// replaced failed in both directions at once on exactly this member: it
+    /// granted the read withheld and withdrew the write given.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn set_member_naming_only_a_did_leaves_an_existing_pair_alone() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (space_uri, admin_did) = seed_space_in(&state).await;
+            let target = format!("did:plc:target{}", uuid::Uuid::new_v4().simple());
+
+            service::put_member(
+                &state,
+                &admin_did,
+                &space_uri,
+                &target,
+                Some(write_only()),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("seed the member on {on}: {e}"));
+
+            let after = set_member(
+                &state,
+                &admin_did,
+                SpaceMemberAdd {
+                    uri: space_uri.clone(),
+                    did: target.clone(),
+                    access: None,
+                    read: None,
+                    write: None,
+                    is_delegation: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("set_member on {on}: {e}"));
+            assert!(!after.read, "read must stay withheld on {on}");
+            assert!(after.write, "write must stay granted on {on}");
+        }
+    }
+
+    /// Parity with `add_member`, whose absent-access default is harmless for
+    /// the same reason: there is no prior access to leave alone.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn set_member_naming_only_a_did_creates_a_reader() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (space_uri, admin_did) = seed_space_in(&state).await;
+            let target = format!("did:plc:target{}", uuid::Uuid::new_v4().simple());
+
+            let created = set_member(
+                &state,
+                &admin_did,
+                SpaceMemberAdd {
+                    uri: space_uri.clone(),
+                    did: target.clone(),
+                    access: None,
+                    read: None,
+                    write: None,
+                    is_delegation: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("set_member on {on}: {e}"));
+            assert!(created.read, "a new member reads on {on}");
+            assert!(!created.write, "a new member does not write on {on}");
+        }
+    }
+
+    /// The call that made the default indefensible: a caller with a reason to
+    /// touch `is_delegation` and none to touch access had to restate access to
+    /// keep it, and restating access one did not mean to change is how a
+    /// script grants something by accident.
+    #[tokio::test]
+    #[serial(spaces_feature_flag)]
+    async fn set_member_changing_is_delegation_alone_leaves_access_alone() {
+        for state in each_backend().await {
+            let on = backend_name(&state);
+            let (space_uri, admin_did) = seed_space_in(&state).await;
+            let target = format!("did:plc:target{}", uuid::Uuid::new_v4().simple());
+
+            service::put_member(
+                &state,
+                &admin_did,
+                &space_uri,
+                &target,
+                Some(write_only()),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("seed the member on {on}: {e}"));
+
+            let after = set_member(
+                &state,
+                &admin_did,
+                SpaceMemberAdd {
+                    uri: space_uri.clone(),
+                    did: target.clone(),
+                    access: None,
+                    read: None,
+                    write: None,
+                    is_delegation: Some(true),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("set_member on {on}: {e}"));
+            assert!(!after.read, "read on {on}");
+            assert!(after.write, "write on {on}");
+
+            let space = service::resolve_space(&state, &space_uri).await.unwrap();
+            let row =
+                crate::spaces::db::get_member(&state.db, state.db_backend, &space.id, &target)
+                    .await
+                    .unwrap_or_else(|e| panic!("read the member row on {on}: {e}"))
+                    .unwrap_or_else(|| panic!("the member exists on {on}"));
+            assert!(row.is_delegation, "is_delegation did change on {on}");
+        }
     }
 }

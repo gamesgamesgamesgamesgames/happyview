@@ -905,10 +905,15 @@ pub struct SpaceInfo {
 }
 
 /// One member of a space. Needs `spaces:read`.
+///
+/// `read` and `write` are the member's actual pair; `access` is the nearest
+/// word for it, which collapses a write-only member into `"write"`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpaceMemberInfo {
     pub did: String,
     pub access: String,
+    pub read: bool,
+    pub write: bool,
 }
 
 /// An invite minted for a space. Needs `spaces:write`.
@@ -917,6 +922,8 @@ pub struct SpaceInviteInfo {
     pub invite_id: String,
     pub token: String,
     pub access: String,
+    pub read: bool,
+    pub write: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1039,12 +1046,21 @@ pub struct SpaceRecordDelete {
 /// Add or set a space member. Shared by `add_member` (refuses an existing
 /// member) and `set_member` (the service's upsert, which keeps an existing
 /// member's `read_self`). Needs `spaces:write`.
+///
+/// Access is named either as the `read`/`write` pair or as the `access`
+/// word, never both, and the pair is all-or-nothing: the word cannot express
+/// write without read, and supplying one boolean alone would leave the host
+/// to invent the other.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpaceMemberAdd {
     pub uri: String,
     pub did: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_delegation: Option<bool>,
 }
@@ -1143,11 +1159,18 @@ pub struct SpaceDelete {
 }
 
 /// Mint an invite for a space. Needs `spaces:write`.
+///
+/// Access follows [`SpaceMemberAdd`]'s rule: the `read`/`write` pair or the
+/// `access` word, never both, and never one boolean alone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpaceInviteCreate {
     pub uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3072,10 +3095,14 @@ mod spaces_tests {
         let member = SpaceMemberInfo {
             did: "did:plc:member".to_string(),
             access: "write".to_string(),
+            read: true,
+            write: true,
         };
         let value = serde_json::to_value(&member).unwrap();
         assert_eq!(value["did"], "did:plc:member");
         assert_eq!(value["access"], "write");
+        assert_eq!(value["read"], true);
+        assert_eq!(value["write"], true);
         assert_eq!(
             serde_json::from_value::<SpaceMemberInfo>(value).unwrap(),
             member
@@ -3088,6 +3115,8 @@ mod spaces_tests {
             invite_id: "invite-1".to_string(),
             token: "tok".to_string(),
             access: "read".to_string(),
+            read: true,
+            write: false,
             max_uses: None,
             expires_at: None,
         };
@@ -3309,13 +3338,15 @@ mod spaces_tests {
     }
 
     #[test]
-    fn space_member_add_defaults_access_and_is_delegation_when_absent() {
+    fn space_member_add_defaults_every_optional_when_absent() {
         let add: SpaceMemberAdd = serde_json::from_value(json!({
             "uri": "at://did:plc:owner/space/dev.happyview.board/main",
             "did": "did:plc:member",
         }))
         .unwrap();
         assert_eq!(add.access, None);
+        assert_eq!(add.read, None);
+        assert_eq!(add.write, None);
         assert_eq!(add.is_delegation, None);
     }
 
@@ -3325,11 +3356,37 @@ mod spaces_tests {
             uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
             did: "did:plc:member".to_string(),
             access: Some("write".to_string()),
+            read: None,
+            write: None,
             is_delegation: Some(true),
         };
         let value = serde_json::to_value(&add).unwrap();
         assert_eq!(value["access"], "write");
+        assert!(value.get("read").is_none());
+        assert!(value.get("write").is_none());
         assert_eq!(value["is_delegation"], true);
+        assert_eq!(
+            serde_json::from_value::<SpaceMemberAdd>(value).unwrap(),
+            add
+        );
+    }
+
+    /// The pair the `access` word cannot name: `as_wire_str` renders any
+    /// write as `"write"`, which reads back as read and write both.
+    #[test]
+    fn space_member_add_carries_a_write_only_pair() {
+        let add = SpaceMemberAdd {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            did: "did:plc:member".to_string(),
+            access: None,
+            read: Some(false),
+            write: Some(true),
+            is_delegation: None,
+        };
+        let value = serde_json::to_value(&add).unwrap();
+        assert_eq!(value["read"], false);
+        assert_eq!(value["write"], true);
+        assert!(value.get("access").is_none());
         assert_eq!(
             serde_json::from_value::<SpaceMemberAdd>(value).unwrap(),
             add
@@ -3366,11 +3423,15 @@ mod spaces_tests {
         let create = SpaceInviteCreate {
             uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
             access: None,
+            read: None,
+            write: None,
             max_uses: None,
             expires_at: None,
         };
         let value = serde_json::to_value(&create).unwrap();
         assert!(value.get("access").is_none());
+        assert!(value.get("read").is_none());
+        assert!(value.get("write").is_none());
         assert!(value.get("max_uses").is_none());
         assert!(value.get("expires_at").is_none());
         assert_eq!(
@@ -3384,12 +3445,35 @@ mod spaces_tests {
         let create = SpaceInviteCreate {
             uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
             access: Some("read".to_string()),
+            read: None,
+            write: None,
             max_uses: Some(5),
             expires_at: Some("2026-10-01T00:00:00Z".to_string()),
         };
         let value = serde_json::to_value(&create).unwrap();
         assert_eq!(value["access"], "read");
         assert_eq!(value["max_uses"], 5);
+        assert_eq!(
+            serde_json::from_value::<SpaceInviteCreate>(value).unwrap(),
+            create
+        );
+    }
+
+    /// As for a member: the pair the `access` word cannot name.
+    #[test]
+    fn space_invite_create_carries_a_write_only_pair() {
+        let create = SpaceInviteCreate {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            access: None,
+            read: Some(false),
+            write: Some(true),
+            max_uses: None,
+            expires_at: None,
+        };
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["read"], false);
+        assert_eq!(value["write"], true);
+        assert!(value.get("access").is_none());
         assert_eq!(
             serde_json::from_value::<SpaceInviteCreate>(value).unwrap(),
             create

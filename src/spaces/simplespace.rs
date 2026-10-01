@@ -375,6 +375,9 @@ async fn put_member(
     let claims = require_auth(&xrpc_claims)?;
     // read_self is never settable over the wire: the spec's member list has no
     // such concept. See `MemberAccess`.
+    //
+    // Always `Some`: `read` and `write` are both required here, so this
+    // surface can never mean "leave access as it is".
     let access = MemberAccess {
         read: input.read,
         write: input.write,
@@ -385,7 +388,7 @@ async fn put_member(
         claims.did(),
         &input.space,
         &input.did,
-        access,
+        Some(access),
         input.is_delegation,
     )
     .await?;

@@ -47,11 +47,11 @@ impl MemberAccess {
         self.read_self
     }
 
-    /// Compact text form, for columns that store access as a single string.
+    /// Compact text form of the three flags: the `access` shorthand a script
+    /// or an `addMember` caller may send in place of the flags themselves.
     ///
-    /// Used by the invite table, which is a HappyView extension rather than a
-    /// spec surface and so keeps a single column. The member list itself stores
-    /// the three flags separately, matching the lexicon.
+    /// Lossy, and so never stored: any `write` renders as `"write"`, which
+    /// `parse_wire` reads back as read *and* write.
     pub fn as_wire_str(&self) -> &'static str {
         match (self.read, self.write, self.read_self) {
             (_, true, _) => "write",

@@ -421,14 +421,16 @@ A plugin declaring `spaces:read` or `spaces:write` can import the matching funct
 | `host_spaces_write_record` | `spaces:write` | `{uri, collection, record}` → `{uri, cid}` |
 | `host_spaces_put_record` | `spaces:write` | `{uri, collection, rkey, record, swap_cid?}` → `{uri, cid}` |
 | `host_spaces_delete_record` | `spaces:write` | `{uri, collection, rkey, swap_cid?}` → nothing |
-| `host_spaces_add_member` | `spaces:write` | `{uri, did, access?, is_delegation?}` → the member |
-| `host_spaces_set_member` | `spaces:write` | `{uri, did, access?, is_delegation?}` → the member, upserting rather than raising `CONFLICT` on an existing one |
+| `host_spaces_add_member` | `spaces:write` | `{uri, did, access?, read?, write?, is_delegation?}` → the member |
+| `host_spaces_set_member` | `spaces:write` | `{uri, did, access?, read?, write?, is_delegation?}` → the member, upserting rather than raising `CONFLICT` on an existing one |
 | `host_spaces_remove_member` | `spaces:write` | `{uri, did}` → nothing |
 | `host_spaces_update` | `spaces:write` | `{uri, display_name?, description?, read_policy?, write_policy?, app_access?, config?}` → the space |
 | `host_spaces_delete` | `spaces:write` | `{uri}` → nothing |
-| `host_spaces_create_invite` | `spaces:write` | `{uri, access?, max_uses?, expires_at?}` → the invite |
+| `host_spaces_create_invite` | `spaces:write` | `{uri, access?, read?, write?, max_uses?, expires_at?}` → the invite |
 
 `spaces:read` needs no caller and enforces no space's read policy — that's why it's High rather than Medium, and its capability description says exactly what it reaches. Every `spaces:write` import acts as `ctx.caller_did` and fails with `BAD_INPUT` when the call has none; a write against a space whose repo has migrated to the member's own PDS then uses that member's session and fails with `NOT_AUTHORIZED` if they have none. On `host_spaces_update`, a key absent from the spec leaves that field unchanged, `false` clears `display_name` or `description`, and a string sets it; `read_policy`, `write_policy`, `app_access`, and `config` replace whole when present.
+
+The three imports that take access take it either as the `read`/`write` pair or as the `access` word, never both. Half a pair is refused too: the word cannot express write without read, so a member or invite that needs that combination must name both booleans, and defaulting the missing half would grant or withdraw access the caller never asked for. A member and an invite are reported back with both — the pair, and the nearest word for it.
 
 Errors reaching the guest: `SPACES_DISABLED` (the `spaces_enabled` feature flag is off), `NOT_FOUND`, `NOT_AUTHORIZED`, `CONFLICT`, `PDS_ERROR`, `BAD_INPUT`, `HOST_ERROR`, and `FORBIDDEN`.
 
