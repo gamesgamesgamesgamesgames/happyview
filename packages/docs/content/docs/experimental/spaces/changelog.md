@@ -50,6 +50,16 @@ Aligns credentials and sync with the latest [Proposal 0016](https://github.com/b
 - `com.atproto.simplespace.addMember` and `dev.happyview.space.addMember` accept an `access` word.
 - `registerNotify` accepts `{space, serviceDid, endpoint}` webhook registrations, returning `{id, expiresAt}`. `notifyWrite` accepts `{space, did, collection, rkey, cid}`.
 
+### Request field renames
+
+- **`spaceType` replaces `type`** in `simplespace.createSpace` and as a new `listSpaces` filter. `type` is accepted in both until v3.
+
+### Credential and notification errors
+
+- **Credential lifetime is enforced.** Credentials lasting more than an hour, without a `jti`, or issued more than 5 seconds in the future are refused.
+- **Named errors.** A credential addressed to the wrong DID fails with `BadSpaceAudience`, a revoked one with `CredentialRevoked`, and one for another space with `InvalidCredential`. `notifyWrite` for an unknown space fails with `SpaceNotFound`.
+- **`notifyWrite` accepts the bare authority DID as its service-auth audience**, as well as `#atproto_space_host`.
+
 ### Deprecated
 
 - **`config.records_public`.** It has never been enforced: setting it did not change who could read a space. Use a `public` `readPolicy` for a space anyone may read. It is still accepted and stored until v3.

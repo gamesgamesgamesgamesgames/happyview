@@ -164,7 +164,7 @@ Delivery is best effort. HappyView does not retry a failed call.
 
 A PDS hosting a repo in the space calls `com.atproto.space.notifyWrite` on HappyView after each commit to that repo. HappyView then pulls the new commit from the PDS and indexes it.
 
-The call requires service auth signed by the account that wrote. The token's `aud` is HappyView's instance DID with a service fragment, and its `lxm` must be `com.atproto.space.notifyWrite`.
+The call requires service auth signed by the account that wrote. The token's `aud` is HappyView's instance DID, either with the `#atproto_space_host` fragment or bare, and its `lxm` must be `com.atproto.space.notifyWrite`.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch("https://happyview.example.com/xrpc/com.atproto.space.notifyWrite", {
@@ -253,6 +253,7 @@ HappyView handles the notification as follows:
 - The writer must pass the space's [write policy](./managing-spaces.md#policies). Otherwise the call fails with `403`.
 - A `repoRev` that is not newer than the last one recorded for the repo is accepted and ignored.
 - A `repoRev` more than 5 minutes in the future fails with `400 FutureRev`.
+- A space HappyView does not host fails with `400 SpaceNotFound`.
 - A newer `repoRev` joins the repo to the space's writer set, advances the space revision, and is forwarded to registered syncers.
 
 **Response (200):**
