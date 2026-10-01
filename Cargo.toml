@@ -88,7 +88,7 @@ tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
 http-body-util = "0.1"
 hickory-resolver = "0.26"
 ipnet = "2"
-mlua = { version = "0.12", features = ["lua54", "async", "serialize", "vendored", "send"] }
+mlua = { version = "0.12", optional = true, features = ["lua54", "async", "serialize", "vendored", "send"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 urlencoding = "2.1.3"
@@ -106,6 +106,13 @@ sqlparser = "0.62.0"
 subtle = "2"
 sfv = "0.15"
 
+[features]
+# The native Lua runtime under `src/lua/`, kept to be compared against the
+# interpreter plugin by `tests/lua_differential.rs`. It is off by default so
+# that a release build carries no Lua interpreter of its own and the plugin is
+# the only path a script run can take.
+lua-reference = ["dep:mlua"]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -120,6 +127,14 @@ path = "src/bin/migrate_space_cids.rs"
 [[bin]]
 name = "happyview-codemod"
 path = "src/bin/codemod.rs"
+
+# Declared rather than discovered so that running it without the native
+# runtime is an error naming the feature, instead of an empty binary reporting
+# success.
+[[test]]
+name = "lua_differential"
+path = "tests/lua_differential.rs"
+required-features = ["lua-reference"]
 
 [dev-dependencies]
 wiremock = "0.6"

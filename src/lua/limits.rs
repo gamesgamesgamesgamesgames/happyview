@@ -203,6 +203,7 @@ async fn refresh_every(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lua-reference")]
     use crate::lua::sandbox::create_sandbox_with_limit;
     use crate::test_support::migrated_memory_pool;
     use serial_test::serial;
@@ -300,6 +301,7 @@ mod tests {
 
     /// The floor is what it takes to build a sandbox: at it the VM comes up,
     /// and below it the guards alone spend the budget.
+    #[cfg(feature = "lua-reference")]
     #[test]
     fn the_instruction_floor_is_enough_to_build_a_sandbox() {
         let floor = *INSTRUCTION_LIMIT_RANGE.start();

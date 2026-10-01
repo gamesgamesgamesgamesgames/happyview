@@ -87,7 +87,7 @@ impl Polyfill {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lua-reference"))]
 mod tests {
     use super::*;
     use mlua::Lua;

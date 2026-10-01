@@ -1,14 +1,23 @@
+//! Two halves. The runners, the trigger grammar and the two script settings
+//! are the host's and serve whatever language a script names; the VM below
+//! them answers only to `lua-reference`, because a request reaches an
+//! interpreter plugin instead.
+
+#[cfg(feature = "lua-reference")]
 pub(crate) mod builtins;
 pub(crate) mod context;
 mod execute;
 pub mod limits;
+#[cfg(feature = "lua-reference")]
 pub(crate) mod require_api;
+#[cfg(feature = "lua-reference")]
 pub(crate) mod sandbox;
 pub mod scripts;
 
 pub(crate) use execute::{execute_procedure_script, execute_query_script};
 /// The reference editor check. Its own tests are what say what an
 /// interpreter's `validate` has to agree with.
+#[cfg(feature = "lua-reference")]
 #[doc(hidden)]
 pub use sandbox::validate_script;
 pub use scripts::{
@@ -20,11 +29,13 @@ pub use scripts::{
 
 /// Test-only seams for integration tests that need a runner-shaped VM
 /// without going through an XRPC handler.
+#[cfg(feature = "lua-reference")]
 #[doc(hidden)]
 pub fn sandbox_for_tests() -> mlua::Lua {
     sandbox::create_sandbox().expect("sandbox")
 }
 
+#[cfg(feature = "lua-reference")]
 #[doc(hidden)]
 pub async fn require_api_for_tests(lua: &mlua::Lua, state: &crate::AppState) {
     let identity = builtins::ScriptIdentity {
@@ -45,6 +56,7 @@ pub async fn require_api_for_tests(lua: &mlua::Lua, state: &crate::AppState) {
 /// here would be comparing this file against itself.
 ///
 /// Leaves with `src/lua/`, and with the harness that is its only caller.
+#[cfg(feature = "lua-reference")]
 #[doc(hidden)]
 pub async fn run_for_differential(
     state: &crate::AppState,
@@ -160,6 +172,7 @@ pub async fn run_for_differential(
 
 /// The failure shape both paths report: `kind` from the run rather than from
 /// the text, `message` and `line` split by the host's own parser.
+#[cfg(feature = "lua-reference")]
 #[doc(hidden)]
 fn failed(
     default: crate::plugin::ScriptErrorKind,

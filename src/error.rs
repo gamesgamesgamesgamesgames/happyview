@@ -600,6 +600,7 @@ mod tests {
 
     /// The hand-written strings above pin the parser's shape; this pins that a
     /// script run the way the runners run it produces that shape.
+    #[cfg(feature = "lua-reference")]
     #[tokio::test]
     async fn parse_lua_line_reads_the_line_of_a_real_script_error() {
         use crate::lua::sandbox::{call_handle, create_sandbox, load_script};

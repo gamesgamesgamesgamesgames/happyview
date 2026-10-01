@@ -15,7 +15,8 @@
 //! D=$(mktemp -d)
 //! cp <plugins>/plugins/happyview-lua/manifest.json "$D/"
 //! cp <target>/wasm32-wasip1/release/happyview_lua.wasm "$D/happyview-lua.wasm"
-//! HAPPYVIEW_LUA_PLUGIN=$D cargo test --test lua_differential -- --ignored
+//! HAPPYVIEW_LUA_PLUGIN=$D cargo test --features lua-reference \
+//!   --test lua_differential -- --ignored
 //! ```
 //!
 //! **What is compared, and what is not.** For every case: the returned value

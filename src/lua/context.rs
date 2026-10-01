@@ -1,5 +1,8 @@
+#[cfg(feature = "lua-reference")]
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
+#[cfg(feature = "lua-reference")]
 use serde_json::Value;
+#[cfg(feature = "lua-reference")]
 use std::collections::HashMap;
 
 /// Optional space context passed to Lua scripts when the request is space-scoped.
@@ -29,6 +32,7 @@ impl From<&SpaceContext> for crate::plugin::ScriptSpace {
 /// Everything the runtime knows about one script invocation, built into the
 /// `ctx` argument of `handle(input, ctx)`. Keys are snake_case, the same
 /// convention as everything else a Lua script sees.
+#[cfg(feature = "lua-reference")]
 pub struct Invocation<'a> {
     pub trigger_id: &'a str,
     pub caller_did: Option<&'a str>,
@@ -43,6 +47,7 @@ pub struct Invocation<'a> {
 }
 
 /// Build the `ctx` table passed as the second argument to `handle`.
+#[cfg(feature = "lua-reference")]
 pub fn build_ctx(lua: &Lua, inv: &Invocation<'_>) -> LuaResult<mlua::Table> {
     let ctx = lua.create_table()?;
     ctx.set("trigger", inv.trigger_id)?;
@@ -85,6 +90,7 @@ pub fn build_ctx(lua: &Lua, inv: &Invocation<'_>) -> LuaResult<mlua::Table> {
 /// An interpreter reaches the same three controls through its `script:host`
 /// imports, which act on the run the host is holding rather than on a job
 /// named here, so this builds the surface only where there is no such run.
+#[cfg(feature = "lua-reference")]
 pub fn job_ctx(
     lua: &Lua,
     state: std::sync::Arc<crate::AppState>,
@@ -148,8 +154,6 @@ pub fn job_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lua::sandbox::create_sandbox;
-    use serde_json::json;
 
     /// Six same-typed strings, where `space`/`space_id` and `uri`/`id` are the
     /// pair that do not share a name: a swap would compile and surface only as
@@ -176,6 +180,13 @@ mod tests {
             }
         );
     }
+}
+
+#[cfg(all(test, feature = "lua-reference"))]
+mod reference_tests {
+    use super::*;
+    use crate::lua::sandbox::create_sandbox;
+    use serde_json::json;
 
     #[tokio::test]
     async fn ctx_carries_snake_case_keys_and_nils() {

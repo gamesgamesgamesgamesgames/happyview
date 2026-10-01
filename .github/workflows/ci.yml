@@ -149,6 +149,13 @@ jobs:
       - name: Run unit tests
         run: cargo test --lib
 
+      # The native Lua runtime is off by default, and the tests that run a
+      # script through it are gated with it. They are the only coverage the
+      # editor templates and the codemod's rewritten corpus have, so this job
+      # runs both configurations. Neither needs a database or a fixture.
+      - name: Run unit tests (native Lua reference)
+        run: cargo test --features lua-reference --lib --test codemod_cases
+
       - name: Run crate tests
         run: cargo test --workspace --exclude happyview
 
@@ -303,8 +310,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+      - name: Check that a default build links no Lua interpreter
+        run: bash scripts/check-no-native-lua.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (native Lua reference)
+        run: cargo clippy --features lua-reference --all-targets -- -D warnings
 
   audit:
     needs: changes

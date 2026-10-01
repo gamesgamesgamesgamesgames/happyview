@@ -246,6 +246,7 @@ async fn record_imports_round_trip_through_wasm() {
     }
 }
 
+#[cfg(feature = "lua-reference")]
 #[tokio::test]
 #[serial]
 async fn chain_through_lua_require() {

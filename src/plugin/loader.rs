@@ -10,6 +10,12 @@ pub const MAX_API_VERSION: u32 = 2;
 /// A version 1 manifest declares no capabilities and is refused at load.
 const MIN_API_VERSION: u32 = 2;
 
+/// The namespace `require` serves from the host rather than from a plugin, so
+/// a published library can never shadow a built-in module. It lives with the
+/// refusal because that refusal is the only thing a release build does with
+/// it.
+pub const BUILTIN_PREFIX: &str = "internal.";
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     #[error("Failed to read plugin file: {0}")]
@@ -302,7 +308,6 @@ fn validate_interpreter(manifest: &PluginManifest) -> Result<(), LoadError> {
 
 /// Structural checks that do not need the WASM bytes.
 pub fn validate_manifest(manifest: &PluginManifest) -> Result<(), LoadError> {
-    use crate::lua::builtins::BUILTIN_PREFIX;
     use crate::plugin::PluginType;
     use crate::plugin::capabilities::PluginCapability;
 

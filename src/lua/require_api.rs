@@ -72,7 +72,7 @@ fn install(
             loaded.set(name.as_str(), module.clone())?;
             return Ok(module);
         }
-        if name.starts_with(builtins::BUILTIN_PREFIX) {
+        if name.starts_with(crate::plugin::loader::BUILTIN_PREFIX) {
             return Err(mlua::Error::runtime(format!(
                 "module '{name}' not found -- built-in modules are: {}",
                 builtins::BUILTIN_MODULES.join(", ")

@@ -8,9 +8,8 @@ use mlua::{Lua, LuaSerdeExt, Result as LuaResult};
 
 use crate::AppState;
 use crate::event_log::{EventLog, Severity, log_event};
+use crate::plugin::loader::BUILTIN_PREFIX;
 use crate::tid::{generate_tid, tid_from_unix_microseconds, tid_to_unix_microseconds};
-
-pub const BUILTIN_PREFIX: &str = "internal.";
 
 /// Every built-in module name, for `require` lookup and for naming them in
 /// an unknown-module error. The one list, so a new built-in can't be added

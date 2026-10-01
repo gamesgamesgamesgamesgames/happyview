@@ -125,6 +125,7 @@ async fn http_post_sends_headers_and_body() {
     assert_eq!(out["status"], 201);
 }
 
+#[cfg(feature = "lua-reference")]
 #[tokio::test]
 async fn http_via_lua_require() {
     let server = MockServer::start().await;

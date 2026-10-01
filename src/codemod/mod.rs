@@ -11,7 +11,7 @@ mod polyfills;
 mod requires;
 mod rewrite;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lua-reference"))]
 mod behaviour;
 
 pub use detect::{REMOVED_GLOBALS, UNPARSEABLE, needs_migration};

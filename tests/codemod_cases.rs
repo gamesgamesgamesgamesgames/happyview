@@ -107,10 +107,9 @@ fn every_case_is_idempotent() {
 }
 
 #[test]
-fn every_expected_file_is_loadable_lua() {
-    let lua = happyview::lua::sandbox_for_tests();
-    // The installed `luac` is 5.5 while the sandbox is 5.4, so this gate is
-    // stricter than the runtime: 5.5 refuses an assignment to a for-loop
+fn every_expected_file_parses() {
+    // The installed `luac` is 5.5 while the corpus targets 5.4, so it gates
+    // more strictly than a run does: 5.5 refuses an assignment to a for-loop
     // variable that 5.4 accepts. Skipped where no `luac` is on the path.
     let luac = std::process::Command::new("luac")
         .arg("-v")
@@ -123,6 +122,24 @@ fn every_expected_file_is_loadable_lua() {
             "{} does not parse",
             case.name
         );
+        if luac {
+            let status = std::process::Command::new("luac")
+                .arg("-p")
+                .arg(dir.join(format!("{}.expected.lua", case.name)))
+                .status()
+                .expect("run luac");
+            assert!(status.success(), "{} is refused by luac -p", case.name);
+        }
+    }
+}
+
+/// What 5.4 itself accepts, which neither `full_moon` nor a 5.5 `luac` can
+/// answer.
+#[cfg(feature = "lua-reference")]
+#[test]
+fn every_expected_file_compiles_under_the_runtime() {
+    let lua = happyview::lua::sandbox_for_tests();
+    for case in cases() {
         // Syntax only: loading compiles the chunk without running it, so a
         // rewrite that produced an unbalanced chain is caught here rather
         // than in production.
@@ -132,14 +149,6 @@ fn every_expected_file_is_loadable_lua() {
         lua.load(case.source.as_str())
             .into_function()
             .unwrap_or_else(|e| panic!("{} is not valid to begin with: {e}", case.name));
-        if luac {
-            let status = std::process::Command::new("luac")
-                .arg("-p")
-                .arg(dir.join(format!("{}.expected.lua", case.name)))
-                .status()
-                .expect("run luac");
-            assert!(status.success(), "{} is refused by luac -p", case.name);
-        }
     }
 }
 
