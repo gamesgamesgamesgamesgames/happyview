@@ -150,9 +150,13 @@ jobs:
         run: cargo test --lib
 
       # The native Lua runtime is off by default, and the tests that run a
-      # script through it are gated with it. They are the only coverage the
-      # editor templates and the codemod's rewritten corpus have, so this job
-      # runs both configurations. Neither needs a database or a fixture.
+      # script through it are gated with it. This step is the only coverage
+      # the editor templates and the codemod's rewritten corpus have, and the
+      # step above is not a second one: `luac` is almost certainly absent from
+      # the runner, which leaves the corpus gated by `full_moon` alone, and
+      # the assertion that a case's *source* compiles sits behind the feature
+      # with the 5.4 compile it belongs to. Nothing here needs a database or a
+      # fixture.
       - name: Run unit tests (native Lua reference)
         run: cargo test --features lua-reference --lib --test codemod_cases
 
