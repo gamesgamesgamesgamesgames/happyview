@@ -210,7 +210,7 @@ export default function ScriptDetail() {
                 No interpreter is installed for{" "}
                 <span className="font-mono">{script.script_type}</span>{" "}
                 scripts, so this one does not run — every trigger it is bound
-                to refuses until one is. It is otherwise intact and still
+                to fails until one is. It is otherwise intact and still
                 editable. Install an interpreter from the{" "}
                 <Link
                   href="/dashboard/settings/plugins"

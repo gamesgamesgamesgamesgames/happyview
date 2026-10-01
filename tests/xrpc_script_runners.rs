@@ -82,15 +82,20 @@ async fn upload_lexicon(app: &TestApp, lexicon: Value) {
 }
 
 async fn seed_script(app: &TestApp, trigger_id: &str, body: &str) {
+    seed_script_as(app, trigger_id, body, "lua").await;
+}
+
+async fn seed_script_as(app: &TestApp, trigger_id: &str, body: &str, script_type: &str) {
     let now = happyview::db::now_rfc3339();
     let sql = happyview::db::adapt_sql(
         "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) \
-         VALUES (?, ?, 'lua', ?, ?)",
+         VALUES (?, ?, ?, ?, ?)",
         app.state.db_backend,
     );
     happyview::db::query(&sql)
         .bind(trigger_id)
         .bind(body)
+        .bind(script_type)
         .bind(&now)
         .bind(&now)
         .execute(&app.state.db)
@@ -100,30 +105,39 @@ async fn seed_script(app: &TestApp, trigger_id: &str, body: &str) {
 
 /// A query endpoint bound to `source`, ready to call.
 async fn query_app(source: &str) -> TestApp {
-    let app = query_app_without_interpreter(source).await;
+    let app = query_app_without_interpreter(source, "lua").await;
     interpreter(&app).await;
     app
 }
 
-/// The same endpoint with nothing installed that claims the row's language.
-async fn query_app_without_interpreter(source: &str) -> TestApp {
+/// The same endpoint with nothing installed that claims `script_type`. The
+/// language is the caller's because the row's language is the whole subject:
+/// `lua` is the one a language filter in the handler would still resolve, so
+/// only a second language says the handler stopped filtering.
+async fn query_app_without_interpreter(source: &str, script_type: &str) -> TestApp {
     let app = TestApp::new().await;
     upload_lexicon(&app, common::fixtures::list_games_query_lexicon()).await;
-    seed_script(&app, &format!("xrpc.query:{QUERY}"), source).await;
+    seed_script_as(&app, &format!("xrpc.query:{QUERY}"), source, script_type).await;
     app
 }
 
 /// A procedure endpoint bound to `source`, ready to call.
 async fn procedure_app(source: &str) -> TestApp {
-    let app = procedure_app_without_interpreter(source).await;
+    let app = procedure_app_without_interpreter(source, "lua").await;
     interpreter(&app).await;
     app
 }
 
-async fn procedure_app_without_interpreter(source: &str) -> TestApp {
+async fn procedure_app_without_interpreter(source: &str, script_type: &str) -> TestApp {
     let app = TestApp::new().await;
     upload_lexicon(&app, common::fixtures::create_game_procedure_lexicon()).await;
-    seed_script(&app, &format!("xrpc.procedure:{PROCEDURE}"), source).await;
+    seed_script_as(
+        &app,
+        &format!("xrpc.procedure:{PROCEDURE}"),
+        source,
+        script_type,
+    )
+    .await;
     app
 }
 
@@ -392,32 +406,45 @@ async fn an_interpreter_that_traps_answers_a_correlation_id() {
 /// Nothing claims the row's language, so no answer this endpoint could give
 /// would be the one the script defines. The operator's fix is named in the
 /// body: there is nobody else who can act on it, and no secret in it.
+///
+/// Both languages are exercised because a 503 for `lua` alone would also hold
+/// if the handler read a row's language and treated anything else as no row at
+/// all — which answered a bound query with the default record listing, a
+/// wrong answer rather than a refused one.
 #[tokio::test]
 async fn a_query_whose_language_has_no_interpreter_is_a_503_naming_it() {
     common::require_db!();
-    let app = query_app_without_interpreter("value:other").await;
+    for language in ["lua", "typescript"] {
+        let app = query_app_without_interpreter("value:other", language).await;
 
-    let resp = call_query(&app, "").await;
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = json_body(resp).await;
-    assert_eq!(body["error"], "ServerMisconfigured");
-    let message = body["message"].as_str().expect("a message");
-    assert!(message.contains("lua"), "{body}");
-    assert!(message.contains("plugins page"), "{body}");
+        let resp = call_query(&app, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{language}");
+        let body = json_body(resp).await;
+        assert_eq!(body["error"], "ServerMisconfigured", "{language}");
+        let message = body["message"].as_str().expect("a message");
+        assert!(message.contains(language), "{language}: {body}");
+        assert!(message.contains("plugins page"), "{language}: {body}");
+    }
 }
 
+/// The stake on the procedure path is a write rather than a reply: treating
+/// the row as absent reached the create-or-put branch, which forwards the
+/// caller's raw input in place of whatever the bound script would have made
+/// of it.
 #[tokio::test]
 async fn a_procedure_whose_language_has_no_interpreter_is_a_503_naming_it() {
     common::require_db!();
-    let app = procedure_app_without_interpreter("value:other").await;
+    for language in ["lua", "typescript"] {
+        let app = procedure_app_without_interpreter("value:other", language).await;
 
-    let resp = call_procedure(&app, &json!({ "title": "hello" })).await;
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = json_body(resp).await;
-    assert_eq!(body["error"], "ServerMisconfigured");
-    let message = body["message"].as_str().expect("a message");
-    assert!(message.contains("lua"), "{body}");
-    assert!(message.contains("plugins page"), "{body}");
+        let resp = call_procedure(&app, &json!({ "title": "hello" })).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{language}");
+        let body = json_body(resp).await;
+        assert_eq!(body["error"], "ServerMisconfigured", "{language}");
+        let message = body["message"].as_str().expect("a message");
+        assert!(message.contains(language), "{language}: {body}");
+        assert!(message.contains("plugins page"), "{language}: {body}");
+    }
 }
 
 /// Installing the interpreter is the whole fix: the same request answers the
@@ -426,7 +453,7 @@ async fn a_procedure_whose_language_has_no_interpreter_is_a_503_naming_it() {
 async fn installing_the_interpreter_makes_the_same_query_answer() {
     common::require_db!();
     require_fixture!();
-    let app = query_app_without_interpreter("value:other").await;
+    let app = query_app_without_interpreter("value:other", "lua").await;
     assert_eq!(
         call_query(&app, "?limit=5").await.status(),
         StatusCode::SERVICE_UNAVAILABLE

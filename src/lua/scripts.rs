@@ -278,6 +278,24 @@ pub async fn run_record_event_script(
         "record": payload.record,
     });
 
+    if no_interpreter_for(state, &resolved).await {
+        dead_letter(
+            state,
+            &DeadLetterEntry {
+                script: &resolved,
+                host_kind: "record",
+                host_id: &host_id,
+                payload: &event_payload,
+                error: &crate::script::no_interpreter_message(&resolved.script_type),
+                attempts: 1,
+                collection: Some(payload.nsid),
+            },
+            payload.uri,
+        )
+        .await;
+        return RecordHookOutcome::Proceed;
+    }
+
     let mut last_error = String::new();
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
@@ -317,7 +335,7 @@ pub async fn run_record_event_script(
         }
     }
 
-    write_dead_letter(
+    dead_letter(
         state,
         &DeadLetterEntry {
             script: &resolved,
@@ -328,23 +346,7 @@ pub async fn run_record_event_script(
             attempts: MAX_ATTEMPTS,
             collection: Some(payload.nsid),
         },
-    )
-    .await;
-    log_event(
-        &state.db,
-        EventLog {
-            event_type: "script.dead_lettered".to_string(),
-            severity: Severity::Error,
-            actor_did: None,
-            subject: Some(payload.uri.to_string()),
-            detail: serde_json::json!({
-                "host_kind": "record",
-                "host_id": host_id,
-                "trigger": resolved.id,
-                "error": last_error,
-            }),
-        },
-        state.db_backend,
+        payload.uri,
     )
     .await;
 
@@ -461,6 +463,31 @@ pub async fn run_label_applied_script(
     let payload = serde_json::to_value(&event).unwrap_or(Value::Null);
     let host_id = event.src.clone();
     let original = event.clone();
+    // `_actor` names a bare DID rather than a collection, so it is the one
+    // suffix with nothing to record here.
+    let collection = resolved
+        .id
+        .split_once(':')
+        .map(|(_, suf)| suf)
+        .filter(|s| *s != "_actor");
+
+    if no_interpreter_for(state, &resolved).await {
+        dead_letter(
+            state,
+            &DeadLetterEntry {
+                script: &resolved,
+                host_kind: "label",
+                host_id: &host_id,
+                payload: &payload,
+                error: &crate::script::no_interpreter_message(&resolved.script_type),
+                attempts: 1,
+                collection,
+            },
+            &event.uri,
+        )
+        .await;
+        return LabelHookOutcome::Continue(original);
+    }
 
     let mut last_error = String::new();
     for attempt in 0..MAX_ATTEMPTS {
@@ -500,12 +527,7 @@ pub async fn run_label_applied_script(
             }
         }
     }
-    let collection = resolved
-        .id
-        .split_once(':')
-        .map(|(_, suf)| suf)
-        .filter(|s| *s != "_actor");
-    write_dead_letter(
+    dead_letter(
         state,
         &DeadLetterEntry {
             script: &resolved,
@@ -516,23 +538,7 @@ pub async fn run_label_applied_script(
             attempts: MAX_ATTEMPTS,
             collection,
         },
-    )
-    .await;
-    log_event(
-        &state.db,
-        EventLog {
-            event_type: "script.dead_lettered".to_string(),
-            severity: Severity::Error,
-            actor_did: None,
-            subject: Some(event.uri.clone()),
-            detail: serde_json::json!({
-                "host_kind": "label",
-                "host_id": host_id,
-                "trigger": resolved.id,
-                "error": last_error,
-            }),
-        },
-        state.db_backend,
+        &event.uri,
     )
     .await;
     LabelHookOutcome::Continue(original)
@@ -617,8 +623,52 @@ struct DeadLetterEntry<'a> {
     host_id: &'a str,
     payload: &'a Value,
     error: &'a str,
+    /// How many runs it took to get here. A retry budget that was spent
+    /// reports [`MAX_ATTEMPTS`]; a failure no retry could have changed
+    /// reports the one attempt it was worth.
     attempts: u32,
     collection: Option<&'a str>,
+}
+
+/// Whether nothing installed claims this row's language.
+///
+/// The runners ask before spending a retry budget, because a missing plugin
+/// is not a transient failure: four attempts and seven seconds of backoff
+/// cannot install one, and on a busy collection that is ingest held up behind
+/// a wait nothing can satisfy. [`DispatchError`] would say the same thing
+/// from inside the loop, but by then the budget is already being spent.
+///
+/// [`DispatchError`]: crate::script::DispatchError
+async fn no_interpreter_for(state: &AppState, script: &ResolvedScript) -> bool {
+    state
+        .plugin_registry
+        .get_interpreter_by_language(&script.script_type)
+        .await
+        .is_none()
+}
+
+/// Record a failed run where an operator reads it: the row they retry from
+/// and the event their feed shows. One call because they describe one failure
+/// and a run that wrote only one of them would be a half-told story.
+async fn dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>, subject: &str) {
+    write_dead_letter(state, entry).await;
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "script.dead_lettered".to_string(),
+            severity: Severity::Error,
+            actor_did: None,
+            subject: Some(subject.to_string()),
+            detail: serde_json::json!({
+                "host_kind": entry.host_kind,
+                "host_id": entry.host_id,
+                "trigger": entry.script.id,
+                "error": entry.error,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
 }
 
 async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {

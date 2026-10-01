@@ -47,6 +47,9 @@ interface Script {
   // non-Lua script. Can instead be ["unparseable"] when a Lua `body` does
   // not parse at all.
   needs_migration: string[];
+  // false when no installed interpreter claims `script_type`, so the script
+  // is stored but inert. See "A script whose language has no interpreter".
+  runnable: boolean;
 }
 
 // List all scripts
@@ -127,7 +130,8 @@ curl "http://127.0.0.1:3000/admin/scripts?suffix=xyz.statusphere.status" -H "$AU
     "description": "Process indexed statuses",
     "created_at": "2026-01-01T00:00:00Z",
     "updated_at": "2026-01-01T00:00:00Z",
-    "needs_migration": []
+    "needs_migration": [],
+    "runnable": true
   }
 ]
 ```
@@ -181,7 +185,8 @@ curl "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status"
   "description": "Process indexed statuses",
   "created_at": "2026-01-01T00:00:00Z",
   "updated_at": "2026-01-01T00:00:00Z",
-  "needs_migration": []
+  "needs_migration": [],
+  "runnable": true
 }
 ```
 
@@ -191,7 +196,7 @@ curl "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere.status"
 POST /admin/scripts
 ```
 
-Creates a new script or replaces an existing one by `id`. The trigger grammar and Lua body are validated at write-time, and a body that still references a removed v2 global is [refused](#saving-an-unmigrated-script).
+Creates a new script or replaces an existing one by `id`. The trigger grammar and Lua body are validated at write-time, a body that still references a removed v2 global is [refused](#saving-an-unmigrated-script), and so is a `script_type` [no installed interpreter claims](#a-script-whose-language-has-no-interpreter).
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch("http://127.0.0.1:3000/admin/scripts", {
@@ -266,7 +271,7 @@ curl -X POST http://127.0.0.1:3000/admin/scripts \
 | Field         | Type   | Required | Description                                                    |
 | ------------- | ------ | -------- | -------------------------------------------------------------- |
 | `id`          | string | yes      | Trigger string (e.g. `record.index:xyz.statusphere.status`)    |
-| `script_type` | string | no       | Script language; defaults to `"lua"`                           |
+| `script_type` | string | no       | Script language; defaults to `"lua"`. Must be one an installed interpreter claims |
 | `body`        | string | yes      | The script source code                                         |
 | `description` | string | no       | Human-readable description (max 300 characters)                |
 
@@ -280,7 +285,8 @@ curl -X POST http://127.0.0.1:3000/admin/scripts \
   "description": "Process indexed statuses",
   "created_at": "2026-01-01T00:00:00Z",
   "updated_at": "2026-01-01T00:00:00Z",
-  "needs_migration": []
+  "needs_migration": [],
+  "runnable": true
 }
 ```
 
@@ -290,7 +296,7 @@ curl -X POST http://127.0.0.1:3000/admin/scripts \
 PATCH /admin/scripts/{id}
 ```
 
-Updates individual fields of an existing script. At least one field must be provided. Setting `description` to `null` in JSON clears it. If `script_type` is changed, `body` must also be provided so validation can run against the new type. A `body` that still references a removed v2 global is [refused](#saving-an-unmigrated-script).
+Updates individual fields of an existing script. At least one field must be provided. Setting `description` to `null` in JSON clears it. If `script_type` is changed, `body` must also be provided so validation can run against the new type. A `body` that still references a removed v2 global is [refused](#saving-an-unmigrated-script), as is a `script_type` [no installed interpreter claims](#a-script-whose-language-has-no-interpreter).
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(
@@ -353,7 +359,7 @@ curl -X PATCH "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statuspher
 
 | Field         | Type         | Required | Description                                                      |
 | ------------- | ------------ | -------- | ---------------------------------------------------------------- |
-| `script_type` | string       | no       | Script language; requires `body` alongside                       |
+| `script_type` | string       | no       | Script language; requires `body` alongside, and must be one an installed interpreter claims |
 | `body`        | string       | no       | New script source; re-validated against `script_type`            |
 | `description` | string\|null | no       | New description, or `null` to clear                              |
 
@@ -367,7 +373,8 @@ curl -X PATCH "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statuspher
   "description": "Updated description for status processing",
   "created_at": "2026-01-01T00:00:00Z",
   "updated_at": "2026-01-01T00:00:00Z",
-  "needs_migration": []
+  "needs_migration": [],
+  "runnable": true
 }
 ```
 
@@ -544,6 +551,31 @@ curl -X POST "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphere
 `source` previews the rewrite of text the server doesn't hold, such as an editor's unsaved changes. No stored script is needed, so it works before a script is first saved: the `{id}` in the path then only tells the codemod which kind of script it is rewriting. Nothing is stored, `changed` compares against `source` rather than the stored body, and sending it with `apply: true` returns `400 Bad Request`.
 
 A non-Lua `script_type` returns `400 Bad Request`. A body that doesn't parse as Lua also returns `400 Bad Request` rather than a result — this is different from `needs_migration`'s `"unparseable"`, which is a value on the *script list/get* response, not this endpoint.
+
+### A script whose language has no interpreter
+
+A script's language is run by an interpreter plugin, and which languages an instance can run is therefore whatever is installed on it rather than a fixed list. `POST /admin/scripts` and `PATCH /admin/scripts/{id}` refuse a `script_type` no installed interpreter claims:
+
+```json
+{
+  "error": "no interpreter installed for 'typescript' scripts; install one from the plugins page"
+}
+```
+
+**Response**: `400 Bad Request`. Nothing is stored. Nothing on the instance could check the body or run it, so storing it would mean keeping a script nothing has validated — the refusal happens at the edit rather than on the script's first trigger. Installing the interpreter is the whole fix; the same request then succeeds unchanged.
+
+The check runs after the [unmigrated-body refusal](#saving-an-unmigrated-script), so a Lua body with removed globals still gets `removed_globals` and the offer of the codemod.
+
+**Stored rows are unaffected.** A script whose interpreter was never installed, or was uninstalled afterwards, still lists and still reads with its body intact, and reports `runnable: false`. It can still be edited and deleted. What it cannot do is run, and each trigger answers that in the way its own caller needs:
+
+| Trigger | What happens |
+| ------- | ------------ |
+| `xrpc.query:*`, `xrpc.procedure:*` | `503 Service Unavailable` with `error: "ServerMisconfigured"` and a `message` naming the language. A caller is refused rather than given an answer the script never shaped — in a procedure's case, rather than having its raw input written |
+| `record.index:*`, `record.create:*`, `record.update:*`, `record.delete:*` | Fail-open: the event is indexed as if no script had run, and a dead-letter row records the reason. Ingest is not held up by a missing plugin |
+| `labeler.apply:*` | Fail-open: the label is persisted unchanged, with a dead-letter row recording the reason |
+| `job.run:*` | The job fails, with the same sentence in its `error` column. A job that silently never ran would tell an operator nothing |
+
+The dead-letter rows record **one** attempt rather than the usual four: a missing plugin is not a transient failure, so the retry budget is not spent on it. Retrying such a row through `POST /admin/dead-letters/{id}/retry` answers `500 Internal Server Error` with a correlation id and writes the sentence to the row's `error` column, until the interpreter is installed. (Label dead letters are never retryable, whatever the reason they were written.)
 
 ### Saving an unmigrated script
 

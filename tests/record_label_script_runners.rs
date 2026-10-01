@@ -483,10 +483,14 @@ async fn a_label_value_that_is_neither_persists_the_original() {
 /// Nothing claims the row's language, so the run produces no result at all.
 /// The label is still persisted — a subscription must not stall on a plugin
 /// an operator has not installed — and the dead letter is the trace that says
-/// why the script did not shape it.
+/// why the script did not shape it, recorded as the one attempt it was worth.
+///
+/// An interpreter is installed here, for a different language, so what the
+/// runner refuses is this row rather than the instance.
 #[tokio::test]
 async fn a_label_row_whose_language_has_no_interpreter_dead_letters_and_persists() {
     common::require_db!();
+    require_fixture!();
     let app = app().await;
     seed_script_as(
         &app,
@@ -496,15 +500,22 @@ async fn a_label_row_whose_language_has_no_interpreter_dead_letters_and_persists
     )
     .await;
 
+    let started = std::time::Instant::now();
     let event = continued(run_label_applied_script(&app.state, label_event()).await);
+    let elapsed = started.elapsed();
     assert_eq!(event.val, "spam");
     assert!(events(&app, "script.executed").await.is_empty());
 
     let rows = dead_letters(&app).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].script_ref, "labeler.apply:app.bsky.feed.post");
+    assert_eq!(rows[0].attempts, 1);
     assert!(rows[0].error.contains("typescript"), "{}", rows[0].error);
     assert_eq!(events(&app, "script.dead_lettered").await.len(), 1);
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the run waited out a backoff: {elapsed:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -687,18 +698,30 @@ async fn a_dead_lettered_failure_keeps_its_category_in_the_error_column() {
 }
 
 /// Nothing is installed that claims the row's language, so the run produces no
-/// result at all — which the retry loop reads as a failure like any other and
-/// the operator reads as a dead letter naming the language.
+/// result at all and the operator reads a dead letter naming the language.
+///
+/// It is recorded as **one** attempt, and the call does not wait out the
+/// backoff three more would carry. No retry can install a plugin, and on a
+/// busy collection a wait nothing can satisfy is ingest held up. The count is
+/// what fails if the retry loop reclaims this case.
 #[tokio::test]
-async fn a_missing_interpreter_dead_letters_naming_the_language() {
+async fn a_missing_interpreter_dead_letters_once_and_does_not_wait() {
     common::require_db!();
     let app = TestApp::new().await;
     seed_script(&app, &format!("record.create:{NSID}"), "value:other").await;
 
+    let started = std::time::Instant::now();
     let outcome = run_record_event_script(&app.state, record_payload("create")).await;
+    let elapsed = started.elapsed();
     assert_eq!(outcome, RecordHookOutcome::Proceed);
 
     let rows = dead_letters(&app).await;
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].attempts, 1);
     assert!(rows[0].error.contains("lua"), "{}", rows[0].error);
+    // Four attempts sleep 1 + 2 + 4 seconds between them.
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the run waited out a backoff: {elapsed:?}"
+    );
 }
