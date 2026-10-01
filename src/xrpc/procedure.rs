@@ -164,6 +164,7 @@ pub(crate) async fn handle_procedure(
             params,
             lexicon,
             &resolved.body,
+            &resolved.script_type,
             None,
             delegate_did.as_deref(),
         )

@@ -142,20 +142,29 @@ async fn seed_procedure_lexicon(app: &TestApp) {
     assert!(status < 300, "failed to seed procedure lexicon: {status}");
 }
 
+/// Seed a script row directly, bypassing `POST /admin/scripts`, and install
+/// the interpreter that will run it. The bodies below are directives for the
+/// echo fixture rather than source in the language the row names, and that
+/// endpoint validates what it stores.
 async fn seed_script(app: &TestApp, id: &str, body: &str) {
-    let (status, resp) = app
-        .post_json_status(
-            "/admin/scripts",
-            json!({
-                "id": id,
-                "body": body,
-            }),
-        )
-        .await;
-    assert!(
-        status < 300,
-        "failed to seed script {id} ({status}): {resp}"
+    let now = happyview::db::now_rfc3339();
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) \
+         VALUES (?, ?, 'lua', ?, ?)",
+        app.state.db_backend,
     );
+    happyview::db::query(&sql)
+        .bind(id)
+        .bind(body)
+        .bind(&now)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .expect("seed a script row");
+    app.state
+        .plugin_registry
+        .register(common::echo_interpreter::plugin("lua"))
+        .await;
 }
 
 /// Load and install the `sdk_caller` fixture, built at
@@ -172,12 +181,13 @@ async fn install_caller_fixture(app: &TestApp) {
 
 const CREATE_GAME: &str = "games.gamesgamesgamesgames.createGame";
 
-fn create_record_script() -> String {
-    "function handle(input, ctx)\n\
-       local c = require(\"caller\")\n\
-       return c.create_record({ collection = \"com.example.post\", record = { text = input.text }, validate = false })\n\
-     end"
-        .to_string()
+/// `require`'s contract: the library's value on success, a raise on an error
+/// envelope. The call's arguments ride in on the request rather than sitting in
+/// the body, since the echo fixture reads a directive and not a script.
+const REQUIRE: &str = "host:require";
+
+fn call(function: &str, args: Value) -> Value {
+    json!({ "library": "sdk_caller", "function": function, "args": [args] })
 }
 
 // ---------------------------------------------------------------------------
@@ -191,12 +201,7 @@ async fn create_record_through_a_procedure_script() {
     let app = TestApp::new_with_encryption().await;
     install_caller_fixture(&app).await;
     seed_procedure_lexicon(&app).await;
-    seed_script(
-        &app,
-        &format!("xrpc.procedure:{CREATE_GAME}"),
-        &create_record_script(),
-    )
-    .await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
 
     const DID: &str = "did:plc:sdkcallerwriter";
     let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
@@ -223,7 +228,7 @@ async fn create_record_through_a_procedure_script() {
     let resp = dpop_post(
         &app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &json!({ "text": "hello" }),
+        &call("create_record", json!({ "collection": "com.example.post", "record": { "text": "hello" }, "validate": false })),
         &client_key,
         &dpop_key,
         &access_token,
@@ -268,15 +273,7 @@ async fn writable_repo_is_enforced() {
     let app = TestApp::new_with_encryption().await;
     install_caller_fixture(&app).await;
     seed_procedure_lexicon(&app).await;
-    seed_script(
-        &app,
-        &format!("xrpc.procedure:{CREATE_GAME}"),
-        "function handle(input, ctx)\n\
-           local c = require(\"caller\")\n\
-           return c.create_record({ collection = \"com.example.post\", repo = \"did:plc:someoneelse\", record = { text = input.text }, validate = false })\n\
-         end",
-    )
-    .await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
 
     const DID: &str = "did:plc:sdkcallerwriter2";
     let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
@@ -284,7 +281,7 @@ async fn writable_repo_is_enforced() {
     let resp = dpop_post(
         &app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &json!({ "text": "hello" }),
+        &call("create_record", json!({ "collection": "com.example.post", "repo": "did:plc:someoneelse", "record": { "text": "hello" }, "validate": false })),
         &client_key,
         &dpop_key,
         &access_token,
@@ -324,15 +321,7 @@ async fn blob_upload_errors_carry_the_pds_status() {
     let app = TestApp::new_with_encryption().await;
     install_caller_fixture(&app).await;
     seed_procedure_lexicon(&app).await;
-    seed_script(
-        &app,
-        &format!("xrpc.procedure:{CREATE_GAME}"),
-        "function handle(input, ctx)\n\
-           local c = require(\"caller\")\n\
-           return c.upload_blob({ bytes = \"hi\", mime_type = \"image/png\" })\n\
-         end",
-    )
-    .await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
 
     const DID: &str = "did:plc:sdkcalleruploader";
     let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
@@ -353,7 +342,10 @@ async fn blob_upload_errors_carry_the_pds_status() {
     let resp = dpop_post(
         &app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &json!({ "text": "hello" }),
+        &call(
+            "upload_blob",
+            json!({ "bytes": "hi", "mime_type": "image/png" }),
+        ),
         &client_key,
         &dpop_key,
         &access_token,
@@ -385,23 +377,8 @@ async fn xrpc_query_reaches_a_local_handler() {
         )
         .await;
     assert!(status < 300, "failed to seed query lexicon: {status}");
-    seed_script(
-        &app,
-        &format!("xrpc.query:{LIST_GAMES}"),
-        "function handle(params, ctx)\n  return { ok = true }\nend",
-    )
-    .await;
-    seed_script(
-        &app,
-        &format!("xrpc.procedure:{CREATE_GAME}"),
-        &format!(
-            "function handle(input, ctx)\n\
-               local c = require(\"caller\")\n\
-               return c.xrpc_query({{ method = \"{LIST_GAMES}\", params = {{}} }})\n\
-             end"
-        ),
-    )
-    .await;
+    seed_script(&app, &format!("xrpc.query:{LIST_GAMES}"), "value:other").await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
 
     const DID: &str = "did:plc:sdkcallerreader";
     let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
@@ -409,7 +386,10 @@ async fn xrpc_query_reaches_a_local_handler() {
     let resp = dpop_post(
         &app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &json!({}),
+        &call(
+            "xrpc_query",
+            json!({ "method": LIST_GAMES, "params": { "ok": true } }),
+        ),
         &client_key,
         &dpop_key,
         &access_token,
@@ -444,12 +424,7 @@ async fn xrpc_query_reaches_a_local_handler_with_no_session() {
         )
         .await;
     assert!(status < 300, "failed to seed query lexicon: {status}");
-    seed_script(
-        &app,
-        &format!("xrpc.query:{LIST_GAMES}"),
-        "function handle(params, ctx)\n  return { ok = true }\nend",
-    )
-    .await;
+    seed_script(&app, &format!("xrpc.query:{LIST_GAMES}"), "value:other").await;
 
     let result = app
         .state
@@ -457,7 +432,7 @@ async fn xrpc_query_reaches_a_local_handler_with_no_session() {
         .call_library(
             "sdk_caller",
             "xrpc_query",
-            &[json!({ "method": LIST_GAMES, "params": {} })],
+            &[json!({ "method": LIST_GAMES, "params": { "ok": true } })],
             &LibraryCallContext::default(),
             0,
         )
@@ -630,15 +605,7 @@ async fn a_created_record_is_mirrored_into_the_index() {
     let app = TestApp::new_with_encryption().await;
     install_caller_fixture(&app).await;
     seed_procedure_lexicon(&app).await;
-    seed_script(
-        &app,
-        &format!("xrpc.procedure:{CREATE_GAME}"),
-        "function handle(input, ctx)\n\
-           local c = require(\"caller\")\n\
-           return c.create_record({ collection = \"com.example.post\", record = { text = input.text, subject = input.subject }, validate = false })\n\
-         end",
-    )
-    .await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
 
     const DID: &str = "did:plc:sdkcallermirror";
     let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
@@ -656,7 +623,7 @@ async fn a_created_record_is_mirrored_into_the_index() {
     let resp = dpop_post(
         &app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &json!({ "text": "hello", "subject": "at://did:plc:other/com.example.post/parent" }),
+        &call("create_record", json!({ "collection": "com.example.post", "record": { "text": "hello", "subject": "at://did:plc:other/com.example.post/parent" }, "validate": false })),
         &client_key,
         &dpop_key,
         &access_token,
@@ -695,15 +662,7 @@ async fn a_put_record_replaces_the_mirrored_cid_and_keeps_indexed_at() {
     let app = TestApp::new_with_encryption().await;
     install_caller_fixture(&app).await;
     seed_procedure_lexicon(&app).await;
-    seed_script(
-        &app,
-        &format!("xrpc.procedure:{CREATE_GAME}"),
-        "function handle(input, ctx)\n\
-           local c = require(\"caller\")\n\
-           return c.put_record({ uri = input.uri, record = { text = input.text }, validate = false })\n\
-         end",
-    )
-    .await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
 
     const DID: &str = "did:plc:sdkcallerputter";
     let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
@@ -735,7 +694,10 @@ async fn a_put_record_replaces_the_mirrored_cid_and_keeps_indexed_at() {
     let resp = dpop_post(
         &app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &json!({ "uri": uri, "text": "second" }),
+        &call(
+            "put_record",
+            json!({ "uri": uri, "record": { "text": "second" }, "validate": false }),
+        ),
         &client_key,
         &dpop_key,
         &access_token,
@@ -762,16 +724,7 @@ async fn a_deleted_record_leaves_the_index_with_its_refs() {
     let app = TestApp::new_with_encryption().await;
     install_caller_fixture(&app).await;
     seed_procedure_lexicon(&app).await;
-    seed_script(
-        &app,
-        &format!("xrpc.procedure:{CREATE_GAME}"),
-        "function handle(input, ctx)\n\
-           local c = require(\"caller\")\n\
-           c.delete_record({ uri = input.uri })\n\
-           return { deleted = true }\n\
-         end",
-    )
-    .await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
 
     const DID: &str = "did:plc:sdkcallerdeleter";
     let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
@@ -796,7 +749,7 @@ async fn a_deleted_record_leaves_the_index_with_its_refs() {
     let resp = dpop_post(
         &app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &json!({ "uri": uri }),
+        &call("delete_record", json!({ "uri": uri })),
         &client_key,
         &dpop_key,
         &access_token,
@@ -805,7 +758,6 @@ async fn a_deleted_record_leaves_the_index_with_its_refs() {
     let status = resp.status();
     let body = response_json(resp).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["deleted"], true);
 
     assert!(indexed(&app, &uri).await.is_none());
     assert!(ref_targets(&app, &uri).await.is_empty());
@@ -821,15 +773,7 @@ async fn a_mirror_failure_leaves_the_write_successful() {
     let app = TestApp::new_with_encryption().await;
     install_caller_fixture(&app).await;
     seed_procedure_lexicon(&app).await;
-    seed_script(
-        &app,
-        &format!("xrpc.procedure:{CREATE_GAME}"),
-        "function handle(input, ctx)\n\
-           local c = require(\"caller\")\n\
-           return c.create_record({ collection = \"com.example.unmirrorable\", record = { text = input.text }, validate = false })\n\
-         end",
-    )
-    .await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
 
     const DID: &str = "did:plc:sdkcallerunmirrored";
     let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
@@ -849,7 +793,7 @@ async fn a_mirror_failure_leaves_the_write_successful() {
     let resp = dpop_post(
         &app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &json!({ "text": "hello" }),
+        &call("create_record", json!({ "collection": "com.example.unmirrorable", "record": { "text": "hello" }, "validate": false })),
         &client_key,
         &dpop_key,
         &access_token,

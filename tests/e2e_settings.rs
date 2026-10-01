@@ -255,56 +255,16 @@ async fn a_script_budget_must_be_an_integer_inside_its_range() {
     }
 }
 
-/// The runner reads the budget from the in-process cache, so a change made
-/// through the settings API has to reach the cache without a restart.
+/// A run reads the budget from the in-process cache and never queries for it,
+/// so a change made through the settings API has to reach that cache without a
+/// restart. What a run then does with the budget is pinned where the budget is
+/// handed to an interpreter, in `xrpc_script_runners.rs`.
 #[tokio::test]
 #[serial]
-async fn a_script_budget_change_reaches_the_next_run_without_restart() {
+async fn a_script_budget_change_reaches_the_cache_without_restart() {
     common::require_db!();
     let app = TestApp::new().await;
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(admin_post(
-            "/admin/lexicons",
-            app.admin_cookie(),
-            &json!({
-                "lexicon_json": common::fixtures::list_games_query_lexicon(),
-                "target_collection": "games.gamesgamesgamesgames.game"
-            }),
-        ))
-        .await
-        .unwrap();
-    assert!(resp.status().is_success(), "{}", resp.status());
-
-    let now = happyview::db::now_rfc3339();
-    let sql = happyview::db::adapt_sql(
-        "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) VALUES (?, ?, 'lua', ?, ?)",
-        app.state.db_backend,
-    );
-    happyview::db::query(&sql)
-        .bind("xrpc.query:games.gamesgamesgamesgames.listGames")
-        .bind("function handle() local n = 0; for i = 1, 10000 do n = n + 1 end; return { n = n } end")
-        .bind(&now)
-        .bind(&now)
-        .execute(&app.state.db)
-        .await
-        .unwrap();
-
-    let run = || {
-        app.router.clone().oneshot(
-            Request::builder()
-                .uri("/xrpc/games.gamesgamesgamesgames.listGames")
-                .header("x-client-key", "hvc_test")
-                .body(Body::empty())
-                .unwrap(),
-        )
-    };
-
-    let resp = run().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(json_body(resp).await["n"], 10_000);
+    let default = app.state.script_limits.instruction_limit();
 
     let resp = app
         .router
@@ -317,10 +277,7 @@ async fn a_script_budget_change_reaches_the_next_run_without_restart() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    let resp = run().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
-    assert_eq!(json_body(resp).await["errorType"], "timeout");
+    assert_eq!(app.state.script_limits.instruction_limit(), 1_000);
 
     let resp = app
         .router
@@ -332,10 +289,7 @@ async fn a_script_budget_change_reaches_the_next_run_without_restart() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    let resp = run().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(json_body(resp).await["n"], 10_000);
+    assert_eq!(app.state.script_limits.instruction_limit(), default);
 }
 
 #[tokio::test]

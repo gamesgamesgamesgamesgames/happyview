@@ -263,6 +263,16 @@ fn failed(kind: &str) -> Value {
     })
 }
 
+fn raised(message: &str) -> Value {
+    json!({
+        "status": "error",
+        "kind": "runtime",
+        "message": message,
+        "line": 7,
+        "raw": format!("[string \"script\"]:7: {message}"),
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn plugin_info() -> i64 {
     return_json(&json!({"ok": {
@@ -335,6 +345,27 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
                     }),
                     "object",
                 )
+            }
+            // The `require` contract a language gives a library call: the
+            // value on success and a raise on an error envelope. A host test
+            // driving a library through a real request reads the library's own
+            // answer as the response, and its refusals as failed runs.
+            "host:require" => {
+                let lib = payload["library"].as_str().unwrap_or("");
+                let function = payload["function"].as_str().unwrap_or("");
+                let args = payload.get("args").cloned().unwrap_or_else(|| json!([]));
+                let envelope = imports::call_library(lib, function, &args);
+                match envelope.get("ok") {
+                    Some(value) => {
+                        let kind = if value.is_object() { "object" } else { "other" };
+                        returned(value.clone(), kind)
+                    }
+                    None => raised(&format!(
+                        "{} - {}",
+                        envelope["error"]["code"].as_str().unwrap_or("HOST_ERROR"),
+                        envelope["error"]["message"].as_str().unwrap_or(""),
+                    )),
+                }
             }
             _ => returned(input, "object"),
         }

@@ -468,6 +468,12 @@ async fn service_auth_procedure_allowed() {
 
     seed_procedure_lexicon(&app).await;
     seed_procedure_script(&app, "function handle(input, ctx)\nreturn { uri = 'at://test/games.gamesgamesgamesgames.game/1' }\nend").await;
+    // The subject here is the access check in front of the script, so the run
+    // only has to happen: the echo fixture answers any body at all.
+    app.state
+        .plugin_registry
+        .register(common::echo_interpreter::plugin("lua"))
+        .await;
 
     let entry_id = app
         .create_service_entry("#chess", "ChessAppView", "specific")

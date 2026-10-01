@@ -13,6 +13,19 @@ pub struct SpaceContext {
     pub skey: String,
 }
 
+impl From<&SpaceContext> for crate::plugin::ScriptSpace {
+    fn from(space: &SpaceContext) -> Self {
+        Self {
+            uri: space.space.clone(),
+            id: space.space_id.clone(),
+            did: space.did.clone(),
+            authority_did: space.authority_did.clone(),
+            type_nsid: space.type_nsid.clone(),
+            skey: space.skey.clone(),
+        }
+    }
+}
+
 /// Everything the runtime knows about one script invocation, built into the
 /// `ctx` argument of `handle(input, ctx)`. Keys are snake_case, the same
 /// convention as everything else a Lua script sees.

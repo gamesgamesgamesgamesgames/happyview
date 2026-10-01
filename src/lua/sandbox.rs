@@ -3,7 +3,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use mlua::{Lua, Result as LuaResult};
 
@@ -243,25 +242,6 @@ pub async fn call_handle(
         inner: Box::pin(handle.call_async::<mlua::Value>(args)),
     }
     .await
-}
-
-/// [`call_handle`] with a wall clock on top, for the runners that answer a
-/// request. A run the clock ends is marked spent like any other.
-pub async fn call_handle_for_request(
-    lua: &Lua,
-    handle: &mlua::Function,
-    args: impl mlua::IntoLuaMulti,
-    wall_clock: Duration,
-) -> LuaResult<mlua::Value> {
-    match tokio::time::timeout(wall_clock, call_handle(lua, handle, args)).await {
-        Ok(result) => result,
-        Err(_elapsed) => {
-            if let Some(limit) = shared_limit(lua) {
-                limit.tripped.store(true, Ordering::Relaxed);
-            }
-            Err(execution_limit_error())
-        }
-    }
 }
 
 struct Budgeted<F> {

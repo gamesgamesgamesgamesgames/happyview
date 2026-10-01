@@ -25,6 +25,7 @@ pub(crate) async fn handle_query(
             params,
             lexicon,
             &resolved.body,
+            &resolved.script_type,
             claims,
             None,
         )

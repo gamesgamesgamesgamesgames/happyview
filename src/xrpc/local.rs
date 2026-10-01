@@ -88,9 +88,46 @@ pub(crate) async fn execute_local_procedure(
 mod tests {
     use super::*;
     use crate::lexicon::{ParsedLexicon, ProcedureAction};
+    use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
     use crate::test_support::{memory_pool, test_state_with_pool};
     use http_body_util::BodyExt;
     use serde_json::json;
+
+    const ECHO: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/interpreter_echo/target/wasm32-unknown-unknown/release/interpreter_echo.wasm"
+    );
+
+    /// The echo fixture installed as the interpreter for `lua`, the language a
+    /// seeded script row names. It interprets nothing — its `source` is a
+    /// directive, and anything it does not recognise echoes the whole `execute`
+    /// input back — so a test here reads what a local call handed an
+    /// interpreter rather than what a language made of it.
+    ///
+    /// `false` when the module is unbuilt and the test is to skip.
+    async fn echo_interpreter(state: &AppState) -> bool {
+        if loader::built_fixture("interpreter_echo", "wasm32-unknown-unknown").is_none() {
+            return false;
+        }
+        let manifest: PluginManifest = serde_json::from_value(json!({
+            "id": "echo", "name": "echo", "version": "1.0.0", "api_version": "2",
+            "plugin_type": "interpreter", "language_id": "lua",
+            "capabilities": ["library:call", "script:host"],
+        }))
+        .unwrap();
+        state
+            .plugin_registry
+            .register(LoadedPlugin {
+                info: manifest.clone().into(),
+                source: PluginSource::File {
+                    path: "tests/fixtures/interpreter_echo".into(),
+                },
+                wasm_bytes: std::fs::read(ECHO).expect("the echo module should read"),
+                manifest: Some(manifest),
+            })
+            .await;
+        true
+    }
 
     async fn seed_script(state: &AppState, trigger: &str, body: &str) {
         crate::db::query(
@@ -172,18 +209,17 @@ mod tests {
     #[tokio::test]
     async fn query_local_script_returns_json() {
         let state = test_state_with_pool(memory_pool().await);
+        if !echo_interpreter(&state).await {
+            return;
+        }
         state
             .lexicons
             .upsert(lexicon("test.echo", LexiconType::Query))
             .await;
-        seed_script(
-            &state,
-            "xrpc.query:test.echo",
-            r#"function handle() return { greeting = "hello" } end"#,
-        )
-        .await;
+        seed_script(&state, "xrpc.query:test.echo", "value:other").await;
 
         let mut params = HashMap::new();
+        params.insert("greeting".into(), Value::String("hello".into()));
         let response = execute_local_query(&state, "test.echo", &mut params, None)
             .await
             .expect("query should run");
@@ -194,53 +230,55 @@ mod tests {
     #[tokio::test]
     async fn query_local_script_receives_params_as_input() {
         let state = test_state_with_pool(memory_pool().await);
+        if !echo_interpreter(&state).await {
+            return;
+        }
         state
             .lexicons
             .upsert(lexicon("test.greet", LexiconType::Query))
             .await;
-        seed_script(
-            &state,
-            "xrpc.query:test.greet",
-            r#"function handle(input) return { greeting = "hello " .. input.name } end"#,
-        )
-        .await;
+        seed_script(&state, "xrpc.query:test.greet", "echo").await;
 
         let mut params = HashMap::new();
         params.insert("name".into(), Value::String("world".into()));
         let response = execute_local_query(&state, "test.greet", &mut params, None)
             .await
             .expect("query should run");
-        assert_eq!(body_json(response).await["greeting"], "hello world");
+        assert_eq!(body_json(response).await["input"]["name"], "world");
     }
 
     #[tokio::test]
     async fn query_local_script_receives_the_caller_in_ctx() {
         let state = test_state_with_pool(memory_pool().await);
+        if !echo_interpreter(&state).await {
+            return;
+        }
         state
             .lexicons
             .upsert(lexicon("test.whoami", LexiconType::Query))
             .await;
-        seed_script(
-            &state,
-            "xrpc.query:test.whoami",
-            r#"function handle(input, ctx)
-                return { did = ctx.caller_did or "anonymous" }
-            end"#,
-        )
-        .await;
+        seed_script(&state, "xrpc.query:test.whoami", "echo").await;
 
         let claims = Claims::internal("did:plc:testuser".into());
         let mut params = HashMap::new();
         let response = execute_local_query(&state, "test.whoami", &mut params, Some(&claims))
             .await
             .expect("query should run");
-        assert_eq!(body_json(response).await["did"], "did:plc:testuser");
+        assert_eq!(
+            body_json(response).await["context"]["caller_did"],
+            "did:plc:testuser"
+        );
 
         let mut params = HashMap::new();
         let response = execute_local_query(&state, "test.whoami", &mut params, None)
             .await
             .expect("query should run");
-        assert_eq!(body_json(response).await["did"], "anonymous");
+        assert!(
+            body_json(response).await["context"]
+                .get("caller_did")
+                .is_none(),
+            "an anonymous local call names no caller"
+        );
     }
 
     #[tokio::test]

@@ -500,20 +500,28 @@ async fn seed_procedure_lexicon(app: &TestApp) {
     assert!(status < 300, "failed to seed procedure lexicon: {status}");
 }
 
+/// Seed a script row directly, bypassing `POST /admin/scripts`: the bodies
+/// below are directives for the echo interpreter rather than source in the
+/// language the row names, and that endpoint validates what it stores.
 async fn seed_script(app: &TestApp, id: &str, body: &str) {
-    let (status, resp) = app
-        .post_json_status(
-            "/admin/scripts",
-            json!({
-                "id": id,
-                "body": body,
-            }),
-        )
-        .await;
-    assert!(
-        status < 300,
-        "failed to seed script {id} ({status}): {resp}"
+    let now = happyview::db::now_rfc3339();
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_scripts (id, body, script_type, created_at, updated_at) \
+         VALUES (?, ?, 'lua', ?, ?)",
+        app.state.db_backend,
     );
+    happyview::db::query(&sql)
+        .bind(id)
+        .bind(body)
+        .bind(&now)
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .expect("seed a script row");
+    app.state
+        .plugin_registry
+        .register(common::echo_interpreter::plugin("lua"))
+        .await;
 }
 
 /// Load and install the `sdk_linked_repos` fixture through the loader, so
@@ -556,11 +564,7 @@ async fn jobs_create_with_auth_carries_the_sessions_dpop_ids() {
     seed_script(
         &app,
         &format!("xrpc.procedure:{CREATE_GAME}"),
-        "function handle(input, ctx)\n\
-           local lr = require(\"linked_fixture\")\n\
-           local job_id = lr.jobs_create({ job_type = \"test.with-auth\", input = {}, auth = true })\n\
-           return { job_id = job_id }\n\
-         end",
+        "host:require",
     )
     .await;
 
@@ -571,7 +575,13 @@ async fn jobs_create_with_auth_carries_the_sessions_dpop_ids() {
     let resp = dpop_post(
         &app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &json!({}),
+        // The call's arguments ride in on the request, since the echo
+        // interpreter reads a directive rather than a script.
+        &json!({
+            "library": "sdk_linked_repos",
+            "function": "jobs_create",
+            "args": [{ "job_type": "test.with-auth", "input": {}, "auth": true }],
+        }),
         &client_key,
         &dpop_key,
         &access_token,
@@ -580,7 +590,7 @@ async fn jobs_create_with_auth_carries_the_sessions_dpop_ids() {
     let status = resp.status();
     let body = response_json(resp).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let job_id = body["job_id"].as_str().expect("job_id in response");
+    let job_id = body.as_str().expect("the job id in the response");
 
     let (inherit_auth, api_client_id, dpop_key_id) = job_dpop_fields(&app, job_id).await;
     assert!(inherit_auth);
@@ -600,11 +610,7 @@ async fn jobs_create_without_auth_leaves_dpop_ids_null() {
     seed_script(
         &app,
         &format!("xrpc.procedure:{CREATE_GAME}"),
-        "function handle(input, ctx)\n\
-           local lr = require(\"linked_fixture\")\n\
-           local job_id = lr.jobs_create({ job_type = \"test.without-auth\", input = {}, auth = false })\n\
-           return { job_id = job_id }\n\
-         end",
+        "host:require",
     )
     .await;
 
@@ -615,7 +621,13 @@ async fn jobs_create_without_auth_leaves_dpop_ids_null() {
     let resp = dpop_post(
         &app,
         &format!("/xrpc/{CREATE_GAME}"),
-        &json!({}),
+        // The call's arguments ride in on the request, since the echo
+        // interpreter reads a directive rather than a script.
+        &json!({
+            "library": "sdk_linked_repos",
+            "function": "jobs_create",
+            "args": [{ "job_type": "test.without-auth", "input": {}, "auth": false }],
+        }),
         &client_key,
         &dpop_key,
         &access_token,
@@ -624,7 +636,7 @@ async fn jobs_create_without_auth_leaves_dpop_ids_null() {
     let status = resp.status();
     let body = response_json(resp).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let job_id = body["job_id"].as_str().expect("job_id in response");
+    let job_id = body.as_str().expect("the job id in the response");
 
     let (inherit_auth, api_client_id, dpop_key_id) = job_dpop_fields(&app, job_id).await;
     assert!(!inherit_auth);
