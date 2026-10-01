@@ -36,6 +36,7 @@ pub mod record_handler;
 pub mod record_refs;
 pub mod repo;
 pub mod resolve;
+pub mod script;
 pub mod server;
 pub mod service_entries;
 pub mod service_identity;

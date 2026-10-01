@@ -416,6 +416,22 @@ impl PluginRegistry {
             .find(|p| p.namespace() == Some(namespace))
             .cloned()
     }
+
+    /// The interpreter that runs `language_id`. `install` refuses a second
+    /// plugin claiming a language, so at most one answers; and only an
+    /// interpreter carries a `language_id` at all, so a library declaring one
+    /// is not reachable through here.
+    pub async fn get_interpreter_by_language(
+        &self,
+        language_id: &str,
+    ) -> Option<Arc<LoadedPlugin>> {
+        self.plugins
+            .read()
+            .await
+            .values()
+            .find(|p| p.language_id() == Some(language_id))
+            .cloned()
+    }
 }
 
 #[cfg(test)]
@@ -592,5 +608,54 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// A script's `script_type` reaches its interpreter through this lookup,
+    /// so a language nothing claims answers `None` rather than falling to
+    /// whichever plugin happens to declare the field.
+    #[tokio::test]
+    async fn an_interpreter_is_found_by_the_language_it_claims() {
+        let plugin = |id: &str, plugin_type: &str, language_id: &str| {
+            let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "version": "1.0.0", "api_version": "2",
+                "plugin_type": plugin_type, "language_id": language_id,
+                "namespace": id, "capabilities": [],
+            }))
+            .unwrap();
+            LoadedPlugin {
+                info: manifest.clone().into(),
+                source: PluginSource::File { path: id.into() },
+                wasm_bytes: vec![],
+                manifest: Some(manifest),
+            }
+        };
+
+        let registry = PluginRegistry::new();
+        registry
+            .install(plugin("happyview-lua", "interpreter", "lua"))
+            .await
+            .unwrap();
+        registry
+            .install(plugin("stray", "library", "moon"))
+            .await
+            .unwrap();
+
+        let found = registry
+            .get_interpreter_by_language("lua")
+            .await
+            .expect("the installed interpreter claims lua");
+        assert_eq!(found.info.id, "happyview-lua");
+
+        assert!(
+            registry
+                .get_interpreter_by_language("python")
+                .await
+                .is_none(),
+            "no interpreter claims python"
+        );
+        assert!(
+            registry.get_interpreter_by_language("moon").await.is_none(),
+            "a library's language_id is not a claim"
+        );
     }
 }

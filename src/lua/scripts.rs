@@ -136,41 +136,13 @@ impl ParsedTrigger {
 }
 
 // ---------------------------------------------------------------------------
-// ScriptLanguage
-// ---------------------------------------------------------------------------
-
-/// Runtime a script is written for. Today only [`ScriptLanguage::Lua`] ships;
-/// the column is stamped per row so a future runtime (e.g. TypeScript) can
-/// land without a schema migration.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ScriptLanguage {
-    #[default]
-    Lua,
-}
-
-impl ScriptLanguage {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Lua => "lua",
-        }
-    }
-
-    pub fn parse_str(s: &str) -> Option<Self> {
-        match s {
-            "lua" => Some(Self::Lua),
-            _ => None,
-        }
-    }
-
-    pub fn supported() -> &'static [&'static str] {
-        &["lua"]
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Script row + resolution
 // ---------------------------------------------------------------------------
+
+/// The language the runners in this module implement. Which other languages a
+/// script may be written in is a question about installed interpreters, so
+/// only this one is a constant.
+pub const NATIVE_LANGUAGE: &str = "lua";
 
 /// A row from the `scripts` table — the wire shape the admin API returns.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -187,12 +159,21 @@ pub struct ScriptRow {
 #[derive(Clone, Debug)]
 pub struct ResolvedScript {
     pub id: String,
-    pub language: ScriptLanguage,
+    /// Which interpreter runs `body`, as the row stamped it.
+    pub script_type: String,
     pub body: String,
 }
 
-/// Look up a single trigger id. Returns `None` when no row matches OR when
-/// the row's `script_type` is unknown to this binary (logged at warn).
+impl ResolvedScript {
+    /// Whether this row's body is for the VM this module runs. Resolution
+    /// reports a row's language rather than filtering on it, so a caller asks
+    /// before handing a body to a Lua VM.
+    pub fn is_native(&self) -> bool {
+        self.script_type == NATIVE_LANGUAGE
+    }
+}
+
+/// Look up a single trigger id. Returns `None` when no row matches.
 pub async fn resolve(state: &AppState, trigger_id: &str) -> Option<ResolvedScript> {
     let sql = adapt_sql(
         "SELECT id, body, script_type FROM happyview_scripts WHERE id = ?",
@@ -210,19 +191,11 @@ pub async fn resolve(state: &AppState, trigger_id: &str) -> Option<ResolvedScrip
         }
     };
     let (id, body, script_type) = row?;
-    let language = match ScriptLanguage::parse_str(&script_type) {
-        Some(l) => l,
-        None => {
-            tracing::warn!(
-                id,
-                script_type,
-                "unknown script_type; this binary supports: {}",
-                ScriptLanguage::supported().join(", ")
-            );
-            return None;
-        }
-    };
-    Some(ResolvedScript { id, language, body })
+    Some(ResolvedScript {
+        id,
+        script_type,
+        body,
+    })
 }
 
 /// Resolve a record-event trigger with the cascade rule:
@@ -395,10 +368,10 @@ pub async fn run_record_event_once(
     script: &ResolvedScript,
     payload: RecordEventPayload<'_>,
 ) -> Result<RecordHookOutcome, String> {
-    if script.language != ScriptLanguage::Lua {
+    if !script.is_native() {
         return Err(format!(
             "this binary cannot run {} scripts",
-            script.language.as_str()
+            script.script_type
         ));
     }
     let lua = sandbox::create_sandbox_with_limit(state.script_limits.instruction_limit())
@@ -598,10 +571,10 @@ async fn run_label_lua_once(
     script: &ResolvedScript,
     event: &LabelAppliedEvent,
 ) -> Result<LabelHookOutcome, String> {
-    if script.language != ScriptLanguage::Lua {
+    if !script.is_native() {
         return Err(format!(
             "this binary cannot run {} scripts",
-            script.language.as_str()
+            script.script_type
         ));
     }
     let lua = sandbox::create_sandbox_with_limit(state.script_limits.instruction_limit())
@@ -906,7 +879,7 @@ mod tests {
     fn lua_script(body: &str) -> ResolvedScript {
         ResolvedScript {
             id: "record.create:com.example.thing".into(),
-            language: ScriptLanguage::Lua,
+            script_type: NATIVE_LANGUAGE.into(),
             body: body.into(),
         }
     }
@@ -1172,14 +1145,6 @@ mod tests {
             trigger_for_label_uri("at://did:plc:abc/"),
             "labeler.apply:_actor"
         );
-    }
-
-    #[test]
-    fn script_language_round_trip() {
-        assert_eq!(ScriptLanguage::Lua.as_str(), "lua");
-        assert_eq!(ScriptLanguage::parse_str("lua"), Some(ScriptLanguage::Lua));
-        assert_eq!(ScriptLanguage::parse_str("typescript"), None);
-        assert_eq!(ScriptLanguage::default(), ScriptLanguage::Lua);
     }
 
     #[test]

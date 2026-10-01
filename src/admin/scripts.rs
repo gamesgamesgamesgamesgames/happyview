@@ -29,7 +29,7 @@ use crate::codemod::{self, ScriptKind};
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
-use crate::lua::{ParsedTrigger, ScriptLanguage};
+use crate::lua::{NATIVE_LANGUAGE, ParsedTrigger};
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -83,7 +83,7 @@ impl ScriptResponse {
         let outbound_xrpcs: Option<Vec<String>> =
             outbound_xrpcs_json.and_then(|j| serde_json::from_str(&j).ok());
         let recreatable = ParsedTrigger::parse(&id).is_ok();
-        let needs_migration = if script_type == ScriptLanguage::Lua.as_str() {
+        let needs_migration = if script_type == NATIVE_LANGUAGE {
             codemod::needs_migration(&body, ScriptKind::from_trigger_id(&id))
                 .into_iter()
                 .map(str::to_string)
@@ -109,9 +109,9 @@ impl ScriptResponse {
 #[derive(Debug, Deserialize)]
 pub(super) struct UpsertBody {
     pub id: String,
-    /// Defaults to `"lua"` server-side if omitted.
+    /// Defaults to [`NATIVE_LANGUAGE`] server-side if omitted.
     #[serde(default)]
-    pub script_type: Option<ScriptLanguage>,
+    pub script_type: Option<String>,
     pub body: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -121,7 +121,7 @@ pub(super) struct UpsertBody {
 #[derive(Debug, Deserialize)]
 pub(super) struct PatchBody {
     #[serde(default)]
-    pub script_type: Option<ScriptLanguage>,
+    pub script_type: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
     /// Set to `Some(None)` to clear via JSON `null`.
@@ -275,9 +275,11 @@ pub(super) async fn upsert(
         )));
     }
 
-    let script_type = body.script_type.unwrap_or_default();
-    refuse_unmigrated(&body.id, script_type.as_str(), &body.body)?;
-    validate_body_for_type(&body.body, script_type)?;
+    let script_type = body
+        .script_type
+        .unwrap_or_else(|| NATIVE_LANGUAGE.to_string());
+    refuse_unmigrated(&body.id, &script_type, &body.body)?;
+    validate_body_for_type(&state, &body.body, &script_type).await?;
 
     let outbound_xrpcs = crate::lua_analysis::extract_outbound_xrpcs(&body.body);
     let outbound_json =
@@ -382,9 +384,12 @@ pub(super) async fn patch(
         ));
     }
     if let Some(ref new_body) = body.body {
-        let lang = body.script_type.unwrap_or_default();
-        refuse_unmigrated(&id, lang.as_str(), new_body)?;
-        validate_body_for_type(new_body, lang)?;
+        let lang = body
+            .script_type
+            .clone()
+            .unwrap_or_else(|| NATIVE_LANGUAGE.to_string());
+        refuse_unmigrated(&id, &lang, new_body)?;
+        validate_body_for_type(&state, new_body, &lang).await?;
     }
     if let Some(Some(ref desc)) = body.description
         && desc.len() > MAX_DESCRIPTION_LEN
@@ -399,10 +404,7 @@ pub(super) async fn patch(
 
     let backend = state.db_backend;
     let now = now_rfc3339();
-    let new_script_type = body
-        .script_type
-        .map(|s| s.as_str().to_string())
-        .unwrap_or(existing.script_type);
+    let new_script_type = body.script_type.unwrap_or(existing.script_type);
     let new_body = body.body.unwrap_or(existing.body);
     let new_description = match body.description {
         Some(desc_opt) => desc_opt,
@@ -540,7 +542,7 @@ pub(super) async fn codemod_apply(
     }
 
     let existing = fetch_one(&state, &id).await?;
-    if existing.script_type != ScriptLanguage::Lua.as_str() {
+    if existing.script_type != NATIVE_LANGUAGE {
         return Err(AppError::BadRequest(
             "codemod applies to Lua scripts".to_string(),
         ));
@@ -671,7 +673,7 @@ fn rewrite_lua(source: &str, kind: ScriptKind) -> Result<codemod::Rewrite, AppEr
 /// A body the scanner cannot read is left to the compile check, which owns
 /// the message for a script that does not parse.
 fn refuse_unmigrated(id: &str, script_type: &str, body: &str) -> Result<(), AppError> {
-    if script_type != ScriptLanguage::Lua.as_str() {
+    if script_type != NATIVE_LANGUAGE {
         return Ok(());
     }
     let remaining = codemod::needs_migration(body, ScriptKind::from_trigger_id(id));
@@ -683,12 +685,43 @@ fn refuse_unmigrated(id: &str, script_type: &str, body: &str) -> Result<(), AppE
     ))
 }
 
-/// Validate the script body against its declared language. Rejects
-/// invalid bodies with a 400 at write-time.
-fn validate_body_for_type(body: &str, lang: ScriptLanguage) -> Result<(), AppError> {
-    match lang {
-        ScriptLanguage::Lua => crate::lua::validate_script(body).map_err(AppError::BadRequest),
+/// Validate the script body against its declared language, rejecting an
+/// invalid body with a 400 at write-time.
+///
+/// Which languages a script may declare is a question about which interpreters
+/// are installed, so an unrecognised one is answered with the list this
+/// instance can actually run rather than with a list compiled in. A body for an
+/// installed interpreter is that interpreter's to check.
+async fn validate_body_for_type(
+    state: &AppState,
+    body: &str,
+    language: &str,
+) -> Result<(), AppError> {
+    if language == NATIVE_LANGUAGE {
+        return crate::lua::validate_script(body).map_err(AppError::BadRequest);
     }
+    let mut available = installed_languages(state).await;
+    if available.iter().any(|l| l == language) {
+        return Ok(());
+    }
+    available.push(NATIVE_LANGUAGE.to_string());
+    available.sort();
+    available.dedup();
+    Err(AppError::BadRequest(format!(
+        "unknown script_type '{language}'; this instance can run: {}",
+        available.join(", ")
+    )))
+}
+
+/// The languages installed interpreters claim.
+async fn installed_languages(state: &AppState) -> Vec<String> {
+    state
+        .plugin_registry
+        .list_by_type(crate::plugin::PluginType::Interpreter)
+        .await
+        .iter()
+        .filter_map(|p| p.language_id().map(str::to_string))
+        .collect()
 }
 
 #[cfg(test)]
