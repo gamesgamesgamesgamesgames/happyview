@@ -13,10 +13,11 @@ use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::ParsedLexicon;
 use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptSpace};
 use crate::repo;
-use crate::script::{DispatchError, Invocation, Trigger, dispatch};
+use crate::script::{DispatchError, Invocation, dispatch};
 use crate::telemetry::counters::Counters;
 
 use super::context;
+use super::scripts::{ResolvedScript, trigger_of};
 
 /// What a caller is told when the budget ended the run. The limit is the
 /// host's, so the sentence is the host's rather than whatever text the
@@ -118,10 +119,7 @@ fn returned_value(
         // A run that produced no result at all is told apart by whose failure
         // it describes, not by how bad it is. The two limits describe the
         // script's own run and keep its envelope; every other way an
-        // interpreter fails to answer describes this instance, and a wasmtime
-        // trap or an instantiation failure is an operator's text rather than a
-        // stranger's. Those travel as a correlation id, and the text itself
-        // reaches the operator through the log and the event row below.
+        // interpreter fails to answer describes this instance.
         //
         // "Your script failed" and "we could not run anything" are also
         // different claims, so they do not share an envelope.
@@ -150,8 +148,7 @@ pub async fn execute_procedure_script(
     input: &Value,
     params: &HashMap<String, Value>,
     lexicon: &ParsedLexicon,
-    script: &str,
-    language: &str,
+    script: &ResolvedScript,
     space_ctx: Option<&context::SpaceContext>,
     delegate_did: Option<&str>,
 ) -> Result<Response, AppError> {
@@ -171,7 +168,7 @@ pub async fn execute_procedure_script(
     let collection = lexicon.target_collection.as_deref().unwrap_or_default();
 
     // Capture script source and input for error logging before anything is consumed.
-    let script_source = script.to_string();
+    let script_source = script.body.clone();
     let input_json = input.clone();
 
     let pds_auth: Option<repo::PdsAuth> = if let Some(client_key) = claims.client_key() {
@@ -233,16 +230,15 @@ pub async fn execute_procedure_script(
         })
     });
     let has_pds_auth = caller_session.is_some();
-    let trigger_id = format!("xrpc.procedure:{}", lexicon.id);
     let space = space_ctx.map(ScriptSpace::from);
 
     let outcome = dispatch(
         state,
         &Invocation {
-            trigger_id: &trigger_id,
-            trigger: Trigger::XrpcProcedure,
-            language,
-            source: script,
+            trigger_id: &script.id,
+            trigger: trigger_of(script, None).map_err(AppError::Internal)?,
+            language: &script.script_type,
+            source: &script.body,
             input: &input_json,
             caller_did: Some(claims.did()),
             has_pds_auth,
@@ -319,8 +315,7 @@ pub async fn execute_query_script(
     method: &str,
     params: &HashMap<String, Value>,
     lexicon: &ParsedLexicon,
-    script: &str,
-    language: &str,
+    script: &ResolvedScript,
     claims: Option<&Claims>,
     space_ctx: Option<&context::SpaceContext>,
 ) -> Result<Response, AppError> {
@@ -335,22 +330,21 @@ pub async fn execute_query_script(
     let collection = lexicon.target_collection.as_deref().unwrap_or_default();
 
     // Capture script source for error logging.
-    let script_source = script.to_string();
+    let script_source = script.body.clone();
 
     // A query's parameters are the first argument of `handle`, which is why
     // `ctx.params` carries nothing: the same values twice would leave a script
     // author guessing which one a runner fills.
     let input_json = Value::Object(params.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
-    let trigger_id = format!("xrpc.query:{}", lexicon.id);
     let space = space_ctx.map(ScriptSpace::from);
 
     let outcome = dispatch(
         state,
         &Invocation {
-            trigger_id: &trigger_id,
-            trigger: Trigger::XrpcQuery,
-            language,
-            source: script,
+            trigger_id: &script.id,
+            trigger: trigger_of(script, None).map_err(AppError::Internal)?,
+            language: &script.script_type,
+            source: &script.body,
             input: &input_json,
             caller_did: claims.map(|c| c.did()),
             has_pds_auth: false,
@@ -441,6 +435,16 @@ mod tests {
             space_type: None,
             space_name: None,
             space_collections: None,
+        }
+    }
+
+    /// A query row bound to the lexicon above, as a resolve would answer it.
+    fn query_script(body: &str) -> ResolvedScript {
+        ResolvedScript {
+            id: "xrpc.query:com.example.probe".to_string(),
+            trigger: crate::lua::TriggerKind::XrpcQuery,
+            script_type: "lua".to_string(),
+            body: body.to_string(),
         }
     }
 
@@ -706,8 +710,7 @@ mod tests {
             "com.example.probe",
             &HashMap::new(),
             &lexicon,
-            "function handle() return {} end",
-            "lua",
+            &query_script("function handle() return {} end"),
             None,
             None,
         )

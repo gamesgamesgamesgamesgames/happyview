@@ -17,17 +17,10 @@ pub(crate) async fn handle_query(
 ) -> Result<Response, AppError> {
     // Trigger-keyed dispatch: a script bound at `xrpc.query:<id>`
     // overrides the default list / get-record flow.
-    let trigger = format!("xrpc.query:{}", lexicon.id);
+    let trigger = crate::lua::ParsedTrigger::new(crate::lua::TriggerKind::XrpcQuery, &lexicon.id);
     if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
         return crate::lua::execute_query_script(
-            state,
-            method,
-            params,
-            lexicon,
-            &resolved.body,
-            &resolved.script_type,
-            claims,
-            None,
+            state, method, params, lexicon, &resolved, claims, None,
         )
         .await;
     }

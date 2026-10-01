@@ -72,6 +72,18 @@ pub struct ParsedTrigger {
 }
 
 impl ParsedTrigger {
+    /// A trigger the host builds from an event it is handling, rather than
+    /// reads out of text. It validates nothing: [`parse`](Self::parse)
+    /// answers whether text names a trigger, while a suffix taken from a
+    /// firehose event or a lexicon id is looked up as it stands, and one the
+    /// grammar would refuse simply matches no row.
+    pub fn new(kind: TriggerKind, suffix: impl Into<String>) -> Self {
+        Self {
+            kind,
+            suffix: suffix.into(),
+        }
+    }
+
     /// Reconstruct the canonical trigger id from `(kind, suffix)`.
     pub fn id(&self) -> String {
         match self.kind {
@@ -160,24 +172,30 @@ pub struct ScriptRow {
 #[derive(Clone, Debug)]
 pub struct ResolvedScript {
     pub id: String,
+    /// The grammar kind of the trigger this row was looked up by, which is
+    /// what decides the contract its result is read under. It comes from the
+    /// lookup rather than from re-reading `id`, because a stored id the
+    /// grammar refuses still resolves by exact match and still has to run.
+    pub trigger: TriggerKind,
     /// Which interpreter runs `body`, as the row stamped it.
     pub script_type: String,
     pub body: String,
 }
 
-/// Look up a single trigger id. Returns `None` when no row matches.
+/// Look up a single trigger. Returns `None` when no row matches.
 ///
 /// Which language the row names is not a filter here. A trigger an operator
 /// bound to a script must resolve to that script whether or not its
 /// interpreter is installed, so that the answer is the dispatcher's refusal
 /// rather than a different script's output or silence.
-pub async fn resolve(state: &AppState, trigger_id: &str) -> Option<ResolvedScript> {
+pub async fn resolve(state: &AppState, trigger: &ParsedTrigger) -> Option<ResolvedScript> {
+    let trigger_id = trigger.id();
     let sql = adapt_sql(
         "SELECT id, body, script_type FROM happyview_scripts WHERE id = ?",
         state.db_backend,
     );
     let row: Option<(String, String, String)> = match crate::db::query_as(&sql)
-        .bind(trigger_id)
+        .bind(&trigger_id)
         .fetch_optional(&state.db)
         .await
     {
@@ -190,6 +208,7 @@ pub async fn resolve(state: &AppState, trigger_id: &str) -> Option<ResolvedScrip
     let (id, body, script_type) = row?;
     Some(ResolvedScript {
         id,
+        trigger: trigger.kind,
         script_type,
         body,
     })
@@ -202,18 +221,18 @@ pub async fn resolve_record_event(
     nsid: &str,
     action: &str,
 ) -> Option<ResolvedScript> {
-    let action_trigger = match action {
-        "create" => Some(format!("record.create:{nsid}")),
-        "update" => Some(format!("record.update:{nsid}")),
-        "delete" => Some(format!("record.delete:{nsid}")),
+    let action_kind = match action {
+        "create" => Some(TriggerKind::RecordCreate),
+        "update" => Some(TriggerKind::RecordUpdate),
+        "delete" => Some(TriggerKind::RecordDelete),
         _ => None,
     };
-    if let Some(t) = action_trigger
-        && let Some(s) = resolve(state, &t).await
+    if let Some(kind) = action_kind
+        && let Some(s) = resolve(state, &ParsedTrigger::new(kind, nsid)).await
     {
         return Some(s);
     }
-    resolve(state, &format!("record.index:{nsid}")).await
+    resolve(state, &ParsedTrigger::new(TriggerKind::RecordIndex, nsid)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -375,11 +394,12 @@ pub async fn run_record_event_once(
         "rkey": payload.rkey,
         "record": payload.record,
     });
+    let trigger = trigger_of(script, None)?;
     let outcome = dispatch(
         state,
         &Invocation {
             trigger_id: &script.id,
-            trigger: Trigger::RecordEvent,
+            trigger,
             language: &script.script_type,
             source: &script.body,
             input: &event,
@@ -434,18 +454,20 @@ pub enum LabelHookOutcome {
     Skip,
 }
 
-/// Compute the trigger string for a given label. `at://` URIs route to
+/// Compute the trigger for a given label. `at://` URIs route to
 /// `labeler.apply:<nsid>` (using the second path segment); everything else
 /// (bare DIDs, malformed) routes to `labeler.apply:_actor`.
-pub fn trigger_for_label_uri(uri: &str) -> String {
-    if let Some(rest) = uri.strip_prefix("at://") {
-        match rest.split('/').nth(1) {
-            Some(nsid) if !nsid.is_empty() => format!("labeler.apply:{nsid}"),
-            _ => "labeler.apply:_actor".to_string(),
-        }
-    } else {
-        "labeler.apply:_actor".to_string()
-    }
+pub fn trigger_for_label_uri(uri: &str) -> ParsedTrigger {
+    let suffix = match uri.strip_prefix("at://").and_then(|rest| {
+        rest.split('/')
+            .nth(1)
+            .filter(|nsid| !nsid.is_empty())
+            .map(str::to_string)
+    }) {
+        Some(nsid) => nsid,
+        None => "_actor".to_string(),
+    };
+    ParsedTrigger::new(TriggerKind::LabelerApply, suffix)
 }
 
 /// Run the label-applied script (if any) for an inbound label. Fail-open:
@@ -465,11 +487,7 @@ pub async fn run_label_applied_script(
     let original = event.clone();
     // `_actor` names a bare DID rather than a collection, so it is the one
     // suffix with nothing to record here.
-    let collection = resolved
-        .id
-        .split_once(':')
-        .map(|(_, suf)| suf)
-        .filter(|s| *s != "_actor");
+    let collection = Some(trigger.suffix.as_str()).filter(|s| *s != "_actor");
 
     if no_interpreter_for(state, &resolved).await {
         dead_letter(
@@ -550,11 +568,12 @@ async fn run_label_once(
     event: &LabelAppliedEvent,
 ) -> Result<LabelHookOutcome, String> {
     let input = serde_json::to_value(event).map_err(|e| format!("encode event: {e}"))?;
+    let trigger = trigger_of(script, None)?;
     let outcome = dispatch(
         state,
         &Invocation {
             trigger_id: &script.id,
-            trigger: Trigger::Label,
+            trigger,
             language: &script.script_type,
             source: &script.body,
             input: &input,
@@ -628,6 +647,18 @@ struct DeadLetterEntry<'a> {
     /// reports the one attempt it was worth.
     attempts: u32,
     collection: Option<&'a str>,
+}
+
+/// The trigger a resolved row's run carries, read from the kind the row was
+/// looked up by. A kind and a job that cannot describe one run end the
+/// attempt, rather than running the script under a contract it was not
+/// written against.
+pub(crate) fn trigger_of<'a>(
+    script: &'a ResolvedScript,
+    job: Option<&'a str>,
+) -> Result<Trigger<'a>, String> {
+    Trigger::for_trigger_kind(script.trigger, job)
+        .ok_or_else(|| format!("no run can be built for trigger '{}'", script.id))
 }
 
 /// Whether nothing installed claims this row's language.
@@ -841,29 +872,53 @@ mod tests {
         assert!(ParsedTrigger::parse("record.index:_actor").is_err());
     }
 
+    /// A lookup's kind and the kind its id names are the same kind, for every
+    /// kind. A resolved row is found by exact id match, so this is what makes
+    /// [`ResolvedScript::trigger`] the kind the stored id names rather than a
+    /// guess about it — and what fails if the two prefix tables drift.
+    #[test]
+    fn a_lookup_id_names_the_kind_it_was_built_from() {
+        for (kind, suffix) in [
+            (TriggerKind::RecordIndex, "com.example.thing"),
+            (TriggerKind::RecordCreate, "com.example.thing"),
+            (TriggerKind::RecordUpdate, "com.example.thing"),
+            (TriggerKind::RecordDelete, "com.example.thing"),
+            (TriggerKind::XrpcQuery, "com.example.list"),
+            (TriggerKind::XrpcProcedure, "com.example.post"),
+            (TriggerKind::LabelerApply, "app.bsky.feed.post"),
+            (TriggerKind::JobRun, "test.export"),
+        ] {
+            let id = ParsedTrigger::new(kind, suffix).id();
+            assert_eq!(ParsedTrigger::parse(&id).expect(&id).kind, kind, "{id}");
+        }
+    }
+
     #[test]
     fn label_uri_routes_at_uri_to_nsid() {
         assert_eq!(
-            trigger_for_label_uri("at://did:plc:abc/app.bsky.feed.post/rkey1"),
+            trigger_for_label_uri("at://did:plc:abc/app.bsky.feed.post/rkey1").id(),
             "labeler.apply:app.bsky.feed.post"
         );
     }
 
     #[test]
     fn label_uri_routes_bare_did_to_actor() {
-        assert_eq!(trigger_for_label_uri("did:plc:abc"), "labeler.apply:_actor");
+        assert_eq!(
+            trigger_for_label_uri("did:plc:abc").id(),
+            "labeler.apply:_actor"
+        );
     }
 
     #[test]
     fn label_uri_routes_malformed_at_uri_to_actor() {
         // `at://` with no path → no second segment → actor.
         assert_eq!(
-            trigger_for_label_uri("at://did:plc:abc"),
+            trigger_for_label_uri("at://did:plc:abc").id(),
             "labeler.apply:_actor"
         );
         // `at://<did>/` → second segment exists but is empty → actor.
         assert_eq!(
-            trigger_for_label_uri("at://did:plc:abc/"),
+            trigger_for_label_uri("at://did:plc:abc/").id(),
             "labeler.apply:_actor"
         );
     }

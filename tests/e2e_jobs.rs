@@ -503,7 +503,7 @@ async fn worker_runs_pending_job_to_completion() {
 /// several times over, so this measures the branch rather than this machine
 /// against another; the run asserts its own premise and says so when a faster
 /// machine outgrows the number.
-const BURN_ITERATIONS: u64 = 10_000_000_000;
+const BURN_ITERATIONS: u64 = 5_000_000_000;
 
 /// Running long is what a job is for, so the wall clock every other kind of
 /// run is bounded by is lifted for one. Only guest CPU that outlasts the

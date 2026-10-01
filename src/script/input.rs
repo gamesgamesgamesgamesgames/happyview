@@ -24,7 +24,7 @@ pub enum Trigger<'a> {
     Job { id: &'a str },
 }
 
-impl Trigger<'_> {
+impl<'a> Trigger<'a> {
     /// The contract the script's result is read under.
     pub fn kind(self) -> ScriptKind {
         match self {
@@ -36,21 +36,29 @@ impl Trigger<'_> {
         }
     }
 
-    /// The trigger a parsed trigger id names. The four record actions share
-    /// one, since the contract a record-event script is read under does not
-    /// distinguish them. `job.run` answers `None`: the job id a job run needs
-    /// is the worker's, not the id's.
-    pub fn for_trigger_kind(kind: TriggerKind) -> Option<Self> {
-        Some(match kind {
-            TriggerKind::RecordIndex
-            | TriggerKind::RecordCreate
-            | TriggerKind::RecordUpdate
-            | TriggerKind::RecordDelete => Self::RecordEvent,
-            TriggerKind::LabelerApply => Self::Label,
-            TriggerKind::XrpcQuery => Self::XrpcQuery,
-            TriggerKind::XrpcProcedure => Self::XrpcProcedure,
-            TriggerKind::JobRun => return None,
-        })
+    /// The trigger a trigger id of `kind` names, for a run reporting to `job`.
+    /// The four record actions share one trigger, since the contract a
+    /// record-event script is read under does not distinguish them — only the
+    /// event payload does.
+    ///
+    /// `None` is a kind and a job that cannot describe one run: the job id is
+    /// the worker's and no trigger id carries it, so a job run arriving
+    /// without one names no job, and no other kind has one to name.
+    pub fn for_trigger_kind(kind: TriggerKind, job: Option<&'a str>) -> Option<Self> {
+        match (kind, job) {
+            (TriggerKind::JobRun, Some(id)) => Some(Self::Job { id }),
+            (TriggerKind::JobRun, None) | (_, Some(_)) => None,
+            (
+                TriggerKind::RecordIndex
+                | TriggerKind::RecordCreate
+                | TriggerKind::RecordUpdate
+                | TriggerKind::RecordDelete,
+                None,
+            ) => Some(Self::RecordEvent),
+            (TriggerKind::LabelerApply, None) => Some(Self::Label),
+            (TriggerKind::XrpcQuery, None) => Some(Self::XrpcQuery),
+            (TriggerKind::XrpcProcedure, None) => Some(Self::XrpcProcedure),
+        }
     }
 }
 
@@ -83,8 +91,6 @@ pub struct Invocation<'a> {
 /// per run by `execute_script_as`.
 pub async fn build_input(state: &AppState, inv: &Invocation<'_>) -> ScriptExecuteInput {
     let kind = inv.trigger.kind();
-    // `require` resolves the namespace and `host_call_library` takes the id, so
-    // the pair travels together and no interpreter resolves a namespace itself.
     let libraries = state
         .plugin_executor()
         .library_index()
@@ -247,13 +253,22 @@ mod tests {
             (TriggerKind::XrpcProcedure, ScriptKind::XrpcProcedure),
         ] {
             assert_eq!(
-                Trigger::for_trigger_kind(kind).map(Trigger::kind),
+                Trigger::for_trigger_kind(kind, None).map(Trigger::kind),
                 Some(expected),
                 "{kind:?}"
             );
+            assert_eq!(
+                Trigger::for_trigger_kind(kind, Some("job-0001")),
+                None,
+                "{kind:?} reports to no job"
+            );
         }
         assert_eq!(
-            Trigger::for_trigger_kind(TriggerKind::JobRun),
+            Trigger::for_trigger_kind(TriggerKind::JobRun, Some("job-0001")),
+            Some(Trigger::Job { id: "job-0001" })
+        );
+        assert_eq!(
+            Trigger::for_trigger_kind(TriggerKind::JobRun, None),
             None,
             "a job run is only buildable with the job id it reports to"
         );

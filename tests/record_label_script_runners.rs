@@ -281,6 +281,68 @@ async fn a_record_event_script_runs_as_the_records_author() {
     assert_eq!(logged[0].1, Some(format!("record.create:{NSID}")));
 }
 
+/// The whole input of a label run: the label as the first argument of
+/// `handle`, the context fields a label fills and the ones it leaves empty,
+/// and the budget the instance's cached setting holds.
+///
+/// A label run's outcome is the label it shaped rather than the value it
+/// returned, so the input is read back off the run's own log line.
+#[tokio::test]
+async fn a_label_hands_the_interpreter_its_event_and_its_context() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_script_variables (key, value, created_at) VALUES (?, ?, ?)",
+        app.state.db_backend,
+    ))
+    .bind("API_KEY")
+    .bind("k")
+    .bind(happyview::db::now_rfc3339())
+    .execute(&app.state.db)
+    .await
+    .expect("seed a script variable");
+    seed_script(&app, "labeler.apply:app.bsky.feed.post", "host:log_input").await;
+    app.state.script_limits.set_instruction_limit(4_242);
+
+    run_label_applied_script(&app.state, label_event()).await;
+
+    let logged = events(&app, "script.log").await;
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    let sent = &logged[0].2["fields"];
+
+    assert_eq!(sent["source"], "host:log_input");
+    assert_eq!(sent["kind"], "label");
+    assert_eq!(
+        sent["input"],
+        json!({
+            "src": LABELER,
+            "uri": LABEL_URI,
+            "val": "spam",
+            "neg": false,
+            "cts": "2026-01-01T00:00:00.000Z",
+        })
+    );
+    assert_eq!(
+        sent["context"]["trigger"],
+        "labeler.apply:app.bsky.feed.post"
+    );
+    assert_eq!(sent["context"]["has_pds_auth"], false);
+    assert_eq!(sent["context"]["env"], json!({ "API_KEY": "k" }));
+    for absent in [
+        "caller_did",
+        "method",
+        "collection",
+        "params",
+        "delegate_did",
+        "space",
+        "job",
+    ] {
+        assert_eq!(sent["context"][absent], Value::Null, "{absent}");
+    }
+    assert_eq!(sent["limits"]["instructions"], 4_242);
+}
+
 /// A label arrives from a subscription, so there is nobody for the run to act
 /// as and no collection for it to read.
 #[tokio::test]

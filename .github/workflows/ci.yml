@@ -75,6 +75,10 @@ jobs:
               - 'docker-compose*'
               - 'entrypoint.sh'
               - '.releaserc.json'
+              # The guard scripts the jobs below run, and the jobs themselves:
+              # a change that weakens a check has to face the suite it guards.
+              - 'scripts/**'
+              - '.github/workflows/**'
             oauth-client:
               - 'packages/oauth-client/**'
             oauth-client-browser:

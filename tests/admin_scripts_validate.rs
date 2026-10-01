@@ -353,8 +353,9 @@ async fn validate_reaches_no_run_and_logs_nothing() {
 // The language, and where it comes from
 // ---------------------------------------------------------------------------
 
-/// Every language is refused on the same terms, including the one this binary
-/// was once able to check for itself.
+/// Every language is refused on the same terms, the reference language
+/// included: whether an interpreter claims it is the only question a save
+/// asks.
 #[tokio::test]
 #[serial]
 async fn a_save_is_refused_for_every_language_no_interpreter_claims() {

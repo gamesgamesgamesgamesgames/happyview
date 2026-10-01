@@ -45,7 +45,8 @@ pub(crate) async fn handle_procedure(
 ) -> Result<Response, AppError> {
     // Trigger-keyed dispatch: a script bound at `xrpc.procedure:<id>`
     // overrides the default PDS-write flow.
-    let trigger = format!("xrpc.procedure:{}", lexicon.id);
+    let trigger =
+        crate::lua::ParsedTrigger::new(crate::lua::TriggerKind::XrpcProcedure, &lexicon.id);
 
     // Service auth access and scope checks
     if let Some(sa) = &service_auth {
@@ -86,7 +87,7 @@ pub(crate) async fn handle_procedure(
             state.db_backend,
         );
         if let Ok(Some((Some(json_str),))) = crate::db::query_as::<(Option<String>,)>(&outbound_sql)
-            .bind(&trigger)
+            .bind(trigger.id())
             .fetch_optional(&state.db)
             .await
             && let Ok(outbound_list) = serde_json::from_str::<Vec<String>>(&json_str)
@@ -163,8 +164,7 @@ pub(crate) async fn handle_procedure(
             &script_input,
             params,
             lexicon,
-            &resolved.body,
-            &resolved.script_type,
+            &resolved,
             None,
             delegate_did.as_deref(),
         )

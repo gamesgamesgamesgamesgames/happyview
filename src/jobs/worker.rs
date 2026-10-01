@@ -6,7 +6,7 @@ use crate::event_log::{EventLog, Severity, log_event};
 use crate::lua::scripts;
 use crate::plugin::ScriptExecuteOutput;
 use crate::repo;
-use crate::script::{Invocation, Trigger, dispatch};
+use crate::script::{Invocation, dispatch};
 
 use super::db;
 
@@ -85,11 +85,11 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         return;
     }
 
-    let trigger_id = format!("job.run:{}", job.job_type);
-    let script = match scripts::resolve(state, &trigger_id).await {
+    let lookup = scripts::ParsedTrigger::new(scripts::TriggerKind::JobRun, &job.job_type);
+    let script = match scripts::resolve(state, &lookup).await {
         Some(s) => s,
         None => {
-            let error = format!("no script found for trigger: {trigger_id}");
+            let error = format!("no script found for trigger: {}", lookup.id());
             tracing::error!(job_id = %job.id, %error);
             let _ = db::set_error(state, &job.id, &error).await;
             log_event(
@@ -177,11 +177,18 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     });
     let has_pds_auth = caller_session.is_some();
 
+    let trigger = match scripts::trigger_of(&script, Some(&job.id)) {
+        Ok(trigger) => trigger,
+        Err(error) => {
+            finalize(state, job, JobOutcome::Failed(error)).await;
+            return;
+        }
+    };
     let run = dispatch(
         state,
         &Invocation {
-            trigger_id: &trigger_id,
-            trigger: Trigger::Job { id: &job.id },
+            trigger_id: &script.id,
+            trigger,
             language: &script.script_type,
             source: &script.body,
             input: &job.input,

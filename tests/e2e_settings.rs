@@ -257,8 +257,9 @@ async fn a_script_budget_must_be_an_integer_inside_its_range() {
 
 /// A run reads the budget from the in-process cache and never queries for it,
 /// so a change made through the settings API has to reach that cache without a
-/// restart. What a run then does with the budget is pinned where the budget is
-/// handed to an interpreter, in `xrpc_script_runners.rs`.
+/// restart. That the cached value is what reaches an interpreter is pinned in
+/// `xrpc_script_runners.rs`; spending it is the interpreter's own, and only a
+/// target that loads a real one sees a run end on it.
 #[tokio::test]
 #[serial]
 async fn a_script_budget_change_reaches_the_cache_without_restart() {

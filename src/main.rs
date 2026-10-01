@@ -373,6 +373,19 @@ async fn main() {
         }
     }
 
+    // Said at boot because the refusals an operator would otherwise meet
+    // first — on a save, on a request — name a language rather than the gap.
+    if plugin_registry
+        .list_by_type(happyview::plugin::PluginType::Interpreter)
+        .await
+        .is_empty()
+    {
+        tracing::warn!(
+            "no interpreter plugin is installed, so no script can be saved or run; \
+             install one from the plugins page in the dashboard"
+        );
+    }
+
     // Every plugin this boot will run is registered by now, so anything
     // else in the cache directory is a module nothing will load.
     wasm_runtime.sweep_cache_dir(&plugin_registry.live_wasm_sha256s().await);

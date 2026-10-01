@@ -93,10 +93,8 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::json;
 
-    const ECHO: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/interpreter_echo/target/wasm32-unknown-unknown/release/interpreter_echo.wasm"
-    );
+    const ECHO_FIXTURE: &str = "interpreter_echo";
+    const ECHO_TARGET: &str = "wasm32-unknown-unknown";
 
     /// The echo fixture installed as the interpreter for `lua`, the language a
     /// seeded script row names. It interprets nothing — its `source` is a
@@ -106,9 +104,10 @@ mod tests {
     ///
     /// `false` when the module is unbuilt and the test is to skip.
     async fn echo_interpreter(state: &AppState) -> bool {
-        if loader::built_fixture("interpreter_echo", "wasm32-unknown-unknown").is_none() {
+        let Some(dir) = loader::built_fixture(ECHO_FIXTURE, ECHO_TARGET) else {
             return false;
-        }
+        };
+        let module = dir.join(format!("target/{ECHO_TARGET}/release/{ECHO_FIXTURE}.wasm"));
         let manifest: PluginManifest = serde_json::from_value(json!({
             "id": "echo", "name": "echo", "version": "1.0.0", "api_version": "2",
             "plugin_type": "interpreter", "language_id": "lua",
@@ -119,10 +118,8 @@ mod tests {
             .plugin_registry
             .register(LoadedPlugin {
                 info: manifest.clone().into(),
-                source: PluginSource::File {
-                    path: "tests/fixtures/interpreter_echo".into(),
-                },
-                wasm_bytes: std::fs::read(ECHO).expect("the echo module should read"),
+                source: PluginSource::File { path: dir },
+                wasm_bytes: std::fs::read(&module).expect("the echo module should read"),
                 manifest: Some(manifest),
             })
             .await;

@@ -11,6 +11,13 @@ use super::input::{Invocation, build_input};
 /// Why a dispatch produced no result at all. A script that ran and failed is
 /// not here: that arrives as [`ScriptExecuteOutput::Error`], which each runner
 /// renders in its own fail mode.
+///
+/// The boundary text from the host or the interpreter may not cross is the
+/// HTTP response envelope rather than the audience: a response body carries a
+/// correlation id, while the text itself travels through a log line and the
+/// rows a run writes. An admin endpoint is no exception, which is why
+/// `validate_body_for_type`'s interpreter failure and a dead-letter retry
+/// both answer an id.
 #[derive(Debug)]
 pub enum DispatchError {
     /// Nothing installed claims the script's language, so there is nothing to

@@ -330,6 +330,18 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
                 })),
                 "other",
             ),
+            // The whole `execute` input, through the one channel a run has
+            // that does not pass through its outcome. A runner that reads
+            // only parts of what a script returned cannot be handed the
+            // input back, so it reads this line's `fields` instead.
+            "host:log_input" => returned(
+                imports::script_log(&json!({
+                    "level": "info",
+                    "message": "input",
+                    "fields": input.clone(),
+                })),
+                "other",
+            ),
             "host:job_progress" => {
                 returned(imports::job_progress(&json!({"data": payload})), "other")
             }
