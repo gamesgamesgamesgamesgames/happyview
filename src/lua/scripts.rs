@@ -611,12 +611,12 @@ async fn run_label_once(
 /// the interpreter's unparsed text.
 ///
 /// Every reader of this is an operator — the retry's warn, the dead-letter
-/// row's only error column, the `script.dead_lettered` row — and neither half
-/// is recoverable from the other. The text carries the line that points at the
-/// script and no category; a spent budget and an exhausted heap describe
-/// themselves in no text at all, so without the category they read as any
-/// other runtime failure.
-fn failure_text(kind: crate::plugin::ScriptErrorKind, raw: &str) -> String {
+/// row's only error column, a job row's `error` column, the
+/// `script.dead_lettered` row — and neither half is recoverable from the
+/// other. The text carries the line that points at the script and no category;
+/// a spent budget and an exhausted heap describe themselves in no text at all,
+/// so without the category they read as any other runtime failure.
+pub(crate) fn failure_text(kind: crate::plugin::ScriptErrorKind, raw: &str) -> String {
     format!("{}: {raw}", kind.as_str())
 }
 

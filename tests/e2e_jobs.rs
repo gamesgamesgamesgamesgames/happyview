@@ -10,6 +10,19 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use common::app::TestApp;
+use common::echo_interpreter;
+
+/// Skips the caller when the echo fixture's module is absent, naming the build
+/// that produces it. Every fixture's `target/` is gitignored, so that is a step
+/// nobody ran; panicking on it would report it as a failure of the worker.
+macro_rules! require_echo {
+    () => {
+        if !echo_interpreter::is_built() {
+            eprintln!("skipping: {}", echo_interpreter::BUILD);
+            return;
+        }
+    };
+}
 
 async fn json_body(resp: axum::response::Response) -> Value {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -416,7 +429,14 @@ async fn resume_running_job_returns_409() {
 // API so a failure here points at the worker rather than the read path.
 // ---------------------------------------------------------------------------
 
+/// Seed a job script row and install the interpreter that will run it. The
+/// bodies below are directives for the echo fixture rather than source in the
+/// language the row names, and `POST /admin/scripts` validates what it stores.
 async fn seed_script(app: &TestApp, trigger_id: &str, body: &str) {
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
     // created_at/updated_at have no default on Postgres — bind them explicitly.
     let now = happyview::db::now_rfc3339();
     let sql = adapt_sql(
@@ -450,7 +470,7 @@ async fn await_terminal_status(
     app: &TestApp,
     id: &str,
 ) -> (String, Option<String>, Option<String>) {
-    for _ in 0..100 {
+    for _ in 0..600 {
         let row = job_row(app, id).await;
         if !matches!(row.0.as_str(), "pending" | "running") {
             return row;
@@ -464,14 +484,10 @@ async fn await_terminal_status(
 #[serial]
 async fn worker_runs_pending_job_to_completion() {
     common::require_db!();
+    require_echo!();
     let app = TestApp::new().await;
 
-    seed_script(
-        &app,
-        "job.run:test.worker",
-        "function handle() return { ok = true } end",
-    )
-    .await;
+    seed_script(&app, "job.run:test.worker", r#"returns:{"ok":true}"#).await;
     let id = seed_job(&app, "test.worker", "pending").await;
 
     let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
@@ -483,44 +499,54 @@ async fn worker_runs_pending_job_to_completion() {
     assert_eq!(result["ok"], true);
 }
 
-/// A job's `handle` runs on a coroutine, and the instruction limit reaches a
-/// coroutine only through the sandbox's global hook; this pins that the
-/// worker lifts that hook, not just the main thread's.
+/// How much guest CPU `burn:` spends. Sized to outlast a one-second budget
+/// several times over, so this measures the branch rather than this machine
+/// against another; the run asserts its own premise and says so when a faster
+/// machine outgrows the number.
+const BURN_ITERATIONS: u64 = 10_000_000_000;
+
+/// Running long is what a job is for, so the wall clock every other kind of
+/// run is bounded by is lifted for one. Only guest CPU that outlasts the
+/// budget *and then returns* can tell the two arms apart — a host wait stops
+/// the guest's clock for its whole duration and so costs nothing either way.
 #[tokio::test]
 #[serial]
-async fn worker_runs_a_job_past_the_instruction_limit() {
+async fn worker_runs_a_job_past_the_budget_that_would_end_a_query() {
     common::require_db!();
+    require_echo!();
     let app = TestApp::new().await;
+    app.state.script_limits.set_wall_clock_seconds(1);
 
     seed_script(
         &app,
         "job.run:test.long",
-        "function handle() local n = 0; for i = 1, 3000000 do n = n + 1 end; return { n = n } end",
+        &format!("burn:{BURN_ITERATIONS}"),
     )
     .await;
     let id = seed_job(&app, "test.long", "pending").await;
 
     let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
-    let (status, result, error) = await_terminal_status(&app, &id).await;
+    let started = std::time::Instant::now();
+    let (status, _result, error) = await_terminal_status(&app, &id).await;
+    let burned = started.elapsed();
     worker.abort();
 
     assert_eq!(status, "completed", "job error: {error:?}");
-    let result: Value = serde_json::from_str(&result.expect("no result persisted")).unwrap();
-    assert_eq!(result["n"], 3_000_000);
+    assert!(
+        burned > std::time::Duration::from_secs(3),
+        "the burn finished in {burned:?}, too close to the one-second budget for this to \
+         mean anything: raise BURN_ITERATIONS"
+    );
 }
 
 #[tokio::test]
 #[serial]
 async fn worker_records_the_line_of_a_failing_job() {
     common::require_db!();
+    require_echo!();
     let app = TestApp::new().await;
 
-    seed_script(
-        &app,
-        "job.run:test.failing",
-        "function handle()\n  local t = nil\n  return t.x\nend",
-    )
-    .await;
+    seed_script(&app, "job.run:test.failing", "error:runtime").await;
     let id = seed_job(&app, "test.failing", "pending").await;
 
     let worker = tokio::spawn(happyview::jobs::worker::run_worker(app.state.clone()));
@@ -529,7 +555,8 @@ async fn worker_records_the_line_of_a_failing_job() {
 
     assert_eq!(status, "failed");
     let error = error.expect("no error persisted");
-    assert!(error.contains("[string \"script\"]:3:"), "{error}");
+    assert!(error.starts_with("runtime: "), "{error}");
+    assert!(error.contains("[string \"script\"]:7:"), "{error}");
 }
 
 // ---------------------------------------------------------------------------

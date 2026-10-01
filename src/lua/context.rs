@@ -79,6 +79,72 @@ pub fn build_ctx(lua: &Lua, inv: &Invocation<'_>) -> LuaResult<mlua::Table> {
     Ok(ctx)
 }
 
+/// The `ctx.job` table a job script receives from a VM in this process: the
+/// job's id, progress reporting, cooperative cancellation and sleep.
+///
+/// An interpreter reaches the same three controls through its `script:host`
+/// imports, which act on the run the host is holding rather than on a job
+/// named here, so this builds the surface only where there is no such run.
+pub fn job_ctx(
+    lua: &Lua,
+    state: std::sync::Arc<crate::AppState>,
+    job_id: String,
+) -> LuaResult<mlua::Table> {
+    let job_table = lua.create_table()?;
+    job_table.set("id", job_id.clone())?;
+
+    {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        let progress_fn = lua.create_async_function(move |lua, data: mlua::Value| {
+            let state = state.clone();
+            let job_id = job_id.clone();
+            let json_data: serde_json::Value =
+                lua.from_value(data).unwrap_or(serde_json::json!({}));
+            async move {
+                crate::jobs::db::update_progress(&state, &job_id, &json_data)
+                    .await
+                    .map_err(|e| mlua::Error::runtime(format!("job.progress failed: {e}")))?;
+                Ok(())
+            }
+        })?;
+        job_table.set("progress", progress_fn)?;
+    }
+
+    {
+        let state = state.clone();
+        let job_id = job_id.clone();
+        let should_stop_fn = lua.create_async_function(move |_lua, ()| {
+            let state = state.clone();
+            let job_id = job_id.clone();
+            async move {
+                let result = crate::jobs::db::should_stop(&state, &job_id).await;
+                Ok(result.is_some())
+            }
+        })?;
+        job_table.set("should_stop", should_stop_fn)?;
+    }
+
+    {
+        let wait_fn = lua.create_async_function(move |_lua, seconds: f64| {
+            let state = state.clone();
+            async move {
+                let duration = std::time::Duration::from_secs_f64(seconds.clamp(0.0, 3600.0));
+                tokio::time::sleep(duration).await;
+                let elapsed_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                crate::telemetry::counters::add_saturating(
+                    &state.telemetry_counters.job_wait_ms,
+                    elapsed_ms,
+                );
+                Ok(())
+            }
+        })?;
+        job_table.set("wait", wait_fn)?;
+    }
+
+    Ok(job_table)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +287,47 @@ mod tests {
         assert_eq!(
             s,
             "did:plc:delegate|at://did:plc:owner/space/com.example.forum/main|space-123|did:plc:owner|com.example.forum|main"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_ctx_carries_the_id_and_the_three_functions() {
+        let lua = create_sandbox().unwrap();
+        let state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        let job = job_ctx(&lua, std::sync::Arc::new(state), "test-id".into()).unwrap();
+        lua.globals().set("job", job).unwrap();
+
+        let ok: bool = lua
+            .load(
+                r#"
+                return job.id == 'test-id'
+                    and type(job.progress) == 'function'
+                    and type(job.should_stop) == 'function'
+                    and type(job.wait) == 'function'
+                "#,
+            )
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn job_wait_clamps_to_the_allowed_range_and_counts_the_time() {
+        let lua = create_sandbox().unwrap();
+        let state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        let counters = state.telemetry_counters.clone();
+        let job = job_ctx(&lua, std::sync::Arc::new(state), "test-id".into()).unwrap();
+        lua.globals().set("job", job).unwrap();
+
+        lua.load("job.wait(-5)").exec_async().await.unwrap();
+        assert_eq!(
+            counters
+                .job_wait_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
         );
     }
 

@@ -1,7 +1,6 @@
 pub(crate) mod db;
 pub(crate) mod logs;
 pub mod native;
-pub(crate) mod script_ctx;
 pub mod worker;
 
 use regex::Regex;

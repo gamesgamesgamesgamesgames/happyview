@@ -90,11 +90,7 @@ pub async fn run_for_differential(
 
     let job = match &context.job {
         Some(job) => {
-            match crate::jobs::script_ctx::job_ctx(
-                &lua,
-                std::sync::Arc::new(state.clone()),
-                job.id.clone(),
-            ) {
+            match context::job_ctx(&lua, std::sync::Arc::new(state.clone()), job.id.clone()) {
                 Ok(table) => Some(table),
                 Err(e) => return failed(ScriptErrorKind::Runtime, &e.to_string(), false),
             }

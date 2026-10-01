@@ -1,13 +1,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mlua::LuaSerdeExt;
-
 use crate::AppState;
-use crate::db::adapt_sql;
 use crate::event_log::{EventLog, Severity, log_event};
-use crate::lua::{sandbox, scripts};
+use crate::lua::scripts;
+use crate::plugin::ScriptExecuteOutput;
 use crate::repo;
+use crate::script::{Invocation, Trigger, dispatch};
 
 use super::db;
 
@@ -165,20 +164,6 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         (None, None)
     };
 
-    let lua = match sandbox::create_sandbox() {
-        Ok(l) => l,
-        Err(e) => {
-            let error = format!("failed to create Lua VM: {e}");
-            let _ = db::set_error(state, &job.id, &error).await;
-            return;
-        }
-    };
-
-    // A job is the one place a script is meant to run long: its budget is the
-    // operator's, spent through `should_stop`, and no clock or instruction
-    // count applies to `handle`.
-    sandbox::lift_execution_limit(&lua);
-
     // A job that did not inherit its creator's auth has nothing to act as, so
     // its library calls carry no session at all.
     let caller_session = claims.zip(pds_auth).map(|(claims, pds_auth)| {
@@ -191,79 +176,39 @@ async fn execute_job(state: &AppState, job: &super::Job) {
         })
     });
     let has_pds_auth = caller_session.is_some();
-    let job_table = match super::script_ctx::job_ctx(&lua, Arc::new(state.clone()), job.id.clone())
-    {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = db::set_error(state, &job.id, &format!("job ctx: {e}")).await;
-            return;
-        }
-    };
-    let identity = crate::lua::builtins::ScriptIdentity {
-        trigger_id: trigger_id.clone(),
-        caller_did: Some(job.created_by.clone()),
-        job_id: Some(job.id.clone()),
-    };
-    if let Err(e) =
-        crate::lua::require_api::register_require(&lua, state, &identity, caller_session).await
-    {
-        let _ = db::set_error(state, &job.id, &format!("require api: {e}")).await;
-        return;
-    }
 
-    let env_vars = load_env_vars(&state.db, backend).await;
-
-    if let Err(e) = sandbox::load_script(&lua, &script.body).exec() {
-        let error = format!("script load failed: {e}");
-        let _ = db::set_error(state, &job.id, &error).await;
-        return;
-    }
-
-    let handle: mlua::Function = match lua.globals().get("handle") {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = db::set_error(state, &job.id, &format!("missing handle(): {e}")).await;
-            return;
-        }
-    };
-
-    let handle_input = match lua.to_value(&job.input) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = db::set_error(state, &job.id, &format!("job input: {e}")).await;
-            return;
-        }
-    };
-    let handle_ctx = match crate::lua::context::build_ctx(
-        &lua,
-        &crate::lua::context::Invocation {
+    let run = dispatch(
+        state,
+        &Invocation {
             trigger_id: &trigger_id,
+            trigger: Trigger::Job { id: &job.id },
+            language: &script.script_type,
+            source: &script.body,
+            input: &job.input,
             caller_did: Some(&job.created_by),
             has_pds_auth,
-            env: &env_vars,
+            // A job answers to whoever enqueued it rather than to a request, so
+            // it has no method, collection, parameters, delegation or space of
+            // its own.
             method: None,
             collection: None,
             params: None,
             delegate_did: None,
             space: None,
-            job: Some(job_table),
         },
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = db::set_error(state, &job.id, &format!("job ctx: {e}")).await;
-            return;
-        }
-    };
+        caller_session,
+    )
+    .await;
 
-    let outcome = match handle
-        .call_async::<mlua::Value>((handle_input, handle_ctx))
-        .await
-    {
-        Ok(result) => {
-            JobOutcome::Completed(lua.from_value(result).unwrap_or(serde_json::json!(null)))
+    // A job's result is whatever the script returned, whatever kind of value
+    // that was: the row has one column for it and nothing reads a job's
+    // outcome by the shape of its value.
+    let outcome = match run {
+        Ok(ScriptExecuteOutput::Returned { value, .. }) => JobOutcome::Completed(value),
+        Ok(ScriptExecuteOutput::Error { kind, raw, .. }) => {
+            JobOutcome::Failed(scripts::failure_text(kind, &raw))
         }
-        Err(e) => JobOutcome::Failed(format!("{e}")),
+        Err(e) => JobOutcome::Failed(e.to_string()),
     };
     finalize(state, job, outcome).await;
 }
@@ -352,17 +297,4 @@ async fn finalize(state: &AppState, job: &super::Job, outcome: JobOutcome) {
         backend,
     )
     .await;
-}
-
-async fn load_env_vars(
-    db: &sqlx::AnyPool,
-    backend: crate::db::DatabaseBackend,
-) -> std::collections::HashMap<String, String> {
-    let sql = adapt_sql("SELECT key, value FROM happyview_script_variables", backend);
-    crate::db::query_as::<(String, String)>(&sql)
-        .fetch_all(db)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
 }
