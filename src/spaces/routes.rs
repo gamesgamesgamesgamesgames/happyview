@@ -443,7 +443,7 @@ fn require_audience(claims: &XrpcClaims, expected: &str) -> Result<(), AppError>
     }
     Err(AppError::XrpcError {
         status: StatusCode::UNAUTHORIZED,
-        code: "BadSpaceSignature",
+        code: "BadSpaceAudience",
         message: format!("request is not addressed to {expected}"),
     })
 }
