@@ -1718,7 +1718,17 @@ async fn notify_write(
     // so the caller must be that account. The space's creator and super admins
     // may also notify, as the legacy shape expects.
     let caller = require_notify_caller(&claims)?;
-    let space = service::resolve_space(&state, &input.space).await?;
+    // Named, so a repo host knows to stop retrying.
+    let space = service::resolve_space(&state, &input.space)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => AppError::XrpcError {
+                status: StatusCode::BAD_REQUEST,
+                code: "SpaceNotFound",
+                message: "space not found".into(),
+            },
+            e => e,
+        })?;
     if caller != writer {
         service::require_space_admin(&state, &space, &caller).await?;
     }

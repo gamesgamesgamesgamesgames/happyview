@@ -548,3 +548,68 @@ async fn deleting_a_space_notifies_registered_syncers() {
     assert_eq!(body["space"], json!(space));
     assert!(received[0].headers.get("authorization").is_some());
 }
+
+/// A repo host told the space does not exist stops retrying, so the error is
+/// named.
+#[tokio::test]
+#[serial]
+async fn notify_write_names_an_unknown_space() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "#atproto_space_host",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let missing = format!("at://{instance_did}/space/{SPACE_TYPE}/no-such-space");
+    let resp = app
+        .router
+        .clone()
+        .oneshot(repo_host_notification(&auth, &missing))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], json!("SpaceNotFound"));
+}
+
+/// Service auth for a space host may name the authority's bare DID instead of
+/// its `#atproto_space_host` service.
+#[tokio::test]
+#[serial]
+async fn notify_write_accepts_the_bare_authority_did_as_audience() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = common::plc::setup_mock_plc(&app.mock_server).await;
+    let instance_did = app.setup_did_web().await;
+    enable_spaces(&app).await;
+    let space = create_instance_space(&app, &instance_did).await;
+
+    let auth = app
+        .service_auth_jwt_for(
+            &plc_store,
+            WRITER,
+            &instance_did,
+            "",
+            Some("com.atproto.space.notifyWrite"),
+        )
+        .await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(repo_host_notification(&auth, &space))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

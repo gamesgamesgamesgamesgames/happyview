@@ -477,7 +477,10 @@ async fn try_parse_service_auth(
     }
 
     let fragment = aud.strip_prefix(&*instance_did).unwrap_or("").to_string();
-    if fragment.is_empty() || !fragment.starts_with('#') {
+    // Space hosts are addressed as `#atproto_space_host` or as the bare
+    // authority DID, so space routes accept both.
+    let bare_space_host = fragment.is_empty() && is_space_route(path);
+    if !bare_space_host && !fragment.starts_with('#') {
         return Err(AppError::Auth(
             "JWT aud must include a service fragment".into(),
         ));
