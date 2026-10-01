@@ -240,6 +240,15 @@ jobs:
       - name: Verify plugin fixtures are built
         run: bash scripts/check-plugin-fixtures.sh --require
 
+      # The real Lua interpreter is another repository's built artefact and
+      # needs a C toolchain, so nothing here produces it and the targets that
+      # load it skip — including the three refusal messages an operator reads
+      # when a script will not save. Reporting only: absent is the expected
+      # state here, and this is what keeps a green run from implying those
+      # assertions were among the things it proved.
+      - name: Report the real Lua interpreter's coverage
+        run: bash scripts/check-lua-plugin.sh
+
       - name: Run plugin SDK tests
         run: cargo test -p happyview-plugin-sdk
 
@@ -355,6 +364,22 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The stack's `lua` interpreter is this fixture, bind-mounted by
+      # docker-compose.e2e.yml, and saving a script asks the interpreter its
+      # language names whether the body is one it can run. The artefact is
+      # gitignored and this job builds no Rust otherwise, so without these two
+      # steps the mount is empty, every save is refused and `globalSetup`
+      # stops the run. Named rather than `--require` alone: this job builds
+      # one fixture, not all thirteen.
+      - name: Add WASM target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Build interpreter echo fixture
+        run: cargo build --manifest-path tests/fixtures/interpreter_echo/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Verify the stack's interpreter is built
+        run: bash scripts/check-plugin-fixtures.sh --require interpreter_echo
 
       - name: Start E2E services
         run: docker compose -f docker-compose.e2e.yml -f docker-compose.e2e.ci.yml up -d --build --wait

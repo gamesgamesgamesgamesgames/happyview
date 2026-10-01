@@ -956,6 +956,47 @@ mod tests {
         }
     }
 
+    /// What each kind an interpreter can report reads as. This runs wherever
+    /// the crate builds, so it is what holds the rendering while the real
+    /// interpreter's own refusals are asserted only where it is installed.
+    #[test]
+    fn each_kind_is_rendered_as_the_operator_reads_it() {
+        assert_eq!(
+            refusal_message(&[validate_error(
+                ScriptErrorKind::MissingHandle,
+                None,
+                "script must define a handle() function",
+            )]),
+            "script must define a handle() function"
+        );
+        assert_eq!(
+            refusal_message(&[validate_error(
+                ScriptErrorKind::Syntax,
+                Some(1),
+                "<name> expected near <eof>",
+            )]),
+            "script compilation failed at line 1: <name> expected near <eof>"
+        );
+        // A read of a removed global fails while the chunk loads, which is a
+        // runtime failure rather than a syntax one.
+        assert_eq!(
+            refusal_message(&[validate_error(
+                ScriptErrorKind::Runtime,
+                Some(2),
+                "the 'input' global was removed in v3",
+            )]),
+            "script compilation failed at line 2: the 'input' global was removed in v3"
+        );
+        assert_eq!(
+            refusal_message(&[validate_error(
+                ScriptErrorKind::Timeout,
+                None,
+                "script exceeded its instruction limit",
+            )]),
+            "script compilation failed: script exceeded its instruction limit"
+        );
+    }
+
     /// Two shapes no interpreter in the suite produces, and both are shapes
     /// the contract permits: an interpreter may report several reasons, and
     /// may report none at all.

@@ -7,8 +7,12 @@
 # them skipping inside a green run. This is what turns that back into a
 # failure in the job that builds them.
 #
-#   --require   exit non-zero on anything missing, for the job that builds the
-#               fixtures and runs the tests needing them
+#   --require [name...]
+#               exit non-zero on anything missing, for a job that builds
+#               fixtures and runs the tests needing them. Named fixtures
+#               narrow it to those, for a job that needs some and not all; a
+#               name matching no entry is itself a failure, so a typo cannot
+#               quietly check nothing.
 #   (default)   report and exit zero, for the job that deliberately builds none
 #
 # Paths are listed rather than derived from the directory name. An artefact is
@@ -39,9 +43,33 @@ ARTEFACTS=(
 require=0
 if [ "${1:-}" = "--require" ]; then
   require=1
+  shift
 fi
 
 status=0
+
+# The artefacts this invocation is about. Every one by default; otherwise the
+# ones under each named fixture directory. A newline-delimited list rather
+# than an array, because an empty array is an unbound variable under `set -u`
+# in the bash a developer's machine may still have, and the empty case is
+# reachable: every name given matched nothing.
+wanted=$(printf '%s\n' "${ARTEFACTS[@]}")
+wanted_count=${#ARTEFACTS[@]}
+if [ "$#" -gt 0 ]; then
+  wanted=""
+  wanted_count=0
+  for name in "$@"; do
+    matched=$(printf '%s\n' "${ARTEFACTS[@]}" | grep "^tests/fixtures/$name/" || true)
+    if [ -z "$matched" ]; then
+      echo "no listed artefact belongs to fixture: $name"
+      status=1
+      continue
+    fi
+    wanted="${wanted}${matched}
+"
+    wanted_count=$((wanted_count + $(printf '%s\n' "$matched" | wc -l)))
+  done
+fi
 
 # A fixture added without an entry here would be built by nothing and skipped
 # by everything, which is the same silence one level up.
@@ -56,16 +84,19 @@ for dir in tests/fixtures/*/; do
 done
 
 missing=0
-for artefact in "${ARTEFACTS[@]}"; do
+while IFS= read -r artefact; do
+  [ -n "$artefact" ] || continue
   if [ ! -f "$artefact" ]; then
     echo "not built, so tests needing it skip: $artefact"
     missing=$((missing + 1))
     status=1
   fi
-done
+done <<EOF
+$wanted
+EOF
 
 if [ "$missing" = 0 ] && [ "$status" = 0 ]; then
-  echo "all ${#ARTEFACTS[@]} plugin fixtures are built"
+  echo "all $wanted_count of the plugin fixtures asked about are built"
   exit 0
 fi
 
