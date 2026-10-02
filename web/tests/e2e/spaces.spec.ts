@@ -49,7 +49,7 @@ test.describe("Spaces API", () => {
   ): Promise<string> {
     const resp = await page.request.post(
       "/xrpc/com.atproto.simplespace.createSpace",
-      { data: { type: TEST_TYPE_NSID, ...data } },
+      { data: { spaceType: TEST_TYPE_NSID, ...data } },
     )
     if (!resp.ok()) {
       throw new Error(`createSpace failed (${resp.status()}): ${await resp.text()}`)
@@ -108,7 +108,7 @@ test.describe("Spaces API", () => {
       "/xrpc/com.atproto.simplespace.createSpace",
       {
         data: {
-          type: TEST_TYPE_NSID,
+          spaceType: TEST_TYPE_NSID,
           skey: TEST_SKEY + "-dup",
         },
       },

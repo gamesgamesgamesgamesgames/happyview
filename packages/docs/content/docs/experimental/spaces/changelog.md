@@ -36,10 +36,10 @@ Aligns credentials and sync with the latest [Proposal 0016](https://github.com/b
 ### Sync
 
 - **`registerNotify` takes a service identifier.** `{space, service}`, where `service` is a DID with an optional fragment, resolved to its endpoint. Returns `{expiresAt}`. Unresolvable identifiers fail with `ServiceNotResolvable`. Registering again replaces the previous registration.
-- **Outbound `notifyWrite` calls.** Registered services receive `com.atproto.space.notifyWrite` once per commit, with service auth from HappyView and `{space, repo, rev, hash, spaceRev, prevSpaceRev?}`. `spaceRev` and `prevSpaceRev` are provisional names.
-- **Inbound `notifyWrite` from repo hosts.** HappyView accepts `{space, repo, rev, hash}` with service auth signed by the writing account. The writer must pass the write policy. Stale revisions are ignored, and revisions more than 5 minutes in the future are refused.
+- **Outbound `notifyWrite` calls.** Registered services receive `com.atproto.space.notifyWrite` once per commit, with service auth from HappyView and `{space, repo, repoRev, hash, spaceRev, prevSpaceRev?}`. `rev` repeats `repoRev` until v3.
+- **Inbound `notifyWrite` from repo hosts.** HappyView accepts `{space, repo, repoRev, hash}` with service auth signed by the writing account, and `rev` in place of `repoRev` until v3. The writer must pass the write policy. Stale revisions are ignored, and revisions more than 5 minutes in the future fail with `FutureRev`.
 - **Space-wide revision.** Every accepted repo update advances a space revision.
-- **`listRepos` serves the writer set.** Returns `{repos: [{did, rev, hash}], cursor?, spaceRev}`, with `limit` (default 100, max 1000), `cursor`, and `since`.
+- **`listRepos` serves the writer set.** Returns `{repos: [{did, repoRev, hash, spaceRev}], cursor?}` in space revision order, with `limit` (default 100, max 1000). `cursor` is a space revision: pass the last one processed to list only repos updated after it.
 - **Fallback sweep.** HappyView re-syncs repos hosted on their authors' PDSes every 5 minutes.
 - **Service auth `lxm` is enforced.** Inbound tokens bound to a different method are rejected.
 
@@ -49,6 +49,16 @@ Aligns credentials and sync with the latest [Proposal 0016](https://github.com/b
 - `appAccess` accepts `{"type": "open"}` and `{"type": "allowList", "allowed": [...]}`.
 - `com.atproto.simplespace.addMember` and `dev.happyview.space.addMember` accept an `access` word.
 - `registerNotify` accepts `{space, serviceDid, endpoint}` webhook registrations, returning `{id, expiresAt}`. `notifyWrite` accepts `{space, did, collection, rkey, cid}`.
+
+### Request field renames
+
+- **`spaceType` replaces `type`** in `simplespace.createSpace` and as a new `listSpaces` filter. `type` is accepted in both until v3.
+
+### Credential and notification errors
+
+- **Credential lifetime is enforced.** Credentials lasting more than an hour, without a `jti`, or issued more than 5 seconds in the future are refused.
+- **Named errors.** A credential addressed to the wrong DID fails with `BadSpaceAudience`, a revoked one with `CredentialRevoked`, and one for another space with `InvalidCredential`. `notifyWrite` for an unknown space fails with `SpaceNotFound`.
+- **`notifyWrite` accepts the bare authority DID as its service-auth audience**, as well as `#atproto_space_host`.
 
 ### Deprecated
 

@@ -150,6 +150,8 @@ pub fn sign_commit(
 
     // Signs the context, not the hash; see `SignedCommit::sig`.
     let sig: p256::ecdsa::Signature = signing_key.sign(&ctx);
+    // Repo signatures must be low-S, and @atproto/crypto refuses the rest.
+    let sig = sig.normalize_s();
 
     Ok(SignedCommit {
         ver: 1,
@@ -196,6 +198,31 @@ pub fn verify_commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Commit signatures follow atproto's rule for repo signatures: low-S only.
+    #[test]
+    fn commit_signatures_are_low_s() {
+        use rand::Rng;
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let key = p256::ecdsa::SigningKey::from_slice(&bytes).unwrap();
+        for i in 0..64 {
+            let commit = sign_commit(
+                &[i as u8; 32],
+                "at://did:plc:owner/space/com.example.forum/main",
+                "did:plc:author",
+                "3lzq2b3k4c22a",
+                &key,
+            )
+            .unwrap();
+            let sig = p256::ecdsa::Signature::from_slice(&commit.sig).unwrap();
+            assert_eq!(
+                sig.normalize_s().to_bytes(),
+                sig.to_bytes(),
+                "high-S signature"
+            );
+        }
+    }
 
     // ---------------------------------------------------------------------
     // Interop vectors

@@ -368,7 +368,7 @@ mod tests {
             .unwrap();
 
         let writers =
-            crate::spaces::writers::list(&state.db, state.db_backend, &space.id, None, None, 10)
+            crate::spaces::writers::list(&state.db, state.db_backend, &space.id, None, 10)
                 .await
                 .unwrap();
         assert_eq!(writers.len(), 1);

@@ -817,9 +817,9 @@ mod tests {
     ///
     /// The skip below is invisible under libtest's captured output, so a
     /// `cargo test --lib` run with no `TEST_DATABASE_URL` — which is what
-    /// `ci.yml:142` does — reports `ok` having proved nothing. The job that
-    /// proves this one is `ci.yml:247`, whose `cargo test --tests` includes
-    /// the lib tests with a URL set.
+    /// `ci.yml`'s `unit-tests` job does — reports `ok` having proved nothing.
+    /// The job that proves this one is `e2e-tests`, whose `cargo test --tests`
+    /// includes the lib tests with a URL set.
     #[tokio::test]
     #[serial]
     async fn the_sweep_deletes_only_orderable_expiries_on_postgres() {

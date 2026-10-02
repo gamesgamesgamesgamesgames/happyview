@@ -125,7 +125,7 @@ async fn setup(app: &mut TestApp, key: &SigningKey) -> (String, String) {
     )
     .await;
     assert_eq!(delegation.status(), StatusCode::OK);
-    let token = json_of(delegation).await["delegationToken"]
+    let token = json_of(delegation).await["token"]
         .as_str()
         .unwrap()
         .to_string();
@@ -212,6 +212,7 @@ async fn refuses_a_credential_addressed_to_another_repo() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("BadSpaceAudience"));
 }
 
 #[tokio::test]
@@ -259,6 +260,7 @@ async fn lists_a_spaces_repos_with_a_credential_addressed_to_its_authority() {
     assert_eq!(resp.status(), StatusCode::OK);
     let resp = call(&app, read(&path, &credential, &key, MEMBER)).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("BadSpaceAudience"));
 }
 
 async fn space_admin(app: &TestApp, nsid: &str, body: Value) {
@@ -296,6 +298,7 @@ async fn a_credential_stops_working_when_its_member_loses_read_access() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("CredentialRevoked"));
 }
 
 #[tokio::test]
@@ -324,6 +327,7 @@ async fn a_credential_stops_working_when_its_member_is_removed() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("CredentialRevoked"));
 }
 
 /// The PDSes hosting native repos verify this instance's credentials, so they

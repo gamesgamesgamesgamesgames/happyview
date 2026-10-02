@@ -153,8 +153,8 @@ const NOTIFY_SPACE_DELETED_LXM: &str = "com.atproto.space.notifySpaceDeleted";
 const NOTIFY_WRITE_LXM: &str = "com.atproto.space.notifyWrite";
 
 /// Where a forwarded notification carries the space revision that ordered it,
-/// and the one before. Proposal 0016 adds both without naming them yet.
-pub(crate) const SPACE_REV_FIELD: &str = "spaceRev";
+/// and the one before. A syncer that sees a gap between them missed an update.
+const SPACE_REV_FIELD: &str = "spaceRev";
 const PREV_SPACE_REV_FIELD: &str = "prevSpaceRev";
 
 /// A repo's new state, as `com.atproto.space.notifyWrite` reports it.
@@ -174,6 +174,8 @@ impl RepoUpdate {
         let mut body = serde_json::json!({
             "space": self.space_uri,
             "repo": self.repo,
+            "repoRev": self.rev,
+            // The alpha lexicon's name for `repoRev`. Sent until v3.
             "rev": self.rev,
             "hash": {
                 "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&self.hash),

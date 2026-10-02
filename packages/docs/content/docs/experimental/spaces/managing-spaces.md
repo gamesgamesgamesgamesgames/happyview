@@ -51,7 +51,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.sim
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    type: "com.example.forum",
+    spaceType: "com.example.forum",
     skey: "main",
     displayName: "My Forum",
     description: "A place for discussion",
@@ -74,7 +74,7 @@ const response = await fetch("https://happyview.example.com/xrpc/com.atproto.sim
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    type: "com.example.forum",
+    spaceType: "com.example.forum",
     skey: "main",
     displayName: "My Forum",
     description: "A place for discussion",
@@ -91,7 +91,7 @@ let response = client
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
     .json(&serde_json::json!({
-        "type": "com.example.forum",
+        "spaceType": "com.example.forum",
         "skey": "main",
         "displayName": "My Forum",
         "description": "A place for discussion",
@@ -104,7 +104,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
-  "type": "com.example.forum",
+  "spaceType": "com.example.forum",
   "skey": "main",
   "displayName": "My Forum",
   "description": "A place for discussion",
@@ -126,7 +126,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.createS
   -H 'DPoP: <proof>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "type": "com.example.forum",
+    "spaceType": "com.example.forum",
     "skey": "main",
     "displayName": "My Forum",
     "description": "A place for discussion",
@@ -139,7 +139,7 @@ curl -X POST 'https://happyview.example.com/xrpc/com.atproto.simplespace.createS
 
 | Field         | Type          | Required | Description                                       |
 | ------------- | ------------- | -------- | ------------------------------------------------- |
-| `type`        | string (NSID) | Yes      | The space type; describes what this space is for  |
+| `spaceType`   | string (NSID) | Yes      | The space type; describes what this space is for. `type`, the earlier name, is accepted until v3. |
 | `skey`        | string        | Yes      | Space key; differentiates spaces of the same type |
 | `displayName` | string        | No       | Human-readable name                               |
 | `description` | string        | No       | Description of the space                          |
@@ -378,6 +378,7 @@ curl 'https://happyview.example.com/xrpc/com.atproto.space.listSpaces?limit=20' 
 | Field    | Type    | Required | Default        | Description                  |
 | -------- | ------- | -------- | -------------- | ---------------------------- |
 | `did`    | string  | No       | authenticated user | Filter by DID              |
+| `spaceType` | string (NSID) | No | | Lists only spaces of this type. `type`, the earlier name, is accepted until v3. |
 | `limit`  | integer | No       | 50             | Max spaces to return (1-100) |
 | `cursor` | string  | No       |                | Pagination cursor            |
 

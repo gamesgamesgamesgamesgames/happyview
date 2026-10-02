@@ -97,14 +97,20 @@ pub(crate) async fn verify_space_credential(
         space.did, space.type_nsid, space.skey
     );
     if claims.sub != space_uri {
-        return Err(AppError::Auth(
-            "space credential is for a different space".into(),
-        ));
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "InvalidCredential",
+            message: "space credential is for a different space".into(),
+        });
     }
     if db::is_space_credential_jti_revoked(&state.db, state.db_backend, &space.id, &claims.jti)
         .await?
     {
-        return Err(AppError::Auth("space credential has been revoked".into()));
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            code: "CredentialRevoked",
+            message: "space credential has been revoked".into(),
+        });
     }
     Ok(claims)
 }

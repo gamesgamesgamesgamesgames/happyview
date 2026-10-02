@@ -12,7 +12,7 @@ Each credential is bound to a P-256 key held by the service that requested it. E
 
 ## How credentials work
 
-A member's consent comes from a **delegation token**, a 60-second JWT naming the member and the space. The service exchanges the delegation token for a **space credential**, proving possession of its key in the same request. The credential lasts 10 minutes.
+A member's consent comes from a **delegation token**, a 60-second JWT naming the member and the space. The service exchanges the delegation token for a **space credential**, proving possession of its key in the same request. The credential lasts 10 minutes. HappyView refuses a credential that lasts longer than an hour, has no `jti`, or was issued more than 5 seconds in the future.
 
 ```mermaid
 sequenceDiagram
@@ -58,7 +58,7 @@ const response = await fetch(`https://happyview.example.com/xrpc/com.atproto.spa
   },
 });
 interface DelegationTokenResponse {
-  delegationToken: string;
+  token: string;
   expiresAt: string;
 }
 const data: DelegationTokenResponse = await response.json();
@@ -107,10 +107,12 @@ curl 'https://happyview.example.com/xrpc/com.atproto.space.getDelegationToken?sp
 
 ```json
 {
-  "delegationToken": "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0In0...",
+  "token": "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0In0...",
   "expiresAt": "2026-09-30T12:01:00Z"
 }
 ```
+
+The response also carries the token as `delegationToken`, its earlier name, until v3.
 
 The OAuth session must hold a `space:` scope with the full `read` action for the space. See [OAuth scopes](./managing-spaces.md#oauth-scopes).
 
@@ -446,7 +448,16 @@ The audience is the DID the request is for:
 | `getRecord`, `listRecords` with `repo`, `getLatestCommit`, `getRepo`, `listRepoOps`, `getBlob`, `listBlobs` | The DID of the repo being read |
 | `listRecords` without `repo`, `listRepos`, `registerNotify`, `unregisterNotify` | The space authority's DID |
 
-A request whose audience does not match fails with `401 BadSpaceSignature`. The audience binding stops a host that receives a request for its own repo from replaying it against another host.
+A request whose audience does not match fails with `401 BadSpaceAudience`. The audience binding stops a host that receives a request for its own repo from replaying it against another host.
+
+**Errors:**
+
+| Code | Status | Meaning |
+|---|---|---|
+| `BadSpaceSignature` | 401 | The signature is missing, malformed, or not made by the credential's bound key |
+| `BadSpaceAudience` | 401 | `Atproto-Space-Audience` is not the DID the request is for |
+| `CredentialRevoked` | 401 | The credential was [revoked](#revocation) |
+| `InvalidCredential` | 400 | The credential is for a different space |
 
 ```ts tab="TypeScript" tab-group="language"
 const params = new URLSearchParams({

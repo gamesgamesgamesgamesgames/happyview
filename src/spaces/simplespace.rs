@@ -19,7 +19,8 @@ use crate::spaces::{SpaceUri, db, members};
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreateSpaceInput {
-    #[serde(rename = "type")]
+    /// `type` is the earlier name, accepted until v3.
+    #[serde(rename = "spaceType", alias = "type")]
     pub type_nsid: String,
     pub skey: String,
     pub display_name: Option<String>,

@@ -77,6 +77,8 @@ These checks must pass before merging:
 | `test-*` (SDK packages) | `bun install`, then `bun run --filter '<package>' build`, `typecheck`, and `test`                                                                                                              |
 | `DCO`                   | See [Sign off your commits](#sign-off-your-commits)                                                                                                                                            |
 
+The `coverage` job also runs on server changes. It reruns the Rust suites under [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), writes a summary to the job page, reports to [Coveralls](https://coveralls.io/github/gamesgamesgamesgamesgames/happyview), and uploads the LCOV and HTML reports as the `coverage` artifact. It doesn't block merging. To get the same report locally, install the tool once with `cargo install cargo-llvm-cov` and `rustup component add llvm-tools`. Then run `cargo llvm-cov --workspace --open` with `TEST_DATABASE_URL` set as for `e2e-tests`.
+
 Jobs only run when the files they cover change, so a docs-only PR skips the Rust and frontend checks.
 
 - **First-time contributors** need a maintainer to approve CI before it runs on your PR. Nothing is wrong if checks show as waiting.

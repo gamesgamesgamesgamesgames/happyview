@@ -78,8 +78,10 @@ struct ListBlobsQuery {
 #[serde(rename_all = "camelCase")]
 struct NotifyWriteInput {
     space: String,
-    /// The repo that advanced, with its new `rev` and `hash`.
+    /// The repo that advanced, with its new `repoRev` and `hash`.
     repo: Option<String>,
+    repo_rev: Option<String>,
+    /// The alpha lexicon's name for `repoRev`. Accepted until v3.
     rev: Option<String>,
     hash: Option<LexBytes>,
     /// The legacy shape names one record instead of the repo's new state.
@@ -111,9 +113,8 @@ impl LexBytes {
 struct ListReposQuery {
     space: String,
     limit: Option<i64>,
-    cursor: Option<String>,
     /// A space revision: list only repos updated after it.
-    since: Option<String>,
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -138,6 +139,10 @@ pub(crate) struct SpaceUriQuery {
 #[serde(rename_all = "camelCase")]
 struct ListSpacesQuery {
     did: Option<String>,
+    /// Lists only spaces of this type. `type` is the earlier name, accepted
+    /// until v3.
+    #[serde(rename = "spaceType", alias = "type")]
+    space_type: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
@@ -438,7 +443,7 @@ fn require_audience(claims: &XrpcClaims, expected: &str) -> Result<(), AppError>
     }
     Err(AppError::XrpcError {
         status: StatusCode::UNAUTHORIZED,
-        code: "BadSpaceSignature",
+        code: "BadSpaceAudience",
         message: format!("request is not addressed to {expected}"),
     })
 }
@@ -544,6 +549,7 @@ async fn list_spaces(
         &state.db,
         state.db_backend,
         &did,
+        query.space_type.as_deref(),
         limit,
         query.cursor.as_deref(),
     )
@@ -1185,6 +1191,8 @@ async fn get_delegation_token(
         .unwrap_or_default();
 
     Ok(Json(serde_json::json!({
+        "token": grant,
+        // The earlier name for `token`. Returned until v3.
         "delegationToken": grant,
         "expiresAt": expires_at,
     })))
@@ -1442,28 +1450,25 @@ async fn list_repos(
         &state.db,
         state.db_backend,
         &space.id,
-        params.since.as_deref(),
         params.cursor.as_deref(),
         limit,
     )
     .await?;
 
-    let next_cursor = (writers.len() as i64 == limit).then(|| {
-        let last = writers.last().expect("a full page is not empty");
-        if params.since.is_some() {
-            last.space_rev.clone()
-        } else {
-            last.repo_did.clone()
-        }
-    });
+    // The cursor is the last space revision returned, so a syncer can also
+    // resume from any space revision it has already processed.
+    let next_cursor = writers.last().map(|w| w.space_rev.clone());
     let repos: Vec<serde_json::Value> = writers
         .iter()
         .map(|w| {
             use base64::Engine;
             serde_json::json!({
                 "did": w.repo_did,
+                "repoRev": w.rev,
+                // The alpha lexicon's name for `repoRev`. Sent until v3.
                 "rev": w.rev,
                 "hash": { "$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(&w.hash) },
+                "spaceRev": w.space_rev,
             })
         })
         .collect();
@@ -1471,11 +1476,6 @@ async fn list_repos(
     let mut body = serde_json::json!({ "repos": repos });
     if let Some(cursor) = next_cursor {
         body["cursor"] = cursor.into();
-    }
-    if let Some(space_rev) =
-        crate::spaces::writers::current_space_rev(&state.db, state.db_backend, &space.id).await?
-    {
-        body[notifications::SPACE_REV_FIELD] = space_rev.into();
     }
     Ok(Json(body))
 }
@@ -1720,7 +1720,17 @@ async fn notify_write(
     // so the caller must be that account. The space's creator and super admins
     // may also notify, as the legacy shape expects.
     let caller = require_notify_caller(&claims)?;
-    let space = service::resolve_space(&state, &input.space).await?;
+    // Named, so a repo host knows to stop retrying.
+    let space = service::resolve_space(&state, &input.space)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound(_) => AppError::XrpcError {
+                status: StatusCode::BAD_REQUEST,
+                code: "SpaceNotFound",
+                message: "space not found".into(),
+            },
+            e => e,
+        })?;
     if caller != writer {
         service::require_space_admin(&state, &space, &caller).await?;
     }
@@ -1761,7 +1771,7 @@ async fn notify_write(
         ),
     }
 
-    if let (Some(rev), Some(hash)) = (&input.rev, &input.hash) {
+    if let (Some(rev), Some(hash)) = (input.repo_rev.as_ref().or(input.rev.as_ref()), &input.hash) {
         let hash = hash.decode()?;
         let mut conn = state
             .db

@@ -502,6 +502,89 @@ async fn created_config(app: &TestApp, body: Value) -> Value {
         .clone()
 }
 
+/// The lexicon names the space type `spaceType`; `type` is the earlier name,
+/// accepted until v3.
+#[tokio::test]
+#[serial]
+async fn create_space_takes_the_type_as_space_type() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("auth");
+    let resp = post(
+        &app,
+        "com.atproto.simplespace.createSpace",
+        &authority,
+        json!({
+            "spaceType": "com.example.forum",
+            "skey": rand_skey("s"),
+            "readPolicy": member_list_policy(),
+            "writePolicy": member_list_policy(),
+            "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
+        }),
+    )
+    .await;
+    assert!(
+        resp.status().is_success(),
+        "createSpace failed: {}",
+        resp.status()
+    );
+    let uri = json_of(resp).await["uri"].as_str().unwrap().to_string();
+    assert!(uri.contains("/space/com.example.forum/"), "{uri}");
+}
+
+/// `listSpaces` narrows to one space type, named `spaceType` or, before the
+/// rename, `type`.
+#[tokio::test]
+#[serial]
+async fn list_spaces_filters_by_space_type() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("auth");
+    for space_type in ["com.example.forum", "com.example.chat"] {
+        let resp = post(
+            &app,
+            "com.atproto.simplespace.createSpace",
+            &authority,
+            json!({
+                "spaceType": space_type,
+                "skey": rand_skey("s"),
+                "readPolicy": member_list_policy(),
+                "writePolicy": member_list_policy(),
+                "appAccess": { "$type": "com.atproto.simplespace.defs#open" },
+            }),
+        )
+        .await;
+        assert!(resp.status().is_success());
+    }
+
+    for param in ["spaceType", "type"] {
+        let listed = json_of(
+            get(
+                &app,
+                &format!("/xrpc/com.atproto.space.listSpaces?{param}=com.example.chat"),
+                &authority,
+            )
+            .await,
+        )
+        .await;
+        let uris: Vec<&str> = listed["spaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["uri"].as_str().unwrap())
+            .collect();
+        assert_eq!(uris.len(), 1, "{param}: {uris:?}");
+        assert!(
+            uris[0].contains("/space/com.example.chat/"),
+            "{param}: {uris:?}"
+        );
+    }
+}
+
 /// Clients written before the read/write split send one policy, which governed
 /// both, and HappyView's own earlier fields. Until v3 they keep working.
 #[tokio::test]
