@@ -43,6 +43,7 @@ pub async fn issue_credential(
     subject_did: &str,
     client_id: Option<&str>,
     authority_did: &str,
+    bound_key: Option<&str>,
 ) -> Result<IssuedCredential, AppError> {
     let auth_ctx = ServiceAuthCtx {
         pool,
@@ -53,8 +54,6 @@ pub async fn issue_credential(
     };
     check_app_access(space, client_id)?;
     check_mint_policy(http, auth_ctx, space, subject_did, client_id, authority_did).await?;
-
-    let private_jwk = get_or_create_signing_key(pool, backend, encryption_key, space).await?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -71,12 +70,34 @@ pub async fn issue_credential(
         iat: now,
         exp,
         jti: make_jti(),
+        cnf: bound_key.map(|kid| crate::spaces::credential::Confirmation {
+            kid: kid.to_string(),
+        }),
     };
 
-    let token = sign_credential(&claims, &private_jwk)?;
+    // A space this instance is authority for is verified against the
+    // `#atproto_space` key in the instance's DID document. Earlier spaces are
+    // anchored on their creator's DID and keep their per-space key.
+    let token = if is_instance_authority(pool, backend, public_url, space).await {
+        let signing_key =
+            crate::spaces::service::load_signing_key(pool, backend, encryption_key).await?;
+        crate::spaces::credential::sign_credential_with_key(&claims, &signing_key)?
+    } else {
+        let private_jwk = get_or_create_signing_key(pool, backend, encryption_key, space).await?;
+        sign_credential(&claims, &private_jwk)?
+    };
 
     let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
-    store_credential_record(pool, backend, &space.id, subject_did, &token_hash, exp).await?;
+    store_credential_record(
+        pool,
+        backend,
+        &space.id,
+        subject_did,
+        &token_hash,
+        &claims.jti,
+        exp,
+    )
+    .await?;
 
     let expires_at = chrono::DateTime::from_timestamp(exp as i64, 0)
         .map(|dt| dt.to_rfc3339())
@@ -151,9 +172,20 @@ async fn policy_allows(
     match policy {
         Policy::Public => Ok(true),
         Policy::MemberList => {
-            // Caller must already be a member; verified upstream by the credential issuance route.
-            // We trust that the delegation token proves membership was checked.
-            Ok(true)
+            let member = crate::spaces::members::is_member(
+                auth_ctx.pool,
+                auth_ctx.backend,
+                &space.id,
+                subject_did,
+            )
+            .await?;
+            Ok(match (member, access) {
+                // A credential reads the whole space, so own-records-only
+                // members do not qualify.
+                (Some(m), AccessKind::Read) => m.can_read() && !m.restricted_to_own_records(),
+                (Some(m), AccessKind::Write) => m.can_write(),
+                (None, _) => false,
+            })
         }
         Policy::ManagingApp { managing_app } => {
             let space_uri = format!(
@@ -173,6 +205,36 @@ async fn policy_allows(
             .await
         }
     }
+}
+
+/// Whether the authority tracks this writer and forwards their notifications,
+/// per `write_policy`.
+pub(crate) async fn writer_admitted(
+    state: &crate::AppState,
+    space: &Space,
+    writer_did: &str,
+) -> Result<bool, AppError> {
+    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+        AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space policy checks".into())
+    })?;
+    let auth_ctx = ServiceAuthCtx {
+        pool: &state.db,
+        backend: state.db_backend,
+        encryption_key,
+        public_url: &state.config.public_url,
+        plc_url: &state.config.plc_url,
+    };
+    policy_allows(
+        &state.http,
+        auth_ctx,
+        &space.write_policy,
+        space,
+        writer_did,
+        None,
+        &space.authority_did,
+        AccessKind::Write,
+    )
+    .await
 }
 
 /// Whether a space credential may be minted for this user, per `read_policy`.
@@ -215,24 +277,15 @@ async fn check_user_access_with_managing_app(
     authority_did: &str,
     access: AccessKind,
 ) -> Result<bool, AppError> {
-    // Parse DID#fragment — the fragment identifies the service endpoint in the DID doc.
-    // For outbound callback we derive the endpoint from the DID.
-    let (did, fragment) = if let Some(pos) = managing_app.find('#') {
-        (&managing_app[..pos], Some(&managing_app[pos + 1..]))
-    } else {
-        (managing_app, None)
-    };
-
-    if let Some(frag) = fragment
-        && frag != "atproto_pds"
-    {
-        return Err(AppError::BadRequest(format!(
-            "unsupported service fragment '#{frag}' for managing app"
-        )));
-    }
-
-    // Resolve the managing app's PDS/service endpoint from its DID document.
-    let endpoint = resolve_did_service_endpoint(http, auth_ctx.plc_url, did).await?;
+    // The managing app is a service identifier; its fragment names the service
+    // entry to call, and a bare DID means the account's PDS.
+    let endpoint = resolve_service_identifier(http, auth_ctx.plc_url, managing_app)
+        .await
+        .ok_or_else(|| {
+            AppError::BadGateway(format!(
+                "could not resolve the managing app {managing_app} to an endpoint"
+            ))
+        })?;
 
     let url = format!(
         "{}/xrpc/com.atproto.simplespace.checkUserAccess",
@@ -319,6 +372,50 @@ pub(crate) async fn resolve_did_service_endpoint(
     plc_url: &str,
     did: &str,
 ) -> Result<String, AppError> {
+    find_service(
+        &fetch_did_services(http, plc_url, did).await?,
+        did,
+        "atproto_pds",
+    )
+    .ok_or_else(|| AppError::Internal(format!("no #atproto_pds service in DID doc for {did}")))
+}
+
+/// Resolve a service identifier, a DID with an optional service fragment such
+/// as `did:web:syncer.example#atproto_space_syncer`, to its endpoint. A bare DID
+/// names an account, which is served by its PDS.
+///
+/// `None` when the DID does not resolve or publishes no such service.
+pub(crate) async fn resolve_service_identifier(
+    http: &reqwest::Client,
+    plc_url: &str,
+    service: &str,
+) -> Option<String> {
+    let (did, fragment) = service.split_once('#').unwrap_or((service, "atproto_pds"));
+    match fetch_did_services(http, plc_url, did).await {
+        Ok(services) => find_service(&services, did, fragment),
+        Err(e) => {
+            tracing::warn!(service, error = %e, "could not resolve service identifier");
+            None
+        }
+    }
+}
+
+/// A service entry's id may be relative (`#frag`) or carry the DID.
+fn find_service(services: &[(String, String)], did: &str, fragment: &str) -> Option<String> {
+    let relative = format!("#{fragment}");
+    let absolute = format!("{did}#{fragment}");
+    services
+        .iter()
+        .find(|(id, _)| *id == relative || *id == absolute)
+        .map(|(_, endpoint)| endpoint.clone())
+}
+
+/// The `(id, serviceEndpoint)` pairs in a DID's document.
+async fn fetch_did_services(
+    http: &reqwest::Client,
+    plc_url: &str,
+    did: &str,
+) -> Result<Vec<(String, String)>, AppError> {
     let url = if did.starts_with("did:plc:") {
         format!("{}/{did}", plc_url.trim_end_matches('/'))
     } else if did.starts_with("did:web:") {
@@ -333,7 +430,7 @@ pub(crate) async fn resolve_did_service_endpoint(
         }
     } else {
         return Err(AppError::BadRequest(format!(
-            "unsupported DID method for managing app: {did}"
+            "unsupported DID method: {did}"
         )));
     };
 
@@ -367,11 +464,11 @@ pub(crate) async fn resolve_did_service_endpoint(
         .await
         .map_err(|e| AppError::Internal(format!("invalid DID document for {did}: {e}")))?;
 
-    doc.service
-        .iter()
-        .find(|s| s.id == "#atproto_pds" || s.id == format!("{did}#atproto_pds"))
-        .map(|s| s.service_endpoint.clone())
-        .ok_or_else(|| AppError::Internal(format!("no #atproto_pds service in DID doc for {did}")))
+    Ok(doc
+        .service
+        .into_iter()
+        .map(|s| (s.id, s.service_endpoint))
+        .collect())
 }
 
 pub fn check_app_access(space: &Space, attested_client_id: Option<&str>) -> Result<(), AppError> {
@@ -389,6 +486,59 @@ pub fn check_app_access(space: &Space, attested_client_id: Option<&str>) -> Resu
             }
         }
     }
+}
+
+/// The key this instance's credentials for a space verify against. Read-only:
+/// a space with no key has minted no credentials.
+pub(crate) async fn space_verifying_key(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    encryption_key: &[u8; 32],
+    public_url: &str,
+    space: &Space,
+) -> Result<crate::spaces::commit::SpaceVerifyingKey, AppError> {
+    if is_instance_authority(pool, backend, public_url, space).await {
+        let method =
+            crate::verification_methods::get_method_by_fragment(pool, backend, "#atproto_space")
+                .await?
+                .ok_or_else(|| AppError::Auth("this instance has no #atproto_space key".into()))?;
+        return crate::spaces::credential::multikey_to_space_key(&method.public_key_multibase);
+    }
+
+    let row: Option<(Vec<u8>,)> = crate::db::query_as(&adapt_sql(
+        "SELECT signing_key_enc FROM happyview_space_dids WHERE space_id = ?",
+        backend,
+    ))
+    .bind(&space.id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to look up space signing key: {e}")))?;
+    let (encrypted,) =
+        row.ok_or_else(|| AppError::Auth("this space has issued no credentials".into()))?;
+    let decrypted = decrypt(encryption_key, &encrypted)
+        .map_err(|e| AppError::Internal(format!("failed to decrypt signing key: {e}")))?;
+    let jwk: serde_json::Value = serde_json::from_slice(&decrypted)
+        .map_err(|e| AppError::Internal(format!("failed to parse signing key: {e}")))?;
+    let d = jwk["d"]
+        .as_str()
+        .and_then(|d| URL_SAFE_NO_PAD.decode(d).ok())
+        .ok_or_else(|| AppError::Internal("space signing key missing d parameter".into()))?;
+    let signing_key = SigningKey::from_slice(&d)
+        .map_err(|e| AppError::Internal(format!("invalid space signing key: {e}")))?;
+    Ok(crate::spaces::commit::SpaceVerifyingKey::P256(
+        *signing_key.verifying_key(),
+    ))
+}
+
+async fn is_instance_authority(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    public_url: &str,
+    space: &Space,
+) -> bool {
+    crate::auth::service_auth::instance_did(pool, backend, public_url)
+        .await
+        .is_ok_and(|did| did == space.authority_did)
 }
 
 async fn get_or_create_signing_key(
@@ -491,6 +641,7 @@ async fn store_credential_record(
     space_id: &str,
     issued_to: &str,
     token_hash: &str,
+    jti: &str,
     expires_at_epoch: u64,
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
@@ -499,7 +650,7 @@ async fn store_credential_record(
         .unwrap_or_default();
 
     let sql = adapt_sql(
-        "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_credentials (id, space_id, issued_to, token_hash, jti, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -508,6 +659,7 @@ async fn store_credential_record(
         .bind(space_id)
         .bind(issued_to)
         .bind(token_hash)
+        .bind(jti)
         .bind(&expires_at)
         .bind(&now)
         .execute(pool)
@@ -520,7 +672,7 @@ async fn store_credential_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spaces::types::{AppAccess, Policy, Space, SpaceConfig};
+    use crate::spaces::types::{AppAccess, MemberAccess, Policy, Space, SpaceConfig};
 
     fn test_space(app_access: AppAccess) -> Space {
         Space {
@@ -600,6 +752,166 @@ mod tests {
                 .await
                 .expect("resolves");
         assert_eq!(endpoint, "http://pds.test");
+    }
+
+    async fn mint_for_member(access: MemberAccess) -> Result<IssuedCredential, AppError> {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let mut space = test_space(AppAccess::Open);
+        space.id = uuid::Uuid::new_v4().to_string();
+        crate::spaces::db::create_space(&pool, backend, &space)
+            .await
+            .unwrap();
+        crate::spaces::db::add_member(
+            &pool,
+            backend,
+            &crate::spaces::types::SpaceMember {
+                id: uuid::Uuid::new_v4().to_string(),
+                space_id: space.id.clone(),
+                did: "did:plc:member".into(),
+                access,
+                is_delegation: false,
+                granted_by: None,
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+
+        issue_credential(
+            &pool,
+            backend,
+            &reqwest::Client::new(),
+            &crate::test_support::TEST_ENCRYPTION_KEY,
+            "http://happyview.test",
+            "http://plc.test",
+            &space,
+            "did:plc:member",
+            None,
+            &space.authority_did,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn member_list_mints_for_a_reader() {
+        assert!(mint_for_member(MemberAccess::READ).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn credentials_last_ten_minutes() {
+        let issued = mint_for_member(MemberAccess::READ).await.unwrap();
+        let claims: crate::spaces::credential::SpaceCredentialClaims = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(issued.token.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims.exp - claims.iat, 600);
+    }
+
+    #[tokio::test]
+    async fn member_list_refuses_a_write_only_member() {
+        let write_only = MemberAccess {
+            read: false,
+            write: true,
+            read_self: false,
+        };
+        assert!(matches!(
+            mint_for_member(write_only).await,
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn member_list_refuses_an_own_records_only_member() {
+        // A credential reads the whole space, which is more than read_self grants.
+        assert!(matches!(
+            mint_for_member(MemberAccess::READ_SELF).await,
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn credentials_for_this_instances_spaces_verify_against_its_published_key() {
+        const INSTANCE_DID: &str = "did:plc:happyviewinstance";
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let key = crate::test_support::TEST_ENCRYPTION_KEY;
+        crate::service_identity::upsert_identity(
+            &pool,
+            backend,
+            &crate::service_identity::IdentityMode::DidPlc,
+            Some(INSTANCE_DID),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let published =
+            crate::verification_methods::ensure_atproto_space_method(&pool, backend, &key)
+                .await
+                .unwrap();
+
+        let mut space = test_space(AppAccess::Open);
+        space.id = uuid::Uuid::new_v4().to_string();
+        space.did = INSTANCE_DID.into();
+        space.authority_did = INSTANCE_DID.into();
+        space.read_policy = Policy::Public;
+        crate::spaces::db::create_space(&pool, backend, &space)
+            .await
+            .unwrap();
+
+        let issued = issue_credential(
+            &pool,
+            backend,
+            &reqwest::Client::new(),
+            &key,
+            "http://happyview.test",
+            "http://plc.test",
+            &space,
+            "did:plc:reader",
+            None,
+            &space.authority_did,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let verifying =
+            crate::spaces::credential::multikey_to_space_key(&published.public_key_multibase)
+                .unwrap();
+        let claims =
+            crate::spaces::credential::verify_credential_with_key(&issued.token, &verifying)
+                .expect("credential should verify against the published #atproto_space key");
+        assert_eq!(claims.iss, INSTANCE_DID);
+    }
+
+    #[tokio::test]
+    async fn member_list_refuses_a_non_member() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let mut space = test_space(AppAccess::Open);
+        space.id = uuid::Uuid::new_v4().to_string();
+        crate::spaces::db::create_space(&pool, DatabaseBackend::Sqlite, &space)
+            .await
+            .unwrap();
+        let result = issue_credential(
+            &pool,
+            DatabaseBackend::Sqlite,
+            &reqwest::Client::new(),
+            &crate::test_support::TEST_ENCRYPTION_KEY,
+            "http://happyview.test",
+            "http://plc.test",
+            &space,
+            "did:plc:stranger",
+            None,
+            &space.authority_did,
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
     }
 
     #[test]

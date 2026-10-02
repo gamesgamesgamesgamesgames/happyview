@@ -1394,3 +1394,54 @@ async fn apply_writes_delete_op_ignores_disallowed_collection() {
         "delete op must not be gated by allowedCollections"
     );
 }
+
+/// A local write reaches registered syncers once per commit, in the lexicon's
+/// shape, with the repo's new rev and hash.
+#[tokio::test]
+#[serial]
+async fn a_local_write_notifies_registered_syncers_once_per_commit() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.setup_did_web().await;
+    enable_spaces(&app).await;
+
+    let authority = rand_did("authority");
+    let writer = rand_did("writer");
+    let (space_id, space_uri) = create_space(&app, &authority, &rand_skey("space")).await;
+    add_member(&app, &space_id, &writer, MemberAccess::WRITE).await;
+
+    let syncer = common::syncer::start().await;
+    happyview::spaces::notifications::register(
+        &app.state.db,
+        app.state.db_backend,
+        &space_id,
+        "did:web:syncer.example#atproto_space_syncer",
+        &syncer.uri(),
+        "did:web:syncer.example",
+        NotifyDelivery::Xrpc,
+    )
+    .await
+    .unwrap();
+
+    let collection = "com.example.item";
+    let resp = app
+        .router
+        .clone()
+        .oneshot(create_record_req(
+            &space_uri,
+            collection,
+            &json!({ "$type": collection, "text": "hi" }),
+            Some(cookie_for(&app, &writer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let received = common::syncer::received(&syncer, 1).await;
+    assert_eq!(received.len(), 1);
+    let body: Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(body["space"], json!(space_uri));
+    assert_eq!(body["repo"], json!(writer));
+    assert!(body["repoRev"].is_string());
+    assert!(body["hash"]["$bytes"].is_string());
+}

@@ -981,6 +981,13 @@ async fn main() {
         });
     }
 
+    {
+        let sweeper_state = state.clone();
+        tokio::spawn(async move {
+            happyview::spaces::native_sync::run_sweeper(sweeper_state).await;
+        });
+    }
+
     let app = server::router(state);
     let addr = config.listen_addr();
 

@@ -7,6 +7,7 @@ pub mod credential;
 pub mod db;
 pub mod describe;
 pub mod host_mode;
+pub mod http_signature;
 pub mod lthash;
 pub mod members;
 pub mod native_client;
@@ -20,6 +21,7 @@ pub mod scope;
 pub mod service;
 pub mod simplespace;
 pub mod types;
+pub mod writers;
 
 #[cfg(test)]
 mod integration_tests;

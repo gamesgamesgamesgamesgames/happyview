@@ -36,8 +36,6 @@ struct JwtPayload {
     iss: String,
     aud: String,
     exp: u64,
-    #[serde(default)]
-    lxm: Option<String>,
 }
 
 // DID document types
@@ -155,10 +153,8 @@ fn verify_service_jwt<'a>(
         // rejected rather than trusted here.
         let _ = &payload.aud;
 
-        // Check lxm if present (optional validation).
-        if let Some(ref _lxm) = payload.lxm {
-            // Allow any lxm for now — HappyView serves many different XRPC methods.
-        }
+        // `lxm` is likewise checked by the caller, which knows the method being
+        // called.
 
         // Resolve the issuer's DID document to get their signing key.
         let signing_key = resolve_signing_key(&payload.iss, state).await?;
@@ -289,6 +285,7 @@ pub struct PublicJwtPayload {
     pub iss: String,
     pub aud: Option<String>,
     pub exp: u64,
+    pub lxm: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +391,9 @@ pub async fn mint_service_auth(
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
     let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
     let message = format!("{header_b64}.{payload_b64}");
+    // @atproto/crypto refuses high-S signatures, and peers verify with it.
     let sig: Signature = signing_key.sign(message.as_bytes());
+    let sig = sig.normalize_s();
 
     Ok(format!(
         "{message}.{}",
@@ -626,6 +625,30 @@ mod outbound_tests {
         assert_eq!(payload["lxm"], "com.atproto.simplespace.checkUserAccess");
         assert!(payload["exp"].as_u64().unwrap() > payload["iat"].as_u64().unwrap());
         assert!(!payload["jti"].as_str().unwrap().is_empty());
+    }
+
+    /// Peers verify service auth with @atproto/crypto, which refuses
+    /// high-S signatures.
+    #[tokio::test]
+    async fn minted_signatures_are_low_s() {
+        let (pool, backend, key) = seeded_pool().await;
+        for _ in 0..64 {
+            let token = mint_service_auth(
+                &pool,
+                backend,
+                &key,
+                "https://hv.example",
+                "did:web:app.example.com#forum",
+                "com.atproto.space.notifyWrite",
+            )
+            .await
+            .expect("mint");
+            let sig_bytes = URL_SAFE_NO_PAD
+                .decode(token.rsplit('.').next().unwrap())
+                .unwrap();
+            let sig = p256::ecdsa::Signature::from_slice(&sig_bytes).unwrap();
+            assert_eq!(sig.normalize_s().to_bytes(), sig.to_bytes(), "high-S signature");
+        }
     }
 
     #[tokio::test]

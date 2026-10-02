@@ -6,7 +6,7 @@ title: "Invites"
 This API is experimental and will change. See the [Permissioned Spaces overview](../spaces.md) for context.
 </Callout>
 
-Invites let space authorities distribute membership tokens without knowing recipients' DIDs in advance.
+Invites let space creators distribute membership tokens without knowing recipients' DIDs in advance.
 
 <Callout type="info" title="HappyView Extension">
 Invites are a HappyView-specific feature, not part of the atproto spaces spec. They may be replaced by a different mechanism in the future.
@@ -14,7 +14,7 @@ Invites are a HappyView-specific feature, not part of the atproto spaces spec. T
 
 ## Creating an invite
 
-Only the space authority or a super admin can create invites.
+Only the space's creator or a super admin can create invites.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.space.createInvite", {
@@ -26,8 +26,8 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "at://did:plc:abc123/space/com.example.forum/main",
-    access: "write",
+    space: "at://did:web:happyview.example.com/space/com.example.forum/main",
+    access: { read: true, write: true },
     maxUses: 10,
     expiresAt: "2026-06-01T00:00:00Z",
   }),
@@ -35,7 +35,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 interface CreateInviteResponse {
   inviteId: string;
   token: string;
-  access: string;
+  access: { read: boolean; write: boolean };
   maxUses: number;
   expiresAt: string;
 }
@@ -51,8 +51,8 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "at://did:plc:abc123/space/com.example.forum/main",
-    access: "write",
+    space: "at://did:web:happyview.example.com/space/com.example.forum/main",
+    access: { read: true, write: true },
     maxUses: 10,
     expiresAt: "2026-06-01T00:00:00Z",
   }),
@@ -66,8 +66,8 @@ let response = client
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
     .json(&serde_json::json!({
-        "space": "at://did:plc:abc123/space/com.example.forum/main",
-        "access": "write",
+        "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
+        "access": { "read": true, "write": true },
         "maxUses": 10,
         "expiresAt": "2026-06-01T00:00:00Z"
     }))
@@ -77,8 +77,8 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
-  "space": "at://did:plc:abc123/space/com.example.forum/main",
-  "access": "write",
+  "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
+  "access": { "read": true, "write": true },
   "maxUses": 10,
   "expiresAt": "2026-06-01T00:00:00Z"
 }`)
@@ -97,8 +97,8 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createInvit
   -H 'DPoP: <proof>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "space": "at://did:plc:abc123/space/com.example.forum/main",
-    "access": "write",
+    "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
+    "access": { "read": true, "write": true },
     "maxUses": 10,
     "expiresAt": "2026-06-01T00:00:00Z"
   }'
@@ -109,7 +109,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createInvit
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `space` | string | Yes | | The space this invite is for |
-| `access` | string | No | `read` | Access level granted on acceptance (`read`, `read_self`, or `write`) |
+| `access` | object | No | `{ "read": true, "write": false }` | Access granted on acceptance: `read` and `write` booleans, both required when `access` is given |
 | `maxUses` | integer | No | unlimited | Maximum number of times the invite can be redeemed |
 | `expiresAt` | string (datetime) | No | never | When the invite expires |
 
@@ -119,7 +119,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.createInvit
 {
   "inviteId": "uuid",
   "token": "a1b2c3d4e5f6...",
-  "access": "write",
+  "access": { "read": true, "write": true },
   "maxUses": 10,
   "expiresAt": "2026-06-01T00:00:00Z"
 }
@@ -148,7 +148,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
 });
 interface AcceptInviteResponse {
   uri: string;
-  access: string;
+  access: { read: boolean; write: boolean };
 }
 const data: AcceptInviteResponse = await response.json();
 ```
@@ -205,8 +205,8 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.acceptInvit
 
 ```json
 {
-  "uri": "at://did:plc:abc123/space/com.example.forum/main",
-  "access": "write"
+  "uri": "at://did:web:happyview.example.com/space/com.example.forum/main",
+  "access": { "read": true, "write": true }
 }
 ```
 
@@ -230,7 +230,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "at://did:plc:abc123/space/com.example.forum/main",
+    space: "at://did:web:happyview.example.com/space/com.example.forum/main",
     inviteId: "uuid",
   }),
 });
@@ -245,7 +245,7 @@ const response = await fetch("https://happyview.example.com/xrpc/dev.happyview.s
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    space: "at://did:plc:abc123/space/com.example.forum/main",
+    space: "at://did:web:happyview.example.com/space/com.example.forum/main",
     inviteId: "uuid",
   }),
 });
@@ -257,7 +257,7 @@ let response = client
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
     .json(&serde_json::json!({
-        "space": "at://did:plc:abc123/space/com.example.forum/main",
+        "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
         "inviteId": "uuid"
     }))
     .send()
@@ -265,7 +265,7 @@ let response = client
 ```
 ```go tab="Go" tab-group="language"
 body := bytes.NewBufferString(`{
-  "space": "at://did:plc:abc123/space/com.example.forum/main",
+  "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
   "inviteId": "uuid"
 }`)
 req, _ := http.NewRequest("POST",
@@ -283,7 +283,7 @@ curl -X POST 'https://happyview.example.com/xrpc/dev.happyview.space.revokeInvit
   -H 'DPoP: <proof>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "space": "at://did:plc:abc123/space/com.example.forum/main",
+    "space": "at://did:web:happyview.example.com/space/com.example.forum/main",
     "inviteId": "uuid"
   }'
 ```
@@ -292,11 +292,11 @@ Revoking an invite prevents future redemptions but does not remove members who a
 
 ## Listing invites
 
-Only the space authority or a super admin can list invites.
+Only the space's creator or a super admin can list invites.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=at://did:plc:abc123/space/com.example.forum/main",
+  "https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=at://did:web:happyview.example.com/space/com.example.forum/main",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -307,7 +307,7 @@ const response = await fetch(
 );
 interface Invite {
   id: string;
-  access: string;
+  access: { read: boolean; write: boolean };
   maxUses: number;
   uses: number;
   expiresAt: string;
@@ -319,7 +319,7 @@ const data: { invites: Invite[] } = await response.json();
 ```
 ```js tab="JavaScript" tab-group="language"
 const response = await fetch(
-  "https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=at://did:plc:abc123/space/com.example.forum/main",
+  "https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=at://did:web:happyview.example.com/space/com.example.forum/main",
   {
     headers: {
       "X-Client-Key": CLIENT_KEY,
@@ -333,7 +333,7 @@ const data = await response.json();
 ```rust tab="Rust" tab-group="language"
 let response = client
     .get("https://happyview.example.com/xrpc/dev.happyview.space.listInvites")
-    .query(&[("space", "at://did:plc:abc123/space/com.example.forum/main")])
+    .query(&[("space", "at://did:web:happyview.example.com/space/com.example.forum/main")])
     .header("X-Client-Key", client_key)
     .header("Authorization", format!("DPoP {}", access_token))
     .header("DPoP", &dpop_proof)
@@ -343,7 +343,7 @@ let data: serde_json::Value = response.json().await?;
 ```
 ```go tab="Go" tab-group="language"
 req, _ := http.NewRequest("GET",
-  "https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=at://did:plc:abc123/space/com.example.forum/main",
+  "https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=at://did:web:happyview.example.com/space/com.example.forum/main",
   nil)
 req.Header.Set("X-Client-Key", clientKey)
 req.Header.Set("Authorization", "DPoP "+accessToken)
@@ -351,7 +351,7 @@ req.Header.Set("DPoP", dpopProof)
 resp, err := http.DefaultClient.Do(req)
 ```
 ```sh tab="cURL" tab-group="language"
-curl 'https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=at://did:plc:abc123/space/com.example.forum/main' \
+curl 'https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=at://did:web:happyview.example.com/space/com.example.forum/main' \
   -H 'X-Client-Key: hvc_...' \
   -H 'Authorization: DPoP <token>' \
   -H 'DPoP: <proof>'
@@ -370,7 +370,7 @@ curl 'https://happyview.example.com/xrpc/dev.happyview.space.listInvites?space=a
   "invites": [
     {
       "id": "uuid",
-      "access": "write",
+      "access": { "read": true, "write": true },
       "maxUses": 10,
       "uses": 3,
       "expiresAt": "2026-06-01T00:00:00Z",

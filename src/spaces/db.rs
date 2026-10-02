@@ -93,15 +93,15 @@ pub async fn get_space_by_address(
 pub async fn list_spaces_by_owner(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    authority_did: &str,
+    creator_did: &str,
 ) -> Result<Vec<Space>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE authority_did = ? ORDER BY created_at DESC",
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE creator_did = ? ORDER BY created_at DESC",
         backend,
     );
 
     let rows: Vec<SpaceRow> = crate::db::query_as(&sql)
-        .bind(authority_did)
+        .bind(creator_did)
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list spaces: {e}")))?;
@@ -119,24 +119,37 @@ pub async fn list_spaces_for_user(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     did: &str,
+    space_type: Option<&str>,
     limit: i64,
     cursor: Option<&str>,
 ) -> Result<(Vec<SpaceView>, Option<String>), AppError> {
     let decoded_cursor = cursor.and_then(decode_cursor);
+    let type_clause = if space_type.is_some() {
+        " AND s.type_nsid = ?"
+    } else {
+        ""
+    };
 
     let sql = if decoded_cursor.is_some() {
         adapt_sql(
-            "SELECT s.did, s.authority_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? AND (sm.created_at > ? OR (sm.created_at = ? AND ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            &format!(
+                "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ?{type_clause} AND (sm.created_at > ? OR (sm.created_at = ? AND ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) > ?)) ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?"
+            ),
             backend,
         )
     } else {
         adapt_sql(
-            "SELECT s.did, s.authority_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ? ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?",
+            &format!(
+                "SELECT s.did, s.creator_did, s.type_nsid, s.skey, sm.created_at FROM happyview_space_members sm JOIN happyview_spaces s ON s.id = sm.space_id WHERE sm.member_did = ?{type_clause} ORDER BY sm.created_at ASC, ('at://' || s.did || '/space/' || s.type_nsid || '/' || s.skey) ASC LIMIT ?"
+            ),
             backend,
         )
     };
 
     let mut query = crate::db::query_as::<(String, String, String, String, String)>(&sql).bind(did);
+    if let Some(space_type) = space_type {
+        query = query.bind(space_type);
+    }
     if let Some((ref ts, ref uri)) = decoded_cursor {
         query = query.bind(ts.as_str()).bind(ts.as_str()).bind(uri.as_str());
     }
@@ -150,9 +163,9 @@ pub async fn list_spaces_for_user(
     let views: Vec<SpaceView> = rows
         .into_iter()
         .map(
-            |(space_did, authority_did, type_nsid, skey, created_at)| SpaceView {
+            |(space_did, creator_did, type_nsid, skey, created_at)| SpaceView {
                 uri: format!("at://{}/space/{}/{}", space_did, type_nsid, skey),
-                is_owner: authority_did == did,
+                is_owner: creator_did == did,
                 created_at,
             },
         )
@@ -363,6 +376,62 @@ pub async fn is_space_credential_revoked(
         .await
         .map_err(|e| AppError::Internal(format!("failed to check credential revocation: {e}")))?;
     Ok(row.is_some())
+}
+
+/// Whether the credential with this `jti` in `space_id` has been revoked.
+pub async fn is_space_credential_jti_revoked(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    jti: &str,
+) -> Result<bool, AppError> {
+    let row: Option<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT revoked_at FROM happyview_space_credentials WHERE space_id = ? AND jti = ? AND revoked_at IS NOT NULL LIMIT 1",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(jti)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to check credential revocation: {e}")))?;
+    Ok(row.is_some())
+}
+
+/// The `jti`s of a member's credentials that are neither revoked nor expired.
+pub async fn outstanding_credential_jtis(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    did: &str,
+) -> Result<Vec<String>, AppError> {
+    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT jti FROM happyview_space_credentials WHERE space_id = ? AND issued_to = ? AND revoked_at IS NULL AND jti IS NOT NULL AND expires_at > ?",
+        backend,
+    ))
+    .bind(space_id)
+    .bind(did)
+    .bind(now_rfc3339())
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list outstanding credentials: {e}")))?;
+    Ok(rows.into_iter().map(|(jti,)| jti).collect())
+}
+
+/// The members whose repos in a space are hosted on their own PDS.
+pub async fn list_native_repo_authors(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let rows: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT author_did FROM happyview_space_repo_state WHERE space_id = ? AND host_mode = 'native'",
+        backend,
+    ))
+    .bind(space_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to list native repos: {e}")))?;
+    Ok(rows.into_iter().map(|(did,)| did).collect())
 }
 
 /// Revoke all active space credentials issued to `did` within `space_id`.
@@ -918,7 +987,7 @@ pub async fn delete_notify_registrations_for_service(
     service: &str,
 ) -> Result<u64, AppError> {
     let sql = adapt_sql(
-        "DELETE FROM happyview_space_notify_registrations WHERE space_id = ? AND registered_by = ?",
+        "DELETE FROM happyview_space_notify_registrations WHERE space_id = ? AND service = ?",
         backend,
     );
     let result = crate::db::query(&sql)
@@ -948,6 +1017,7 @@ pub async fn list_polyfill_repos_for_author(
         .map_err(|e| AppError::Internal(format!("failed to list polyfill repos: {e}")))
 }
 
+/// Store a registration, replacing the service's earlier one for this space.
 pub async fn register_notify(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -955,18 +1025,20 @@ pub async fn register_notify(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO happyview_space_notify_registrations (id, space_id, author_did, endpoint, registered_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_notify_registrations (id, space_id, service, endpoint, registered_by, expires_at, created_at, delivery) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (space_id, service) DO UPDATE SET id = excluded.id, endpoint = excluded.endpoint, registered_by = excluded.registered_by, expires_at = excluded.expires_at, created_at = excluded.created_at, delivery = excluded.delivery",
         backend,
     );
 
     crate::db::query(&sql)
         .bind(&reg.id)
         .bind(&reg.space_id)
-        .bind(&reg.author_did)
+        .bind(&reg.service)
         .bind(&reg.endpoint)
         .bind(&reg.registered_by)
         .bind(&reg.expires_at)
         .bind(&now)
+        .bind(reg.delivery.as_str())
         .execute(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to register notify: {e}")))?;
@@ -974,30 +1046,20 @@ pub async fn register_notify(
     Ok(())
 }
 
+/// The registrations for a space that have not expired.
 pub async fn list_notify_registrations(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     space_id: &str,
-    author_did: Option<&str>,
 ) -> Result<Vec<NotifyRegistration>, AppError> {
-    let sql = if author_did.is_some() {
-        adapt_sql(
-            "SELECT id, space_id, author_did, endpoint, registered_by, expires_at, created_at FROM happyview_space_notify_registrations WHERE space_id = ? AND author_did = ? ORDER BY created_at ASC",
-            backend,
-        )
-    } else {
-        adapt_sql(
-            "SELECT id, space_id, author_did, endpoint, registered_by, expires_at, created_at FROM happyview_space_notify_registrations WHERE space_id = ? ORDER BY created_at ASC",
-            backend,
-        )
-    };
+    let sql = adapt_sql(
+        "SELECT id, space_id, service, endpoint, registered_by, expires_at, created_at, delivery FROM happyview_space_notify_registrations WHERE space_id = ? AND expires_at > ? ORDER BY created_at ASC",
+        backend,
+    );
 
-    let mut query = crate::db::query_as::<NotifyRow>(&sql).bind(space_id);
-    if let Some(did) = author_did {
-        query = query.bind(did);
-    }
-
-    let rows = query
+    let rows = crate::db::query_as::<NotifyRow>(&sql)
+        .bind(space_id)
+        .bind(now_rfc3339())
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list notify registrations: {e}")))?;
@@ -1027,7 +1089,8 @@ pub async fn delete_notify_registration(
 type NotifyRow = (
     String,
     String,
-    Option<String>,
+    String,
+    String,
     String,
     String,
     String,
@@ -1038,11 +1101,12 @@ fn parse_notify_row(r: NotifyRow) -> NotifyRegistration {
     NotifyRegistration {
         id: r.0,
         space_id: r.1,
-        author_did: r.2,
+        service: r.2,
         endpoint: r.3,
         registered_by: r.4,
         expires_at: r.5,
         created_at: r.6,
+        delivery: NotifyDelivery::parse(&r.7),
     }
 }
 
@@ -1102,26 +1166,42 @@ pub async fn find_blob_author_did(
 // Space Repos
 // ---------------------------------------------------------------------------
 
-pub async fn list_space_repos(
+// ---------------------------------------------------------------------------
+// Delegation token uses
+// ---------------------------------------------------------------------------
+
+/// Record a delegation token as used, returning `false` if it already was.
+pub async fn consume_delegation_token(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    space_id: &str,
-) -> Result<Vec<serde_json::Value>, AppError> {
-    let sql = adapt_sql(
-        "SELECT DISTINCT r.author_did, s.rev FROM happyview_space_records r LEFT JOIN happyview_space_repo_state s ON s.space_id = r.space_id AND s.author_did = r.author_did WHERE r.space_id = ? ORDER BY r.author_did ASC",
+    issuer: &str,
+    jti: &str,
+    exp: u64,
+) -> Result<bool, AppError> {
+    let now = now_rfc3339();
+    crate::db::query(&adapt_sql(
+        "DELETE FROM happyview_space_delegation_uses WHERE expires_at < ?",
         backend,
-    );
+    ))
+    .bind(&now)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to prune delegation token uses: {e}")))?;
 
-    let rows: Vec<(String, Option<String>)> = crate::db::query_as(&sql)
-        .bind(space_id)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list space repos: {e}")))?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(did, rev)| serde_json::json!({ "did": did, "rev": rev }))
-        .collect())
+    let expires_at = chrono::DateTime::from_timestamp(exp as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or(now);
+    let result = crate::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_delegation_uses (issuer, jti, expires_at) VALUES (?, ?, ?) ON CONFLICT (issuer, jti) DO NOTHING",
+        backend,
+    ))
+    .bind(issuer)
+    .bind(jti)
+    .bind(&expires_at)
+    .execute(pool)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to record delegation token use: {e}")))?;
+    Ok(result.rows_affected() == 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,7 +1215,7 @@ pub async fn create_invite(
 ) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
-        "INSERT INTO happyview_space_invites (id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO happyview_space_invites (id, space_id, token_hash, created_by, can_read, can_write, read_self, max_uses, uses, expires_at, revoked, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         backend,
     );
 
@@ -1144,7 +1224,9 @@ pub async fn create_invite(
         .bind(&invite.space_id)
         .bind(&invite.token_hash)
         .bind(&invite.created_by)
-        .bind(invite.access.as_wire_str())
+        .bind(invite.access.read as i32)
+        .bind(invite.access.write as i32)
+        .bind(invite.access.read_self as i32)
         .bind(invite.max_uses)
         .bind(invite.uses)
         .bind(&invite.expires_at)
@@ -1163,7 +1245,7 @@ pub async fn get_invite_by_token_hash(
     token_hash: &str,
 ) -> Result<Option<SpaceInvite>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at FROM happyview_space_invites WHERE token_hash = ?",
+        "SELECT id, space_id, token_hash, created_by, can_read, can_write, read_self, max_uses, uses, expires_at, revoked, created_at FROM happyview_space_invites WHERE token_hash = ?",
         backend,
     );
 
@@ -1220,7 +1302,7 @@ pub async fn list_invites(
     space_id: &str,
 ) -> Result<Vec<SpaceInvite>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, space_id, token_hash, created_by, access, max_uses, uses, expires_at, revoked, created_at FROM happyview_space_invites WHERE space_id = ? ORDER BY created_at DESC",
+        "SELECT id, space_id, token_hash, created_by, can_read, can_write, read_self, max_uses, uses, expires_at, revoked, created_at FROM happyview_space_invites WHERE space_id = ? ORDER BY created_at DESC",
         backend,
     );
 
@@ -1238,7 +1320,9 @@ type InviteRow = (
     String,
     String,
     String,
-    String,
+    i32,
+    i32,
+    i32,
     Option<i64>,
     i64,
     Option<String>,
@@ -1247,19 +1331,20 @@ type InviteRow = (
 );
 
 fn parse_invite_row(r: InviteRow) -> Result<SpaceInvite, AppError> {
-    let access = MemberAccess::parse_wire(&r.4)
-        .ok_or_else(|| AppError::Internal(format!("invalid invite access: {}", r.4)))?;
-
     Ok(SpaceInvite {
         id: r.0,
         space_id: r.1,
         token_hash: r.2,
         created_by: r.3,
-        access,
-        max_uses: r.5,
-        uses: r.6,
-        expires_at: r.7,
-        revoked: r.8 != 0,
-        created_at: r.9,
+        access: MemberAccess {
+            read: r.4 != 0,
+            write: r.5 != 0,
+            read_self: r.6 != 0,
+        },
+        max_uses: r.7,
+        uses: r.8,
+        expires_at: r.9,
+        revoked: r.10 != 0,
+        created_at: r.11,
     })
 }

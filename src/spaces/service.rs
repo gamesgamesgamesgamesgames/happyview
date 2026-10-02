@@ -36,7 +36,7 @@ pub(crate) async fn require_space_admin(
     space: &Space,
     did: &str,
 ) -> Result<(), AppError> {
-    if space.authority_did == did {
+    if space.creator_did == did {
         return Ok(());
     }
     let sql = adapt_sql(
@@ -52,7 +52,7 @@ pub(crate) async fn require_space_admin(
         return Ok(());
     }
     Err(AppError::Forbidden(
-        "Only the space authority can perform this action".into(),
+        "Only the space's creator can perform this action".into(),
     ))
 }
 
@@ -68,6 +68,53 @@ pub(crate) fn check_collection_allowed(space: &Space, collection: &str) -> Resul
     Ok(())
 }
 
+/// Verify a space credential this instance issued for `space`, returning its
+/// claims.
+///
+/// Verified against the local key rather than through the authority's DID
+/// document: this instance is the space host, and the per-space keys of spaces
+/// anchored on their creator's DID are published nowhere.
+pub(crate) async fn verify_space_credential(
+    state: &AppState,
+    space: &Space,
+    token: &str,
+) -> Result<crate::spaces::credential::SpaceCredentialClaims, AppError> {
+    let encryption_key = state.config.token_encryption_key.as_ref().ok_or_else(|| {
+        AppError::Internal("TOKEN_ENCRYPTION_KEY is required for space credentials".into())
+    })?;
+    let key = crate::spaces::auth::space_verifying_key(
+        &state.db,
+        state.db_backend,
+        encryption_key,
+        &state.config.public_url,
+        space,
+    )
+    .await?;
+    let claims = crate::spaces::credential::verify_credential_with_key(token, &key)?;
+
+    let space_uri = format!(
+        "at://{}/space/{}/{}",
+        space.did, space.type_nsid, space.skey
+    );
+    if claims.sub != space_uri {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "InvalidCredential",
+            message: "space credential is for a different space".into(),
+        });
+    }
+    if db::is_space_credential_jti_revoked(&state.db, state.db_backend, &space.id, &claims.jti)
+        .await?
+    {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::UNAUTHORIZED,
+            code: "CredentialRevoked",
+            message: "space credential has been revoked".into(),
+        });
+    }
+    Ok(claims)
+}
+
 pub(crate) async fn require_membership(
     state: &AppState,
     space: &Space,
@@ -76,31 +123,13 @@ pub(crate) async fn require_membership(
     space_credential: Option<&str>,
 ) -> Result<MemberAccess, AppError> {
     if let Some(token) = space_credential {
-        let space_uri = format!(
-            "at://{}/space/{}/{}",
-            space.did, space.type_nsid, space.skey
-        );
-        match crate::spaces::credential::verify_external_credential(
-            token,
-            &state.http,
-            &state.config.plc_url,
-        )
-        .await
-        {
-            Ok(claims) if claims.sub == space_uri => {
-                if crate::spaces::routes::space_credential_revoked(state, token).await? {
-                    // fall through
-                } else if require_write {
-                    return Err(AppError::Forbidden(
-                        "Write access is required for this action".into(),
-                    ));
-                } else {
-                    return Ok(MemberAccess::READ);
-                }
-            }
-            Ok(_) => {}
-            Err(_) => {}
+        verify_space_credential(state, space, token).await?;
+        if require_write {
+            return Err(AppError::Forbidden(
+                "Write access is required for this action".into(),
+            ));
         }
+        return Ok(MemberAccess::READ);
     }
     let access = members::is_member(&state.db, state.db_backend, &space.id, did)
         .await?
@@ -195,7 +224,7 @@ pub(crate) async fn commit_write(
     rev: &str,
     ops: &[AppliedOp],
     signing_key: &p256::ecdsa::SigningKey,
-) -> Result<(), AppError> {
+) -> Result<CommittedWrite, AppError> {
     let mut repo_state =
         db::get_or_create_repo_state(&mut *conn, backend, &space.id, author_did).await?;
 
@@ -241,7 +270,8 @@ pub(crate) async fn commit_write(
 
     repo_state.lthash_state = set_hash.as_bytes().to_vec();
     repo_state.rev = Some(signed.rev);
-    repo_state.hash = Some(signed.hash.to_vec());
+    let hash = signed.hash.to_vec();
+    repo_state.hash = Some(hash.clone());
     repo_state.ikm = Some(signed.ikm.to_vec());
     repo_state.sig = Some(signed.sig);
     repo_state.mac = Some(signed.mac.to_vec());
@@ -249,15 +279,51 @@ pub(crate) async fn commit_write(
 
     db::update_space_revision(&mut *conn, backend, &space.id, rev).await?;
 
-    Ok(())
+    let recorded =
+        crate::spaces::writers::record(&mut *conn, backend, &space.id, author_did, rev, &hash)
+            .await?;
+
+    Ok(CommittedWrite { hash, recorded })
 }
 
+/// What a committed write reports to syncers.
+pub(crate) struct CommittedWrite {
+    pub hash: Vec<u8>,
+    pub recorded: crate::spaces::writers::Recorded,
+}
+
+/// Tell syncers about a committed write: once for the commit to services
+/// registered by identifier, and once per op to legacy webhooks.
 pub(crate) async fn notify_ops(
     state: &AppState,
     space: &Space,
     author_did: &str,
     ops: &[AppliedOp],
+    rev: &str,
+    committed: CommittedWrite,
 ) {
+    if let crate::spaces::writers::Recorded::Advanced {
+        space_rev,
+        prev_space_rev,
+    } = committed.recorded
+    {
+        notifications::forward_repo_update(
+            state,
+            &space.id,
+            notifications::RepoUpdate {
+                space_uri: format!(
+                    "at://{}/space/{}/{}",
+                    space.did, space.type_nsid, space.skey
+                ),
+                repo: author_did.to_string(),
+                rev: rev.to_string(),
+                hash: committed.hash,
+                space_rev,
+                prev_space_rev,
+            },
+        );
+    }
+
     for op in ops {
         let _ = notifications::dispatch_write_notification(
             &state.db,
@@ -427,7 +493,7 @@ pub(crate) async fn create_record(
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
     db::insert_space_record(&mut *tx, state.db_backend, &rec).await?;
-    commit_write(
+    let committed = commit_write(
         &mut tx,
         state.db_backend,
         &space,
@@ -441,7 +507,7 @@ pub(crate) async fn create_record(
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
 
-    notify_ops(state, &space, did, &ops).await;
+    notify_ops(state, &space, did, &ops, &rev, committed).await;
 
     Ok((record_uri, cid))
 }
@@ -546,7 +612,7 @@ pub(crate) async fn put_record(
         new_cid: Some(cid.clone()),
         old_cid,
     }];
-    commit_write(
+    let committed = commit_write(
         &mut tx,
         state.db_backend,
         &space,
@@ -560,7 +626,7 @@ pub(crate) async fn put_record(
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
 
-    notify_ops(state, &space, did, &ops).await;
+    notify_ops(state, &space, did, &ops, &rev, committed).await;
 
     Ok((record_uri, cid))
 }
@@ -640,7 +706,7 @@ pub(crate) async fn delete_record(
         new_cid: None,
         old_cid: Some(old_cid),
     }];
-    commit_write(
+    let committed = commit_write(
         &mut tx,
         state.db_backend,
         &space,
@@ -654,9 +720,31 @@ pub(crate) async fn delete_record(
         .await
         .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))?;
 
-    notify_ops(state, &space, did, &ops).await;
+    notify_ops(state, &space, did, &ops, &rev, committed).await;
 
     Ok(())
+}
+
+/// The authority for a space this instance is about to create.
+///
+/// Peers find a space's credential key and host through its authority's DID
+/// document, so the authority must be a DID whose document points here: this
+/// instance's own. Without a published identity nothing resolves to this
+/// instance, and the space is anchored on the creator's DID.
+async fn space_authority_for_new_space(state: &AppState, creator_did: &str) -> String {
+    match crate::auth::service_auth::instance_did(
+        &state.db,
+        state.db_backend,
+        &state.config.public_url,
+    )
+    .await
+    {
+        Ok(did) => did,
+        Err(e) => {
+            tracing::debug!("creating a space under its creator's DID: {e}");
+            creator_did.to_string()
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -675,8 +763,9 @@ pub(crate) async fn create_space(
     if type_nsid.is_empty() || skey.is_empty() {
         return Err(AppError::BadRequest("type and skey are required".into()));
     }
+    let authority = space_authority_for_new_space(state, did).await;
     let existing =
-        db::get_space_by_address(&state.db, state.db_backend, did, type_nsid, skey).await?;
+        db::get_space_by_address(&state.db, state.db_backend, &authority, type_nsid, skey).await?;
     if existing.is_some() {
         return Err(AppError::Conflict(
             "A space with this address already exists".into(),
@@ -700,8 +789,8 @@ pub(crate) async fn create_space(
     }
     let space = Space {
         id: uuid::Uuid::new_v4().to_string(),
-        did: did.to_string(),
-        authority_did: did.to_string(),
+        did: authority.clone(),
+        authority_did: authority,
         creator_did: did.to_string(),
         type_nsid: type_nsid.to_string(),
         skey: skey.to_string(),
@@ -726,6 +815,11 @@ pub(crate) async fn create_space(
     {
         tracing::warn!("failed to auto-provision #atproto_space verification method: {e}");
     }
+    if let Err(e) =
+        crate::service_entries::ensure_space_host_entry(&state.db, state.db_backend).await
+    {
+        tracing::warn!("failed to auto-provision #atproto_space_host service entry: {e}");
+    }
     let member = SpaceMember {
         id: uuid::Uuid::new_v4().to_string(),
         space_id: space.id.clone(),
@@ -746,6 +840,22 @@ pub(crate) async fn create_space(
 /// `read_self` is HappyView-local and never sent over the wire, so a caller
 /// replacing read/write access has not asked to lift an own-records-only
 /// restriction.
+/// Revoke a member's credentials, and tell the hosts that verify them.
+async fn revoke_member_credentials(
+    state: &AppState,
+    space: &Space,
+    member_did: &str,
+) -> Result<(), AppError> {
+    let jtis =
+        db::outstanding_credential_jtis(&state.db, state.db_backend, &space.id, member_did).await?;
+    db::revoke_space_credentials_for_member(&state.db, state.db_backend, &space.id, member_did)
+        .await?;
+    if !jtis.is_empty() {
+        notifications::announce_revoked_credentials(state, space, jtis);
+    }
+    Ok(())
+}
+
 pub(crate) async fn put_member(
     state: &AppState,
     actor_did: &str,
@@ -763,7 +873,7 @@ pub(crate) async fn put_member(
             .as_ref()
             .map(|m| m.id.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-        space_id: space.id,
+        space_id: space.id.clone(),
         did: member_did.to_string(),
         access: MemberAccess {
             read_self: existing.map(|m| m.access.read_self).unwrap_or(false),
@@ -774,6 +884,10 @@ pub(crate) async fn put_member(
         created_at: now_rfc3339(),
     };
     db::add_member(&state.db, state.db_backend, &member).await?;
+    // A credential is the member's read access, so it goes when that does.
+    if !member.access.read {
+        revoke_member_credentials(state, &space, member_did).await?;
+    }
     Ok(member)
 }
 
@@ -852,7 +966,10 @@ pub(crate) async fn delete_space(
 ) -> Result<(), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
+    let registrations =
+        db::list_notify_registrations(&state.db, state.db_backend, &space.id).await?;
     db::delete_space(&state.db, state.db_backend, &space.id).await?;
+    notifications::announce_space_deleted(state, &space, registrations);
     Ok(())
 }
 
@@ -864,8 +981,7 @@ pub(crate) async fn remove_member(
 ) -> Result<(), AppError> {
     let space = resolve_space(state, space_ref).await?;
     require_space_admin(state, &space, actor_did).await?;
-    db::revoke_space_credentials_for_member(&state.db, state.db_backend, &space.id, member_did)
-        .await?;
+    revoke_member_credentials(state, &space, member_did).await?;
     let removed = db::remove_member(&state.db, state.db_backend, &space.id, member_did).await?;
     if !removed {
         return Err(AppError::NotFound("Member not found in this space".into()));
@@ -1755,6 +1871,134 @@ mod tests {
         assert_eq!(access, Some(crate::spaces::types::MemberAccess::WRITE));
     }
 
+    async fn create_in_memory(
+        state: &AppState,
+        creator: &str,
+        skey: &str,
+    ) -> Result<Space, AppError> {
+        super::create_space(
+            state,
+            creator,
+            "com.example.chat",
+            skey,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn creating_a_space_advertises_this_instance_as_space_host() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("create should succeed");
+
+        let entries = crate::service_entries::list_entries(&state.db, state.db_backend)
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.fragment_id == "#atproto_space_host"),
+            "no #atproto_space_host service entry: {entries:?}"
+        );
+    }
+
+    const INSTANCE_DID: &str = "did:plc:happyviewinstance";
+
+    async fn state_with_instance_identity() -> AppState {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        crate::service_identity::upsert_identity(
+            &state.db,
+            state.db_backend,
+            &crate::service_identity::IdentityMode::DidPlc,
+            Some(INSTANCE_DID),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn this_instance_is_the_authority_for_spaces_it_creates() {
+        let state = state_with_instance_identity().await;
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .expect("create should succeed");
+        assert_eq!(space.authority_did, INSTANCE_DID);
+        assert_eq!(space.did, INSTANCE_DID);
+        assert_eq!(space.creator_did, "did:plc:creator");
+    }
+
+    #[tokio::test]
+    async fn the_creator_administers_a_space_this_instance_is_authority_for() {
+        let state = state_with_instance_identity().await;
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap();
+        let uri = format!(
+            "at://{}/space/{}/{}",
+            space.did, space.type_nsid, space.skey
+        );
+
+        super::put_member(
+            &state,
+            "did:plc:creator",
+            &uri,
+            "did:plc:friend",
+            MemberAccess::READ,
+            None,
+        )
+        .await
+        .expect("the creator may manage members");
+        let err = super::put_member(
+            &state,
+            "did:plc:friend",
+            &uri,
+            "did:plc:other",
+            MemberAccess::READ,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn creators_cannot_share_an_skey_under_this_instance() {
+        let state = state_with_instance_identity().await;
+        create_in_memory(&state, "did:plc:alice", "general")
+            .await
+            .unwrap();
+        let err = create_in_memory(&state, "did:plc:bob", "general")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn without_an_instance_identity_the_creator_is_the_authority() {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let space = create_in_memory(&state, "did:plc:creator", "general")
+            .await
+            .unwrap();
+        assert_eq!(space.authority_did, "did:plc:creator");
+    }
+
     #[tokio::test]
     async fn delete_space_requires_admin() {
         require_test_db!();
@@ -1935,5 +2179,158 @@ mod native_write_bridge_tests {
             format!("{err}").contains("re-authenticate"),
             "the error should tell the user what to do: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod invite_access_tests {
+    use super::*;
+    use crate::spaces::types::{AppAccess, Policy, SpaceConfig};
+
+    const ADMIN: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+    const JOINER: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+
+    async fn state_with_space() -> (AppState, Space) {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let state = crate::test_support::test_state_with_pool(pool);
+
+        let space = Space {
+            id: "sp-invite".into(),
+            did: ADMIN.into(),
+            authority_did: ADMIN.into(),
+            creator_did: ADMIN.into(),
+            type_nsid: "com.example.forum".into(),
+            skey: "main".into(),
+            display_name: None,
+            description: None,
+            read_policy: Policy::MemberList,
+            write_policy: Policy::MemberList,
+            app_access: AppAccess::Open,
+            config: SpaceConfig::default(),
+            revision: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+        db::create_space(&state.db, state.db_backend, &space)
+            .await
+            .expect("seed space");
+        (state, space)
+    }
+
+    fn space_uri(space: &Space) -> String {
+        format!(
+            "at://{}/space/{}/{}",
+            space.did, space.type_nsid, space.skey
+        )
+    }
+
+    fn write_only() -> MemberAccess {
+        MemberAccess {
+            read: false,
+            write: true,
+            read_self: false,
+        }
+    }
+
+    /// The combination the single access word could not hold: `as_wire_str`
+    /// rendered any `write` as `"write"` and `parse_wire` read that back as
+    /// read *and* write, so the row silently granted the read the caller
+    /// withheld.
+    ///
+    /// Three reads, because they failed independently. `create_invite` returns
+    /// the struct it built and so was right all along, which is what made this
+    /// invisible: the caller was told the truth and the stored invite said
+    /// something else.
+    #[tokio::test]
+    async fn a_write_only_invite_survives_storage() {
+        let (state, space) = state_with_space().await;
+
+        let (created, token) = create_invite(
+            &state,
+            ADMIN,
+            &space_uri(&space),
+            Some(write_only()),
+            None,
+            None,
+        )
+        .await
+        .expect("mint the invite");
+        assert_eq!(created.access, write_only(), "the create response");
+
+        let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
+        let fetched = db::get_invite_by_token_hash(&state.db, state.db_backend, &token_hash)
+            .await
+            .expect("read the invite back")
+            .expect("the invite exists");
+        assert_eq!(fetched.access, write_only(), "the stored row");
+
+        let listed = db::list_invites(&state.db, state.db_backend, &space.id)
+            .await
+            .expect("list the invites");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].access, write_only(), "the invite list");
+    }
+
+    /// Redemption reads the row, so this is where the collapse actually cost
+    /// something: the joiner became a full read/write member of a space whose
+    /// admin had granted write alone.
+    #[tokio::test]
+    async fn redeeming_a_write_only_invite_grants_write_alone() {
+        let (state, space) = state_with_space().await;
+
+        let (_, token) = create_invite(
+            &state,
+            ADMIN,
+            &space_uri(&space),
+            Some(write_only()),
+            None,
+            None,
+        )
+        .await
+        .expect("mint the invite");
+
+        let (joined, granted) = accept_invite(&state, JOINER, &token)
+            .await
+            .expect("redeem the invite");
+        assert_eq!(joined, space_uri(&space), "redemption names the space");
+        assert_eq!(granted, write_only(), "the access redemption reports");
+
+        let member = db::get_member(&state.db, state.db_backend, &space.id, JOINER)
+            .await
+            .expect("read the new member")
+            .expect("the joiner is a member");
+        assert_eq!(member.access, write_only(), "the membership row");
+    }
+
+    /// Every other combination the word could express still round-trips, so
+    /// the migration's backfill has nothing left to get wrong. `read_self` is
+    /// HappyView-local and reachable only through the script access word, but
+    /// it is stored, so it is checked.
+    #[tokio::test]
+    async fn every_access_combination_round_trips() {
+        let (state, space) = state_with_space().await;
+
+        for access in [
+            MemberAccess::READ,
+            MemberAccess::WRITE,
+            MemberAccess::READ_SELF,
+            MemberAccess {
+                read: false,
+                write: false,
+                read_self: false,
+            },
+            write_only(),
+        ] {
+            let (_, token) =
+                create_invite(&state, ADMIN, &space_uri(&space), Some(access), None, None)
+                    .await
+                    .expect("mint the invite");
+            let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
+            let fetched = db::get_invite_by_token_hash(&state.db, state.db_backend, &token_hash)
+                .await
+                .expect("read the invite back")
+                .expect("the invite exists");
+            assert_eq!(fetched.access, access, "round-trip of {access:?}");
+        }
     }
 }

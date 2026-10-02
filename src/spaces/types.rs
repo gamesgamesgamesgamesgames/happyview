@@ -241,6 +241,9 @@ pub struct Space {
 pub struct SpaceConfig {
     #[serde(default)]
     pub membership_public: bool,
+    /// Deprecated and not enforced: no read path consults it. A space readable
+    /// by anyone uses a `public` read policy. Still accepted and stored until
+    /// v3, so clients that send it keep working.
     #[serde(default)]
     pub records_public: bool,
     #[serde(flatten)]
@@ -283,11 +286,40 @@ pub struct SpaceRecord {
 pub struct NotifyRegistration {
     pub id: String,
     pub space_id: String,
-    pub author_did: Option<String>,
+    /// The subscribing service. A service holds one registration per space.
+    pub service: String,
     pub endpoint: String,
     pub registered_by: String,
     pub expires_at: String,
     pub created_at: String,
+    pub delivery: NotifyDelivery,
+}
+
+/// How a registration receives notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyDelivery {
+    /// `com.atproto.space.notifyWrite` at the service's resolved endpoint.
+    Xrpc,
+    /// The legacy payload, posted to the URL given at registration. Accepted
+    /// until v3.
+    Webhook,
+}
+
+impl NotifyDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Xrpc => "xrpc",
+            Self::Webhook => "webhook",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "xrpc" => Self::Xrpc,
+            _ => Self::Webhook,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

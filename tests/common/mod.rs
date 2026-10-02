@@ -11,6 +11,8 @@ pub mod fixtures;
 #[allow(dead_code, unused_imports)]
 pub mod plc;
 #[allow(dead_code, unused_imports)]
+pub mod syncer;
+#[allow(dead_code, unused_imports)]
 pub mod tls;
 
 #[allow(unused_macros)]

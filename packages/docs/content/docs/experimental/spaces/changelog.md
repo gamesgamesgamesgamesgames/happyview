@@ -2,6 +2,81 @@
 title: "Changelog"
 ---
 
+## v2.16 — Space Authority, Signed Credentials, and Sync
+
+Aligns credentials and sync with the latest [Proposal 0016](https://github.com/bluesky-social/proposals/blob/main/0016-permissioned-data/README.md) updates.
+
+### Space authority
+
+- **HappyView is the authority for spaces it creates.** New spaces use the instance's service identity DID (`did:web` or `did:plc`) as both the space URI DID and `authority_did`: `at://<instance DID>/space/<type>/<skey>`. Instances without a published service identity use the creator's DID, as before.
+- **The creator administers the space.** `creator_did` controls `putMember`, `removeMember`, `updateSpace`, `deleteSpace`, and invites. `isOwner` in `listSpaces` reflects the creator.
+- **Space keys are unique per type across the instance.** A second creator using the same type and `skey` gets `409 Conflict`.
+- **`#atproto_space_host` service entry.** HappyView publishes an `AtprotoSpaceHost` entry when a space is created. `did:web` instances serve it at once. `did:plc` operators must sync service entries to the PLC directory for it, and the `#atproto_space` key, to reach their DID document.
+- **OAuth scopes must name HappyView as the authority.** Apps requesting `space:` scopes need `authority=<HappyView DID>` or `authority=*`. The default `authority=self` does not cover HappyView-authority spaces.
+- **Managing apps are reached through the service entry their identifier names** (e.g. `did:web:forum.example.com#forum`), not only `#atproto_pds`.
+
+### Credentials
+
+- **HTTP Message Signatures replace DPoP for credentials.** `getSpaceCredential` takes the delegation token as `Authorization: Bearer`, with an [RFC 9421](https://www.rfc-editor.org/rfc/rfc9421) `atproto-space` signature by a fresh P-256 key. The body is `{space, clientAttestation?}`. No OAuth session is needed.
+- **Credentials are bound to that key** through `cnf.kid`.
+- **Credentials use the `Atproto-Space` scheme.** Requests carry `Atproto-Space-Audience` and an `atproto-space` signature over `authorization` and `atproto-space-audience`. The audience is the repo DID for repo reads and the authority DID for space-wide calls. Bearer space credentials are refused.
+- **New error:** `BadSpaceSignature` (401).
+- **Credentials last 10 minutes** (was 2 hours).
+- **Delegation tokens are single-use.** A second exchange fails with `InvalidDelegationToken`. Tokens signed by the account's own key, as a spaces-capable PDS issues, are accepted beside HappyView's own.
+- **Credentials for HappyView-authority spaces are signed with the instance's `#atproto_space` key**, so other hosts can verify them.
+- **Member-list read policies require the `read` flag.** Write-only members and members limited to their own records cannot obtain credentials.
+- **Revocation on read loss.** Removing a member, or setting their `read` to `false`, revokes their credentials. HappyView tells hosts of the space's native repos through `com.atproto.space.notifyCredentialRevoked`.
+
+### Removed
+
+- The `{grant}` body and OAuth caller flow on `getSpaceCredential`
+- `dev.happyview.space.getSpaceCredential`
+- Verification of credentials issued by other space authorities
+
+### Sync
+
+- **`registerNotify` takes a service identifier.** `{space, service}`, where `service` is a DID with an optional fragment, resolved to its endpoint. Returns `{expiresAt}`. Unresolvable identifiers fail with `ServiceNotResolvable`. Registering again replaces the previous registration.
+- **Outbound `notifyWrite` calls.** Registered services receive `com.atproto.space.notifyWrite` once per commit, with service auth from HappyView and `{space, repo, repoRev, hash, spaceRev, prevSpaceRev?}`. `rev` repeats `repoRev` until v3.
+- **Inbound `notifyWrite` from repo hosts.** HappyView accepts `{space, repo, repoRev, hash}` with service auth signed by the writing account, and `rev` in place of `repoRev` until v3. The writer must pass the write policy. Stale revisions are ignored, and revisions more than 5 minutes in the future fail with `FutureRev`.
+- **Space-wide revision.** Every accepted repo update advances a space revision.
+- **`listRepos` serves the writer set.** Returns `{repos: [{did, repoRev, hash, spaceRev}], cursor?}` in space revision order, with `limit` (default 100, max 1000). `cursor` is a space revision: pass the last one processed to list only repos updated after it.
+- **Fallback sweep.** HappyView re-syncs repos hosted on their authors' PDSes every 5 minutes.
+- **Service auth `lxm` is enforced.** Inbound tokens bound to a different method are rejected.
+
+### Backward compatibility (until v3)
+
+- `createSpace` and `updateSpace` accept a single `policy` or `mintPolicy` (`public`, `member-list`, `managing-app`) with a sibling `managingApp` or `managingAppDid`, applied to both reads and writes when `readPolicy` and `writePolicy` are absent.
+- `appAccess` accepts `{"type": "open"}` and `{"type": "allowList", "allowed": [...]}`.
+- `com.atproto.simplespace.addMember` and `dev.happyview.space.addMember` accept an `access` word.
+- `registerNotify` accepts `{space, serviceDid, endpoint}` webhook registrations, returning `{id, expiresAt}`. `notifyWrite` accepts `{space, did, collection, rkey, cid}`.
+
+### Request field renames
+
+- **`spaceType` replaces `type`** in `simplespace.createSpace` and as a new `listSpaces` filter. `type` is accepted in both until v3.
+
+### Credential and notification errors
+
+- **Credential lifetime is enforced.** Credentials lasting more than an hour, without a `jti`, or issued more than 5 seconds in the future are refused.
+- **Named errors.** A credential addressed to the wrong DID fails with `BadSpaceAudience`, a revoked one with `CredentialRevoked`, and one for another space with `InvalidCredential`. `notifyWrite` for an unknown space fails with `SpaceNotFound`.
+- **`notifyWrite` accepts the bare authority DID as its service-auth audience**, as well as `#atproto_space_host`.
+
+### Deprecated
+
+- **`config.records_public`.** It has never been enforced: setting it did not change who could read a space. Use a `public` `readPolicy` for a space anyone may read. It is still accepted and stored until v3.
+
+### Lua
+
+- **`space:put_member{did, read, write, is_delegation?}`** sets a member's flags and returns `{did, read, write}`.
+- **`space:members()`** entries include `read` and `write` booleans beside `access`.
+
+### Breaking changes
+
+- Credential clients must sign requests and use the `Atproto-Space` scheme.
+- Apps must request `space:` scopes naming HappyView's DID as the authority.
+- Syncers must accept `notifyWrite` calls in place of webhook payloads, or keep a legacy registration until v3.
+
+---
+
 ## v2.11 — Final Proposal 0016 Alignment
 
 Aligns with the merged [Proposal 0016](https://github.com/bluesky-social/proposals/blob/main/0016-permissioned-data/README.md) specification.

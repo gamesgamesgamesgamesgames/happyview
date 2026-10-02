@@ -231,8 +231,8 @@ fn setup_no_auth_lua(state: &AppState) -> Lua {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_static_delete_local_returns_true_when_row_existed() {
+    common::require_db!();
     let pool = db::test_pool().await;
     let backend = db::test_backend();
     db::truncate_all(&pool).await;
@@ -265,8 +265,8 @@ async fn record_static_delete_local_returns_true_when_row_existed() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_static_delete_local_returns_false_when_row_absent() {
+    common::require_db!();
     let pool = db::test_pool().await;
     let backend = db::test_backend();
     db::truncate_all(&pool).await;
@@ -287,8 +287,8 @@ async fn record_static_delete_local_returns_false_when_row_absent() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_instance_delete_local_removes_row_and_clears_uri() {
+    common::require_db!();
     let pool = db::test_pool().await;
     let backend = db::test_backend();
     db::truncate_all(&pool).await;
@@ -333,8 +333,8 @@ async fn record_instance_delete_local_removes_row_and_clears_uri() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_instance_save_local_updates_existing_row() {
+    common::require_db!();
     let pool = db::test_pool().await;
     let backend = db::test_backend();
     db::truncate_all(&pool).await;
@@ -384,8 +384,8 @@ async fn record_instance_save_local_updates_existing_row() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_save_local_creates_new_row_when_repo_set() {
+    common::require_db!();
     let pool = db::test_pool().await;
     let backend = db::test_backend();
     db::truncate_all(&pool).await;
@@ -426,8 +426,8 @@ async fn record_save_local_creates_new_row_when_repo_set() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_save_local_errors_without_did_when_no_uri() {
+    common::require_db!();
     let pool = db::test_pool().await;
     let backend = db::test_backend();
     db::truncate_all(&pool).await;
@@ -458,8 +458,8 @@ async fn record_save_local_errors_without_did_when_no_uri() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_save_errors_without_pds_auth() {
+    common::require_db!();
     let pool = db::test_pool().await;
     let backend = db::test_backend();
     db::truncate_all(&pool).await;
@@ -502,8 +502,8 @@ async fn record_save_errors_without_pds_auth() {
 
 #[tokio::test]
 #[serial]
-#[ignore]
 async fn record_delete_errors_without_pds_auth() {
+    common::require_db!();
     let pool = db::test_pool().await;
     let backend = db::test_backend();
     db::truncate_all(&pool).await;

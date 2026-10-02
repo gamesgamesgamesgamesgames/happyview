@@ -12,7 +12,8 @@ use crate::error::AppError;
 use crate::profile;
 use crate::spaces::commit::SpaceVerifyingKey;
 
-pub const DEFAULT_CREDENTIAL_TTL_SECS: u64 = 2 * 60 * 60; // 2 hours
+/// The lifetime of a credential this instance issues.
+pub const DEFAULT_CREDENTIAL_TTL_SECS: u64 = 10 * 60;
 pub const DELEGATION_TOKEN_TTL_SECS: u64 = 60; // 60 seconds
 
 pub const DELEGATION_TOKEN_TYP: &str = "atproto-space-delegation+jwt";
@@ -35,6 +36,12 @@ pub fn peek_delegation_sub(token: &str) -> Option<String> {
     let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
     let claims: DelegationTokenClaims = serde_json::from_slice(&payload_bytes).ok()?;
     Some(claims.sub)
+}
+
+/// The key an unverified credential is bound to, if any.
+pub fn peek_bound_key(token: &str) -> Option<String> {
+    let (_, claims) = peek_jwt::<SpaceCredentialClaims>(token)?;
+    claims.cnf.map(|cnf| cnf.kid)
 }
 
 /// Peek at a space credential JWT's payload to extract the `sub` (space URI) without verifying.
@@ -88,6 +95,58 @@ pub fn verify_delegation_token(
     verifying_key: &K256VerifyingKey,
     accepted_aud: &[&str],
 ) -> Result<DelegationTokenClaims, AppError> {
+    verify_delegation_token_with_key(
+        token,
+        &SpaceVerifyingKey::K256(*verifying_key),
+        accepted_aud,
+    )
+}
+
+/// Verify a delegation token minted by the account itself, as a PDS that serves
+/// spaces does, against the key its DID document names in the token's `kid`.
+pub async fn verify_account_delegation_token(
+    token: &str,
+    http: &reqwest::Client,
+    plc_url: &str,
+    accepted_aud: &[&str],
+) -> Result<DelegationTokenClaims, AppError> {
+    let (header, claims) = peek_jwt::<DelegationTokenClaims>(token)
+        .ok_or_else(|| AppError::Auth("invalid delegation token format".into()))?;
+    let fragment = header["kid"].as_str().unwrap_or("#atproto");
+    let fragment = if fragment.starts_with('#') {
+        fragment.to_string()
+    } else {
+        format!("#{fragment}")
+    };
+
+    let did_doc = profile::resolve_did_document(http, plc_url, &claims.iss).await?;
+    let method = did_doc
+        .verification_method
+        .iter()
+        .find(|v| v.id == fragment || v.id == format!("{}{fragment}", claims.iss))
+        .ok_or_else(|| AppError::Auth(format!("delegation token signer has no {fragment} key")))?;
+    let multibase = method.public_key_multibase.as_deref().ok_or_else(|| {
+        AppError::Auth(format!(
+            "{fragment} verification method missing publicKeyMultibase"
+        ))
+    })?;
+    verify_delegation_token_with_key(token, &multikey_to_space_key(multibase)?, accepted_aud)
+}
+
+/// An unverified JWT's header and claims.
+fn peek_jwt<T: serde::de::DeserializeOwned>(token: &str) -> Option<(serde_json::Value, T)> {
+    let mut parts = token.split('.');
+    let header = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    let claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    Some((header, claims))
+}
+
+/// Verify a delegation token against a known key of either curve.
+pub fn verify_delegation_token_with_key(
+    token: &str,
+    verifying_key: &SpaceVerifyingKey,
+    accepted_aud: &[&str],
+) -> Result<DelegationTokenClaims, AppError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(AppError::Auth("invalid delegation token format".into()));
@@ -99,8 +158,14 @@ pub fn verify_delegation_token(
     let header: serde_json::Value = serde_json::from_slice(&header_bytes)
         .map_err(|_| AppError::Auth("invalid delegation token header".into()))?;
 
-    if header["alg"].as_str() != Some("ES256K") {
-        return Err(AppError::Auth("delegation token alg must be ES256K".into()));
+    let expected_alg = match verifying_key {
+        SpaceVerifyingKey::P256(_) => "ES256",
+        SpaceVerifyingKey::K256(_) => "ES256K",
+    };
+    if header["alg"].as_str() != Some(expected_alg) {
+        return Err(AppError::Auth(format!(
+            "delegation token alg must be {expected_alg} for the signer's key"
+        )));
     }
 
     if header["typ"].as_str() != Some(DELEGATION_TOKEN_TYP) {
@@ -113,25 +178,9 @@ pub fn verify_delegation_token(
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(parts[2])
         .map_err(|_| AppError::Auth("invalid delegation token signature encoding".into()))?;
-
-    // Try direct verify, then with low-S normalization
-    let verified = if let Ok(sig) = K256Signature::from_slice(sig_bytes.as_slice()) {
-        if verifying_key.verify(message.as_bytes(), &sig).is_ok() {
-            true
-        } else {
-            verifying_key
-                .verify(message.as_bytes(), &sig.normalize_s())
-                .is_ok()
-        }
-    } else {
-        false
-    };
-
-    if !verified {
-        return Err(AppError::Auth(
-            "delegation token signature verification failed".into(),
-        ));
-    }
+    verifying_key
+        .verify(message.as_bytes(), &sig_bytes)
+        .map_err(|_| AppError::Auth("delegation token signature verification failed".into()))?;
 
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
@@ -164,6 +213,17 @@ pub struct SpaceCredentialClaims {
     pub iat: u64,
     pub exp: u64,
     pub jti: String, // Random nonce
+    /// The key the credential is bound to. Requests using the credential must be
+    /// signed by it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Confirmation>,
+}
+
+/// An RFC 7800 confirmation claim naming the bound key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confirmation {
+    /// A P-256 `did:key`.
+    pub kid: String,
 }
 
 pub fn sign_credential(
@@ -181,6 +241,14 @@ pub fn sign_credential(
     let signing_key = SigningKey::from_slice(&d_bytes[..])
         .map_err(|e| AppError::Internal(format!("invalid signing key: {e}")))?;
 
+    sign_credential_with_key(claims, &signing_key)
+}
+
+/// Sign a credential with a P-256 key published as `#atproto_space`.
+pub fn sign_credential_with_key(
+    claims: &SpaceCredentialClaims,
+    signing_key: &SigningKey,
+) -> Result<String, AppError> {
     let header = serde_json::json!({
         "alg": "ES256",
         "typ": SPACE_CREDENTIAL_TYP,
@@ -191,10 +259,34 @@ pub fn sign_credential(
     let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
 
     let message = format!("{}.{}", header_b64, payload_b64);
+    // @atproto/crypto refuses high-S signatures, and peers verify with it.
     let signature: Signature = signing_key.sign(message.as_bytes());
+    let signature = signature.normalize_s();
     let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     Ok(format!("{}.{}.{}", header_b64, payload_b64, sig_b64))
+}
+
+/// How far ahead of this clock a credential's `iat` may be.
+pub const CREDENTIAL_CLOCK_SKEW_SECS: u64 = 5;
+
+/// The longest lifetime a space credential may have.
+pub const MAX_CREDENTIAL_TTL_SECS: u64 = 60 * 60;
+
+/// Proposal 0016's limits on a credential beyond its expiry: issued no later
+/// than now, give or take clock skew, for at most an hour, and revocable by a
+/// non-empty `jti`.
+fn check_credential_lifetime(claims: &SpaceCredentialClaims, now: u64) -> Result<(), AppError> {
+    if claims.jti.is_empty() {
+        return Err(AppError::Auth("credential has no jti".into()));
+    }
+    if claims.iat > now + CREDENTIAL_CLOCK_SKEW_SECS {
+        return Err(AppError::Auth("credential was issued in the future".into()));
+    }
+    if claims.exp <= claims.iat || claims.exp - claims.iat > MAX_CREDENTIAL_TTL_SECS {
+        return Err(AppError::Auth("credential lifetime is invalid".into()));
+    }
+    Ok(())
 }
 
 /// Verify a space credential against a key resolved from a DID document.
@@ -253,6 +345,7 @@ pub fn verify_credential_with_key(
     if now >= claims.exp {
         return Err(AppError::Auth("credential has expired".into()));
     }
+    check_credential_lifetime(&claims, now)?;
 
     Ok(claims)
 }
@@ -309,6 +402,7 @@ pub fn verify_credential(
     if now >= claims.exp {
         return Err(AppError::Auth("credential has expired".into()));
     }
+    check_credential_lifetime(&claims, now)?;
 
     Ok(claims)
 }
@@ -478,11 +572,27 @@ mod tests {
             .unwrap()
             .as_secs();
         SpaceCredentialClaims {
+            cnf: None,
             iss: "did:plc:spaceowner".into(),
             sub: "at://did:plc:spaceowner/space/com.example.forum/main".into(),
             iat: now,
             exp: now + DEFAULT_CREDENTIAL_TTL_SECS,
             jti: make_jti(),
+        }
+    }
+
+    /// @atproto/crypto refuses high-S signatures unless a caller opts out,
+    /// and the reference PDS verifies credentials without opting out.
+    #[test]
+    fn credential_signatures_are_low_s() {
+        let keypair = generate_dpop_keypair().unwrap();
+        for _ in 0..64 {
+            let token = sign_credential(&make_claims(), &keypair.private_jwk).unwrap();
+            let sig_bytes = URL_SAFE_NO_PAD
+                .decode(token.rsplit('.').next().unwrap())
+                .unwrap();
+            let sig = Signature::from_slice(&sig_bytes).unwrap();
+            assert_eq!(sig.normalize_s().to_bytes(), sig.to_bytes(), "high-S signature");
         }
     }
 
@@ -536,6 +646,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let claims = SpaceCredentialClaims {
+            cnf: None,
             iss: "did:plc:owner".into(),
             sub: "at://did:plc:owner/space/com.example.test/main".into(),
             iat: now - 7200,
@@ -547,6 +658,58 @@ mod tests {
         let result = verify_credential(&token, &keypair.public_jwk);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expired"));
+    }
+
+    fn verify_with_times(
+        iat_offset: i64,
+        lifetime: i64,
+        jti: &str,
+    ) -> Result<SpaceCredentialClaims, AppError> {
+        let keypair = generate_dpop_keypair().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let iat = now + iat_offset;
+        let claims = SpaceCredentialClaims {
+            cnf: None,
+            iss: "did:plc:owner".into(),
+            sub: "at://did:plc:owner/space/com.example.test/main".into(),
+            iat: iat as u64,
+            exp: (iat + lifetime) as u64,
+            jti: jti.into(),
+        };
+        let token = sign_credential(&claims, &keypair.private_jwk).unwrap();
+        verify_credential(&token, &keypair.public_jwk)
+    }
+
+    #[test]
+    fn verify_accepts_an_hour_long_credential() {
+        assert!(verify_with_times(0, 3600, "jti").is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_a_credential_longer_than_an_hour() {
+        assert!(verify_with_times(0, 3601, "jti").is_err());
+    }
+
+    #[test]
+    fn verify_rejects_a_credential_that_expires_before_it_is_issued() {
+        assert!(verify_with_times(2, 0, "jti").is_err());
+    }
+
+    #[test]
+    fn verify_rejects_a_credential_issued_in_the_future() {
+        assert!(verify_with_times(60, 600, "jti").is_err());
+        assert!(
+            verify_with_times(3, 600, "jti").is_ok(),
+            "within clock skew"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_credential_without_a_jti() {
+        assert!(verify_with_times(0, 600, "").is_err());
     }
 
     #[test]
