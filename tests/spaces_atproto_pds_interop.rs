@@ -108,6 +108,8 @@ impl Account {
             .post(
                 "com.atproto.simplespace.createSpace",
                 json!({
+                    // `spaceType` and `type` to handle backwards compat.
+                    "spaceType": "com.example.forum",
                     "type": "com.example.forum",
                     "skey": "self",
                     "policy": { "$type": "com.atproto.simplespace.defs#memberListPolicy" },
@@ -406,6 +408,8 @@ async fn atproto_pds_stores_split_read_and_write_policies() {
         .post(
             "com.atproto.simplespace.createSpace",
             json!({
+                // `spaceType` and `type` to handle backwards compat.
+                "spaceType": "com.example.forum",
                 "type": "com.example.forum",
                 "skey": "self",
                 "readPolicy": Policy::Public,
