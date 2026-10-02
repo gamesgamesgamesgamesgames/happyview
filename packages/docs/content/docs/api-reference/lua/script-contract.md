@@ -69,7 +69,7 @@ Every invocation gets the same keys. A key that does not apply to the trigger is
 | `collection` | string? | Query and procedure: the lexicon's `target_collection`. Record event: the record's collection |
 | `params` | table? | Procedure: the query-string parameters. The body is `input` |
 | `delegate_did` | string? | Procedure: the account the caller is delegated to write for |
-| `space` | table? | Query and procedure on a space-scoped request: `{ uri, id, did, authority_did, type_nsid, skey }` |
+| `space` | table? | Query and procedure on a space-scoped request: `{ uri, id, did, authority_did, spaceType, skey }` |
 | `job` | table? | Job: `{ id, progress(data), should_stop(), wait(seconds) }`. See [Background Jobs](../../guides/background-jobs.md#controlling-a-running-job) |
 
 `has_pds_auth` is what decides whether a library call that acts as the caller can succeed. `create`, `put`, `delete` and `upload_blob` on `happyview.record`, and `procedure` on `happyview.xrpc`, raise `NO_SESSION` when it is `false`.

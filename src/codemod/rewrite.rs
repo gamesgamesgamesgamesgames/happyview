@@ -687,6 +687,7 @@ impl<'a> Planner<'a> {
             "space" => match dots.first() {
                 Some(&"space") => self.rename_head(path, 1, "ctx.space.uri", &[]),
                 Some(&"space_id") => self.rename_head(path, 1, "ctx.space.id", &[]),
+                Some(&"type_nsid") => self.rename_head(path, 1, "ctx.space.spaceType", &[]),
                 _ => self.rename_head(path, 0, "ctx.space", &[]),
             },
             "job" => self.visit_job(path, &dots),
@@ -1166,16 +1167,34 @@ impl<'a> Planner<'a> {
         let (Some(start), Some(end)) = (start_of(*args), end_of(*args)) else {
             return self.no_equivalent(path, "atproto", Some("spaces"));
         };
-        self.replace_through(
-            path,
-            2,
-            vec![
+        let mut edits = vec![Edit {
+            start: match path.start() {
+                Some(start) => start,
+                None => return,
+            },
+            end,
+            pieces: vec![
                 Piece::Text(format!("spaces.get((spaces.{name}")),
                 Piece::Source(start, end),
                 Piece::Text(").uri)".into()),
             ],
-            &["spaces"],
-        );
+        }];
+        // The spec, the HTTP surface and the library all name a space's type
+        // `spaceType`; a table carried forward verbatim would hand v3 a key
+        // it does not read.
+        if name == "create"
+            && let Some(table) = path.segs.get(2).and_then(call_table)
+        {
+            for field in table.fields() {
+                if let Field::NameKey { key, .. } = field
+                    && identifier(key) == Some("type")
+                    && let (Some(start), Some(end)) = (start_of(key), end_of(key))
+                {
+                    edits.push(Edit::replace(start, end, "spaceType"));
+                }
+            }
+        }
+        self.commit(path, &["spaces"], edits);
     }
 
     /// Membership is a handle method in v3 rather than a module function, so
@@ -1887,13 +1906,28 @@ mod tests {
         );
     }
 
+    /// Each v2 space field answers under the name v3 gives it, and the type
+    /// is the one the spec renamed.
+    #[test]
+    fn the_space_globals_become_their_ctx_space_fields() {
+        let result = query(
+            "function handle()\n  return { uri = space.space, id = space.space_id, kind = space.type_nsid, skey = space.skey }\nend\n",
+        );
+        assert!(
+            result.contains(
+                "{ uri = ctx.space.uri, id = ctx.space.id, kind = ctx.space.spaceType, skey = ctx.space.skey }"
+            ),
+            "{result}"
+        );
+    }
+
     #[test]
     fn a_created_space_is_fetched_back_as_a_handle() {
         let result = query(
             "function handle()\n  local s = atproto.spaces.create{ type = \"t\", skey = \"k\" }\n  return s:query{ limit = 1 }\nend\n",
         );
         assert!(
-            result.contains("spaces.get((spaces.create{ type = \"t\", skey = \"k\" }).uri)"),
+            result.contains("spaces.get((spaces.create{ spaceType = \"t\", skey = \"k\" }).uri)"),
             "{result}"
         );
         assert!(result.contains("s:records{ limit = 1 }"), "{result}");

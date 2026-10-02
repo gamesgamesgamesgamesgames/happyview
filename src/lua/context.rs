@@ -70,7 +70,7 @@ pub fn build_ctx(lua: &Lua, inv: &Invocation<'_>) -> LuaResult<mlua::Table> {
         t.set("id", s.space_id.as_str())?;
         t.set("did", s.did.as_str())?;
         t.set("authority_did", s.authority_did.as_str())?;
-        t.set("type_nsid", s.type_nsid.as_str())?;
+        t.set("spaceType", s.type_nsid.as_str())?;
         t.set("skey", s.skey.as_str())?;
         ctx.set("space", t)?;
     }
@@ -291,7 +291,7 @@ mod reference_tests {
         lua.globals().set("ctx", ctx).unwrap();
         let s: String = lua
             .load(
-                r#"return ctx.delegate_did .. "|" .. ctx.space.uri .. "|" .. ctx.space.id .. "|" .. ctx.space.did .. "|" .. ctx.space.type_nsid .. "|" .. ctx.space.skey"#,
+                r#"return ctx.delegate_did .. "|" .. ctx.space.uri .. "|" .. ctx.space.id .. "|" .. ctx.space.did .. "|" .. ctx.space.spaceType .. "|" .. ctx.space.skey"#,
             )
             .eval()
             .unwrap();

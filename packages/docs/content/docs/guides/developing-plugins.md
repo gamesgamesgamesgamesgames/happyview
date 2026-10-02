@@ -408,7 +408,7 @@ Errors reaching the guest: linked repos imports use `NOT_LINKED` (no grant for t
 
 ### Spaces
 
-A plugin declaring `spaces:read` or `spaces:write` can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope. A space is `{uri, id, did, authority_did, creator_did, type, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at}`; a member is `{did, access}`, where `access` is one of `read`, `write`, `read_self`, or `none`; an invite is `{invite_id, token, access, max_uses, expires_at}`; a record is `{uri, collection, rkey, record, cid, author_did}`.
+A plugin declaring `spaces:read` or `spaces:write` can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope. A space is `{uri, id, did, authority_did, creator_did, spaceType, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at}`; a member is `{did, access}`, where `access` is one of `read`, `write`, `read_self`, or `none`; an invite is `{invite_id, token, access, max_uses, expires_at}`; a record is `{uri, collection, rkey, record, cid, author_did}`.
 
 | Import | Capability | Spec → result |
 | --- | --- | --- |
@@ -416,7 +416,7 @@ A plugin declaring `spaces:read` or `spaces:write` can import the matching funct
 | `host_spaces_query` | `spaces:read` | `{uri, collection?, limit?, cursor?}` → `{records, cursor?}`, `cursor` absent on the last page |
 | `host_spaces_members` | `spaces:read` | `{uri}` → array of members |
 | `host_spaces_access` | `spaces:read` | `{uri, did}` → the DID's access, or null if they aren't a member or the space does not exist |
-| `host_spaces_create` | `spaces:write` | `{type, skey, display_name?, description?, read_policy?, write_policy?, app_access?, config?}` → the space |
+| `host_spaces_create` | `spaces:write` | `{spaceType, skey, display_name?, description?, read_policy?, write_policy?, app_access?, config?}` → the space |
 | `host_spaces_accept_invite` | `spaces:write` | `{token}` → the space |
 | `host_spaces_write_record` | `spaces:write` | `{uri, collection, record}` → `{uri, cid}` |
 | `host_spaces_put_record` | `spaces:write` | `{uri, collection, rkey, record, swap_cid?}` → `{uri, cid}` |

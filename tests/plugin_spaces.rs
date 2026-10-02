@@ -132,7 +132,7 @@ async fn seeded_space(app: &TestApp, creator: &str) -> String {
         "sdk_spaces",
         "create",
         &[json!({
-            "type": "com.example.forum",
+            "spaceType": "com.example.forum",
             "skey": rand_skey("main"),
         })],
         &ctx_for(creator),
@@ -542,7 +542,7 @@ async fn a_write_with_no_caller_did_is_bad_input_naming_the_caller() {
         &app,
         "sdk_spaces",
         "create",
-        &[json!({"type": "com.example.forum", "skey": rand_skey("main")})],
+        &[json!({"spaceType": "com.example.forum", "skey": rand_skey("main")})],
         &LibraryCallContext::default(),
     )
     .await
@@ -566,7 +566,7 @@ async fn create_without_spaces_write_is_forbidden() {
         &app,
         "sdk_spaces_readonly",
         "create",
-        &[json!({"type": "com.example.forum", "skey": rand_skey("main")})],
+        &[json!({"spaceType": "com.example.forum", "skey": rand_skey("main")})],
         &ctx_for(&rand_did("creator")),
     )
     .await

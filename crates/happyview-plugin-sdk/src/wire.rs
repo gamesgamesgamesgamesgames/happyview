@@ -887,7 +887,7 @@ pub struct SpaceInfo {
     pub did: String,
     pub authority_did: String,
     pub creator_did: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "spaceType")]
     pub type_nsid: String,
     pub skey: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -983,12 +983,12 @@ pub struct SpacesAccess {
     pub did: String,
 }
 
-/// Create a space. `skey` and the collection's `type` NSID are the only
+/// Create a space. `skey` and the collection's `spaceType` NSID are the only
 /// required fields; every policy defaults to whatever the service assigns an
 /// unconfigured space. Needs `spaces:write`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpacesCreate {
-    #[serde(rename = "type")]
+    #[serde(rename = "spaceType")]
     pub type_nsid: String,
     pub skey: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1437,6 +1437,7 @@ pub struct ScriptSpace {
     pub id: String,
     pub did: String,
     pub authority_did: String,
+    #[serde(rename = "spaceType")]
     pub type_nsid: String,
     pub skey: String,
 }
@@ -3071,10 +3072,44 @@ mod spaces_tests {
     fn space_info_round_trips_with_every_field_set() {
         let info = space_info();
         let value = serde_json::to_value(&info).unwrap();
-        assert_eq!(value["type"], "dev.happyview.board");
-        assert!(value.get("type_nsid").is_none());
+        assert_eq!(value["spaceType"], "dev.happyview.board");
         assert_eq!(value["display_name"], "Main board");
         assert_eq!(serde_json::from_value::<SpaceInfo>(value).unwrap(), info);
+    }
+
+    /// The protocol, the HTTP surface and the library all name a space's
+    /// type `spaceType`; a script author who meets it in one place must find
+    /// the same word in the others, so the three structs that carry it are
+    /// pinned together rather than one test each.
+    #[test]
+    fn every_space_type_field_is_spelled_spacetype_on_the_wire() {
+        let script_space = ScriptSpace {
+            uri: "at://did:plc:owner/space/dev.happyview.board/main".to_string(),
+            id: "space-1".to_string(),
+            did: "did:plc:owner".to_string(),
+            authority_did: "did:plc:authority".to_string(),
+            type_nsid: "dev.happyview.board".to_string(),
+            skey: "main".to_string(),
+        };
+        let create = SpacesCreate {
+            type_nsid: "dev.happyview.board".to_string(),
+            skey: "main".to_string(),
+            display_name: None,
+            description: None,
+            read_policy: None,
+            write_policy: None,
+            app_access: None,
+            config: None,
+        };
+        for value in [
+            serde_json::to_value(space_info()).unwrap(),
+            serde_json::to_value(&create).unwrap(),
+            serde_json::to_value(&script_space).unwrap(),
+        ] {
+            assert_eq!(value["spaceType"], "dev.happyview.board", "{value}");
+            assert!(value.get("type").is_none(), "{value}");
+            assert!(value.get("type_nsid").is_none(), "{value}");
+        }
     }
 
     #[test]
@@ -3243,7 +3278,7 @@ mod spaces_tests {
     #[test]
     fn spaces_create_accepts_only_the_two_required_keys() {
         let create: SpacesCreate = serde_json::from_value(json!({
-            "type": "dev.happyview.board",
+            "spaceType": "dev.happyview.board",
             "skey": "main",
         }))
         .unwrap();
@@ -3270,8 +3305,7 @@ mod spaces_tests {
             config: Some(json!({"foo": "bar"})),
         };
         let value = serde_json::to_value(&create).unwrap();
-        assert_eq!(value["type"], "dev.happyview.board");
-        assert!(value.get("type_nsid").is_none());
+        assert_eq!(value["spaceType"], "dev.happyview.board");
         assert_eq!(
             serde_json::from_value::<SpacesCreate>(value).unwrap(),
             create

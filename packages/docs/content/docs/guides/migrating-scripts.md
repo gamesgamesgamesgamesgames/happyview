@@ -8,7 +8,7 @@ A codemod does the rewrite for you — from the script editor or a CLI — and l
 
 ## What changes
 
-**Contract, every kind:** `caller_did` → `ctx.caller_did`; `delegate_did` → `ctx.delegate_did`; `method` → `ctx.method`; `env` / `env.X` → `ctx.env` / `ctx.env.X`; `space.space` → `ctx.space.uri`, `space.space_id` → `ctx.space.id`, and every other `space.K` → `ctx.space.K`.
+**Contract, every kind:** `caller_did` → `ctx.caller_did`; `delegate_did` → `ctx.delegate_did`; `method` → `ctx.method`; `env` / `env.X` → `ctx.env` / `ctx.env.X`; `space.space` → `ctx.space.uri`, `space.space_id` → `ctx.space.id`, `space.type_nsid` → `ctx.space.spaceType`, and every other `space.K` → `ctx.space.K`.
 
 **Per kind**, the same free name means something different, so the rewrite depends on the script's trigger:
 
@@ -46,7 +46,7 @@ The hoist covers a read inside a function that runs after `handle` has been call
 - `xrpc.query`/`xrpc.procedure` are also handled by an inlined polyfill, because the v3 library's success/failure shape differs from v2's — see [Polyfills](#polyfills).
 - `atproto.spaces.*` → `require("happyview.spaces")`, with `is_member`/`get_access`/`list_members` becoming `spaces.get(uri):is_member(did)` / `:access(did)` / `:members()`, and a space handle's `:query{...}` becoming `:records{...}`
 - `atproto.spaces.query{...}` → `spaces.query{...}`, with its `space_uri` filter key becoming `uri`
-- `atproto.spaces.create{...}` and `atproto.spaces.accept_invite{...}` return a bare `uri` in v3 rather than the v2 handle, so both rewrite to `spaces.get((spaces.create{...}).uri)` / `spaces.get((spaces.accept_invite{...}).uri)` to keep the handle a script can call methods on.
+- `atproto.spaces.create{...}` and `atproto.spaces.accept_invite{...}` return a bare `uri` in v3 rather than the v2 handle, so both rewrite to `spaces.get((spaces.create{...}).uri)` / `spaces.get((spaces.accept_invite{...}).uri)` to keep the handle a script can call methods on. `create`'s `type` key becomes `spaceType`, the name the protocol gives it.
 
 A `local NAME = require("MODULE")` line is inserted once per module actually used, grouped after any leading comment. Running the codemod on an already-migrated script changes nothing. A re-run reports only markers on constructs it left untouched; a marker placed beside a completed rewrite keys on the v2 name that rewrite consumed, so it is not reported again. Treat exit `2` as a first-run signal and search the source for `-- codemod:` to find what is still open.
 
