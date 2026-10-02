@@ -647,7 +647,11 @@ mod outbound_tests {
                 .decode(token.rsplit('.').next().unwrap())
                 .unwrap();
             let sig = p256::ecdsa::Signature::from_slice(&sig_bytes).unwrap();
-            assert_eq!(sig.normalize_s().to_bytes(), sig.to_bytes(), "high-S signature");
+            assert_eq!(
+                sig.normalize_s().to_bytes(),
+                sig.to_bytes(),
+                "high-S signature"
+            );
         }
     }
 
