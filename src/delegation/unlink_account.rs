@@ -54,17 +54,53 @@ pub async fn unlink_account(
     // Delete delegated account (CASCADE deletes all delegates)
     db::delete_delegated_account(&state.db, state.db_backend, account_did).await?;
 
-    // Delete all DPoP sessions for the target account using the stored api_client_id
-    if let Some(api_client_id) = stored_api_client_id
-        && let Err(e) = crate::oauth::sessions::delete_all_dpop_sessions(
+    // Delete all DPoP sessions for the target account using the stored
+    // api_client_id, revoking each at the user's authorization server first —
+    // unlinking that left the grants live on their PDS was the same leak as a
+    // logout that never told anyone.
+    if let Some(api_client_id) = stored_api_client_id {
+        if let Some(encryption_key) = state.config.token_encryption_key.as_ref() {
+            let key_ids = crate::oauth::sessions::dpop_key_ids_for_user(
+                &state.db,
+                state.db_backend,
+                &api_client_id,
+                account_did,
+            )
+            .await
+            .unwrap_or_default();
+
+            for dpop_key_id in &key_ids {
+                if let Err(e) = crate::oauth::pds_write::revoke_dpop_session_at_as(
+                    &state.http,
+                    &state.db,
+                    state.db_backend,
+                    encryption_key,
+                    &state.oauth,
+                    &api_client_id,
+                    account_did,
+                    dpop_key_id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        account_did,
+                        %e,
+                        "failed to revoke session at authorization server on unlink"
+                    );
+                }
+            }
+        }
+
+        if let Err(e) = crate::oauth::sessions::delete_all_dpop_sessions(
             &state.db,
             state.db_backend,
             &api_client_id,
             account_did,
         )
         .await
-    {
-        tracing::warn!(account_did, %e, "failed to clean up DPoP sessions on unlink");
+        {
+            tracing::warn!(account_did, %e, "failed to clean up DPoP sessions on unlink");
+        }
     }
 
     log_event(

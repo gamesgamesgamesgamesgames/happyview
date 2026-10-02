@@ -187,7 +187,7 @@ async fn plc_register(
         .as_ref()
         .ok_or_else(|| AppError::Internal("no signing key stored".into()))?;
     let signing_key_bytes = crate::plc::decrypt_key(signing_key_enc, encryption_key)?;
-    let signing_key_did = crate::plc::private_key_to_did_key(&signing_key_bytes)?;
+    let signing_key_did = happyview_plc::private_key_to_did_key(&signing_key_bytes)?;
 
     // Decrypt rotation key
     let sql = crate::db::adapt_sql(
@@ -202,7 +202,7 @@ async fn plc_register(
         .and_then(|(k,)| k)
         .ok_or_else(|| AppError::Internal("no rotation key stored".into()))?;
     let rotation_key_bytes = crate::plc::decrypt_key(&rotation_key_enc, encryption_key)?;
-    let rotation_key_did = crate::plc::private_key_to_did_key(&rotation_key_bytes)?;
+    let rotation_key_did = happyview_plc::private_key_to_did_key(&rotation_key_bytes)?;
 
     let rotation_signing_key =
         p256::ecdsa::SigningKey::from_slice(rotation_key_bytes.as_slice())
@@ -219,16 +219,16 @@ async fn plc_register(
         })
         .collect();
 
-    let params = crate::plc::PlcGenesisParams {
+    let params = happyview_plc::PlcGenesisParams {
         rotation_key_did_key: rotation_key_did,
         signing_key_did_key: signing_key_did,
         service_entries,
     };
 
     // Build, sign, derive DID, and submit
-    let unsigned = crate::plc::build_unsigned_genesis(&params);
-    let signed = crate::plc::sign_operation(&unsigned, &rotation_signing_key)?;
-    let did = crate::plc::derive_did(&signed)?;
+    let unsigned = happyview_plc::build_unsigned_genesis(&params);
+    let signed = happyview_plc::sign_operation(&unsigned, &rotation_signing_key)?;
+    let did = happyview_plc::derive_did(&signed)?;
 
     crate::plc::submit_genesis(&state.http, &state.config.plc_url, &did, &signed).await?;
 
@@ -605,6 +605,12 @@ async fn complete(_auth: UserAuth, State(state): State<AppState>) -> Result<Stat
     require_setup_incomplete(&state).await?;
     service_identity::mark_setup_complete(&state.db, state.db_backend).await?;
 
+    // A database created by this version already has incremental auto-vacuum and
+    // has nothing stranded, so it must never be prompted to vacuum.
+    if let Err(e) = crate::maintenance::vacuum::mark_not_needed(&state.db, state.db_backend).await {
+        tracing::warn!(error = %e, "failed to mark vacuum as not needed");
+    }
+
     log_event(
         &state.db,
         EventLog {
@@ -644,96 +650,22 @@ async fn resolve_identity(
         return Ok(Json(vec![]));
     }
 
-    // If it's already a DID, resolve the profile directly
-    if q.starts_with("did:") {
-        match crate::profile::resolve_profile(&state.http, &state.config.plc_url, &q).await {
-            Ok(profile) => {
-                return Ok(Json(vec![ResolveResult {
-                    did: profile.did,
-                    handle: Some(profile.handle),
-                    display_name: profile.display_name,
-                    avatar: profile.avatar_url,
-                }]));
-            }
-            Err(_) => {
-                // Return the DID as-is if profile resolution fails
-                return Ok(Json(vec![ResolveResult {
-                    did: q.to_string(),
-                    handle: None,
-                    display_name: None,
-                    avatar: None,
-                }]));
-            }
-        }
+    let Ok(resolved) = crate::identity::resolve_identifier(&q).await else {
+        return Ok(Json(vec![]));
+    };
+
+    match crate::profile::resolve_profile(&state.http, &state.config.plc_url, &resolved.did).await {
+        Ok(profile) => Ok(Json(vec![ResolveResult {
+            did: profile.did,
+            handle: Some(profile.handle),
+            display_name: profile.display_name,
+            avatar: profile.avatar_url,
+        }])),
+        Err(_) => Ok(Json(vec![ResolveResult {
+            did: resolved.did,
+            handle: resolved.handle,
+            display_name: None,
+            avatar: None,
+        }])),
     }
-
-    // Try to resolve the handle to a DID, then fetch the profile.
-    // AT Protocol handle resolution: check DNS TXT `_atproto.<handle>` for `did=<DID>`,
-    // or fall back to `https://<handle>/.well-known/atproto-did`.
-    let handle = q.trim_start_matches('@').to_string();
-    let did = resolve_handle_to_did(&state.http, &handle).await;
-
-    match did {
-        Some(did) => {
-            match crate::profile::resolve_profile(&state.http, &state.config.plc_url, &did).await {
-                Ok(profile) => Ok(Json(vec![ResolveResult {
-                    did: profile.did,
-                    handle: Some(profile.handle),
-                    display_name: profile.display_name,
-                    avatar: profile.avatar_url,
-                }])),
-                Err(_) => Ok(Json(vec![ResolveResult {
-                    did,
-                    handle: Some(handle),
-                    display_name: None,
-                    avatar: None,
-                }])),
-            }
-        }
-        None => Ok(Json(vec![])),
-    }
-}
-
-/// Resolve an AT Protocol handle to a DID.
-/// Tries HTTPS well-known first, then DNS TXT `_atproto.<handle>` fallback.
-async fn resolve_handle_to_did(http: &reqwest::Client, handle: &str) -> Option<String> {
-    // Try HTTPS well-known first (simpler, no DNS library needed here)
-    let url = format!("https://{}/.well-known/atproto-did", handle);
-    if let Ok(resp) = http.get(&url).send().await
-        && resp.status().is_success()
-        && let Ok(text) = resp.text().await
-    {
-        let did = text.trim().to_string();
-        if did.starts_with("did:") {
-            return Some(did);
-        }
-    }
-
-    // Try DNS TXT record `_atproto.<handle>`
-    use hickory_resolver::Resolver;
-    use hickory_resolver::proto::rr::RData;
-    let lookup_name = format!("_atproto.{}.", handle);
-    if let Ok(resolver) = Resolver::builder_tokio().and_then(|b| b.build())
-        && let Ok(txt_lookup) = resolver.txt_lookup(&lookup_name).await
-    {
-        let did = txt_lookup
-            .answers()
-            .iter()
-            .filter_map(|r| match &r.data {
-                RData::TXT(txt) => Some(txt),
-                _ => None,
-            })
-            .flat_map(|txt| txt.txt_data.iter())
-            .filter_map(|data| {
-                let s = std::str::from_utf8(data).ok()?;
-                s.strip_prefix("did=")
-            })
-            .next()
-            .map(|s| s.to_string());
-        if did.is_some() {
-            return did;
-        }
-    }
-
-    None
 }

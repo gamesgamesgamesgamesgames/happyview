@@ -2,11 +2,11 @@
 title: "Glossary"
 ---
 
-Key terms used throughout the HappyView documentation. For a broader introduction to the atproto, see the [official ATProto glossary](https://atproto.com/guides/glossary).
+Key terms used throughout the HappyView documentation. For a broader introduction to the atproto, see the [official atproto glossary](https://atproto.com/guides/glossary).
 
 ## atproto terms
 
-**AppView** — A backend service that indexes atproto records and serves them through an API. HappyView is an AppView. See the [ATProto docs](https://atproto.com/guides/glossary#app-view) for more.
+**AppView** — A backend service that indexes atproto records and serves them through an API. HappyView is an AppView. See the [atproto docs](https://atproto.com/guides/glossary#app-view) for more.
 
 **DID** (Decentralized Identifier) — A persistent, globally unique identifier for an account (e.g. `did:plc:abc123`).
 
@@ -36,29 +36,29 @@ Key terms used throughout the HappyView documentation. For a broader introductio
 
 ## HappyView-specific terms
 
-**App Access** — Controls which third-party apps can interact with a space. Either `open` (any app) or `allowList` (only specified apps). Set via `com.atproto.simplespace.updateConfig`.
+**App Access** — Controls which third-party apps can obtain credentials for a space. Either `open` (any app) or `allowList` (only apps whose attested client ID is listed). Set via `com.atproto.simplespace.createSpace` or `updateSpace`.
 
-**Authority DID** — The DID that controls a space. Distinct from the creator DID (who originally created it). Replaces the earlier `owner_did` concept.
+**Authority DID** — The DID that other services resolve to find a space's host and credential key. For spaces created through HappyView, this is the instance's service identity DID. Distinct from the creator DID, the account that created and administers the space.
 
 **Backfill** — The process of bulk-indexing existing records from the network. HappyView discovers repos via the relay and fetches each repo's records directly from its PDS. Runs when a new record-type lexicon is uploaded or triggered manually. See [Backfill](../guides/backfill.md).
 
-**Delegation Token** — A short-lived JWT (`typ: atproto-space-delegation+jwt`, ES256K, 60-second TTL) that proves a user is a member of a space. Used as step 1 of the credential issuance flow. Obtained via `com.atproto.space.getDelegationToken`.
+**Delegation Token** — A short-lived, single-use JWT (`typ: atproto-space-delegation+jwt`, ES256K, 60-second TTL) carrying a member's consent to issue a credential for a space. Used as step 1 of the credential issuance flow. Obtained via `com.atproto.space.getDelegationToken`, or signed by the account's own key on a PDS that serves spaces.
 
 **LtHash** — A homomorphic set-hash used for per-user repo state in spaces. Uses a 2048-byte state with 1024 little-endian uint16 lanes and BLAKE3 XOF. Supports incremental insert/remove operations.
-
-**Mint Policy** — Controls who can create permissioned repos in a space: `member-list` (only members), `public` (anyone), or `managing-app` (only the managing app).
 
 **Network lexicon** — A lexicon fetched directly from the atproto network via DNS authority resolution, rather than uploaded manually. See [Lexicons - Network lexicons](../guides/lexicons.md#network-lexicons).
 
 **Permission** — A granular access control right that authorizes a specific action in the admin API. HappyView defines 44 permissions organized by category (e.g. `lexicons:create`, `users:read`). See [Permissions](../guides/permissions.md).
 
-**Permissioned Data** — AT Protocol data that is gated by membership in a space, as opposed to public repo data. Defined by AT Protocol Proposal 0016.
+**Permissioned Data** — atproto data that is gated by membership in a space, as opposed to public repo data. Defined by atproto Proposal 0016.
 
 **Permission template** — A predefined set of permissions that can be applied when creating a user. Templates are: **Viewer** (read-only access), **Operator** (viewer + backfill and API key management), **Manager** (operator + lexicon, record, spaces, and plugin management), and **Full Access** (all 44 permissions).
 
-**Space** — A container for permissioned data in AT Protocol. Identified by a space DID, type NSID, and space key (skey), forming an `at://` URI with a `space` path segment (e.g. `at://did:plc:abc/space/com.example.forum/main`).
+**Read Policy / Write Policy** — A space's two independent policies. The read policy decides who can obtain a space credential; the write policy decides whose writes the space tracks. Each is member-list, public, or managing-app.
 
-**Space Credential** — A short-lived JWT (`typ: atproto-space-credential+jwt`, ES256, 2-hour TTL) for cross-service read access to space data. Signed by the space's P-256 keypair. Obtained by exchanging a delegation token via `com.atproto.space.getSpaceCredential`.
+**Space** — A container for permissioned data in atproto. Identified by a space DID, type NSID, and space key (skey), forming an `at://` URI with a `space` path segment (e.g. `at://did:plc:abc/space/com.example.forum/main`).
+
+**Space Credential** — A short-lived JWT (`typ: atproto-space-credential+jwt`, ES256, 10-minute TTL) for cross-service read access to space data. Bound to the requester's P-256 key through `cnf.kid`, and used with HTTP Message Signatures by that key. Obtained by exchanging a delegation token via `com.atproto.space.getSpaceCredential`.
 
 **Super user** — The bootstrapped user created on first login to a fresh HappyView instance. The super user has unrestricted access to all endpoints regardless of permissions, can transfer super status to another user, and cannot be deleted.
 

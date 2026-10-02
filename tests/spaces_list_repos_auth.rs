@@ -54,9 +54,9 @@ async fn create_space(app: &TestApp, skey: &str, membership_public: bool) -> Str
         skey: skey.to_string(),
         display_name: None,
         description: None,
-        mint_policy: MintPolicy::MemberList,
+        read_policy: Policy::MemberList,
+        write_policy: Policy::MemberList,
         app_access: AppAccess::Open,
-        managing_app_did: None,
         config: SpaceConfig {
             membership_public,
             ..Default::default()
@@ -79,7 +79,7 @@ async fn add_member(app: &TestApp, space_id: &str, did: &str) {
             id: Uuid::new_v4().to_string(),
             space_id: space_id.to_string(),
             did: did.to_string(),
-            access: SpaceAccess::Read,
+            access: MemberAccess::READ,
             is_delegation: false,
             granted_by: Some(AUTHORITY.to_string()),
             created_at: now_rfc3339(),

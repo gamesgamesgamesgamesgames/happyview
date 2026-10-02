@@ -136,6 +136,9 @@ test.describe("Service Identity Settings", () => {
     ).not.toBeVisible({ timeout: 3000 })
   })
 
+  // Changing the mode deliberately un-completes setup — that redirect is the
+  // behaviour under test, so this cannot restore the instance inline without
+  // undoing its own assertion. The afterAll below is what puts it back.
   test("change mode redirects to setup", async ({ page }) => {
     const changeModeButton = page.getByRole("button", { name: /change mode/i })
     await expect(changeModeButton).toBeVisible({ timeout: 5000 })
@@ -146,5 +149,18 @@ test.describe("Service Identity Settings", () => {
     await confirmButton.click()
 
     await expect(page).toHaveURL(/\/setup/, { timeout: 10000 })
+  })
+
+  // This file is the only one that can leave the instance needing setup, and a
+  // half-configured instance is not a state any later spec asks for: every
+  // dashboard page redirects to the wizard, so the next spec to run fails on a
+  // page it never navigated to. That reads as a broken environment rather than
+  // as state this file leaked, which is expensive to diagnose — `spaces.spec.ts`
+  // only escapes it by driving the API instead of the UI.
+  //
+  // afterAll rather than an inline restore so a test that fails partway through
+  // still hands the instance back set up.
+  test.afterAll(async () => {
+    await setServiceIdentityMode("did_web", { did: "did:web:localhost" })
   })
 })

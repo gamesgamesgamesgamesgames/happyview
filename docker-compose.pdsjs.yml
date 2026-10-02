@@ -1,0 +1,99 @@
+# pds.js, a single-account PDS that serves atproto spaces, for interop testing.
+#
+#   docker compose -f docker-compose.pdsjs.yml up -d --wait
+#   cargo test --test spaces_pdsjs_interop -- --ignored --nocapture
+#   docker compose -f docker-compose.pdsjs.yml down -v
+#
+# Pulls the newest image from happyproto/pds-test; `docker compose pull`
+# refreshes a stale one. CI runs the image pinned in interop/images.env, and
+# `--env-file interop/images.env` does the same locally. To test a local
+# checkout, add `--build`; PDSJS_DIR defaults to ../../atproto/pds.js.
+#
+# pds.js hosts one account and has no createAccount; the test suite registers
+# the account on first use. What this host covers is described in
+# tests/spaces_pdsjs_interop.rs.
+#
+# Isolated from the dev, test and e2e stacks — see the note in docker-compose.yml.
+name: happyview-pdsjs
+
+x-pdsjs-common: &pdsjs-common
+  image: ${PDSJS_IMAGE:-ghcr.io/happyproto/pds-test/pdsjs:latest}
+  build:
+    context: ${PDSJS_DIR:-../../atproto/pds.js}
+  environment: &pdsjs-env
+    PDS_HOSTNAME: localhost
+    JWT_SECRET: pdsjs-interop-jwt-secret
+    PDS_PASSWORD: password123
+    PLC_URL: http://plc:2582
+  healthcheck:
+    test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+process.env.PORT+'/xrpc/_health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+    start_period: 2s
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: plc
+      POSTGRES_PASSWORD: plc
+      POSTGRES_DB: plc
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plc -d plc"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  plc:
+    # Built nightly by happyproto/pds-test; built from source only when it
+    # cannot be pulled.
+    image: ${PLC_IMAGE:-ghcr.io/happyproto/pds-test/plc:latest}
+    build:
+      context: https://github.com/did-method-plc/did-method-plc.git
+      dockerfile: packages/server/Dockerfile
+    environment:
+      DB_CREDS_JSON: '{"username":"plc","password":"plc","host":"postgres","port":"5432","database":"plc"}'
+      ENABLE_MIGRATIONS: "true"
+      DB_MIGRATE_CREDS_JSON: '{"username":"plc","password":"plc","host":"postgres","port":"5432","database":"plc"}'
+      PORT: "2582"
+    # 2585, so this stack can run alongside the ZDS and alpha stacks.
+    ports:
+      - "2585:2582"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Spaces on: the host under test.
+  pdsjs:
+    <<: *pdsjs-common
+    environment:
+      <<: *pdsjs-env
+      PORT: "2588"
+      PDS_ENABLE_SPACES: "true"
+    ports:
+      - "2588:2588"
+    volumes:
+      - pdsjs-data:/data
+    depends_on:
+      plc:
+        condition: service_started
+
+  # The same build with spaces off, for detection to tell apart.
+  pdsjs-no-spaces:
+    <<: *pdsjs-common
+    environment:
+      <<: *pdsjs-env
+      PORT: "2589"
+      PDS_ENABLE_SPACES: "false"
+    ports:
+      - "2589:2589"
+    volumes:
+      - pdsjs-no-spaces-data:/data
+    depends_on:
+      plc:
+        condition: service_started
+
+volumes:
+  pdsjs-data:
+  pdsjs-no-spaces-data:

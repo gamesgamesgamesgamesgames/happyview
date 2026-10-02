@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use crate::db::{DatabaseBackend, adapt_sql};
 use crate::error::AppError;
-use crate::plc::private_key_to_did_key;
 use crate::plugin::encryption::{decrypt, encrypt};
+use happyview_plc::private_key_to_did_key;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -195,7 +195,7 @@ pub fn private_key_bytes_to_signing_key(key_bytes: &[u8]) -> Result<SigningKey, 
 }
 
 pub fn private_key_bytes_to_did_key(key_bytes: &[u8]) -> Result<String, AppError> {
-    private_key_to_did_key(key_bytes)
+    Ok(private_key_to_did_key(key_bytes)?)
 }
 
 // ---------------------------------------------------------------------------

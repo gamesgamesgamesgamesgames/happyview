@@ -323,7 +323,7 @@ function ScriptsTargetingPanel({
           <li key={kind}>
             {script ? (
               <Link
-                href={`/dashboard/settings/scripts/${encodeURIComponent(triggerId)}`}
+                href={`/dashboard/settings/scripts/${encodeURIComponent(triggerId)}?lexicon=${encodeURIComponent(lexiconId)}`}
                 className="group flex items-start gap-3 rounded-md border p-3 transition-colors hover:bg-accent/50"
               >
                 <IconScript className="text-muted-foreground mt-0.5 size-4 flex-shrink-0" />
@@ -340,7 +340,7 @@ function ScriptsTargetingPanel({
               </Link>
             ) : canManage ? (
               <Link
-                href={`/dashboard/settings/scripts/new?id=${encodeURIComponent(triggerId)}`}
+                href={`/dashboard/settings/scripts/new?id=${encodeURIComponent(triggerId)}&lexicon=${encodeURIComponent(lexiconId)}`}
                 className="group flex items-start gap-3 rounded-md border border-dashed p-3 transition-colors hover:bg-accent/50"
               >
                 <IconPlus className="text-muted-foreground mt-0.5 size-4 flex-shrink-0" />

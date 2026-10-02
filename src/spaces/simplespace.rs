@@ -1,7 +1,7 @@
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 
@@ -19,15 +19,26 @@ use crate::spaces::{SpaceUri, db, members};
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreateSpaceInput {
-    #[serde(rename = "type")]
+    /// `type` is the earlier name, accepted until v3.
+    #[serde(rename = "spaceType", alias = "type")]
     pub type_nsid: String,
     pub skey: String,
     pub display_name: Option<String>,
     pub description: Option<String>,
-    pub mint_policy: Option<MintPolicy>,
-    pub app_access: Option<AppAccess>,
-    pub managing_app_did: Option<String>,
+    // Raw, so `parse_policy` can report an unimplemented variant with its own
+    // error code rather than as a generic deserialize failure.
+    pub read_policy: Option<serde_json::Value>,
+    pub write_policy: Option<serde_json::Value>,
+    pub app_access: Option<serde_json::Value>,
     pub config: Option<SpaceConfig>,
+    /// One policy for both reads and writes, as clients sent it before the
+    /// split: `policy` from earlier drafts, `mintPolicy` from HappyView.
+    /// Accepted until v3.
+    pub policy: Option<serde_json::Value>,
+    pub mint_policy: Option<serde_json::Value>,
+    /// The legacy policy's managing app, sent beside it rather than inside.
+    pub managing_app: Option<String>,
+    pub managing_app_did: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -48,18 +59,42 @@ pub(crate) struct UpdateSpaceInput {
     pub space: String,
     pub display_name: Option<Option<String>>,
     pub description: Option<Option<String>>,
-    pub mint_policy: Option<MintPolicy>,
-    pub app_access: Option<AppAccess>,
-    pub managing_app_did: Option<Option<String>>,
+    pub read_policy: Option<serde_json::Value>,
+    pub write_policy: Option<serde_json::Value>,
+    pub app_access: Option<serde_json::Value>,
     pub config: Option<SpaceConfig>,
+    /// One policy for both reads and writes, as clients sent it before the
+    /// split: `policy` from earlier drafts, `mintPolicy` from HappyView.
+    /// Accepted until v3.
+    pub policy: Option<serde_json::Value>,
+    pub mint_policy: Option<serde_json::Value>,
+    /// The legacy policy's managing app, sent beside it rather than inside.
+    pub managing_app: Option<String>,
+    pub managing_app_did: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PutMemberInput {
+    pub space: String,
+    pub did: String,
+    /// Both required by the lexicon, and not defaulted: putMember replaces the
+    /// pair wholesale, so a defaulted value would grant or revoke access the
+    /// caller never specified.
+    pub read: bool,
+    pub write: bool,
+    /// HappyView extension: a member added transitively via a delegated space.
+    pub is_delegation: Option<bool>,
+}
+
+/// `addMember`, which predates `putMember`, names access with one word.
+/// Accepted until v3.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AddMemberInput {
     pub space: String,
     pub did: String,
-    pub access: Option<SpaceAccess>,
+    pub access: Option<String>,
     pub is_delegation: Option<bool>,
 }
 
@@ -70,15 +105,6 @@ pub(crate) struct RemoveMemberInput {
     pub did: String,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct UpdateConfigInput {
-    pub space: String,
-    pub mint_policy: Option<MintPolicy>,
-    pub app_access: Option<AppAccess>,
-    pub managing_app: Option<Option<String>>,
-}
-
 // ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
@@ -86,42 +112,39 @@ pub(crate) struct UpdateConfigInput {
 const NS: &str = "com.atproto";
 const LEGACY_NS: &str = "dev.happyview";
 
+/// Every `simplespace` method this build serves. See
+/// [`crate::spaces::routes::protocol_method_table`] for why this is a table.
+pub(crate) fn management_method_table() -> Vec<(String, MethodRouter<AppState>)> {
+    vec![
+        (format!("{NS}.simplespace.createSpace"), post(create_space)),
+        (format!("{NS}.simplespace.updateSpace"), post(update_space)),
+        (format!("{NS}.simplespace.deleteSpace"), post(delete_space)),
+        (
+            format!("{NS}.simplespace.getSpace"),
+            get(crate::spaces::routes::get_space),
+        ),
+        (format!("{NS}.simplespace.putMember"), post(put_member)),
+        (
+            format!("{NS}.simplespace.removeMember"),
+            post(remove_member),
+        ),
+        (format!("{NS}.simplespace.listMembers"), get(list_members)),
+    ]
+}
+
 pub fn simplespace_routes() -> Router<AppState> {
-    Router::new()
-        // Management routes (com.atproto.simplespace.*)
+    let mut router = Router::new();
+    for (nsid, handler) in management_method_table() {
+        router = router.route(&format!("/xrpc/{nsid}"), handler);
+    }
+
+    router
+        // Backward-compatible aliases (dev.happyview.space.*) — kept until v3
+        .route("/xrpc/com.atproto.simplespace.addMember", post(add_member))
         .route(
-            &format!("/xrpc/{NS}.simplespace.createSpace"),
-            post(create_space),
-        )
-        .route(
-            &format!("/xrpc/{NS}.simplespace.updateSpace"),
-            post(update_space),
-        )
-        .route(
-            &format!("/xrpc/{NS}.simplespace.deleteSpace"),
-            post(delete_space),
-        )
-        .route(
-            &format!("/xrpc/{NS}.simplespace.addMember"),
+            &format!("/xrpc/{LEGACY_NS}.space.addMember"),
             post(add_member),
         )
-        .route(
-            &format!("/xrpc/{NS}.simplespace.removeMember"),
-            post(remove_member),
-        )
-        .route(
-            &format!("/xrpc/{NS}.simplespace.listMembers"),
-            get(list_members),
-        )
-        .route(
-            &format!("/xrpc/{NS}.simplespace.getConfig"),
-            get(get_config),
-        )
-        .route(
-            &format!("/xrpc/{NS}.simplespace.updateConfig"),
-            post(update_config),
-        )
-        // Backward-compatible aliases (dev.happyview.space.*) — kept until v3
         .route(
             &format!("/xrpc/{LEGACY_NS}.space.createSpace"),
             post(create_space),
@@ -135,8 +158,8 @@ pub fn simplespace_routes() -> Router<AppState> {
             post(delete_space),
         )
         .route(
-            &format!("/xrpc/{LEGACY_NS}.space.addMember"),
-            post(add_member),
+            &format!("/xrpc/{LEGACY_NS}.space.putMember"),
+            post(put_member),
         )
         .route(
             &format!("/xrpc/{LEGACY_NS}.space.removeMember"),
@@ -172,31 +195,81 @@ async fn resolve_space(state: &AppState, space_uri: &str) -> Result<Space, AppEr
     .ok_or_else(|| AppError::NotFound("Space not found".into()))
 }
 
-async fn require_space_admin(state: &AppState, space: &Space, did: &str) -> Result<(), AppError> {
-    use crate::db::adapt_sql;
-    if space.authority_did == did {
-        return Ok(());
-    }
-    let sql = adapt_sql(
-        "SELECT is_super FROM happyview_users WHERE did = ?",
-        state.db_backend,
-    );
-    let row: Option<(i32,)> = crate::db::query_as(&sql)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to check admin status: {e}")))?;
-    if row.is_some_and(|(is_super,)| is_super != 0) {
-        return Ok(());
-    }
-    Err(AppError::Forbidden(
-        "Only the space authority can perform this action".into(),
-    ))
-}
-
 // ---------------------------------------------------------------------------
 // Space management handlers
 // ---------------------------------------------------------------------------
+
+/// Convert a supplied policy value, naming the failure.
+///
+/// A host MUST reject a policy it does not implement rather than store one it
+/// cannot enforce, and the rejection carries `UnsupportedPolicy` so a client can
+/// distinguish it from a malformed request.
+fn parse_policy(raw: Option<serde_json::Value>, field: &str) -> Result<Option<Policy>, AppError> {
+    raw.map(|v| {
+        serde_json::from_value(v).map_err(|_| AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "UnsupportedPolicy",
+            message: format!("{field} names a policy this host does not implement"),
+        })
+    })
+    .transpose()
+}
+
+/// The single policy clients sent before reads and writes were split, which
+/// governed both.
+fn legacy_policy(
+    policy: Option<serde_json::Value>,
+    mint_policy: Option<serde_json::Value>,
+    managing_app: Option<String>,
+    managing_app_did: Option<String>,
+) -> Result<Option<Policy>, AppError> {
+    let Some(raw) = policy.or(mint_policy) else {
+        return Ok(None);
+    };
+    let unsupported = || AppError::XrpcError {
+        status: StatusCode::BAD_REQUEST,
+        code: "UnsupportedPolicy",
+        message: "policy names a policy this host does not implement".into(),
+    };
+    let Some(name) = raw.as_str() else {
+        return parse_policy(Some(raw), "policy");
+    };
+    match name {
+        "public" => Ok(Some(Policy::Public)),
+        "member-list" => Ok(Some(Policy::MemberList)),
+        "managing-app" => managing_app
+            .or(managing_app_did)
+            .map(|managing_app| Some(Policy::ManagingApp { managing_app }))
+            .ok_or_else(unsupported),
+        _ => Err(unsupported()),
+    }
+}
+
+fn parse_app_access(raw: Option<serde_json::Value>) -> Result<Option<AppAccess>, AppError> {
+    // Earlier HappyView tagged variants with `type` and a short name.
+    let raw = raw.map(|mut v| {
+        if let Some(obj) = v.as_object_mut()
+            && !obj.contains_key("$type")
+            && let Some(kind) = obj
+                .remove("type")
+                .and_then(|t| t.as_str().map(str::to_string))
+        {
+            obj.insert(
+                "$type".into(),
+                format!("com.atproto.simplespace.defs#{kind}").into(),
+            );
+        }
+        v
+    });
+    raw.map(|v| {
+        serde_json::from_value(v).map_err(|_| AppError::XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            code: "UnsupportedAppAccess",
+            message: "appAccess names a variant this host does not implement".into(),
+        })
+    })
+    .transpose()
+}
 
 async fn create_space(
     State(state): State<AppState>,
@@ -204,6 +277,12 @@ async fn create_space(
     Json(input): Json<CreateSpaceInput>,
 ) -> Result<Response, AppError> {
     let claims = require_auth(&xrpc_claims)?;
+    let legacy = legacy_policy(
+        input.policy,
+        input.mint_policy,
+        input.managing_app,
+        input.managing_app_did,
+    )?;
     let space = service::create_space(
         &state,
         claims.did(),
@@ -211,9 +290,9 @@ async fn create_space(
         &input.skey,
         input.display_name,
         input.description,
-        input.mint_policy,
-        input.app_access,
-        input.managing_app_did,
+        parse_policy(input.read_policy, "readPolicy")?.or_else(|| legacy.clone()),
+        parse_policy(input.write_policy, "writePolicy")?.or(legacy),
+        parse_app_access(input.app_access)?,
         input.config,
     )
     .await?;
@@ -242,15 +321,21 @@ async fn update_space(
     Json(input): Json<UpdateSpaceInput>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claims = require_auth(&xrpc_claims)?;
+    let legacy = legacy_policy(
+        input.policy,
+        input.mint_policy,
+        input.managing_app,
+        input.managing_app_did,
+    )?;
     let space = service::update_space(
         &state,
         claims.did(),
         &input.space,
         input.display_name,
         input.description,
-        input.mint_policy,
-        input.app_access,
-        input.managing_app_did,
+        parse_policy(input.read_policy, "readPolicy")?.or_else(|| legacy.clone()),
+        parse_policy(input.write_policy, "writePolicy")?.or(legacy),
+        parse_app_access(input.app_access)?,
         input.config,
     )
     .await?;
@@ -278,18 +363,53 @@ async fn list_members(
     Ok(Json(serde_json::json!({ "members": resolved })))
 }
 
+async fn put_member(
+    State(state): State<AppState>,
+    xrpc_claims: XrpcClaims,
+    Json(input): Json<PutMemberInput>,
+) -> Result<Response, AppError> {
+    let claims = require_auth(&xrpc_claims)?;
+    // read_self is never settable over the wire: the spec's member list has no
+    // such concept. See `MemberAccess`.
+    let access = MemberAccess {
+        read: input.read,
+        write: input.write,
+        read_self: false,
+    };
+    let member = service::put_member(
+        &state,
+        claims.did(),
+        &input.space,
+        &input.did,
+        access,
+        input.is_delegation,
+    )
+    .await?;
+    let mut response = Json(serde_json::json!({ "member": member })).into_response();
+    *response.status_mut() = StatusCode::CREATED;
+    Ok(response)
+}
+
 async fn add_member(
     State(state): State<AppState>,
     xrpc_claims: XrpcClaims,
     Json(input): Json<AddMemberInput>,
 ) -> Result<Response, AppError> {
     let claims = require_auth(&xrpc_claims)?;
+    let access = input
+        .access
+        .as_deref()
+        .map(|word| {
+            MemberAccess::parse_wire(word)
+                .ok_or_else(|| AppError::BadRequest(format!("unknown access '{word}'")))
+        })
+        .transpose()?;
     let member = service::add_member(
         &state,
         claims.did(),
         &input.space,
         &input.did,
-        input.access,
+        access,
         input.is_delegation,
     )
     .await?;
@@ -306,50 +426,4 @@ async fn remove_member(
     let claims = require_auth(&xrpc_claims)?;
     service::remove_member(&state, claims.did(), &input.space, &input.did).await?;
     Ok(Json(serde_json::json!({ "success": true })))
-}
-
-async fn get_config(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Query(query): Query<SpaceUriQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let space = resolve_space(&state, &query.space).await?;
-    let claims = require_auth(&xrpc_claims)?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    Ok(Json(serde_json::json!({
-        "$type": "com.atproto.simplespace.defs#spaceConfig",
-        "mintPolicy": space.mint_policy,
-        "appAccess": space.app_access,
-        "managingApp": space.managing_app_did,
-    })))
-}
-
-async fn update_config(
-    State(state): State<AppState>,
-    xrpc_claims: XrpcClaims,
-    Json(input): Json<UpdateConfigInput>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let claims = require_auth(&xrpc_claims)?;
-    let mut space = resolve_space(&state, &input.space).await?;
-    require_space_admin(&state, &space, claims.did()).await?;
-
-    if let Some(policy) = input.mint_policy {
-        space.mint_policy = policy;
-    }
-    if let Some(access) = input.app_access {
-        space.app_access = access;
-    }
-    if let Some(managing_app) = input.managing_app {
-        space.managing_app_did = managing_app;
-    }
-
-    db::update_space(&state.db, state.db_backend, &space).await?;
-
-    Ok(Json(serde_json::json!({
-        "$type": "com.atproto.simplespace.defs#spaceConfig",
-        "mintPolicy": space.mint_policy,
-        "appAccess": space.app_access,
-        "managingApp": space.managing_app_did,
-    })))
 }

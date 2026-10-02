@@ -20,6 +20,38 @@ fn pds_error(context: &str, e: AppError) -> mlua::Error {
     }
 }
 
+/// Reject a `Record` write aimed at a repo the caller has no credentials for.
+///
+/// `record:set_repo()` will point a write at any DID, but a `Record` write acts
+/// as the caller either way: the DPoP path looks up a session keyed by the
+/// target DID, and the cookie path presents the caller's own token. Neither can
+/// write to somebody else's repo, so such a write can never succeed — the only
+/// question is how confusingly it fails.
+///
+/// Badly, without this check. The DPoP path dies deep in session lookup with
+/// `PDS createRecord failed: not found: DPoP session not found`, which reads as
+/// a broken login. That error cost one reporter several days and three
+/// rewritten OAuth clients before the real answer surfaced: the instance was
+/// never given access to the repo the script had redirected the write to.
+///
+/// Writing to another account's repo is what [`linked_repos`](crate::lua::linked_repos_api)
+/// is for.
+fn check_writable_repo(
+    repo: &str,
+    caller_did: &str,
+    delegate_did: Option<&str>,
+) -> mlua::Result<()> {
+    if repo == caller_did || Some(repo) == delegate_did {
+        return Ok(());
+    }
+    Err(mlua::Error::runtime(format!(
+        "cannot write to repo {repo}: a Record write acts as the caller \
+         ({caller_did}), so it can only target the caller's own repo. To write \
+         to another account's repo, an admin must link that repo, and the \
+         script should use linked_repos.get(\"{repo}\") instead of set_repo()."
+    )))
+}
+
 const INTERNAL_FIELDS: &[&str] = &[
     "_collection",
     "_uri",
@@ -95,6 +127,7 @@ pub(crate) fn register_record_api(
                     .as_deref()
                     .or(delegate_did.as_deref())
                     .unwrap_or_else(|| claims.did());
+                check_writable_repo(repo, claims.did(), delegate_did.as_deref())?;
 
                 // Validate required fields against schema
                 if let mlua::Value::Table(ref schema_table) = schema {
@@ -152,8 +185,7 @@ pub(crate) fn register_record_api(
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT (uri) DO UPDATE
                                SET record = EXCLUDED.record,
-                                   cid = EXCLUDED.cid,
-                                   indexed_at = ?"#,
+                                   cid = EXCLUDED.cid"#,
                         backend,
                     );
                     let _ = crate::db::query(&upsert_sql)
@@ -163,8 +195,7 @@ pub(crate) fn register_record_api(
                         .bind(&rkey)
                         .bind(&data_str)
                         .bind(cid)
-                        .bind(&now)
-                        .bind(&now)
+                        .bind(crate::db::NO_INDEXED_AT)
                         .bind(&now)
                         .execute(&state.db)
                         .await;
@@ -212,8 +243,8 @@ pub(crate) fn register_record_api(
                         let data_str = serde_json::to_string(&data).unwrap_or_default();
                         let now = now_rfc3339();
                         let upsert_sql = adapt_sql(
-                            r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
-                               VALUES (?, ?, ?, ?, ?, ?, ?)
+                            r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                ON CONFLICT (uri) DO UPDATE
                                    SET record = EXCLUDED.record,
                                        cid = EXCLUDED.cid"#,
@@ -226,6 +257,7 @@ pub(crate) fn register_record_api(
                             .bind(rkey)
                             .bind(&data_str)
                             .bind(cid)
+                            .bind(crate::db::NO_INDEXED_AT)
                             .bind(&now)
                             .execute(&state.db)
                             .await;
@@ -292,26 +324,41 @@ pub(crate) fn register_record_api(
                 // reflected in the local DB even when the PDS is down or
                 // refuses the call. The local row is the source of truth
                 // for the index.
-                match pds_auth
-                    .post_json(&state, repo, "com.atproto.repo.deleteRecord", &pds_body)
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => {}
-                    Ok(resp) => {
-                        let status = resp.status();
-                        let body = resp.text().await.unwrap_or_default();
-                        tracing::warn!(
-                            uri = %uri,
-                            "PDS deleteRecord returned {status}: {body} \
-                             — proceeding with local delete anyway"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            uri = %uri,
-                            "PDS deleteRecord failed: {e} \
-                             — proceeding with local delete anyway"
-                        );
+                //
+                // A delete aimed at somebody else's repo is skipped rather
+                // than attempted: it acts as the caller, so it can only fail,
+                // and it would fail as `DPoP session not found` — an error
+                // about the caller's login rather than about the repo the
+                // script pointed at. Unlike `:save()` this isn't fatal, since
+                // dropping the record from the index is still meaningful.
+                if let Err(e) = check_writable_repo(repo, claims.did(), delegate_did.as_deref()) {
+                    tracing::warn!(
+                        uri = %uri,
+                        "skipping PDS deleteRecord: {e} \
+                         — proceeding with local delete anyway"
+                    );
+                } else {
+                    match pds_auth
+                        .post_json(&state, repo, "com.atproto.repo.deleteRecord", &pds_body)
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {}
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            tracing::warn!(
+                                uri = %uri,
+                                "PDS deleteRecord returned {status}: {body} \
+                                 — proceeding with local delete anyway"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                uri = %uri,
+                                "PDS deleteRecord failed: {e} \
+                                 — proceeding with local delete anyway"
+                            );
+                        }
                     }
                 }
 
@@ -341,6 +388,9 @@ pub(crate) fn register_record_api(
     // `_repo_override` / `claims.did()` for the repo, and generate an
     // rkey via `_key_type` if `_rkey` isn't set. Errors clearly when no
     // DID can be determined.
+    //
+    // `cid` and `indexed_at` are network-derived and are never written here —
+    // see the comment on the upsert below.
     {
         let state = state.clone();
         let claims = claims.clone();
@@ -417,15 +467,25 @@ pub(crate) fn register_record_api(
                     (uri, repo, rkey)
                 };
 
-                // NULL CID — no PDS round-trip means we have no real CID
-                // to record.
+                // `save_local` never touches a PDS, so it has no CID of its own.
+                //
+                // On update it leaves the stored one alone. The CID describes
+                // the version the PDS holds, and a local-only edit — the
+                // redaction flow this method exists for — doesn't change that.
+                // It's also what `_cid` feeds into strongRefs, which must point
+                // at what's actually in the repo. Overwriting it here used to
+                // destroy that, exactly the way overwriting `indexed_at`
+                // destroyed network-arrival provenance.
+                //
+                // On insert there has never been a PDS version to describe, so
+                // the CID is empty rather than NULL: the column is NOT NULL on
+                // both backends, and `cid_verify` already reads an empty CID as
+                // "nothing to check" (`CidCheck::Skipped`).
                 let upsert_sql = adapt_sql(
                     r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT (uri) DO UPDATE
-                           SET record = EXCLUDED.record,
-                               cid = EXCLUDED.cid,
-                               indexed_at = ?"#,
+                           SET record = EXCLUDED.record"#,
                     backend,
                 );
                 crate::db::query(&upsert_sql)
@@ -434,9 +494,8 @@ pub(crate) fn register_record_api(
                     .bind(&collection)
                     .bind(&rkey)
                     .bind(&data_str)
-                    .bind(Option::<String>::None)
-                    .bind(&now)
-                    .bind(&now)
+                    .bind("")
+                    .bind(crate::db::NO_INDEXED_AT)
                     .bind(&now)
                     .execute(&state.db)
                     .await
@@ -445,7 +504,6 @@ pub(crate) fn register_record_api(
                 let _ = sync_refs(&state.db, &uri, &collection, &data, backend).await;
 
                 this.raw_set("_uri", uri.as_str())?;
-                this.raw_set("_cid", mlua::Value::Nil)?;
 
                 Ok(this)
             }
@@ -709,6 +767,7 @@ pub(crate) fn register_record_api(
                                 .as_deref()
                                 .or(delegate_did.as_deref())
                                 .unwrap_or_else(|| claims.did());
+                            check_writable_repo(repo, claims.did(), delegate_did.as_deref())?;
                             if let Some(ref uri) = existing_uri {
                                 let rkey = uri
                                     .split('/')
@@ -756,8 +815,7 @@ pub(crate) fn register_record_api(
                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                        ON CONFLICT (uri) DO UPDATE
                                            SET record = EXCLUDED.record,
-                                               cid = EXCLUDED.cid,
-                                               indexed_at = ?"#,
+                                               cid = EXCLUDED.cid"#,
                                     backend,
                                 );
                                 let _ = crate::db::query(&upsert_sql)
@@ -767,8 +825,7 @@ pub(crate) fn register_record_api(
                                 .bind(&rkey)
                                 .bind(&data_str)
                                 .bind(cid)
-                                .bind(&now)
-                                .bind(&now)
+                                .bind(crate::db::NO_INDEXED_AT)
                                 .bind(&now)
                                 .execute(&state.db)
                                 .await;
@@ -821,8 +878,8 @@ pub(crate) fn register_record_api(
                                     let data_str = serde_json::to_string(&data).unwrap_or_default();
                                     let now = now_rfc3339();
                                     let upsert_sql = adapt_sql(
-                                        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
-                                           VALUES (?, ?, ?, ?, ?, ?, ?)
+                                        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                            ON CONFLICT (uri) DO UPDATE
                                                SET record = EXCLUDED.record,
                                                    cid = EXCLUDED.cid"#,
@@ -835,6 +892,7 @@ pub(crate) fn register_record_api(
                                     .bind(rkey)
                                     .bind(&data_str)
                                     .bind(cid)
+                                    .bind(crate::db::NO_INDEXED_AT)
                                     .bind(&now)
                                     .execute(&state.db)
                                     .await;
@@ -1146,6 +1204,49 @@ fn extract_record_data(lua: &Lua, table: &mlua::Table, collection: &str) -> LuaR
 mod tests {
     use super::*;
     use mlua::Lua;
+
+    const CALLER: &str = "did:plc:caller";
+    const OTHER: &str = "did:plc:someoneelse";
+
+    #[test]
+    fn writes_to_the_callers_own_repo_are_allowed() {
+        assert!(check_writable_repo(CALLER, CALLER, None).is_ok());
+    }
+
+    #[test]
+    fn writes_to_a_delegated_repo_are_allowed() {
+        let delegate = "did:plc:delegated";
+        assert!(check_writable_repo(delegate, CALLER, Some(delegate)).is_ok());
+        // The caller's own repo stays writable while delegating.
+        assert!(check_writable_repo(CALLER, CALLER, Some(delegate)).is_ok());
+    }
+
+    #[test]
+    fn writes_to_a_foreign_repo_are_refused() {
+        let err = check_writable_repo(OTHER, CALLER, None)
+            .expect_err("writing to another account's repo cannot succeed");
+        let msg = err.to_string();
+
+        // The message has to name the repo that was actually targeted and
+        // point at the mechanism that does work. The failure it replaces —
+        // `DPoP session not found` — named neither, and reads as a broken
+        // login rather than a repo the instance has no access to.
+        assert!(msg.contains(OTHER), "should name the target repo: {msg}");
+        assert!(msg.contains(CALLER), "should name the caller: {msg}");
+        assert!(
+            msg.contains("linked_repos"),
+            "should point at linked repos: {msg}"
+        );
+        assert!(
+            !msg.contains("DPoP"),
+            "should not blame the caller's session: {msg}"
+        );
+    }
+
+    #[test]
+    fn delegating_does_not_open_up_unrelated_repos() {
+        assert!(check_writable_repo(OTHER, CALLER, Some("did:plc:delegated")).is_err());
+    }
 
     #[test]
     fn validate_required_fields_passes_when_present() {

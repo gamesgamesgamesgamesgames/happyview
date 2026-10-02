@@ -48,6 +48,42 @@ pub(super) struct ScriptResponse {
     pub outbound_xrpcs: Option<Vec<String>>,
     pub created_at: String,
     pub updated_at: String,
+    /// `false` when this row's own trigger id would be refused if submitted
+    /// today — the NSID rules tightened after it was created. Such a script
+    /// still fires and can still be edited, but it cannot be recreated with
+    /// the same id after deletion.
+    pub recreatable: bool,
+}
+
+impl ScriptResponse {
+    /// Builds a response from a fetched row.
+    ///
+    /// `recreatable` and `outbound_xrpcs` are derived here rather than passed
+    /// in, so a new call site cannot forget them. `recreatable` is `false`
+    /// when the row's own trigger id would be refused if submitted today.
+    fn from_row(
+        id: String,
+        script_type: String,
+        body: String,
+        description: Option<String>,
+        outbound_xrpcs_json: Option<String>,
+        created_at: String,
+        updated_at: String,
+    ) -> Self {
+        let outbound_xrpcs: Option<Vec<String>> =
+            outbound_xrpcs_json.and_then(|j| serde_json::from_str(&j).ok());
+        let recreatable = ParsedTrigger::parse(&id).is_ok();
+        Self {
+            id,
+            script_type,
+            body,
+            description,
+            outbound_xrpcs,
+            created_at,
+            updated_at,
+            recreatable,
+        }
+    }
 }
 
 /// Body for `POST /admin/scripts` (create or replace by `id`).
@@ -137,17 +173,15 @@ pub(super) async fn list(
         .into_iter()
         .map(
             |(id, script_type, body, description, outbound_xrpcs_json, created_at, updated_at)| {
-                let outbound_xrpcs: Option<Vec<String>> =
-                    outbound_xrpcs_json.and_then(|j| serde_json::from_str(&j).ok());
-                ScriptResponse {
+                ScriptResponse::from_row(
                     id,
                     script_type,
                     body,
                     description,
-                    outbound_xrpcs,
+                    outbound_xrpcs_json,
                     created_at,
                     updated_at,
-                }
+                )
             },
         )
         .collect();
@@ -433,17 +467,15 @@ async fn fetch_one(state: &AppState, id: &str) -> Result<ScriptResponse, AppErro
         .map_err(|e| AppError::Internal(format!("failed to fetch script: {e}")))?;
     let (id, script_type, body, description, outbound_xrpcs_json, created_at, updated_at) =
         row.ok_or_else(|| AppError::NotFound(format!("script '{id}' not found")))?;
-    let outbound_xrpcs: Option<Vec<String>> =
-        outbound_xrpcs_json.and_then(|j| serde_json::from_str(&j).ok());
-    Ok(ScriptResponse {
+    Ok(ScriptResponse::from_row(
         id,
         script_type,
         body,
         description,
-        outbound_xrpcs,
+        outbound_xrpcs_json,
         created_at,
         updated_at,
-    })
+    ))
 }
 
 /// Validate the script body against its declared language. Rejects
@@ -451,5 +483,74 @@ async fn fetch_one(state: &AppState, id: &str) -> Result<ScriptResponse, AppErro
 fn validate_body_for_type(body: &str, lang: ScriptLanguage) -> Result<(), AppError> {
     match lang {
         ScriptLanguage::Lua => crate::lua::validate_script(body).map_err(AppError::BadRequest),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `ScriptResponse::from_row` is the only place `recreatable` and
+    // `outbound_xrpcs` are derived — both HTTP construction sites (`list`
+    // and `fetch_one`) go through it. These exercise it directly, since
+    // exercising the full HTTP handlers needs a database (see
+    // `tests/e2e_scripts.rs`, which is `#[ignore]`-gated).
+
+    #[test]
+    fn from_row_marks_a_valid_trigger_id_recreatable() {
+        let r = ScriptResponse::from_row(
+            "record.create:com.example.thing".into(),
+            "lua".into(),
+            "function handle() end".into(),
+            None,
+            None,
+            "2026-01-01T00:00:00+00:00".into(),
+            "2026-01-01T00:00:00+00:00".into(),
+        );
+        assert!(r.recreatable);
+    }
+
+    #[test]
+    fn from_row_marks_a_legacy_trigger_id_not_recreatable() {
+        // Hyphen in the name segment: accepted before the NSID consolidation,
+        // refused now. The script still fires, but cannot be recreated.
+        let r = ScriptResponse::from_row(
+            "xrpc.query:com.example.get-photos".into(),
+            "lua".into(),
+            "function handle() end".into(),
+            None,
+            None,
+            "2026-01-01T00:00:00+00:00".into(),
+            "2026-01-01T00:00:00+00:00".into(),
+        );
+        assert!(!r.recreatable);
+    }
+
+    #[test]
+    fn from_row_parses_outbound_xrpcs_and_tolerates_garbage() {
+        let ok = ScriptResponse::from_row(
+            "record.create:com.example.thing".into(),
+            "lua".into(),
+            String::new(),
+            None,
+            Some(r#"["com.example.foo"]"#.into()),
+            "2026-01-01T00:00:00+00:00".into(),
+            "2026-01-01T00:00:00+00:00".into(),
+        );
+        assert_eq!(
+            ok.outbound_xrpcs.as_deref(),
+            Some(&["com.example.foo".to_string()][..])
+        );
+
+        let garbage = ScriptResponse::from_row(
+            "record.create:com.example.thing".into(),
+            "lua".into(),
+            String::new(),
+            None,
+            Some("not json".into()),
+            "2026-01-01T00:00:00+00:00".into(),
+            "2026-01-01T00:00:00+00:00".into(),
+        );
+        assert_eq!(garbage.outbound_xrpcs, None);
     }
 }

@@ -12,3 +12,4 @@ build/
 .worktrees/
 next-env.d.ts
 bun.lock
+lcov.info

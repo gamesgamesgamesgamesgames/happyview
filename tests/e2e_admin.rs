@@ -351,6 +351,197 @@ async fn lexicon_missing_id_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+// ---------------------------------------------------------------------------
+// Lexicon-triggered backfill
+// ---------------------------------------------------------------------------
+
+/// Count backfill jobs for a collection.
+async fn backfill_job_count(app: &TestApp, collection: &str) -> i64 {
+    let sql = adapt_sql(
+        "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE collection = ?",
+        app.state.db_backend,
+    );
+    let row: (i64,) = happyview::db::query_as(&sql)
+        .bind(collection)
+        .fetch_one(&app.state.db)
+        .await
+        .expect("count backfill jobs");
+    row.0
+}
+
+#[tokio::test]
+#[serial]
+async fn record_lexicon_with_backfill_starts_a_backfill_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": true
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json = json_body(resp).await;
+    let job_id = json["backfill_job_id"]
+        .as_str()
+        .expect("backfill_job_id in upload response");
+
+    let sql = adapt_sql(
+        "SELECT collection FROM happyview_backfill_jobs WHERE id = ?",
+        app.state.db_backend,
+    );
+    let row: Option<(Option<String>,)> = happyview::db::query_as(&sql)
+        .bind(job_id)
+        .fetch_optional(&app.state.db)
+        .await
+        .expect("query backfill job");
+    assert_eq!(
+        row.expect("backfill job row exists").0.as_deref(),
+        Some("games.gamesgamesgamesgames.game"),
+        "the job must target the uploaded lexicon's collection"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn re_uploading_a_lexicon_does_not_start_a_second_backfill_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": true
+    });
+
+    for _ in 0..2 {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    assert_eq!(
+        backfill_job_count(&app, "games.gamesgamesgamesgames.game").await,
+        1,
+        "only the first upload (revision 1) may start a backfill"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn record_lexicon_without_backfill_starts_no_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": false
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(json_body(resp).await["backfill_job_id"].is_null());
+
+    assert_eq!(
+        backfill_job_count(&app, "games.gamesgamesgamesgames.game").await,
+        0
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn query_lexicon_with_backfill_starts_no_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({
+        "lexicon_json": fixtures::list_games_query_lexicon(),
+        "backfill": true,
+        "target_collection": "games.gamesgamesgamesgames.game"
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(
+        json_body(resp).await["backfill_job_id"].is_null(),
+        "there is nothing to backfill for a non-record lexicon"
+    );
+}
+
+/// An uploader holding `lexicons:create` but not `backfill:create` gets the
+/// lexicon, not a 403 — the backfill is skipped and reported as skipped.
+#[tokio::test]
+#[serial]
+async fn lexicon_upload_without_backfill_permission_skips_the_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let create = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/api-keys",
+            app.admin_cookie(),
+            &json!({ "name": "lexicon-only", "permissions": ["lexicons:create"] }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let key = response_json(create).await["key"]
+        .as_str()
+        .expect("api key returned")
+        .to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/lexicons")
+                .header("authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "lexicon_json": fixtures::game_record_lexicon(),
+                        "backfill": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "a missing backfill permission must not fail the upload"
+    );
+    assert!(json_body(resp).await["backfill_job_id"].is_null());
+
+    assert_eq!(
+        backfill_job_count(&app, "games.gamesgamesgamesgames.game").await,
+        0
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn lexicon_list_all() {
@@ -896,4 +1087,148 @@ async fn admin_delete_not_found() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_collection_enqueues_a_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/admin/records/collection?collection=app.test.post")
+                .header(app.admin_cookie().0, app.admin_cookie().1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    let job_id = body["job_id"].as_str().expect("job_id missing");
+
+    // These four columns are exactly what the reserved-prefix authorization
+    // boundary depends on: the literal job type, an input built only from the
+    // validated `collection` param (no other request-controlled key), no
+    // inherited PDS session for a local-table delete, and `created_by`
+    // sourced from the authenticated session rather than the request.
+    let sql = happyview::db::adapt_sql(
+        "SELECT job_type, input, created_by, CAST(inherit_auth AS INTEGER) FROM happyview_jobs WHERE id = ?",
+        app.state.db_backend,
+    );
+    let (job_type, input, created_by, inherit_auth): (String, String, String, i64) =
+        happyview::db::query_as(&sql)
+            .bind(job_id)
+            .fetch_one(&app.state.db)
+            .await
+            .expect("job row missing");
+    assert_eq!(job_type, "happyview.delete-collection");
+    assert_eq!(inherit_auth, 0, "must not inherit a PDS session");
+    assert_eq!(created_by, app.admin_did, "must come from the auth session");
+    let input_json: serde_json::Value = serde_json::from_str(&input).unwrap();
+    assert_eq!(
+        input_json,
+        serde_json::json!({ "collection": "app.test.post" }),
+        "input must carry exactly the validated collection and nothing else"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Identifier resolution on user creation (issue #85)
+// ---------------------------------------------------------------------------
+
+/// A handle that cannot be resolved must be refused outright. Storing it
+/// verbatim produces a row whose `did` column holds a handle, and the login
+/// authorization check in `auth::routes` matches the OAuth session's DID
+/// exactly — so such a user can never sign in, and the failure surfaces at
+/// login rather than at the point of the mistake.
+#[tokio::test]
+#[serial]
+async fn admin_create_rejects_unresolvable_handle() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({ "did": "nonexistent-handle.invalid" });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/users", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // And no row was created.
+    let count: (i64,) = happyview::db::query_as(&adapt_sql(
+        "SELECT COUNT(*) FROM happyview_users WHERE did = ?",
+        app.state.db_backend,
+    ))
+    .bind("nonexistent-handle.invalid")
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(count.0, 0, "an unresolvable handle must not be stored");
+}
+
+/// Input that is neither a DID nor a syntactically valid handle is refused
+/// before any network work is attempted.
+#[tokio::test]
+#[serial]
+async fn admin_create_rejects_malformed_identifier() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    for bad in ["not a handle", "", "@"] {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(admin_post(
+                "/admin/users",
+                app.admin_cookie(),
+                &json!({ "did": bad }),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "expected {bad:?} to be refused"
+        );
+    }
+}
+
+/// Adding the same account twice reports a conflict rather than a 500 from the
+/// UNIQUE constraint on `did`.
+#[tokio::test]
+#[serial]
+async fn admin_create_duplicate_did_conflicts() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json!({ "did": "did:plc:duplicate" });
+
+    let first = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/users", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/users", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
 }

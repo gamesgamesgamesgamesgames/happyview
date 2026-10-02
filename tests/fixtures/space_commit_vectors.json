@@ -1,0 +1,34 @@
+{
+  "vectors": [
+    {
+      "space": "at://did:plc:abc/space/com.example.forum/main",
+      "author": "did:plc:testuser",
+      "rev": "3k2rev1",
+      "ikm_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "hash_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "context_hex": "617470726f746f2d73706163652d7631002d61743a2f2f6469643a706c633a6162632f73706163652f636f6d2e6578616d706c652e666f72756d2f6d61696e00106469643a706c633a74657374757365720007336b32726576310020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "derived_key_hex": "a6f83401d2dcb04726c4cccaa40dc34b9f7e85a37eb4f5665da3d8377b5cb6af",
+      "mac_hex": "4eb9078e8db94aaca94ae2db6288b0df5433221fa8b7a891c304e95de4b127d3"
+    },
+    {
+      "space": "at://did:plc:xyz/space/app.bsky.group/self",
+      "author": "did:plc:alice",
+      "rev": "3l9zzz9",
+      "ikm_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hash_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "context_hex": "617470726f746f2d73706163652d7631002a61743a2f2f6469643a706c633a78797a2f73706163652f6170702e62736b792e67726f75702f73656c66000d6469643a706c633a616c6963650007336c397a7a7a3900200000000000000000000000000000000000000000000000000000000000000000",
+      "derived_key_hex": "bdffad4913e8fea76609414241dcf8791c240c48abed03764a25d885ac5875dc",
+      "mac_hex": "2150db646b0cd61bebe84cc178fe2c05dd75d74fe760bab30a44719b4db8abd2"
+    },
+    {
+      "space": "at://did:web:example.com/space/my.bulletin.board/self",
+      "author": "did:web:bob.example.com",
+      "rev": "3m1aaaa",
+      "ikm_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "hash_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+      "context_hex": "617470726f746f2d73706163652d7631003561743a2f2f6469643a7765623a6578616d706c652e636f6d2f73706163652f6d792e62756c6c6574696e2e626f6172642f73656c6600176469643a7765623a626f622e6578616d706c652e636f6d0007336d316161616100205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "derived_key_hex": "2e7c874779793624c5b2163951a080a156afebdaa29ec80e7b18b93af136463b",
+      "mac_hex": "5a1af66c976cb42649019e575ddab0d59b72e570c369e82b924a8d3aeea2db28"
+    }
+  ]
+}

@@ -14,6 +14,7 @@ pub struct DpopSession {
     pub scopes: String,
     pub pds_url: Option<String>,
     pub issuer: Option<String>,
+    pub signing_kid: Option<String>,
 }
 
 /// Session metadata returned by list_dpop_sessions (no decrypted tokens).
@@ -44,6 +45,7 @@ pub async fn store_dpop_session(
     scopes: &str,
     pds_url: Option<&str>,
     issuer: Option<&str>,
+    signing_kid: Option<&str>,
 ) -> Result<(), AppError> {
     let access_enc = encrypt(encryption_key, access_token.as_bytes())
         .map_err(|e| AppError::Internal(format!("failed to encrypt access token: {e}")))?;
@@ -57,8 +59,8 @@ pub async fn store_dpop_session(
 
     let now = now_rfc3339();
     let sql = adapt_sql(
-        r#"INSERT INTO happyview_dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        r#"INSERT INTO happyview_dpop_sessions (id, api_client_id, dpop_key_id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (api_client_id, user_did, dpop_key_id) DO UPDATE SET
                access_token_enc = EXCLUDED.access_token_enc,
                refresh_token_enc = EXCLUDED.refresh_token_enc,
@@ -81,12 +83,39 @@ pub async fn store_dpop_session(
         .bind(scopes)
         .bind(pds_url)
         .bind(issuer)
+        .bind(signing_kid)
         .bind(&now)
         .bind(&now)
         .execute(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to store DPoP session: {e}")))?;
 
+    Ok(())
+}
+
+pub async fn repin_dpop_session_signing_kid(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    dpop_key_id: &str,
+    user_did: &str,
+    signing_kid: Option<&str>,
+) -> Result<(), AppError> {
+    let sql = adapt_sql(
+        "UPDATE happyview_dpop_sessions SET signing_kid = ? \
+         WHERE api_client_id = ? AND dpop_key_id = ? AND user_did = ?",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(signing_kid)
+        .bind(api_client_id)
+        .bind(dpop_key_id)
+        .bind(user_did)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("failed to re-pin DPoP session signing_kid: {e}"))
+        })?;
     Ok(())
 }
 
@@ -100,7 +129,7 @@ pub async fn get_dpop_session(
     dpop_key_id: &str,
 ) -> Result<DpopSession, AppError> {
     let sql = adapt_sql(
-        "SELECT id, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
+        "SELECT id, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? AND dpop_key_id = ?",
         backend,
     );
 
@@ -113,6 +142,7 @@ pub async fn get_dpop_session(
         String,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = crate::db::query_as(&sql)
         .bind(api_client_id)
         .bind(user_did)
@@ -121,7 +151,7 @@ pub async fn get_dpop_session(
         .await
         .map_err(|e| AppError::Internal(format!("failed to look up DPoP session: {e}")))?;
 
-    let (id, access_enc, refresh_enc, token_expires_at, scopes, pds_url, issuer) =
+    let (id, access_enc, refresh_enc, token_expires_at, scopes, pds_url, issuer, signing_kid) =
         row.ok_or_else(|| AppError::NotFound("DPoP session not found".into()))?;
 
     let access_token = String::from_utf8(
@@ -150,11 +180,37 @@ pub async fn get_dpop_session(
         scopes,
         pds_url,
         issuer,
+        signing_kid,
     })
 }
 
 /// Look up a DPoP session by api_client_id and dpop_key_id, decrypting tokens.
 /// Used by the auth middleware where the key ID is derived from the DPoP proof thumbprint.
+/// Look up just the granted scopes for a session.
+///
+/// Deliberately does not decrypt the tokens: a scope check has no business
+/// touching them, and this runs on every forwarded request.
+pub async fn get_dpop_session_scopes(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    dpop_key_id: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT scopes FROM happyview_dpop_sessions WHERE api_client_id = ? AND dpop_key_id = ?",
+        backend,
+    );
+
+    let row: Option<(String,)> = crate::db::query_as(&sql)
+        .bind(api_client_id)
+        .bind(dpop_key_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to look up DPoP session scopes: {e}")))?;
+
+    Ok(row.map(|(scopes,)| scopes))
+}
+
 pub async fn get_dpop_session_by_key_id(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -163,7 +219,7 @@ pub async fn get_dpop_session_by_key_id(
     dpop_key_id: &str,
 ) -> Result<DpopSession, AppError> {
     let sql = adapt_sql(
-        "SELECT id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer FROM happyview_dpop_sessions WHERE api_client_id = ? AND dpop_key_id = ?",
+        "SELECT id, user_did, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid FROM happyview_dpop_sessions WHERE api_client_id = ? AND dpop_key_id = ?",
         backend,
     );
 
@@ -177,6 +233,7 @@ pub async fn get_dpop_session_by_key_id(
         String,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = crate::db::query_as(&sql)
         .bind(api_client_id)
         .bind(dpop_key_id)
@@ -184,8 +241,17 @@ pub async fn get_dpop_session_by_key_id(
         .await
         .map_err(|e| AppError::Internal(format!("failed to look up DPoP session: {e}")))?;
 
-    let (id, user_did, access_enc, refresh_enc, token_expires_at, scopes, pds_url, issuer) =
-        row.ok_or_else(|| AppError::Auth("no matching DPoP session".into()))?;
+    let (
+        id,
+        user_did,
+        access_enc,
+        refresh_enc,
+        token_expires_at,
+        scopes,
+        pds_url,
+        issuer,
+        signing_kid,
+    ) = row.ok_or_else(|| AppError::Auth("no matching DPoP session".into()))?;
 
     let access_token = String::from_utf8(
         decrypt(encryption_key, &access_enc)
@@ -213,7 +279,50 @@ pub async fn get_dpop_session_by_key_id(
         scopes,
         pds_url,
         issuer,
+        signing_kid,
     })
+}
+
+/// Every DPoP key id this user holds a session under with this client.
+pub async fn dpop_key_ids_for_user(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    api_client_id: &str,
+    user_did: &str,
+) -> Result<Vec<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT dpop_key_id FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ?",
+        backend,
+    );
+    let rows: Vec<(String,)> = crate::db::query_as(&sql)
+        .bind(api_client_id)
+        .bind(user_did)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list DPoP session keys: {e}")))?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// The DPoP key id backing one session row, checked against its owner.
+pub async fn dpop_key_id_for_session(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    session_id: &str,
+    api_client_id: &str,
+    user_did: &str,
+) -> Result<Option<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT dpop_key_id FROM happyview_dpop_sessions WHERE id = ? AND api_client_id = ? AND user_did = ?",
+        backend,
+    );
+    let row: Option<(String,)> = crate::db::query_as(&sql)
+        .bind(session_id)
+        .bind(api_client_id)
+        .bind(user_did)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to look up DPoP session: {e}")))?;
+    Ok(row.map(|(id,)| id))
 }
 
 /// Delete a DPoP session by api_client_id, user_did, and dpop_key_id (device-specific).
@@ -330,7 +439,7 @@ pub async fn get_dpop_session_for_user(
     user_did: &str,
 ) -> Result<DpopSession, AppError> {
     let sql = adapt_sql(
-        "SELECT id, dpop_key_id, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? LIMIT 1",
+        "SELECT id, dpop_key_id, access_token_enc, refresh_token_enc, token_expires_at, scopes, pds_url, issuer, signing_kid FROM happyview_dpop_sessions WHERE api_client_id = ? AND user_did = ? LIMIT 1",
         backend,
     );
 
@@ -344,6 +453,7 @@ pub async fn get_dpop_session_for_user(
         String,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = crate::db::query_as(&sql)
         .bind(api_client_id)
         .bind(user_did)
@@ -351,8 +461,17 @@ pub async fn get_dpop_session_for_user(
         .await
         .map_err(|e| AppError::Internal(format!("failed to look up DPoP session: {e}")))?;
 
-    let (id, dpop_key_id, access_enc, refresh_enc, token_expires_at, scopes, pds_url, issuer) =
-        row.ok_or_else(|| AppError::NotFound("DPoP session not found".into()))?;
+    let (
+        id,
+        dpop_key_id,
+        access_enc,
+        refresh_enc,
+        token_expires_at,
+        scopes,
+        pds_url,
+        issuer,
+        signing_kid,
+    ) = row.ok_or_else(|| AppError::NotFound("DPoP session not found".into()))?;
 
     let access_token = String::from_utf8(
         decrypt(encryption_key, &access_enc)
@@ -380,6 +499,7 @@ pub async fn get_dpop_session_for_user(
         scopes,
         pds_url,
         issuer,
+        signing_kid,
     })
 }
 

@@ -52,11 +52,17 @@ The API client must be registered as a **public** client (no secret) with your a
 
 ## Sign in
 
-`signIn()` resolves the user's handle, discovers their PDS, provisions a DPoP key, and redirects the browser to the PDS authorization server:
+`signIn()` resolves the user's identifier, discovers their PDS, provisions a DPoP key, and redirects the browser to the PDS authorization server:
 
 ```typescript
 await client.signIn("alice.bsky.social");
 // Browser redirects — code stops here
+```
+
+Every sign-in method accepts either a handle or a DID as the identifier:
+
+```typescript
+await client.signIn("did:plc:abcdefghijklmnopqrstuvwx");
 ```
 
 To sign in via a popup window instead:
@@ -90,7 +96,7 @@ const { authorizationUrl, did, state } =
 
 ### What happens during sign in
 
-1. The handle is resolved to a DID via `resolveHandleToDid`.
+1. The identifier is resolved to a DID via `resolveHandleToDid`, unless it is already a DID.
 2. The DID document is fetched to find the PDS URL.
 3. The PDS's OAuth authorization server metadata is fetched.
 4. A DPoP key is provisioned from HappyView.
@@ -194,6 +200,14 @@ await client.revoke(session.did);
 <Callout type="info">
 `logout()` still works as an alias for `revoke()`.
 </Callout>
+
+The stored session is always cleared, even when the server refuses the revocation. `404`, `401`, and `403` are treated as a completed logout — there is no live credential left to revoke. `5xx` and network errors still throw so you know revocation may not have reached the server, but they throw after the local session is gone, so the user is never left signed in by a failed logout.
+
+To clear a session locally without contacting the server at all:
+
+```typescript
+await client.forgetSession(session.did);
+```
 
 ## Resolution utilities
 
@@ -345,7 +359,7 @@ The `redirect_uris` array must include the `redirectUri` your client is configur
 
 ## Local development
 
-For local development with ATProto's loopback client ID convention, use `buildLoopbackClientId`:
+For local development with atproto's loopback client ID convention, use `buildLoopbackClientId`:
 
 ```typescript
 import { buildLoopbackClientId } from "@happyview/oauth-client-browser";

@@ -1,0 +1,98 @@
+# atproto-pds, the Rust PDS from atproto-crates, for interop testing.
+#
+#   docker compose -f docker-compose.atproto-pds.yml up -d --wait
+#   cargo test --test spaces_atproto_pds_interop -- --ignored --nocapture
+#   docker compose -f docker-compose.atproto-pds.yml down -v
+#
+# Pulls the newest image from happyproto/pds-test; `docker compose pull`
+# refreshes a stale one. CI runs the image pinned in interop/images.env, and
+# `--env-file interop/images.env` does the same locally. To test a local
+# checkout, add `--build`; ATPROTO_CRATES_DIR defaults to
+# ../../atproto/atproto-crates. That build compiles the workspace in release
+# mode and takes a while.
+#
+# Spaces are always on in this build, so there is no spaces-off service to
+# check detection's negative answer against.
+#
+# Isolated from the dev, test and e2e stacks — see the note in docker-compose.yml.
+name: happyview-atproto-pds
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: plc
+      POSTGRES_PASSWORD: plc
+      POSTGRES_DB: plc
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plc -d plc"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  plc:
+    # Built nightly by happyproto/pds-test; built from source only when it
+    # cannot be pulled.
+    image: ${PLC_IMAGE:-ghcr.io/happyproto/pds-test/plc:latest}
+    build:
+      context: https://github.com/did-method-plc/did-method-plc.git
+      dockerfile: packages/server/Dockerfile
+    environment:
+      DB_CREDS_JSON: '{"username":"plc","password":"plc","host":"postgres","port":"5432","database":"plc"}'
+      ENABLE_MIGRATIONS: "true"
+      DB_MIGRATE_CREDS_JSON: '{"username":"plc","password":"plc","host":"postgres","port":"5432","database":"plc"}'
+      PORT: "2582"
+    # 2591, so this stack can run alongside the other interop stacks.
+    ports:
+      - "2591:2582"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  atproto-pds:
+    image: ${ATPROTO_PDS_IMAGE:-ghcr.io/happyproto/pds-test/atproto-pds:latest}
+    build:
+      context: ${ATPROTO_CRATES_DIR:-../../atproto/atproto-crates}
+      dockerfile: Dockerfile.pds
+    environment:
+      # Same port inside and out, so the endpoint it publishes to PLC
+      # (http://localhost:2590) is the one tests reach.
+      PDS_PORT: "2590"
+      PDS_HOSTNAME: localhost:2590
+      PDS_SERVICE_DID: did:web:localhost
+      PDS_DID_PLC_URL: http://plc:2582
+      PDS_JWT_SECRET: atproto-pds-interop-jwt-secret-0123456789abcdef
+      PDS_ADMIN_PASSWORD: atproto-pds-interop-admin
+      PDS_SERVICE_HANDLE_DOMAINS: .test
+      PDS_INVITE_REQUIRED: "false"
+      # Throwaway secp256k1 key in the did:key private form the server expects.
+      PDS_PLC_ROTATION_KEY_PRIVATE: did:key:z3vLWVWW3rA4nYExwkkR8AQZZxt5Z2vyZRUvPyjR1mFvmmL7
+      # Every test creates accounts from one address.
+      PDS_RATE_LIMIT_AUTH: "0"
+    ports:
+      - "2590:2590"
+    volumes:
+      - atproto-pds-data:/data
+    depends_on:
+      plc:
+        condition: service_started
+
+  # The image is distroless, with no shell to run a healthcheck with. This
+  # shares the PDS's network namespace and reports its readiness endpoint, so
+  # `up --wait` waits for a PDS that can serve.
+  atproto-pds-ready:
+    image: curlimages/curl:8.11.1
+    network_mode: service:atproto-pds
+    init: true
+    entrypoint: ["sleep", "infinity"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:2590/xrpc/_health"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    depends_on:
+      atproto-pds:
+        condition: service_started
+
+volumes:
+  atproto-pds-data:

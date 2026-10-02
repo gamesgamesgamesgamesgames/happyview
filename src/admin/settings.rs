@@ -27,6 +27,7 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ),
     ("backfill_retention_days", "BACKFILL_RETENTION_DAYS"),
     ("client_uri", "CLIENT_URI"),
+    ("event_log_retention_days", "EVENT_LOG_RETENTION_DAYS"),
     ("feature.spaces_enabled", "FEATURE_SPACES_ENABLED"),
     ("logo_uri", "LOGO_URI"),
     ("tos_uri", "TOS_URI"),

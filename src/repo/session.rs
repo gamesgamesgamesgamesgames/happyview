@@ -34,9 +34,49 @@ pub(crate) async fn get_oauth_session(
 ) -> Result<HappyViewOAuthSession, AppError> {
     let did =
         Did::new(did.to_string()).map_err(|_| AppError::Auth(format!("invalid DID: {did}")))?;
-    state
-        .oauth
-        .primary_client()
+
+    let signing_kid = crate::auth::oauth_store::lookup_signing_kid(
+        &state.db,
+        state.db_backend,
+        "happyview_oauth_sessions",
+        did.as_ref(),
+    )
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to look up session signing key: {e}")))?;
+
+    let client = match signing_kid {
+        Some(kid) => {
+            let client_id_url = state.config.instance_client_id_url();
+            state
+                .oauth
+                .get_for_kid(&client_id_url, &kid)
+                .ok_or_else(|| {
+                    AppError::Auth(format!(
+                        "the key session for {} was established with is no longer available; the user must re-authenticate",
+                        did.as_ref()
+                    ))
+                })?
+        }
+        None => {
+            let (client, kid) = state.oauth.primary_client_and_kid();
+            if let Some(kid) = kid
+                && let Err(e) = crate::auth::oauth_store::stamp_signing_kid_if_unset(
+                    &state.db,
+                    state.db_backend,
+                    "happyview_oauth_sessions",
+                    "did",
+                    did.as_ref(),
+                    &kid,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "failed to lazily stamp signing_kid");
+            }
+            client
+        }
+    };
+
+    client
         .restore(&did)
         .await
         .map_err(|e| AppError::Auth(format!("no OAuth session for {}: {e}", did.as_ref())))

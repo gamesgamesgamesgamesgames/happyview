@@ -7,6 +7,8 @@ use crate::error::AppError;
 
 use super::Job;
 
+const JOB_COLUMNS: &str = "id, job_type, status, input, progress, result, error, created_by, started_at, completed_at, created_at, CAST(inherit_auth AS INTEGER), api_client_id, dpop_key_id";
+
 type JobRow = (
     String,
     String,
@@ -19,7 +21,7 @@ type JobRow = (
     Option<String>,
     Option<String>,
     String,
-    bool,
+    i64,
     Option<String>,
     Option<String>,
 );
@@ -54,7 +56,7 @@ fn row_to_job(
         started_at,
         completed_at,
         created_at,
-        inherit_auth,
+        inherit_auth: inherit_auth != 0,
         api_client_id,
         dpop_key_id,
     }
@@ -96,7 +98,7 @@ pub async fn create_job(
 
 pub async fn get_job(state: &AppState, id: &str) -> Result<Option<Job>, AppError> {
     let sql = adapt_sql(
-        "SELECT * FROM happyview_jobs WHERE id = ?",
+        &format!("SELECT {JOB_COLUMNS} FROM happyview_jobs WHERE id = ?"),
         state.db_backend,
     );
     let row: Option<JobRow> = crate::db::query_as(&sql)
@@ -116,18 +118,24 @@ pub async fn list_jobs(
 ) -> Result<(Vec<Job>, Option<String>), AppError> {
     let sql = if status_filter.is_some() {
         let base = if cursor.is_some() {
-            "SELECT * FROM happyview_jobs WHERE status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?"
+            format!(
+                "SELECT {JOB_COLUMNS} FROM happyview_jobs WHERE status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?"
+            )
         } else {
-            "SELECT * FROM happyview_jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?"
+            format!(
+                "SELECT {JOB_COLUMNS} FROM happyview_jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?"
+            )
         };
-        adapt_sql(base, state.db_backend)
+        adapt_sql(&base, state.db_backend)
     } else {
         let base = if cursor.is_some() {
-            "SELECT * FROM happyview_jobs WHERE created_at < ? ORDER BY created_at DESC LIMIT ?"
+            format!(
+                "SELECT {JOB_COLUMNS} FROM happyview_jobs WHERE created_at < ? ORDER BY created_at DESC LIMIT ?"
+            )
         } else {
-            "SELECT * FROM happyview_jobs ORDER BY created_at DESC LIMIT ?"
+            format!("SELECT {JOB_COLUMNS} FROM happyview_jobs ORDER BY created_at DESC LIMIT ?")
         };
-        adapt_sql(base, state.db_backend)
+        adapt_sql(&base, state.db_backend)
     };
 
     let mut query = crate::db::query_as::<JobRow>(&sql);
@@ -279,7 +287,9 @@ pub async fn should_stop(state: &AppState, id: &str) -> Option<&'static str> {
 /// Find jobs that were interrupted by a server restart.
 pub async fn find_interrupted_jobs(state: &AppState) -> Vec<Job> {
     let sql = adapt_sql(
-        "SELECT * FROM happyview_jobs WHERE status IN ('running', 'cancelling', 'pausing')",
+        &format!(
+            "SELECT {JOB_COLUMNS} FROM happyview_jobs WHERE status IN ('running', 'cancelling', 'pausing')"
+        ),
         state.db_backend,
     );
     let rows: Vec<JobRow> = crate::db::query_as(&sql)
@@ -296,11 +306,15 @@ pub async fn claim_next_job(state: &AppState) -> Result<Option<Job>, AppError> {
 
     let sql = match state.db_backend {
         DatabaseBackend::Postgres => adapt_sql(
-            "UPDATE happyview_jobs SET status = 'running', started_at = ? WHERE id = (SELECT id FROM happyview_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *",
+            &format!(
+                "UPDATE happyview_jobs SET status = 'running', started_at = ? WHERE id = (SELECT id FROM happyview_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING {JOB_COLUMNS}"
+            ),
             state.db_backend,
         ),
         DatabaseBackend::Sqlite => adapt_sql(
-            "UPDATE happyview_jobs SET status = 'running', started_at = ? WHERE id = (SELECT id FROM happyview_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1) AND status = 'pending' RETURNING *",
+            &format!(
+                "UPDATE happyview_jobs SET status = 'running', started_at = ? WHERE id = (SELECT id FROM happyview_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1) AND status = 'pending' RETURNING {JOB_COLUMNS}"
+            ),
             state.db_backend,
         ),
     };

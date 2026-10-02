@@ -41,6 +41,25 @@ For public clients, `pkceVerifier` is included and must be passed back when regi
 
 Use the returned `dpopKey` (a private JWK) as your DPoP keypair during your atproto OAuth flow with the user's PDS.
 
+## Client assertions
+
+If your app is a confidential atproto OAuth client — its `client_id_url` document publishes `token_endpoint_auth_method: "private_key_jwt"` and a `jwks_uri` pointing back at HappyView — the PDS requires a signed `private_key_jwt` assertion at two points during the OAuth flow: the pushed authorization request (PAR) and the token exchange. HappyView holds the signing key on your behalf, so ask it to sign each one:
+
+```typescript
+const { clientAssertion, clientAssertionType } =
+  await client.getClientAssertion(pdsIssuer);
+```
+
+`pdsIssuer` is the `issuer` field from the PDS authorization server's metadata. Attach `clientAssertion` and `clientAssertionType` as the `client_assertion` and `client_assertion_type` form parameters on the request.
+
+<Callout type="warn">
+Call this once for the PAR and once more for the token exchange — never reuse a single assertion for both. Each one is valid for only 60 seconds and carries a unique `jti`, so an app that mints one and reuses it fails at whichever call comes second.
+</Callout>
+
+Public clients don't need this — PKCE is their proof of possession, and `pkceVerifier` from `provisionDpopKey` covers it. `getClientAssertion` is unrelated to `isConfidential` on this class, which only describes whether this SDK instance authenticates *to HappyView* with a client secret, not whether your app is a confidential OAuth client to a user's PDS.
+
+See [API Clients — Confidential clients: attaching the client assertion](../../guides/api-clients.md#confidential-clients-attaching-the-client-assertion) for the endpoint this wraps and the full manual flow.
+
 ## Session registration
 
 After completing OAuth authorization with the user's PDS, register the session with HappyView:
@@ -116,7 +135,33 @@ Returns `null` if no stored session is found.
 await client.deleteSession("did:plc:abc123");
 ```
 
-This deletes the session from both HappyView and local storage.
+This deletes the session from HappyView and local storage, and revokes it at the user's PDS.
+
+That last part matters: without it the session stays listed under the account's active sessions on their PDS until its refresh token expires — up to two years — even though they logged out. Revocation is best-effort, so a PDS that is unreachable or does not implement RFC 7009 will not make the logout fail.
+
+### Signing in again replaces the previous session
+
+Each login runs a full OAuth authorization and so creates a *new* session on the user's PDS; the DPoP key is minted fresh and the old key is overwritten in storage. Left alone, that means every re-login strands the previous session on their account with no way to reach it.
+
+`registerSession` therefore retires this client's previous session for the same account as part of completing a login — revoking it at the PDS while the credentials to do so still exist. It is scoped to the account being signed into, so sessions for other accounts, and sessions belonging to the same account on other devices, are untouched. No `onSessionDelete` hook fires: the user is signing in, not out.
+
+**The local cleanup always happens.** A `404`, `401`, or `403` from the server is treated as a completed logout — the session is either already gone or the credential is no longer usable, so there is nothing left to revoke. A `5xx` or a network error still throws, because the server may genuinely still hold a live session and you should know that, but it throws *after* the local session has been cleared. Either way the user ends up logged out on this device, and calling `deleteSession` again is safe.
+
+### Forgetting a session locally
+
+```typescript
+await client.forgetSession("did:plc:abc123");
+```
+
+Clears the stored session without contacting the server. Use it when revocation is impossible — an unreachable instance, or a credential the server has already rejected. Nothing is revoked, so the instance may still consider the session live until it expires naturally.
+
+### Storage keys
+
+`STORAGE_PREFIX` (`"happyview:session:"`) and `LAST_ACTIVE_KEY` (`"happyview:last-active-did"`) are exported, so tooling that needs to inspect or clear stored sessions directly can do so without hardcoding the format:
+
+```typescript
+import { STORAGE_PREFIX, LAST_ACTIVE_KEY } from "@happyview/oauth-client";
+```
 
 ## Adapters
 

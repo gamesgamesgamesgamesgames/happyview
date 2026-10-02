@@ -17,7 +17,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ExternalLink, Eye, Trash2 } from "lucide-react";
+import { AlertTriangle, ExternalLink, Eye, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
@@ -252,13 +252,34 @@ export default function ScriptsPage() {
                 <AlertDialogContent onClick={(e) => e.stopPropagation()}>
                   <AlertDialogHeader>
                     <AlertDialogTitle>Delete script?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      This will permanently remove the script. This action cannot be undone.
+                    <AlertDialogDescription asChild>
+                      <div className="flex flex-col gap-3">
+                        <p>
+                          This will permanently remove the script. This action cannot be undone.
+                        </p>
+                        {row.original.recreatable === false && (
+                          <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
+                            <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
+                            <p className="text-xs text-amber-500">
+                              This script&rsquo;s trigger id no longer satisfies
+                              current NSID rules. It will keep firing and can
+                              still be edited in place — but once deleted, it{" "}
+                              <span className="font-medium">
+                                cannot be recreated
+                              </span>{" "}
+                              with the same id. Deletion is not required to
+                              change it.
+                            </p>
+                          </div>
+                        )}
+                      </div>
                     </AlertDialogDescription>
                   </AlertDialogHeader>
                   <AlertDialogFooter>
                     <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction variant="destructive" onClick={() => handleDelete(row.original.id)}>Delete</AlertDialogAction>
+                    <AlertDialogAction variant="destructive" onClick={() => handleDelete(row.original.id)}>
+                      {row.original.recreatable === false ? "Delete anyway" : "Delete"}
+                    </AlertDialogAction>
                   </AlertDialogFooter>
                 </AlertDialogContent>
               </AlertDialog>

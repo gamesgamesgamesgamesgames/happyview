@@ -336,6 +336,51 @@ async fn service_auth_query_allowed() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+async fn list_games_with_lxm(lxm: &str) -> StatusCode {
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    seed_query_lexicon(&app).await;
+
+    app.create_service_entry("#chess", "ChessAppView", "all")
+        .await;
+
+    let auth = app
+        .service_auth_jwt_for(&plc_store, "did:plc:caller123", &did, "#chess", Some(lxm))
+        .await;
+
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/games.gamesgamesgamesgames.listGames")
+                .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+#[serial]
+async fn service_auth_accepts_lxm_naming_the_called_method() {
+    common::require_db!();
+    let status = list_games_with_lxm("games.gamesgamesgamesgames.listGames").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial]
+async fn service_auth_rejects_lxm_naming_another_method() {
+    common::require_db!();
+    let status = list_games_with_lxm("com.atproto.space.notifyWrite").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test]
 #[serial]
 async fn service_auth_query_denied() {
@@ -1706,6 +1751,7 @@ async fn proxy_config_disabled_rejects_unknown_method() {
         .proxy_config
         .store(std::sync::Arc::new(happyview::proxy_config::ProxyConfig {
             mode: happyview::proxy_config::ProxyMode::Disabled,
+            routing: happyview::proxy_config::ProxyRouting::Authority,
             nsids: vec![],
         }));
 
@@ -1743,6 +1789,7 @@ async fn proxy_config_allowlist_rejects_unlisted_method() {
         .proxy_config
         .store(std::sync::Arc::new(happyview::proxy_config::ProxyConfig {
             mode: happyview::proxy_config::ProxyMode::Allowlist,
+            routing: happyview::proxy_config::ProxyRouting::Authority,
             nsids: vec!["com.allowed.*".to_string()],
         }));
 

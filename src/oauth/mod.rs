@@ -1,6 +1,10 @@
+pub mod client_assertion;
 pub mod client_auth;
+pub mod client_keys;
+pub mod client_probe;
 pub mod dpop_proof;
 pub mod keys;
 pub mod pds_write;
+pub mod rotation;
 pub mod routes;
 pub mod sessions;

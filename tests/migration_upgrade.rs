@@ -157,3 +157,59 @@ async fn postgres_upgrade_from_v2_0_0_applies_and_preserves_data() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// The migration before `20260915000000_backfill_job_scope`.
+const PRE_SCOPE_CUTOFF: &str = "20260913000001";
+
+#[tokio::test]
+async fn sqlite_backfill_scope_marks_existing_single_did_jobs() {
+    sqlx::any::install_default_drivers();
+
+    let tmp_db = std::env::temp_dir().join(format!("hv-scope-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", tmp_db.display());
+    let pool = AnyPool::connect(&url)
+        .await
+        .expect("connect to fresh sqlite database");
+
+    let baseline_dir = std::env::temp_dir().join(format!("hv-scope-base-{}", uuid::Uuid::new_v4()));
+    stage_baseline_migrations("./migrations/sqlite", &baseline_dir, PRE_SCOPE_CUTOFF);
+    Migrator::new(baseline_dir.as_path())
+        .await
+        .expect("load pre-scope migrations")
+        .run(&pool)
+        .await
+        .expect("pre-scope migrations apply");
+
+    sqlx::query(
+        "INSERT INTO happyview_backfill_jobs (id, collection, did, status, stage, created_at) VALUES \
+         ('network-job', NULL, NULL, 'completed', 'completed', '2026-01-01T00:00:00Z'), \
+         ('did-job', NULL, 'did:plc:legacy', 'completed', 'completed', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed legacy jobs");
+
+    Migrator::new(Path::new("./migrations/sqlite"))
+        .await
+        .expect("load current migrations")
+        .run(&pool)
+        .await
+        .expect("current migrations apply");
+
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, scope FROM happyview_backfill_jobs ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("read scopes");
+    assert_eq!(
+        rows,
+        vec![
+            ("did-job".to_string(), "dids".to_string()),
+            ("network-job".to_string(), "network".to_string()),
+        ]
+    );
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&baseline_dir);
+    let _ = std::fs::remove_file(&tmp_db);
+}

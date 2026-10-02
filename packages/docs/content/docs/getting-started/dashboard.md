@@ -99,7 +99,7 @@ View the audit log of admin actions. Events include user creation, lexicon uploa
 
 ### Service Identity
 
-Configure the AT Protocol service identity for your HappyView instance — either a `did:web` derived from your public URL, a `did:plc` you control, or a linked atproto account. This determines the DID that signs service-level interactions on the network.
+Configure the atproto service identity for your HappyView instance — either a `did:web` derived from your public URL, a `did:plc` you control, or a linked atproto account. This determines the DID that signs service-level interactions on the network.
 
 ### Experiments
 

@@ -59,6 +59,32 @@ r:set_rkey("my-key")
 local key = r:generate_rkey()
 ```
 
+### `set_repo` only targets repos you can write to
+
+`r:save()` acts as the caller. Under DPoP it uses the session belonging to the target DID; under a cookie session it presents the caller's own token. Neither can write to another account's repo, so `set_repo()` accepts only the caller's own DID, or the delegated account's DID when the script is acting under a delegation. Anything else raises before the write is attempted:
+
+```
+cannot write to repo did:plc:xyz: a Record write acts as the caller
+(did:plc:abc), so it can only target the caller's own repo.
+```
+
+To write to an account this instance doesn't act as, an admin links that repo and the script uses [`linked_repos`](./linked-repos-api.md) instead:
+
+```lua
+local repo = linked_repos.get("did:plc:xyz")
+repo:create_record{ collection = "com.example.note", record = { text = "hi" } }
+```
+
+`set_repo()` remains the right tool for `save_local()`, which never touches a PDS and needs a DID to build the URI for a brand-new local row.
+
+### `save_local` and network provenance
+
+`cid` and `indexed_at` describe the record as it exists **on the network**, so `save_local()` never writes them.
+
+On an existing record — the redaction flow this method exists for — both are left exactly as they were. The CID still describes what the PDS holds, since editing the local copy doesn't change the repo's copy, and it's what `_cid` feeds into strongRefs. `indexed_at` still records when the firehose delivered it.
+
+On a record that has never existed on a PDS, there is nothing to describe: `cid` is empty and `indexed_at` is NULL. A row with `indexed_at IS NULL` is precisely "written locally, not yet echoed back" — use `COALESCE(indexed_at, created_at)` when you need a timestamp regardless.
+
 **Key type behavior for `generate_rkey()`:**
 
 | Key type        | Generated rkey                    |

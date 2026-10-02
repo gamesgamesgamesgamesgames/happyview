@@ -50,6 +50,8 @@ pub(super) async fn upload_lexicon(
         .ok_or_else(|| AppError::BadRequest("lexicon JSON must have a string 'id' field".into()))?
         .to_string();
 
+    happyview_nsid::validate_nsid(&id).map_err(|e| AppError::BadRequest(e.to_string()))?;
+
     // Validate action
     let action =
         ProcedureAction::from_optional_str(body.action.as_deref()).map_err(AppError::BadRequest)?;
@@ -117,6 +119,29 @@ pub(super) async fn upload_lexicon(
         notify_collections(&state).await;
     }
 
+    let backfill_job_id: Option<String> =
+        if is_record && body.backfill && revision == 1 && auth.has(Permission::BackfillCreate) {
+            match crate::admin::backfill::start_backfill(
+                &state,
+                Some(id.clone()),
+                Vec::new(),
+                &auth.did,
+            )
+            .await
+            {
+                Ok(job_id) => Some(job_id),
+                Err(e) => {
+                    tracing::warn!(
+                        lexicon = id.as_str(),
+                        "failed to start backfill for uploaded lexicon: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let status = if revision == 1 {
         StatusCode::CREATED
     } else {
@@ -149,6 +174,7 @@ pub(super) async fn upload_lexicon(
         Json(serde_json::json!({
             "id": id,
             "revision": revision,
+            "backfill_job_id": backfill_job_id,
         })),
     ))
 }

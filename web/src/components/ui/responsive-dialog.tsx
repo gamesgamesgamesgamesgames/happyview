@@ -89,6 +89,12 @@ function ResponsiveDialog({
   const onOpenChangeRef = useAsRef(onOpenChangeProp);
 
   const store = React.useMemo<Store>(() => {
+    const notify = () => {
+      for (const cb of listenersRef.current) {
+        cb();
+      }
+    };
+
     return {
       subscribe: (cb) => {
         listenersRef.current.add(cb);
@@ -105,13 +111,9 @@ function ResponsiveDialog({
           stateRef.current[key] = value;
         }
 
-        store.notify();
+        notify();
       },
-      notify: () => {
-        for (const cb of listenersRef.current) {
-          cb();
-        }
-      },
+      notify,
     };
   }, [listenersRef, stateRef, onOpenChangeRef]);
 

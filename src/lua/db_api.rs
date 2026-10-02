@@ -92,38 +92,6 @@ fn check_raw_sql_tables(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_valid_json_field_path(path: &str) -> bool {
-    if path.is_empty() {
-        return false;
-    }
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            return false;
-        }
-        let bracket_start = segment.find('[').unwrap_or(segment.len());
-        let ident = &segment[..bracket_start];
-        if ident.is_empty() || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return false;
-        }
-        let mut rest = &segment[bracket_start..];
-        while !rest.is_empty() {
-            if !rest.starts_with('[') {
-                return false;
-            }
-            let close = match rest.find(']') {
-                Some(i) => i,
-                None => return false,
-            };
-            let idx = &rest[1..close];
-            if idx.is_empty() || !idx.chars().all(|c| c.is_ascii_digit()) {
-                return false;
-            }
-            rest = &rest[close + 1..];
-        }
-    }
-    true
-}
-
 #[derive(Debug)]
 enum FilterNode {
     Condition {
@@ -145,7 +113,7 @@ fn parse_filter_node(table: &mlua::Table, depth: u8) -> LuaResult<FilterNode> {
     }
 
     if let Ok(field) = table.get::<String>("field") {
-        if !is_valid_json_field_path(&field) {
+        if !crate::db::is_valid_json_field_path(&field) {
             return Err(mlua::Error::runtime(format!(
                 "invalid filter field '{field}': use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]')",
             )));
@@ -242,7 +210,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
             let cursor_str: Option<String> = opts.get("cursor").ok();
 
             if let Some(ref field) = sort
-                && !is_valid_json_field_path(field)
+                && !crate::db::is_valid_json_field_path(field)
             {
                 return Err(mlua::Error::runtime(
                     "invalid sort field: use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]')",
@@ -438,7 +406,7 @@ pub fn register_db_api(lua: &Lua, state: Arc<AppState>) -> LuaResult<()> {
             let query: String = opts.get("query")?;
             let limit: i64 = opts.get::<i64>("limit").unwrap_or(10).min(100);
 
-            if !is_valid_json_field_path(&field) {
+            if !crate::db::is_valid_json_field_path(&field) {
                 return Err(mlua::Error::runtime(
                     "invalid search field: use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]')",
                 ));
@@ -786,7 +754,9 @@ mod tests {
             port: 3000,
             database_url: String::new(),
             database_backend: crate::db::DatabaseBackend::Sqlite,
+            sqlite_journal_size_limit: crate::db::DEFAULT_JOURNAL_SIZE_LIMIT,
             public_url: String::new(),
+            user_agent: String::new(),
             session_secret: "test-secret".into(),
             jetstream_url: String::new(),
             relay_url: String::new(),
@@ -801,12 +771,13 @@ mod tests {
             token_encryption_key: None,
             default_rate_limit_capacity: 100,
             default_rate_limit_refill_rate: 2.0,
+            telemetry_collector_url: String::new(),
         };
         let (tx, _) = watch::channel(vec![]);
         let (labeler_tx, _) = watch::channel(());
         sqlx::any::install_default_drivers();
         let test_db = sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap();
-        let atrium_http = std::sync::Arc::new(atrium_oauth::DefaultHttpClient::default());
+        let atrium_http = std::sync::Arc::new(crate::http_retry::HappyViewHttpClient::default());
         let did_resolver = atrium_identity::did::CommonDidResolver::new(
             atrium_identity::did::CommonDidResolverConfig {
                 plc_directory_url: "https://plc.directory".into(),
@@ -841,6 +812,7 @@ mod tests {
                 authorization_server_metadata: Default::default(),
                 protected_resource_metadata: Default::default(),
             },
+            http_client: crate::http_retry::HappyViewHttpClient::default(),
         })
         .expect("Failed to create test OAuth client");
         AppState {
@@ -867,6 +839,27 @@ mod tests {
                 test_db.clone(),
                 crate::db::DatabaseBackend::Sqlite,
             ),
+            linked_repos_client: std::sync::Arc::new(
+                crate::linked_repos::client::build(
+                    "https://plc.directory",
+                    "http://127.0.0.1:0/oauth-client-metadata.json",
+                    "http://127.0.0.1:0",
+                    "http://127.0.0.1:0/auth/callback".into(),
+                    true,
+                    vec![atrium_oauth::Scope::Known(
+                        atrium_oauth::KnownScope::Atproto,
+                    )],
+                    crate::auth::oauth_store::DbStateStore::new(
+                        test_db.clone(),
+                        crate::db::DatabaseBackend::Sqlite,
+                    ),
+                    test_db.clone(),
+                    crate::db::DatabaseBackend::Sqlite,
+                    None,
+                )
+                .expect("Failed to create test linked-repo OAuth client"),
+            ),
+            linked_repos_client_kid: None,
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-for-tests-only-not-production",
             ),
@@ -885,6 +878,8 @@ mod tests {
             ))),
             backfill_events_tx: tokio::sync::broadcast::channel(16).0,
             verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            client_jwks: Vec::new(),
+            telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
         }
     }
 
@@ -1022,27 +1017,29 @@ mod tests {
 
     #[test]
     fn valid_json_field_paths() {
-        assert!(super::is_valid_json_field_path("name"));
-        assert!(super::is_valid_json_field_path("author_name"));
-        assert!(super::is_valid_json_field_path("author.handle"));
-        assert!(super::is_valid_json_field_path("tags[0]"));
-        assert!(super::is_valid_json_field_path("data[0][1]"));
-        assert!(super::is_valid_json_field_path("author.websites[0].url"));
-        assert!(super::is_valid_json_field_path("a.b.c.d.e"));
+        assert!(crate::db::is_valid_json_field_path("name"));
+        assert!(crate::db::is_valid_json_field_path("author_name"));
+        assert!(crate::db::is_valid_json_field_path("author.handle"));
+        assert!(crate::db::is_valid_json_field_path("tags[0]"));
+        assert!(crate::db::is_valid_json_field_path("data[0][1]"));
+        assert!(crate::db::is_valid_json_field_path(
+            "author.websites[0].url"
+        ));
+        assert!(crate::db::is_valid_json_field_path("a.b.c.d.e"));
     }
 
     #[test]
     fn invalid_json_field_paths() {
-        assert!(!super::is_valid_json_field_path(""));
-        assert!(!super::is_valid_json_field_path(".name"));
-        assert!(!super::is_valid_json_field_path("name."));
-        assert!(!super::is_valid_json_field_path("name..foo"));
-        assert!(!super::is_valid_json_field_path("[0]"));
-        assert!(!super::is_valid_json_field_path("name[]"));
-        assert!(!super::is_valid_json_field_path("name[abc]"));
-        assert!(!super::is_valid_json_field_path("name; DROP TABLE"));
-        assert!(!super::is_valid_json_field_path("name'OR 1=1"));
-        assert!(!super::is_valid_json_field_path("na-me"));
+        assert!(!crate::db::is_valid_json_field_path(""));
+        assert!(!crate::db::is_valid_json_field_path(".name"));
+        assert!(!crate::db::is_valid_json_field_path("name."));
+        assert!(!crate::db::is_valid_json_field_path("name..foo"));
+        assert!(!crate::db::is_valid_json_field_path("[0]"));
+        assert!(!crate::db::is_valid_json_field_path("name[]"));
+        assert!(!crate::db::is_valid_json_field_path("name[abc]"));
+        assert!(!crate::db::is_valid_json_field_path("name; DROP TABLE"));
+        assert!(!crate::db::is_valid_json_field_path("name'OR 1=1"));
+        assert!(!crate::db::is_valid_json_field_path("na-me"));
     }
 
     #[tokio::test]

@@ -15,12 +15,15 @@ pub mod external_auth;
 pub mod feature_flags;
 pub mod feature_middleware;
 pub mod http_retry;
+pub mod identity;
 pub mod jetstream;
 pub mod jobs;
 pub mod labeler;
 pub mod lexicon;
+pub mod linked_repos;
 pub mod lua;
 pub mod lua_analysis;
+pub mod maintenance;
 pub mod oauth;
 pub mod plc;
 pub mod plugin;
@@ -36,7 +39,12 @@ pub mod service_entries;
 pub mod service_identity;
 pub mod setup;
 pub mod spaces;
+pub mod telemetry;
+pub mod telemetry_middleware;
+#[cfg(test)]
+pub mod test_support;
 pub mod verification_methods;
+pub mod version;
 pub mod xrpc;
 
 use auth::oauth_store::{DbSessionStore, DbStateStore};
@@ -49,21 +57,22 @@ use rate_limit::RateLimiter;
 use std::sync::Arc;
 use tokio::sync::watch;
 
+use crate::http_retry::HappyViewHttpClient;
 use atrium_identity::did::CommonDidResolver;
 use atrium_identity::handle::AtprotoHandleResolver;
-use atrium_oauth::DefaultHttpClient;
 
 pub type HappyViewOAuthClient = atrium_oauth::OAuthClient<
     DbStateStore,
     DbSessionStore,
-    CommonDidResolver<DefaultHttpClient>,
-    AtprotoHandleResolver<NativeDnsResolver, DefaultHttpClient>,
+    CommonDidResolver<HappyViewHttpClient>,
+    AtprotoHandleResolver<NativeDnsResolver, HappyViewHttpClient>,
+    HappyViewHttpClient,
 >;
 
 pub type HappyViewOAuthSession = atrium_oauth::OAuthSession<
-    DefaultHttpClient,
-    CommonDidResolver<DefaultHttpClient>,
-    AtprotoHandleResolver<NativeDnsResolver, DefaultHttpClient>,
+    HappyViewHttpClient,
+    CommonDidResolver<HappyViewHttpClient>,
+    AtprotoHandleResolver<NativeDnsResolver, HappyViewHttpClient>,
     DbSessionStore,
 >;
 
@@ -81,6 +90,8 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     pub oauth: Arc<auth::OAuthClientRegistry>,
     pub oauth_state_store: DbStateStore,
+    pub linked_repos_client: Arc<HappyViewOAuthClient>,
+    pub linked_repos_client_kid: Option<String>,
     pub cookie_key: axum_extra::extract::cookie::Key,
     pub plugin_registry: Arc<plugin::PluginRegistry>,
     pub wasm_runtime: Arc<plugin::WasmRuntime>,
@@ -90,6 +101,8 @@ pub struct AppState {
     pub proxy_config: Arc<arc_swap::ArcSwap<proxy_config::ProxyConfig>>,
     pub backfill_events_tx: tokio::sync::broadcast::Sender<crate::admin::types::BackfillEvent>,
     pub verbose_event_logging: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub client_jwks: Vec<jose_jwk::Jwk>,
+    pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
 }
 
 impl axum::extract::FromRef<AppState> for axum_extra::extract::cookie::Key {

@@ -3,8 +3,7 @@ mod common;
 use atrium_identity::did::{CommonDidResolver, CommonDidResolverConfig};
 use atrium_identity::handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig};
 use atrium_oauth::{
-    AtprotoLocalhostClientMetadata, DefaultHttpClient, KnownScope, OAuthClientConfig,
-    OAuthResolverConfig, Scope,
+    AtprotoLocalhostClientMetadata, KnownScope, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 use happyview::AppState;
 use happyview::config::Config;
@@ -24,7 +23,9 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
         port: 3000,
         database_url: String::new(),
         database_backend: backend,
+        sqlite_journal_size_limit: happyview::db::DEFAULT_JOURNAL_SIZE_LIMIT,
         public_url: String::new(),
+        user_agent: String::new(),
         session_secret: "test-secret".into(),
         jetstream_url: String::new(),
         relay_url: String::new(),
@@ -39,10 +40,11 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
         token_encryption_key: None,
         default_rate_limit_capacity: 100,
         default_rate_limit_refill_rate: 2.0,
+        telemetry_collector_url: String::new(),
     };
     let (tx, _) = watch::channel(vec![]);
     let (labeler_tx, _) = watch::channel(());
-    let atrium_http = std::sync::Arc::new(DefaultHttpClient::default());
+    let atrium_http = std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
     let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
         plc_directory_url: "https://plc.directory".into(),
         http_client: std::sync::Arc::clone(&atrium_http),
@@ -66,6 +68,7 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
             authorization_server_metadata: Default::default(),
             protected_resource_metadata: Default::default(),
         },
+        http_client: happyview::http_retry::HappyViewHttpClient::default(),
     })
     .expect("Failed to create test OAuth client");
     AppState {
@@ -87,6 +90,22 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
             std::sync::Arc::new(oauth),
         )),
         oauth_state_store: happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+        linked_repos_client: std::sync::Arc::new(
+            happyview::linked_repos::client::build(
+                "https://plc.directory",
+                "http://127.0.0.1:0/oauth-client-metadata.json",
+                "http://127.0.0.1:0",
+                "http://127.0.0.1:0/auth/callback".into(),
+                true,
+                vec![Scope::Known(KnownScope::Atproto)],
+                happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
+                pool.clone(),
+                backend,
+                None,
+            )
+            .expect("Failed to create test linked-repo OAuth client"),
+        ),
+        linked_repos_client_kid: None,
         cookie_key: axum_extra::extract::cookie::Key::derive_from(
             b"test-secret-that-is-at-least-32-bytes-long",
         ),
@@ -107,6 +126,8 @@ async fn test_state_with_pool(pool: sqlx::AnyPool, backend: DatabaseBackend) -> 
         backfill_db: pool.clone(),
         backfill_events_tx: tokio::sync::broadcast::channel(16).0,
         verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        client_jwks: Vec::new(),
+        telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
     }
 }
 

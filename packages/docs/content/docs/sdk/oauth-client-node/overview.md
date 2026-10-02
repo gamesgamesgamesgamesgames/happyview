@@ -2,7 +2,7 @@
 title: "Node Client"
 ---
 
-Server-side OAuth client for authenticating with a HappyView instance using AT Protocol. Built on top of [`@happyview/oauth-client`](../oauth-client/overview.md), matching the API surface of [`@atproto/oauth-client-node`](https://www.npmjs.com/package/@atproto/oauth-client-node).
+Server-side OAuth client for authenticating with a HappyView instance using atproto. Built on top of [`@happyview/oauth-client`](../oauth-client/overview.md), matching the API surface of [`@atproto/oauth-client-node`](https://www.npmjs.com/package/@atproto/oauth-client-node).
 
 ## Installation
 
@@ -269,6 +269,14 @@ Or from the session itself:
 
 ```typescript
 await session.signOut();
+```
+
+The stored session is always cleared, even if the server refuses the revocation. `404`, `401`, and `403` count as a completed logout — the credential is already gone or unusable. `5xx` and network errors still throw, after the local cleanup, so a failed revocation can never leave the session stored and restorable.
+
+To clear a session locally without contacting the server:
+
+```typescript
+await client.forgetSession("did:plc:abc123");
 ```
 
 ## Validate client metadata

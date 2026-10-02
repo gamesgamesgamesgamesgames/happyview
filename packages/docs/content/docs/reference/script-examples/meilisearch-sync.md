@@ -31,7 +31,7 @@ function handle()
     })
   end
 
-  return record
+  return record or true  -- `record` is nil on delete; `true` lets it proceed
 end
 ```
 

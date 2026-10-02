@@ -2,7 +2,7 @@
 title: "Service Identity"
 ---
 
-Manage the service identity configuration: the DID and identity mode that HappyView uses to identify itself on the AT Protocol network. All endpoints require the `settings:manage` permission.
+Manage the service identity configuration: the DID and identity mode that HappyView uses to identify itself on the atproto network. All endpoints require the `settings:manage` permission.
 
 ```ts tab="TypeScript" tab-group="language"
 const TOKEN = "hv_..."; // your API key
@@ -86,7 +86,7 @@ Returns the current service identity configuration, or `null` if no identity has
 | ---------------- | ---------------------------------------------------- |
 | `did_web`        | HappyView derives a `did:web` from its public URL    |
 | `did_plc`        | HappyView manages its own `did:plc` identity         |
-| `attach_account` | HappyView uses an existing AT Protocol account's DID |
+| `attach_account` | HappyView uses an existing atproto account's DID |
 | `not_exposed`    | No service identity is exposed on the network        |
 
 ## Update service identity

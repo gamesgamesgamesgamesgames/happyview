@@ -15,17 +15,8 @@ pub async fn resolve_nsid_authority(
     plc_url: &str,
     nsid: &str,
 ) -> Result<(String, String), AppError> {
-    let segments: Vec<&str> = nsid.split('.').collect();
-    if segments.len() < 2 {
-        return Err(AppError::BadRequest(format!(
-            "invalid NSID (too few segments): {nsid}"
-        )));
-    }
-
-    // Authority is everything except the last segment, reversed to form a domain.
-    let authority_segments = &segments[..segments.len() - 1];
-    let reversed: Vec<&str> = authority_segments.iter().copied().rev().collect();
-    let domain = reversed.join(".");
+    let domain =
+        happyview_nsid::nsid_authority(nsid).map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     let lookup_name = format!("_lexicon.{domain}.");
 
@@ -108,5 +99,15 @@ mod tests {
         let http = reqwest::Client::new();
         let result = rt.block_on(resolve_nsid_authority(&http, "http://localhost", "single"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn nsid_with_digit_leading_authority_resolves_domain() {
+        // Regression guard: this NSID must reach DNS lookup rather than being
+        // rejected as malformed.
+        assert_eq!(
+            happyview_nsid::nsid_authority("pics.2bit.feed.getPhotos").unwrap(),
+            "feed.2bit.pics"
+        );
     }
 }

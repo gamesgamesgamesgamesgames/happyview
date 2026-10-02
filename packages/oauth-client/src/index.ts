@@ -1,9 +1,14 @@
 export * from "@atproto/jwk";
 export * from "@atproto/jwk-webcrypto";
 
-export { HappyViewOAuthClient, LAST_ACTIVE_KEY } from "./client";
+export {
+  HappyViewOAuthClient,
+  LAST_ACTIVE_KEY,
+  STORAGE_PREFIX,
+} from "./client";
 export type { FetchMetadataOptions } from "./client";
 export { importJwk } from "./import-jwk";
+export { jwkThumbprint } from "./thumbprint";
 export {
   ApiError,
   AuthenticationError,

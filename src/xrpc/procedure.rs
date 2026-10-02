@@ -269,8 +269,8 @@ async fn handle_create_record(
             let record_str = serde_json::to_string(&record).unwrap_or_default();
             let sql = adapt_sql(
                 r#"
-                INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (uri) DO UPDATE
                     SET record = EXCLUDED.record,
                         cid = EXCLUDED.cid
@@ -285,6 +285,7 @@ async fn handle_create_record(
                 .bind(rkey)
                 .bind(&record_str)
                 .bind(cid)
+                .bind(crate::db::NO_INDEXED_AT)
                 .bind(&now)
                 .execute(&state.db)
                 .await;
@@ -356,12 +357,11 @@ async fn handle_put_record(
         let now = now_rfc3339();
         let sql = adapt_sql(
             r#"
-            INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (uri) DO UPDATE
                 SET record = EXCLUDED.record,
-                    cid = EXCLUDED.cid,
-                    indexed_at = ?
+                    cid = EXCLUDED.cid
             "#,
             backend,
         );
@@ -372,7 +372,7 @@ async fn handle_put_record(
             .bind(&rkey)
             .bind(&record_str)
             .bind(cid)
-            .bind(&now)
+            .bind(crate::db::NO_INDEXED_AT)
             .bind(&now)
             .execute(&state.db)
             .await;

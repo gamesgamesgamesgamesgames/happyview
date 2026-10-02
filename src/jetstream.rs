@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
-use crate::record_handler::{self, LEXICON_SCHEMA_COLLECTION, RecordEvent};
+use crate::record_handler::{self, LEXICON_SCHEMA_COLLECTION, RecordEvent, RecordOutcome};
 
 // ---------------------------------------------------------------------------
 // Jetstream event types
@@ -260,6 +260,11 @@ async fn run(
                     }
                 };
 
+                state
+                    .telemetry_counters
+                    .jetstream_received
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                 // Update cursor tracking.
                 latest_cursor = Some(event.time_us);
                 events_since_flush += 1;
@@ -288,7 +293,25 @@ async fn run(
                             let state = state.clone();
                             tokio::spawn(async move {
                                 let _permit = sem.acquire().await.unwrap();
-                                record_handler::handle_record_event(&state, &record_event).await;
+                                let outcome =
+                                    record_handler::handle_record_event(&state, &record_event)
+                                        .await;
+
+                                match outcome {
+                                    RecordOutcome::Matched => {
+                                        state
+                                            .telemetry_counters
+                                            .jetstream_matched
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    RecordOutcome::Skipped => {
+                                        state
+                                            .telemetry_counters
+                                            .jetstream_skipped
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    RecordOutcome::SchemaEvent | RecordOutcome::Errored => {}
+                                }
                             });
                         }
                     }

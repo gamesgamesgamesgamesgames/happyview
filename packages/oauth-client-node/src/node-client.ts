@@ -5,6 +5,7 @@ import {
   HappyViewOAuthClient,
   HappyViewSession,
   importJwk,
+  jwkThumbprint,
   InvalidStateError,
   OAuthCallbackError,
   ResolutionError,
@@ -158,7 +159,15 @@ export class HappyViewNodeClient extends HappyViewOAuthClient {
     if (options?.nonce) authParams.set("nonce", options.nonce);
     if (options?.max_age != null) authParams.set("max_age", String(options.max_age));
     if (options?.ui_locales) authParams.set("ui_locales", options.ui_locales);
-    if (options?.dpop_jkt) authParams.set("dpop_jkt", options.dpop_jkt);
+    // ⚠ THE AUTHORIZATION REQUEST MUST BE BOUND TO THE DPoP KEY, and this client
+    // is the only thing that can do it — `provisionDpopKey` above returned the
+    // very key that signs the token-endpoint proof in `callback`, and it never
+    // leaves the SDK. Sent unbound, the PAR carries neither a `DPoP` header nor
+    // `dpop_jkt`; bsky's PDS tolerates that, but the tolerance is deprecated
+    // (https://atproto.com/blog/oauth-improvements#deprecation-notice) and other
+    // implementations reject the request outright. A caller-supplied `dpop_jkt`
+    // still wins, for anyone driving the key themselves.
+    authParams.set("dpop_jkt", options?.dpop_jkt ?? (await jwkThumbprint(rawJwk)));
     if (options?.id_token_hint) authParams.set("id_token_hint", options.id_token_hint);
     if (options?.claims) authParams.set("claims", JSON.stringify(options.claims));
     if (options?.authorization_details) authParams.set("authorization_details", JSON.stringify(options.authorization_details));

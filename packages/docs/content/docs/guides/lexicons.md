@@ -10,7 +10,7 @@ You don't write route handlers or database queries; you upload a lexicon and Hap
 
 | Type          | Effect                                                                                                                                   |
 | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `record`      | Adds the collection to the Jetstream subscription filter and indexes records into the database. Supports [record scripts](label-scripts) |
+| `record`      | Adds the collection to the Jetstream subscription filter and indexes records into the database. Supports [record scripts](record-scripts) |
 | `query`       | Registers a `GET /xrpc/{nsid}` endpoint that queries indexed records                                                                     |
 | `procedure`   | Registers a `POST /xrpc/{nsid}` endpoint that proxies writes to the user's PDS                                                           |
 | `definitions` | Stored but does not generate routes or subscriptions                                                                                     |
@@ -31,7 +31,9 @@ The `target_collection` is available in Lua scripts as the `collection` global, 
 
 ## Backfill flag
 
-When uploading a record-type lexicon, HappyView automatically creates a backfill job to discover existing records. If you only want to index new records going forward, you can set `backfill` to `false`.
+When a record-type lexicon is uploaded for the first time, HappyView automatically creates a [backfill job](backfill.md) to discover existing records. The job appears on the Backfill page like any other, with the same progress, pause, cancel, and retry controls, and the upload response returns its id as `backfill_job_id`.
+
+Only the *first* upload starts one. Editing a lexicon afterwards re-saves it without re-crawling the network — if you want to backfill again, start one from the Backfill page. If you only want to index new records going forward, set `backfill` to `false`.
 
 ## Jetstream collection filters
 
@@ -100,7 +102,7 @@ In short: if you want to serve an XRPC method on your instance, you need a local
 ## Next steps
 
 - [Lua Scripting](./lua-scripting.md): Add custom query and procedure logic to your endpoints
-- [Record & Label Scripts](label-scripts): Run Lua scripts when records are indexed or labels arrive
+- [Record & Label Scripts](record-scripts): Run Lua scripts when records are indexed or labels arrive
 - [XRPC API](../api-reference/xrpc-api.md): Understand how the generated endpoints behave
 - [Backfill](backfill.md): Learn how historical records are indexed
 - [Admin API](../api-reference/admin/admin-api.md): Full reference for lexicon management endpoints

@@ -7,6 +7,7 @@ use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::{LexiconType, ParsedLexicon, ProcedureAction};
+use crate::lua::RecordHookOutcome;
 
 /// The static collection we always include for lexicon schema updates.
 pub const LEXICON_SCHEMA_COLLECTION: &str = "com.atproto.lexicon.schema";
@@ -21,9 +22,22 @@ pub struct RecordEvent {
     pub cid: Option<String>,
 }
 
+/// The outcome of processing one record event, returned so a caller can
+/// account for it in telemetry rather than this function reaching into
+/// `state.telemetry_counters` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum RecordOutcome {
+    Matched,
+    Skipped,
+    SchemaEvent,
+    Errored,
+}
+
 /// Process a record event: upsert/delete the record in the database, run index
-/// hooks, and handle lexicon schema events.
-pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
+/// hooks, and handle lexicon schema events. Returns the outcome so the caller
+/// can account for it in telemetry — see `RecordOutcome`.
+pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> RecordOutcome {
     let db = &state.db;
     let lexicons = &state.lexicons;
 
@@ -32,7 +46,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
     // Handle lexicon schema events for tracked network lexicons.
     if record.collection == LEXICON_SCHEMA_COLLECTION {
         handle_lexicon_schema_event(state, &record.did, record).await;
-        return;
+        return RecordOutcome::SchemaEvent;
     }
 
     // Skip records whose collection is not tracked by a registered record-type lexicon.
@@ -46,14 +60,14 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
             collection = %record.collection,
             "skipping record for untracked collection"
         );
-        return;
+        return RecordOutcome::Skipped;
     }
 
     match record.action.as_str() {
         "create" | "update" => {
             let rec = match &record.record {
                 Some(r) => r,
-                None => return,
+                None => return RecordOutcome::Errored,
             };
             let cid = record.cid.as_deref().unwrap_or_default();
 
@@ -82,13 +96,14 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                     state.db_backend,
                 )
                 .await;
-                return;
+                return RecordOutcome::Skipped;
             }
 
             // Run record-event script (if any) before storing. The script's
             // return value determines what gets written:
-            //   None → skip indexing entirely
-            //   Some(record) → upsert with that record body
+            //   Skip → skip indexing entirely
+            //   Replace(record) → upsert with that record body
+            //   Proceed → upsert with the record as it arrived
             // The dispatcher cascades `record.<action>:<nsid>` →
             // `record.index:<nsid>`; failures are dead-lettered fail-open.
             let hook_result = crate::lua::run_record_event_script(
@@ -104,27 +119,34 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
             )
             .await;
             let rec_to_store = match hook_result {
-                None => {
-                    log_event(
-                        db,
-                        EventLog {
-                            event_type: "record.skipped".to_string(),
-                            severity: Severity::Info,
-                            actor_did: None,
-                            subject: Some(uri.clone()),
-                            detail: serde_json::json!({
-                                "collection": record.collection,
-                                "did": record.did,
-                                "rkey": record.rkey,
-                                "reason": "script returned nil",
-                            }),
-                        },
-                        state.db_backend,
-                    )
-                    .await;
-                    return;
+                RecordHookOutcome::Skip => {
+                    // Gated like `record.created`/`record.deleted` below: a
+                    // filtering script skips far more records than it keeps, so
+                    // logging every skip writes a row per discarded firehose
+                    // record.
+                    if state.verbose_event_logging.load(Ordering::Relaxed) {
+                        log_event(
+                            db,
+                            EventLog {
+                                event_type: "record.skipped".to_string(),
+                                severity: Severity::Info,
+                                actor_did: None,
+                                subject: Some(uri.clone()),
+                                detail: serde_json::json!({
+                                    "collection": record.collection,
+                                    "did": record.did,
+                                    "rkey": record.rkey,
+                                    "reason": "script returned nil",
+                                }),
+                            },
+                            state.db_backend,
+                        )
+                        .await;
+                    }
+                    return RecordOutcome::Skipped;
                 }
-                Some(v) => v,
+                RecordHookOutcome::Replace(v) => v,
+                RecordHookOutcome::Proceed => rec.clone(),
             };
 
             let now = now_rfc3339();
@@ -183,6 +205,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                     }
 
                     crate::labeler::backfill_labels_for_uri(Arc::new(state.clone()), uri.clone());
+                    RecordOutcome::Matched
                 }
                 Err(e) => {
                     tracing::warn!(uri = %uri, "failed to upsert record: {e}");
@@ -203,14 +226,16 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                         backend,
                     )
                     .await;
+                    RecordOutcome::Errored
                 }
             }
         }
         "delete" => {
             let backend = state.db_backend;
 
-            // Run record-event script (if any) before deleting. A nil
-            // return aborts the delete; any other return continues.
+            // Run record-event script (if any) before deleting. Only a
+            // script that actually ran and returned `nil` aborts the
+            // delete — no script, or a dead-lettered one, proceeds.
             let hook_result = crate::lua::run_record_event_script(
                 state,
                 crate::lua::RecordEventPayload {
@@ -223,25 +248,28 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                 },
             )
             .await;
-            if hook_result.is_none() {
-                log_event(
-                    db,
-                    EventLog {
-                        event_type: "record.skipped".to_string(),
-                        severity: Severity::Info,
-                        actor_did: None,
-                        subject: Some(uri.clone()),
-                        detail: serde_json::json!({
-                            "collection": record.collection,
-                            "did": record.did,
-                            "rkey": record.rkey,
-                            "reason": "script returned nil",
-                        }),
-                    },
-                    backend,
-                )
-                .await;
-                return;
+            if hook_result == RecordHookOutcome::Skip {
+                // Gated for the same reason as the create path above.
+                if state.verbose_event_logging.load(Ordering::Relaxed) {
+                    log_event(
+                        db,
+                        EventLog {
+                            event_type: "record.skipped".to_string(),
+                            severity: Severity::Info,
+                            actor_did: None,
+                            subject: Some(uri.clone()),
+                            detail: serde_json::json!({
+                                "collection": record.collection,
+                                "did": record.did,
+                                "rkey": record.rkey,
+                                "reason": "script returned nil",
+                            }),
+                        },
+                        backend,
+                    )
+                    .await;
+                }
+                return RecordOutcome::Skipped;
             }
 
             let delete_sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
@@ -265,6 +293,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                         )
                         .await;
                     }
+                    RecordOutcome::Matched
                 }
                 Err(e) => {
                     tracing::warn!(uri = %uri, "failed to delete record: {e}");
@@ -285,10 +314,11 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) {
                         backend,
                     )
                     .await;
+                    RecordOutcome::Errored
                 }
             }
         }
-        _ => {}
+        _ => RecordOutcome::Errored,
     }
 }
 
@@ -393,5 +423,325 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::lexicon::ProcedureAction;
+    use crate::test_support::{memory_pool, test_state_with_pool};
+
+    const NSID: &str = "com.example.thing";
+    const URI: &str = "at://did:plc:abc/com.example.thing/rkey1";
+
+    /// A state with the record/script/event-log tables and `NSID` registered as
+    /// a record-type lexicon, so `handle_record_event` treats it as tracked.
+    async fn tracked_state() -> AppState {
+        let pool = memory_pool().await;
+        for ddl in [
+            "CREATE TABLE happyview_records (
+                uri TEXT PRIMARY KEY,
+                did TEXT NOT NULL,
+                collection TEXT NOT NULL,
+                rkey TEXT NOT NULL,
+                record TEXT NOT NULL,
+                cid TEXT,
+                indexed_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+            "CREATE TABLE happyview_scripts (
+                id TEXT PRIMARY KEY,
+                body TEXT NOT NULL,
+                script_type TEXT NOT NULL DEFAULT 'lua'
+            )",
+            "CREATE TABLE happyview_event_logs (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                actor_did TEXT,
+                subject TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            )",
+            "CREATE TABLE happyview_record_refs (
+                source_uri TEXT NOT NULL,
+                target_uri TEXT NOT NULL,
+                field TEXT NOT NULL
+            )",
+        ] {
+            crate::db::query(ddl)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("create table: {e}"));
+        }
+
+        let state = test_state_with_pool(pool);
+        let parsed = ParsedLexicon::parse(
+            serde_json::json!({
+                "lexicon": 1,
+                "id": NSID,
+                "defs": {"main": {"type": "record", "key": "tid"}},
+            }),
+            1,
+            Some(NSID.to_string()),
+            ProcedureAction::Upsert,
+            None,
+        )
+        .expect("parse test lexicon");
+        state.lexicons.upsert(parsed).await;
+        state
+    }
+
+    async fn insert_record(state: &AppState) {
+        crate::db::query(
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(URI)
+        .bind("did:plc:abc")
+        .bind(NSID)
+        .bind("rkey1")
+        .bind(r#"{"text":"hello"}"#)
+        .bind("bafyreiabc")
+        .bind("2026-01-01T00:00:00+00:00")
+        .bind("2026-01-01T00:00:00+00:00")
+        .execute(&state.db)
+        .await
+        .expect("seed record");
+    }
+
+    async fn record_exists(state: &AppState) -> bool {
+        let row: Option<(String,)> =
+            crate::db::query_as("SELECT uri FROM happyview_records WHERE uri = ?")
+                .bind(URI)
+                .fetch_optional(&state.db)
+                .await
+                .expect("query record");
+        row.is_some()
+    }
+
+    fn delete_event() -> RecordEvent {
+        RecordEvent {
+            did: "did:plc:abc".to_string(),
+            collection: NSID.to_string(),
+            rkey: "rkey1".to_string(),
+            action: "delete".to_string(),
+            record: None,
+            cid: None,
+        }
+    }
+
+    fn create_event() -> RecordEvent {
+        RecordEvent {
+            did: "did:plc:abc".to_string(),
+            collection: NSID.to_string(),
+            rkey: "rkey1".to_string(),
+            action: "create".to_string(),
+            record: Some(serde_json::json!({"text": "hello"})),
+            cid: None,
+        }
+    }
+
+    async fn skipped_event_count(state: &AppState) -> i64 {
+        let row: (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'record.skipped'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("count record.skipped events");
+        row.0
+    }
+
+    async fn install_script(state: &AppState, trigger: &str, body: &str) {
+        crate::db::query(
+            "INSERT INTO happyview_scripts (id, body, script_type) VALUES (?, ?, 'lua')",
+        )
+        .bind(trigger)
+        .bind(body)
+        .execute(&state.db)
+        .await
+        .expect("install script");
+    }
+
+    /// Regression test for #80: a Jetstream delete for a tracked collection with
+    /// no registered script must delete the row. The "no script ran" and "the
+    /// script returned nil" signals used to be spelled the same way, so an
+    /// instance with no scripts at all skipped every delete.
+    #[tokio::test]
+    async fn delete_without_any_script_removes_the_record() {
+        let state = tracked_state().await;
+        insert_record(&state).await;
+
+        let _ = handle_record_event(&state, &delete_event()).await;
+
+        assert!(
+            !record_exists(&state).await,
+            "delete with no registered script must remove the record"
+        );
+    }
+
+    /// `return true` is the documented "proceed, I only had side effects"
+    /// return. On a delete it used to fall through to the original record
+    /// body — which is nil for a delete — and abort.
+    #[tokio::test]
+    async fn delete_with_a_script_returning_true_removes_the_record() {
+        let state = tracked_state().await;
+        install_script(
+            &state,
+            &format!("record.delete:{NSID}"),
+            "function handle() return true end",
+        )
+        .await;
+        insert_record(&state).await;
+
+        let _ = handle_record_event(&state, &delete_event()).await;
+
+        assert!(
+            !record_exists(&state).await,
+            "a delete script returning true must let the delete proceed"
+        );
+    }
+
+    /// The documented delete gate: a script that runs and returns `nil`
+    /// still keeps the record. This is the one case that must NOT delete.
+    #[tokio::test]
+    async fn delete_with_a_script_returning_nil_keeps_the_record() {
+        let state = tracked_state().await;
+        install_script(
+            &state,
+            &format!("record.delete:{NSID}"),
+            "function handle() return nil end",
+        )
+        .await;
+        insert_record(&state).await;
+
+        let _ = handle_record_event(&state, &delete_event()).await;
+
+        assert!(
+            record_exists(&state).await,
+            "a delete script returning nil must keep the record"
+        );
+    }
+
+    /// The create path's pass-through: no script means index the record as it
+    /// arrived, not skip it.
+    #[tokio::test]
+    async fn create_without_any_script_indexes_the_record() {
+        let state = tracked_state().await;
+
+        let _ = handle_record_event(
+            &state,
+            &RecordEvent {
+                did: "did:plc:abc".to_string(),
+                collection: NSID.to_string(),
+                rkey: "rkey1".to_string(),
+                action: "create".to_string(),
+                record: Some(serde_json::json!({"text": "hello"})),
+                cid: None,
+            },
+        )
+        .await;
+
+        assert!(
+            record_exists(&state).await,
+            "create with no registered script must index the record"
+        );
+    }
+
+    /// `record.skipped` is per-record telemetry on the *most common* outcome
+    /// for a filtering script, so it belongs behind the same `verbose_event_logging`
+    /// gate as its `record.created`/`record.deleted` siblings. Ungated, it wrote a
+    /// row for every discarded firehose record: on upvote.at that was 5.7M of the
+    /// 5.8M rows in `happyview_event_logs`, ~2.7 GB, against 397 `record.created`.
+    #[tokio::test]
+    async fn create_skip_is_not_logged_while_verbose_logging_is_off() {
+        let state = tracked_state().await;
+        install_script(
+            &state,
+            &format!("record.create:{NSID}"),
+            "function handle() return nil end",
+        )
+        .await;
+
+        let _ = handle_record_event(&state, &create_event()).await;
+
+        assert!(
+            !record_exists(&state).await,
+            "a create script returning nil must skip indexing"
+        );
+        assert_eq!(
+            skipped_event_count(&state).await,
+            0,
+            "record.skipped must not be logged while verbose event logging is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_skip_is_not_logged_while_verbose_logging_is_off() {
+        let state = tracked_state().await;
+        install_script(
+            &state,
+            &format!("record.delete:{NSID}"),
+            "function handle() return nil end",
+        )
+        .await;
+        insert_record(&state).await;
+
+        let _ = handle_record_event(&state, &delete_event()).await;
+
+        assert!(
+            record_exists(&state).await,
+            "a delete script returning nil must keep the record"
+        );
+        assert_eq!(
+            skipped_event_count(&state).await,
+            0,
+            "record.skipped must not be logged while verbose event logging is off"
+        );
+    }
+
+    /// The gate must suppress the log, not remove it: with verbose logging on,
+    /// both skip paths still report.
+    #[tokio::test]
+    async fn create_skip_is_logged_when_verbose_logging_is_on() {
+        let state = tracked_state().await;
+        state.verbose_event_logging.store(true, Ordering::Relaxed);
+        install_script(
+            &state,
+            &format!("record.create:{NSID}"),
+            "function handle() return nil end",
+        )
+        .await;
+
+        let _ = handle_record_event(&state, &create_event()).await;
+
+        assert_eq!(
+            skipped_event_count(&state).await,
+            1,
+            "record.skipped must still be logged when verbose event logging is on"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_skip_is_logged_when_verbose_logging_is_on() {
+        let state = tracked_state().await;
+        state.verbose_event_logging.store(true, Ordering::Relaxed);
+        install_script(
+            &state,
+            &format!("record.delete:{NSID}"),
+            "function handle() return nil end",
+        )
+        .await;
+        insert_record(&state).await;
+
+        let _ = handle_record_event(&state, &delete_event()).await;
+
+        assert_eq!(
+            skipped_event_count(&state).await,
+            1,
+            "record.skipped must still be logged when verbose event logging is on"
+        );
     }
 }

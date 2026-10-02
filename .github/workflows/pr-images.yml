@@ -1,0 +1,168 @@
+name: PR images
+
+# Publishes the images built by CI's `pr-build` job and comments on the PR.
+#
+# `pr-build` runs in the PR's context, where fork PRs get a read-only token and
+# no secrets, so it only exports the images as artifacts. This workflow runs
+# from the default branch with write access. It never checks out or executes PR
+# code: it loads the exported image tarballs and pushes them as-is. Everything
+# read from the CI run (artifacts, branch names) is untrusted input.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  publish:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: depot-ubuntu-24.04
+    permissions:
+      actions: read
+      packages: write
+      pull-requests: write
+    env:
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Resolve PR
+        id: pr
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runId = Number(process.env.RUN_ID);
+            const headSha = process.env.HEAD_SHA;
+
+            const artifacts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              { owner, repo, run_id: runId },
+            );
+            const names = new Set(artifacts.filter(a => !a.expired).map(a => a.name));
+            const required = ['pr-build-metadata', 'happyview-image-amd64', 'happyview-image-arm64'];
+            const missing = required.filter(n => !names.has(n));
+            if (missing.length > 0) {
+              core.info(`No PR images to publish (missing: ${missing.join(', ')}).`);
+              core.setOutput('publish', 'false');
+              return;
+            }
+
+            const metadata = artifacts.find(a => a.name === 'pr-build-metadata');
+            const { data: zip } = await github.rest.actions.downloadArtifact({
+              owner, repo, artifact_id: metadata.id, archive_format: 'zip',
+            });
+            const fs = require('fs');
+            const { execFileSync } = require('child_process');
+            fs.writeFileSync('pr-build-metadata.zip', Buffer.from(zip));
+            const prNumber = execFileSync('unzip', ['-p', 'pr-build-metadata.zip', 'pr-number'])
+              .toString()
+              .trim();
+
+            if (!/^[1-9][0-9]*$/.test(prNumber)) {
+              core.setFailed(`Invalid PR number in artifact: ${JSON.stringify(prNumber)}`);
+              return;
+            }
+
+            // The number comes from the PR's own run, so confirm it names a PR
+            // whose head is the commit this run built. This also drops runs
+            // for commits that have since been superseded.
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: Number(prNumber),
+            });
+            if (pr.head.sha !== headSha) {
+              core.info(`PR #${prNumber} head is ${pr.head.sha}, run built ${headSha}; skipping.`);
+              core.setOutput('publish', 'false');
+              return;
+            }
+
+            core.setOutput('publish', 'true');
+            core.setOutput('number', prNumber);
+
+      - name: Download images
+        if: steps.pr.outputs.publish == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: happyview-image-*
+          merge-multiple: true
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: steps.pr.outputs.publish == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        if: steps.pr.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push images
+        if: steps.pr.outputs.publish == 'true'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          sources=()
+          for arch in amd64 arm64; do
+            docker load --input "happyview-image-${arch}.tar"
+            ref="${GHCR_IMAGE}:pr-${PR_NUMBER}-${arch}"
+            docker tag "happyview-pr:${arch}" "$ref"
+            docker push "$ref"
+            sources+=("$ref")
+          done
+          docker buildx imagetools create -t "${GHCR_IMAGE}:pr-${PR_NUMBER}" "${sources[@]}"
+
+      - name: Comment on PR
+        if: steps.pr.outputs.publish == 'true'
+        uses: actions/github-script@v9
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const runId = process.env.RUN_ID;
+            const sha = process.env.HEAD_SHA.substring(0, 7);
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${runId}`;
+            const image = `ghcr.io/${owner}/${repo}`;
+            const body = [
+              '### PR Build',
+              '',
+              `Builds for \`${sha}\`:`,
+              '',
+              '**Docker**',
+              '```sh',
+              `docker pull ${image}:pr-${prNumber}`,
+              '```',
+              '',
+              '**Binaries**',
+              '```sh',
+              `gh run download ${runId} -n happyview-linux-amd64`,
+              `gh run download ${runId} -n happyview-linux-arm64`,
+              '```',
+              '',
+              `Or download binaries from the [workflow run](${runUrl}).`,
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber,
+            });
+            const existing = comments.find(
+              c => c.user?.type === 'Bot' && c.body.startsWith('### PR Build'),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber, body,
+              });
+            }

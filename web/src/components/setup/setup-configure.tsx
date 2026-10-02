@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
-import { setSetupIdentity, resolveIdentity, type ResolveResult } from "@/lib/api"
+import { setSetupIdentity, resolveSetupIdentity, type ResolveResult } from "@/lib/api"
 
 interface SetupConfigureProps {
   mode: string
@@ -58,7 +58,7 @@ function AttachAccountForm({ onComplete, onBack }: {
 
     setResolving(true)
     try {
-      const results = await resolveIdentity(q)
+      const results = await resolveSetupIdentity(q)
       setSuggestions(results)
       setShowSuggestions(true)
       setFocusedIndex(-1)

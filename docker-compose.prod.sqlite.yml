@@ -1,0 +1,216 @@
+# Production stack — SQLite.
+#
+# Explicit project name so this never shares containers, networks or volumes
+# with the dev (`happyview`), unit-test (`happyview-test`) or e2e
+# (`happyview-e2e`) stacks. All four compose files live in this directory and
+# would otherwise default to the same project name, where a `down` in one tears
+# down the others.
+name: happyview-prod-sqlite
+
+# Required variables (put them in a `.env` beside this file, or export them):
+#
+#   PUBLIC_URL           https://happyview.example.com — must match exactly the
+#                        URL users hit, scheme included, or OAuth login breaks.
+#                        Do NOT include BASE_PATH here.
+#   SESSION_SECRET       openssl rand -base64 48   (>= 64 chars recommended)
+#   TOKEN_ENCRYPTION_KEY openssl rand -base64 32   (exactly 32 bytes, base64)
+#
+# Compose fails fast with the message below if any of them is missing.
+#
+#   docker compose -f docker-compose.prod.sqlite.yml up -d
+#
+# Compose auto-loads a `.env` sitting beside this file, so a development `.env`
+# left in a deployment clone will quietly supply these. Keep production values
+# in their own file and pass it explicitly:
+#
+#   docker compose --env-file .env.prod -f docker-compose.prod.sqlite.yml up -d
+#
+# HappyView does not terminate TLS. Put a reverse proxy (Caddy, nginx,
+# Cloudflare Tunnel, a platform load balancer) in front of it and point
+# PUBLIC_URL at the public HTTPS URL. If you don't already have one, a
+# commented-out Caddy service at the bottom of this file will do it, with
+# certificates obtained and renewed automatically.
+
+services:
+  happyview:
+    image: ghcr.io/gamesgamesgamesgamesgames/happyview:${HAPPYVIEW_VERSION:-latest}
+    restart: unless-stopped
+
+    # Published on loopback by default — the reverse proxy in front is what
+    # should be exposed. Set HTTP_BIND=0.0.0.0:3000 to publish on all
+    # interfaces, or drop `ports` entirely and attach the proxy to this
+    # compose network.
+    ports:
+      - "${HTTP_BIND:-127.0.0.1:3000}:3000"
+
+    volumes:
+      # The SQLite database, its WAL, and anything else HappyView persists.
+      # This is the only stateful path — back this volume up.
+      - happyview-data:/data
+
+    environment:
+      # --- Database -----------------------------------------------------
+      # Deliberately literal, not interpolated. A relative SQLite path (as in
+      # `.env.example`) resolves against the image's /app workdir, which is the
+      # container's writable layer — the database would live outside the volume
+      # and vanish on the next `up`. Change the path here, not through the
+      # environment. `mode=rwc` creates the file on first boot.
+      DATABASE_URL: sqlite:///data/happyview.db?mode=rwc
+      # Caps the -wal file after a checkpoint. Deleting rows on SQLite grows
+      # the WAL for the duration of the delete, so this bounds a delete's peak
+      # disk usage. Default 64 MiB.
+      SQLITE_JOURNAL_SIZE_LIMIT: ${SQLITE_JOURNAL_SIZE_LIMIT:-67108864}
+
+      # --- Identity / networking ----------------------------------------
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL to the public HTTPS URL, e.g. https://happyview.example.com}
+      HOST: 0.0.0.0
+      PORT: "3000"
+      # Subpath prefix when sharing a domain with another service, e.g. /hv.
+      # PUBLIC_URL must NOT include it. Applied at container start, so no
+      # rebuild is needed. /health stays at the domain root regardless.
+      BASE_PATH: ${BASE_PATH:-}
+
+      # --- Secrets ------------------------------------------------------
+      # Signs the dashboard session cookie. An unset or too-short value does
+      # not stop boot — it silently disables cookie login — so it is required
+      # here instead.
+      SESSION_SECRET: ${SESSION_SECRET:?generate one with `openssl rand -base64 48`}
+      # AES-256-GCM key for OAuth tokens, DPoP private keys and plugin secrets
+      # at rest. Without it, DPoP sessions, spaces and service identity are
+      # disabled. Rotating it makes everything already encrypted unreadable.
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?generate one with `openssl rand -base64 32` (must decode to exactly 32 bytes)}
+      # Attestation signing uses a key generated and persisted to the database
+      # on first run. To supply your own, uncomment this — but note it must be
+      # a valid hex-encoded 32-byte secp256k1 key. An empty value is treated as
+      # "set", and fails signer construction instead of falling back to the
+      # generated key, which is why it is not declared with an empty default.
+      # ATTESTATION_PRIVATE_KEY: ${ATTESTATION_PRIVATE_KEY:-}
+
+      # --- Upstream services --------------------------------------------
+      JETSTREAM_URL: ${JETSTREAM_URL:-wss://jetstream1.us-east.bsky.network}
+      RELAY_URL: ${RELAY_URL:-https://bsky.network}
+      PLC_URL: ${PLC_URL:-https://plc.directory}
+
+      # --- Operational ---------------------------------------------------
+      # The dev default (`happyview=debug`) is very noisy in production.
+      RUST_LOG: ${RUST_LOG:-happyview=info,tower_http=info,sqlx=warn}
+      EVENT_LOG_RETENTION_DAYS: ${EVENT_LOG_RETENTION_DAYS:-30}
+      DEFAULT_RATE_LIMIT_CAPACITY: ${DEFAULT_RATE_LIMIT_CAPACITY:-100}
+      DEFAULT_RATE_LIMIT_REFILL_RATE: ${DEFAULT_RATE_LIMIT_REFILL_RATE:-2.0}
+
+    # The runtime image carries no curl or wget, so this probes /health over
+    # bash's /dev/tcp. `sh` is dash here and does not support it — hence CMD
+    # rather than CMD-SHELL.
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/3000 && printf "GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n" >&3 && head -n 1 <&3 | grep -q 200'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+    # `entrypoint.sh` execs the server, making it PID 1 — where the kernel
+    # drops signals that have only their default disposition, and the server
+    # installs no SIGTERM handler. Without an init, every `stop`, `restart` and
+    # `down` therefore hangs for the full grace period and ends in SIGKILL
+    # (exit 137), which on SQLite means leaving the WAL to be recovered on the
+    # next open. `init: true` puts tini at PID 1 to forward the signal, so the
+    # server exits promptly. Note this is prompt, not graceful: there is no
+    # graceful-shutdown handler, so in-flight requests are dropped either way,
+    # and an interrupted job is re-queued on the next boot.
+    init: true
+    stop_grace_period: 30s
+
+    # Container stdout is the only log sink; without a cap json-file logs grow
+    # unbounded. Ship these to an aggregator if you need retention.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # --------------------------------------------------------------------------
+  # Optional: Caddy as the TLS-terminating reverse proxy.
+  #
+  # HappyView does not terminate TLS. Uncommenting this puts Caddy in front of
+  # it with an automatically obtained and renewed Let's Encrypt certificate.
+  # Skip it if you already have a proxy, a platform load balancer, or a
+  # Cloudflare Tunnel doing the same job.
+  #
+  # Create a `Caddyfile` beside this file containing:
+  #
+  #   {$CADDY_DOMAIN} {
+  #       reverse_proxy happyview:3000
+  #   }
+  #
+  # and set CADDY_DOMAIN in your env file to the hostname from PUBLIC_URL with
+  # the scheme stripped — `happyview.example.com` for
+  # `https://happyview.example.com`. PUBLIC_URL itself stays the full URL.
+  #
+  # When you enable this, also:
+  #
+  #   - Delete the `ports` block from the `happyview` service. Caddy reaches it
+  #     over the compose network, so publishing it to the host as well only
+  #     widens the exposure. Leave HTTP_BIND unset.
+  #   - Point DNS at this host *before* the first `up`. Caddy asks Let's
+  #     Encrypt for a certificate on startup, and a challenge against a
+  #     hostname that does not resolve here fails and retries with backoff.
+  #
+  # For a subpath deployment (BASE_PATH), the Caddyfile needs an extra rewrite
+  # so `/xrpc/*` still resolves at the domain root — see "Reverse proxy
+  # subpath" in the deployment docs.
+  #
+  # caddy:
+  #   image: caddy:2-alpine
+  #   restart: unless-stopped
+  #
+  #   # Deliberately `service_started`, not `service_healthy`. Caddy should come
+  #   # up and start the ACME exchange immediately rather than waiting out
+  #   # HappyView's start period, which on a first boot is minutes of migrations
+  #   # with nothing listening on 80 or 443. A request arriving before the
+  #   # backend is ready just gets a 502.
+  #   depends_on:
+  #     happyview:
+  #       condition: service_started
+  #
+  #   # Port 80 must stay open. It serves the HTTP->HTTPS redirect *and* the
+  #   # ACME HTTP-01 challenge — which is also how renewal works, so closing it
+  #   # once the first certificate issues makes renewal fail silently about 60
+  #   # days later. 443/udp carries HTTP/3.
+  #   #
+  #   # DNS-01 (needed for wildcards, or when 80 cannot be exposed) is not
+  #   # possible with this image: the stock build ships no DNS provider
+  #   # modules, and adding one means building a custom image with xcaddy.
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #     - "443:443/udp"
+  #
+  #   environment:
+  #     CADDY_DOMAIN: ${CADDY_DOMAIN:?set CADDY_DOMAIN to the hostname in PUBLIC_URL, without the scheme}
+  #
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     # Issued certificates and the ACME account key. This MUST persist.
+  #     # Without it every recreate re-issues from scratch, and Let's Encrypt
+  #     # allows only 5 duplicate certificates per week before it starts
+  #     # refusing — which locks the site out of HTTPS for days. Back it up
+  #     # with the same care as the data volume, or accept a re-issue on
+  #     # restore.
+  #     - caddy-data:/data
+  #     - caddy-config:/config
+  #
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "5"
+
+volumes:
+  happyview-data:
+  # Uncomment together with the caddy service above.
+  # caddy-data:
+  # caddy-config:

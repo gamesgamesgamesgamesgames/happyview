@@ -1,3 +1,6 @@
+# Isolated from the dev and e2e stacks — see the note in docker-compose.yml.
+name: happyview-test
+
 services:
   postgres:
     image: postgres:17

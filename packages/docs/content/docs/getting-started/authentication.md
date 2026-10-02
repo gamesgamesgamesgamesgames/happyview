@@ -133,8 +133,8 @@ Queries that don't care who is calling need nothing more than the client key. Pr
 XRPC routes accept several auth methods, resolved in this order:
 
 1. **DPoP auth** (`Authorization: DPoP <token>` + `DPoP` proof header + `X-Client-Key`) — used by third-party apps that went through the [DPoP key provisioning](#dpop-key-provisioning-for-third-party-apps) flow.
-2. **Bearer space credential** (`Authorization: Bearer <space_credential_jwt>`) — a signed JWT granting access to a specific space; accepted on space routes.
-3. **Bearer service auth JWT** (`Authorization: Bearer <service_auth_jwt>`) — a standard atproto inter-service JWT signed by a DID's atproto signing key; the caller is identified as the issuer DID.
+2. **Bearer service auth JWT** (`Authorization: Bearer <service_auth_jwt>`) — a standard atproto inter-service JWT signed by a DID's atproto signing key; the caller is identified as the issuer DID. The token's `lxm`, when present, must name the method being called.
+3. **Space credential** (`Authorization: Atproto-Space <credential>`) — a signed JWT granting read access to a specific space, sent with an `Atproto-Space-Audience` header and an HTTP Message Signature by the key the credential is bound to; accepted on space routes. See [Space credentials](../experimental/spaces/credentials.md).
 4. **Cookie session** — when no `Authorization` header is present, HappyView falls back to the signed session cookie set after dashboard login.
 5. **Anonymous** — if none of the above is present, the request proceeds with no identity. The endpoint's Lua script determines whether that is acceptable.
 
@@ -482,7 +482,7 @@ X-Client-Key: hvc_...
 X-Client-Secret: hvs_...
 ```
 
-Public clients must provide a valid DPoP proof to prove they hold the key. This revokes only the session that matches the DPoP key used in the proof — other device sessions for the same user are unaffected:
+Alternatively, provide a valid DPoP proof to prove you hold the key. This revokes only the session that matches the DPoP key used in the proof — other device sessions for the same user are unaffected:
 
 ```
 DELETE /oauth/sessions/did:plc:user123
@@ -490,6 +490,10 @@ X-Client-Key: hvc_...
 Authorization: DPoP <access_token>
 DPoP: <proof_jwt>
 ```
+
+DPoP auth is accepted here from any client, confidential or public — the same credentials that authorise `/xrpc/*` calls. A confidential client using DPoP does not have to fall back to its secret just to log out.
+
+The `htu` in the proof must match the URL you actually requested, byte for byte. If you percent-encode the DID in the path, sign the encoded form.
 
 To revoke a specific device session (for either client type), use the [device management endpoints](#6-managing-device-sessions) instead.
 
@@ -536,7 +540,7 @@ X-Client-Key: hvc_...
 X-Client-Secret: hvs_...
 ```
 
-For public clients, use DPoP auth instead of `X-Client-Secret`:
+Or use DPoP auth instead of `X-Client-Secret` — accepted from any client type:
 
 ```
 DELETE /oauth/sessions/did:plc:user123/devices/uuid-session-1

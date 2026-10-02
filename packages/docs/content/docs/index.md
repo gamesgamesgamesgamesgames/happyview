@@ -2,7 +2,7 @@
 title: "Introduction"
 ---
 
-HappyView is the best way to build an [AppView](https://atproto.com/guides/glossary#app-view) for the [AT Protocol](https://atproto.com). Upload your [lexicon](reference/glossary.md#atproto-terms) schemas and get a fully functional AppView, complete with [XRPC](reference/glossary.md#atproto-terms) endpoints, OAuth, real-time network sync, and historical [backfill](guides/backfill.md), without writing a single line of server code.
+HappyView is the best way to build an [AppView](https://atproto.com/guides/glossary#app-view) for the [atproto](https://atproto.com). Upload your [lexicon](reference/glossary.md#atproto-terms) schemas and get a fully functional AppView, complete with [XRPC](reference/glossary.md#atproto-terms) endpoints, OAuth, real-time network sync, and historical [backfill](guides/backfill.md), without writing a single line of server code.
 
 Building an AppView from scratch means wiring up real-time event streams, record storage, XRPC routing, OAuth flows, and PDS write proxying before you can even think about your application. HappyView handles all of that. Define your data model with lexicons, add custom logic with Lua scripts when you need it, and ship your app.
 
@@ -12,11 +12,11 @@ Building an AppView from scratch means wiring up real-time event streams, record
 
 - **Network sync built in:** Real-time record streaming via [Jetstream](https://github.com/bluesky-social/jetstream), historical [backfill](guides/backfill.md) from each user's PDS, and atproto OAuth with DPoP-bound proxy writes back to the PDS.
 
-- **Customize with Lua scripts and plugins:** Trigger-keyed [Lua scripts](guides/lua-scripting.md) for XRPC query/procedure logic and [record/label event handling](guides/label-scripts), WASM [plugins](guides/plugins.md) for external platform integration, and [labeler](guides/labelers.md) subscriptions for content moderation.
+- **Customize with Lua scripts and plugins:** Trigger-keyed [Lua scripts](guides/lua-scripting.md) for XRPC query/procedure logic and [record/label event handling](guides/record-scripts), WASM [plugins](guides/plugins.md) for external platform integration, and [labeler](guides/labelers.md) subscriptions for content moderation.
 
 - **Protocol-native:** Works with any PDS, resolves DIDs through the directory, and fetches [network lexicons](guides/lexicons.md#network-lexicons) via DNS authority resolution.
 
-- **Permissioned Spaces:** Experimental support for [AT Protocol Proposal 0016](experimental/spaces/index.md) — membership-gated data containers with per-user repo state, cross-service credentials, and write notifications.
+- **Permissioned Spaces:** Experimental support for [atproto Proposal 0016](experimental/spaces/index.md) — membership-gated data containers with per-user repo state, cross-service credentials, and write notifications.
 
 - **Full admin surface:** Built-in [dashboard](getting-started/dashboard.md) and [admin API](api-reference/admin/admin-api.md) for managing lexicons, users, API keys, API clients, backfill jobs, and plugins.
 
@@ -35,8 +35,8 @@ Building an AppView from scratch means wiring up real-time event streams, record
 - [Quickstart](getting-started/deployment/railway.md): Deploy HappyView on Railway or run it locally
 - [Lexicons](guides/lexicons.md): Upload lexicon schemas and start indexing records
 - [Lua Scripting](guides/lua-scripting.md): Write custom query and procedure logic
-- [Record & Label Scripts](guides/label-scripts): React to record changes and label events in real time
+- [Record & Label Scripts](guides/record-scripts): React to record changes and label events in real time
 - [Labelers](guides/labelers.md): Subscribe to external labelers and manage content labels
 - [Plugins](guides/plugins.md): Integrate with external platforms using WASM plugins
-- [Permissioned Spaces](experimental/spaces/index.md): Create membership-gated data containers with the AT Protocol spaces API
+- [Permissioned Spaces](experimental/spaces/index.md): Create membership-gated data containers with the atproto spaces API
 - [Event Logs](guides/event-logs.md): Monitor system activity, debug script errors, and audit admin actions

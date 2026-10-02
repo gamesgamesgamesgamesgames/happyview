@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { toast } from "sonner";
 import {
   CheckCircle2,
@@ -15,6 +16,7 @@ import { useCurrentUser } from "@/hooks/use-current-user";
 import { toastError } from "@/lib/format";
 import {
   cancelJob,
+  getJob,
   getJobLogs,
   getJobs,
   pauseJob,
@@ -156,26 +158,36 @@ function relativeTime(dateStr: string): string {
 
 export default function JobsPage() {
   const { hasPermission } = useCurrentUser();
-  const [jobs, setJobs] = useState<Job[]>([]);
+  const searchParams = useSearchParams();
+  const [{ loadedFilter, jobs }, setJobsState] = useState<{
+    loadedFilter: string | undefined;
+    jobs: Job[];
+  }>({ loadedFilter: undefined, jobs: [] });
   const [statusFilter, setStatusFilter] = useState("all");
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  // Holds a job opened via the `?job=` deep link that may not be present in
+  // the current (filtered/paginated) `jobs` list — fetched directly by id
+  // rather than relying on it showing up in the list.
+  const [linkedJob, setLinkedJob] = useState<Job | null>(null);
+  const appliedDeepLink = useRef(false);
+  const loading = loadedFilter !== statusFilter;
 
   const load = useCallback(() => {
     const params = statusFilter !== "all" ? { status: statusFilter } : {};
     getJobs(params)
       .then((resp) => {
-        setJobs(resp.jobs);
-        setLoading(false);
+        setJobsState({ loadedFilter: statusFilter, jobs: resp.jobs });
       })
       .catch((e) => {
         toastError("Failed to load jobs", e);
-        setLoading(false);
+        setJobsState((prev) => ({
+          loadedFilter: statusFilter,
+          jobs: prev.jobs,
+        }));
       });
   }, [statusFilter]);
 
   useEffect(() => {
-    setLoading(true);
     load();
   }, [load]);
 
@@ -193,7 +205,28 @@ export default function JobsPage() {
     return () => clearInterval(interval);
   }, [load, hasActiveJobs]);
 
-  const selectedJob = jobs.find((j) => j.id === selectedJobId) ?? null;
+  // Open a job's detail sheet from a `?job=<id>` deep link (e.g. the "View
+  // job" toast after enqueueing a collection delete). Fetched directly by id
+  // rather than found in `jobs`, since the linked job may not be on the
+  // current page or may not match the default status filter.
+  useEffect(() => {
+    if (appliedDeepLink.current) return;
+    const jobParam = searchParams.get("job");
+    if (!jobParam) return;
+    appliedDeepLink.current = true;
+    getJob(jobParam)
+      .then((job) => {
+        setLinkedJob(job);
+        setSelectedJobId(job.id);
+      })
+      .catch((e) => {
+        toastError("Failed to open linked job", e);
+      });
+  }, [searchParams]);
+
+  const selectedJob =
+    jobs.find((j) => j.id === selectedJobId) ??
+    (linkedJob?.id === selectedJobId ? linkedJob : null);
   const canManage = hasPermission("jobs:manage");
 
   return (
@@ -294,6 +327,7 @@ export default function JobsPage() {
           onOpenChange={(open) => {
             if (!open) {
               setSelectedJobId(null);
+              setLinkedJob(null);
               load();
             }
           }}
@@ -426,8 +460,14 @@ function JobDetail({
         )}
 
         <JsonSection title="Input" data={job.input} defaultOpen />
-        <JsonSection title="Progress" data={job.progress} defaultOpen={isActive} />
-        {hasContent(job.result) && <JsonSection title="Result" data={job.result} />}
+        <JsonSection
+          title="Progress"
+          data={job.progress}
+          defaultOpen={isActive}
+        />
+        {hasContent(job.result) && (
+          <JsonSection title="Result" data={job.result} />
+        )}
 
         <JobLogs jobId={job.id} isActive={isActive} />
       </div>
@@ -460,14 +500,10 @@ function JobDetail({
             <Button
               variant="destructive"
               size="sm"
-              disabled={
-                actionLoading !== null || job.status === "cancelling"
-              }
+              disabled={actionLoading !== null || job.status === "cancelling"}
               onClick={handleCancel}
             >
-              {job.status === "cancelling"
-                ? "Cancelling…"
-                : "Cancel Job"}
+              {job.status === "cancelling" ? "Cancelling…" : "Cancel Job"}
             </Button>
           )}
           {job.status === "paused" && (

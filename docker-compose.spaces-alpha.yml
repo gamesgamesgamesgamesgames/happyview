@@ -1,0 +1,81 @@
+# The Bluesky reference PDS with permissioned-data support, for interop testing.
+#
+#   docker compose -f docker-compose.spaces-alpha.yml up -d --wait
+#   cargo test --test spaces_reference_interop -- --ignored --nocapture
+#   docker compose -f docker-compose.spaces-alpha.yml down -v
+#
+# What this host covers is described in tests/spaces_reference_interop.rs.
+#
+# Isolated from the dev, test and e2e stacks — see the note in docker-compose.yml.
+name: happyview-spaces-alpha
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: plc
+      POSTGRES_PASSWORD: plc
+      POSTGRES_DB: plc
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plc -d plc"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  plc:
+    # Built nightly by happyproto/pds-test; built from source only when it
+    # cannot be pulled.
+    image: ${PLC_IMAGE:-ghcr.io/happyproto/pds-test/plc:latest}
+    build:
+      context: https://github.com/did-method-plc/did-method-plc.git
+      dockerfile: packages/server/Dockerfile
+    environment:
+      DB_CREDS_JSON: '{"username":"plc","password":"plc","host":"postgres","port":"5432","database":"plc"}'
+      ENABLE_MIGRATIONS: "true"
+      DB_MIGRATE_CREDS_JSON: '{"username":"plc","password":"plc","host":"postgres","port":"5432","database":"plc"}'
+      PORT: "2582"
+    # 2584, so this stack can run alongside the other interop stacks.
+    ports:
+      - "2584:2582"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  pds-spaces-alpha:
+    # Bluesky's own image by default. CI runs the happyproto/pds-test mirror
+    # pinned in interop/images.env.
+    image: ${PDS_SPACES_ALPHA_IMAGE:-ghcr.io/bluesky-social/atproto:pds-spaces-alpha}
+    # amd64-only image; runs under emulation on Apple Silicon.
+    platform: linux/amd64
+    # The named volume mounts as root-owned; the image otherwise runs as uid
+    # 1000 and cannot create its SQLite files. Fine for a throwaway dev PDS.
+    user: root
+    ports:
+      - "2583:3000"
+    environment:
+      PDS_HOSTNAME: localhost
+      PDS_PORT: "3000"
+      PDS_DEV_MODE: "true"
+      PDS_DATA_DIRECTORY: /tmp/pds
+      PDS_BLOBSTORE_DISK_LOCATION: /tmp/pds/blocks
+      PDS_JWT_SECRET: dev-secret-not-for-production
+      PDS_ADMIN_PASSWORD: admin
+      PDS_DID_PLC_URL: http://plc:2582
+      PDS_SERVICE_HANDLE_DOMAINS: .test
+      PDS_INVITE_REQUIRED: "false"
+      # Throwaway dev key, regenerate with `openssl rand -hex 32`.
+      PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: ee69c68a213e447d2c0881ef7a8a3e821c9500344bbaafe8011f057597eb8d58
+    volumes:
+      - pds-data:/tmp/pds
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/xrpc/_health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+      start_period: 5s
+    depends_on:
+      plc:
+        condition: service_started
+
+volumes:
+  pds-data:
