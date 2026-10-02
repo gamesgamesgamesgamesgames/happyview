@@ -205,6 +205,84 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo test --tests
 
+  # Runs the unit, crate, and e2e suites once under LLVM source-based
+  # instrumentation. Informational for now: no threshold gates the PR.
+  coverage:
+    needs: changes
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: happyview
+          POSTGRES_PASSWORD: happyview
+          POSTGRES_DB: happyview_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # Instrumented artifacts differ from the plain test build, so they get
+      # their own cache rather than evicting the `test` one.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Add WASM target and LLVM tools
+        run: rustup target add wasm32-unknown-unknown && rustup component add llvm-tools
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Build test plugin
+        run: cargo build --manifest-path tests/fixtures/test_plugin/Cargo.toml --target wasm32-unknown-unknown --release
+
+      - name: Run tests with coverage
+        env:
+          TEST_DATABASE_URL: postgres://happyview:happyview@localhost:5432/happyview_test
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo llvm-cov --workspace --no-report
+
+      - name: Generate reports
+        run: |
+          cargo llvm-cov report --lcov --output-path lcov.info
+          cargo llvm-cov report --html
+          {
+            echo '## Rust coverage'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          file: lcov.info
+          format: lcov
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            target/llvm-cov/html
+
   frontend:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
