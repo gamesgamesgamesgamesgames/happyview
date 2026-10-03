@@ -356,7 +356,7 @@ async fn list_members(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let space = resolve_space(&state, &query.space).await?;
     let claims = require_auth(&xrpc_claims)?;
-    require_space_admin(&state, &space, claims.did()).await?;
+    service::require_space_admin(&state, &space, claims.did()).await?;
 
     let resolved = members::resolve_members(&state.db, state.db_backend, &space.id).await?;
 
