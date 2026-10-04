@@ -1437,17 +1437,15 @@ async fn list_repos(
     let space = service::resolve_space(&state, &params.space).await?;
     require_audience(&claims, &space.authority_did)?;
 
-    if !space.config.membership_public {
-        let did = require_auth_or_credential(&state, &claims).await?;
-        service::require_membership(
-            &state,
-            &space,
-            &did,
-            false,
-            claims.space_credential.as_deref(),
-        )
-        .await?;
-    }
+    let did = require_auth_or_credential(&state, &claims).await?;
+    service::require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
 
     let limit = params.limit.unwrap_or(100).clamp(1, 1000);
     let writers = crate::spaces::writers::list(

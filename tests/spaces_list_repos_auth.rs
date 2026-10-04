@@ -142,10 +142,10 @@ async fn list_repos_private_allows_member() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-/// When `membershipPublic` is set, the repo list is public — no auth required.
+/// Outsiders cannot list repos even when membership is public on the space.
 #[tokio::test]
 #[serial]
-async fn list_repos_public_allows_anonymous() {
+async fn list_repos_public_rejects_anonymous() {
     common::require_db!();
     let app = TestApp::new().await;
     enable_spaces(&app).await;
@@ -157,5 +157,5 @@ async fn list_repos_public_allows_anonymous() {
         .oneshot(list_repos_req("pub", None))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
