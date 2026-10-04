@@ -14,7 +14,7 @@ use crate::lua::tid::generate_tid;
 use crate::spaces::scope::{check_delegation_token_access, check_read_access};
 use crate::spaces::service;
 use crate::spaces::types::*;
-use crate::spaces::{db, members, notifications, oplog};
+use crate::spaces::{db, notifications, oplog};
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -508,14 +508,18 @@ pub(crate) async fn get_space(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let space = service::resolve_space(&state, &query.space).await?;
 
-    // If the space's membership is not public, require auth + membership
-    if !space.config.membership_public {
-        let claims = require_auth(&xrpc_claims)?;
-        let did = claims.did();
-        if space.creator_did != did {
-            members::is_member(&state.db, state.db_backend, &space.id, did)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Space not found".into()))?;
+    // Only the owner or a holder of a space credential may read the space.
+    let is_owner = xrpc_claims
+        .identity
+        .as_ref()
+        .is_some_and(|identity| identity.did() == space.creator_did);
+    if !is_owner {
+        if let Some(token) = &xrpc_claims.space_credential {
+            require_audience(&xrpc_claims, &space.authority_did)?;
+            service::verify_space_credential(&state, &space, token).await?;
+        } else {
+            require_auth(&xrpc_claims)?;
+            return Err(AppError::NotFound("Space not found".into()));
         }
     }
 
@@ -1433,17 +1437,15 @@ async fn list_repos(
     let space = service::resolve_space(&state, &params.space).await?;
     require_audience(&claims, &space.authority_did)?;
 
-    if !space.config.membership_public {
-        let did = require_auth_or_credential(&state, &claims).await?;
-        service::require_membership(
-            &state,
-            &space,
-            &did,
-            false,
-            claims.space_credential.as_deref(),
-        )
-        .await?;
-    }
+    let did = require_auth_or_credential(&state, &claims).await?;
+    service::require_membership(
+        &state,
+        &space,
+        &did,
+        false,
+        claims.space_credential.as_deref(),
+    )
+    .await?;
 
     let limit = params.limit.unwrap_or(100).clamp(1, 1000);
     let writers = crate::spaces::writers::list(
