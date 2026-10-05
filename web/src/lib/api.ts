@@ -229,9 +229,15 @@ export function resolveNetworkLexicon(nsid: string, signal?: AbortSignal) {
 
 export function addNetworkLexicon(body: {
   nsid: string;
+  backfill?: boolean;
   target_collection?: string;
 }) {
-  return apiFetch<{ nsid: string; authority_did: string; revision: number }>(
+  return apiFetch<{
+    nsid: string;
+    authority_did: string;
+    revision: number;
+    backfill_job_id: string | null;
+  }>(
     "/admin/network-lexicons",
     { method: "POST", body: JSON.stringify(body) },
   );
