@@ -263,6 +263,32 @@ async fn lists_a_spaces_repos_with_a_credential_addressed_to_its_authority() {
     assert_eq!(json_of(resp).await["error"], json!("BadSpaceAudience"));
 }
 
+#[tokio::test]
+#[serial]
+async fn gets_a_space_with_a_credential_addressed_to_its_authority() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    let key = key();
+    let (space, credential) = setup(&mut app, &key).await;
+    let authority = space
+        .strip_prefix("at://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let path = format!(
+        "/xrpc/com.atproto.simplespace.getSpace?space={}",
+        urlencoding::encode(&space)
+    );
+    let resp = call(&app, read(&path, &credential, &key, &authority)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = call(&app, read(&path, &credential, &key, MEMBER)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_of(resp).await["error"], json!("BadSpaceAudience"));
+}
+
 async fn space_admin(app: &TestApp, nsid: &str, body: Value) {
     let resp = call(app, post_as(app, CREATOR, nsid, body)).await;
     assert!(
