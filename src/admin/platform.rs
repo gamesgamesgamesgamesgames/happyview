@@ -49,7 +49,10 @@ pub(super) async fn set_super_user(
     let backend = state.db_backend;
     let now = now_rfc3339();
 
-    // One transaction, so a failure can never leave zero super users or two.
+    // One transaction, so a failure part-way through can never leave zero super
+    // users or two. It does not guard against concurrent calls (Postgres runs at
+    // READ COMMITTED), so callers must not issue them; the platform calls this
+    // sequentially.
     let mut tx = state
         .db
         .begin()

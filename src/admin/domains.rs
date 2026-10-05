@@ -343,12 +343,18 @@ pub(super) async fn set_primary(
         "UPDATE happyview_domains SET is_primary = 1, updated_at = ? WHERE id = ?",
         state.db_backend,
     );
-    crate::db::query(&set_sql)
+    let set_result = crate::db::query(&set_sql)
         .bind(&now)
         .bind(&id)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("failed to set primary: {e}")))?;
+
+    // The domain can be deleted between the lookup and here; dropping `tx`
+    // rolls back the unset so the old primary survives.
+    if set_result.rows_affected() != 1 {
+        return Err(AppError::NotFound("domain not found".into()));
+    }
 
     tx.commit()
         .await
