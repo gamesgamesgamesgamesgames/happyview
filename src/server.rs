@@ -356,6 +356,9 @@ async fn config_endpoint(
         "default_rate_limit_capacity": state.config.default_rate_limit_capacity,
         "default_rate_limit_refill_rate": state.config.default_rate_limit_refill_rate,
         "app_name": app_name,
+        // Whether a managed-hosting platform administers this instance, so the
+        // dashboard can say so.
+        "platform_managed": state.config.platform_api_key_hash.is_some(),
         "logo_url": logo_url,
         "features": {
             "spaces": spaces_enabled,

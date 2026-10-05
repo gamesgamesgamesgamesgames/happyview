@@ -9,7 +9,6 @@ use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 
 use super::auth::UserAuth;
-use super::permissions::Permission;
 use super::types::{CreateDomainBody, DomainResponse};
 
 fn domain_to_response(d: &Domain) -> DomainResponse {
@@ -27,7 +26,7 @@ pub(super) async fn list(
     State(state): State<AppState>,
     auth: UserAuth,
 ) -> Result<Json<Vec<DomainResponse>>, AppError> {
-    auth.require(Permission::SettingsManage).await?;
+    auth.require_domain_access().await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains ORDER BY created_at",
@@ -60,7 +59,7 @@ pub(super) async fn create(
     auth: UserAuth,
     Json(body): Json<CreateDomainBody>,
 ) -> Result<(StatusCode, Json<DomainResponse>), AppError> {
-    auth.require(Permission::SettingsManage).await?;
+    auth.require_domain_access().await?;
 
     let url = body.url.trim_end_matches('/').to_string();
 
@@ -232,7 +231,7 @@ pub(super) async fn delete(
     auth: UserAuth,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    auth.require(Permission::SettingsManage).await?;
+    auth.require_domain_access().await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains WHERE id = ?",
@@ -298,7 +297,7 @@ pub(super) async fn set_primary(
     auth: UserAuth,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
-    auth.require(Permission::SettingsManage).await?;
+    auth.require_domain_access().await?;
 
     let sql = adapt_sql(
         "SELECT id, url, is_primary, created_at, updated_at FROM happyview_domains WHERE id = ?",
