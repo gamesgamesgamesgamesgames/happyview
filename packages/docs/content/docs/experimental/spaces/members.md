@@ -279,7 +279,7 @@ curl 'https://happyview.example.com/xrpc/com.atproto.simplespace.listMembers?spa
   -H 'DPoP: <proof>'
 ```
 
-If the space's `membership_public` config is `true`, this endpoint is accessible without authentication. Otherwise, the caller must be authenticated and be a member.
+Only the space's creator or a HappyView super admin can list its members. Other accounts receive `403 Forbidden` and unauthenticated callers `401 Unauthorized`, whatever the space's `membership_public` setting.
 
 The response returns the **resolved** member list, with delegation chains traversed and flattened:
 
