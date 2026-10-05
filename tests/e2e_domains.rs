@@ -208,6 +208,8 @@ async fn domains_cannot_delete_primary() {
     let app = TestApp::new().await;
 
     seed_domain(&app, "primary-id", "http://127.0.0.1:0", true).await;
+    // A second domain keeps the last-domain guard from firing first.
+    seed_domain(&app, "other-id", "https://other.example.com", false).await;
 
     let resp = app
         .router
@@ -224,6 +226,11 @@ async fn domains_cannot_delete_primary() {
         StatusCode::BAD_REQUEST,
         "expected 400 when deleting primary domain, got {}",
         resp.status()
+    );
+    let body = json_body(resp).await;
+    assert!(
+        body.to_string().contains("primary domain"),
+        "unexpected body: {body}"
     );
 }
 
