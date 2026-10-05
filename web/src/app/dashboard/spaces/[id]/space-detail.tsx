@@ -1,0 +1,491 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import { usePathname } from "next/navigation";
+import { ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
+
+import { useCurrentUser } from "@/hooks/use-current-user";
+import { toastError } from "@/lib/format";
+import {
+  adminSpaceBlobUrl,
+  getAdminSpace,
+  getAdminSpaceRecords,
+} from "@/lib/api";
+import type { AdminSpaceDetail, AdminSpaceRecord } from "@/types/spaces";
+import { CodeBlock } from "@/components/code-block";
+import { SiteHeader } from "@/components/site-header";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+
+const ALL = "__all__";
+const PAGE_SIZE = 20;
+
+const POLICY_LABELS: Record<string, string> = {
+  publicPolicy: "Public",
+  memberListPolicy: "Member list",
+  managingAppPolicy: "Managing app",
+  open: "Open",
+  allowList: "Allow list",
+};
+
+function policyLabel(type: string): string {
+  const name = type.split("#").pop() ?? type;
+  return POLICY_LABELS[name] ?? name;
+}
+
+/** CIDs of the blob refs anywhere in a record. */
+function blobCids(value: unknown, found: string[] = []): string[] {
+  if (Array.isArray(value)) {
+    for (const item of value) blobCids(item, found);
+  } else if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const ref = obj.ref as Record<string, unknown> | undefined;
+    if (obj.$type === "blob" && typeof ref?.$link === "string") {
+      found.push(ref.$link);
+    }
+    for (const child of Object.values(obj)) blobCids(child, found);
+  }
+  return found;
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-muted-foreground text-xs">{label}</span>
+      <div className="text-sm">{children}</div>
+    </div>
+  );
+}
+
+export default function SpaceDetail() {
+  const pathname = usePathname();
+  const id = decodeURIComponent(
+    pathname.split("/").filter(Boolean).pop() ?? "",
+  );
+  const { hasPermission } = useCurrentUser();
+  const canReadRecords = hasPermission("spaces:manage-records");
+
+  const [detail, setDetail] = useState<AdminSpaceDetail | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const [showRecords, setShowRecords] = useState(false);
+  const [collection, setCollection] = useState(ALL);
+  const [repo, setRepo] = useState(ALL);
+  const [records, setRecords] = useState<AdminSpaceRecord[]>([]);
+  const [cursorStack, setCursorStack] = useState<string[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | undefined>();
+  const [loading, setLoading] = useState(false);
+  const [viewRecord, setViewRecord] = useState<AdminSpaceRecord | null>(null);
+
+  useEffect(() => {
+    getAdminSpace(id)
+      .then(setDetail)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }, [id]);
+
+  const fetchRecords = useCallback(
+    async (filters: { collection: string; repo: string }, cursor?: string) => {
+      setLoading(true);
+      try {
+        const data = await getAdminSpaceRecords(id, {
+          collection: filters.collection === ALL ? undefined : filters.collection,
+          repo: filters.repo === ALL ? undefined : filters.repo,
+          limit: PAGE_SIZE,
+          cursor,
+        });
+        setRecords(data.records);
+        setNextCursor(data.cursor);
+      } catch (e: unknown) {
+        toastError("Failed to load records", e);
+        setRecords([]);
+        setNextCursor(undefined);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [id],
+  );
+
+  function applyFilters(filters: { collection: string; repo: string }) {
+    setCollection(filters.collection);
+    setRepo(filters.repo);
+    setCursorStack([]);
+    fetchRecords(filters);
+  }
+
+  function handleShowRecords() {
+    setShowRecords(true);
+    fetchRecords({ collection, repo });
+  }
+
+  function handleNext() {
+    if (!nextCursor) return;
+    setCursorStack((prev) => [...prev, nextCursor]);
+    fetchRecords({ collection, repo }, nextCursor);
+  }
+
+  function handlePrevious() {
+    if (cursorStack.length === 0) return;
+    const stack = cursorStack.slice(0, -1);
+    setCursorStack(stack);
+    fetchRecords({ collection, repo }, stack[stack.length - 1]);
+  }
+
+  if (error) {
+    return (
+      <>
+        <SiteHeader title="Space" />
+        <div className="p-4 md:p-6">
+          <p className="text-destructive text-sm">{error}</p>
+        </div>
+      </>
+    );
+  }
+
+  if (!detail) {
+    return <SiteHeader title="Space" />;
+  }
+
+  const { space, members, collections } = detail;
+  const blobs = viewRecord ? blobCids(viewRecord.record) : [];
+
+  return (
+    <>
+      <SiteHeader title={space.display_name ?? space.skey} />
+      <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
+        <Card>
+          <CardHeader>
+            <CardTitle>{space.display_name ?? space.skey}</CardTitle>
+            {space.description && (
+              <CardDescription>{space.description}</CardDescription>
+            )}
+          </CardHeader>
+          <CardContent className="grid gap-4 sm:grid-cols-2">
+            <div className="sm:col-span-2">
+              <Field label="URI">
+                <span className="font-mono text-xs break-all">{space.uri}</span>
+              </Field>
+            </div>
+            <Field label="Type">
+              <span className="font-mono text-xs">{space.type}</span>
+            </Field>
+            <Field label="Creator">
+              <span className="font-mono text-xs break-all">
+                {space.creator_did}
+              </span>
+            </Field>
+            <Field label="Authority">
+              <span className="font-mono text-xs break-all">
+                {space.authority_did}
+              </span>
+            </Field>
+            <Field label="Created">
+              {new Date(space.created_at).toLocaleString()}
+            </Field>
+            <Field label="Read policy">
+              <Badge variant="outline">{policyLabel(space.read_policy.$type)}</Badge>
+            </Field>
+            <Field label="Write policy">
+              <Badge variant="outline">
+                {policyLabel(space.write_policy.$type)}
+              </Badge>
+            </Field>
+            <Field label="App access">
+              <Badge variant="outline">{policyLabel(space.app_access.$type)}</Badge>
+            </Field>
+          </CardContent>
+        </Card>
+
+        <div className="grid gap-4 lg:grid-cols-2">
+          <Card>
+            <CardHeader>
+              <CardTitle>Members</CardTitle>
+              <CardDescription>
+                Includes members added through delegated spaces.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {members.length === 0 ? (
+                <p className="text-muted-foreground text-sm">No members.</p>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>DID</TableHead>
+                      <TableHead>Access</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {members.map((member) => (
+                      <TableRow key={member.did}>
+                        <TableCell className="font-mono text-xs break-all">
+                          {member.did}
+                        </TableCell>
+                        <TableCell className="flex gap-1">
+                          {member.read && <Badge variant="outline">read</Badge>}
+                          {member.write && <Badge variant="outline">write</Badge>}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Collections</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {collections.length === 0 ? (
+                <p className="text-muted-foreground text-sm">No records.</p>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Collection</TableHead>
+                      <TableHead className="text-right">Records</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {collections.map((c) => (
+                      <TableRow key={c.collection}>
+                        <TableCell className="font-mono text-xs">
+                          {c.collection}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {c.count}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+
+        {canReadRecords && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Records</CardTitle>
+              <CardDescription>
+                This space is private to its members. Each time you load its
+                records or open a blob, the read is recorded in the event log
+                under your account.
+              </CardDescription>
+              {!showRecords && (
+                <CardAction>
+                  <Button variant="outline" onClick={handleShowRecords}>
+                    Show records
+                  </Button>
+                </CardAction>
+              )}
+            </CardHeader>
+            {showRecords && (
+              <CardContent className="flex flex-col gap-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Select
+                    value={collection}
+                    onValueChange={(value) =>
+                      applyFilters({ collection: value, repo })
+                    }
+                  >
+                    <SelectTrigger className="h-8 w-72 text-sm" aria-label="Collection">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ALL}>All collections</SelectItem>
+                      {collections.map((c) => (
+                        <SelectItem key={c.collection} value={c.collection}>
+                          {c.collection}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Select
+                    value={repo}
+                    onValueChange={(value) =>
+                      applyFilters({ collection, repo: value })
+                    }
+                  >
+                    <SelectTrigger className="h-8 w-72 text-sm" aria-label="Author">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value={ALL}>All authors</SelectItem>
+                      {members.map((member) => (
+                        <SelectItem key={member.did} value={member.did}>
+                          {member.did}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {records.length === 0 ? (
+                  <p className="text-muted-foreground text-sm">
+                    {loading ? "Loading…" : "No records match."}
+                  </p>
+                ) : (
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Author</TableHead>
+                        <TableHead>Collection</TableHead>
+                        <TableHead>Record key</TableHead>
+                        <TableHead>Indexed</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {records.map((record) => (
+                        <TableRow
+                          key={record.uri}
+                          className="cursor-pointer"
+                          onClick={() => setViewRecord(record)}
+                        >
+                          <TableCell className="font-mono text-xs whitespace-nowrap">
+                            {record.did}
+                          </TableCell>
+                          <TableCell className="font-mono text-xs">
+                            {record.collection}
+                          </TableCell>
+                          <TableCell className="font-mono text-xs">
+                            {record.rkey}
+                          </TableCell>
+                          <TableCell className="text-xs whitespace-nowrap">
+                            {new Date(record.indexed_at).toLocaleString()}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                )}
+
+                <div className="flex items-center justify-end gap-2">
+                  <Button
+                    aria-label="Go to previous page"
+                    title="Previous page"
+                    variant="outline"
+                    size="icon"
+                    className="size-8"
+                    disabled={cursorStack.length === 0 || loading}
+                    onClick={handlePrevious}
+                  >
+                    <ChevronLeft />
+                  </Button>
+                  <Button
+                    aria-label="Go to next page"
+                    title="Next page"
+                    variant="outline"
+                    size="icon"
+                    className="size-8"
+                    disabled={!nextCursor || loading}
+                    onClick={handleNext}
+                  >
+                    <ChevronRight />
+                  </Button>
+                </div>
+              </CardContent>
+            )}
+          </Card>
+        )}
+
+        <Sheet
+          open={viewRecord != null}
+          onOpenChange={(open) => {
+            if (!open) setViewRecord(null);
+          }}
+        >
+          <SheetContent className="flex flex-col overflow-hidden">
+            {viewRecord && (
+              <>
+                <SheetHeader>
+                  <SheetTitle className="sr-only">Record detail</SheetTitle>
+                </SheetHeader>
+                <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="col-span-2">
+                      <Field label="URI">
+                        <span className="font-mono text-xs break-all">
+                          {viewRecord.uri}
+                        </span>
+                      </Field>
+                    </div>
+                    <Field label="Author">
+                      <span className="font-mono text-xs break-all">
+                        {viewRecord.did}
+                      </span>
+                    </Field>
+                    <Field label="Collection">
+                      <span className="font-mono text-xs">
+                        {viewRecord.collection}
+                      </span>
+                    </Field>
+                    <Field label="CID">
+                      <span className="font-mono text-xs break-all">
+                        {viewRecord.cid}
+                      </span>
+                    </Field>
+                    <Field label="Indexed">
+                      {new Date(viewRecord.indexed_at).toLocaleString()}
+                    </Field>
+                  </div>
+
+                  {blobs.length > 0 && (
+                    <Field label="Blobs">
+                      <ul className="flex flex-col gap-1">
+                        {blobs.map((cid) => (
+                          <li key={cid}>
+                            <a
+                              href={adminSpaceBlobUrl(id, cid)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex items-center gap-1 font-mono text-xs underline underline-offset-2"
+                            >
+                              {cid}
+                              <ExternalLink className="size-3" aria-hidden />
+                            </a>
+                          </li>
+                        ))}
+                      </ul>
+                    </Field>
+                  )}
+
+                  <Field label="Record">
+                    <CodeBlock code={JSON.stringify(viewRecord.record, null, 2)} />
+                  </Field>
+                </div>
+              </>
+            )}
+          </SheetContent>
+        </Sheet>
+      </div>
+    </>
+  );
+}
