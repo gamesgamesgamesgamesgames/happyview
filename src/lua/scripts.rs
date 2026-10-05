@@ -35,6 +35,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
 
 static JOB_TYPE_RE: LazyLock<Regex> =
@@ -341,23 +342,25 @@ pub async fn run_record_event_script(
         }
         match run_record_event_once(state, &resolved, payload).await {
             Ok(outcome) => {
-                log_event(
-                    &state.db,
-                    EventLog {
-                        event_type: "script.executed".to_string(),
-                        severity: Severity::Info,
-                        actor_did: None,
-                        subject: Some(payload.uri.to_string()),
-                        detail: serde_json::json!({
-                            "host_kind": "record",
-                            "host_id": host_id,
-                            "trigger": resolved.id,
-                            "attempts": attempt + 1,
-                        }),
-                    },
-                    state.db_backend,
-                )
-                .await;
+                if state.verbose_event_logging.load(Ordering::Relaxed) {
+                    log_event(
+                        &state.db,
+                        EventLog {
+                            event_type: "script.executed".to_string(),
+                            severity: Severity::Info,
+                            actor_did: None,
+                            subject: Some(payload.uri.to_string()),
+                            detail: serde_json::json!({
+                                "host_kind": "record",
+                                "host_id": host_id,
+                                "trigger": resolved.id,
+                                "attempts": attempt + 1,
+                            }),
+                        },
+                        state.db_backend,
+                    )
+                    .await;
+                }
                 return outcome;
             }
             Err(e) => {
@@ -556,23 +559,25 @@ pub async fn run_label_applied_script(
         }
         match run_label_lua_once(state, &resolved, &event).await {
             Ok(outcome) => {
-                log_event(
-                    &state.db,
-                    EventLog {
-                        event_type: "script.executed".to_string(),
-                        severity: Severity::Info,
-                        actor_did: None,
-                        subject: Some(event.uri.clone()),
-                        detail: serde_json::json!({
-                            "host_kind": "label",
-                            "host_id": host_id,
-                            "trigger": resolved.id,
-                            "attempts": attempt + 1,
-                        }),
-                    },
-                    state.db_backend,
-                )
-                .await;
+                if state.verbose_event_logging.load(Ordering::Relaxed) {
+                    log_event(
+                        &state.db,
+                        EventLog {
+                            event_type: "script.executed".to_string(),
+                            severity: Severity::Info,
+                            actor_did: None,
+                            subject: Some(event.uri.clone()),
+                            detail: serde_json::json!({
+                                "host_kind": "label",
+                                "host_id": host_id,
+                                "trigger": resolved.id,
+                                "attempts": attempt + 1,
+                            }),
+                        },
+                        state.db_backend,
+                    )
+                    .await;
+                }
                 return outcome;
             }
             Err(e) => {
