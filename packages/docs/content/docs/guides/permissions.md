@@ -106,7 +106,7 @@ HappyView defines 49 permissions organized by category:
 | Permission                  | Description                                |
 | --------------------------- | ------------------------------------------ |
 | `spaces:create`             | Create new permissioned data spaces        |
-| `spaces:read`               | View space details and metadata            |
+| `spaces:read`               | View space details, metadata, and members  |
 | `spaces:update`             | Modify space settings                      |
 | `spaces:delete`             | Remove spaces and their data               |
 | `spaces:manage-members`     | Add or remove space members and roles      |

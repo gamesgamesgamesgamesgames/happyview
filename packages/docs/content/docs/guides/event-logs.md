@@ -60,6 +60,14 @@ The `user.bootstrapped` event is logged when the first user is auto-promoted to 
 
 Logged when a user attempts to access an endpoint they don't have permission for.
 
+### Space events
+
+| Event Type             | Severity | Subject       | Detail                                                        |
+| ---------------------- | -------- | ------------- | ------------------------------------------------------------- |
+| `space.moderator_read` | info     | Space AT URI  | `action`, `space_id`, `user_id`, and what was read (see below) |
+
+Logged when an admin reads a space's records or blobs through the [admin spaces API](../api-reference/admin/spaces.md). `action` is `list_records` or `get_blob`. A `list_records` event includes the `repo` and `collection` filters and the `uris` returned. A `get_blob` event includes the blob `cid` and the `repo` that references it. Listing spaces and viewing their metadata or members is not logged.
+
 ### API Key events
 
 | Event Type        | Severity | Subject | Detail                |

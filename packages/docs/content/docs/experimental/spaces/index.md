@@ -121,6 +121,8 @@ The `dev.happyview.space.*` aliases are deprecated and kept until v3. Most endpo
 
 A space's creator administers it: they update and delete the space and manage its members and invites.
 
+Instance operators can browse any space for moderation through the [admin spaces API](../../api-reference/admin/spaces.md) without being members. Each read of a space's contents is recorded in the event log.
+
 Two independent **policies** decide who can use the space. See [Policies](./managing-spaces.md#policies).
 
 - The **read policy** decides who can obtain a space credential to read the whole space.
