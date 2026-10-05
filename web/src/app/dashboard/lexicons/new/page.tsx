@@ -388,7 +388,10 @@ export default function AddLexiconPage() {
                   />
                 </div>
               )}
-              <Button onClick={handleAddNetwork} disabled={submitting}>
+              <Button
+                onClick={handleAddNetwork}
+                disabled={submitting || resolving || resolved.nsid !== nsid}
+              >
                 {submitting ? "Adding..." : "Add"}
               </Button>
             </footer>
