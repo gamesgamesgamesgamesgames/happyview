@@ -24,6 +24,7 @@ mod scripts;
 mod service_entries;
 mod service_identity;
 pub mod settings;
+mod spaces;
 pub mod spaces_migration;
 mod stats;
 mod telemetry;
@@ -79,6 +80,10 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/spaces/migration-status",
             get(spaces_migration::migration_status),
         )
+        .route("/spaces", get(spaces::list_spaces))
+        .route("/spaces/{id}", get(spaces::get_space))
+        .route("/spaces/{id}/records", get(spaces::list_space_records))
+        .route("/spaces/{id}/blob", get(spaces::get_space_blob))
         .route("/jobs", get(jobs::list_jobs))
         .route("/jobs/{id}", get(jobs::get_job))
         .route("/jobs/{id}/cancel", post(jobs::cancel_job))

@@ -109,6 +109,46 @@ pub async fn list_spaces_by_owner(
     rows.into_iter().map(parse_space_row).collect()
 }
 
+/// Every space on the instance, newest first, for the admin API.
+pub async fn list_all_spaces(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Space>, AppError> {
+    let sql = adapt_sql(
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        backend,
+    );
+
+    let rows: Vec<SpaceRow> = crate::db::query_as(&sql)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list spaces: {e}")))?;
+
+    rows.into_iter().map(parse_space_row).collect()
+}
+
+/// Each collection in a space with its record count, by collection NSID.
+pub async fn count_space_records_by_collection(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<(String, i64)>, AppError> {
+    let sql = adapt_sql(
+        "SELECT collection, COUNT(*) FROM happyview_space_records WHERE space_id = ? GROUP BY collection ORDER BY collection",
+        backend,
+    );
+
+    crate::db::query_as(&sql)
+        .bind(space_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to count space records: {e}")))
+}
+
 pub struct SpaceView {
     pub uri: String,
     pub is_owner: bool,

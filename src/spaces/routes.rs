@@ -1520,53 +1520,7 @@ async fn get_space_blob(
     )
     .await?;
 
-    let pds_endpoint =
-        crate::profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, &author_did)
-            .await?;
-
-    let url = format!(
-        "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
-        pds_endpoint,
-        urlencoding::encode(&author_did),
-        urlencoding::encode(&params.cid),
-    );
-
-    let resp = state
-        .http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| AppError::BadGateway(format!("blob fetch failed: {e}")))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(AppError::BadGateway(format!(
-            "PDS returned {status} for blob cid={}",
-            params.cid
-        )));
-    }
-
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| AppError::BadGateway(format!("failed to read blob body: {e}")))?;
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        content_type
-            .parse()
-            .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
-    );
-
-    Ok((status, headers, bytes))
+    service::fetch_space_blob(&state, &author_did, &params.cid).await
 }
 
 async fn register_notify(

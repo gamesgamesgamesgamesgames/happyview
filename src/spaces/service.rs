@@ -142,6 +142,68 @@ pub(crate) async fn require_membership(
     Ok(access)
 }
 
+/// Fetch a space blob from its author's PDS, with the content type the PDS
+/// reported.
+pub(crate) async fn fetch_space_blob(
+    state: &AppState,
+    author_did: &str,
+    cid: &str,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        axum::http::HeaderMap,
+        axum::body::Bytes,
+    ),
+    AppError,
+> {
+    let pds_endpoint =
+        crate::profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, author_did)
+            .await?;
+
+    let url = format!(
+        "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
+        pds_endpoint,
+        urlencoding::encode(author_did),
+        urlencoding::encode(cid),
+    );
+
+    let resp = state
+        .http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AppError::BadGateway(format!("blob fetch failed: {e}")))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(AppError::BadGateway(format!(
+            "PDS returned {status} for blob cid={cid}"
+        )));
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::BadGateway(format!("failed to read blob body: {e}")))?;
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        content_type
+            .parse()
+            .unwrap_or_else(|_| "application/octet-stream".parse().unwrap()),
+    );
+
+    Ok((status, headers, bytes))
+}
+
 pub(crate) struct AppliedOp {
     pub action: OplogAction,
     pub collection: String,
