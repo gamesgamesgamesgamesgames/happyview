@@ -250,6 +250,11 @@ jobs:
           token: ${{ secrets.INTEROP_PR_TOKEN || secrets.GITHUB_TOKEN }}
           branch: interop/pin-${{ steps.pin.outputs.target }}
           commit-message: "chore(interop): pin ${{ steps.pin.outputs.target }} to its newest passing image"
+          # The DCO check matches the sign-off against the author, and
+          # `--signoff` signs as the committer, so the two must be the same.
+          author: ${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>
+          committer: ${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>
+          signoff: true
           title: "chore(interop): pin ${{ steps.pin.outputs.target }} to its newest passing image"
           body: |
             The spaces interop suite passed against a new `${{ steps.pin.outputs.target }}` image from happyproto/pds-test.
