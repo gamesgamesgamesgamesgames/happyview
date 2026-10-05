@@ -156,3 +156,21 @@ async fn get_space_public_rejects_anonymous() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// A super admin can read a space they did not create.
+#[tokio::test]
+#[serial]
+async fn get_space_allows_super_admin() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+    create_space(&app, "super", false).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(get_space_req("super", Some(app.admin_cookie())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

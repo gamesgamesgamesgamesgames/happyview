@@ -508,12 +508,18 @@ pub(crate) async fn get_space(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let space = service::resolve_space(&state, &query.space).await?;
 
-    // Only the owner or a holder of a space credential may read the space.
-    let is_owner = xrpc_claims
-        .identity
-        .as_ref()
-        .is_some_and(|identity| identity.did() == space.creator_did);
-    if !is_owner {
+    // Only a space admin or a holder of a space credential may read the space.
+    let is_admin = match &xrpc_claims.identity {
+        Some(identity) => {
+            match service::require_space_admin(&state, &space, identity.did()).await {
+                Ok(()) => true,
+                Err(AppError::Forbidden(_)) => false,
+                Err(e) => return Err(e),
+            }
+        }
+        None => false,
+    };
+    if !is_admin {
         if let Some(token) = &xrpc_claims.space_credential {
             require_audience(&xrpc_claims, &space.authority_did)?;
             service::verify_space_credential(&state, &space, token).await?;
