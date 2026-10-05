@@ -321,3 +321,168 @@ async fn platform_key_can_read_stats() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+async fn supers(app: &TestApp) -> Vec<String> {
+    let sql = happyview::db::adapt_sql(
+        "SELECT did FROM happyview_users WHERE is_super = 1 ORDER BY did",
+        app.state.db_backend,
+    );
+    happyview::db::query_as::<(String,)>(&sql)
+        .fetch_all(&app.state.db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(d,)| d)
+        .collect()
+}
+
+async fn put_super(app: &TestApp, token: &str, did: &str) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(bearer(
+            Method::PUT,
+            "/admin/platform/super-user",
+            token,
+            Some(&json!({ "did": did })),
+        ))
+        .await
+        .unwrap()
+}
+
+async fn delete_all_users(app: &TestApp) {
+    for sql in [
+        "DELETE FROM happyview_user_permissions",
+        "DELETE FROM happyview_users",
+    ] {
+        happyview::db::query(sql)
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn super_user_is_created_on_an_empty_instance() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+    delete_all_users(&app).await;
+
+    let resp = put_super(&app, PLATFORM_KEY, "did:plc:owner").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["did"], "did:plc:owner");
+    assert_eq!(supers(&app).await, vec!["did:plc:owner".to_string()]);
+}
+
+#[tokio::test]
+#[serial]
+async fn super_user_blocks_first_login_bootstrap() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+    delete_all_users(&app).await;
+    put_super(&app, PLATFORM_KEY, "did:plc:owner").await;
+
+    // An interloper signing in afterwards must not become a user, let alone super.
+    let interloper = common::auth::admin_cookie_header("did:plc:interloper", &app.state.cookie_key);
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/domains")
+                .header(interloper.0, interloper.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(supers(&app).await, vec!["did:plc:owner".to_string()]);
+}
+
+#[tokio::test]
+#[serial]
+async fn super_user_is_idempotent() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+    delete_all_users(&app).await;
+
+    let first = json_body(put_super(&app, PLATFORM_KEY, "did:plc:owner").await).await;
+    let second_resp = put_super(&app, PLATFORM_KEY, "did:plc:owner").await;
+    assert_eq!(second_resp.status(), StatusCode::OK);
+    let second = json_body(second_resp).await;
+
+    assert_eq!(first["user_id"], second["user_id"]);
+    assert_eq!(supers(&app).await, vec!["did:plc:owner".to_string()]);
+}
+
+#[tokio::test]
+#[serial]
+async fn super_user_transfers_from_existing_super() {
+    common::require_db!();
+    let app = app_with_platform_key().await; // seeds did:plc:testadmin as super
+
+    let resp = put_super(&app, PLATFORM_KEY, "did:plc:newowner").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(supers(&app).await, vec!["did:plc:newowner".to_string()]);
+}
+
+#[tokio::test]
+#[serial]
+async fn super_user_promotes_existing_non_super_user() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+    let now = happyview::db::now_rfc3339();
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, 0, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind("existing-user-id")
+        .bind("did:plc:member")
+        .bind(&now)
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    let resp = put_super(&app, PLATFORM_KEY, "did:plc:member").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["user_id"], "existing-user-id");
+    assert_eq!(supers(&app).await, vec!["did:plc:member".to_string()]);
+}
+
+#[tokio::test]
+#[serial]
+async fn super_user_rejects_non_did() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+    let resp = put_super(&app, PLATFORM_KEY, "alice.example.com").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[serial]
+async fn super_user_requires_platform_principal() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    // The seeded super admin, via cookie, is not the platform.
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            app.authed_request()
+                .method(Method::PUT)
+                .uri("/admin/platform/super-user")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "did": "did:plc:x" })).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(supers(&app).await, vec!["did:plc:testadmin".to_string()]);
+}
