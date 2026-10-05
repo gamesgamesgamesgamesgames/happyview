@@ -246,6 +246,16 @@ pub(super) async fn delete(
     let (_, url, is_primary, _, _) =
         row.ok_or_else(|| AppError::NotFound("domain not found".into()))?;
 
+    let (count,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_domains")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to count domains: {e}")))?;
+    if count <= 1 {
+        return Err(AppError::BadRequest(
+            "cannot delete the last domain — add another domain first".into(),
+        ));
+    }
+
     if is_primary != 0 {
         return Err(AppError::BadRequest(
             "cannot delete the primary domain — set a different domain as primary first".into(),
@@ -313,13 +323,19 @@ pub(super) async fn set_primary(
 
     let now = now_rfc3339();
 
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
     let unset_sql = adapt_sql(
         "UPDATE happyview_domains SET is_primary = 0, updated_at = ? WHERE is_primary = 1",
         state.db_backend,
     );
     crate::db::query(&unset_sql)
         .bind(&now)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("failed to unset primary: {e}")))?;
 
@@ -330,9 +346,13 @@ pub(super) async fn set_primary(
     crate::db::query(&set_sql)
         .bind(&now)
         .bind(&id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("failed to set primary: {e}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit primary change: {e}")))?;
 
     // Update cache
     let host = url

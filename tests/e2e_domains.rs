@@ -650,3 +650,56 @@ async fn domain_create_compensates_registry_on_commit_failure() {
         "expected the client_id_url registry entry to be undone after a commit failure"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn domains_cannot_delete_last_domain_even_if_not_primary() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    // A degenerate state (no primary) that set_primary's old two-step update
+    // could produce. The last domain must still be protected.
+    seed_domain(&app, "only-id", "https://only.example.com", false).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete("/admin/domains/only-id", app.admin_cookie()))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(resp).await;
+    assert!(
+        body.to_string().contains("last domain"),
+        "unexpected body: {body}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn domains_set_primary_leaves_exactly_one_primary() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    seed_domain(&app, "a", "https://a.example.com", true).await;
+    seed_domain(&app, "b", "https://b.example.com", false).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post(
+            "/admin/domains/b/primary",
+            app.admin_cookie(),
+            &json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let rows: Vec<(String,)> =
+        happyview::db::query_as("SELECT id FROM happyview_domains WHERE is_primary = 1")
+            .fetch_all(&app.state.db)
+            .await
+            .unwrap();
+    assert_eq!(rows, vec![("b".to_string(),)]);
+}
