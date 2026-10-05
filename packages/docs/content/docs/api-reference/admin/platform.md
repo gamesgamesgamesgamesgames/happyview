@@ -13,6 +13,8 @@ KEY="hv_$(openssl rand -hex 16)"
 printf '%s' "$KEY" | sha256sum | cut -d' ' -f1
 ```
 
+On macOS, use `shasum -a 256` in place of `sha256sum`.
+
 A request with `Authorization: Bearer <key>` is then authenticated as the **platform principal**. It isn't stored with other API keys, so it can't be revoked from the dashboard; change or remove the variable and restart to rotate or disable it. When it's set, the dashboard shows "Managed by HappyProto".
 
 The platform principal can:

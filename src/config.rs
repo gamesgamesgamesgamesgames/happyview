@@ -103,9 +103,8 @@ pub fn parse_platform_api_key_hash(raw: Option<&str>) -> Result<Option<String>, 
     Ok(Some(lower))
 }
 
-/// Upper bound on `JOB_WORKER_CONCURRENCY`. Each worker can hold a database
-/// connection for the length of a job, so an unbounded value could starve the
-/// request path.
+/// Upper bound on `JOB_WORKER_CONCURRENCY`. The cap bounds concurrent job load
+/// on the database pool, so an unbounded value could starve the request path.
 const MAX_JOB_WORKERS: usize = 32;
 
 /// Parse `JOB_WORKER_CONCURRENCY`. Defaults to 1 (the historical behaviour);
