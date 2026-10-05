@@ -232,3 +232,92 @@ async fn config_reports_platform_managed() {
         .unwrap();
     assert_eq!(json_body(resp).await["platform_managed"], true);
 }
+
+#[tokio::test]
+#[serial]
+async fn platform_key_is_refused_on_auth_only_routes() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let cases = [
+        (Method::GET, "/api/setup/rotation-key", None),
+        (Method::POST, "/api/setup/complete", Some(json!({}))),
+        (
+            Method::GET,
+            "/admin/identity/resolve?identifier=alice.test",
+            None,
+        ),
+    ];
+    for (method, uri, body) in cases {
+        let resp = app
+            .router
+            .clone()
+            .oneshot(bearer(method.clone(), uri, PLATFORM_KEY, body.as_ref()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn platform_key_can_manage_domains() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+    seed_domain(&app, "d1", "http://127.0.0.1:0", true).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(
+            Method::POST,
+            "/admin/domains",
+            PLATFORM_KEY,
+            Some(&json!({ "url": "https://two.example.com" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let new_id = json_body(resp).await["id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(
+            Method::POST,
+            &format!("/admin/domains/{new_id}/primary"),
+            PLATFORM_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(
+            Method::DELETE,
+            "/admin/domains/d1",
+            PLATFORM_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+#[serial]
+async fn platform_key_can_read_stats() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(Method::GET, "/admin/stats", PLATFORM_KEY, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

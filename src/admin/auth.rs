@@ -122,13 +122,11 @@ impl UserAuth {
     }
 }
 
-impl FromRequestParts<AppState> for UserAuth {
-    type Rejection = AppError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+impl UserAuth {
+    /// Authenticate the request, platform principal included. Callers decide
+    /// whether the platform principal is acceptable; see `UserAuth`'s extractor
+    /// and `AllowPlatform`.
+    async fn authenticate(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
         if let Some(auth) = Self::try_api_key_auth(parts, state).await? {
             return Ok(auth);
         }
@@ -236,6 +234,42 @@ impl FromRequestParts<AppState> for UserAuth {
             db: state.db.clone(),
             db_backend: backend,
         })
+    }
+}
+
+/// Deny by default: every handler that takes `UserAuth` refuses the managed-
+/// hosting platform principal, so a new route can never be reachable with the
+/// platform key by accident. Routes it may call opt in with `AllowPlatform`.
+impl FromRequestParts<AppState> for UserAuth {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let auth = Self::authenticate(parts, state).await?;
+        if auth.is_platform {
+            return Err(AppError::Forbidden(
+                "the platform key cannot use this endpoint".into(),
+            ));
+        }
+        Ok(auth)
+    }
+}
+
+/// Explicit opt-in for routes the managed-hosting platform may call. Behaves
+/// like `UserAuth` but also accepts the platform principal; the handler must
+/// still check what that principal is allowed to do.
+pub struct AllowPlatform(pub UserAuth);
+
+impl FromRequestParts<AppState> for AllowPlatform {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        UserAuth::authenticate(parts, state).await.map(Self)
     }
 }
 

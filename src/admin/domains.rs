@@ -8,7 +8,7 @@ use crate::domain::Domain;
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 
-use super::auth::UserAuth;
+use super::auth::AllowPlatform;
 use super::types::{CreateDomainBody, DomainResponse};
 
 fn domain_to_response(d: &Domain) -> DomainResponse {
@@ -24,7 +24,7 @@ fn domain_to_response(d: &Domain) -> DomainResponse {
 /// GET /admin/domains
 pub(super) async fn list(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
 ) -> Result<Json<Vec<DomainResponse>>, AppError> {
     auth.require_domain_access().await?;
 
@@ -56,7 +56,7 @@ pub(super) async fn list(
 /// POST /admin/domains
 pub(super) async fn create(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
     Json(body): Json<CreateDomainBody>,
 ) -> Result<(StatusCode, Json<DomainResponse>), AppError> {
     auth.require_domain_access().await?;
@@ -228,7 +228,7 @@ pub(super) async fn create(
 /// DELETE /admin/domains/{id}
 pub(super) async fn delete(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     auth.require_domain_access().await?;
@@ -294,7 +294,7 @@ pub(super) async fn delete(
 /// POST /admin/domains/{id}/primary
 pub(super) async fn set_primary(
     State(state): State<AppState>,
-    auth: UserAuth,
+    AllowPlatform(auth): AllowPlatform,
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     auth.require_domain_access().await?;
