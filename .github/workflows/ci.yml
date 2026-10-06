@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, dev, next]
+    branches: [main, beta, alpha]
   pull_request:
-    branches: [main, dev, next]
+    branches: [main, beta, alpha]
   workflow_dispatch:
     inputs:
       server:
@@ -224,9 +224,9 @@ jobs:
       - name: Add WASI target
         run: rustup target add wasm32-wasip1
 
-      # The plugin resolves `happyview-plugin-sdk` from HappyView's `next`
-      # branch over git, so an unpatched build would answer for whatever that
-      # branch published rather than for the commit under test. Pointing the
+      # The plugin resolves `happyview-plugin-sdk` from a HappyView branch
+      # over git, so an unpatched build would answer for whatever that branch
+      # published rather than for the commit under test. Pointing the
       # patch at the checkout above is what makes this job's result evidence
       # about this commit's SDK.
       - name: Resolve the SDK from this commit
@@ -623,12 +623,16 @@ jobs:
   # This job only builds. Fork PRs get a read-only token, so the image is
   # exported as an artifact and `pr-images.yml` pushes it to GHCR and comments
   # on the PR from the base repository's context.
+  #
+  # A PR opened from a release branch is skipped: that branch's own push run has
+  # already built and published the same head, so the image would be a duplicate
+  # of one reviewers can already pull.
   # ---------------------------------------------------------------------------
   pr-build:
     needs: [changes, build-server]
     if: >-
       github.event_name == 'pull_request'
-      && github.head_ref != 'dev'
+      && !contains(fromJSON('["beta", "alpha"]'), github.head_ref)
       && needs.changes.outputs.server == 'true'
     runs-on: ${{ matrix.runs-on }}
     permissions:
@@ -730,7 +734,7 @@ jobs:
   release:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
       && needs.unit-tests.result == 'success'
       && needs.e2e-tests.result == 'success'
@@ -839,8 +843,8 @@ jobs:
           MAJOR="${VERSION%%.*}"
           MINOR="${VERSION#*.}"
           MINOR="${MINOR%%.*}"
-          # A `-` suffix means semantic-release cut this from `dev` (e.g. 2.13.0-dev.1).
-          # Prereleases must never move the stable moving tags.
+          # A `-` suffix marks a prerelease (e.g. 3.0.0-alpha.1), which must
+          # never move the stable moving tags.
           case "$VERSION" in
             *-*) PRERELEASE=true ;;
             *)   PRERELEASE=false ;;
@@ -930,7 +934,8 @@ jobs:
   # all — once `build` completes, the versioned manifest exists and this is a
   # single atomic retag of it.
   #
-  # Skipped for prereleases, since `release` also runs on `dev`.
+  # Skipped for prereleases, since `release` also runs on the prerelease
+  # branches.
   # ---------------------------------------------------------------------------
   tag-latest:
     needs: [release, build]
@@ -1087,7 +1092,7 @@ jobs:
   release-oauth-client:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
       && needs.test-oauth-client.result == 'success'
     needs: [changes, test-oauth-client]
@@ -1127,7 +1132,7 @@ jobs:
   release-oauth-client-browser:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client-browser == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-browser))
       && needs.test-oauth-client-browser.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
@@ -1158,12 +1163,15 @@ jobs:
 
       - name: Resolve workspace dependencies to published versions
         run: |
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          # A prerelease channel's dist-tag is its branch name, which is also
+          # what semantic-release passes to `npm publish --tag`, so the two agree
+          # without a list to keep in step.
+          if [[ "$GITHUB_REF_NAME" == "main" ]]; then
             DIST_TAG="latest"
           else
-            DIST_TAG="dev"
+            DIST_TAG="$GITHUB_REF_NAME"
           fi
-          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version)
+          CORE_VERSION=$(npm view "@happyview/oauth-client@${DIST_TAG}" version)
           node -e "
             const fs = require('fs');
             const pkg = JSON.parse(fs.readFileSync('packages/oauth-client-browser/package.json', 'utf8'));
@@ -1185,7 +1193,7 @@ jobs:
   release-oauth-client-node:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client-node == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-node))
       && needs.test-oauth-client-node.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
@@ -1216,12 +1224,15 @@ jobs:
 
       - name: Resolve workspace dependencies to published versions
         run: |
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          # A prerelease channel's dist-tag is its branch name, which is also
+          # what semantic-release passes to `npm publish --tag`, so the two agree
+          # without a list to keep in step.
+          if [[ "$GITHUB_REF_NAME" == "main" ]]; then
             DIST_TAG="latest"
           else
-            DIST_TAG="dev"
+            DIST_TAG="$GITHUB_REF_NAME"
           fi
-          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version)
+          CORE_VERSION=$(npm view "@happyview/oauth-client@${DIST_TAG}" version)
           node -e "
             const fs = require('fs');
             const pkg = JSON.parse(fs.readFileSync('packages/oauth-client-node/package.json', 'utf8'));
@@ -1243,7 +1254,7 @@ jobs:
   release-lex-agent:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.lex-agent == 'true' || (github.event_name == 'workflow_dispatch' && inputs.lex-agent))
       && needs.test-lex-agent.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
@@ -1274,12 +1285,15 @@ jobs:
 
       - name: Resolve workspace dependencies to published versions
         run: |
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+          # A prerelease channel's dist-tag is its branch name, which is also
+          # what semantic-release passes to `npm publish --tag`, so the two agree
+          # without a list to keep in step.
+          if [[ "$GITHUB_REF_NAME" == "main" ]]; then
             DIST_TAG="latest"
           else
-            DIST_TAG="dev"
+            DIST_TAG="$GITHUB_REF_NAME"
           fi
-          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version)
+          CORE_VERSION=$(npm view "@happyview/oauth-client@${DIST_TAG}" version)
           node -e "
             const fs = require('fs');
             const pkg = JSON.parse(fs.readFileSync('packages/lex-agent/package.json', 'utf8'));
@@ -1301,7 +1315,7 @@ jobs:
   release-nsid:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
       && needs.test-nsid.result == 'success'
     needs: [changes, test-nsid]
