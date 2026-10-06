@@ -204,49 +204,8 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
 
-      # wasip1 is only for the two fixtures that link preview-1 imports; every
-      # other fixture is a bare wasm32 module.
-      - name: Add WASM targets
-        run: rustup target add wasm32-unknown-unknown wasm32-wasip1
-
-      - name: Build test plugin
-        run: cargo build --manifest-path tests/fixtures/test_plugin/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build test library
-        run: cargo build --manifest-path tests/fixtures/test_library/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build SDK http fixture
-        run: cargo build --manifest-path tests/fixtures/sdk_http/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build SDK auth fixture
-        run: cargo build --manifest-path tests/fixtures/sdk_auth/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build SDK objects fixture
-        run: cargo build --manifest-path tests/fixtures/sdk_objects/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build SDK caller fixture
-        run: cargo build --manifest-path tests/fixtures/sdk_caller/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build SDK atproto fixture
-        run: cargo build --manifest-path tests/fixtures/sdk_atproto/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build SDK linked repos fixture
-        run: cargo build --manifest-path tests/fixtures/sdk_linked_repos/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build SDK spaces fixture
-        run: cargo build --manifest-path tests/fixtures/sdk_spaces/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build interpreter echo fixture
-        run: cargo build --manifest-path tests/fixtures/interpreter_echo/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build differential library fixture
-        run: cargo build --manifest-path tests/fixtures/differential_library/Cargo.toml --target wasm32-unknown-unknown --release
-
-      - name: Build WASI probe fixture
-        run: cargo build --manifest-path tests/fixtures/wasi_probe/Cargo.toml --target wasm32-wasip1 --release
-
-      - name: Build WASI forbidden-import fixture
-        run: cargo build --manifest-path tests/fixtures/wasi_forbidden/Cargo.toml --target wasm32-wasip1 --release
+      - name: Build plugin fixtures
+        run: bash scripts/build-plugin-fixtures.sh
 
       # This is the job where the fixture-loading tests are supposed to run,
       # so here a missing module is a failure and not a skip. Without it a
@@ -291,7 +250,7 @@ jobs:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16-alpine
@@ -323,14 +282,19 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
 
-      - name: Add WASM target and LLVM tools
-        run: rustup target add wasm32-unknown-unknown && rustup component add llvm-tools
+      - name: Install LLVM tools
+        run: rustup component add llvm-tools
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Build test plugin
-        run: cargo build --manifest-path tests/fixtures/test_plugin/Cargo.toml --target wasm32-unknown-unknown --release
+      # `--workspace` below runs every fixture-loading test, so this job needs
+      # the whole set and not the one plugin a narrower run would reach.
+      - name: Build plugin fixtures
+        run: bash scripts/build-plugin-fixtures.sh
+
+      - name: Verify plugin fixtures are built
+        run: bash scripts/check-plugin-fixtures.sh --require
 
       - name: Run tests with coverage
         env:
@@ -467,15 +431,12 @@ jobs:
       # The stack's `lua` interpreter is this fixture, bind-mounted by
       # docker-compose.e2e.yml, and saving a script asks the interpreter its
       # language names whether the body is one it can run. The artefact is
-      # gitignored and this job builds no Rust otherwise, so without the three
+      # gitignored and this job builds no Rust otherwise, so without the two
       # steps below the mount is empty, every save is refused and
       # `globalSetup` stops the run. The fixture is named rather than left to
       # `--require` alone: this job builds one, not all thirteen.
-      - name: Add WASM target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Build interpreter echo fixture
-        run: cargo build --manifest-path tests/fixtures/interpreter_echo/Cargo.toml --target wasm32-unknown-unknown --release
+      - name: Build the stack's interpreter
+        run: bash scripts/build-plugin-fixtures.sh interpreter_echo
 
       - name: Verify the stack's interpreter is built
         run: bash scripts/check-plugin-fixtures.sh --require interpreter_echo
