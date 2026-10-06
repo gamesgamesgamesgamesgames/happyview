@@ -4,10 +4,11 @@
 # load it.
 #
 # It is a built artefact of another repository and needs a C toolchain, so
-# nothing here can produce it and the targets needing it skip. libtest
-# captures a passing test's skip line, so without this a green run would not
-# say which assertions it did not make — and among them are the three refusal
-# messages an operator reads when a script will not save.
+# nothing in this repository can produce it and the targets needing it skip
+# wherever it was not supplied. libtest captures a passing test's skip line,
+# so without this a green run would not say which assertions it did not make
+# — and among them are the three refusal messages an operator reads when a
+# script will not save.
 #
 #   --require   exit non-zero when the plugin is absent, for a runner that is
 #               meant to have it
@@ -18,6 +19,19 @@ if [ -n "${HAPPYVIEW_LUA_PLUGIN:-}" ]; then
   dir=$HAPPYVIEW_LUA_PLUGIN
   if [ ! -f "$dir/manifest.json" ]; then
     echo "HAPPYVIEW_LUA_PLUGIN names $dir, which holds no manifest.json"
+    exit 1
+  fi
+  # One key off one line, rather than a JSON parser this has no other need
+  # for. A directory carrying a manifest without the module it names loads
+  # nothing, and saying so here beats the same absence surfacing mid-suite as
+  # a test panicking about a file it could not open.
+  wasm=$(sed -n 's/.*"wasm_file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/manifest.json")
+  if [ -z "$wasm" ]; then
+    echo "the manifest under $dir names no wasm_file"
+    exit 1
+  fi
+  if [ ! -f "$dir/$wasm" ]; then
+    echo "the manifest under $dir names $wasm, which is not there"
     exit 1
   fi
   echo "the real Lua interpreter is at $dir"
@@ -35,8 +49,9 @@ these did not run:
                                     its declared capabilities are the ones
                                     its imports need, and that a script runs
                                     through it
-  tests/lua_differential.rs         the 84-file corpus and the 34 bridge
-                                    cases against the native runner
+  tests/lua_differential.rs         the codemod's rewritten corpus, the
+                                    editor templates and the bridge cases,
+                                    each against the native runner
   tests/admin_scripts_validate.rs   five of its ten: that a save refuses a
                                     missing `handle`, a body that will not
                                     parse and a file-scope read of a removed
@@ -53,7 +68,10 @@ What still ran, so the gap is only the real interpreter's half of it:
   tests/e2e_scripts.rs, pin the save path through the interpreter_echo
   fixture, whose messages are its own.
 
-To make them run, point HAPPYVIEW_LUA_PLUGIN at a directory holding the
+CI builds the plugin in its own job and runs all of the above against it, so
+this gap is a local one.
+
+To close it here, point HAPPYVIEW_LUA_PLUGIN at a directory holding the
 plugin's manifest.json beside the .wasm it names, and HAPPYVIEW_LUA_SRC at
 the plugin crate's src/ so a stale artefact fails rather than reporting.
 The plugin is built from the happyview-plugins repository, not this one:
