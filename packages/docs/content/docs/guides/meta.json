@@ -1,6 +1,7 @@
 {
   "title": "Guides",
   "pages": [
+    "upgrading-to-v3",
     "upgrading-to-v2",
     "lexicons",
     "backfill",
