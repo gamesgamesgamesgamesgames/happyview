@@ -61,6 +61,7 @@ import {
 } from "@/components/ui/combobox";
 import {
   ResponsiveDialog,
+  ResponsiveDialogBody,
   ResponsiveDialogClose,
   ResponsiveDialogContent,
   ResponsiveDialogDescription,
@@ -1460,6 +1461,7 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
         <Button>Create Backfill Job</Button>
       </ResponsiveDialogTrigger>
       <ResponsiveDialogContent
+        className="data-[variant=dialog]:max-h-[calc(100dvh-2rem)] data-[variant=dialog]:grid-rows-[auto_minmax(0,1fr)_auto]"
         onInteractOutside={(e) => {
           const target = e.target as HTMLElement;
           if (
@@ -1479,7 +1481,7 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
             backfilled; without a collection, every record collection is.
           </ResponsiveDialogDescription>
         </ResponsiveDialogHeader>
-        <div className="flex flex-col gap-4">
+        <ResponsiveDialogBody className="flex flex-col gap-4">
           <div className="flex flex-col gap-2">
             <Label>Collection (optional)</Label>
             <Combobox
@@ -1515,7 +1517,7 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
               or spaces.
             </p>
           </div>
-        </div>
+        </ResponsiveDialogBody>
         <ResponsiveDialogFooter>
           <ResponsiveDialogClose asChild>
             <Button variant="outline">Cancel</Button>
