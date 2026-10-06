@@ -1162,24 +1162,7 @@ jobs:
         run: bun run --filter '@happyview/*' build
 
       - name: Resolve workspace dependencies to published versions
-        run: |
-          # A prerelease channel's dist-tag is its branch name, which is also
-          # what semantic-release passes to `npm publish --tag`, so the two agree
-          # without a list to keep in step.
-          if [[ "$GITHUB_REF_NAME" == "main" ]]; then
-            DIST_TAG="latest"
-          else
-            DIST_TAG="$GITHUB_REF_NAME"
-          fi
-          CORE_VERSION=$(npm view "@happyview/oauth-client@${DIST_TAG}" version)
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('packages/oauth-client-browser/package.json', 'utf8'));
-            if (pkg.dependencies['@happyview/oauth-client']?.startsWith('workspace:')) {
-              pkg.dependencies['@happyview/oauth-client'] = '^${CORE_VERSION}';
-              fs.writeFileSync('packages/oauth-client-browser/package.json', JSON.stringify(pkg, null, 2) + '\n');
-            }
-          "
+        run: bash scripts/resolve-workspace-deps.sh packages/oauth-client-browser
 
       - name: Ensure npm supports trusted publishing
         run: npm install -g npm@latest
@@ -1223,24 +1206,7 @@ jobs:
         run: bun run --filter '@happyview/*' build
 
       - name: Resolve workspace dependencies to published versions
-        run: |
-          # A prerelease channel's dist-tag is its branch name, which is also
-          # what semantic-release passes to `npm publish --tag`, so the two agree
-          # without a list to keep in step.
-          if [[ "$GITHUB_REF_NAME" == "main" ]]; then
-            DIST_TAG="latest"
-          else
-            DIST_TAG="$GITHUB_REF_NAME"
-          fi
-          CORE_VERSION=$(npm view "@happyview/oauth-client@${DIST_TAG}" version)
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('packages/oauth-client-node/package.json', 'utf8'));
-            if (pkg.dependencies['@happyview/oauth-client']?.startsWith('workspace:')) {
-              pkg.dependencies['@happyview/oauth-client'] = '^${CORE_VERSION}';
-              fs.writeFileSync('packages/oauth-client-node/package.json', JSON.stringify(pkg, null, 2) + '\n');
-            }
-          "
+        run: bash scripts/resolve-workspace-deps.sh packages/oauth-client-node
 
       - name: Ensure npm supports trusted publishing
         run: npm install -g npm@latest
@@ -1284,24 +1250,7 @@ jobs:
         run: bun run --filter '@happyview/*' build
 
       - name: Resolve workspace dependencies to published versions
-        run: |
-          # A prerelease channel's dist-tag is its branch name, which is also
-          # what semantic-release passes to `npm publish --tag`, so the two agree
-          # without a list to keep in step.
-          if [[ "$GITHUB_REF_NAME" == "main" ]]; then
-            DIST_TAG="latest"
-          else
-            DIST_TAG="$GITHUB_REF_NAME"
-          fi
-          CORE_VERSION=$(npm view "@happyview/oauth-client@${DIST_TAG}" version)
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('packages/lex-agent/package.json', 'utf8'));
-            if (pkg.dependencies['@happyview/oauth-client']?.startsWith('workspace:')) {
-              pkg.dependencies['@happyview/oauth-client'] = '^${CORE_VERSION}';
-              fs.writeFileSync('packages/lex-agent/package.json', JSON.stringify(pkg, null, 2) + '\n');
-            }
-          "
+        run: bash scripts/resolve-workspace-deps.sh packages/lex-agent
 
       - name: Ensure npm supports trusted publishing
         run: npm install -g npm@latest
