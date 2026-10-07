@@ -1505,9 +1505,10 @@ async fn get_space_blob(
     )
     .await?;
 
-    let author_did = db::find_blob_author_did(&state.db, state.db_backend, &space.id, &params.cid)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Blob not found in this space".into()))?;
+    let author_did =
+        db::find_blob_author_did(&state.db, state.db_backend, &space.id, &params.cid, None)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Blob not found in this space".into()))?;
 
     authorize_space_read(
         &state,

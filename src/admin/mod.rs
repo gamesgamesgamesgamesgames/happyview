@@ -91,6 +91,10 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/spaces/access-grants/{id}",
             delete(space_access::revoke_grant),
         )
+        .route(
+            "/spaces/access-grants/{id}/reads",
+            get(space_access::grant_reads),
+        )
         .route("/spaces/{id}", get(spaces::get_space))
         .route("/spaces/{id}/records", get(spaces::list_space_records))
         .route("/spaces/{id}/blob", get(spaces::get_space_blob))

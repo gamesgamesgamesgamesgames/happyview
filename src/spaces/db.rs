@@ -1185,16 +1185,27 @@ pub async fn find_blob_author_did(
     backend: DatabaseBackend,
     space_id: &str,
     blob_cid: &str,
+    author_did: Option<&str>,
 ) -> Result<Option<String>, AppError> {
     // Escape LIKE metacharacters in the caller-supplied CID so `%`/`_` are matched
     // literally and can't be used to match another author's record (L8).
     let pattern = format!("%\"$link\":\"{}\"%", crate::db::escape_like(blob_cid));
+    let author_clause = if author_did.is_some() {
+        " AND author_did = ?"
+    } else {
+        ""
+    };
     let sql = adapt_sql(
-        "SELECT author_did FROM happyview_space_records WHERE space_id = ? AND record LIKE ? ESCAPE '\\' LIMIT 1",
+        &format!(
+            "SELECT author_did FROM happyview_space_records WHERE space_id = ?{author_clause} AND record LIKE ? ESCAPE '\\' LIMIT 1"
+        ),
         backend,
     );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(space_id)
+    let mut q = crate::db::query_as::<(String,)>(&sql).bind(space_id);
+    if let Some(author) = author_did {
+        q = q.bind(author);
+    }
+    let row = q
         .bind(&pattern)
         .fetch_optional(pool)
         .await

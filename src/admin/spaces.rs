@@ -18,6 +18,7 @@ use crate::spaces::{db, members, service};
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
+use super::space_access::{self, Grant, GrantScope};
 
 #[derive(Deserialize)]
 pub(super) struct ListSpacesParams {
@@ -57,22 +58,25 @@ async fn load_space(state: &AppState, id: &str) -> Result<Space, AppError> {
         .ok_or_else(|| AppError::NotFound("Space not found".into()))
 }
 
+/// Record a read of space contents under the grant that allowed it.
 async fn log_content_read(
     state: &AppState,
     auth: &UserAuth,
-    space: &Space,
+    grant: &Grant,
+    subject: String,
     detail: serde_json::Value,
 ) {
     let mut detail = detail;
-    detail["space_id"] = space.id.clone().into();
     detail["user_id"] = auth.user_id.clone().into();
+    detail["grant_id"] = grant.id.clone().into();
+    detail["scope"] = grant.scope.as_str().into();
     log_event(
         &state.db,
         EventLog {
             event_type: "space.moderator_read".to_string(),
             severity: Severity::Info,
             actor_did: Some(auth.did.clone()),
-            subject: Some(space_uri(space)),
+            subject: Some(subject),
             detail,
         },
         state.db_backend,
@@ -139,8 +143,16 @@ pub(super) async fn list_space_records(
     Path(id): Path<String>,
     Query(params): Query<ListSpaceRecordsParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    auth.require(Permission::SpacesManageRecords).await?;
     let space = load_space(&state, &id).await?;
+    let grant = space_access::require_grant(
+        &state,
+        &auth,
+        space_access::Covers::Space {
+            space_id: &space.id,
+            repo: params.repo.as_deref(),
+        },
+    )
+    .await?;
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
     let (records, cursor) = db::list_space_records(
@@ -158,9 +170,11 @@ pub(super) async fn list_space_records(
     log_content_read(
         &state,
         &auth,
-        &space,
+        &grant,
+        space_uri(&space),
         serde_json::json!({
             "action": "list_records",
+            "space_id": space.id,
             "repo": params.repo,
             "collection": params.collection,
             "uris": records.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(),
@@ -195,19 +209,58 @@ pub(super) async fn get_space_blob(
     Path(id): Path<String>,
     Query(params): Query<GetSpaceBlobParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    auth.require(Permission::SpacesManageRecords).await?;
     let space = load_space(&state, &id).await?;
+    let grants = space_access::active_grants(&state, &auth).await?;
+    let now = chrono::Utc::now();
 
-    let author_did = db::find_blob_author_did(&state.db, state.db_backend, &space.id, &params.cid)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Blob not found in this space".into()))?;
+    // A space grant opens any blob in the space. An account grant opens a
+    // blob only when that account's own record references it, even if
+    // another author's record shares the CID.
+    let mut found: Option<(Grant, String)> = None;
+    if let Some(g) = space_access::select_covering(
+        &grants,
+        &space_access::Covers::Space {
+            space_id: &space.id,
+            repo: None,
+        },
+        now,
+    ) {
+        if let Some(author) =
+            db::find_blob_author_did(&state.db, state.db_backend, &space.id, &params.cid, None)
+                .await?
+        {
+            found = Some((g.clone(), author));
+        }
+    } else {
+        for g in grants.iter().filter(|g| g.scope == GrantScope::Account) {
+            if let Some(author) = db::find_blob_author_did(
+                &state.db,
+                state.db_backend,
+                &space.id,
+                &params.cid,
+                Some(&g.target),
+            )
+            .await?
+            {
+                found = Some((g.clone(), author));
+                break;
+            }
+        }
+        if found.is_none() && grants.iter().all(|g| g.scope != GrantScope::Account) {
+            return Err(space_access::grant_required());
+        }
+    }
+    let (grant, author_did) =
+        found.ok_or_else(|| AppError::NotFound("Blob not found in this space".into()))?;
 
     log_content_read(
         &state,
         &auth,
-        &space,
+        &grant,
+        space_uri(&space),
         serde_json::json!({
             "action": "get_blob",
+            "space_id": space.id,
             "cid": params.cid,
             "repo": author_did,
         }),

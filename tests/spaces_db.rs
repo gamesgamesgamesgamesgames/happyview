@@ -1008,21 +1008,22 @@ async fn find_blob_author_did_treats_cid_wildcards_literally() {
         .expect("insert_space_record failed");
 
     // A genuine CID still resolves to the author (escaping must not break lookups).
-    let found = spaces_db::find_blob_author_did(&pool, backend, &space_id, blob_cid)
+    let found = spaces_db::find_blob_author_did(&pool, backend, &space_id, blob_cid, None)
         .await
         .unwrap();
     assert_eq!(found.as_deref(), Some(author));
 
     // `%` must be matched literally, not as a wildcard that leaks any blob ref.
-    let wildcard = spaces_db::find_blob_author_did(&pool, backend, &space_id, "%")
+    let wildcard = spaces_db::find_blob_author_did(&pool, backend, &space_id, "%", None)
         .await
         .unwrap();
     assert_eq!(wildcard, None, "'%' leaked a record via a LIKE wildcard");
 
     // `_` must not match the single differing character of a real CID.
-    let underscore = spaces_db::find_blob_author_did(&pool, backend, &space_id, "bafyreal_id")
-        .await
-        .unwrap();
+    let underscore =
+        spaces_db::find_blob_author_did(&pool, backend, &space_id, "bafyreal_id", None)
+            .await
+            .unwrap();
     assert_eq!(underscore, None, "'_' leaked a record via a LIKE wildcard");
 }
 

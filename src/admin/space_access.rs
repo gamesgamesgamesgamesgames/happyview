@@ -136,8 +136,6 @@ pub fn inspector_disabled() -> AppError {
     }
 }
 
-/// Used once record reads enforce a live grant (a later task); unused for now.
-#[allow(dead_code)]
 pub fn grant_required() -> AppError {
     AppError::XrpcError {
         status: StatusCode::FORBIDDEN,
@@ -237,6 +235,95 @@ pub async fn list_user_grants(
         .await
         .map_err(|e| AppError::Internal(format!("failed to list access grants: {e}")))?;
     rows.into_iter().map(parse_grant).collect()
+}
+
+/// A user's own unrevoked grants, with expiry checked in Rust rather than in
+/// SQL. Unlike `list_user_grants`, this has no row limit: the authorization
+/// path must see every grant the caller holds, not just the most recent 200.
+async fn unrevoked_user_grants(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    user_id: &str,
+) -> Result<Vec<Grant>, AppError> {
+    let sql = adapt_sql(
+        &format!(
+            "SELECT {GRANT_COLUMNS} FROM happyview_space_access_grants WHERE user_id = ? AND revoked_at IS NULL"
+        ),
+        backend,
+    );
+    let rows: Vec<GrantRow> = crate::db::query_as(&sql)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list active access grants: {e}")))?;
+    rows.into_iter().map(parse_grant).collect()
+}
+
+/// What a content read must be covered by.
+pub enum Covers<'a> {
+    /// Records in one space. With `repo`, an account grant for that author
+    /// also covers the request.
+    Space {
+        space_id: &'a str,
+        repo: Option<&'a str>,
+    },
+    /// One account's records in any space.
+    #[allow(dead_code)] // No account-wide read route constructs this yet.
+    Account { did: &'a str },
+}
+
+fn covers(grant: &Grant, request: &Covers) -> bool {
+    match (grant.scope, request) {
+        (GrantScope::Space, Covers::Space { space_id, .. }) => grant.target == *space_id,
+        (
+            GrantScope::Account,
+            Covers::Space {
+                repo: Some(repo), ..
+            },
+        ) => grant.target == *repo,
+        (GrantScope::Account, Covers::Account { did }) => grant.target == *did,
+        _ => false,
+    }
+}
+
+/// The active grant covering a request, preferring the one that expires last.
+pub fn select_covering<'g>(
+    grants: &'g [Grant],
+    request: &Covers,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<&'g Grant> {
+    grants
+        .iter()
+        .filter(|g| g.is_active(now) && covers(g, request))
+        .max_by_key(|g| parse_dt(&g.expires_at))
+}
+
+/// The caller's active grants, after checking the permission and the switch.
+pub async fn active_grants(state: &AppState, auth: &UserAuth) -> Result<Vec<Grant>, AppError> {
+    auth.require(Permission::SpacesInspect).await?;
+    if !load_config(&state.db, state.db_backend).await.enabled {
+        return Err(inspector_disabled());
+    }
+    let now = chrono::Utc::now();
+    Ok(
+        unrevoked_user_grants(&state.db, state.db_backend, &auth.user_id)
+            .await?
+            .into_iter()
+            .filter(|g| g.is_active(now))
+            .collect(),
+    )
+}
+
+/// The grant covering a request, or `SpaceAccessGrantRequired` if none does.
+pub async fn require_grant(
+    state: &AppState,
+    auth: &UserAuth,
+    request: Covers<'_>,
+) -> Result<Grant, AppError> {
+    let grants = active_grants(state, auth).await?;
+    select_covering(&grants, &request, chrono::Utc::now())
+        .cloned()
+        .ok_or_else(grant_required)
 }
 
 async fn mark_revoked(
@@ -407,6 +494,52 @@ pub(super) async fn revoke_grant(
     }))
 }
 
+/// GET /admin/spaces/access-grants/{id}/reads — reads made under a grant,
+/// oldest first.
+pub(super) async fn grant_reads(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::EventsRead).await?;
+    // `detail` is compact JSON text on both backends, so the grant id appears
+    // as `"grant_id":"<id>"`.
+    let pattern = format!("%\"grant_id\":\"{}\"%", crate::db::escape_like(&id));
+    let sql = adapt_sql(
+        "SELECT id, event_type, severity, actor_did, subject, detail, created_at FROM happyview_event_logs WHERE event_type = 'space.moderator_read' AND detail LIKE ? ESCAPE '\\' ORDER BY created_at ASC LIMIT 500",
+        state.db_backend,
+    );
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+    )> = crate::db::query_as(&sql)
+        .bind(&pattern)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to load grant reads: {e}")))?;
+    let events: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, event_type, severity, actor_did, subject, detail, created_at)| {
+            serde_json::json!({
+                "id": id,
+                "event_type": event_type,
+                "severity": severity,
+                "actor_did": actor_did,
+                "subject": subject,
+                "detail": serde_json::from_str::<serde_json::Value>(&detail).unwrap_or_default(),
+                "created_at": parse_dt(&created_at),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "events": events })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,5 +582,70 @@ mod tests {
             "the cap counts characters, not bytes"
         );
         assert!(validate_reason(&"a".repeat(2001)).is_err());
+    }
+
+    fn grant(scope: GrantScope, target: &str, minutes: i64) -> Grant {
+        let now = chrono::Utc::now();
+        Grant {
+            id: format!("{target}-{minutes}"),
+            user_id: "u".into(),
+            user_did: "did:plc:u".into(),
+            scope,
+            target: target.into(),
+            reason: "r".into(),
+            created_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::minutes(minutes)).to_rfc3339(),
+            revoked_at: None,
+            revoked_by: None,
+        }
+    }
+
+    #[test]
+    fn coverage_rules() {
+        let now = chrono::Utc::now();
+        let grants = vec![
+            grant(GrantScope::Space, "s1", 10),
+            grant(GrantScope::Account, "did:plc:a", 30),
+            grant(GrantScope::Space, "s2", -1),
+        ];
+        let space_all = Covers::Space {
+            space_id: "s1",
+            repo: None,
+        };
+        assert_eq!(
+            select_covering(&grants, &space_all, now).unwrap().target,
+            "s1"
+        );
+        let other_space = Covers::Space {
+            space_id: "s3",
+            repo: None,
+        };
+        assert!(select_covering(&grants, &other_space, now).is_none());
+        let expired = Covers::Space {
+            space_id: "s2",
+            repo: None,
+        };
+        assert!(select_covering(&grants, &expired, now).is_none());
+        let author_elsewhere = Covers::Space {
+            space_id: "s3",
+            repo: Some("did:plc:a"),
+        };
+        assert_eq!(
+            select_covering(&grants, &author_elsewhere, now)
+                .unwrap()
+                .target,
+            "did:plc:a"
+        );
+        let both = Covers::Space {
+            space_id: "s1",
+            repo: Some("did:plc:a"),
+        };
+        assert_eq!(
+            select_covering(&grants, &both, now).unwrap().target,
+            "did:plc:a",
+            "the grant expiring latest wins"
+        );
+        let account = Covers::Account { did: "did:plc:b" };
+        assert!(select_covering(&grants, &account, now).is_none());
     }
 }
