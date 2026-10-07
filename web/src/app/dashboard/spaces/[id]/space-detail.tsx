@@ -131,7 +131,7 @@ export default function SpaceDetail() {
     (g) =>
       (g.scope === "space" && g.target === id) ||
       (g.scope === "account" && memberDids.has(g.target)),
-    Boolean(inspector?.enabled && canInspect),
+    Boolean(detail && inspector?.enabled && canInspect),
   );
 
   const fetchRecords = useCallback(
