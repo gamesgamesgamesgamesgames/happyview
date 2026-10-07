@@ -4,7 +4,7 @@ title: "Spaces"
 
 Browse the [spaces](../../experimental/spaces/index.md) on this instance for moderation. These endpoints give operators access to spaces they are not members of, so they live in the admin API rather than the space XRPC API.
 
-Listing spaces and reading their metadata requires `spaces:read`. Reading a space's records or blobs requires `spaces:inspect`, the space inspector turned on for the instance (see [Configuration](../../getting-started/configuration.md)), and an active [access grant](#access-grants) covering the request. Every grant, its revocation, and every read made under it is written to the [event log](../../guides/event-logs.md#space-events) as a protected event that can't be purged by hand.
+Every route on this page except [Space inspector status](#space-inspector-status) returns `403 SpaceInspectorDisabled` while the space inspector is off (see [Configuration](../../getting-started/configuration.md)). Listing spaces and reading their metadata requires `spaces:read`. Reading a space's records or blobs also requires `spaces:inspect` and an active [access grant](#access-grants) covering the request. Every grant, its revocation, and every read made under it is written to the [event log](../../guides/event-logs.md#space-events) as a protected event that can't be purged by hand.
 
 ```sh tab="cURL" tab-group="language"
 # All examples assume $TOKEN is an API key (hv_...)
@@ -17,7 +17,7 @@ AUTH="Authorization: Bearer $TOKEN"
 GET /admin/spaces/inspector
 ```
 
-Whether the space inspector is on, and how long an access grant can last. Requires `spaces:read`.
+Whether the space inspector is on, and how long an access grant can last. Requires `spaces:read`. This route answers while the inspector is off, so the dashboard can show why the other routes are closed.
 
 ```sh tab="cURL" tab-group="language"
 curl http://127.0.0.1:3000/admin/spaces/inspector -H "$AUTH"
@@ -229,7 +229,7 @@ curl http://127.0.0.1:3000/admin/spaces/0b6c1f0e-... -H "$AUTH"
 }
 ```
 
-Returns `404 Not Found` if no space has that ID.
+Returns `403 SpaceInspectorDisabled` if the space inspector is off, and `404 Not Found` if no space has that ID.
 
 ## List records in a space
 
@@ -299,7 +299,7 @@ Returns `403 SpaceAccessGrantRequired` if no grant covers the space and the call
 GET /admin/accounts/{did}/spaces
 ```
 
-Where an account has membership or records. Metadata only — no access grant required. Requires `spaces:read`.
+Where an account has membership or records. Metadata only — no access grant required. Requires `spaces:read`. Returns `403 SpaceInspectorDisabled` if the space inspector is off.
 
 ```sh tab="cURL" tab-group="language"
 curl http://127.0.0.1:3000/admin/accounts/did:plc:abc/spaces -H "$AUTH"
