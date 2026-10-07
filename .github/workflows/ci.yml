@@ -190,7 +190,7 @@ jobs:
       # Public, so no token. A sibling of the checkout above, which is what
       # the patch below reaches across.
       #
-      # `next` because the interpreter exists only there: `main` carries the
+      # `alpha` because the interpreter exists only there: `main` carries the
       # four auth plugins and nothing else, so a default checkout holds no
       # `happyview-lua` to build. A branch rather than a revision, and
       # deliberately: this job's question is whether the SDK in this commit

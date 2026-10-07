@@ -111,6 +111,6 @@ Full changelog is on [GitHub](https://github.com/gamesgamesgamesgamesgames/happy
 
 ## A little sneaky peaky 👀
 
-If you're interested in development for v3, you can check out the [`next` branch](https://github.com/gamesgamesgamesgamesgames/happyview/tree/next). There's also a `next` branch on the [`happyview-plugins`](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/next) repo.
+If you're interested in development for v3, you can check out the [`alpha` branch](https://github.com/gamesgamesgamesgamesgames/happyview/tree/alpha). There's also an `alpha` branch on the [`happyview-plugins`](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/alpha) repo.
 
 I'll be publishing another article soon as a sort of State of the Software to make all of the changes easier to understand. 😉
