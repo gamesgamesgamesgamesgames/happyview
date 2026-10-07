@@ -596,3 +596,63 @@ async fn the_inspector_stays_off_when_its_audit_event_cannot_be_written() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(!enabled, "the setting rolls back with its audit event");
 }
+
+#[tokio::test]
+#[serial]
+async fn retention_removes_grants_that_ended_before_the_cutoff() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let now = chrono::Utc::now();
+    let days_ago = |d: i64| (now - chrono::Duration::days(d)).to_rfc3339();
+    let insert = adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at, revoked_at) VALUES (?, 'u', 'did:plc:u', 'account', 'did:plc:t', 'r', ?, ?, ?)",
+        app.state.db_backend,
+    );
+    for (id, expires_at, revoked_at) in [
+        ("expired-long-ago", days_ago(400), None),
+        (
+            "revoked-long-ago",
+            (now + chrono::Duration::days(1)).to_rfc3339(),
+            Some(days_ago(400)),
+        ),
+        ("expired-recently", days_ago(10), None),
+        (
+            "active",
+            (now + chrono::Duration::hours(1)).to_rfc3339(),
+            None,
+        ),
+    ] {
+        happyview::db::query(&insert)
+            .bind(id)
+            .bind(days_ago(500))
+            .bind(expires_at)
+            .bind(revoked_at)
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
+
+    let deleted =
+        happyview::event_log::sweep_ended_access_grants(&app.state.db, 365, app.state.db_backend)
+            .await
+            .unwrap();
+    assert_eq!(deleted, 2);
+    let mut left: Vec<String> =
+        happyview::db::query_as::<(String,)>("SELECT id FROM happyview_space_access_grants")
+            .fetch_all(&app.state.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+    left.sort();
+    assert_eq!(left, vec!["active", "expired-recently"]);
+
+    assert_eq!(
+        happyview::event_log::sweep_ended_access_grants(&app.state.db, 0, app.state.db_backend)
+            .await
+            .unwrap(),
+        0,
+        "0 keeps them forever"
+    );
+}

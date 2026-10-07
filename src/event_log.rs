@@ -302,6 +302,32 @@ pub async fn run_retention_sweep(
 /// spawn, so an operator can change it without a restart. A value of `0`
 /// therefore skips the sweep and leaves this task running — it must not return,
 /// or disabling retention once would be permanent until the process restarts.
+/// Delete space access grants that ended (expired or were revoked) more than
+/// `retention_days` ago. Grants hold a moderator's DID and reason, so they
+/// follow the same schedule as the protected events that record them. `0`
+/// keeps them forever. Returns how many were deleted.
+pub async fn sweep_ended_access_grants(
+    db: &AnyPool,
+    retention_days: u32,
+    backend: DatabaseBackend,
+) -> Result<u64, sqlx::Error> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+    // Grant timestamps are written with `to_rfc3339()`, so they compare as text.
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+    let sql = adapt_sql(
+        "DELETE FROM happyview_space_access_grants WHERE (revoked_at IS NOT NULL AND revoked_at < ?) OR expires_at < ?",
+        backend,
+    );
+    let result = crate::db::query(&sql)
+        .bind(&cutoff)
+        .bind(&cutoff)
+        .execute(db)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
     let interval = tokio::time::Duration::from_secs(3600);
 
@@ -339,6 +365,12 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
                 vacuumed = outcome.vacuumed,
                 "cleaned up old event logs"
             );
+        }
+
+        match sweep_ended_access_grants(&db, protected_days, backend).await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "cleaned up ended space access grants"),
+            Err(e) => tracing::warn!("failed to clean up ended space access grants: {e}"),
         }
     }
 }
