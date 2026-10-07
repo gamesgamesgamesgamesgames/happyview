@@ -14,7 +14,7 @@ use super::db;
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Start the background job worker. Polls for pending jobs and
-/// executes them one at a time.
+/// executes them one at a time per worker; see `spawn_workers`.
 pub async fn run_worker(state: AppState) {
     tracing::info!("job worker started");
 
@@ -33,6 +33,16 @@ pub async fn run_worker(state: AppState) {
             }
         }
     }
+}
+
+/// Start `count` job workers (at least one). Each claims jobs independently;
+/// `db::claim_next_job` guarantees a job is claimed by exactly one worker.
+pub fn spawn_workers(state: AppState, count: usize) -> Vec<tokio::task::JoinHandle<()>> {
+    let count = count.max(1);
+    tracing::info!(count, "starting job workers");
+    (0..count)
+        .map(|_| tokio::spawn(run_worker(state.clone())))
+        .collect()
 }
 
 /// Resume jobs that were interrupted by a server restart.

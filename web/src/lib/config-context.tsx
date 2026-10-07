@@ -9,6 +9,7 @@ interface ConfigContextType {
   default_rate_limit_refill_rate: number
   app_name: string | null
   logo_url: string | null
+  platform_managed: boolean
   configErrors: string[]
 }
 
@@ -18,6 +19,7 @@ const ConfigContext = createContext<ConfigContextType>({
   default_rate_limit_refill_rate: 2.0,
   app_name: null,
   logo_url: null,
+  platform_managed: false,
   configErrors: [],
 })
 
@@ -63,6 +65,7 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
           default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
           app_name: data.app_name ?? null,
           logo_url: data.logo_url ?? null,
+          platform_managed: data.platform_managed === true,
           configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
         })
       })
