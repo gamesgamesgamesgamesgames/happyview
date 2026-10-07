@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, beta, alpha]
   pull_request:
-    branches: [main, dev]
+    branches: [main, beta, alpha]
   workflow_dispatch:
     inputs:
       server:
@@ -413,12 +413,16 @@ jobs:
   # This job only builds. Fork PRs get a read-only token, so the image is
   # exported as an artifact and `pr-images.yml` pushes it to GHCR and comments
   # on the PR from the base repository's context.
+  #
+  # A PR opened from a release branch is skipped: that branch's own push run has
+  # already built and published the same head, so the image would be a duplicate
+  # of one reviewers can already pull.
   # ---------------------------------------------------------------------------
   pr-build:
     needs: [changes, build-server]
     if: >-
       github.event_name == 'pull_request'
-      && github.head_ref != 'dev'
+      && !contains(fromJSON('["beta", "alpha"]'), github.head_ref)
       && needs.changes.outputs.server == 'true'
     runs-on: ${{ matrix.runs-on }}
     permissions:
@@ -520,7 +524,7 @@ jobs:
   release:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
       && needs.unit-tests.result == 'success'
       && needs.e2e-tests.result == 'success'
@@ -629,8 +633,8 @@ jobs:
           MAJOR="${VERSION%%.*}"
           MINOR="${VERSION#*.}"
           MINOR="${MINOR%%.*}"
-          # A `-` suffix means semantic-release cut this from `dev` (e.g. 2.13.0-dev.1).
-          # Prereleases must never move the stable moving tags.
+          # A `-` suffix marks a prerelease (e.g. 3.0.0-alpha.1), which must
+          # never move the stable moving tags.
           case "$VERSION" in
             *-*) PRERELEASE=true ;;
             *)   PRERELEASE=false ;;
@@ -720,7 +724,8 @@ jobs:
   # all — once `build` completes, the versioned manifest exists and this is a
   # single atomic retag of it.
   #
-  # Skipped for prereleases, since `release` also runs on `dev`.
+  # Skipped for prereleases, since `release` also runs on the prerelease
+  # branches.
   # ---------------------------------------------------------------------------
   tag-latest:
     needs: [release, build]
@@ -877,7 +882,7 @@ jobs:
   release-oauth-client:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client))
       && needs.test-oauth-client.result == 'success'
     needs: [changes, test-oauth-client]
@@ -917,7 +922,7 @@ jobs:
   release-oauth-client-browser:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client-browser == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-browser))
       && needs.test-oauth-client-browser.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
@@ -947,21 +952,7 @@ jobs:
         run: bun run --filter '@happyview/*' build
 
       - name: Resolve workspace dependencies to published versions
-        run: |
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            DIST_TAG="latest"
-          else
-            DIST_TAG="dev"
-          fi
-          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version)
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('packages/oauth-client-browser/package.json', 'utf8'));
-            if (pkg.dependencies['@happyview/oauth-client']?.startsWith('workspace:')) {
-              pkg.dependencies['@happyview/oauth-client'] = '^${CORE_VERSION}';
-              fs.writeFileSync('packages/oauth-client-browser/package.json', JSON.stringify(pkg, null, 2) + '\n');
-            }
-          "
+        run: bash scripts/resolve-workspace-deps.sh packages/oauth-client-browser
 
       - name: Ensure npm supports trusted publishing
         run: npm install -g npm@latest
@@ -975,7 +966,7 @@ jobs:
   release-oauth-client-node:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.oauth-client-node == 'true' || (github.event_name == 'workflow_dispatch' && inputs.oauth-client-node))
       && needs.test-oauth-client-node.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
@@ -1005,21 +996,7 @@ jobs:
         run: bun run --filter '@happyview/*' build
 
       - name: Resolve workspace dependencies to published versions
-        run: |
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            DIST_TAG="latest"
-          else
-            DIST_TAG="dev"
-          fi
-          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version)
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('packages/oauth-client-node/package.json', 'utf8'));
-            if (pkg.dependencies['@happyview/oauth-client']?.startsWith('workspace:')) {
-              pkg.dependencies['@happyview/oauth-client'] = '^${CORE_VERSION}';
-              fs.writeFileSync('packages/oauth-client-node/package.json', JSON.stringify(pkg, null, 2) + '\n');
-            }
-          "
+        run: bash scripts/resolve-workspace-deps.sh packages/oauth-client-node
 
       - name: Ensure npm supports trusted publishing
         run: npm install -g npm@latest
@@ -1033,7 +1010,7 @@ jobs:
   release-lex-agent:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.lex-agent == 'true' || (github.event_name == 'workflow_dispatch' && inputs.lex-agent))
       && needs.test-lex-agent.result == 'success'
       && (needs.release-oauth-client.result == 'success' || needs.changes.outputs.oauth-client != 'true')
@@ -1063,21 +1040,7 @@ jobs:
         run: bun run --filter '@happyview/*' build
 
       - name: Resolve workspace dependencies to published versions
-        run: |
-          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-            DIST_TAG="latest"
-          else
-            DIST_TAG="dev"
-          fi
-          CORE_VERSION=$(npm view @happyview/oauth-client@${DIST_TAG} version)
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('packages/lex-agent/package.json', 'utf8'));
-            if (pkg.dependencies['@happyview/oauth-client']?.startsWith('workspace:')) {
-              pkg.dependencies['@happyview/oauth-client'] = '^${CORE_VERSION}';
-              fs.writeFileSync('packages/lex-agent/package.json', JSON.stringify(pkg, null, 2) + '\n');
-            }
-          "
+        run: bash scripts/resolve-workspace-deps.sh packages/lex-agent
 
       - name: Ensure npm supports trusted publishing
         run: npm install -g npm@latest
@@ -1091,7 +1054,7 @@ jobs:
   release-nsid:
     if: >-
       always()
-      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+      && contains(fromJSON('["refs/heads/main", "refs/heads/beta", "refs/heads/alpha"]'), github.ref)
       && (needs.changes.outputs.nsid == 'true' || (github.event_name == 'workflow_dispatch' && inputs.nsid))
       && needs.test-nsid.result == 'success'
     needs: [changes, test-nsid]

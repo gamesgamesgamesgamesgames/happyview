@@ -27,7 +27,7 @@ Multi-arch manifests are published for `linux/amd64` and `linux/arm64` on every 
 | `2`           | Every stable minor in that major | Automatic minor updates    |
 | `sha-abc1234` | Never                            | Pinning to an exact commit |
 
-Prereleases cut from the `dev` branch (e.g. `2.13.0-dev.1`) are published under their full version only. They never move `latest`, `2.13`, or `2`.
+Prereleases are cut from `beta` (the 2.x line, e.g. `2.17.0-beta.1`) and from `alpha` (the 3.x line, e.g. `3.0.0-alpha.1`). Both are published under their full version and their commit SHA only — neither moves `latest`, `2.13`, or `2`, so either is safe to pin.
 
 <Callout type="idea" title="Pin a version in production">
 Every Compose file below reads `HAPPYVIEW_VERSION` and defaults to `latest`. Set it to an exact version so a redeploy can't pull a different build than the one you tested.
