@@ -403,7 +403,7 @@ impl Permission {
             Self::SpacesRead => PermissionInfo {
                 key: "spaces:read",
                 name: "View Spaces",
-                description: "View space details and metadata",
+                description: "View space details, metadata, and members",
                 category: "Spaces",
             },
             Self::SpacesUpdate => PermissionInfo {

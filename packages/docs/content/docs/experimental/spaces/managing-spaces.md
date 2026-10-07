@@ -304,7 +304,7 @@ curl 'https://happyview.example.com/xrpc/com.atproto.simplespace.getSpace?space=
 }
 ```
 
-If `membership_public` is `false`, the caller must be authenticated and be the creator or a member. Everyone else receives `404 Not Found`.
+Only the space's creator, a HappyView super admin, or a caller presenting a [space credential](./credentials.md) for the space can read it. Other accounts, members included, receive `404 Not Found`, and unauthenticated callers `401 Unauthorized`.
 
 `dev.happyview.space.getSpace` is a deprecated alias, kept until v3.
 

@@ -285,25 +285,27 @@ pub async fn execute_procedure_script(
             "script execution completed"
         );
     });
-    log_event(
-        &state.db,
-        EventLog {
-            event_type: "script.executed".to_string(),
-            severity: Severity::Info,
-            actor_did: Some(claims.did().to_string()),
-            subject: Some(method.to_string()),
-            detail: serde_json::json!({
-                "method": method,
-                "caller_did": claims.did(),
-                "duration_ms": start.elapsed().as_millis() as u64,
-                "response_size": json_value.to_string().len(),
-                "input": input_json,
-                "response": json_value,
-            }),
-        },
-        backend,
-    )
-    .await;
+    if state.verbose_event_logging.load(Ordering::Relaxed) {
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "script.executed".to_string(),
+                severity: Severity::Info,
+                actor_did: Some(claims.did().to_string()),
+                subject: Some(method.to_string()),
+                detail: serde_json::json!({
+                    "method": method,
+                    "caller_did": claims.did(),
+                    "duration_ms": start.elapsed().as_millis() as u64,
+                    "response_size": json_value.to_string().len(),
+                    "input": input_json,
+                    "response": json_value,
+                }),
+            },
+            backend,
+        )
+        .await;
+    }
 
     Ok(Json(json_value).into_response())
 }
@@ -389,24 +391,26 @@ pub async fn execute_query_script(
             "script execution completed"
         );
     });
-    log_event(
-        &state.db,
-        EventLog {
-            event_type: "script.executed".to_string(),
-            severity: Severity::Info,
-            actor_did: None,
-            subject: Some(method.to_string()),
-            detail: serde_json::json!({
-                "method": method,
-                "duration_ms": start.elapsed().as_millis() as u64,
-                "response_size": json_value.to_string().len(),
-                "params": params,
-                "response": json_value,
-            }),
-        },
-        backend,
-    )
-    .await;
+    if state.verbose_event_logging.load(Ordering::Relaxed) {
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "script.executed".to_string(),
+                severity: Severity::Info,
+                actor_did: None,
+                subject: Some(method.to_string()),
+                detail: serde_json::json!({
+                    "method": method,
+                    "duration_ms": start.elapsed().as_millis() as u64,
+                    "response_size": json_value.to_string().len(),
+                    "params": params,
+                    "response": json_value,
+                }),
+            },
+            backend,
+        )
+        .await;
+    }
 
     Ok(Json(json_value).into_response())
 }
@@ -416,7 +420,7 @@ mod tests {
     use super::*;
     use crate::lexicon::{LexiconType, ProcedureAction};
     use crate::plugin::{ExecutionError, ScriptErrorKind, ScriptValueKind};
-    use crate::test_support::{memory_pool, test_state_with_pool};
+    use crate::test_support::{memory_pool, migrated_memory_pool, test_state_with_pool};
 
     fn query_lexicon() -> ParsedLexicon {
         ParsedLexicon {
@@ -718,5 +722,79 @@ mod tests {
         .expect_err("no interpreter is installed, so the run cannot happen");
 
         assert_eq!(counters.script_executions.load(Ordering::Relaxed), 1);
+    }
+
+    async fn executed_event_count(state: &AppState) -> i64 {
+        let row: (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'script.executed'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("count script.executed events");
+        row.0
+    }
+
+    /// Query and procedure scripts run on every XRPC call, and `script.executed`
+    /// stores the full request and response, so the row is gated like the other
+    /// per-request telemetry.
+    #[tokio::test]
+    #[ignore = "needs an interpreter plugin, and v3 ships none to tests"]
+    async fn script_executed_is_not_logged_while_verbose_logging_is_off() {
+        let state = test_state_with_pool(migrated_memory_pool().await);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+
+        let result = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            &query_script("function handle() return { ok = true } end"),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "script should have executed: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            executed_event_count(&state).await,
+            0,
+            "script.executed must not be logged while verbose event logging is off"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs an interpreter plugin, and v3 ships none to tests"]
+    async fn script_executed_is_logged_when_verbose_logging_is_on() {
+        let state = test_state_with_pool(migrated_memory_pool().await);
+        state.verbose_event_logging.store(true, Ordering::Relaxed);
+        let lexicon = query_lexicon();
+        let params = HashMap::new();
+
+        let result = execute_query_script(
+            &state,
+            "com.example.probe",
+            &params,
+            &lexicon,
+            &query_script("function handle() return { ok = true } end"),
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "script should have executed: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            executed_event_count(&state).await,
+            1,
+            "script.executed must still be logged when verbose event logging is on"
+        );
     }
 }

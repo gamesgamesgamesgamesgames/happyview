@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useLayoutEffect, useState, type RefObject } from "react"
 import type { Combobox as ComboboxPrimitive } from "@base-ui/react"
 import { Loader2 } from "lucide-react"
 
@@ -92,6 +92,52 @@ function AccountChip({ tag }: { tag: AccountTag }) {
   )
 }
 
+// Below this much room, the suggestion list opens upward if there is more
+// room there.
+const MIN_ROOM_BELOW = 288
+
+/**
+ * Pick the side of `anchor` with room for the suggestion list.
+ *
+ * Base UI's flip never fires for this list: the list shrinks to the available
+ * height, so it always fits the side it is on, however little room that side
+ * has. Choosing the side here and letting the list shrink to fit it keeps
+ * every suggestion on screen.
+ */
+function usePopupSide(
+  anchor: RefObject<HTMLElement | null>,
+  layoutKey: unknown,
+): "top" | "bottom" {
+  const [side, setSide] = useState<"top" | "bottom">("bottom")
+
+  useLayoutEffect(() => {
+    function measure() {
+      const el = anchor.current
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      const viewport = window.visualViewport
+      const top = viewport?.offsetTop ?? 0
+      const bottom = top + (viewport?.height ?? window.innerHeight)
+      const above = rect.top - top
+      const below = bottom - rect.bottom
+      setSide(below < MIN_ROOM_BELOW && above > below ? "top" : "bottom")
+    }
+
+    measure()
+    const viewport = window.visualViewport
+    window.addEventListener("resize", measure)
+    viewport?.addEventListener("resize", measure)
+    viewport?.addEventListener("scroll", measure)
+    return () => {
+      window.removeEventListener("resize", measure)
+      viewport?.removeEventListener("resize", measure)
+      viewport?.removeEventListener("scroll", measure)
+    }
+  }, [anchor, layoutKey])
+
+  return side
+}
+
 export function AccountInput({
   id,
   placeholder = "alice.bsky.social or did:plc:...",
@@ -133,6 +179,8 @@ export function AccountInput({
     ? suggestions.map((actor) => ({ kind: "actor", actor }))
     : []
   const value: Option[] = tags.map((tag) => ({ kind: "tag", tag }))
+  // Re-measured when the list fills or the chips wrap onto a new line.
+  const side = usePopupSide(anchor, `${items.length}:${tags.length}`)
 
   function handleValueChange(
     next: Option[],
@@ -221,7 +269,11 @@ export function AccountInput({
           }}
         />
       </ComboboxChips>
-      <ComboboxContent anchor={anchor} className="data-empty:hidden">
+      <ComboboxContent
+        anchor={anchor}
+        side={side}
+        className="data-empty:hidden"
+      >
         <ComboboxList>
           {(option: Option) =>
             option.kind === "actor" ? (

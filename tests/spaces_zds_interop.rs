@@ -91,6 +91,8 @@ async fn create_space(token: &str, read: &Policy, write: &Policy, app: &AppAcces
         &format!("{ZDS}/xrpc/com.atproto.simplespace.createSpace"),
         Some(token),
         json!({
+            // `spaceType` and `type` to handle backwards compat.
+            "spaceType": "com.example.forum",
             "type": "com.example.forum",
             "skey": "self",
             "readPolicy": read,

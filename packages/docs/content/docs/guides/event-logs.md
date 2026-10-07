@@ -20,24 +20,25 @@ Logged when lexicons are uploaded, updated, or deleted via the [admin API](../ap
 
 ### Record events
 
-| Event Type       | Severity | Subject       | Detail                      |
-| ---------------- | -------- | ------------- | --------------------------- |
-| `record.created` | info     | Record AT URI | `collection`, `did`, `rkey` |
-| `record.deleted` | info     | Record AT URI | `collection`, `did`, `rkey` |
+| Event Type       | Severity | Subject       | Detail                                |
+| ---------------- | -------- | ------------- | ------------------------------------- |
+| `record.created` | info     | Record AT URI | `collection`, `did`, `rkey`           |
+| `record.deleted` | info     | Record AT URI | `collection`, `did`, `rkey`           |
+| `record.skipped` | info     | Record AT URI | `collection`, `did`, `rkey`, `reason` |
 
-Logged when records are received from Jetstream and stored or removed from the local database. These are system-triggered events (`actor_did` is null). If a database error occurs during the operation, the same event type is logged with `error` severity and the error message is included in the detail.
+Logged when records are received from Jetstream and stored or removed from the local database, or skipped because a record script returned `nil`. These are system-triggered events (`actor_did` is null). They write one row per record, so successful operations are only logged when [`verbose_event_logging`](../api-reference/admin/settings.md) is on. If a database error occurs, the same event type is logged with `error` severity regardless of that setting, and the error message is included in the detail.
 
 ### Script events
 
-| Event Type        | Severity | Subject     | Detail                                                    |
-| ----------------- | -------- | ----------- | --------------------------------------------------------- |
-| `script.executed` | info     | Method NSID | `method`, `caller_did`, `duration_ms`                     |
-| `script.error`    | error    | Method NSID | `error`, `script_source`, `input`, `caller_did`, `method` |
+| Event Type        | Severity | Subject     | Detail                                                                     |
+| ----------------- | -------- | ----------- | -------------------------------------------------------------------------- |
+| `script.executed` | info     | Method NSID | `method`, `caller_did`, `duration_ms`, `response_size`, `input`, `response` |
+| `script.error`    | error    | Method NSID | `error`, `script_source`, `input`, `caller_did`, `method`                  |
 
-Logged when Lua scripts run for XRPC query or procedure endpoints. Script errors capture the full context needed to reproduce and debug the issue: the error message, the complete Lua script source, the input that triggered it, and the caller's DID.
+Logged when Lua scripts run for XRPC query or procedure endpoints. `script.executed` is written on every call and stores the full request and response, so it is only logged when [`verbose_event_logging`](../api-reference/admin/settings.md) is on. `script.error` is always logged. Script errors capture the full context needed to reproduce and debug the issue: the error message, the complete Lua script source, the input that triggered it, and the caller's DID.
 
 <Callout type="info">
-For query scripts (unauthenticated), `caller_did` and `input` are omitted from the detail since queries don't have an authenticated user or request body.
+For query scripts (unauthenticated), `caller_did` is omitted from the detail and `input` is replaced by `params`, since queries don't have an authenticated user or request body.
 </Callout>
 
 ### User events
@@ -60,6 +61,14 @@ The `user.bootstrapped` event is logged when the first user is auto-promoted to 
 
 Logged when a user attempts to access an endpoint they don't have permission for.
 
+### Space events
+
+| Event Type             | Severity | Subject       | Detail                                                        |
+| ---------------------- | -------- | ------------- | ------------------------------------------------------------- |
+| `space.moderator_read` | info     | Space AT URI  | `action`, `space_id`, `user_id`, and what was read (see below) |
+
+Logged when an admin reads a space's records or blobs through the [admin spaces API](../api-reference/admin/spaces.md). `action` is `list_records` or `get_blob`. A `list_records` event includes the `repo` and `collection` filters and the `uris` returned. A `get_blob` event includes the blob `cid` and the `repo` that references it. Listing spaces and viewing their metadata or members is not logged.
+
 ### API Key events
 
 | Event Type        | Severity | Subject | Detail                |
@@ -76,12 +85,12 @@ Logged when a user attempts to access an endpoint they don't have permission for
 
 ### Hook events
 
-| Event Type             | Severity | Subject    | Detail                |
-| ---------------------- | -------- | ---------- | --------------------- |
-| `script.executed`      | info     | Trigger ID | `trigger_id`          |
-| `script.dead_lettered` | error    | Trigger ID | `trigger_id`, `error` |
+| Event Type             | Severity | Subject                | Detail                                        |
+| ---------------------- | -------- | ---------------------- | --------------------------------------------- |
+| `script.executed`      | info     | Record or label AT URI | `host_kind`, `host_id`, `trigger`, `attempts` |
+| `script.dead_lettered` | error    | Record or label AT URI | `host_kind`, `host_id`, `trigger`, `error`    |
 
-Logged when [record/label scripts](./record-scripts.md) run. Dead-lettered events indicate a script failed all retry attempts. You can manage dead letters from the **Data > Dead Letters** page in the dashboard — see [Dead Letters](#dead-letters) below.
+Logged when [record/label scripts](./record-scripts.md) run. `script.executed` fires once per record or label that reaches a script, so it is only logged when [`verbose_event_logging`](../api-reference/admin/settings.md) is on. Dead-lettered events indicate a script failed all retry attempts. You can manage dead letters from the **Data > Dead Letters** page in the dashboard — see [Dead Letters](#dead-letters) below.
 
 ### Backfill events
 

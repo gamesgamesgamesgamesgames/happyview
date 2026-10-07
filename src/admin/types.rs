@@ -212,6 +212,8 @@ pub(crate) struct BackfillErrorCount {
 #[derive(Deserialize)]
 pub(super) struct AddNetworkLexiconBody {
     pub(super) nsid: String,
+    #[serde(default)]
+    pub(super) backfill: bool,
     pub(super) target_collection: Option<String>,
 }
 

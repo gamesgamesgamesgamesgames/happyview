@@ -27,6 +27,7 @@ import {
   IconLink,
   IconShieldLock,
   IconChartBar,
+  IconLock,
 } from "@tabler/icons-react";
 import Image from "next/image";
 import Link from "next/link";
@@ -63,6 +64,12 @@ type NavItem = {
 const dataItems: NavItem[] = [
   { title: "Lexicons", url: "/dashboard/lexicons", icon: IconFileDescription },
   { title: "Records", url: "/dashboard/records", icon: IconTable },
+  {
+    title: "Spaces",
+    url: "/dashboard/spaces",
+    icon: IconLock,
+    requiredPermissions: ["spaces:read"],
+  },
   { title: "Backfill", url: "/dashboard/backfill", icon: IconDatabase },
   {
     title: "Jobs",

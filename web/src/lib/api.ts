@@ -17,6 +17,11 @@ import type {
 } from "@/types/linked-repos";
 import type { UserSummary } from "@/types/users";
 import type { AdminListRecordsResponse } from "@/types/records";
+import type {
+  AdminListSpaceRecordsResponse,
+  AdminListSpacesResponse,
+  AdminSpaceDetail,
+} from "@/types/spaces";
 import type { EventsListResponse } from "@/types/events";
 import type { ScriptVariableSummary } from "@/types/script-variables";
 import type {
@@ -241,9 +246,15 @@ export function resolveNetworkLexicon(nsid: string, signal?: AbortSignal) {
 
 export function addNetworkLexicon(body: {
   nsid: string;
+  backfill?: boolean;
   target_collection?: string;
 }) {
-  return apiFetch<{ nsid: string; authority_did: string; revision: number }>(
+  return apiFetch<{
+    nsid: string;
+    authority_did: string;
+    revision: number;
+    backfill_job_id: string | null;
+  }>(
     "/admin/network-lexicons",
     { method: "POST", body: JSON.stringify(body) },
   );
@@ -584,6 +595,42 @@ export function deleteRecord(uri: string) {
   return apiFetch(`/admin/records?${new URLSearchParams({ uri })}`, {
     method: "DELETE",
   });
+}
+
+export function getAdminSpaces(limit?: number, cursor?: string) {
+  const params = new URLSearchParams();
+  if (limit) params.set("limit", String(limit));
+  if (cursor) params.set("cursor", cursor);
+  return apiFetch<AdminListSpacesResponse>(`/admin/spaces?${params}`);
+}
+
+export function getAdminSpace(id: string) {
+  return apiFetch<AdminSpaceDetail>(`/admin/spaces/${encodeURIComponent(id)}`);
+}
+
+/** Reading a space's records is written to the event log. */
+export function getAdminSpaceRecords(
+  id: string,
+  options: {
+    repo?: string;
+    collection?: string;
+    limit?: number;
+    cursor?: string;
+  } = {},
+) {
+  const params = new URLSearchParams();
+  if (options.repo) params.set("repo", options.repo);
+  if (options.collection) params.set("collection", options.collection);
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.cursor) params.set("cursor", options.cursor);
+  return apiFetch<AdminListSpaceRecordsResponse>(
+    `/admin/spaces/${encodeURIComponent(id)}/records?${params}`,
+  );
+}
+
+/** Opening this URL is written to the event log. */
+export function adminSpaceBlobUrl(id: string, cid: string) {
+  return `${BASE_PATH}/admin/spaces/${encodeURIComponent(id)}/blob?${new URLSearchParams({ cid })}`;
 }
 
 export function deleteCollectionRecords(collection: string) {

@@ -12,12 +12,11 @@ use uuid::Uuid;
 
 use common::app::TestApp;
 
-const AUTHORITY: &str = "did:plc:listrepos-authority";
-const MEMBER: &str = "did:plc:listrepos-member";
-const OUTSIDER: &str = "did:plc:listrepos-outsider";
+const AUTHORITY: &str = "did:plc:listmembers-authority";
+const MEMBER: &str = "did:plc:listmembers-member";
 
 fn space_uri(skey: &str) -> String {
-    format!("at://{AUTHORITY}/space/com.example.listrepos/{skey}")
+    format!("at://{AUTHORITY}/space/com.example.listmembers/{skey}")
 }
 
 async fn enable_spaces(app: &TestApp) {
@@ -41,7 +40,6 @@ async fn enable_spaces(app: &TestApp) {
     );
 }
 
-/// Create a space with the given skey and `membership_public`. Returns its id.
 async fn create_space(app: &TestApp, skey: &str, membership_public: bool) -> String {
     let now = now_rfc3339();
     let id = Uuid::new_v4().to_string();
@@ -50,7 +48,7 @@ async fn create_space(app: &TestApp, skey: &str, membership_public: bool) -> Str
         did: AUTHORITY.to_string(),
         authority_did: AUTHORITY.to_string(),
         creator_did: AUTHORITY.to_string(),
-        type_nsid: "com.example.listrepos".to_string(),
+        type_nsid: "com.example.listmembers".to_string(),
         skey: skey.to_string(),
         display_name: None,
         description: None,
@@ -79,7 +77,11 @@ async fn add_member(app: &TestApp, space_id: &str, did: &str) {
             id: Uuid::new_v4().to_string(),
             space_id: space_id.to_string(),
             did: did.to_string(),
-            access: MemberAccess::READ,
+            access: if did == AUTHORITY {
+                MemberAccess::WRITE
+            } else {
+                MemberAccess::READ
+            },
             is_delegation: false,
             granted_by: Some(AUTHORITY.to_string()),
             created_at: now_rfc3339(),
@@ -93,9 +95,9 @@ fn cookie_for(app: &TestApp, did: &str) -> (HeaderName, HeaderValue) {
     common::auth::admin_cookie_header(did, &app.state.cookie_key)
 }
 
-fn list_repos_req(skey: &str, cookie: Option<(HeaderName, HeaderValue)>) -> Request<Body> {
+fn list_members_req(skey: &str, cookie: Option<(HeaderName, HeaderValue)>) -> Request<Body> {
     let mut b = Request::builder().method("GET").uri(format!(
-        "/xrpc/com.atproto.space.listRepos?space={}",
+        "/xrpc/com.atproto.simplespace.listMembers?space={}",
         urlencoding::encode(&space_uri(skey))
     ));
     if let Some((name, value)) = cookie {
@@ -104,48 +106,51 @@ fn list_repos_req(skey: &str, cookie: Option<(HeaderName, HeaderValue)>) -> Requ
     b.body(Body::empty()).unwrap()
 }
 
-/// A private space must not leak its participant list to an authenticated
-/// non-member. Before the fix this returned 200.
+/// A private space must not leak its participant list to a credentialed
+// non-owner member.
 #[tokio::test]
 #[serial]
-async fn list_repos_private_rejects_non_member() {
+async fn list_members_private_rejects_non_owner_member() {
     common::require_db!();
     let app = TestApp::new().await;
     enable_spaces(&app).await;
-    create_space(&app, "priv", false).await;
-
-    let resp = app
-        .router
-        .clone()
-        .oneshot(list_repos_req("priv", Some(cookie_for(&app, OUTSIDER))))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-}
-
-/// A member of the private space can list its repos.
-#[tokio::test]
-#[serial]
-async fn list_repos_private_allows_member() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    enable_spaces(&app).await;
-    let id = create_space(&app, "priv2", false).await;
+    let id = create_space(&app, "priv", false).await;
+    add_member(&app, &id, AUTHORITY).await;
     add_member(&app, &id, MEMBER).await;
 
     let resp = app
         .router
         .clone()
-        .oneshot(list_repos_req("priv2", Some(cookie_for(&app, MEMBER))))
+        .oneshot(list_members_req("priv", Some(cookie_for(&app, MEMBER))))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// The space authority can list members (host-internal mint policy).
+#[tokio::test]
+#[serial]
+async fn list_members_private_allows_owner() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_spaces(&app).await;
+    let id = create_space(&app, "priv2", false).await;
+    add_member(&app, &id, AUTHORITY).await;
+    add_member(&app, &id, MEMBER).await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(list_members_req("priv2", Some(cookie_for(&app, AUTHORITY))))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-/// Outsiders cannot list repos even when membership is public on the space.
+/// Outsiders cannot list members even when membership is public on the space.
 #[tokio::test]
 #[serial]
-async fn list_repos_public_rejects_anonymous() {
+async fn list_members_public_rejects_anonymous() {
     common::require_db!();
     let app = TestApp::new().await;
     enable_spaces(&app).await;
@@ -154,7 +159,7 @@ async fn list_repos_public_rejects_anonymous() {
     let resp = app
         .router
         .clone()
-        .oneshot(list_repos_req("pub", None))
+        .oneshot(list_members_req("pub", None))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);

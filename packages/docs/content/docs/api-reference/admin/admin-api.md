@@ -52,6 +52,7 @@ AUTH="Authorization: Bearer $TOKEN"
 | [Users](users.md) | Create, list, update, and delete admin users |
 | [Labelers](labelers.md) | Manage external labeler subscriptions |
 | [Records](records.md) | List and delete indexed records |
+| [Spaces](spaces.md) | Browse spaces and their records for moderation |
 | [Instance Settings](settings.md) | Configure app name, logo, policy URLs, and concurrency settings |
 | [Domains](domains.md) | Manage domains and their OAuth client identities |
 | [OAuth Keys](oauth-keys.md) | Rotate and revoke the instance's OAuth client-assertion signing key |
@@ -116,6 +117,10 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/records/collections`         | `records:read`             |
 | `DELETE /admin/records`                  | `records:delete`           |
 | `DELETE /admin/records/collection`       | `records:delete-collection`|
+| `GET /admin/spaces`                      | `spaces:read`              |
+| `GET /admin/spaces/{id}`                 | `spaces:read`              |
+| `GET /admin/spaces/{id}/records`         | `spaces:manage-records`    |
+| `GET /admin/spaces/{id}/blob`            | `spaces:manage-records`    |
 | `GET /admin/database/status`             | `settings:manage`          |
 | `POST /admin/database/vacuum/schedule`   | `settings:manage`          |
 | `DELETE /admin/database/vacuum/schedule` | `settings:manage`          |
