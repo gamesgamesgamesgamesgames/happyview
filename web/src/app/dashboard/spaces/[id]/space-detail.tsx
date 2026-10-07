@@ -229,10 +229,10 @@ function SpaceDetailContent() {
               <span className="font-mono text-xs">{space.type}</span>
             </Field>
             <Field label="Creator">
-              <AccountName did={space.creator_did} showDid />
+              <AccountName did={space.creator_did} />
             </Field>
             <Field label="Authority">
-              <AccountName did={space.authority_did} showDid />
+              <AccountName did={space.authority_did} />
             </Field>
             <Field label="Created">
               {new Date(space.created_at).toLocaleString()}
@@ -278,7 +278,7 @@ function SpaceDetailContent() {
                             href={`/dashboard/spaces/account/?did=${encodeURIComponent(member.did)}`}
                             className="underline underline-offset-2"
                           >
-                            <AccountName did={member.did} showDid />
+                            <AccountName did={member.did} />
                           </Link>
                         </TableCell>
                         <TableCell className="flex gap-1">
@@ -500,7 +500,7 @@ function SpaceDetailContent() {
                       </Field>
                     </div>
                     <Field label="Author">
-                      <AccountName did={viewRecord.did} showDid />
+                      <AccountName did={viewRecord.did} />
                     </Field>
                     <Field label="Collection">
                       <span className="font-mono text-xs">

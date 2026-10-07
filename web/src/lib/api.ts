@@ -475,8 +475,13 @@ export function addUser(body: {
   });
 }
 
-export function resolveIdentity(identifier: string) {
-  const qs = new URLSearchParams({ identifier }).toString();
+export function resolveIdentity(
+  identifier: string,
+  options: { profile?: boolean } = {},
+) {
+  const params = new URLSearchParams({ identifier });
+  if (options.profile) params.set("profile", "true");
+  const qs = params.toString();
   return apiFetch<ResolvedIdentity>(`/admin/identity/resolve?${qs}`);
 }
 

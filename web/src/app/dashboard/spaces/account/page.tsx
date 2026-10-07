@@ -121,7 +121,7 @@ function AccountView() {
         <Card>
           <CardHeader>
             <CardTitle>
-              <AccountName did={did} showDid />
+              <AccountName did={did} />
             </CardTitle>
             <CardDescription>Spaces this account belongs to or has written in.</CardDescription>
           </CardHeader>
