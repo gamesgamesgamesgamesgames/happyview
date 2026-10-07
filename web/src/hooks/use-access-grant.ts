@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useCallbackRef } from "@/hooks/use-callback-ref";
 import { listAccessGrants, revokeAccessGrant } from "@/lib/api";
@@ -28,16 +28,22 @@ export function useAccessGrant(
   } | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const matchRef = useCallbackRef(match);
+  // Bumped by every refresh and every local change. A refresh that resolves
+  // after a newer one, or after a grant was set locally, discards its result.
+  const generation = useRef(0);
 
   const refresh = useCallback(async () => {
     if (!enabled) return;
+    const current = ++generation.current;
     try {
       const { grants } = await listAccessGrants(true);
+      if (current !== generation.current) return;
       const matching = grants
         .filter((g) => matchRef(g))
         .sort((a, b) => Date.parse(b.expires_at) - Date.parse(a.expires_at));
       setFound({ key: targetKey, grant: matching[0] ?? null });
     } catch (e) {
+      if (current !== generation.current) return;
       setFound({ key: targetKey, grant: null });
       toastError("Couldn't load access grants", e);
     } finally {
@@ -71,6 +77,7 @@ export function useAccessGrant(
 
   const setGrant = useCallback(
     (next: AccessGrant | null) => {
+      generation.current += 1;
       setFound({ key: targetKey, grant: next });
       setNow(Date.now());
     },
@@ -80,15 +87,16 @@ export function useAccessGrant(
   const end = useCallback(async () => {
     if (!grant) return;
     await revokeAccessGrant(grant.id);
+    generation.current += 1;
     setFound({ key: targetKey, grant: null });
     // Another grant may still cover the page.
     await refresh();
   }, [grant, refresh, targetKey]);
 
-  const drop = useCallback(
-    () => setFound({ key: targetKey, grant: null }),
-    [targetKey],
-  );
+  const drop = useCallback(() => {
+    generation.current += 1;
+    setFound({ key: targetKey, grant: null });
+  }, [targetKey]);
 
   return { grant, setGrant, remainingMs, refresh, end, drop };
 }
