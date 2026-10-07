@@ -24,6 +24,9 @@ use super::permissions::Permission;
 pub const MAX_GRANT_SETTING: &str = "space_inspector_max_grant_minutes";
 pub const DEFAULT_GRANT_MINUTES: i64 = 60;
 pub const MIN_GRANT_MINUTES: i64 = 5;
+/// The longest grant the instance can be configured for: one year. Keeps the
+/// expiry inside what date arithmetic can represent.
+pub const MAX_GRANT_MINUTES: i64 = 365 * 24 * 60;
 pub const MAX_REASON_CHARS: usize = 2000;
 
 pub struct InspectorConfig {
@@ -32,11 +35,11 @@ pub struct InspectorConfig {
 }
 
 /// The instance's maximum grant length. Unparseable values fall back to the
-/// default; anything below the minimum is raised to it.
+/// default, and the result is kept between the minimum and one year.
 pub fn parse_max_minutes(raw: Option<&str>) -> i64 {
     raw.and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(DEFAULT_GRANT_MINUTES)
-        .max(MIN_GRANT_MINUTES)
+        .clamp(MIN_GRANT_MINUTES, MAX_GRANT_MINUTES)
 }
 
 pub async fn load_config(pool: &AnyPool, backend: DatabaseBackend) -> InspectorConfig {
@@ -353,7 +356,7 @@ async fn mark_revoked<'e, E>(
     id: &str,
     revoked_by: &str,
     at: &str,
-) -> Result<(), AppError>
+) -> Result<bool, AppError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Any>,
 {
@@ -361,14 +364,15 @@ where
         "UPDATE happyview_space_access_grants SET revoked_at = ?, revoked_by = ? WHERE id = ? AND revoked_at IS NULL",
         backend,
     );
-    crate::db::query(&sql)
+    let result = crate::db::query(&sql)
         .bind(at)
         .bind(revoked_by)
         .bind(id)
         .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to revoke access grant: {e}")))?;
-    Ok(())
+    // Zero rows means another request revoked it first.
+    Ok(result.rows_affected() > 0)
 }
 
 async fn begin(state: &AppState) -> Result<sqlx::Transaction<'static, sqlx::Any>, AppError> {
@@ -543,7 +547,15 @@ pub(super) async fn revoke_grant(
 
     let at = now_rfc3339();
     let mut tx = begin(&state).await?;
-    mark_revoked(&mut *tx, state.db_backend, &grant.id, &auth.user_id, &at).await?;
+    if !mark_revoked(&mut *tx, state.db_backend, &grant.id, &auth.user_id, &at).await? {
+        // A concurrent request revoked it and wrote the event; return its
+        // result rather than record a second revocation.
+        drop(tx);
+        let current = get_grant(&state.db, state.db_backend, &grant.id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Access grant not found".into()))?;
+        return Ok(Json(current));
+    }
     write_event(&mut *tx, &event, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to record the revocation: {e}")))?;
@@ -643,6 +655,18 @@ mod tests {
         assert_eq!(parse_max_minutes(Some("-10")), 5);
         assert_eq!(parse_max_minutes(Some(" 90 ")), 90);
         assert_eq!(parse_max_minutes(Some("100000")), 100000);
+        assert_eq!(
+            parse_max_minutes(Some("9223372036854775807")),
+            MAX_GRANT_MINUTES
+        );
+        assert_eq!(
+            clamp_duration(
+                Some(i64::MAX),
+                parse_max_minutes(Some("9223372036854775807"))
+            ),
+            MAX_GRANT_MINUTES,
+            "a huge setting can't overflow the expiry"
+        );
     }
 
     #[test]
