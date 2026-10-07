@@ -555,6 +555,8 @@ mod tests {
             default_rate_limit_refill_rate: 2.0,
             telemetry_collector_url: String::new(),
             plugin_cache_dir: None,
+            platform_api_key_hash: None,
+            job_worker_concurrency: 1,
         };
         let (collections_tx, _) = watch::channel(vec![]);
         let (labeler_subscriptions_tx, _) = watch::channel(());

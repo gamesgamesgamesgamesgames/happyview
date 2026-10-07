@@ -1006,12 +1006,7 @@ async fn main() {
 
     // Resume interrupted jobs and start the job worker
     happyview::jobs::worker::resume_interrupted_jobs(&state).await;
-    {
-        let job_state = state.clone();
-        tokio::spawn(async move {
-            happyview::jobs::worker::run_worker(job_state).await;
-        });
-    }
+    happyview::jobs::worker::spawn_workers(state.clone(), state.config.job_worker_concurrency);
 
     {
         let state = state.clone();
