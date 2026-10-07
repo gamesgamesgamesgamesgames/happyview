@@ -40,6 +40,7 @@ export default defineConfig({
         "record-delete.spec.ts",
         "proxy-config.spec.ts",
         "spaces.spec.ts",
+        "space-inspector.spec.ts",
         "jobs.spec.ts",
         "linked-repos.spec.ts",
         "link-invite-pages.spec.ts",
