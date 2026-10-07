@@ -69,6 +69,7 @@ services:
     volumes:
       - ./scripts/tunnel.sh:/scripts/tunnel.sh:ro
       - tunnel-url:/shared
+      - ./.cloudflared:/etc/cloudflared:ro
     environment:
       CLOUDFLARE_TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
       TUNNEL_HOSTNAME: ${TUNNEL_HOSTNAME:-}

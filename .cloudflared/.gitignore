@@ -1,0 +1,4 @@
+# Tunnel credentials are per-person secrets; only this file is tracked, so the
+# directory exists for the tunnel service's bind mount.
+*
+!.gitignore
