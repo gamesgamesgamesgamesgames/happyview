@@ -100,4 +100,20 @@ test.describe("Space inspector", () => {
     await page.getByRole("dialog").getByRole("button", { name: "Grant access" }).click();
     await expect(page.getByText(`Access to ${creatorDid}`)).toBeVisible();
   });
+
+  test("a grant's event lists the reads made under it", async ({ page }) => {
+    await setSetting("feature.space_inspector_enabled", "true");
+    const { uri, id } = await createSpace(page);
+    spaceUri = uri;
+    await page.goto(`/dashboard/spaces/${encodeURIComponent(id)}/`);
+    await page.getByRole("button", { name: "Request access" }).click();
+    await page.getByRole("dialog").getByLabel("Reason").fill("Report #3");
+    await page.getByRole("dialog").getByRole("button", { name: "Grant access" }).click();
+    await expect(page.getByText("No records match.")).toBeVisible();
+
+    await page.goto("/dashboard/events/");
+    await page.getByText("space.access_granted").first().click();
+    await expect(page.getByText("Reads under this grant")).toBeVisible();
+    await expect(page.getByText("list_records")).toBeVisible();
+  });
 });

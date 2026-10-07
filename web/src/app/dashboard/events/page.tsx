@@ -9,7 +9,7 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 
-import { getEvents, type EventLogEntry } from "@/lib/api";
+import { getEvents, getGrantReads, type EventLogEntry } from "@/lib/api";
 import { DataTable } from "@/components/data-table/data-table";
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header";
 import { DataTableToolbar } from "@/components/data-table/data-table-toolbar";
@@ -68,7 +68,62 @@ const KNOWN_KEYS = [
   "response_size",
   "message",
   "level",
+  "grant_id",
+  "reason",
+  "uris",
 ] as const;
+
+function GrantReads({ grantId }: { grantId: string }) {
+  const [reads, setReads] = useState<EventLogEntry[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getGrantReads(grantId)
+      .then((r) => {
+        if (!cancelled) setReads(r.events);
+      })
+      .catch(() => {
+        if (!cancelled) setReads([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [grantId]);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <span className="text-muted-foreground text-sm">Reads under this grant</span>
+      {reads === null ? (
+        <p className="text-muted-foreground text-xs">Loading…</p>
+      ) : reads.length === 0 ? (
+        <p className="text-muted-foreground text-xs">Nothing was read.</p>
+      ) : (
+        <ul className="flex flex-col gap-2">
+          {reads.map((r) => (
+            <li key={r.id} className="rounded border p-2 text-xs">
+              <div className="flex justify-between gap-2">
+                <span className="font-mono">{String(r.detail.action)}</span>
+                <span className="text-muted-foreground">
+                  {new Date(r.created_at).toLocaleString()}
+                </span>
+              </div>
+              {Array.isArray(r.detail.uris) && (
+                <ul className="mt-1 font-mono break-all">
+                  {(r.detail.uris as string[]).map((u) => (
+                    <li key={u}>{u}</li>
+                  ))}
+                </ul>
+              )}
+              {typeof r.detail.cid === "string" && (
+                <p className="mt-1 font-mono break-all">blob {r.detail.cid}</p>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 function EventDetailBody({ event }: { event: EventLogEntry }) {
   const d = event.detail;
@@ -129,6 +184,25 @@ function EventDetailBody({ event }: { event: EventLogEntry }) {
           </div>
         )}
       </div>
+
+      {/* Access grant */}
+      {event.event_type === "space.access_granted" &&
+        typeof d.grant_id === "string" && (
+          <>
+            <div>
+              <span className="text-muted-foreground text-sm">Reason</span>
+              <p className="text-sm break-words">{String(d.reason)}</p>
+            </div>
+            <GrantReads grantId={d.grant_id} />
+          </>
+        )}
+      {event.event_type === "space.moderator_read" &&
+        typeof d.grant_id === "string" && (
+          <div>
+            <span className="text-muted-foreground text-sm">Grant</span>
+            <p className="font-mono text-xs">{d.grant_id}</p>
+          </div>
+        )}
 
       {/* Plugin log message */}
       {d.message != null && (
