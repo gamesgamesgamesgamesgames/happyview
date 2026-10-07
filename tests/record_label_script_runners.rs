@@ -590,6 +590,10 @@ async fn a_successful_record_run_is_logged_with_its_attempt_count() {
     require_fixture!();
     let app = app().await;
     seed_script(&app, &format!("record.create:{NSID}"), "value:other").await;
+    // `script.executed` is only written while verbose event logging is on.
+    app.state
+        .verbose_event_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     run_record_event_script(&app.state, record_payload("create")).await;
 
@@ -614,6 +618,10 @@ async fn a_successful_label_run_is_logged_with_its_attempt_count() {
     require_fixture!();
     let app = app().await;
     seed_script(&app, "labeler.apply:app.bsky.feed.post", "value:other").await;
+    // `script.executed` is only written while verbose event logging is on.
+    app.state
+        .verbose_event_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     run_label_applied_script(&app.state, label_event()).await;
 
