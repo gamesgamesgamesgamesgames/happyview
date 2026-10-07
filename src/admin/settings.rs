@@ -10,7 +10,7 @@ use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{
     DEFAULT_PROTECTED_RETENTION_DAYS, DEFAULT_RETENTION_DAYS, EventLog,
-    SPACE_ACCESS_RETENTION_SETTING, Severity, log_event,
+    SPACE_ACCESS_RETENTION_SETTING, Severity, log_event, write_event,
 };
 
 use super::auth::UserAuth;
@@ -47,25 +47,24 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ("verbose_event_logging", "VERBOSE_EVENT_LOGGING"),
 ];
 
-/// Settings whose changes are written as protected events: turning the space
+/// The protected event for an audited setting change: turning the space
 /// inspector on or off, and changing how long event logs are kept.
 ///
 /// Compares effective values, env fallback included, so a save that rewrites
 /// an unchanged value logs nothing.
-async fn log_audited_setting_change(
-    state: &AppState,
+fn audited_setting_event(
     auth: &UserAuth,
     key: &str,
-    before: Option<String>,
-    after: Option<String>,
-) {
+    before: &Option<String>,
+    after: &Option<String>,
+) -> Option<EventLog> {
     let event = match key {
         crate::feature_flags::FeatureFlag::SPACE_INSPECTOR => {
             let on = |v: &Option<String>| {
                 v.as_deref()
                     .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
             };
-            match (on(&before), on(&after)) {
+            match (on(before), on(after)) {
                 (false, true) => Some(("space_inspector.enabled", serde_json::json!({}))),
                 (true, false) => Some(("space_inspector.disabled", serde_json::json!({}))),
                 _ => None,
@@ -85,7 +84,7 @@ async fn log_audited_setting_change(
                         .unwrap_or(DEFAULT_RETENTION_DAYS)
                 }
             };
-            let (from, to) = (effective(&before), effective(&after));
+            let (from, to) = (effective(before), effective(after));
             (from != to).then(|| {
                 (
                     "event_logs.retention_changed",
@@ -95,20 +94,51 @@ async fn log_audited_setting_change(
         }
         _ => None,
     };
-    if let Some((event_type, detail)) = event {
-        log_event(
-            &state.db,
-            EventLog {
-                event_type: event_type.to_string(),
-                severity: Severity::Warn,
-                actor_did: Some(auth.did.clone()),
-                subject: Some(key.to_string()),
-                detail,
-            },
-            state.db_backend,
-        )
-        .await;
+    event.map(|(event_type, detail)| EventLog {
+        event_type: event_type.to_string(),
+        severity: Severity::Warn,
+        actor_did: Some(auth.did.clone()),
+        subject: Some(key.to_string()),
+        detail,
+    })
+}
+
+/// The env var value a key falls back to when it has no database row.
+fn env_fallback(key: &str) -> Option<String> {
+    ENV_FALLBACKS
+        .iter()
+        .find(|(setting_key, _)| *setting_key == key)
+        .and_then(|(_, env_var)| env::var(env_var).ok())
+}
+
+/// Write a setting change and its audit event together, so an audited setting
+/// never changes without its protected record.
+async fn write_audited<'q>(
+    state: &AppState,
+    change: sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments>,
+    event: Option<EventLog>,
+) -> Result<u64, AppError> {
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let affected = change
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to write setting: {e}")))?
+        .rows_affected();
+    if affected > 0
+        && let Some(event) = &event
+    {
+        write_event(&mut *tx, event, state.db_backend)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to record the setting change: {e}")))?;
     }
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit setting: {e}")))?;
+    Ok(affected)
 }
 
 /// Resolve a setting value: check the DB first, then fall back to env var.
@@ -202,15 +232,14 @@ pub(super) async fn upsert(
         "#,
         backend,
     );
-    crate::db::query(&sql)
+    let change = crate::db::query(&sql)
         .bind(&key)
         .bind(&body.value)
         .bind(&now)
         .bind(&body.value)
-        .bind(&now)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to upsert setting: {e}")))?;
+        .bind(&now);
+    let event = audited_setting_event(&auth, &key, &before, &Some(body.value.clone()));
+    write_audited(&state, change, event).await?;
 
     log_event(
         &state.db,
@@ -224,9 +253,6 @@ pub(super) async fn upsert(
         state.db_backend,
     )
     .await;
-
-    let after = get_setting(&state.db, &key, backend).await;
-    log_audited_setting_change(&state, &auth, &key, before, after).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -245,13 +271,9 @@ pub(super) async fn delete(
         "DELETE FROM happyview_instance_settings WHERE key = ?",
         backend,
     );
-    let result = crate::db::query(&sql)
-        .bind(&key)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to delete setting: {e}")))?;
-
-    if result.rows_affected() == 0 {
+    let change = crate::db::query(&sql).bind(&key);
+    let event = audited_setting_event(&auth, &key, &before, &env_fallback(&key));
+    if write_audited(&state, change, event).await? == 0 {
         return Err(AppError::NotFound(format!("setting '{key}' not found")));
     }
 
@@ -267,9 +289,6 @@ pub(super) async fn delete(
         state.db_backend,
     )
     .await;
-
-    let after = get_setting(&state.db, &key, backend).await;
-    log_audited_setting_change(&state, &auth, &key, before, after).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

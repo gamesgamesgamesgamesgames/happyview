@@ -569,3 +569,30 @@ async fn active_listing_keeps_an_old_grant_past_newer_ones() {
         .collect();
     assert_eq!(ids, vec![old["id"].as_str().unwrap()]);
 }
+
+#[tokio::test]
+#[serial]
+async fn the_inspector_stays_off_when_its_audit_event_cannot_be_written() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    rename_events_table(&app, "happyview_event_logs", "happyview_event_logs_hidden").await;
+    let resp = send(
+        &app,
+        "PUT",
+        "/admin/settings/feature.space_inspector_enabled",
+        Some(json!({ "value": "true" })),
+    )
+    .await;
+    let status = resp.status();
+    let enabled = happyview::feature_flags::is_enabled(
+        &app.state.db,
+        happyview::feature_flags::FeatureFlag::SPACE_INSPECTOR,
+        app.state.db_backend,
+    )
+    .await;
+    rename_events_table(&app, "happyview_event_logs_hidden", "happyview_event_logs").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!enabled, "the setting rolls back with its audit event");
+}
