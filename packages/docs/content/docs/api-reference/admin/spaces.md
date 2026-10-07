@@ -4,7 +4,7 @@ title: "Spaces"
 
 Browse the [spaces](../../experimental/spaces/index.md) on this instance for moderation. These endpoints give operators access to spaces they are not members of, so they live in the admin API rather than the space XRPC API.
 
-Every route on this page except [Space inspector status](#space-inspector-status) returns `403 SpaceInspectorDisabled` while the space inspector is off (see [Configuration](../../getting-started/configuration.md)). Listing spaces and reading their metadata requires `spaces:read`. Reading a space's records or blobs also requires `spaces:inspect` and an active [access grant](#access-grants) covering the request. Every grant, its revocation, and every read made under it is written to the [event log](../../guides/event-logs.md#space-events) as a protected event that can't be purged by hand.
+Every route on this page except [Space inspector status](#space-inspector-status) returns `403 SpaceInspectorDisabled` while the space inspector is off (see [Configuration](../../getting-started/configuration.md)). Listing spaces and reading their metadata requires `spaces:read`. Reading a space's records or blobs also requires `spaces:inspect` and an active [access grant](#access-grants) covering the request. Every grant, its revocation, and every read made under it is written to the [event log](../../guides/event-logs.md#space-events) as a protected event that can't be purged by hand. The grant or revocation and its event are written together, and content is returned only after its read event is written: if the event can't be written, the request fails with `500` and nothing changes or is returned.
 
 ```sh tab="cURL" tab-group="language"
 # All examples assume $TOKEN is an API key (hv_...)
@@ -132,7 +132,12 @@ curl -X DELETE http://127.0.0.1:3000/admin/spaces/access-grants/6f1ecb2a-... -H 
 GET /admin/spaces/access-grants/{id}/reads
 ```
 
-The `space.moderator_read` events logged under a grant, oldest first. Requires `events:read`.
+The `space.moderator_read` events logged under a grant, oldest first, a page at a time. Requires `events:read`.
+
+| Param    | Type   | Required | Description                                 |
+| -------- | ------ | -------- | ------------------------------------------- |
+| `limit`  | number | no       | Max results per page (default 100, max 500) |
+| `cursor` | string | no       | Pagination cursor from a previous response  |
 
 ```sh tab="cURL" tab-group="language"
 curl http://127.0.0.1:3000/admin/spaces/access-grants/6f1ecb2a-.../reads -H "$AUTH"
@@ -152,9 +157,12 @@ curl http://127.0.0.1:3000/admin/spaces/access-grants/6f1ecb2a-.../reads -H "$AU
       "detail": { "action": "list_records", "grant_id": "6f1ecb2a-...", "scope": "space", "...": "..." },
       "created_at": "2026-01-01T00:05:00Z"
     }
-  ]
+  ],
+  "cursor": "..."
 }
 ```
+
+`cursor` is omitted when there are no more reads.
 
 ## List spaces
 
