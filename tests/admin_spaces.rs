@@ -38,23 +38,6 @@ async fn get(app: &TestApp, uri: &str, key: Option<&str>) -> axum::response::Res
         .unwrap()
 }
 
-/// Mint an API key for the test admin limited to `permissions`.
-async fn api_key(app: &TestApp, permissions: &[&str]) -> String {
-    let (name, value) = app.admin_cookie();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/api-keys")
-        .header(name, value)
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({ "name": "moderator", "permissions": permissions }).to_string(),
-        ))
-        .unwrap();
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    json_body(resp).await["key"].as_str().unwrap().to_string()
-}
-
 /// A space the test admin neither created nor belongs to, holding one record.
 async fn seed_space(app: &TestApp) -> String {
     let now = now_rfc3339();
@@ -163,7 +146,7 @@ async fn spaces_read_does_not_grant_record_access() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
-    let key = api_key(&app, &["spaces:read"]).await;
+    let key = common::api_key(&app, &["spaces:read"]).await;
 
     let resp = get(&app, &format!("/admin/spaces/{id}"), Some(&key)).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -186,7 +169,7 @@ async fn manage_records_reads_records_and_logs_the_read() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
-    let key = api_key(&app, &["spaces:manage-records"]).await;
+    let key = common::api_key(&app, &["spaces:manage-records"]).await;
 
     let resp = get(
         &app,
