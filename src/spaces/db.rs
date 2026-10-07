@@ -791,7 +791,7 @@ pub async fn list_author_spaces(
     did: &str,
 ) -> Result<Vec<(Space, i64)>, AppError> {
     let sql = adapt_sql(
-        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE id IN (SELECT space_id FROM happyview_space_members WHERE did = ? UNION SELECT space_id FROM happyview_space_records WHERE author_did = ?) ORDER BY created_at DESC, id DESC",
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE id IN (SELECT space_id FROM happyview_space_members WHERE member_did = ? UNION SELECT space_id FROM happyview_space_records WHERE author_did = ?) ORDER BY created_at DESC, id DESC",
         backend,
     );
     let rows: Vec<SpaceRow> = crate::db::query_as(&sql)

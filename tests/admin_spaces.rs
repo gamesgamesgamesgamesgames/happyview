@@ -635,3 +635,45 @@ async fn grant_reads_lists_the_reads_made_under_a_grant() {
     assert_eq!(body["events"].as_array().unwrap().len(), 1);
     assert_eq!(body["events"][0]["detail"]["action"], "list_records");
 }
+
+#[tokio::test]
+#[serial]
+async fn account_spaces_include_membership_without_records() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    let lurker = "did:plc:adminspaces-lurker";
+    spaces_db::add_member(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceMember {
+            id: Uuid::new_v4().to_string(),
+            space_id: id.clone(),
+            did: lurker.to_string(),
+            access: MemberAccess::READ,
+            is_delegation: false,
+            granted_by: Some(CREATOR.to_string()),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let resp = get(&app, &format!("/admin/accounts/{lurker}/spaces"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let spaces = body["spaces"].as_array().unwrap();
+    assert_eq!(spaces.len(), 1);
+    assert_eq!(spaces[0]["space"]["id"], id);
+    assert_eq!(spaces[0]["record_count"], 0);
+
+    let resp = get(&app, &format!("/admin/accounts/{CREATOR}/spaces"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        json_body(resp).await["spaces"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the space's own DID is not a member and has no records in it"
+    );
+}
