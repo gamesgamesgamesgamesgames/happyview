@@ -4,6 +4,35 @@ import { loginAsTestAdmin } from "./auth-helper";
 
 const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
 
+async function getSetting(key: string): Promise<string | null> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const { rows } = await client.query(
+      "SELECT value FROM happyview_instance_settings WHERE key = $1",
+      [key],
+    );
+    return rows[0]?.value ?? null;
+  } finally {
+    await client.end();
+  }
+}
+
+// Ends every grant still active, so one test's grant can't unlock the next
+// test's space (every space here shares the test admin as creator).
+async function revokeOpenGrants() {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    await client.query(
+      "UPDATE happyview_space_access_grants SET revoked_at = $1 WHERE revoked_at IS NULL",
+      [new Date().toISOString()],
+    );
+  } finally {
+    await client.end();
+  }
+}
+
 async function setSetting(key: string, value: string | null) {
   const client = new pg.Client(DB_URL);
   await client.connect();
@@ -59,6 +88,15 @@ async function spaceIdFor(uri: string): Promise<string> {
 
 test.describe("Space inspector", () => {
   let spaceUri: string | null = null;
+  let spacesSetting: string | null = null;
+
+  test.beforeAll(async () => {
+    spacesSetting = await getSetting("feature.spaces_enabled");
+  });
+
+  test.afterAll(async () => {
+    await setSetting("feature.spaces_enabled", spacesSetting);
+  });
 
   test.beforeEach(async ({ page }) => {
     await setSetting("feature.spaces_enabled", "true");
@@ -67,6 +105,7 @@ test.describe("Space inspector", () => {
 
   test.afterEach(async ({ page }) => {
     await setSetting("feature.space_inspector_enabled", null);
+    await revokeOpenGrants();
     if (spaceUri) {
       await page.request.post("/xrpc/com.atproto.simplespace.deleteSpace", { data: { space: spaceUri } });
       spaceUri = null;
