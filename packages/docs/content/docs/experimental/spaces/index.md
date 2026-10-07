@@ -121,7 +121,7 @@ The `dev.happyview.space.*` aliases are deprecated and kept until v3. Most endpo
 
 A space's creator administers it: they update and delete the space and manage its members and invites.
 
-Instance operators can browse any space for moderation through the [admin spaces API](../../api-reference/admin/spaces.md) without being members. Each read of a space's contents is recorded in the event log.
+Instance operators can browse any space's metadata and members through the [admin spaces API](../../api-reference/admin/spaces.md) without being members. Reading a space's contents takes the [space inspector](#moderating-spaces) — a time-limited grant, logged to the event log.
 
 Two independent **policies** decide who can use the space. See [Policies](./managing-spaces.md#policies).
 
@@ -166,6 +166,25 @@ HappyView implements [atproto Proposal 0016](https://github.com/bluesky-social/p
 - **`displayName`, `description` on spaces**: human-readable metadata
 - **`config` object**: `membership_public`, plus arbitrary extra fields. `records_public` is deprecated and not enforced.
 - **`read_self` access**: limits a member's reads to their own records
+
+## Moderating spaces
+
+Spaces decide who can ask for data. They don't encrypt it. Anyone who can read
+HappyView's database can read every space it hosts, and that will hold for any
+server that hosts or indexes a space.
+
+HappyView's space inspector lets moderators read space contents from the
+dashboard while handling a report. It's off until an operator turns it on in
+**Settings → General**. With it on, a user with the `spaces:inspect`
+permission picks one space or one account, writes down why, and gets access
+for a limited time (an hour by default). The grant, the reason, and every
+record and blob opened under it go to the event log, where they can't be
+purged by hand.
+
+If you build an app on spaces, tell your users what "private" means in your
+app. If moderators can read private data, say so. If you promise they can't,
+you need end-to-end encryption on top of spaces; the inspector would then show
+only ciphertext.
 
 ## Next steps
 

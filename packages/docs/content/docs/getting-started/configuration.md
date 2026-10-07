@@ -21,6 +21,9 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `PLC_URL` | no | `https://plc.directory` | [PLC directory](https://github.com/did-method-plc/did-method-plc) URL for DID resolution |
 | `STATIC_DIR` | no | `./web/out` | Directory containing the built dashboard static assets |
 | `EVENT_LOG_RETENTION_DAYS` | no | `30` | Number of days to keep event logs before automatic cleanup. Set to `0` to disable cleanup |
+| `SPACE_INSPECTOR_ENABLED` | no | `false` | Lets users with `spaces:inspect` request time-limited access to read records and blobs in private [spaces](../experimental/spaces/index.md) from the dashboard. Maps to **Enable Space Inspector** under **Settings > General**. Overridden by database setting if set via admin API |
+| `SPACE_INSPECTOR_MAX_GRANT_MINUTES` | no | `60` | The longest an access grant can last. Requests default to 60 minutes or this value, whichever is shorter; unparseable values fall back to `60`, and anything below `5` is raised to `5`. Maps to **Maximum Access Length (minutes)** under **Settings > General**. Overridden by database setting if set via admin API |
+| `SPACE_ACCESS_LOG_RETENTION_DAYS` | no | `365` | Days to keep [protected events](../guides/event-logs.md#protected-events) — space access grants, the reads made under them, and inspector on/off switches — before cleanup. Set to `0` to keep them forever. Maps to **Space Access Log Retention (days)** under **Settings > General**. Overridden by database setting if set via admin API |
 | `TOKEN_ENCRYPTION_KEY` | no | --- | Base64-encoded 32-byte key for encrypting stored OAuth tokens. **Strongly recommended in production** |
 | `DEFAULT_RATE_LIMIT_CAPACITY` | no | `100` | Default token bucket capacity used when registering a new API client |
 | `DEFAULT_RATE_LIMIT_REFILL_RATE` | no | `2.0` | Default token bucket refill rate (tokens/second) for new API clients |
@@ -64,6 +67,9 @@ SESSION_SECRET=change-me-in-production
 # PLC_URL=https://plc.directory
 # STATIC_DIR=./web/out
 # EVENT_LOG_RETENTION_DAYS=30
+# SPACE_INSPECTOR_ENABLED=false
+# SPACE_INSPECTOR_MAX_GRANT_MINUTES=60
+# SPACE_ACCESS_LOG_RETENTION_DAYS=365
 # TOKEN_ENCRYPTION_KEY=base64-encoded-32-byte-key
 # DEFAULT_RATE_LIMIT_CAPACITY=100
 # DEFAULT_RATE_LIMIT_REFILL_RATE=2.0

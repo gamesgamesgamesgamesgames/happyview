@@ -6,7 +6,7 @@ HappyView uses a granular permission system to control access to the admin API. 
 
 ## Permission list
 
-HappyView defines 49 permissions organized by category:
+HappyView defines 51 permissions organized by category:
 
 ### Lexicons
 
@@ -113,6 +113,9 @@ HappyView defines 49 permissions organized by category:
 | `spaces:manage-invites`     | Create and revoke space invitations        |
 | `spaces:manage-records`     | Read and write records within spaces       |
 | `spaces:manage-credentials` | Issue and revoke space access credentials  |
+| `spaces:inspect`            | Request time-limited access to read records and blobs in private spaces |
+
+No template grants `spaces:inspect` except Full Access — it's assigned individually to the moderators who should be able to request access to a space or account's contents. See [Spaces — Moderating spaces](../experimental/spaces/index.md#moderating-spaces).
 
 ### Jobs
 
