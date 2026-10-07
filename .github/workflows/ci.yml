@@ -203,7 +203,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: gamesgamesgamesgamesgames/happyview-plugins
-          ref: next
+          ref: alpha
           path: plugins
 
       - name: Cache wasi-sdk
