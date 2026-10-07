@@ -482,3 +482,90 @@ async fn revoking_a_space_grant_logs_the_space_uri() {
     let revoked = events_of(&app, "space.access_revoked").await;
     assert_eq!(revoked[1].0.as_deref(), Some("deleted-space"));
 }
+
+async fn rename_events_table(app: &TestApp, from: &str, to: &str) {
+    happyview::db::query(&format!("ALTER TABLE {from} RENAME TO {to}"))
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+}
+
+async fn grant_count(app: &TestApp) -> i64 {
+    happyview::db::query_as::<(i64,)>("SELECT COUNT(*) FROM happyview_space_access_grants")
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap()
+        .0
+}
+
+#[tokio::test]
+#[serial]
+async fn a_grant_is_not_created_when_its_audit_event_cannot_be_written() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+
+    rename_events_table(&app, "happyview_event_logs", "happyview_event_logs_hidden").await;
+    let resp = create_grant(
+        &app,
+        json!({ "scope": "account", "target": "did:plc:abc", "reason": "report" }),
+    )
+    .await;
+    let status = resp.status();
+    let grants = grant_count(&app).await;
+    rename_events_table(&app, "happyview_event_logs_hidden", "happyview_event_logs").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(grants, 0, "the grant rolls back with its audit event");
+}
+
+#[tokio::test]
+#[serial]
+async fn active_listing_keeps_an_old_grant_past_newer_ones() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    let old = json_body(
+        create_grant(
+            &app,
+            json!({ "scope": "account", "target": "did:plc:old", "reason": "r", "duration_minutes": 60 }),
+        )
+        .await,
+    )
+    .await;
+
+    // 200 newer, already-expired grants for the same user.
+    let user_id: (String,) = happyview::db::query_as(&adapt_sql(
+        "SELECT user_id FROM happyview_space_access_grants WHERE id = ?",
+        app.state.db_backend,
+    ))
+    .bind(old["id"].as_str().unwrap())
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    let insert = adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at) VALUES (?, ?, 'did:plc:x', 'account', 'did:plc:newer', 'r', ?, ?)",
+        app.state.db_backend,
+    );
+    let now = chrono::Utc::now();
+    for i in 0..200 {
+        happyview::db::query(&insert)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&user_id.0)
+            .bind((now + chrono::Duration::seconds(i + 1)).to_rfc3339())
+            .bind((now - chrono::Duration::minutes(1)).to_rfc3339())
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
+
+    let list =
+        json_body(send(&app, "GET", "/admin/spaces/access-grants?active=true", None).await).await;
+    let ids: Vec<&str> = list["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![old["id"].as_str().unwrap()]);
+}

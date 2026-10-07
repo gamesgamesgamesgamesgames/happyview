@@ -15,7 +15,7 @@ use crate::AppState;
 use crate::admin::settings::get_setting;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339, parse_dt};
 use crate::error::AppError;
-use crate::event_log::{EventLog, Severity, log_event};
+use crate::event_log::{EventLog, Severity, write_event};
 use crate::feature_flags::{self, FeatureFlag};
 
 use super::auth::UserAuth;
@@ -175,7 +175,14 @@ fn parse_grant(r: GrantRow) -> Result<Grant, AppError> {
     })
 }
 
-async fn insert_grant(pool: &AnyPool, backend: DatabaseBackend, g: &Grant) -> Result<(), AppError> {
+async fn insert_grant<'e, E>(
+    executor: E,
+    backend: DatabaseBackend,
+    g: &Grant,
+) -> Result<(), AppError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
     let sql = adapt_sql(
         &format!(
             "INSERT INTO happyview_space_access_grants ({GRANT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -193,7 +200,7 @@ async fn insert_grant(pool: &AnyPool, backend: DatabaseBackend, g: &Grant) -> Re
         .bind(&g.expires_at)
         .bind(&g.revoked_at)
         .bind(&g.revoked_by)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to create access grant: {e}")))?;
     Ok(())
@@ -340,13 +347,16 @@ pub async fn require_grant(
         .ok_or_else(grant_required)
 }
 
-async fn mark_revoked(
-    pool: &AnyPool,
+async fn mark_revoked<'e, E>(
+    executor: E,
     backend: DatabaseBackend,
     id: &str,
     revoked_by: &str,
     at: &str,
-) -> Result<(), AppError> {
+) -> Result<(), AppError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
     let sql = adapt_sql(
         "UPDATE happyview_space_access_grants SET revoked_at = ?, revoked_by = ? WHERE id = ? AND revoked_at IS NULL",
         backend,
@@ -355,10 +365,24 @@ async fn mark_revoked(
         .bind(at)
         .bind(revoked_by)
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await
         .map_err(|e| AppError::Internal(format!("failed to revoke access grant: {e}")))?;
     Ok(())
+}
+
+async fn begin(state: &AppState) -> Result<sqlx::Transaction<'static, sqlx::Any>, AppError> {
+    state
+        .db
+        .begin()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))
+}
+
+async fn commit(tx: sqlx::Transaction<'static, sqlx::Any>) -> Result<(), AppError> {
+    tx.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to commit transaction: {e}")))
 }
 
 fn grant_subject(grant: &Grant, space: Option<&crate::spaces::types::Space>) -> String {
@@ -417,27 +441,29 @@ pub(super) async fn create_grant(
         revoked_at: None,
         revoked_by: None,
     };
-    insert_grant(&state.db, state.db_backend, &grant).await?;
+    let event = EventLog {
+        event_type: "space.access_granted".to_string(),
+        severity: Severity::Info,
+        actor_did: Some(auth.did.clone()),
+        subject: Some(grant_subject(&grant, space.as_ref())),
+        detail: serde_json::json!({
+            "grant_id": grant.id,
+            "scope": grant.scope.as_str(),
+            "target": grant.target,
+            "reason": grant.reason,
+            "expires_at": grant.expires_at,
+            "user_id": grant.user_id,
+        }),
+    };
 
-    log_event(
-        &state.db,
-        EventLog {
-            event_type: "space.access_granted".to_string(),
-            severity: Severity::Info,
-            actor_did: Some(auth.did.clone()),
-            subject: Some(grant_subject(&grant, space.as_ref())),
-            detail: serde_json::json!({
-                "grant_id": grant.id,
-                "scope": grant.scope.as_str(),
-                "target": grant.target,
-                "reason": grant.reason,
-                "expires_at": grant.expires_at,
-                "user_id": grant.user_id,
-            }),
-        },
-        state.db_backend,
-    )
-    .await;
+    // The grant and the event recording its reason commit together: a grant
+    // with no audit record must not exist.
+    let mut tx = begin(&state).await?;
+    insert_grant(&mut *tx, state.db_backend, &grant).await?;
+    write_event(&mut *tx, &event, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to record the access grant: {e}")))?;
+    commit(tx).await?;
 
     Ok((StatusCode::CREATED, Json(grant)))
 }
@@ -454,12 +480,21 @@ pub(super) async fn list_grants(
     Query(params): Query<ListGrantsParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::SpacesInspect).await?;
-    let now = chrono::Utc::now();
-    let grants: Vec<Grant> = list_user_grants(&state.db, state.db_backend, &auth.user_id)
-        .await?
-        .into_iter()
-        .filter(|g| !params.active.unwrap_or(false) || g.is_active(now))
-        .collect();
+    let grants: Vec<Grant> = if params.active.unwrap_or(false) {
+        // Active grants come from the uncapped query, so an older long-lived
+        // grant is never pushed out of the list by newer ones.
+        let now = chrono::Utc::now();
+        let mut active: Vec<Grant> =
+            unexpired_user_grants(&state.db, state.db_backend, &auth.user_id, now)
+                .await?
+                .into_iter()
+                .filter(|g| g.is_active(now))
+                .collect();
+        active.sort_by_key(|g| std::cmp::Reverse(parse_dt(&g.created_at)));
+        active
+    } else {
+        list_user_grants(&state.db, state.db_backend, &auth.user_id).await?
+    };
     Ok(Json(serde_json::json!({ "grants": grants })))
 }
 
@@ -483,8 +518,6 @@ pub(super) async fn revoke_grant(
         return Ok(Json(grant));
     }
 
-    let at = now_rfc3339();
-    mark_revoked(&state.db, state.db_backend, &grant.id, &auth.user_id, &at).await?;
     // The space may have been deleted since the grant was made; the subject
     // then falls back to the raw target.
     let space = match grant.scope {
@@ -496,22 +529,25 @@ pub(super) async fn revoke_grant(
         }
         GrantScope::Account => None,
     };
-    log_event(
-        &state.db,
-        EventLog {
-            event_type: "space.access_revoked".to_string(),
-            severity: Severity::Info,
-            actor_did: Some(auth.did.clone()),
-            subject: Some(grant_subject(&grant, space.as_ref())),
-            detail: serde_json::json!({
-                "grant_id": grant.id,
-                "revoked_by": auth.did,
-                "user_id": grant.user_id,
-            }),
-        },
-        state.db_backend,
-    )
-    .await;
+    let event = EventLog {
+        event_type: "space.access_revoked".to_string(),
+        severity: Severity::Info,
+        actor_did: Some(auth.did.clone()),
+        subject: Some(grant_subject(&grant, space.as_ref())),
+        detail: serde_json::json!({
+            "grant_id": grant.id,
+            "revoked_by": auth.did,
+            "user_id": grant.user_id,
+        }),
+    };
+
+    let at = now_rfc3339();
+    let mut tx = begin(&state).await?;
+    mark_revoked(&mut *tx, state.db_backend, &grant.id, &auth.user_id, &at).await?;
+    write_event(&mut *tx, &event, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to record the revocation: {e}")))?;
+    commit(tx).await?;
 
     Ok(Json(Grant {
         revoked_at: Some(at),
@@ -520,19 +556,36 @@ pub(super) async fn revoke_grant(
     }))
 }
 
+#[derive(Deserialize)]
+pub(super) struct GrantReadsParams {
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
 /// GET /admin/spaces/access-grants/{id}/reads — reads made under a grant,
-/// oldest first.
+/// oldest first, a page at a time. `cursor` is present while more remain.
 pub(super) async fn grant_reads(
     State(state): State<AppState>,
     auth: UserAuth,
     Path(id): Path<String>,
+    Query(params): Query<GrantReadsParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::EventsRead).await?;
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let after = params.cursor.as_deref().and_then(crate::db::decode_cursor);
+
     // `detail` is compact JSON text on both backends, so the grant id appears
     // as `"grant_id":"<id>"`.
     let pattern = format!("%\"grant_id\":\"{}\"%", crate::db::escape_like(&id));
+    let after_clause = if after.is_some() {
+        " AND (created_at > ? OR (created_at = ? AND id > ?))"
+    } else {
+        ""
+    };
     let sql = adapt_sql(
-        "SELECT id, event_type, severity, actor_did, subject, detail, created_at FROM happyview_event_logs WHERE event_type = 'space.moderator_read' AND detail LIKE ? ESCAPE '\\' ORDER BY created_at ASC LIMIT 500",
+        &format!(
+            "SELECT id, event_type, severity, actor_did, subject, detail, created_at FROM happyview_event_logs WHERE event_type = 'space.moderator_read' AND detail LIKE ? ESCAPE '\\'{after_clause} ORDER BY created_at ASC, id ASC LIMIT ?"
+        ),
         state.db_backend,
     );
     #[allow(clippy::type_complexity)]
@@ -544,11 +597,19 @@ pub(super) async fn grant_reads(
         Option<String>,
         String,
         String,
-    )> = crate::db::query_as(&sql)
-        .bind(&pattern)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to load grant reads: {e}")))?;
+    )> = {
+        let mut q = crate::db::query_as(&sql).bind(&pattern);
+        if let Some((ts, last_id)) = &after {
+            q = q.bind(ts).bind(ts).bind(last_id);
+        }
+        q.bind(limit)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to load grant reads: {e}")))?
+    };
+    let cursor = (rows.len() as i64 == limit)
+        .then(|| rows.last().map(|r| crate::db::encode_cursor(&r.6, &r.0)))
+        .flatten();
     let events: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|(id, event_type, severity, actor_did, subject, detail, created_at)| {
@@ -563,7 +624,11 @@ pub(super) async fn grant_reads(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "events": events })))
+    let mut body = serde_json::json!({ "events": events });
+    if let Some(cursor) = cursor {
+        body["cursor"] = cursor.into();
+    }
+    Ok(Json(body))
 }
 
 #[cfg(test)]

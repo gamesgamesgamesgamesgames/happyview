@@ -729,3 +729,62 @@ async fn account_spaces_include_membership_without_records() {
         "the space's own DID is not a member and has no records in it"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn records_are_withheld_when_the_read_cannot_be_recorded() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    grant(&app, "space", &id).await;
+
+    happyview::db::query("ALTER TABLE happyview_event_logs RENAME TO happyview_event_logs_hidden")
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    let resp = get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+    let status = resp.status();
+    let body = json_body(resp).await;
+    happyview::db::query("ALTER TABLE happyview_event_logs_hidden RENAME TO happyview_event_logs")
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.get("records").is_none(), "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn grant_reads_are_paginated() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    let grant_id = grant(&app, "space", &id).await;
+    for _ in 0..3 {
+        get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+    }
+
+    let reads = format!("/admin/spaces/access-grants/{grant_id}/reads");
+    let first = json_body(get(&app, &format!("{reads}?limit=2"), None).await).await;
+    assert_eq!(first["events"].as_array().unwrap().len(), 2);
+    let cursor = first["cursor"]
+        .as_str()
+        .expect("a cursor while reads remain");
+
+    let second = json_body(
+        get(
+            &app,
+            &format!("{reads}?limit=2&cursor={}", urlencoding::encode(cursor)),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(second["events"].as_array().unwrap().len(), 1);
+    assert!(second.get("cursor").is_none());
+    assert_ne!(first["events"][0]["id"], second["events"][0]["id"]);
+    assert_ne!(first["events"][1]["id"], second["events"][0]["id"]);
+}

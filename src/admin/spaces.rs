@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::AppState;
 use crate::db::parse_dt;
 use crate::error::AppError;
-use crate::event_log::{EventLog, Severity, log_event};
+use crate::event_log::{EventLog, Severity, write_event};
 use crate::spaces::types::Space;
 use crate::spaces::{db, members, service};
 
@@ -74,23 +74,22 @@ async fn log_content_read(
     grant: &Grant,
     subject: String,
     detail: serde_json::Value,
-) {
+) -> Result<(), AppError> {
     let mut detail = detail;
     detail["user_id"] = auth.user_id.clone().into();
     detail["grant_id"] = grant.id.clone().into();
     detail["scope"] = grant.scope.as_str().into();
-    log_event(
-        &state.db,
-        EventLog {
-            event_type: "space.moderator_read".to_string(),
-            severity: Severity::Info,
-            actor_did: Some(auth.did.clone()),
-            subject: Some(subject),
-            detail,
-        },
-        state.db_backend,
-    )
-    .await;
+    let event = EventLog {
+        event_type: "space.moderator_read".to_string(),
+        severity: Severity::Info,
+        actor_did: Some(auth.did.clone()),
+        subject: Some(subject),
+        detail,
+    };
+    // Fails the request rather than return content whose read went unrecorded.
+    write_event(&state.db, &event, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to record the read: {e}")))
 }
 
 /// GET /admin/spaces — every space on the instance, newest first.
@@ -195,7 +194,7 @@ pub(super) async fn list_space_records(
             "uris": records.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(),
         }),
     )
-    .await;
+    .await?;
 
     let mut body = serde_json::json!({
         "records": records
@@ -285,7 +284,7 @@ pub(super) async fn get_space_blob(
             "repo": author_did,
         }),
     )
-    .await;
+    .await?;
 
     service::fetch_space_blob(&state, &author_did, &params.cid).await
 }
@@ -344,7 +343,7 @@ pub(super) async fn list_account_space_records(
             "uris": records.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(),
         }),
     )
-    .await;
+    .await?;
 
     let mut body = serde_json::json!({
         "records": records

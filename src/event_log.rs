@@ -344,6 +344,22 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
 }
 
 pub async fn log_event(db: &AnyPool, event: EventLog, backend: DatabaseBackend) {
+    if let Err(e) = write_event(db, &event, backend).await {
+        tracing::warn!(event_type = %event.event_type, "failed to log event: {e}");
+    }
+}
+
+/// Write an event and report failure. For audit events whose absence must stop
+/// the action they record; `log_event` is the best-effort form. Accepts a
+/// transaction so the event can commit or roll back with the change it records.
+pub async fn write_event<'e, E>(
+    executor: E,
+    event: &EventLog,
+    backend: DatabaseBackend,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
     let severity = event.severity.to_string();
     let detail_str = serde_json::to_string(&event.detail).unwrap_or_else(|_| "{}".to_string());
     let id = Uuid::new_v4().to_string();
@@ -354,7 +370,7 @@ pub async fn log_event(db: &AnyPool, event: EventLog, backend: DatabaseBackend) 
         backend,
     );
 
-    let result = crate::db::query(&sql)
+    crate::db::query(&sql)
         .bind(&id)
         .bind(&event.event_type)
         .bind(&severity)
@@ -362,12 +378,9 @@ pub async fn log_event(db: &AnyPool, event: EventLog, backend: DatabaseBackend) 
         .bind(&event.subject)
         .bind(&detail_str)
         .bind(&created_at)
-        .execute(db)
-        .await;
-
-    if let Err(e) = result {
-        tracing::warn!(event_type = %event.event_type, "failed to log event: {e}");
-    }
+        .execute(executor)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]
