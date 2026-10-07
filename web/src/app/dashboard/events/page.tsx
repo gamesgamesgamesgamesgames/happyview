@@ -75,6 +75,7 @@ const KNOWN_KEYS = [
 
 function GrantReads({ grantId }: { grantId: string }) {
   const [reads, setReads] = useState<EventLogEntry[] | null>(null);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,7 +84,7 @@ function GrantReads({ grantId }: { grantId: string }) {
         if (!cancelled) setReads(r.events);
       })
       .catch(() => {
-        if (!cancelled) setReads([]);
+        if (!cancelled) setFailed(true);
       });
     return () => {
       cancelled = true;
@@ -93,7 +94,11 @@ function GrantReads({ grantId }: { grantId: string }) {
   return (
     <div className="flex flex-col gap-2">
       <span className="text-muted-foreground text-sm">Reads under this grant</span>
-      {reads === null ? (
+      {failed ? (
+        <p className="text-destructive text-xs">
+          Couldn&apos;t load the reads for this grant.
+        </p>
+      ) : reads === null ? (
         <p className="text-muted-foreground text-xs">Loading…</p>
       ) : reads.length === 0 ? (
         <p className="text-muted-foreground text-xs">Nothing was read.</p>
