@@ -196,7 +196,7 @@ const systemItems: NavItem[] = [
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const pathname = usePathname();
   const { logout } = useAuth();
-  const { app_name, logo_url, features } = useConfig();
+  const { app_name, logo_url, features, platform_managed } = useConfig();
   const { hasPermission } = useCurrentUser();
   const { hasUpdates } = usePluginUpdates();
   const { addReason, removeReason } = useRestart();
@@ -435,6 +435,11 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       </Scroller>
       <SidebarSeparator className="!mx-0" />
       <SidebarFooter>
+        {platform_managed && (
+          <p className="px-2 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
+            Managed by HappyProto
+          </p>
+        )}
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton

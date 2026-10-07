@@ -2,22 +2,22 @@
 
 Thanks for helping out! This guide covers what a pull request needs to get merged.
 
-## Open pull requests against `dev`
+## Open pull requests against `beta`
 
-All work lands on `dev` first, and `main` is updated from `dev` when a release is cut.
+Work lands on `beta` first, and `main` is updated from `beta` when a release is cut. `alpha` carries the next major line, so target it only when a change belongs to that line rather than to the current one.
 
-GitHub defaults new PRs to `main`, so change the **base** dropdown to `dev` when you open one. To start from the right place:
+GitHub defaults new PRs to `main`, so change the **base** dropdown to `beta` when you open one. To start from the right place:
 
 ```bash
 git remote add upstream https://github.com/gamesgamesgamesgamesgames/happyview.git
 git fetch upstream
-git switch -c fix/my-change upstream/dev
+git switch -c fix/my-change upstream/beta
 ```
 
-If your branch was started from `main`, rebase it onto `dev`:
+If your branch was started from `main`, rebase it onto `beta`:
 
 ```bash
-git rebase --onto upstream/dev upstream/main fix/my-change
+git rebase --onto upstream/beta upstream/main fix/my-change
 ```
 
 ## Sign off your commits
@@ -37,7 +37,7 @@ Git has no setting to sign off automatically, but an alias saves typing: `git co
 Either sign off the existing commits and force-push:
 
 ```bash
-git rebase --signoff upstream/dev
+git rebase --signoff upstream/beta
 git push --force-with-lease
 ```
 

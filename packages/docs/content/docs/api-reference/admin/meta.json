@@ -22,6 +22,7 @@
     "api-clients",
     "linked-repos",
     "plugins",
+    "platform",
     "dead-letters",
     "service-identity",
     "service-entries",

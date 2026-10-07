@@ -3879,6 +3879,7 @@ mod tests {
             did: "did:plc:admin".to_string(),
             user_id: "admin".to_string(),
             is_super: true,
+            is_platform: false,
             permissions: std::collections::HashSet::new(),
             db: state.db.clone(),
             db_backend: state.db_backend,

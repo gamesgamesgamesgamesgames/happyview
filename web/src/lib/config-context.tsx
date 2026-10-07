@@ -15,6 +15,7 @@ interface Config {
   app_name: string | null
   logo_url: string | null
   features: Features
+  platform_managed: boolean
   configErrors: string[]
 }
 
@@ -30,6 +31,7 @@ const ConfigContext = createContext<ConfigContextType>({
   app_name: null,
   logo_url: null,
   features: { spaces: false, space_inspector: false },
+  platform_managed: false,
   configErrors: [],
   refreshConfig: async () => {},
 })
@@ -78,6 +80,7 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
           spaces: data.features?.spaces === true,
           space_inspector: data.features?.space_inspector === true,
         },
+        platform_managed: data.platform_managed === true,
         configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
       })
     } catch (e: unknown) {

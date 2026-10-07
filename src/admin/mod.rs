@@ -16,6 +16,7 @@ mod lexicons;
 mod linked_repos;
 mod network_lexicons;
 pub(crate) mod permissions;
+mod platform;
 mod plugins;
 mod proxy_config;
 mod records;
@@ -139,6 +140,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route("/identity/resolve", get(identity::resolve_identity))
         .route("/users", post(users::create_user).get(users::list_users))
         .route("/users/transfer-super", post(users::transfer_super))
+        .route("/platform/super-user", put(platform::set_super_user))
         .route(
             "/users/{id}",
             get(users::get_user).delete(users::delete_user),
