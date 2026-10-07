@@ -25,7 +25,7 @@ import {
 export interface ScopeOption {
   scope: GrantScope;
   target: string;
-  label: string;
+  label: React.ReactNode;
 }
 
 const DURATIONS = [5, 15, 30, 60, 120, 240, 480];

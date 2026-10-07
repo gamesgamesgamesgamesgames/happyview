@@ -20,6 +20,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { InspectorDisabled } from "@/components/spaces/inspector-disabled";
+import { AccountName } from "@/components/account-name";
 import { useConfig } from "@/lib/config-context";
 
 const PAGE_SIZE = 50;
@@ -86,11 +87,7 @@ function SpacesList() {
         id: "creator_did",
         accessorKey: "creator_did",
         header: "Creator",
-        cell: ({ getValue }) => (
-          <span className="font-mono text-xs whitespace-nowrap">
-            {getValue<string>()}
-          </span>
-        ),
+        cell: ({ getValue }) => <AccountName did={getValue<string>()} />,
         meta: { label: "Creator" },
       },
       {

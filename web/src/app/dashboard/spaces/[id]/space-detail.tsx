@@ -9,6 +9,7 @@ import { useAccessGrant } from "@/hooks/use-access-grant";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { useConfig } from "@/lib/config-context";
 import { InspectorDisabled } from "@/components/spaces/inspector-disabled";
+import { AccountName } from "@/components/account-name";
 import { blobCids } from "@/lib/blob-refs";
 import { toastError } from "@/lib/format";
 import {
@@ -228,14 +229,10 @@ function SpaceDetailContent() {
               <span className="font-mono text-xs">{space.type}</span>
             </Field>
             <Field label="Creator">
-              <span className="font-mono text-xs break-all">
-                {space.creator_did}
-              </span>
+              <AccountName did={space.creator_did} showDid />
             </Field>
             <Field label="Authority">
-              <span className="font-mono text-xs break-all">
-                {space.authority_did}
-              </span>
+              <AccountName did={space.authority_did} showDid />
             </Field>
             <Field label="Created">
               {new Date(space.created_at).toLocaleString()}
@@ -276,12 +273,12 @@ function SpaceDetailContent() {
                   <TableBody>
                     {members.map((member) => (
                       <TableRow key={member.did}>
-                        <TableCell className="font-mono text-xs break-all">
+                        <TableCell>
                           <Link
                             href={`/dashboard/spaces/account/?did=${encodeURIComponent(member.did)}`}
                             className="underline underline-offset-2"
                           >
-                            {member.did}
+                            <AccountName did={member.did} showDid />
                           </Link>
                         </TableCell>
                         <TableCell className="flex gap-1">
@@ -406,7 +403,7 @@ function SpaceDetailContent() {
                       <SelectItem value={ALL}>All authors</SelectItem>
                       {members.map((member) => (
                         <SelectItem key={member.did} value={member.did}>
-                          {member.did}
+                          <AccountName did={member.did} />
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -434,8 +431,8 @@ function SpaceDetailContent() {
                           className="cursor-pointer"
                           onClick={() => setViewRecord(record)}
                         >
-                          <TableCell className="font-mono text-xs whitespace-nowrap">
-                            {record.did}
+                          <TableCell className="whitespace-nowrap">
+                            <AccountName did={record.did} />
                           </TableCell>
                           <TableCell className="font-mono text-xs">
                             {record.collection}
@@ -503,9 +500,7 @@ function SpaceDetailContent() {
                       </Field>
                     </div>
                     <Field label="Author">
-                      <span className="font-mono text-xs break-all">
-                        {viewRecord.did}
-                      </span>
+                      <AccountName did={viewRecord.did} showDid />
                     </Field>
                     <Field label="Collection">
                       <span className="font-mono text-xs">
@@ -562,7 +557,7 @@ function SpaceDetailContent() {
               ...detail.members.map((m) => ({
                 scope: "account" as const,
                 target: m.did,
-                label: `One member: ${m.did}`,
+                label: <>One member: <AccountName did={m.did} /></>,
               })),
             ]}
             onGranted={(g) => access.setGrant(g)}

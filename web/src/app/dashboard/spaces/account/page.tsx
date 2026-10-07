@@ -9,6 +9,7 @@ import { useAccessGrant } from "@/hooks/use-access-grant";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { useConfig } from "@/lib/config-context";
 import { InspectorDisabled } from "@/components/spaces/inspector-disabled";
+import { AccountName } from "@/components/account-name";
 import { blobCids } from "@/lib/blob-refs";
 import { toastError } from "@/lib/format";
 import {
@@ -119,7 +120,9 @@ function AccountView() {
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
         <Card>
           <CardHeader>
-            <CardTitle className="font-mono text-sm break-all">{did}</CardTitle>
+            <CardTitle>
+              <AccountName did={did} showDid />
+            </CardTitle>
             <CardDescription>Spaces this account belongs to or has written in.</CardDescription>
           </CardHeader>
           <CardContent>
@@ -243,7 +246,7 @@ function AccountView() {
             onOpenChange={setRequestOpen}
             maxMinutes={inspector.max_grant_minutes}
             defaultMinutes={inspector.default_grant_minutes}
-            scopeOptions={[{ scope: "account", target: did, label: `This account: ${did}` }]}
+            scopeOptions={[{ scope: "account", target: did, label: <>This account: <AccountName did={did} /></> }]}
             onGranted={(g) => access.setGrant(g)}
           />
         )}
