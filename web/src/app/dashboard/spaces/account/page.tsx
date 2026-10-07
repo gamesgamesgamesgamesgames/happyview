@@ -258,7 +258,7 @@ function AccountView() {
             onOpenChange={setRequestOpen}
             maxMinutes={inspector.max_grant_minutes}
             defaultMinutes={inspector.default_grant_minutes}
-            scopeOptions={[{ scope: "account", target: did, label: <>This account: <AccountName did={did} /></> }]}
+            scopeOptions={[{ scope: "account", target: did, label: <>This account, in every space: <AccountName did={did} /></> }]}
             onGranted={(g) => access.setGrant(g)}
           />
         )}

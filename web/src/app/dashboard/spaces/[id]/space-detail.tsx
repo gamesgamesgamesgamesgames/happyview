@@ -574,11 +574,15 @@ function SpaceDetailContent() {
             maxMinutes={inspector.max_grant_minutes}
             defaultMinutes={inspector.default_grant_minutes}
             scopeOptions={[
-              { scope: "space", target: id, label: "This space (all members)" },
+              { scope: "space", target: id, label: "This space: every record and blob, from every author" },
               ...accountDids.map((did) => ({
                 scope: "account" as const,
                 target: did,
-                label: <>One account: <AccountName did={did} /></>,
+                label: (
+                  <>
+                    One account, in every space: <AccountName did={did} />
+                  </>
+                ),
               })),
             ]}
             onGranted={(g) => access.setGrant(g)}

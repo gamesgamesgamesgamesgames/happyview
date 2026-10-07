@@ -68,10 +68,18 @@ const KNOWN_KEYS = [
   "response_size",
   "message",
   "level",
-  "grant_id",
-  "reason",
-  "uris",
 ] as const;
+
+// Detail keys the space access events render themselves.
+const SPACE_ACCESS_KEYS = ["grant_id", "reason", "uris"] as const;
+
+function isSpaceAccessEvent(eventType: string) {
+  return (
+    eventType === "space.access_granted" ||
+    eventType === "space.access_revoked" ||
+    eventType === "space.moderator_read"
+  );
+}
 
 function GrantReads({ grantId }: { grantId: string }) {
   const [reads, setReads] = useState<EventLogEntry[] | null>(null);
@@ -162,10 +170,11 @@ function GrantReads({ grantId }: { grantId: string }) {
 function EventDetailBody({ event }: { event: EventLogEntry }) {
   const d = event.detail;
 
-  // Collect any keys not in KNOWN_KEYS for the "Other" section
-  const otherKeys = Object.keys(d).filter(
-    (k) => !(KNOWN_KEYS as readonly string[]).includes(k),
-  );
+  // Collect any keys not rendered above for the "Other" section
+  const renderedKeys: readonly string[] = isSpaceAccessEvent(event.event_type)
+    ? [...KNOWN_KEYS, ...SPACE_ACCESS_KEYS]
+    : KNOWN_KEYS;
+  const otherKeys = Object.keys(d).filter((k) => !renderedKeys.includes(k));
   const otherDetail =
     otherKeys.length > 0
       ? Object.fromEntries(otherKeys.map((k) => [k, d[k]]))
@@ -220,6 +229,13 @@ function EventDetailBody({ event }: { event: EventLogEntry }) {
       </div>
 
       {/* Access grant */}
+      {isSpaceAccessEvent(event.event_type) &&
+        typeof d.grant_id === "string" && (
+          <div>
+            <span className="text-muted-foreground text-sm">Grant</span>
+            <p className="font-mono text-xs">{d.grant_id}</p>
+          </div>
+        )}
       {event.event_type === "space.access_granted" &&
         typeof d.grant_id === "string" && (
           <>
@@ -231,10 +247,15 @@ function EventDetailBody({ event }: { event: EventLogEntry }) {
           </>
         )}
       {event.event_type === "space.moderator_read" &&
-        typeof d.grant_id === "string" && (
+        Array.isArray(d.uris) &&
+        d.uris.length > 0 && (
           <div>
-            <span className="text-muted-foreground text-sm">Grant</span>
-            <p className="font-mono text-xs">{d.grant_id}</p>
+            <span className="text-muted-foreground text-sm">Records read</span>
+            <ul className="font-mono text-xs break-all">
+              {(d.uris as string[]).map((uri) => (
+                <li key={uri}>{uri}</li>
+              ))}
+            </ul>
           </div>
         )}
 
