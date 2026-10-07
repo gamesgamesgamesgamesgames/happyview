@@ -11,6 +11,7 @@ use axum::response::IntoResponse;
 use serde::Deserialize;
 
 use crate::AppState;
+use crate::db::parse_dt;
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::spaces::types::Space;
@@ -37,6 +38,14 @@ pub(super) struct ListSpaceRecordsParams {
 #[derive(Deserialize)]
 pub(super) struct GetSpaceBlobParams {
     pub cid: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct AccountRecordsParams {
+    pub space: Option<String>,
+    pub collection: Option<String>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
 }
 
 fn space_uri(space: &Space) -> String {
@@ -232,7 +241,12 @@ pub(super) async fn get_space_blob(
             found = Some((g.clone(), author));
         }
     } else {
-        for g in grants.iter().filter(|g| g.scope == GrantScope::Account) {
+        let mut account_grants: Vec<&Grant> = grants
+            .iter()
+            .filter(|g| g.scope == GrantScope::Account)
+            .collect();
+        account_grants.sort_by_key(|g| std::cmp::Reverse(parse_dt(&g.expires_at)));
+        for g in account_grants {
             if let Some(author) = db::find_blob_author_did(
                 &state.db,
                 state.db_backend,
@@ -268,4 +282,84 @@ pub(super) async fn get_space_blob(
     .await;
 
     service::fetch_space_blob(&state, &author_did, &params.cid).await
+}
+
+/// GET /admin/accounts/{did}/spaces — where an account has membership or
+/// records. Metadata only.
+pub(super) async fn list_account_spaces(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(did): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    auth.require(Permission::SpacesRead).await?;
+    let spaces = db::list_author_spaces(&state.db, state.db_backend, &did).await?;
+    Ok(Json(serde_json::json!({
+        "spaces": spaces
+            .iter()
+            .map(|(space, count)| serde_json::json!({ "space": space_json(space), "record_count": count }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+/// GET /admin/accounts/{did}/space-records — one account's records across
+/// spaces, newest first.
+pub(super) async fn list_account_space_records(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(did): Path<String>,
+    Query(params): Query<AccountRecordsParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let grant =
+        space_access::require_grant(&state, &auth, space_access::Covers::Account { did: &did })
+            .await?;
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    let (records, cursor) = db::list_author_space_records(
+        &state.db,
+        state.db_backend,
+        &did,
+        params.space.as_deref(),
+        params.collection.as_deref(),
+        limit,
+        params.cursor.as_deref(),
+    )
+    .await?;
+
+    log_content_read(
+        &state,
+        &auth,
+        &grant,
+        did.clone(),
+        serde_json::json!({
+            "action": "list_account_records",
+            "repo": did,
+            "space_id": params.space,
+            "collection": params.collection,
+            "uris": records.iter().map(|r| r.uri.as_str()).collect::<Vec<_>>(),
+        }),
+    )
+    .await;
+
+    let mut body = serde_json::json!({
+        "records": records
+            .iter()
+            .map(|r| {
+                let suffix = format!("/{}/{}/{}", r.author_did, r.collection, r.rkey);
+                serde_json::json!({
+                    "uri": r.uri,
+                    "did": r.author_did,
+                    "collection": r.collection,
+                    "rkey": r.rkey,
+                    "cid": r.cid,
+                    "indexed_at": r.indexed_at,
+                    "record": r.record,
+                    "space_id": r.space_id,
+                    "space_uri": r.uri.strip_suffix(&suffix).unwrap_or(&r.uri),
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    if let Some(cursor) = cursor {
+        body["cursor"] = cursor.into();
+    }
+    Ok(Json(body))
 }

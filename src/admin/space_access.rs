@@ -268,7 +268,6 @@ pub enum Covers<'a> {
         repo: Option<&'a str>,
     },
     /// One account's records in any space.
-    #[allow(dead_code)] // No account-wide read route constructs this yet.
     Account { did: &'a str },
 }
 

@@ -729,6 +729,100 @@ pub async fn list_space_records(
     Ok((records, next_cursor))
 }
 
+/// One author's records across every space, newest first.
+#[allow(clippy::too_many_arguments)]
+pub async fn list_author_space_records(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    author_did: &str,
+    space_id: Option<&str>,
+    collection: Option<&str>,
+    limit: i64,
+    cursor: Option<&str>,
+) -> Result<(Vec<SpaceRecord>, Option<String>), AppError> {
+    let decoded_cursor = cursor.and_then(decode_cursor);
+    let mut conditions = vec!["author_did = ?".to_string()];
+    if space_id.is_some() {
+        conditions.push("space_id = ?".to_string());
+    }
+    if collection.is_some() {
+        conditions.push("collection = ?".to_string());
+    }
+    if decoded_cursor.is_some() {
+        conditions.push("(indexed_at < ? OR (indexed_at = ? AND uri < ?))".to_string());
+    }
+    let sql = adapt_sql(
+        &format!(
+            "SELECT uri, space_id, author_did, collection, rkey, record, cid, indexed_at FROM happyview_space_records WHERE {} ORDER BY indexed_at DESC, uri DESC LIMIT ?",
+            conditions.join(" AND ")
+        ),
+        backend,
+    );
+    let mut query = crate::db::query_as::<RecordRow>(&sql).bind(author_did);
+    if let Some(s) = space_id {
+        query = query.bind(s);
+    }
+    if let Some(c) = collection {
+        query = query.bind(c);
+    }
+    if let Some((ref ts, ref uri)) = decoded_cursor {
+        query = query.bind(ts.as_str()).bind(ts.as_str()).bind(uri.as_str());
+    }
+    let rows = query
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list author space records: {e}")))?;
+    let records: Vec<SpaceRecord> = rows
+        .into_iter()
+        .map(parse_record_row)
+        .collect::<Result<_, _>>()?;
+    let next_cursor = (records.len() as i64 == limit)
+        .then(|| records.last().map(|r| encode_cursor(&r.indexed_at, &r.uri)))
+        .flatten();
+    Ok((records, next_cursor))
+}
+
+/// Spaces an account belongs to or has written in, with how many records it
+/// has in each.
+pub async fn list_author_spaces(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    did: &str,
+) -> Result<Vec<(Space, i64)>, AppError> {
+    let sql = adapt_sql(
+        "SELECT id, did, authority_did, creator_did, type_nsid, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at FROM happyview_spaces WHERE id IN (SELECT space_id FROM happyview_space_members WHERE did = ? UNION SELECT space_id FROM happyview_space_records WHERE author_did = ?) ORDER BY created_at DESC, id DESC",
+        backend,
+    );
+    let rows: Vec<SpaceRow> = crate::db::query_as(&sql)
+        .bind(did)
+        .bind(did)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list account spaces: {e}")))?;
+
+    let count_sql = adapt_sql(
+        "SELECT space_id, COUNT(*) FROM happyview_space_records WHERE author_did = ? GROUP BY space_id",
+        backend,
+    );
+    let counts: std::collections::HashMap<String, i64> =
+        crate::db::query_as::<(String, i64)>(&count_sql)
+            .bind(did)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to count account records: {e}")))?
+            .into_iter()
+            .collect();
+
+    rows.into_iter()
+        .map(|r| {
+            let space = parse_space_row(r)?;
+            let count = counts.get(&space.id).copied().unwrap_or(0);
+            Ok((space, count))
+        })
+        .collect()
+}
+
 pub async fn list_all_space_records(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,

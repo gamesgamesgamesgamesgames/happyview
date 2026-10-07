@@ -461,6 +461,150 @@ async fn account_grant_reads_only_that_author_in_a_space() {
     );
 }
 
+/// Add a record by `author` that references `cid` as a blob.
+async fn seed_blob_record(
+    app: &TestApp,
+    space_id: &str,
+    skey: &str,
+    author: &str,
+    rkey: &str,
+    cid: &str,
+) {
+    spaces_db::upsert_space_record(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceRecord {
+            uri: format!("at://{CREATOR}/space/com.example.adminspaces/{skey}/{author}/{COLLECTION}/{rkey}"),
+            space_id: space_id.to_string(),
+            author_did: author.to_string(),
+            collection: COLLECTION.to_string(),
+            rkey: rkey.to_string(),
+            record: json!({ "$type": COLLECTION, "image": { "$type": "blob", "ref": { "$link": cid }, "mimeType": "image/png", "size": 1 } }),
+            cid: format!("bafyrei{rkey}"),
+            indexed_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn account_routes_span_spaces() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let first = seed_space(&app).await;
+    let second = seed_space_with_skey(&app, "second").await;
+    enable_inspector(&app).await;
+
+    let resp = get(&app, &format!("/admin/accounts/{MEMBER}/spaces"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let ids: Vec<&str> = body["spaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["space"]["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&first.as_str()) && ids.contains(&second.as_str()));
+    assert_eq!(body["spaces"][0]["record_count"], 1);
+    assert!(
+        moderator_reads(&app).await.is_empty(),
+        "listing an account's spaces reads no contents"
+    );
+
+    let resp = get(
+        &app,
+        &format!("/admin/accounts/{MEMBER}/space-records"),
+        None,
+    )
+    .await;
+    assert_eq!(json_body(resp).await["error"], "SpaceAccessGrantRequired");
+
+    let grant_id = grant(&app, "account", MEMBER).await;
+    let resp = get(
+        &app,
+        &format!("/admin/accounts/{MEMBER}/space-records"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["records"].as_array().unwrap().len(), 2);
+    assert!(
+        body["records"][0]["space_uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("at://did:plc:adminspaces-creator/space/")
+    );
+
+    let resp = get(
+        &app,
+        &format!("/admin/accounts/{MEMBER}/space-records?space={first}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        json_body(resp).await["records"].as_array().unwrap().len(),
+        1
+    );
+
+    let reads = moderator_reads(&app).await;
+    let (_, subject, detail) = reads.last().unwrap();
+    assert_eq!(subject.as_deref(), Some(MEMBER));
+    let detail: Value = serde_json::from_str(detail).unwrap();
+    assert_eq!(detail["action"], "list_account_records");
+    assert_eq!(detail["grant_id"], grant_id);
+
+    let resp = get(
+        &app,
+        &format!("/admin/accounts/{CREATOR}/space-records"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "the grant covers one account"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn account_grant_blob_access_follows_the_author() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    seed_blob_record(&app, &id, "main", MEMBER, "m1", "bafkshared").await;
+    seed_blob_record(&app, &id, "main", CREATOR, "c1", "bafkshared").await;
+    seed_blob_record(&app, &id, "main", CREATOR, "c2", "bafkcreatoronly").await;
+    enable_inspector(&app).await;
+    grant(&app, "account", MEMBER).await;
+
+    // Shared CID: covered because MEMBER's own record references it. The PDS
+    // endpoint can't be resolved for a test DID, so a covered request still
+    // surfaces as 404 — the proof that authorization passed is the logged
+    // read naming MEMBER, not the status code.
+    let shared = get(
+        &app,
+        &format!("/admin/spaces/{id}/blob?cid=bafkshared"),
+        None,
+    )
+    .await;
+    assert_eq!(shared.status(), StatusCode::NOT_FOUND);
+    let detail: Value =
+        serde_json::from_str(&moderator_reads(&app).await.last().unwrap().2).unwrap();
+    assert_eq!(detail["repo"], MEMBER);
+
+    let other = get(
+        &app,
+        &format!("/admin/spaces/{id}/blob?cid=bafkcreatoronly"),
+        None,
+    )
+    .await;
+    assert_eq!(other.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 #[serial]
 async fn grant_reads_lists_the_reads_made_under_a_grant() {

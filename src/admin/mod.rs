@@ -98,6 +98,11 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route("/spaces/{id}", get(spaces::get_space))
         .route("/spaces/{id}/records", get(spaces::list_space_records))
         .route("/spaces/{id}/blob", get(spaces::get_space_blob))
+        .route("/accounts/{did}/spaces", get(spaces::list_account_spaces))
+        .route(
+            "/accounts/{did}/space-records",
+            get(spaces::list_account_space_records),
+        )
         .route("/jobs", get(jobs::list_jobs))
         .route("/jobs/{id}", get(jobs::get_job))
         .route("/jobs/{id}/cancel", post(jobs::cancel_job))
