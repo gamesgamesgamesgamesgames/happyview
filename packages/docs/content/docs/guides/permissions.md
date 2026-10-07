@@ -111,7 +111,7 @@ HappyView defines 51 permissions organized by category:
 | `spaces:delete`             | Remove spaces and their data               |
 | `spaces:manage-members`     | Add or remove space members and roles      |
 | `spaces:manage-invites`     | Create and revoke space invitations        |
-| `spaces:manage-records`     | Read and write records within spaces       |
+| `spaces:manage-records`     | Reserved; grants no access. Use `spaces:inspect` to read space contents. |
 | `spaces:manage-credentials` | Issue and revoke space access credentials  |
 | `spaces:inspect`            | Request time-limited access to read records and blobs in private spaces |
 

@@ -58,7 +58,7 @@ pub const DEFAULT_PROTECTED_RETENTION_DAYS: u32 = 365;
 /// How an `EventFilter` treats `PROTECTED_EVENT_TYPES`.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub enum ProtectedEvents {
-    /// Match protected and unprotected rows alike (the historical behaviour).
+    /// Match protected and unprotected rows alike.
     #[default]
     Include,
     /// Match only unprotected rows.

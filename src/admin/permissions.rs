@@ -436,7 +436,7 @@ impl Permission {
             Self::SpacesManageRecords => PermissionInfo {
                 key: "spaces:manage-records",
                 name: "Manage Records",
-                description: "Read and write records within spaces",
+                description: "Reserved; grants no access. Use `spaces:inspect` to read space contents.",
                 category: "Spaces",
             },
             Self::SpacesManageCredentials => PermissionInfo {
