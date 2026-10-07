@@ -7,6 +7,8 @@ import { ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
 
 import { useAccessGrant } from "@/hooks/use-access-grant";
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { useConfig } from "@/lib/config-context";
+import { InspectorDisabled } from "@/components/spaces/inspector-disabled";
 import { blobCids } from "@/lib/blob-refs";
 import { toastError } from "@/lib/format";
 import {
@@ -78,7 +80,7 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-export default function SpaceDetail() {
+function SpaceDetailContent() {
   const pathname = usePathname();
   const id = decodeURIComponent(
     pathname.split("/").filter(Boolean).pop() ?? "",
@@ -569,4 +571,10 @@ export default function SpaceDetail() {
       </div>
     </>
   );
+}
+
+export default function SpaceDetail() {
+  const { features } = useConfig();
+  if (!features.space_inspector) return <InspectorDisabled title="Space" />;
+  return <SpaceDetailContent />;
 }

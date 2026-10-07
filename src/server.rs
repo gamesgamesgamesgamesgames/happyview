@@ -345,6 +345,12 @@ async fn config_endpoint(
         backend,
     )
     .await;
+    let space_inspector_enabled = crate::feature_flags::is_enabled(
+        pool,
+        crate::feature_flags::FeatureFlag::SPACE_INSPECTOR,
+        backend,
+    )
+    .await;
 
     Json(serde_json::json!({
         "public_url": domain_url,
@@ -359,6 +365,7 @@ async fn config_endpoint(
         "logo_url": logo_url,
         "features": {
             "spaces": spaces_enabled,
+            "space_inspector": space_inspector_enabled,
         },
         // Startup configuration problems (e.g. an insecure SESSION_SECRET) so the
         // dashboard can surface them to an operator. Empty when healthy.

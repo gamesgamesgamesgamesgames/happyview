@@ -100,6 +100,7 @@ pub(super) async fn list_spaces(
     Query(params): Query<ListSpacesParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::SpacesRead).await?;
+    space_access::require_enabled(&state).await?;
     let limit = params.limit.unwrap_or(50).clamp(1, 100);
     let offset: i64 = params
         .cursor
@@ -126,6 +127,7 @@ pub(super) async fn get_space(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::SpacesRead).await?;
+    space_access::require_enabled(&state).await?;
     let space = load_space(&state, &id).await?;
 
     let members = members::resolve_members(&state.db, state.db_backend, &space.id).await?;
@@ -296,6 +298,7 @@ pub(super) async fn list_account_spaces(
     Path(did): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     auth.require(Permission::SpacesRead).await?;
+    space_access::require_enabled(&state).await?;
     let spaces = db::list_author_spaces(&state.db, state.db_backend, &did).await?;
     Ok(Json(serde_json::json!({
         "spaces": spaces

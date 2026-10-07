@@ -303,12 +303,21 @@ pub fn select_covering<'g>(
         .max_by_key(|g| parse_dt(&g.expires_at))
 }
 
+/// Fails with `SpaceInspectorDisabled` unless the instance switch is on. Every
+/// space moderation route checks it, metadata included, so turning the
+/// inspector off closes the whole area.
+pub async fn require_enabled(state: &AppState) -> Result<(), AppError> {
+    if load_config(&state.db, state.db_backend).await.enabled {
+        Ok(())
+    } else {
+        Err(inspector_disabled())
+    }
+}
+
 /// The caller's active grants, after checking the permission and the switch.
 pub async fn active_grants(state: &AppState, auth: &UserAuth) -> Result<Vec<Grant>, AppError> {
     auth.require(Permission::SpacesInspect).await?;
-    if !load_config(&state.db, state.db_backend).await.enabled {
-        return Err(inspector_disabled());
-    }
+    require_enabled(state).await?;
     let now = chrono::Utc::now();
     Ok(
         unexpired_user_grants(&state.db, state.db_backend, &auth.user_id, now)

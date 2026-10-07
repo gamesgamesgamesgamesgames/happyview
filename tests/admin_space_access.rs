@@ -66,6 +66,19 @@ async fn events_of(app: &TestApp, event_type: &str) -> Vec<(Option<String>, Stri
 
 #[tokio::test]
 #[serial]
+async fn config_reports_the_inspector_switch() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json_body(send(&app, "GET", "/config", None).await).await;
+    assert_eq!(body["features"]["space_inspector"], false);
+
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
+    let body = json_body(send(&app, "GET", "/config", None).await).await;
+    assert_eq!(body["features"]["space_inspector"], true);
+}
+
+#[tokio::test]
+#[serial]
 async fn inspector_is_off_by_default() {
     common::require_db!();
     let app = TestApp::new().await;

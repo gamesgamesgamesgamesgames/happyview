@@ -153,6 +153,7 @@ async fn super_admin_lists_and_reads_spaces() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
+    enable_inspector(&app).await;
 
     let resp = get(&app, "/admin/spaces", None).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -170,7 +171,6 @@ async fn super_admin_lists_and_reads_spaces() {
     assert_eq!(body["collections"][0]["collection"], COLLECTION);
     assert_eq!(body["collections"][0]["count"], 1);
 
-    enable_inspector(&app).await;
     grant(&app, "space", &id).await;
     let resp = get(&app, &format!("/admin/spaces/{id}/records"), None).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -185,6 +185,7 @@ async fn spaces_read_does_not_grant_record_access() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
+    enable_inspector(&app).await;
     let key = common::api_key(&app, &["spaces:read"]).await;
 
     let resp = get(&app, &format!("/admin/spaces/{id}"), Some(&key)).await;
@@ -242,10 +243,36 @@ async fn inspect_reads_records_and_logs_the_read() {
 
 #[tokio::test]
 #[serial]
+async fn metadata_routes_are_closed_while_the_inspector_is_off() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+
+    for uri in [
+        "/admin/spaces".to_string(),
+        format!("/admin/spaces/{id}"),
+        format!("/admin/accounts/{MEMBER}/spaces"),
+    ] {
+        let resp = get(&app, &uri, None).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+        assert_eq!(json_body(resp).await["error"], "SpaceInspectorDisabled");
+    }
+
+    let resp = get(&app, "/admin/spaces/inspector", None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the status route stays open so the dashboard can explain the state"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn metadata_reads_are_not_logged() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
+    enable_inspector(&app).await;
 
     assert_eq!(
         get(&app, "/admin/spaces", None).await.status(),
@@ -266,11 +293,9 @@ async fn unknown_space_is_not_found() {
     common::require_db!();
     let app = TestApp::new().await;
 
-    let resp = get(&app, "/admin/spaces/does-not-exist", None).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-    // Content routes check the switch before looking the space up.
+    // Every route checks the switch before looking the space up.
     for uri in [
+        "/admin/spaces/does-not-exist",
         "/admin/spaces/does-not-exist/records",
         "/admin/spaces/does-not-exist/blob?cid=bafyunknown",
     ] {
@@ -285,6 +310,8 @@ async fn unknown_space_is_not_found() {
     assert_eq!(json_body(resp).await["error"], "InsufficientPermissions");
 
     enable_inspector(&app).await;
+    let resp = get(&app, "/admin/spaces/does-not-exist", None).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let resp = get(&app, "/admin/spaces/does-not-exist/records", None).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let resp = get(
@@ -666,6 +693,7 @@ async fn account_spaces_include_membership_without_records() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
+    enable_inspector(&app).await;
     let lurker = "did:plc:adminspaces-lurker";
     spaces_db::add_member(
         &app.state.db,

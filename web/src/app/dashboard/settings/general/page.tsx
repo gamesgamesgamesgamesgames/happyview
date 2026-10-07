@@ -5,6 +5,7 @@ import { Upload, Trash2 } from "lucide-react";
 import Link from "next/link";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { useConfig } from "@/lib/config-context";
 import {
   getSettings,
   getDbInfo,
@@ -88,6 +89,7 @@ const FIELDS: FieldConfig[] = [
 
 export default function GeneralSettingsPage() {
   const { hasPermission } = useCurrentUser();
+  const { refreshConfig } = useConfig();
   const canManage = hasPermission("settings:manage");
   const canReadEvents = hasPermission("events:read");
   const canPurgeEvents = hasPermission("events:purge");
@@ -255,6 +257,7 @@ export default function GeneralSettingsPage() {
         }
       }
       setNotice("Settings saved.");
+      await refreshConfig();
       await load();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));

@@ -1,15 +1,26 @@
 "use client"
 
-import { createContext, useContext, useEffect, useState } from "react"
+import { createContext, useCallback, useContext, useEffect, useState } from "react"
 import { TriangleAlert } from "lucide-react"
 
-interface ConfigContextType {
+interface Features {
+  spaces: boolean
+  space_inspector: boolean
+}
+
+interface Config {
   public_url: string
   default_rate_limit_capacity: number
   default_rate_limit_refill_rate: number
   app_name: string | null
   logo_url: string | null
+  features: Features
   configErrors: string[]
+}
+
+interface ConfigContextType extends Config {
+  /** Re-fetch `/config`, e.g. after a setting that changes a feature flag. */
+  refreshConfig: () => Promise<void>
 }
 
 const ConfigContext = createContext<ConfigContextType>({
@@ -18,7 +29,9 @@ const ConfigContext = createContext<ConfigContextType>({
   default_rate_limit_refill_rate: 2.0,
   app_name: null,
   logo_url: null,
+  features: { spaces: false, space_inspector: false },
   configErrors: [],
+  refreshConfig: async () => {},
 })
 
 function ConfigErrorBanner({ errors }: { errors: string[] }) {
@@ -47,27 +60,34 @@ function ConfigErrorBanner({ errors }: { errors: string[] }) {
 }
 
 export function ConfigProvider({ children }: { children: React.ReactNode }) {
-  const [config, setConfig] = useState<ConfigContextType | null>(null)
+  const [config, setConfig] = useState<Config | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`)
-        return res.json()
+  const refreshConfig = useCallback(async () => {
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`)
+      if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`)
+      const data = await res.json()
+      setConfig({
+        public_url: data.public_url,
+        default_rate_limit_capacity: data.default_rate_limit_capacity,
+        default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
+        app_name: data.app_name ?? null,
+        logo_url: data.logo_url ?? null,
+        features: {
+          spaces: data.features?.spaces === true,
+          space_inspector: data.features?.space_inspector === true,
+        },
+        configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
       })
-      .then((data) => {
-        setConfig({
-          public_url: data.public_url,
-          default_rate_limit_capacity: data.default_rate_limit_capacity,
-          default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
-          app_name: data.app_name ?? null,
-          logo_url: data.logo_url ?? null,
-          configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
-        })
-      })
-      .catch((e) => setError(e.message))
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
   }, [])
+
+  useEffect(() => {
+    refreshConfig()
+  }, [refreshConfig])
 
   if (error) {
     return <div style={{ padding: "2rem", color: "red" }}>Failed to load config: {error}</div>
@@ -76,7 +96,7 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
   if (!config) return null
 
   return (
-    <ConfigContext.Provider value={config}>
+    <ConfigContext.Provider value={{ ...config, refreshConfig }}>
       {config.configErrors.length > 0 && (
         <ConfigErrorBanner errors={config.configErrors} />
       )}

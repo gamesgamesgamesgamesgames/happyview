@@ -7,6 +7,8 @@ import { ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
 
 import { useAccessGrant } from "@/hooks/use-access-grant";
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { useConfig } from "@/lib/config-context";
+import { InspectorDisabled } from "@/components/spaces/inspector-disabled";
 import { blobCids } from "@/lib/blob-refs";
 import { toastError } from "@/lib/format";
 import {
@@ -284,6 +286,8 @@ function AccountView() {
 }
 
 export default function AccountPage() {
+  const { features } = useConfig();
+  if (!features.space_inspector) return <InspectorDisabled title="Account" />;
   return (
     <Suspense>
       <AccountView />
