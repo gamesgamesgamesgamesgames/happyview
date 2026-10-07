@@ -34,9 +34,27 @@ async function createSpace(page: Page): Promise<{ uri: string; id: string }> {
   });
   expect(resp.ok()).toBe(true);
   const { uri } = await resp.json();
-  const list = await (await page.request.get("/admin/spaces?limit=100")).json();
-  const space = list.spaces.find((s: { uri: string }) => s.uri === uri);
-  return { uri, id: space.id };
+  return { uri, id: await spaceIdFor(uri) };
+}
+
+/**
+ * The internal id of a space, read from the database. The admin spaces API
+ * is closed while the inspector is off, and some tests create a space in that
+ * state.
+ */
+async function spaceIdFor(uri: string): Promise<string> {
+  const [did, , typeNsid, skey] = uri.replace(/^at:\/\//, "").split("/");
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const { rows } = await client.query(
+      "SELECT id FROM happyview_spaces WHERE did = $1 AND type_nsid = $2 AND skey = $3",
+      [did, typeNsid, skey],
+    );
+    return rows[0].id;
+  } finally {
+    await client.end();
+  }
 }
 
 test.describe("Space inspector", () => {
