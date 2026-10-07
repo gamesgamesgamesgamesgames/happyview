@@ -149,6 +149,24 @@ pub async fn count_space_records_by_collection(
         .map_err(|e| AppError::Internal(format!("failed to count space records: {e}")))
 }
 
+/// Every DID that has records in a space, whether or not it is still a member.
+pub async fn list_space_authors(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT DISTINCT author_did FROM happyview_space_records WHERE space_id = ? ORDER BY author_did",
+        backend,
+    );
+    let rows: Vec<(String,)> = crate::db::query_as(&sql)
+        .bind(space_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list space authors: {e}")))?;
+    Ok(rows.into_iter().map(|(did,)| did).collect())
+}
+
 pub struct SpaceView {
     pub uri: String,
     pub is_owner: bool,

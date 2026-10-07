@@ -112,8 +112,16 @@ function SpaceDetailContent() {
       .catch(() => setInspector(null));
   }, [id]);
 
-  const memberDids = useMemo(
-    () => new Set(detail?.members.map((m) => m.did) ?? []),
+  // Members and record authors: an account grant for any of them, including an
+  // author who has since left, covers that account's records here.
+  const accountDids = useMemo(
+    () =>
+      [
+        ...new Set([
+          ...(detail?.members.map((m) => m.did) ?? []),
+          ...(detail?.authors ?? []),
+        ]),
+      ].sort(),
     [detail],
   );
   // Keyed on the loaded space too: member grants only match once that space's
@@ -122,7 +130,7 @@ function SpaceDetailContent() {
     `${id}:${detail?.space.id ?? ""}`,
     (g) =>
       (g.scope === "space" && g.target === id) ||
-      (g.scope === "account" && memberDids.has(g.target)),
+      (g.scope === "account" && accountDids.includes(g.target)),
     Boolean(detail && inspector?.enabled && canInspect),
   );
 
@@ -405,9 +413,9 @@ function SpaceDetailContent() {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value={ALL}>All authors</SelectItem>
-                      {members.map((member) => (
-                        <SelectItem key={member.did} value={member.did}>
-                          <AccountName did={member.did} />
+                      {accountDids.map((did) => (
+                        <SelectItem key={did} value={did}>
+                          <AccountName did={did} />
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -442,7 +450,16 @@ function SpaceDetailContent() {
                             {record.collection}
                           </TableCell>
                           <TableCell className="font-mono text-xs">
-                            {record.rkey}
+                            <button
+                              type="button"
+                              className="underline-offset-2 hover:underline focus-visible:underline"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setViewRecord(record);
+                              }}
+                            >
+                              {record.rkey}
+                            </button>
                           </TableCell>
                           <TableCell className="text-xs whitespace-nowrap">
                             {new Date(record.indexed_at).toLocaleString()}
@@ -558,10 +575,10 @@ function SpaceDetailContent() {
             defaultMinutes={inspector.default_grant_minutes}
             scopeOptions={[
               { scope: "space", target: id, label: "This space (all members)" },
-              ...detail.members.map((m) => ({
+              ...accountDids.map((did) => ({
                 scope: "account" as const,
-                target: m.did,
-                label: <>One member: <AccountName did={m.did} /></>,
+                target: did,
+                label: <>One account: <AccountName did={did} /></>,
               })),
             ]}
             onGranted={(g) => access.setGrant(g)}

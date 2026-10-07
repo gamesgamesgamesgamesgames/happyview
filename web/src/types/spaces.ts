@@ -36,6 +36,8 @@ export interface AdminSpaceCollection {
 export interface AdminSpaceDetail {
   space: AdminSpace
   members: AdminSpaceMember[]
+  /** Every DID with records in the space, members or not. */
+  authors: string[]
   collections: AdminSpaceCollection[]
 }
 

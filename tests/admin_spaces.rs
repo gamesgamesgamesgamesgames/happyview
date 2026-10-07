@@ -788,3 +788,32 @@ async fn grant_reads_are_paginated() {
     assert_ne!(first["events"][0]["id"], second["events"][0]["id"]);
     assert_ne!(first["events"][1]["id"], second["events"][0]["id"]);
 }
+
+#[tokio::test]
+#[serial]
+async fn space_detail_lists_authors_who_are_not_members() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    let former = "did:plc:adminspaces-former";
+    seed_blob_record(&app, &id, "main", former, "f1", "bafkformer").await;
+    enable_inspector(&app).await;
+
+    let body = json_body(get(&app, &format!("/admin/spaces/{id}"), None).await).await;
+    let authors: Vec<&str> = body["authors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert!(authors.contains(&former), "{authors:?}");
+    assert!(authors.contains(&MEMBER), "{authors:?}");
+    assert!(
+        !body["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["did"] == former),
+        "the former author is not a member"
+    );
+}

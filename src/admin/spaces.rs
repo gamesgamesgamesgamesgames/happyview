@@ -132,10 +132,12 @@ pub(super) async fn get_space(
     let members = members::resolve_members(&state.db, state.db_backend, &space.id).await?;
     let collections =
         db::count_space_records_by_collection(&state.db, state.db_backend, &space.id).await?;
+    let authors = db::list_space_authors(&state.db, state.db_backend, &space.id).await?;
 
     Ok(Json(serde_json::json!({
         "space": space_json(&space),
         "members": members,
+        "authors": authors,
         "collections": collections
             .into_iter()
             .map(|(collection, count)| serde_json::json!({

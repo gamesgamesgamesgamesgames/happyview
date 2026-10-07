@@ -197,7 +197,18 @@ function AccountView() {
                         <TableRow key={r.uri} className="cursor-pointer" onClick={() => setViewRecord(r)}>
                           <TableCell className="font-mono text-xs break-all">{r.space_uri}</TableCell>
                           <TableCell className="font-mono text-xs">{r.collection}</TableCell>
-                          <TableCell className="font-mono text-xs">{r.rkey}</TableCell>
+                          <TableCell className="font-mono text-xs">
+                            <button
+                              type="button"
+                              className="underline-offset-2 hover:underline focus-visible:underline"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setViewRecord(r);
+                              }}
+                            >
+                              {r.rkey}
+                            </button>
+                          </TableCell>
                           <TableCell className="text-xs whitespace-nowrap">
                             {new Date(r.indexed_at).toLocaleString()}
                           </TableCell>
