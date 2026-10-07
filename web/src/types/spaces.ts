@@ -53,3 +53,34 @@ export interface AdminListSpaceRecordsResponse {
   records: AdminSpaceRecord[]
   cursor?: string
 }
+
+export type GrantScope = "space" | "account"
+
+export interface AccessGrant {
+  id: string
+  user_id: string
+  user_did: string
+  scope: GrantScope
+  target: string
+  reason: string
+  created_at: string
+  expires_at: string
+  revoked_at: string | null
+  revoked_by: string | null
+}
+
+export interface InspectorStatus {
+  enabled: boolean
+  default_grant_minutes: number
+  max_grant_minutes: number
+}
+
+export interface AdminAccountSpace {
+  space: AdminSpace
+  record_count: number
+}
+
+export interface AdminAccountRecord extends AdminSpaceRecord {
+  space_id: string
+  space_uri: string
+}

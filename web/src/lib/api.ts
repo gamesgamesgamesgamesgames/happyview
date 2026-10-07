@@ -21,8 +21,13 @@ import type {
   AdminListSpaceRecordsResponse,
   AdminListSpacesResponse,
   AdminSpaceDetail,
+  AccessGrant,
+  GrantScope,
+  InspectorStatus,
+  AdminAccountSpace,
+  AdminAccountRecord,
 } from "@/types/spaces";
-import type { EventsListResponse } from "@/types/events";
+import type { EventLogEntry, EventsListResponse } from "@/types/events";
 import type { ScriptVariableSummary } from "@/types/script-variables";
 import type {
   Script,
@@ -614,6 +619,70 @@ export function getAdminSpaceRecords(
 /** Opening this URL is written to the event log. */
 export function adminSpaceBlobUrl(id: string, cid: string) {
   return `${BASE_PATH}/admin/spaces/${encodeURIComponent(id)}/blob?${new URLSearchParams({ cid })}`;
+}
+
+export const SPACE_ACCESS_GRANT_REQUIRED = "SpaceAccessGrantRequired";
+export const SPACE_INSPECTOR_DISABLED = "SpaceInspectorDisabled";
+
+export function getInspectorStatus() {
+  return apiFetch<InspectorStatus>("/admin/spaces/inspector");
+}
+
+export function listAccessGrants(active = true) {
+  return apiFetch<{ grants: AccessGrant[] }>(
+    `/admin/spaces/access-grants?active=${active}`,
+  );
+}
+
+export function createAccessGrant(body: {
+  scope: GrantScope;
+  target: string;
+  reason: string;
+  duration_minutes: number;
+}) {
+  return apiFetch<AccessGrant>("/admin/spaces/access-grants", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function revokeAccessGrant(id: string) {
+  return apiFetch<AccessGrant>(
+    `/admin/spaces/access-grants/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function getGrantReads(id: string) {
+  return apiFetch<{ events: EventLogEntry[] }>(
+    `/admin/spaces/access-grants/${encodeURIComponent(id)}/reads`,
+  );
+}
+
+export function getAccountSpaces(did: string) {
+  return apiFetch<{ spaces: AdminAccountSpace[] }>(
+    `/admin/accounts/${encodeURIComponent(did)}/spaces`,
+  );
+}
+
+/** Reading an account's records is written to the event log. */
+export function getAccountSpaceRecords(
+  did: string,
+  options: {
+    space?: string;
+    collection?: string;
+    limit?: number;
+    cursor?: string;
+  } = {},
+) {
+  const params = new URLSearchParams();
+  if (options.space) params.set("space", options.space);
+  if (options.collection) params.set("collection", options.collection);
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.cursor) params.set("cursor", options.cursor);
+  return apiFetch<{ records: AdminAccountRecord[]; cursor?: string }>(
+    `/admin/accounts/${encodeURIComponent(did)}/space-records?${params}`,
+  );
 }
 
 export function deleteCollectionRecords(collection: string) {
