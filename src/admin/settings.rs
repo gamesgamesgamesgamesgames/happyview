@@ -28,12 +28,69 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
     ("backfill_retention_days", "BACKFILL_RETENTION_DAYS"),
     ("client_uri", "CLIENT_URI"),
     ("event_log_retention_days", "EVENT_LOG_RETENTION_DAYS"),
+    ("feature.space_inspector_enabled", "SPACE_INSPECTOR_ENABLED"),
     ("feature.spaces_enabled", "FEATURE_SPACES_ENABLED"),
     ("logo_uri", "LOGO_URI"),
+    (
+        "space_access_log_retention_days",
+        "SPACE_ACCESS_LOG_RETENTION_DAYS",
+    ),
+    (
+        "space_inspector_max_grant_minutes",
+        "SPACE_INSPECTOR_MAX_GRANT_MINUTES",
+    ),
     ("tos_uri", "TOS_URI"),
     ("policy_uri", "POLICY_URI"),
     ("verbose_event_logging", "VERBOSE_EVENT_LOGGING"),
 ];
+
+/// Settings whose changes are written as protected events: turning the space
+/// inspector on or off, and shortening how long the audit trail is kept.
+///
+/// Compares effective values, env fallback included, so a save that rewrites
+/// an unchanged value logs nothing.
+async fn log_audited_setting_change(
+    state: &AppState,
+    auth: &UserAuth,
+    key: &str,
+    before: Option<String>,
+    after: Option<String>,
+) {
+    let event = match key {
+        crate::feature_flags::FeatureFlag::SPACE_INSPECTOR => {
+            let on = |v: &Option<String>| {
+                v.as_deref()
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+            };
+            match (on(&before), on(&after)) {
+                (false, true) => Some(("space_inspector.enabled", serde_json::json!({}))),
+                (true, false) => Some(("space_inspector.disabled", serde_json::json!({}))),
+                _ => None,
+            }
+        }
+        "event_log_retention_days" | "space_access_log_retention_days" if before != after => {
+            Some((
+                "event_logs.retention_changed",
+                serde_json::json!({ "from": before, "to": after }),
+            ))
+        }
+        _ => None,
+    };
+    if let Some((event_type, detail)) = event {
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: event_type.to_string(),
+                severity: Severity::Warn,
+                actor_did: Some(auth.did.clone()),
+                subject: Some(key.to_string()),
+                detail,
+            },
+            state.db_backend,
+        )
+        .await;
+    }
+}
 
 /// Resolve a setting value: check the DB first, then fall back to env var.
 pub async fn get_setting(pool: &AnyPool, key: &str, backend: DatabaseBackend) -> Option<String> {
@@ -116,6 +173,7 @@ pub(super) async fn upsert(
     auth.require(Permission::SettingsManage).await?;
 
     let backend = state.db_backend;
+    let before = get_setting(&state.db, &key, backend).await;
     let now = now_rfc3339();
     let sql = adapt_sql(
         r#"
@@ -148,6 +206,9 @@ pub(super) async fn upsert(
     )
     .await;
 
+    let after = get_setting(&state.db, &key, backend).await;
+    log_audited_setting_change(&state, &auth, &key, before, after).await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -160,6 +221,7 @@ pub(super) async fn delete(
     auth.require(Permission::SettingsManage).await?;
 
     let backend = state.db_backend;
+    let before = get_setting(&state.db, &key, backend).await;
     let sql = adapt_sql(
         "DELETE FROM happyview_instance_settings WHERE key = ?",
         backend,
@@ -180,12 +242,15 @@ pub(super) async fn delete(
             event_type: "setting.deleted".to_string(),
             severity: Severity::Info,
             actor_did: Some(auth.did.clone()),
-            subject: Some(key),
+            subject: Some(key.clone()),
             detail: serde_json::json!({}),
         },
         state.db_backend,
     )
     .await;
+
+    let after = get_setting(&state.db, &key, backend).await;
+    log_audited_setting_change(&state, &auth, &key, before, after).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

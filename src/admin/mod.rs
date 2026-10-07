@@ -24,6 +24,7 @@ mod scripts;
 mod service_entries;
 mod service_identity;
 pub mod settings;
+pub(crate) mod space_access;
 mod spaces;
 pub mod spaces_migration;
 mod stats;
@@ -81,6 +82,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             get(spaces_migration::migration_status),
         )
         .route("/spaces", get(spaces::list_spaces))
+        .route("/spaces/inspector", get(space_access::inspector_status))
         .route("/spaces/{id}", get(spaces::get_space))
         .route("/spaces/{id}/records", get(spaces::list_space_records))
         .route("/spaces/{id}/blob", get(spaces::get_space_blob))
