@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import { useCallbackRef } from "@/hooks/use-callback-ref";
 import { listAccessGrants, revokeAccessGrant } from "@/lib/api";
+import { toastError } from "@/lib/format";
 import type { AccessGrant } from "@/types/spaces";
 
 /**
@@ -27,8 +28,9 @@ export function useAccessGrant(
         .filter((g) => matchRef(g))
         .sort((a, b) => Date.parse(b.expires_at) - Date.parse(a.expires_at));
       setGrant(matching[0] ?? null);
-    } catch {
+    } catch (e) {
       setGrant(null);
+      toastError("Couldn't load access grants", e);
     } finally {
       setNow(Date.now());
     }
@@ -57,7 +59,9 @@ export function useAccessGrant(
     if (!grant) return;
     await revokeAccessGrant(grant.id);
     setGrant(null);
-  }, [grant]);
+    // Another grant may still cover the page.
+    await refresh();
+  }, [grant, refresh]);
 
   const drop = useCallback(() => setGrant(null), []);
 
