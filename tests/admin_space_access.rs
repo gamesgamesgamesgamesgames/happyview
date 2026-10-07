@@ -3,6 +3,7 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use happyview::db::adapt_sql;
+use happyview::spaces::types::{AppAccess, Policy, Space, SpaceConfig};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -349,4 +350,111 @@ async fn revoking_someone_elses_grant_needs_users_update() {
     let detail: Value =
         serde_json::from_str(&events_of(&app, "space.access_revoked").await[0].1).unwrap();
     assert_eq!(detail["revoked_by"], app.admin_did);
+}
+
+async fn revoke_with_key(app: &TestApp, key: &str, id: &str) -> StatusCode {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/admin/spaces/access-grants/{id}"))
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::empty())
+        .unwrap();
+    app.router.clone().oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+#[serial]
+async fn owners_can_revoke_their_grant_with_users_update() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    let grant = json_body(
+        create_grant(
+            &app,
+            json!({ "scope": "account", "target": "did:plc:abc", "reason": "r" }),
+        )
+        .await,
+    )
+    .await;
+    let id = grant["id"].as_str().unwrap();
+
+    let key = common::api_key(&app, &["spaces:read"]).await;
+    assert_eq!(revoke_with_key(&app, &key, id).await, StatusCode::FORBIDDEN);
+
+    let key = common::api_key(&app, &["users:update"]).await;
+    assert_eq!(revoke_with_key(&app, &key, id).await, StatusCode::OK);
+    assert_eq!(events_of(&app, "space.access_revoked").await.len(), 1);
+}
+
+async fn seed_space(app: &TestApp) -> String {
+    let now = happyview::db::now_rfc3339();
+    let id = uuid::Uuid::new_v4().to_string();
+    let space = Space {
+        id: id.clone(),
+        did: "did:plc:spaceaccess-creator".to_string(),
+        authority_did: "did:plc:spaceaccess-creator".to_string(),
+        creator_did: "did:plc:spaceaccess-creator".to_string(),
+        type_nsid: "com.example.spaceaccess".to_string(),
+        skey: "main".to_string(),
+        display_name: None,
+        description: None,
+        read_policy: Policy::MemberList,
+        write_policy: Policy::MemberList,
+        app_access: AppAccess::Open,
+        config: SpaceConfig::default(),
+        revision: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    happyview::spaces::db::create_space(&app.state.db, app.state.db_backend, &space)
+        .await
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+#[serial]
+async fn revoking_a_space_grant_logs_the_space_uri() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    let space_id = seed_space(&app).await;
+    let grant = json_body(
+        create_grant(
+            &app,
+            json!({ "scope": "space", "target": space_id, "reason": "r" }),
+        )
+        .await,
+    )
+    .await;
+    let id = grant["id"].as_str().unwrap();
+    let resp = send(
+        &app,
+        "DELETE",
+        &format!("/admin/spaces/access-grants/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let granted = events_of(&app, "space.access_granted").await;
+    let revoked = events_of(&app, "space.access_revoked").await;
+    assert_eq!(
+        granted[0].0.as_deref(),
+        Some("at://did:plc:spaceaccess-creator/space/com.example.spaceaccess/main")
+    );
+    assert_eq!(revoked[0].0, granted[0].0);
+
+    // A grant whose space no longer exists falls back to the raw target.
+    let gone = foreign_grant(&app, "space", "deleted-space").await;
+    let resp = send(
+        &app,
+        "DELETE",
+        &format!("/admin/spaces/access-grants/{gone}"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let revoked = events_of(&app, "space.access_revoked").await;
+    assert_eq!(revoked[1].0.as_deref(), Some("deleted-space"));
 }

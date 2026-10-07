@@ -237,22 +237,28 @@ pub async fn list_user_grants(
     rows.into_iter().map(parse_grant).collect()
 }
 
-/// A user's own unrevoked grants, with expiry checked in Rust rather than in
-/// SQL. Unlike `list_user_grants`, this has no row limit: the authorization
-/// path must see every grant the caller holds, not just the most recent 200.
-async fn unrevoked_user_grants(
+/// A user's own unrevoked, unexpired grants. Unlike `list_user_grants`, this
+/// has no row limit: the authorization path must see every grant the caller
+/// holds, not just the most recent 200.
+///
+/// Grants store `expires_at` as UTC `to_rfc3339()` text, which sorts as a
+/// string, so the SQL bound skips long-expired rows. Callers still check
+/// `Grant::is_active`, which is the authority on expiry.
+async fn unexpired_user_grants(
     pool: &AnyPool,
     backend: DatabaseBackend,
     user_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<Grant>, AppError> {
     let sql = adapt_sql(
         &format!(
-            "SELECT {GRANT_COLUMNS} FROM happyview_space_access_grants WHERE user_id = ? AND revoked_at IS NULL"
+            "SELECT {GRANT_COLUMNS} FROM happyview_space_access_grants WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?"
         ),
         backend,
     );
     let rows: Vec<GrantRow> = crate::db::query_as(&sql)
         .bind(user_id)
+        .bind(now.to_rfc3339())
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to list active access grants: {e}")))?;
@@ -305,7 +311,7 @@ pub async fn active_grants(state: &AppState, auth: &UserAuth) -> Result<Vec<Gran
     }
     let now = chrono::Utc::now();
     Ok(
-        unrevoked_user_grants(&state.db, state.db_backend, &auth.user_id)
+        unexpired_user_grants(&state.db, state.db_backend, &auth.user_id, now)
             .await?
             .into_iter()
             .filter(|g| g.is_active(now))
@@ -449,7 +455,8 @@ pub(super) async fn list_grants(
 }
 
 /// DELETE /admin/spaces/access-grants/{id} — end a grant early. Owners end
-/// their own; `users:update` ends anyone's.
+/// their own with `spaces:inspect` or `users:update`; `users:update` ends
+/// anyone's.
 pub(super) async fn revoke_grant(
     State(state): State<AppState>,
     auth: UserAuth,
@@ -458,10 +465,10 @@ pub(super) async fn revoke_grant(
     let grant = get_grant(&state.db, state.db_backend, &id)
         .await?
         .ok_or_else(|| AppError::NotFound("Access grant not found".into()))?;
-    if grant.user_id == auth.user_id {
-        auth.require(Permission::SpacesInspect).await?;
-    } else {
+    if grant.user_id != auth.user_id {
         auth.require(Permission::UsersUpdate).await?;
+    } else if !auth.has(Permission::UsersUpdate) {
+        auth.require(Permission::SpacesInspect).await?;
     }
     if !grant.is_active(chrono::Utc::now()) {
         return Ok(Json(grant));
@@ -469,13 +476,24 @@ pub(super) async fn revoke_grant(
 
     let at = now_rfc3339();
     mark_revoked(&state.db, state.db_backend, &grant.id, &auth.user_id, &at).await?;
+    // The space may have been deleted since the grant was made; the subject
+    // then falls back to the raw target.
+    let space = match grant.scope {
+        GrantScope::Space => {
+            crate::spaces::db::get_space(&state.db, state.db_backend, &grant.target)
+                .await
+                .ok()
+                .flatten()
+        }
+        GrantScope::Account => None,
+    };
     log_event(
         &state.db,
         EventLog {
             event_type: "space.access_revoked".to_string(),
             severity: Severity::Info,
             actor_did: Some(auth.did.clone()),
-            subject: Some(grant.target.clone()),
+            subject: Some(grant_subject(&grant, space.as_ref())),
             detail: serde_json::json!({
                 "grant_id": grant.id,
                 "revoked_by": auth.did,
