@@ -47,6 +47,10 @@ pub const PROTECTED_EVENT_TYPES: &[&str] = &[
 /// sweeps them, in days.
 pub const SPACE_ACCESS_RETENTION_SETTING: &str = "space_access_log_retention_days";
 
+/// Default retention for unprotected events, in days, when the setting is
+/// unset or unparseable.
+pub const DEFAULT_RETENTION_DAYS: u32 = 30;
+
 /// Default retention for protected events, in days, when the setting is unset
 /// or unparseable.
 pub const DEFAULT_PROTECTED_RETENTION_DAYS: u32 = 365;
@@ -317,9 +321,9 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
                     error = %e,
                     "event_log_retention_days is not a valid non-negative integer, defaulting to 30"
                 );
-                30
+                DEFAULT_RETENTION_DAYS
             }),
-            None => 30,
+            None => DEFAULT_RETENTION_DAYS,
         };
 
         let protected_days =

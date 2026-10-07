@@ -114,7 +114,7 @@ See [Backfill](./backfill.md) for background on backfill jobs.
 | --------------------------------- | -------- | ------------------------------------------------------------------ | --------------- |
 | `event_logs.retention_changed`    | warn     | Setting key (`event_log_retention_days` or `space_access_log_retention_days`) | `from`, `to` |
 
-Logged when a retention setting's effective value changes, env fallback included — saving a setting back to its current value logs nothing. See [Protected events](#protected-events) below.
+Logged when a retention setting's effective value changes, env fallback included. An unset or unparseable value counts as its default (30 days for `event_log_retention_days`, 365 for `space_access_log_retention_days`), so saving a setting back to its current or default value logs nothing. `from` and `to` are the effective day counts. See [Protected events](#protected-events) below.
 
 ### Jetstream events
 

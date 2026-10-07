@@ -101,7 +101,30 @@ async fn saving_the_same_value_twice_logs_once() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].0.as_deref(), Some("event_log_retention_days"));
     let detail: Value = serde_json::from_str(&changes[0].1).unwrap();
-    assert_eq!(detail["to"], "14");
+    assert_eq!(detail["from"], 30);
+    assert_eq!(detail["to"], 14);
+}
+
+#[tokio::test]
+#[serial]
+async fn saving_a_retention_default_logs_nothing() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    put_setting(&app, "space_access_log_retention_days", "365").await;
+    put_setting(&app, "event_log_retention_days", "30").await;
+    assert!(
+        events_of(&app, "event_logs.retention_changed")
+            .await
+            .is_empty(),
+        "an unset retention setting already holds its default"
+    );
+
+    put_setting(&app, "space_access_log_retention_days", "14").await;
+    let changes = events_of(&app, "event_logs.retention_changed").await;
+    assert_eq!(changes.len(), 1);
+    let detail: Value = serde_json::from_str(&changes[0].1).unwrap();
+    assert_eq!(detail["from"], 365);
+    assert_eq!(detail["to"], 14);
 }
 
 #[tokio::test]

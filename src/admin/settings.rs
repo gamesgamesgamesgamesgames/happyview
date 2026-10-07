@@ -8,7 +8,10 @@ use std::env;
 use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::event_log::{EventLog, Severity, log_event};
+use crate::event_log::{
+    DEFAULT_PROTECTED_RETENTION_DAYS, DEFAULT_RETENTION_DAYS, EventLog,
+    SPACE_ACCESS_RETENTION_SETTING, Severity, log_event,
+};
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -45,7 +48,7 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
 ];
 
 /// Settings whose changes are written as protected events: turning the space
-/// inspector on or off, and shortening how long the audit trail is kept.
+/// inspector on or off, and changing how long event logs are kept.
 ///
 /// Compares effective values, env fallback included, so a save that rewrites
 /// an unchanged value logs nothing.
@@ -68,11 +71,27 @@ async fn log_audited_setting_change(
                 _ => None,
             }
         }
-        "event_log_retention_days" | "space_access_log_retention_days" if before != after => {
-            Some((
-                "event_logs.retention_changed",
-                serde_json::json!({ "from": before, "to": after }),
-            ))
+        "event_log_retention_days" | SPACE_ACCESS_RETENTION_SETTING => {
+            // An unset or unparseable value counts as the default the
+            // retention sweep uses in its place.
+            let effective = |v: &Option<String>| -> u32 {
+                if key == SPACE_ACCESS_RETENTION_SETTING {
+                    v.as_deref()
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(DEFAULT_PROTECTED_RETENTION_DAYS)
+                } else {
+                    v.as_deref()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(DEFAULT_RETENTION_DAYS)
+                }
+            };
+            let (from, to) = (effective(&before), effective(&after));
+            (from != to).then(|| {
+                (
+                    "event_logs.retention_changed",
+                    serde_json::json!({ "from": from, "to": to }),
+                )
+            })
         }
         _ => None,
     };
