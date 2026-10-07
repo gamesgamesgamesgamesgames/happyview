@@ -19,7 +19,7 @@ impl FeatureFlag {
 pub async fn is_enabled(pool: &AnyPool, key: &str, backend: DatabaseBackend) -> bool {
     get_setting(pool, key, backend)
         .await
-        .map(|v| v.eq_ignore_ascii_case("true"))
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 

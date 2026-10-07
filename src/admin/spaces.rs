@@ -152,16 +152,20 @@ pub(super) async fn list_space_records(
     Path(id): Path<String>,
     Query(params): Query<ListSpaceRecordsParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // Permission and switch first, so a caller who can't read contents
+    // learns nothing about which spaces exist.
+    let grants = space_access::active_grants(&state, &auth).await?;
     let space = load_space(&state, &id).await?;
-    let grant = space_access::require_grant(
-        &state,
-        &auth,
-        space_access::Covers::Space {
+    let grant = space_access::select_covering(
+        &grants,
+        &space_access::Covers::Space {
             space_id: &space.id,
             repo: params.repo.as_deref(),
         },
+        chrono::Utc::now(),
     )
-    .await?;
+    .cloned()
+    .ok_or_else(space_access::grant_required)?;
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
     let (records, cursor) = db::list_space_records(
@@ -218,8 +222,8 @@ pub(super) async fn get_space_blob(
     Path(id): Path<String>,
     Query(params): Query<GetSpaceBlobParams>,
 ) -> Result<impl IntoResponse, AppError> {
-    let space = load_space(&state, &id).await?;
     let grants = space_access::active_grants(&state, &auth).await?;
+    let space = load_space(&state, &id).await?;
     let now = chrono::Utc::now();
 
     // A space grant opens any blob in the space. An account grant opens a

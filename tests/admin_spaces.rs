@@ -268,7 +268,31 @@ async fn unknown_space_is_not_found() {
 
     let resp = get(&app, "/admin/spaces/does-not-exist", None).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Content routes check the switch before looking the space up.
+    for uri in [
+        "/admin/spaces/does-not-exist/records",
+        "/admin/spaces/does-not-exist/blob?cid=bafyunknown",
+    ] {
+        let resp = get(&app, uri, None).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(resp).await["error"], "SpaceInspectorDisabled");
+    }
+
+    let key = common::api_key(&app, &["spaces:read"]).await;
+    let resp = get(&app, "/admin/spaces/does-not-exist/records", Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["error"], "InsufficientPermissions");
+
+    enable_inspector(&app).await;
     let resp = get(&app, "/admin/spaces/does-not-exist/records", None).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = get(
+        &app,
+        "/admin/spaces/does-not-exist/blob?cid=bafyunknown",
+        None,
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 

@@ -90,6 +90,17 @@ async fn toggling_the_inspector_logs_each_change() {
 
 #[tokio::test]
 #[serial]
+async fn padded_true_turns_the_inspector_on() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    put_setting(&app, "feature.space_inspector_enabled", " true ").await;
+    let body = json_body(send(&app, "GET", "/admin/spaces/inspector", None).await).await;
+    assert_eq!(body["enabled"], true);
+    assert_eq!(events_of(&app, "space_inspector.enabled").await.len(), 1);
+}
+
+#[tokio::test]
+#[serial]
 async fn saving_the_same_value_twice_logs_once() {
     common::require_db!();
     let app = TestApp::new().await;
