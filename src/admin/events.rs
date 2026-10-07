@@ -12,7 +12,7 @@ use crate::AppState;
 use crate::db::{adapt_sql, parse_dt};
 use crate::error::AppError;
 use crate::event_log::{
-    EventFilter, EventLog, ProtectedEvents, Severity, log_event, normalize_rfc3339,
+    EventFilter, EventLog, ProtectedEvents, Severity, log_event, names_protected, normalize_rfc3339,
 };
 
 #[derive(Deserialize)]
@@ -166,7 +166,8 @@ pub struct PurgeBody {
 ///
 /// The dashboard calls this before offering to purge. It shares
 /// `filter_from_query` with the list endpoint and the purge job, so the number
-/// shown is the number deleted.
+/// shown is the number deleted — this handler is the purge preview, so it
+/// excludes protected events the same way the purge itself does.
 ///
 /// Reuses `EventsQuery` for convenience, but `cursor` and `limit` are ignored —
 /// a count of a paginated slice would be meaningless.
@@ -177,7 +178,9 @@ pub(super) async fn count_events(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::EventsRead).await?;
 
-    let (frag, binds) = filter_from_query(&query)?.build();
+    let mut filter = filter_from_query(&query)?;
+    filter.protected = ProtectedEvents::Exclude;
+    let (frag, binds) = filter.build();
     let sql = adapt_sql(
         &format!("SELECT COUNT(*) FROM happyview_event_logs WHERE 1=1{frag}"),
         state.db_backend,
@@ -218,6 +221,11 @@ pub(super) async fn purge_events(
         limit: None,
     };
     let filter = filter_from_query(&query)?;
+    if names_protected(&filter) {
+        return Err(AppError::BadRequest(
+            "Space access and purge records can't be purged. They're removed only by space_access_log_retention_days.".into(),
+        ));
+    }
 
     let input = serde_json::json!({
         "event_type": filter.event_type,
@@ -226,6 +234,7 @@ pub(super) async fn purge_events(
         "subject": filter.subject,
         "after": filter.after,
         "before": filter.before,
+        "protected": "exclude",
     });
 
     let job_id = crate::jobs::db::create_job(

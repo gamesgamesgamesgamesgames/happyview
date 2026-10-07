@@ -39,7 +39,9 @@ fn filter_from_input(input: &serde_json::Value) -> EventFilter {
         subject: field("subject"),
         after: field("after"),
         before: field("before"),
-        protected: ProtectedEvents::Include,
+        // Protected events are never purged, whatever the input says; see
+        // `event_log::PROTECTED_EVENT_TYPES`.
+        protected: ProtectedEvents::Exclude,
     }
 }
 
