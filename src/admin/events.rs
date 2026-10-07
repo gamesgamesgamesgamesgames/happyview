@@ -11,7 +11,9 @@ use super::permissions::Permission;
 use crate::AppState;
 use crate::db::{adapt_sql, parse_dt};
 use crate::error::AppError;
-use crate::event_log::{EventFilter, EventLog, Severity, log_event, normalize_rfc3339};
+use crate::event_log::{
+    EventFilter, EventLog, ProtectedEvents, Severity, log_event, normalize_rfc3339,
+};
 
 #[derive(Deserialize)]
 pub struct EventsQuery {
@@ -56,6 +58,7 @@ pub(super) fn filter_from_query(q: &EventsQuery) -> Result<EventFilter, AppError
         subject: text(&q.subject),
         after: norm(&q.after)?,
         before: norm(&q.before)?,
+        protected: ProtectedEvents::Include,
     })
 }
 

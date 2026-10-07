@@ -30,6 +30,55 @@ pub struct EventLog {
     pub detail: Value,
 }
 
+/// Events that record access to private data and changes to the audit trail
+/// itself. Manual purges never delete them; retention removes them on their
+/// own schedule (`space_access_log_retention_days`).
+pub const PROTECTED_EVENT_TYPES: &[&str] = &[
+    "space.access_granted",
+    "space.access_revoked",
+    "space.moderator_read",
+    "space_inspector.enabled",
+    "space_inspector.disabled",
+    "event_logs.purged",
+    "event_logs.retention_changed",
+];
+
+/// Setting key for how long protected events are kept before retention
+/// sweeps them, in days.
+pub const SPACE_ACCESS_RETENTION_SETTING: &str = "space_access_log_retention_days";
+
+/// Default retention for protected events, in days, when the setting is unset
+/// or unparseable.
+pub const DEFAULT_PROTECTED_RETENTION_DAYS: u32 = 365;
+
+/// How an `EventFilter` treats `PROTECTED_EVENT_TYPES`.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub enum ProtectedEvents {
+    /// Match protected and unprotected rows alike (the historical behaviour).
+    #[default]
+    Include,
+    /// Match only unprotected rows.
+    Exclude,
+    /// Match only protected rows.
+    Only,
+}
+
+/// True when a filter names a protected type or a category containing one.
+pub fn names_protected(filter: &EventFilter) -> bool {
+    let type_hit = filter
+        .event_type
+        .as_deref()
+        .is_some_and(|t| PROTECTED_EVENT_TYPES.contains(&t));
+    let category_hit = filter.category.as_deref().is_some_and(|c| {
+        c.split(',').map(str::trim).any(|part| {
+            PROTECTED_EVENT_TYPES
+                .iter()
+                .any(|t| t.starts_with(&format!("{part}.")))
+        })
+    });
+    type_hit || category_hit
+}
+
 /// A filter over `happyview_event_logs`, shared by the admin list and count
 /// endpoints, the purge job, and the retention sweep.
 ///
@@ -49,6 +98,9 @@ pub struct EventFilter {
     pub after: Option<String>,
     /// Exclusive upper bound on `created_at`.
     pub before: Option<String>,
+    /// Whether protected event types (`PROTECTED_EVENT_TYPES`) are included,
+    /// excluded, or the only rows matched.
+    pub protected: ProtectedEvents,
 }
 
 impl EventFilter {
@@ -100,6 +152,19 @@ impl EventFilter {
             binds.push(before.clone());
         }
 
+        let placeholders = vec!["?"; PROTECTED_EVENT_TYPES.len()].join(",");
+        match self.protected {
+            ProtectedEvents::Include => {}
+            ProtectedEvents::Exclude => {
+                sql.push_str(&format!(" AND event_type NOT IN ({placeholders})"));
+                binds.extend(PROTECTED_EVENT_TYPES.iter().map(|t| t.to_string()));
+            }
+            ProtectedEvents::Only => {
+                sql.push_str(&format!(" AND event_type IN ({placeholders})"));
+                binds.extend(PROTECTED_EVENT_TYPES.iter().map(|t| t.to_string()));
+            }
+        }
+
         (sql, binds)
     }
 }
@@ -138,10 +203,12 @@ const SWEEP_BATCH_SIZE: i64 = 5000;
 pub async fn sweep_with_cutoff(
     db: &AnyPool,
     cutoff: &str,
+    protected: ProtectedEvents,
     backend: DatabaseBackend,
 ) -> SweepOutcome {
     let filter = EventFilter {
         before: Some(cutoff.to_string()),
+        protected,
         ..Default::default()
     };
     let (frag, binds) = filter.build();
@@ -198,20 +265,31 @@ pub async fn sweep_with_cutoff(
     SweepOutcome { deleted, vacuumed }
 }
 
-/// Sweep rows older than `retention_days`. A retention of `0` is a no-op.
+/// Sweep unprotected rows older than `retention_days` and protected rows
+/// older than `protected_retention_days`. A value of `0` skips that pass.
 pub async fn run_retention_sweep(
     db: &AnyPool,
     retention_days: u32,
+    protected_retention_days: u32,
     backend: DatabaseBackend,
 ) -> SweepOutcome {
-    if retention_days == 0 {
-        return SweepOutcome {
-            deleted: 0,
-            vacuumed: false,
-        };
+    let mut outcome = SweepOutcome {
+        deleted: 0,
+        vacuumed: false,
+    };
+    for (days, mode) in [
+        (retention_days, ProtectedEvents::Exclude),
+        (protected_retention_days, ProtectedEvents::Only),
+    ] {
+        if days == 0 {
+            continue;
+        }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let pass = sweep_with_cutoff(db, &cutoff, mode, backend).await;
+        outcome.deleted += pass.deleted;
+        outcome.vacuumed |= pass.vacuumed;
     }
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
-    sweep_with_cutoff(db, &cutoff, backend).await
+    outcome
 }
 
 /// Hourly retention sweep.
@@ -244,7 +322,13 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
             None => 30,
         };
 
-        let outcome = run_retention_sweep(&db, retention_days, backend).await;
+        let protected_days =
+            crate::admin::settings::get_setting(&db, SPACE_ACCESS_RETENTION_SETTING, backend)
+                .await
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(DEFAULT_PROTECTED_RETENTION_DAYS);
+
+        let outcome = run_retention_sweep(&db, retention_days, protected_days, backend).await;
         if outcome.deleted > 0 {
             tracing::info!(
                 count = outcome.deleted,
@@ -450,16 +534,21 @@ mod tests {
         pool
     }
 
-    async fn insert_at(pool: &AnyPool, id: &str, created_at: &str) {
+    async fn insert_typed(pool: &AnyPool, id: &str, event_type: &str, created_at: &str) {
         crate::db::query(
             "INSERT INTO happyview_event_logs (id, event_type, severity, detail, created_at)
-             VALUES (?, 'record.skipped', 'info', '{}', ?)",
+             VALUES (?, ?, 'info', '{}', ?)",
         )
         .bind(id)
+        .bind(event_type)
         .bind(created_at)
         .execute(pool)
         .await
         .expect("insert event");
+    }
+
+    async fn insert_at(pool: &AnyPool, id: &str, created_at: &str) {
+        insert_typed(pool, id, "record.skipped", created_at).await;
     }
 
     async fn remaining_ids(pool: &AnyPool) -> Vec<String> {
@@ -482,8 +571,13 @@ mod tests {
         insert_at(&pool, "boundary", "2026-07-08T16:00:00+00:00").await;
         insert_at(&pool, "newer", "2026-07-08T20:00:00+00:00").await;
 
-        let outcome =
-            sweep_with_cutoff(&pool, "2026-07-08T16:00:00+00:00", DatabaseBackend::Sqlite).await;
+        let outcome = sweep_with_cutoff(
+            &pool,
+            "2026-07-08T16:00:00+00:00",
+            ProtectedEvents::Exclude,
+            DatabaseBackend::Sqlite,
+        )
+        .await;
 
         assert_eq!(outcome.deleted, 1, "only the row before the cutoff goes");
         assert_eq!(
@@ -498,13 +592,23 @@ mod tests {
         let pool = pool_with_events().await;
         insert_at(&pool, "old", "2026-01-01T00:00:00+00:00").await;
 
-        let hit =
-            sweep_with_cutoff(&pool, "2026-07-08T16:00:00+00:00", DatabaseBackend::Sqlite).await;
+        let hit = sweep_with_cutoff(
+            &pool,
+            "2026-07-08T16:00:00+00:00",
+            ProtectedEvents::Exclude,
+            DatabaseBackend::Sqlite,
+        )
+        .await;
         assert_eq!(hit.deleted, 1);
         assert!(hit.vacuumed, "a sweep that freed pages reclaims them");
 
-        let miss =
-            sweep_with_cutoff(&pool, "2026-07-08T16:00:00+00:00", DatabaseBackend::Sqlite).await;
+        let miss = sweep_with_cutoff(
+            &pool,
+            "2026-07-08T16:00:00+00:00",
+            ProtectedEvents::Exclude,
+            DatabaseBackend::Sqlite,
+        )
+        .await;
         assert_eq!(miss.deleted, 0);
         assert!(
             !miss.vacuumed,
@@ -517,7 +621,7 @@ mod tests {
         let pool = pool_with_events().await;
         insert_at(&pool, "ancient", "2020-01-01T00:00:00+00:00").await;
 
-        let outcome = run_retention_sweep(&pool, 0, DatabaseBackend::Sqlite).await;
+        let outcome = run_retention_sweep(&pool, 0, 0, DatabaseBackend::Sqlite).await;
 
         assert_eq!(outcome.deleted, 0);
         assert!(!outcome.vacuumed);
@@ -533,9 +637,80 @@ mod tests {
         insert_at(&pool, "ancient", &ancient).await;
         insert_at(&pool, "recent", &recent).await;
 
-        let outcome = run_retention_sweep(&pool, 30, DatabaseBackend::Sqlite).await;
+        let outcome = run_retention_sweep(&pool, 30, 0, DatabaseBackend::Sqlite).await;
 
         assert_eq!(outcome.deleted, 1);
         assert_eq!(remaining_ids(&pool).await, vec!["recent".to_string()]);
+    }
+
+    #[test]
+    fn filter_modes_build_type_clauses() {
+        let excl = EventFilter {
+            protected: ProtectedEvents::Exclude,
+            ..Default::default()
+        };
+        let (sql, binds) = excl.build();
+        assert!(sql.contains("event_type NOT IN"));
+        assert_eq!(binds.len(), PROTECTED_EVENT_TYPES.len());
+        let only = EventFilter {
+            protected: ProtectedEvents::Only,
+            ..Default::default()
+        };
+        assert!(only.build().0.contains(" AND event_type IN ("));
+        assert!(!EventFilter::default().build().0.contains("event_type"));
+    }
+
+    #[test]
+    fn protected_names_are_detected() {
+        let by_type = EventFilter {
+            event_type: Some("space.moderator_read".into()),
+            ..Default::default()
+        };
+        assert!(names_protected(&by_type));
+        let by_category = EventFilter {
+            category: Some("record,space".into()),
+            ..Default::default()
+        };
+        assert!(names_protected(&by_category));
+        let purge_log = EventFilter {
+            category: Some("event_logs".into()),
+            ..Default::default()
+        };
+        assert!(names_protected(&purge_log));
+        let plain = EventFilter {
+            category: Some("record".into()),
+            severity: Some("info".into()),
+            ..Default::default()
+        };
+        assert!(!names_protected(&plain));
+    }
+
+    #[tokio::test]
+    async fn retention_keeps_protected_events_on_their_own_schedule() {
+        let pool = pool_with_events().await;
+        let now = chrono::Utc::now();
+        let days_ago = |d: i64| (now - chrono::Duration::days(d)).to_rfc3339();
+        insert_typed(&pool, "old-plain", "record.skipped", &days_ago(90)).await;
+        insert_typed(&pool, "old-read", "space.moderator_read", &days_ago(90)).await;
+        insert_typed(
+            &pool,
+            "ancient-read",
+            "space.moderator_read",
+            &days_ago(400),
+        )
+        .await;
+        insert_typed(&pool, "ancient-purge", "event_logs.purged", &days_ago(400)).await;
+
+        run_retention_sweep(&pool, 30, 365, DatabaseBackend::Sqlite).await;
+        assert_eq!(remaining_ids(&pool).await, vec!["old-read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn protected_retention_of_zero_keeps_them_forever() {
+        let pool = pool_with_events().await;
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(4000)).to_rfc3339();
+        insert_typed(&pool, "ancient-read", "space.moderator_read", &ancient).await;
+        run_retention_sweep(&pool, 1, 0, DatabaseBackend::Sqlite).await;
+        assert_eq!(remaining_ids(&pool).await, vec!["ancient-read".to_string()]);
     }
 }
