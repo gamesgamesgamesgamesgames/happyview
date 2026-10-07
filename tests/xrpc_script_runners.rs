@@ -474,6 +474,10 @@ async fn a_successful_query_writes_the_executed_row() {
     common::require_db!();
     require_fixture!();
     let app = query_app("value:other").await;
+    // `script.executed` is only written while verbose event logging is on.
+    app.state
+        .verbose_event_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     assert_eq!(call_query(&app, "?limit=5").await.status(), StatusCode::OK);
 
@@ -525,6 +529,10 @@ async fn a_successful_procedure_writes_the_executed_row() {
     common::require_db!();
     require_fixture!();
     let app = procedure_app("value:other").await;
+    // `script.executed` is only written while verbose event logging is on.
+    app.state
+        .verbose_event_logging
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     assert_eq!(
         call_procedure(&app, &json!({ "title": "hello" }))
