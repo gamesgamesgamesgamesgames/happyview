@@ -4,7 +4,7 @@ title: "Spaces"
 
 Browse the [spaces](../../experimental/spaces/index.md) on this instance for moderation. These endpoints give operators access to spaces they are not members of, so they live in the admin API rather than the space XRPC API.
 
-Every route on this page except [Space inspector status](#space-inspector-status) returns `403 SpaceInspectorDisabled` while the space inspector is off (see [Configuration](../../getting-started/configuration.md)). Listing spaces and reading their metadata requires `spaces:read`. Reading a space's records or blobs also requires `spaces:inspect` and an active [access grant](#access-grants) covering the request. Every grant, its revocation, and every read made under it is written to the [event log](../../guides/event-logs.md#space-events) as a protected event that can't be purged by hand. The grant or revocation and its event are written together, and content is returned only after its read event is written: if the event can't be written, the request fails with `500` and nothing changes or is returned.
+While the space inspector is off (see [Configuration](../../getting-started/configuration.md)), listing spaces and accounts, reading a space's metadata or contents, and creating access grants return `403 SpaceInspectorDisabled`. [Space inspector status](#space-inspector-status), listing your own grants, revoking a grant, and listing a grant's reads stay available, so access can still be ended and audited. Listing spaces and reading their metadata requires `spaces:read`. Reading a space's records or blobs also requires `spaces:inspect` and an active [access grant](#access-grants) covering the request. Every grant, its revocation, and every read made under it is written to the [event log](../../guides/event-logs.md#space-events) as a protected event that can't be purged by hand. The grant or revocation and its event are written together, and content is returned only after its read event is written: if the event can't be written, the request fails with `500` and nothing changes or is returned.
 
 ```sh tab="cURL" tab-group="language"
 # All examples assume $TOKEN is an API key (hv_...)
@@ -217,7 +217,7 @@ curl "http://127.0.0.1:3000/admin/spaces?limit=20" -H "$AUTH"
 GET /admin/spaces/{id}
 ```
 
-A space's metadata, its resolved member list (including members added through delegation), and the record count of each collection in it. `{id}` is the space's `id` from [List spaces](#list-spaces).
+A space's metadata, its resolved member list (including members added through delegation), every DID with records in it (`authors`, which can include accounts that are no longer members), and the record count of each collection in it. `{id}` is the space's `id` from [List spaces](#list-spaces).
 
 ```sh tab="cURL" tab-group="language"
 curl http://127.0.0.1:3000/admin/spaces/0b6c1f0e-... -H "$AUTH"
@@ -231,6 +231,7 @@ curl http://127.0.0.1:3000/admin/spaces/0b6c1f0e-... -H "$AUTH"
   "members": [
     { "did": "did:plc:creator123", "read": true, "write": true }
   ],
+  "authors": ["did:plc:creator123", "did:plc:formermember"],
   "collections": [
     { "collection": "com.example.forum.post", "count": 42 }
   ]

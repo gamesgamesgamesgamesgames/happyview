@@ -66,7 +66,7 @@ Logged when a user attempts to access an endpoint they don't have permission for
 | Event Type                | Severity | Subject                                                           | Detail                                                                  |
 | -------------------------- | -------- | -------------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | `space.access_granted`     | info     | Space AT URI for a space grant, account DID for an account grant     | `grant_id`, `scope`, `target`, `reason`, `expires_at`, `user_id`           |
-| `space.access_revoked`     | info     | The grant's target (space id or DID)                                  | `grant_id`, `revoked_by`, `user_id`                                        |
+| `space.access_revoked`     | info     | Same as `space.access_granted`; the raw space id if the space was deleted | `grant_id`, `revoked_by`, `user_id`                                        |
 | `space.moderator_read`     | info     | Space AT URI, or the account DID for an account-records read         | `action`, `grant_id`, `scope`, `user_id`, and what was read (see below)   |
 | `space_inspector.enabled`  | warn     | Setting key                                                           | —                                                                            |
 | `space_inspector.disabled` | warn     | Setting key                                                           | —                                                                            |
