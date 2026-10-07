@@ -82,4 +82,22 @@ test.describe("Space inspector", () => {
     await page.getByRole("button", { name: "End access" }).click();
     await expect(page.getByRole("button", { name: "Request access" })).toBeVisible();
   });
+
+  test("account view lists spaces before access and records after", async ({ page }) => {
+    await setSetting("feature.space_inspector_enabled", "true");
+    const { uri } = await createSpace(page);
+    spaceUri = uri;
+    const creatorDid = uri.split("/")[2];
+
+    await page.goto("/dashboard/spaces/");
+    await page.getByLabel("Account DID").fill(creatorDid);
+    await page.getByRole("button", { name: "Open account" }).click();
+    await expect(page).toHaveURL(/\/dashboard\/spaces\/account\/\?did=/);
+    await expect(page.getByText(uri)).toBeVisible();
+
+    await page.getByRole("button", { name: "Request access" }).click();
+    await page.getByRole("dialog").getByLabel("Reason").fill("Report #2");
+    await page.getByRole("dialog").getByRole("button", { name: "Grant access" }).click();
+    await expect(page.getByText(`Access to ${creatorDid}`)).toBeVisible();
+  });
 });

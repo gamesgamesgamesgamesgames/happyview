@@ -17,6 +17,8 @@ import { DataTable } from "@/components/data-table/data-table";
 import { DataTableViewOptions } from "@/components/data-table/data-table-view-options";
 import { SiteHeader } from "@/components/site-header";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 const PAGE_SIZE = 50;
 
@@ -27,6 +29,7 @@ export default function SpacesPage() {
   const [nextCursor, setNextCursor] = useState<string | undefined>();
   const [loading, setLoading] = useState(false);
   const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
+  const [lookupDid, setLookupDid] = useState("");
 
   const fetchSpaces = useCallback(async (cursor?: string) => {
     setLoading(true);
@@ -147,7 +150,29 @@ export default function SpacesPage() {
             router.push(`/dashboard/spaces/${encodeURIComponent(space.id)}`)
           }
         >
-          <div className="flex w-full items-center justify-end gap-2 p-1">
+          <div className="flex w-full items-center justify-between gap-2 p-1">
+            <form
+              className="mr-auto flex items-center gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const did = lookupDid.trim();
+                if (did) router.push(`/dashboard/spaces/account/?did=${encodeURIComponent(did)}`);
+              }}
+            >
+              <Label htmlFor="account-did" className="sr-only">
+                Account DID
+              </Label>
+              <Input
+                id="account-did"
+                className="h-8 w-72 font-mono text-xs"
+                placeholder="did:plc:…"
+                value={lookupDid}
+                onChange={(e) => setLookupDid(e.target.value)}
+              />
+              <Button type="submit" variant="outline" size="sm">
+                Open account
+              </Button>
+            </form>
             <DataTableViewOptions table={table} />
           </div>
         </DataTable>
