@@ -75,13 +75,17 @@ const KNOWN_KEYS = [
 
 function GrantReads({ grantId }: { grantId: string }) {
   const [reads, setReads] = useState<EventLogEntry[] | null>(null);
+  const [cursor, setCursor] = useState<string | undefined>();
   const [failed, setFailed] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     getGrantReads(grantId)
       .then((r) => {
-        if (!cancelled) setReads(r.events);
+        if (cancelled) return;
+        setReads(r.events);
+        setCursor(r.cursor);
       })
       .catch(() => {
         if (!cancelled) setFailed(true);
@@ -90,6 +94,20 @@ function GrantReads({ grantId }: { grantId: string }) {
       cancelled = true;
     };
   }, [grantId]);
+
+  async function loadMore() {
+    if (!cursor) return;
+    setLoadingMore(true);
+    try {
+      const page = await getGrantReads(grantId, cursor);
+      setReads((current) => [...(current ?? []), ...page.events]);
+      setCursor(page.cursor);
+    } catch {
+      setFailed(true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   return (
     <div className="flex flex-col gap-2">
@@ -125,6 +143,17 @@ function GrantReads({ grantId }: { grantId: string }) {
             </li>
           ))}
         </ul>
+      )}
+      {cursor && !failed && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="self-start"
+          disabled={loadingMore}
+          onClick={loadMore}
+        >
+          {loadingMore ? "Loading…" : "Load more"}
+        </Button>
       )}
     </div>
   );

@@ -61,6 +61,7 @@ function AccountView() {
   const [viewRecord, setViewRecord] = useState<AdminAccountRecord | null>(null);
 
   const access = useAccessGrant(
+    did,
     (g) => g.scope === "account" && g.target === did,
     Boolean(inspector?.enabled && canInspect && did),
   );
@@ -101,7 +102,7 @@ function AccountView() {
     if (access.grant) fetchRecords();
     else setRecords([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [access.grant?.id]);
+  }, [access.grant?.id, did]);
 
   if (!did) {
     return (

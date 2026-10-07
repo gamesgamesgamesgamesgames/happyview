@@ -658,9 +658,13 @@ export function revokeAccessGrant(id: string) {
   );
 }
 
-export function getGrantReads(id: string) {
-  return apiFetch<{ events: EventLogEntry[] }>(
-    `/admin/spaces/access-grants/${encodeURIComponent(id)}/reads`,
+/** One page of the reads made under a grant, oldest first. */
+export function getGrantReads(id: string, cursor?: string) {
+  const params = new URLSearchParams();
+  if (cursor) params.set("cursor", cursor);
+  const qs = params.toString();
+  return apiFetch<{ events: EventLogEntry[]; cursor?: string }>(
+    `/admin/spaces/access-grants/${encodeURIComponent(id)}/reads${qs ? `?${qs}` : ""}`,
   );
 }
 

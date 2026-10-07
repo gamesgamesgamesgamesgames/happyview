@@ -116,7 +116,10 @@ function SpaceDetailContent() {
     () => new Set(detail?.members.map((m) => m.did) ?? []),
     [detail],
   );
+  // Keyed on the loaded space too: member grants only match once that space's
+  // members are known.
   const access = useAccessGrant(
+    `${id}:${detail?.space.id ?? ""}`,
     (g) =>
       (g.scope === "space" && g.target === id) ||
       (g.scope === "account" && memberDids.has(g.target)),
@@ -166,9 +169,10 @@ function SpaceDetailContent() {
         : { collection, repo };
     setRepo(filters.repo);
     fetchRecords(filters);
-    // Reload only when the grant changes; filter changes go through applyFilters.
+    // Reload only when the grant or the space changes; filter changes go
+    // through applyFilters.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [access.grant?.id]);
+  }, [access.grant?.id, id]);
 
   function applyFilters(filters: { collection: string; repo: string }) {
     setCollection(filters.collection);
