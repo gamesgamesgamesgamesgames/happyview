@@ -596,6 +596,11 @@ async fn account_grant_blob_access_follows_the_author() {
         serde_json::from_str(&moderator_reads(&app).await.last().unwrap().2).unwrap();
     assert_eq!(detail["repo"], MEMBER);
 
+    // CREATOR-only CID: denied, because MEMBER's account grant covers only
+    // records MEMBER itself references. A 404 alone can't tell this apart
+    // from an authorized request whose PDS fetch fails (also 404 above), so
+    // the real check is that denial logs no read at all.
+    let reads_before = moderator_reads(&app).await.len();
     let other = get(
         &app,
         &format!("/admin/spaces/{id}/blob?cid=bafkcreatoronly"),
@@ -603,6 +608,11 @@ async fn account_grant_blob_access_follows_the_author() {
     )
     .await;
     assert_eq!(other.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        moderator_reads(&app).await.len(),
+        reads_before,
+        "a denied request must not log a moderator read"
+    );
 }
 
 #[tokio::test]
