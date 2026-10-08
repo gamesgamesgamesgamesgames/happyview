@@ -18,6 +18,7 @@ import {
   adminSpaceBlobUrl,
   getAdminSpace,
   getAdminSpaceRecords,
+  getSpaceAccess,
   getInspectorStatus,
 } from "@/lib/api";
 import type {
@@ -112,25 +113,15 @@ function SpaceDetailContent() {
       .catch(() => setInspector(null));
   }, [id]);
 
-  // Members and record authors: an account grant for any of them, including an
-  // author who has since left, covers that account's records here.
-  const accountDids = useMemo(
-    () =>
-      [
-        ...new Set([
-          ...(detail?.members.map((m) => m.did) ?? []),
-          ...(detail?.authors ?? []),
-        ]),
-      ].sort(),
+  const memberDids = useMemo(
+    () => detail?.members.map((m) => m.did) ?? [],
     [detail],
   );
-  // Keyed on the loaded space too: member grants only match once that space's
-  // members are known.
+  // The server picks the covering grant: a space grant if there is one, or an
+  // account grant for a member or author of this space.
   const access = useAccessGrant(
-    `${id}:${detail?.space.id ?? ""}`,
-    (g) =>
-      (g.scope === "space" && g.target === id) ||
-      (g.scope === "account" && accountDids.includes(g.target)),
+    id,
+    () => getSpaceAccess(id).then((r) => r.grant),
     Boolean(detail && inspector?.enabled && canInspect),
   );
 
@@ -413,7 +404,7 @@ function SpaceDetailContent() {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value={ALL}>All authors</SelectItem>
-                      {accountDids.map((did) => (
+                      {memberDids.map((did) => (
                         <SelectItem key={did} value={did}>
                           <AccountName did={did} />
                         </SelectItem>
@@ -575,7 +566,7 @@ function SpaceDetailContent() {
             defaultMinutes={inspector.default_grant_minutes}
             scopeOptions={[
               { scope: "space", target: id, label: "This space: every record and blob, from every author" },
-              ...accountDids.map((did) => ({
+              ...memberDids.map((did) => ({
                 scope: "account" as const,
                 target: did,
                 label: (

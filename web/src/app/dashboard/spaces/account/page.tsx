@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
@@ -19,6 +19,7 @@ import {
   getAccountSpaceRecords,
   getAccountSpaces,
   getInspectorStatus,
+  listAccessGrants,
 } from "@/lib/api";
 import type { AdminAccountRecord, AdminAccountSpace, InspectorStatus } from "@/types/spaces";
 import { AccessGrantBanner } from "@/components/spaces/access-grant-banner";
@@ -51,7 +52,13 @@ function AccountView() {
   const { hasPermission } = useCurrentUser();
   const canInspect = hasPermission("spaces:inspect");
 
-  const [spaces, setSpaces] = useState<AdminAccountSpace[] | null>(null);
+  // Kept with the DID it was loaded for, so a change of account never shows
+  // the previous account's spaces under the new heading.
+  const [loadedSpaces, setLoadedSpaces] = useState<{
+    did: string;
+    spaces: AdminAccountSpace[];
+  } | null>(null);
+  const spaces = loadedSpaces?.did === did ? loadedSpaces.spaces : null;
   const [inspector, setInspector] = useState<InspectorStatus | null>(null);
   const [records, setRecords] = useState<AdminAccountRecord[]>([]);
   const [cursorStack, setCursorStack] = useState<string[]>([]);
@@ -59,29 +66,49 @@ function AccountView() {
   const [loading, setLoading] = useState(false);
   const [requestOpen, setRequestOpen] = useState(false);
   const [viewRecord, setViewRecord] = useState<AdminAccountRecord | null>(null);
+  // Bumped by each records request and each change of account; a response
+  // for an older request is dropped.
+  const recordsRequest = useRef(0);
 
   const access = useAccessGrant(
     did,
-    (g) => g.scope === "account" && g.target === did,
+    () =>
+      listAccessGrants(true).then(
+        ({ grants }) =>
+          grants
+            .filter((g) => g.scope === "account" && g.target === did)
+            .sort((a, b) => Date.parse(b.expires_at) - Date.parse(a.expires_at))[0] ?? null,
+      ),
     Boolean(inspector?.enabled && canInspect && did),
   );
 
   useEffect(() => {
     if (!did) return;
+    let cancelled = false;
     getAccountSpaces(did)
-      .then((r) => setSpaces(r.spaces))
-      .catch((e) => toastError("Failed to load spaces", e));
+      .then((r) => {
+        if (!cancelled) setLoadedSpaces({ did, spaces: r.spaces });
+      })
+      .catch((e) => {
+        if (!cancelled) toastError("Failed to load spaces", e);
+      });
     getInspectorStatus().then(setInspector).catch(() => setInspector(null));
+    return () => {
+      cancelled = true;
+    };
   }, [did]);
 
   const fetchRecords = useCallback(
     async (cursor?: string) => {
+      const request = ++recordsRequest.current;
       setLoading(true);
       try {
         const data = await getAccountSpaceRecords(did, { limit: PAGE_SIZE, cursor });
+        if (request !== recordsRequest.current) return;
         setRecords(data.records);
         setNextCursor(data.cursor);
       } catch (e: unknown) {
+        if (request !== recordsRequest.current) return;
         if (e instanceof ApiError && e.message === SPACE_ACCESS_GRANT_REQUIRED) {
           access.drop();
           return;
@@ -97,6 +124,7 @@ function AccountView() {
   );
 
   useEffect(() => {
+    recordsRequest.current += 1;
     setCursorStack([]);
     setViewRecord(null);
     if (access.grant) fetchRecords();

@@ -633,6 +633,13 @@ export function getInspectorStatus() {
   return apiFetch<InspectorStatus>("/admin/spaces/inspector");
 }
 
+/** The caller's active grant covering a space's page, if any. */
+export function getSpaceAccess(id: string) {
+  return apiFetch<{ grant: AccessGrant | null }>(
+    `/admin/spaces/${encodeURIComponent(id)}/access`,
+  );
+}
+
 export function listAccessGrants(active = true) {
   return apiFetch<{ grants: AccessGrant[] }>(
     `/admin/spaces/access-grants?active=${active}`,

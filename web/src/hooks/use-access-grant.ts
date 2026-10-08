@@ -3,12 +3,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useCallbackRef } from "@/hooks/use-callback-ref";
-import { listAccessGrants, revokeAccessGrant } from "@/lib/api";
+import { revokeAccessGrant } from "@/lib/api";
 import { toastError } from "@/lib/format";
 import type { AccessGrant } from "@/types/spaces";
 
 /**
- * The caller's active grant matching `match`, with a countdown. The grant is
+ * The caller's active grant for a page, as `load` finds it, with a countdown. The grant is
  * dropped locally the moment it expires; the server enforces the same expiry.
  * It is hidden (not fetched, not returned) while `enabled` is false.
  *
@@ -19,7 +19,7 @@ import type { AccessGrant } from "@/types/spaces";
  */
 export function useAccessGrant(
   targetKey: string,
-  match: (grant: AccessGrant) => boolean,
+  load: () => Promise<AccessGrant | null>,
   enabled: boolean,
 ) {
   const [found, setFound] = useState<{
@@ -27,7 +27,7 @@ export function useAccessGrant(
     grant: AccessGrant | null;
   } | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const matchRef = useCallbackRef(match);
+  const loadRef = useCallbackRef(load);
   // Bumped by every refresh and every local change. A refresh that resolves
   // after a newer one, or after a grant was set locally, discards its result.
   const generation = useRef(0);
@@ -36,18 +36,9 @@ export function useAccessGrant(
     if (!enabled) return;
     const current = ++generation.current;
     try {
-      const { grants } = await listAccessGrants(true);
+      const loaded = await loadRef();
       if (current !== generation.current) return;
-      // A space grant opens everything an account grant would on the same page,
-      // so it wins over any account grant; ties go to the one expiring last.
-      const matching = grants
-        .filter((g) => matchRef(g))
-        .sort(
-          (a, b) =>
-            Number(b.scope === "space") - Number(a.scope === "space") ||
-            Date.parse(b.expires_at) - Date.parse(a.expires_at),
-        );
-      setFound({ key: targetKey, grant: matching[0] ?? null });
+      setFound({ key: targetKey, grant: loaded });
     } catch (e) {
       if (current !== generation.current) return;
       setFound({ key: targetKey, grant: null });
@@ -55,7 +46,7 @@ export function useAccessGrant(
     } finally {
       setNow(Date.now());
     }
-  }, [enabled, matchRef, targetKey]);
+  }, [enabled, loadRef, targetKey]);
 
   useEffect(() => {
     refresh();
