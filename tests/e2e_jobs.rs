@@ -544,9 +544,8 @@ async fn two_workers_run_two_jobs_at_once() {
         .register(echo_interpreter::plugin("lua"))
         .await;
 
-    // Each job burns guest CPU for about three seconds, longer than the
-    // polling below takes, so a single worker could never have both running
-    // at the same moment.
+    // Each job burns guest CPU for about three seconds, so a single worker
+    // could never have both running at the same moment.
     let burn = burn::calibrate(&app.state, "interpreter_echo").await;
     seed_script(&app, "job.run:test.slow", &burn.source()).await;
     let a = seed_job(&app, "test.slow", "pending").await;
@@ -554,8 +553,11 @@ async fn two_workers_run_two_jobs_at_once() {
 
     let workers = happyview::jobs::worker::spawn_workers(app.state.clone(), 2);
 
+    // Watch for up to ten seconds. A single worker can never show both jobs
+    // running at once however long it is watched, so the window only has to
+    // outlast a slow runner's start-up, not match the burn.
     let mut both_running = false;
-    for _ in 0..20 {
+    for _ in 0..100 {
         let (sa, _, _) = job_row(&app, &a).await;
         let (sb, _, _) = job_row(&app, &b).await;
         if sa == "running" && sb == "running" {
