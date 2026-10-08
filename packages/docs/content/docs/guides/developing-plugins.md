@@ -4,7 +4,7 @@ title: "Developing Plugins"
 
 This guide covers how to build your own HappyView WASM plugins. For installing and configuring plugins, see the [Plugins guide](plugins.md).
 
-See the [happyview-plugins](https://tangled.org/gamesgamesgamesgames.games/happyview-plugins) repository for examples and the plugin SDK.
+See the [plugins](https://github.com/happyproto/plugins) repository for examples and the plugin SDK.
 
 ## Plugin Manifest
 
@@ -474,11 +474,11 @@ Everything above — the allocator, the packed-`i64` calling convention, the JSO
 
 The `http` plugin (outbound `get`/`post`/`put`/`patch`/`delete`/`head` through `host::http_request`) is the worked example. HappyView's test fixture at `tests/fixtures/sdk_http` is the same source with a different id.
 
-All plugins, including the standard library ones, live in the [plugins repository](https://tangled.org/gamesgamesgamesgames.games/happyview-plugins) and consume `happyview-plugin-sdk` as an ordinary dependency — HappyView itself ships no plugins, only the SDK crate and, for its own tests, a small SDK-built fixture. `tests/fixtures/test_library` is the one exception: it stays hand-rolled against the raw ABI on purpose, as the conformance fixture the SDK itself is checked against.
+All plugins, including the standard library ones, live in the [plugins repository](https://github.com/happyproto/plugins) and consume `happyview-plugin-sdk` as an ordinary dependency — HappyView itself ships no plugins, only the SDK crate and, for its own tests, a small SDK-built fixture. `tests/fixtures/test_library` is the one exception: it stays hand-rolled against the raw ABI on purpose, as the conformance fixture the SDK itself is checked against.
 
 ## Next steps
 
-- [Official plugins repository](https://tangled.org/gamesgamesgamesgames.games/happyview-plugins) — ready-to-use plugins and the plugin SDK
+- [Official plugins repository](https://github.com/happyproto/plugins) — ready-to-use plugins and the plugin SDK
 - [Plugins guide](plugins.md) — install and configure plugins
 - [API Keys](./api-keys.md) — authenticate programmatic access to admin endpoints
 - [Permissions](./permissions.md) — configure user access to plugin management

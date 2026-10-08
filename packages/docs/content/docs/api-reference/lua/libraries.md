@@ -2,20 +2,20 @@
 title: "Libraries"
 ---
 
-A library is a WASM plugin a script loads with `require`. Each has a namespace under `happyview.`, declares the [capabilities](../../guides/developing-plugins.md#capabilities) it needs, and documents its own surface in its README. HappyView ships none of them: every library is installed from the [plugins repository](https://github.com/gamesgamesgamesgamesgames/happyview-plugins) through **Settings > Plugins** or the [admin API](../admin/plugins.md), and a script that requires one that is not installed fails to load.
+A library is a WASM plugin a script loads with `require`. Each has a namespace under `happyview.`, declares the [capabilities](../../guides/developing-plugins.md#capabilities) it needs, and documents its own surface in its README. HappyView ships none of them: every library is installed from the [plugins repository](https://github.com/happyproto/plugins) through **Settings > Plugins** or the [admin API](../admin/plugins.md), and a script that requires one that is not installed fails to load.
 
 | `require` | Capabilities | Purpose | Surface |
 | --- | --- | --- | --- |
-| `happyview.db` | `records:read` | Read indexed records: a chainable query per collection, one record by URI, substring search, and the backend name | [README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-db) |
-| `happyview.sql` | `database:read`, `database:write` | Raw SQL, and a chainable builder over the operator's own tables | [README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-sql) |
-| `happyview.backlinks` | `records:read` | Records whose strong refs point at a given AT URI | [README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-backlinks) |
-| `happyview.record` | `caller:write`, `records:read`, `records:write` | Record writes as the calling user, blob uploads, direct local-index writes, and lexicon validation | [README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-record) |
-| `happyview.xrpc` | `caller:read`, `caller:call` | XRPC queries and procedures as the calling user | [README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-xrpc) |
-| `happyview.atproto` | `atproto:read`, `attest:sign` | Service resolution, blob download, label lookup, and attestation signing and verification | [README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-atproto) |
-| `happyview.spaces` | `spaces:read`, `spaces:write` | Permissioned spaces: records, membership and invites | [README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-spaces) |
-| `happyview.linked_repos` | `linked_repos:use` | Record writes, blob uploads and XRPC calls through repos an admin has linked | [README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-linked-repos) |
-| `happyview.jobs` | `jobs:create` | Enqueue background jobs | [README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-jobs) |
-| `happyview.http` | `network:request:unrestricted` | Outbound HTTP: `get`, `post`, `put`, `patch`, `delete`, `head` | [README](https://github.com/gamesgamesgamesgamesgames/happyview-plugins/tree/main/plugins/happyview-http) |
+| `happyview.db` | `records:read` | Read indexed records: a chainable query per collection, one record by URI, substring search, and the backend name | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/db) |
+| `happyview.sql` | `database:read`, `database:write` | Raw SQL, and a chainable builder over the operator's own tables | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/sql) |
+| `happyview.backlinks` | `records:read` | Records whose strong refs point at a given AT URI | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/backlinks) |
+| `happyview.record` | `caller:write`, `records:read`, `records:write` | Record writes as the calling user, blob uploads, direct local-index writes, and lexicon validation | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/record) |
+| `happyview.xrpc` | `caller:read`, `caller:call` | XRPC queries and procedures as the calling user | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/xrpc) |
+| `happyview.atproto` | `atproto:read`, `attest:sign` | Service resolution, blob download, label lookup, and attestation signing and verification | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/atproto) |
+| `happyview.spaces` | `spaces:read`, `spaces:write` | Permissioned spaces: records, membership and invites | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/spaces) |
+| `happyview.linked_repos` | `linked_repos:use` | Record writes, blob uploads and XRPC calls through repos an admin has linked | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/linked-repos) |
+| `happyview.jobs` | `jobs:create` | Enqueue background jobs | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/jobs) |
+| `happyview.http` | `network:request:unrestricted` | Outbound HTTP: `get`, `post`, `put`, `patch`, `delete`, `head` | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/http) |
 
 The capability column is what an operator grants when installing the library, and it bounds what any script can do through it: `happyview.sql` with `database:write` can run any statement, `happyview.xrpc` with `caller:call` can invoke any procedure as the user. Install only what your scripts use.
 

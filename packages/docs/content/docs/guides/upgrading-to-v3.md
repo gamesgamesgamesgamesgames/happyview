@@ -52,16 +52,22 @@ The scripts list also flags each row: `runnable` is `false` when no installed in
 
 ### Getting the Lua interpreter
 
-The Lua interpreter lives in the [happyview-plugins](https://tangled.org/gamesgamesgamesgames.games/happyview-plugins) repository and has no published release yet, so build it from source. It vendors PUC Lua, which needs a C toolchain that targets WASI — [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) 34 — and the `wasm32-wasip1` Rust target:
+The Lua interpreter is a plugin like any other, published from the [plugins](https://github.com/happyproto/plugins) repository. Install its release manifest by any of the [three plugin install routes](plugins.md#installing-plugins) — the dashboard's **Add Plugin**, `PLUGIN_URLS`, or a directory under `./plugins/`:
 
-From the plugins repository's root, with wasi-sdk installed where its `.cargo/config.toml` expects it:
+```
+https://github.com/happyproto/plugins/releases/download/happyview-lua-v1.0.0/manifest.json
+```
+
+The `.wasm` module is fetched from beside the manifest, so that one URL is the whole install. The repository's releases page carries the current version; each plugin is tagged under its own name.
+
+Building it from source is the other way, and needs more: it vendors PUC Lua, which compiles with a C toolchain targeting WASI — [wasi-sdk](https://github.com/WebAssembly/wasi-sdk) 34 — and the `wasm32-wasip1` Rust target. From the plugins repository's root, with wasi-sdk where its `.cargo/config.toml` expects it:
 
 ```sh
 rustup target add wasm32-wasip1
 cargo build --release -p happyview-lua --target wasm32-wasip1
 ```
 
-A release is two files: the manifest, and the `.wasm` module the manifest's `wasm_file` names beside it. Host those two together and install the manifest's URL by any of the [three plugin install routes](plugins.md#installing-plugins) — the dashboard's **Add Plugin**, `PLUGIN_URLS`, or a directory under `./plugins/`.
+That produces the same two files a release publishes — the manifest, and the `.wasm` its `wasm_file` names — which a URL install needs hosted together.
 
 ## 2. Migrate your stored scripts
 
