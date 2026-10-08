@@ -124,6 +124,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `DELETE /admin/spaces/access-grants/{id}`| `spaces:inspect` (own) or `users:update` (others) |
 | `GET /admin/spaces/access-grants/{id}/reads` | `events:read`          |
 | `GET /admin/spaces/{id}`                 | `spaces:read`              |
+| `GET /admin/spaces/{id}/access`          | `spaces:inspect`           |
 | `GET /admin/spaces/{id}/records`         | `spaces:inspect`           |
 | `GET /admin/spaces/{id}/blob`            | `spaces:inspect`           |
 | `GET /admin/accounts/{did}/spaces`       | `spaces:read`              |

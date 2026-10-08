@@ -217,7 +217,7 @@ curl "http://127.0.0.1:3000/admin/spaces?limit=20" -H "$AUTH"
 GET /admin/spaces/{id}
 ```
 
-A space's metadata, its resolved member list (including members added through delegation), every DID with records in it (`authors`, which can include accounts that are no longer members), and the record count of each collection in it. `{id}` is the space's `id` from [List spaces](#list-spaces).
+A space's metadata, its resolved member list (including members added through delegation), and the record count of each collection in it. `{id}` is the space's `id` from [List spaces](#list-spaces).
 
 ```sh tab="cURL" tab-group="language"
 curl http://127.0.0.1:3000/admin/spaces/0b6c1f0e-... -H "$AUTH"
@@ -231,7 +231,6 @@ curl http://127.0.0.1:3000/admin/spaces/0b6c1f0e-... -H "$AUTH"
   "members": [
     { "did": "did:plc:creator123", "read": true, "write": true }
   ],
-  "authors": ["did:plc:creator123", "did:plc:formermember"],
   "collections": [
     { "collection": "com.example.forum.post", "count": 42 }
   ]
@@ -239,6 +238,26 @@ curl http://127.0.0.1:3000/admin/spaces/0b6c1f0e-... -H "$AUTH"
 ```
 
 Returns `403 SpaceInspectorDisabled` if the space inspector is off, and `404 Not Found` if no space has that ID.
+
+## Get the grant covering a space
+
+```
+GET /admin/spaces/{id}/access
+```
+
+The caller's active access grant that covers this space: a `space` grant for it if there is one, otherwise the `account` grant expiring last whose account is a member of the space or has records in it. Only the caller's own grants are considered. Requires `spaces:inspect`.
+
+```sh tab="cURL" tab-group="language"
+curl http://127.0.0.1:3000/admin/spaces/0b6c1f0e-.../access -H "$AUTH"
+```
+
+**Response**: `200 OK`
+
+```json
+{ "grant": { "id": "6f1ecb2a-...", "scope": "space", "target": "0b6c1f0e-...", "...": "..." } }
+```
+
+`grant` is `null` when none of the caller's active grants covers the space. Returns `403 SpaceInspectorDisabled` if the space inspector is off and `404 Not Found` if no space has that ID.
 
 ## List records in a space
 
