@@ -17,9 +17,9 @@ import {
   SPACE_ACCESS_GRANT_REQUIRED,
   adminSpaceBlobUrl,
   getAccountSpaceRecords,
+  getAccountAccess,
   getAccountSpaces,
   getInspectorStatus,
-  listAccessGrants,
 } from "@/lib/api";
 import type { AdminAccountRecord, AdminAccountSpace, InspectorStatus } from "@/types/spaces";
 import { AccessGrantBanner } from "@/components/spaces/access-grant-banner";
@@ -72,13 +72,7 @@ function AccountView() {
 
   const access = useAccessGrant(
     did,
-    () =>
-      listAccessGrants(true).then(
-        ({ grants }) =>
-          grants
-            .filter((g) => g.scope === "account" && g.target === did)
-            .sort((a, b) => Date.parse(b.expires_at) - Date.parse(a.expires_at))[0] ?? null,
-      ),
+    () => getAccountAccess(did).then((r) => r.grant),
     Boolean(inspector?.enabled && canInspect && did),
   );
 

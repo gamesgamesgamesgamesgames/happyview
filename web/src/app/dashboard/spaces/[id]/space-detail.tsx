@@ -124,6 +124,17 @@ function SpaceDetailContent() {
     () => getSpaceAccess(id).then((r) => r.grant),
     Boolean(detail && inspector?.enabled && canInspect),
   );
+  // The author filter lists members, plus the account an account grant covers
+  // when that account authored records here without being a member.
+  const accountTarget =
+    access.grant?.scope === "account" ? access.grant.target : null;
+  const authorOptions = useMemo(
+    () =>
+      accountTarget && !memberDids.includes(accountTarget)
+        ? [...memberDids, accountTarget]
+        : memberDids,
+    [memberDids, accountTarget],
+  );
 
   // Bumped by each records request and each change of grant or space; a
   // response for an older request is dropped, so records fetched under a
@@ -171,10 +182,13 @@ function SpaceDetailContent() {
       setViewRecord(null);
       return;
     }
+    // A new grant starts from its own scope: an account grant fixes the author,
+    // and a space grant starts from every author rather than a filter left
+    // over from a previous grant.
     const filters =
       access.grant.scope === "account"
         ? { collection, repo: access.grant.target }
-        : { collection, repo };
+        : { collection, repo: ALL };
     setRepo(filters.repo);
     fetchRecords(filters);
     // Reload only when the grant or the space changes; filter changes go
@@ -413,7 +427,7 @@ function SpaceDetailContent() {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value={ALL}>All authors</SelectItem>
-                      {memberDids.map((did) => (
+                      {authorOptions.map((did) => (
                         <SelectItem key={did} value={did}>
                           <AccountName did={did} />
                         </SelectItem>

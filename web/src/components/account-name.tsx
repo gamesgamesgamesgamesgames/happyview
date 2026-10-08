@@ -2,7 +2,7 @@
 
 import { type RefObject, useEffect, useRef, useState } from "react";
 
-import { resolveIdentity } from "@/lib/api";
+import { ApiError, resolveIdentity } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { ResolvedIdentity } from "@/types/identity";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -31,16 +31,26 @@ function releaseSlot() {
   waiting.shift()?.();
 }
 
-// One lookup per DID for the life of the page. A DID that can't be resolved
-// caches as null, so it isn't retried on every render.
-const identities = new Map<string, Promise<ResolvedIdentity | null>>();
+// A lookup that failed for a reason other than the DID being unresolvable.
+type Unavailable = "unavailable";
+type Lookup = ResolvedIdentity | null | Unavailable;
 
-function lookupIdentity(did: string): Promise<ResolvedIdentity | null> {
+// One lookup per DID for the life of the page. A DID the server can't resolve
+// (a 400) caches as null. Any other failure is dropped from the cache, so the
+// next component to show that DID tries again.
+const identities = new Map<string, Promise<Lookup>>();
+
+function lookupIdentity(did: string): Promise<Lookup> {
   let pending = identities.get(did);
   if (!pending) {
     pending = whenSlotFree().then(() =>
       resolveIdentity(did, { profile: true })
-        .catch(() => null)
+        .then((identity): Lookup => identity)
+        .catch((e: unknown): Lookup => {
+          if (e instanceof ApiError && e.status === 400) return null;
+          identities.delete(did);
+          return "unavailable";
+        })
         .finally(releaseSlot),
     );
     identities.set(did, pending);
@@ -50,15 +60,16 @@ function lookupIdentity(did: string): Promise<ResolvedIdentity | null> {
 
 /**
  * A DID's identity: `undefined` while loading, `null` when the DID can't be
- * resolved. With `ref`, the lookup waits until that element is on screen.
+ * resolved, `"unavailable"` when the lookup failed for another reason. With
+ * `ref`, the lookup waits until that element is on screen.
  */
 export function useIdentity(
   did: string,
   ref?: RefObject<Element | null>,
-): ResolvedIdentity | null | undefined {
+): Lookup | undefined {
   const [resolved, setResolved] = useState<{
     did: string;
-    identity: ResolvedIdentity | null;
+    identity: Lookup;
   } | null>(null);
 
   useEffect(() => {
@@ -105,9 +116,18 @@ export function AccountName({
   className?: string;
 }) {
   const ref = useRef<HTMLSpanElement>(null);
-  const identity = useIdentity(did, ref);
-  const loading = identity === undefined;
+  const lookup = useIdentity(did, ref);
+  const loading = lookup === undefined;
+  const unavailable = lookup === "unavailable";
+  const identity = typeof lookup === "object" ? lookup : null;
   const handle = identity?.handle;
+  const label = loading
+    ? "Resolving…"
+    : handle
+      ? `@${handle}`
+      : unavailable
+        ? "Handle unavailable"
+        : "Invalid Handle";
 
   return (
     <span
@@ -129,7 +149,7 @@ export function AccountName({
             !loading && !handle && "text-muted-foreground italic",
           )}
         >
-          {loading ? "Resolving…" : handle ? `@${handle}` : "Invalid Handle"}
+          {label}
         </span>
         <span className="text-muted-foreground font-mono text-[10px] break-all">
           {did}
