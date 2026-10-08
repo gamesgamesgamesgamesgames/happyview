@@ -83,7 +83,8 @@ export function AccessGrantDialog({
         <div className="flex flex-col gap-4">
           <p className="text-muted-foreground text-sm">
             Your reason, and every record and blob you open, is logged under
-            your account. These logs can&apos;t be purged.
+            your account. These logs can&apos;t be purged by hand; they&apos;re
+            kept for the instance&apos;s space access log retention period.
           </p>
           {scopeOptions.length > 1 && (
             <div className="flex flex-col gap-2">
