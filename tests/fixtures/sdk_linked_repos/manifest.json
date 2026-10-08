@@ -5,7 +5,7 @@
   "api_version": "2",
   "plugin_type": "library",
   "namespace": "linked_fixture",
-  "capabilities": ["linked_repos:use", "jobs:create"],
+  "capabilities": ["linked_repos:use", "jobs:create", "jobs:read", "jobs:read_any"],
   "allowed_hosts": [],
   "dependencies": [],
   "wasm_file": "target/wasm32-unknown-unknown/release/sdk_linked_repos.wasm"

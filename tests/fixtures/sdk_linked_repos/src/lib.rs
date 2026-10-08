@@ -1,4 +1,4 @@
-//! Pins the seven linked-repo/jobs host imports: one pass-through function
+//! Pins the ten linked-repo/jobs host imports: one pass-through function
 //! per SDK wrapper. `list` takes no argument; every other function takes a
 //! single spec argument.
 
@@ -6,9 +6,9 @@
 
 use happyview_plugin_sdk::host;
 use happyview_plugin_sdk::{
-    library_plugin, ApiExport, ApiSurface, CallContext, JobCreate, LinkedRepoBlobUpload,
-    LinkedRepoCall, LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut,
-    PluginError, PluginInfo, Value,
+    library_plugin, ApiExport, ApiSurface, CallContext, JobCreate, JobGet, JobListAny,
+    LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoRecordCreate, LinkedRepoRecordDelete,
+    LinkedRepoRecordPut, PluginError, PluginInfo, Value,
 };
 
 library_plugin! {
@@ -27,6 +27,9 @@ fn surface() -> ApiSurface {
             "upload_blob",
             "call",
             "jobs_create",
+            "jobs_get",
+            "jobs_get_any",
+            "jobs_list_any",
         ]
         .into_iter()
         .map(ApiExport::function),
@@ -58,6 +61,13 @@ fn dispatch(function: &str, args: &[Value], _ctx: &CallContext) -> Result<Value,
         "upload_blob" => host::linked_repo_upload_blob(&one::<LinkedRepoBlobUpload>(args)?),
         "call" => host::linked_repo_call(&one::<LinkedRepoCall>(args)?),
         "jobs_create" => Ok(Value::from(host::jobs_create(&one::<JobCreate>(args)?)?)),
+        "jobs_get" => {
+            serde_json::to_value(host::jobs_get(&one::<JobGet>(args)?)?).map_err(PluginError::from)
+        }
+        "jobs_get_any" => serde_json::to_value(host::jobs_get_any(&one::<JobGet>(args)?)?)
+            .map_err(PluginError::from),
+        "jobs_list_any" => serde_json::to_value(host::jobs_list_any(&one::<JobListAny>(args)?)?)
+            .map_err(PluginError::from),
         other => Err(PluginError::unknown_function(other)),
     }
 }
