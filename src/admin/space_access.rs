@@ -387,6 +387,26 @@ async fn begin(state: &AppState) -> Result<sqlx::Transaction<'static, sqlx::Any>
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))
 }
 
+/// Tie a grant or revocation event to its grant, so retention keeps it while
+/// the grant row exists.
+async fn link_grant_event(
+    tx: &mut sqlx::Transaction<'static, sqlx::Any>,
+    backend: DatabaseBackend,
+    event_id: &str,
+    grant_id: &str,
+) -> Result<(), AppError> {
+    crate::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_access_grant_events (event_id, grant_id) VALUES (?, ?)",
+        backend,
+    ))
+    .bind(event_id)
+    .bind(grant_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to link the grant event: {e}")))?;
+    Ok(())
+}
+
 async fn commit(tx: sqlx::Transaction<'static, sqlx::Any>) -> Result<(), AppError> {
     tx.commit()
         .await
@@ -468,9 +488,10 @@ pub(super) async fn create_grant(
     // with no audit record must not exist.
     let mut tx = begin(&state).await?;
     insert_grant(&mut *tx, state.db_backend, &grant).await?;
-    write_event(&mut *tx, &event, state.db_backend)
+    let event_id = write_event(&mut *tx, &event, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to record the access grant: {e}")))?;
+    link_grant_event(&mut tx, state.db_backend, &event_id, &grant.id).await?;
     commit(tx).await?;
 
     Ok((StatusCode::CREATED, Json(grant)))
@@ -560,9 +581,10 @@ pub(super) async fn revoke_grant(
             .ok_or_else(|| AppError::NotFound("Access grant not found".into()))?;
         return Ok(Json(current));
     }
-    write_event(&mut *tx, &event, state.db_backend)
+    let event_id = write_event(&mut *tx, &event, state.db_backend)
         .await
         .map_err(|e| AppError::Internal(format!("failed to record the revocation: {e}")))?;
+    link_grant_event(&mut tx, state.db_backend, &event_id, &grant.id).await?;
     commit(tx).await?;
 
     Ok(Json(Grant {
