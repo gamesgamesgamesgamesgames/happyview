@@ -115,14 +115,43 @@ fn env_fallback(key: &str) -> Option<String> {
 /// never changes without its protected record.
 async fn write_audited<'q>(
     state: &AppState,
+    auth: &UserAuth,
+    key: &str,
     change: sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments>,
-    event: Option<EventLog>,
+    after: Option<String>,
 ) -> Result<u64, AppError> {
+    let backend = state.db_backend;
     let mut tx = state
         .db
         .begin()
         .await
         .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+
+    // Serialize writers of this key before reading its current value, so two
+    // concurrent changes can't both compare against the same old value and
+    // leave the audit trail out of step with what was stored. Postgres takes a
+    // per-key advisory lock; SQLite takes its database write lock.
+    let lock_sql = match backend {
+        DatabaseBackend::Postgres => "SELECT pg_advisory_xact_lock(hashtext($1))::text",
+        DatabaseBackend::Sqlite => "UPDATE happyview_instance_settings SET key = key WHERE key = ?",
+    };
+    crate::db::query(lock_sql)
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to lock setting: {e}")))?;
+
+    let stored: Option<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT value FROM happyview_instance_settings WHERE key = ?",
+        backend,
+    ))
+    .bind(key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read setting: {e}")))?;
+    let before = stored.map(|(v,)| v).or_else(|| env_fallback(key));
+    let event = audited_setting_event(auth, key, &before, &after);
+
     let affected = change
         .execute(&mut *tx)
         .await
@@ -222,7 +251,6 @@ pub(super) async fn upsert(
     auth.require(Permission::SettingsManage).await?;
 
     let backend = state.db_backend;
-    let before = get_setting(&state.db, &key, backend).await;
     let now = now_rfc3339();
     let sql = adapt_sql(
         r#"
@@ -238,8 +266,7 @@ pub(super) async fn upsert(
         .bind(&now)
         .bind(&body.value)
         .bind(&now);
-    let event = audited_setting_event(&auth, &key, &before, &Some(body.value.clone()));
-    write_audited(&state, change, event).await?;
+    write_audited(&state, &auth, &key, change, Some(body.value.clone())).await?;
 
     log_event(
         &state.db,
@@ -266,14 +293,12 @@ pub(super) async fn delete(
     auth.require(Permission::SettingsManage).await?;
 
     let backend = state.db_backend;
-    let before = get_setting(&state.db, &key, backend).await;
     let sql = adapt_sql(
         "DELETE FROM happyview_instance_settings WHERE key = ?",
         backend,
     );
     let change = crate::db::query(&sql).bind(&key);
-    let event = audited_setting_event(&auth, &key, &before, &env_fallback(&key));
-    if write_audited(&state, change, event).await? == 0 {
+    if write_audited(&state, &auth, &key, change, env_fallback(&key)).await? == 0 {
         return Err(AppError::NotFound(format!("setting '{key}' not found")));
     }
 
