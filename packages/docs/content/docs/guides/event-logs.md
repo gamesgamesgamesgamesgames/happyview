@@ -114,7 +114,7 @@ See [Backfill](./backfill.md) for background on backfill jobs.
 | --------------------------------- | -------- | ------------------------------------------------------------------ | --------------- |
 | `event_logs.retention_changed`    | warn     | Setting key (`event_log_retention_days` or `space_access_log_retention_days`) | `from`, `to` |
 
-Logged when a retention setting's effective value changes, env fallback included. An unset or unparseable value counts as its default (30 days for `event_log_retention_days`, 365 for `space_access_log_retention_days`), so saving a setting back to its current or default value logs nothing. `from` and `to` are the effective day counts. See [Protected events](#protected-events) below.
+Logged when a retention setting's effective value changes, env fallback included. An unset or unparseable value counts as its default: 30 days for `event_log_retention_days`, and for `space_access_log_retention_days` 0 (keep forever) while `event_log_retention_days` is 0 and 365 otherwise. Saving a setting back to its current or default value logs nothing. Because protected retention can follow the general setting, one change can log an event for each key. `from` and `to` are the effective day counts. See [Protected events](#protected-events) below.
 
 ### Jetstream events
 
@@ -318,7 +318,7 @@ Some event types record access to private space data, or changes to the audit tr
 
 `POST /admin/events/purge` excludes them: a filter naming one of these types, or a category that contains one, returns `400 Bad Request`. `GET /admin/events/count`, the purge preview, never counts them either.
 
-They're removed only on their own schedule, set by `space_access_log_retention_days` (default `365`; `0` keeps them forever). Protected events from the oldest access grant still on record onward are kept whatever their age, so a grant's reason and the reads made under it last as long as the grant does. The same schedule deletes access grants once they have been expired or revoked for that long. See [Configuration](../getting-started/configuration.md).
+They're removed only on their own schedule, set by `space_access_log_retention_days` (default `365`; `0` keeps them forever; when unset it follows an `event_log_retention_days` of `0`). The events tied to an access grant that still exists, meaning its grant and revocation events and the reads made under it, are kept whatever their age, so a grant's reason and reads last as long as the grant does. Other protected events keep their own schedule. The same schedule deletes access grants once they have been expired or revoked for that long. See [Configuration](../getting-started/configuration.md).
 
 Protected events live in the same database table as every other event log row. This is a safeguard against a routine or accidental purge, not a tamper-proof audit log — anyone with direct access to the database can still delete them.
 
