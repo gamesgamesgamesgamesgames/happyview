@@ -318,7 +318,7 @@ Some event types record access to private space data, or changes to the audit tr
 
 `POST /admin/events/purge` excludes them: a filter naming one of these types, or a category that contains one, returns `400 Bad Request`. `GET /admin/events/count`, the purge preview, never counts them either.
 
-They're removed only on their own schedule, set by `space_access_log_retention_days` (default `365`; `0` keeps them forever). The same schedule deletes access grants once they have been expired or revoked for that long. See [Configuration](../getting-started/configuration.md).
+They're removed only on their own schedule, set by `space_access_log_retention_days` (default `365`; `0` keeps them forever; when unset it follows an `event_log_retention_days` of `0`). Protected events from the oldest still-active access grant onward are kept whatever their age, so a grant's reason outlasts the grant. The same schedule deletes access grants once they have been expired or revoked for that long. See [Configuration](../getting-started/configuration.md).
 
 Protected events live in the same database table as every other event log row. This is a safeguard against a routine or accidental purge, not a tamper-proof audit log — anyone with direct access to the database can still delete them.
 

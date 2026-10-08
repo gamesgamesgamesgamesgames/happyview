@@ -17,7 +17,7 @@ AUTH="Authorization: Bearer $TOKEN"
 GET /admin/spaces/inspector
 ```
 
-Whether the space inspector is on, and how long an access grant can last. Requires `spaces:read`. This route answers while the inspector is off, so the dashboard can show why the other routes are closed.
+Whether the space inspector is on, and how long an access grant can last. Requires `spaces:read` or `spaces:inspect`. This route answers while the inspector is off, so the dashboard can show why the other routes are closed.
 
 ```sh tab="cURL" tab-group="language"
 curl http://127.0.0.1:3000/admin/spaces/inspector -H "$AUTH"
@@ -342,6 +342,20 @@ curl http://127.0.0.1:3000/admin/accounts/did:plc:abc/spaces -H "$AUTH"
   ]
 }
 ```
+
+## Get the grant covering an account
+
+```
+GET /admin/accounts/{did}/access
+```
+
+The caller's active `account` grant for `{did}`, chosen by the same rule [List an account's records](#list-an-accounts-records) enforces: the one expiring last. Requires `spaces:inspect`.
+
+```sh tab="cURL" tab-group="language"
+curl http://127.0.0.1:3000/admin/accounts/did:plc:abc/access -H "$AUTH"
+```
+
+**Response**: `200 OK` with `{ "grant": { ... } }`, or `{ "grant": null }` when no active grant covers the account. Returns `403 SpaceInspectorDisabled` if the space inspector is off.
 
 ## List an account's records
 
