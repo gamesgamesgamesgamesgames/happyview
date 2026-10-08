@@ -625,3 +625,59 @@ async fn every_run_moves_the_script_counters() {
     }
     assert!(counters.script_runtime_us.load(Ordering::Relaxed) > 0);
 }
+
+// ---------------------------------------------------------------------------
+// The lexicon's output encoding
+// ---------------------------------------------------------------------------
+
+/// `list_games_query_lexicon` with its output encoding replaced, so the only
+/// difference between the two cases below is the declaration itself.
+fn query_lexicon_encoded(encoding: &str) -> Value {
+    let mut lexicon = common::fixtures::list_games_query_lexicon();
+    lexicon["defs"]["main"]["output"] = json!({ "encoding": encoding });
+    lexicon
+}
+
+async fn query_app_encoded(encoding: &str, source: &str) -> TestApp {
+    let app = TestApp::new().await;
+    upload_lexicon(&app, query_lexicon_encoded(encoding)).await;
+    seed_script_as(&app, &format!("xrpc.query:{QUERY}"), source, "lua").await;
+    interpreter(&app).await;
+    app
+}
+
+/// The runner has to consult the lexicon, not just run the script.
+///
+/// The echo fixture answers with its own `execute` input, which is an object
+/// and neither of the byte forms. Declared as JSON that is a 200; declared as
+/// `*/*` it has to be refused, and the refusal has to name what a byte-
+/// returning script should have produced. Deleting the runner's call to
+/// `script::response::resolve` answers 200 in both cases, which is what makes
+/// this a test of the wiring rather than of the helper.
+#[tokio::test]
+async fn the_output_encoding_decides_how_a_query_answers() {
+    require_fixture!();
+
+    let json_app = query_app_encoded("application/json", "echo me").await;
+    let resp = call_query(&json_app, "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a json-declared query should answer with the value as it stands"
+    );
+
+    let bytes_app = query_app_encoded("*/*", "echo me").await;
+    let resp = call_query(&bytes_app, "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a */*-declared query must not answer an ordinary object as JSON"
+    );
+    let body = json_body(resp).await;
+    assert_eq!(body["error"], "script_error");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("blob ref") && message.contains("$bytes"),
+        "the refusal should name both accepted forms, got {message:?}"
+    );
+}

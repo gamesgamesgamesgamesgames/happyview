@@ -1,5 +1,4 @@
-use axum::Json;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -279,6 +278,18 @@ pub async fn execute_procedure_script(
         }
     };
 
+    // The lexicon's declared output encoding decides whether this answers
+    // JSON or bytes, so a method declaring `application/json` is never
+    // examined for the byte forms and cannot be reinterpreted.
+    let answer = crate::script::response::resolve(
+        &state.db,
+        backend,
+        method,
+        &crate::script::output_encoding(lexicon),
+        json_value,
+    )
+    .await?;
+
     span.in_scope(|| {
         tracing::info!(
             duration_ms = start.elapsed().as_millis() as u64,
@@ -297,9 +308,9 @@ pub async fn execute_procedure_script(
                     "method": method,
                     "caller_did": claims.did(),
                     "duration_ms": start.elapsed().as_millis() as u64,
-                    "response_size": json_value.to_string().len(),
+                    "response_size": answer.response_size(),
                     "input": input_json,
-                    "response": json_value,
+                    "response": answer.log_detail(),
                 }),
             },
             backend,
@@ -307,7 +318,7 @@ pub async fn execute_procedure_script(
         .await;
     }
 
-    Ok(Json(json_value).into_response())
+    Ok(answer.into_response())
 }
 
 /// Execute a query endpoint's script.
@@ -385,6 +396,18 @@ pub async fn execute_query_script(
         }
     };
 
+    // The lexicon's declared output encoding decides whether this answers
+    // JSON or bytes, so a method declaring `application/json` is never
+    // examined for the byte forms and cannot be reinterpreted.
+    let answer = crate::script::response::resolve(
+        &state.db,
+        backend,
+        method,
+        &crate::script::output_encoding(lexicon),
+        json_value,
+    )
+    .await?;
+
     span.in_scope(|| {
         tracing::info!(
             duration_ms = start.elapsed().as_millis() as u64,
@@ -402,9 +425,9 @@ pub async fn execute_query_script(
                 detail: serde_json::json!({
                     "method": method,
                     "duration_ms": start.elapsed().as_millis() as u64,
-                    "response_size": json_value.to_string().len(),
+                    "response_size": answer.response_size(),
                     "params": params,
-                    "response": json_value,
+                    "response": answer.log_detail(),
                 }),
             },
             backend,
@@ -412,7 +435,7 @@ pub async fn execute_query_script(
         .await;
     }
 
-    Ok(Json(json_value).into_response())
+    Ok(answer.into_response())
 }
 
 #[cfg(test)]
@@ -421,6 +444,7 @@ mod tests {
     use crate::lexicon::{LexiconType, ProcedureAction};
     use crate::plugin::{ExecutionError, ScriptErrorKind, ScriptValueKind};
     use crate::test_support::{memory_pool, migrated_memory_pool, test_state_with_pool};
+    use axum::response::IntoResponse;
 
     fn query_lexicon() -> ParsedLexicon {
         ParsedLexicon {

@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod auth;
+pub mod blobs;
 pub mod cid_verify;
 pub mod codemod;
 pub mod config;
