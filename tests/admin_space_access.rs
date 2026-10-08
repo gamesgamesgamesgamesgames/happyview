@@ -656,3 +656,52 @@ async fn retention_removes_grants_that_ended_before_the_cutoff() {
         "0 keeps them forever"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn retention_keeps_the_record_of_a_grant_that_is_still_active() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let now = chrono::Utc::now();
+    let long_ago = (now - chrono::Duration::days(400)).to_rfc3339();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at) VALUES ('long-grant', 'u', 'did:plc:u', 'account', 'did:plc:t', 'r', ?, ?)",
+        app.state.db_backend,
+    ))
+    .bind(&long_ago)
+    .bind((now + chrono::Duration::days(30)).to_rfc3339())
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    let insert_event = adapt_sql(
+        "INSERT INTO happyview_event_logs (id, event_type, severity, detail, created_at) VALUES (?, 'space.access_granted', 'info', '{}', ?)",
+        app.state.db_backend,
+    );
+    for (id, created_at) in [
+        ("granted-long-ago", long_ago.clone()),
+        (
+            "before-the-grant",
+            (now - chrono::Duration::days(500)).to_rfc3339(),
+        ),
+    ] {
+        happyview::db::query(&insert_event)
+            .bind(id)
+            .bind(created_at)
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
+
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+
+    let left: Vec<String> = happyview::db::query_as::<(String,)>(
+        "SELECT id FROM happyview_event_logs WHERE event_type = 'space.access_granted'",
+    )
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(id,)| id)
+    .collect();
+    assert_eq!(left, vec!["granted-long-ago"]);
+}
