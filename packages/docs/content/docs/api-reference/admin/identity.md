@@ -37,7 +37,6 @@ interface ResolvedIdentity {
   handle: string | null;
   display_name?: string; // with profile=true
   avatar?: string; // with profile=true
-}| null;
 }
 
 const params = new URLSearchParams({ identifier: "alice.bsky.social" });
