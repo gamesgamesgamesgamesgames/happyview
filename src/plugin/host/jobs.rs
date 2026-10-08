@@ -115,12 +115,16 @@ pub async fn get_any(state: &AppState, spec: JobGet) -> Result<Option<JobView>, 
 const DEFAULT_LIST_LIMIT: u32 = 50;
 const MAX_LIST_LIMIT: u32 = 200;
 
+fn effective_limit(limit: Option<u32>) -> Result<u32, JobsError> {
+    match limit {
+        None => Ok(DEFAULT_LIST_LIMIT),
+        Some(0) => Err(JobsError::Invalid("limit must be at least 1".into())),
+        Some(n) => Ok(n.min(MAX_LIST_LIMIT)),
+    }
+}
+
 pub async fn list_any(state: &AppState, spec: JobListAny) -> Result<Vec<JobView>, JobsError> {
-    let limit = match spec.limit {
-        None => DEFAULT_LIST_LIMIT,
-        Some(0) => return Err(JobsError::Invalid("limit must be at least 1".into())),
-        Some(n) => n.min(MAX_LIST_LIMIT),
-    };
+    let limit = effective_limit(spec.limit)?;
     let jobs = crate::jobs::db::list_jobs_any(state, &spec.status, spec.job_type.as_deref(), limit)
         .await
         .map_err(|e| JobsError::Database(e.to_string()))?;
@@ -504,5 +508,14 @@ mod tests {
         .await
         .unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn effective_limit_defaults_to_50_and_clamps_to_200() {
+        assert_eq!(effective_limit(None).unwrap(), 50);
+        assert_eq!(effective_limit(Some(1)).unwrap(), 1);
+        assert_eq!(effective_limit(Some(200)).unwrap(), 200);
+        assert_eq!(effective_limit(Some(1000)).unwrap(), 200);
+        assert_eq!(effective_limit(Some(0)).unwrap_err().code(), "BAD_INPUT");
     }
 }
