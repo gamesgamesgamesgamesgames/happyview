@@ -403,7 +403,7 @@ A plugin declaring `linked_repos:use`, `jobs:create`, `jobs:read` or `jobs:read_
 | `host_jobs_create`                | `jobs:create`       | `{job_type, input, auth}` → the job id |
 | `host_jobs_get`                   | `jobs:read`         | `{id}` → the job or `null`; only returns the caller's own jobs |
 | `host_jobs_get_any`               | `jobs:read_any`     | `{id}` → the job or `null` |
-| `host_jobs_list_any`              | `jobs:read_any`     | `{status?, job_type?, limit?}` → jobs, newest first; `limit` defaults to 50 and is capped at 200 |
+| `host_jobs_list_any`              | `jobs:read_any`     | `{status?: [string], job_type?, limit?}` → jobs, newest first; `limit` defaults to 50, maximum 200, minimum 1 (0 is `BAD_INPUT`) |
 
 The plugin capability `jobs:read` is distinct from the admin user permission of the same name (see [Permissions](./permissions.md)): it controls what a plugin can read, not what an operator can see in the dashboard. Job views never include `inherit_auth`, `api_client_id` or `dpop_key_id`.
 

@@ -122,6 +122,8 @@ Enqueuing needs a caller: `jobs.create` raises `BAD_INPUT` when `ctx.caller_did`
 
 ## Reading jobs from a script
 
+Reading jobs needs the `happyview-jobs` plugin at version 1.1.0 or later, the release that adds `get`, `get_any` and `list_any`.
+
 `jobs.get(id)` returns a job's status, progress, result and error. It answers `nil` unless `ctx.caller_did` created the job, so a job that belongs to someone else looks the same as one that doesn't exist.
 
 ```lua
@@ -133,7 +135,7 @@ function handle(input, ctx)
 end
 ```
 
-Reading other users' jobs needs the `jobs:read_any` capability. Job views never include the PDS session fields (`inherit_auth`, `api_client_id`, `dpop_key_id`).
+Reading other users' jobs needs the `jobs:read_any` capability: `jobs.get_any(id)` returns any job on the instance, and `jobs.list_any(opts?)` lists jobs across every user, newest first. Plugin authors calling the host directly should see the host imports in [Developing plugins](./developing-plugins.md). Job views never include the PDS session fields (`inherit_auth`, `api_client_id`, `dpop_key_id`).
 
 ## Authentication
 
