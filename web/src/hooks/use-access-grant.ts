@@ -38,9 +38,15 @@ export function useAccessGrant(
     try {
       const { grants } = await listAccessGrants(true);
       if (current !== generation.current) return;
+      // A space grant opens everything an account grant would on the same page,
+      // so it wins over any account grant; ties go to the one expiring last.
       const matching = grants
         .filter((g) => matchRef(g))
-        .sort((a, b) => Date.parse(b.expires_at) - Date.parse(a.expires_at));
+        .sort(
+          (a, b) =>
+            Number(b.scope === "space") - Number(a.scope === "space") ||
+            Date.parse(b.expires_at) - Date.parse(a.expires_at),
+        );
       setFound({ key: targetKey, grant: matching[0] ?? null });
     } catch (e) {
       if (current !== generation.current) return;
