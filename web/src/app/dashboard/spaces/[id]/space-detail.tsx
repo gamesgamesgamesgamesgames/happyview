@@ -175,14 +175,12 @@ function SpaceDetailContent() {
 
   useEffect(() => {
     recordsRequest.current += 1;
-    // Pages and the open record belong to the previous grant's scope.
+    // Records, pages and the open record belong to the previous grant's scope.
+    setRecords([]);
+    setNextCursor(undefined);
     setCursorStack([]);
     setViewRecord(null);
-    if (!access.grant) {
-      setRecords([]);
-      setNextCursor(undefined);
-      return;
-    }
+    if (!access.grant) return;
     // A new grant starts from its own scope: an account grant fixes the author,
     // and a space grant starts from every author rather than a filter left
     // over from a previous grant.

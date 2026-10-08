@@ -119,10 +119,11 @@ function AccountView() {
 
   useEffect(() => {
     recordsRequest.current += 1;
+    setRecords([]);
+    setNextCursor(undefined);
     setCursorStack([]);
     setViewRecord(null);
     if (access.grant) fetchRecords();
-    else setRecords([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [access.grant?.id, did]);
 

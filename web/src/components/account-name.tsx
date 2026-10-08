@@ -35,9 +35,10 @@ function releaseSlot() {
 type Unavailable = "unavailable";
 type Lookup = ResolvedIdentity | null | Unavailable;
 
-// One successful lookup per DID for the life of the page. A failure is never
-// cached, so the next component to show that DID tries again: the server also
-// answers 400 for timeouts and rate limits, so a 400 isn't proof the DID is bad.
+// One lookup per DID for the life of the page. The resolver answers 400 only
+// for a DID that is malformed or has no usable document, which is cached as
+// null. Timeouts, rate limits and unreachable hosts (502) and network errors
+// are dropped from the cache, so the next component to show that DID retries.
 const identities = new Map<string, Promise<Lookup>>();
 
 function lookupIdentity(did: string): Promise<Lookup> {
@@ -47,8 +48,9 @@ function lookupIdentity(did: string): Promise<Lookup> {
       resolveIdentity(did, { profile: true })
         .then((identity): Lookup => identity)
         .catch((e: unknown): Lookup => {
+          if (e instanceof ApiError && e.status === 400) return null;
           identities.delete(did);
-          return e instanceof ApiError && e.status === 400 ? null : "unavailable";
+          return "unavailable";
         })
         .finally(releaseSlot),
     );
