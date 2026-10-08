@@ -316,16 +316,28 @@ pub async fn sweep_ended_access_grants(
     }
     // Grant timestamps are written with `to_rfc3339()`, so they compare as text.
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+    // Batched like the event sweep, so a long-disabled retention catching up
+    // doesn't become one huge transaction holding the write lock.
     let sql = adapt_sql(
-        "DELETE FROM happyview_space_access_grants WHERE (revoked_at IS NOT NULL AND revoked_at < ?) OR expires_at < ?",
+        "DELETE FROM happyview_space_access_grants WHERE id IN \
+         (SELECT id FROM happyview_space_access_grants WHERE (revoked_at IS NOT NULL AND revoked_at < ?) OR expires_at < ? LIMIT ?)",
         backend,
     );
-    let result = crate::db::query(&sql)
-        .bind(&cutoff)
-        .bind(&cutoff)
-        .execute(db)
-        .await?;
-    Ok(result.rows_affected())
+    let mut deleted = 0;
+    loop {
+        let affected = crate::db::query(&sql)
+            .bind(&cutoff)
+            .bind(&cutoff)
+            .bind(SWEEP_BATCH_SIZE)
+            .execute(db)
+            .await?
+            .rows_affected();
+        deleted += affected;
+        if (affected as i64) < SWEEP_BATCH_SIZE {
+            break;
+        }
+    }
+    Ok(deleted)
 }
 
 pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
