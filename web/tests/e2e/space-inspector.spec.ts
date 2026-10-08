@@ -52,7 +52,9 @@ async function setSetting(key: string, value: string | null) {
   }
 }
 
-async function createSpace(page: Page): Promise<{ uri: string; id: string }> {
+async function createSpace(
+  page: Page,
+): Promise<{ uri: string; id: string; creatorDid: string }> {
   const resp = await page.request.post("/xrpc/com.atproto.simplespace.createSpace", {
     data: {
       spaceType: "com.example.inspector",
@@ -63,24 +65,25 @@ async function createSpace(page: Page): Promise<{ uri: string; id: string }> {
   });
   expect(resp.ok()).toBe(true);
   const { uri } = await resp.json();
-  return { uri, id: await spaceIdFor(uri) };
+  return { uri, ...(await spaceRowFor(uri)) };
 }
 
 /**
- * The internal id of a space, read from the database. The admin spaces API
- * is closed while the inspector is off, and some tests create a space in that
- * state.
+ * A space's internal id and creator, read from the database. The admin spaces
+ * API is closed while the inspector is off, and some tests create a space in
+ * that state. The creator differs from the DID in the URI, which is the space's
+ * authority.
  */
-async function spaceIdFor(uri: string): Promise<string> {
+async function spaceRowFor(uri: string): Promise<{ id: string; creatorDid: string }> {
   const [did, , typeNsid, skey] = uri.replace(/^at:\/\//, "").split("/");
   const client = new pg.Client(DB_URL);
   await client.connect();
   try {
     const { rows } = await client.query(
-      "SELECT id FROM happyview_spaces WHERE did = $1 AND type_nsid = $2 AND skey = $3",
+      "SELECT id, creator_did FROM happyview_spaces WHERE did = $1 AND type_nsid = $2 AND skey = $3",
       [did, typeNsid, skey],
     );
-    return rows[0].id;
+    return { id: rows[0].id, creatorDid: rows[0].creator_did };
   } finally {
     await client.end();
   }
@@ -142,9 +145,8 @@ test.describe("Space inspector", () => {
 
   test("account view lists spaces before access and records after", async ({ page }) => {
     await setSetting("feature.space_inspector_enabled", "true");
-    const { uri } = await createSpace(page);
+    const { uri, creatorDid } = await createSpace(page);
     spaceUri = uri;
-    const creatorDid = uri.split("/")[2];
 
     await page.goto("/dashboard/spaces/");
     await page.getByLabel("Account DID").fill(creatorDid);
@@ -155,7 +157,13 @@ test.describe("Space inspector", () => {
     await page.getByRole("button", { name: "Request access" }).click();
     await page.getByRole("dialog").getByLabel("Reason").fill("Report #2");
     await page.getByRole("dialog").getByRole("button", { name: "Grant access" }).click();
-    await expect(page.getByText(`Access to ${creatorDid}`)).toBeVisible();
+    const banner = page
+      .locator("div")
+      .filter({ hasText: "Access to" })
+      .filter({ has: page.getByRole("button", { name: "End access" }) })
+      .last();
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText(creatorDid);
   });
 
   test("a grant's event lists the reads made under it", async ({ page }) => {
