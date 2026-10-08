@@ -11,7 +11,7 @@ use axum::response::IntoResponse;
 use serde::Deserialize;
 
 use crate::AppState;
-use crate::db::parse_dt;
+use crate::db::{adapt_sql, parse_dt};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, write_event};
 use crate::spaces::types::Space;
@@ -87,9 +87,22 @@ async fn log_content_read(
         detail,
     };
     // Fails the request rather than return content whose read went unrecorded.
-    write_event(&state.db, &event, state.db_backend)
+    // The event and its link to the grant commit together.
+    let failed = |e: sqlx::Error| AppError::Internal(format!("failed to record the read: {e}"));
+    let mut tx = state.db.begin().await.map_err(failed)?;
+    let event_id = write_event(&mut *tx, &event, state.db_backend)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to record the read: {e}")))
+        .map_err(failed)?;
+    crate::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_access_reads (event_id, grant_id) VALUES (?, ?)",
+        state.db_backend,
+    ))
+    .bind(&event_id)
+    .bind(&grant.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(failed)?;
+    tx.commit().await.map_err(failed)
 }
 
 /// GET /admin/spaces — every space on the instance, newest first.
@@ -132,12 +145,10 @@ pub(super) async fn get_space(
     let members = members::resolve_members(&state.db, state.db_backend, &space.id).await?;
     let collections =
         db::count_space_records_by_collection(&state.db, state.db_backend, &space.id).await?;
-    let authors = db::list_space_authors(&state.db, state.db_backend, &space.id).await?;
 
     Ok(Json(serde_json::json!({
         "space": space_json(&space),
         "members": members,
-        "authors": authors,
         "collections": collections
             .into_iter()
             .map(|(collection, count)| serde_json::json!({
@@ -146,6 +157,51 @@ pub(super) async fn get_space(
             }))
             .collect::<Vec<_>>(),
     })))
+}
+
+/// GET /admin/spaces/{id}/access — the caller's active grant that covers this
+/// space's page: a space grant for it if one exists, otherwise the account
+/// grant expiring last whose account is a member or has records here.
+/// `{ "grant": null }` when none does.
+pub(super) async fn covering_grant(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let grants = space_access::active_grants(&state, &auth).await?;
+    let space = load_space(&state, &id).await?;
+    let now = chrono::Utc::now();
+
+    let space_grant = space_access::select_covering(
+        &grants,
+        &space_access::Covers::Space {
+            space_id: &space.id,
+            repo: None,
+        },
+        now,
+    );
+    let grant = match space_grant {
+        Some(g) => Some(g.clone()),
+        None => {
+            let targets: Vec<String> = grants
+                .iter()
+                .filter(|g| g.scope == GrantScope::Account && g.is_active(now))
+                .map(|g| g.target.clone())
+                .collect();
+            let present =
+                db::space_accounts_among(&state.db, state.db_backend, &space.id, &targets).await?;
+            grants
+                .iter()
+                .filter(|g| {
+                    g.scope == GrantScope::Account
+                        && g.is_active(now)
+                        && present.contains(&g.target)
+                })
+                .max_by_key(|g| parse_dt(&g.expires_at))
+                .cloned()
+        }
+    };
+    Ok(Json(serde_json::json!({ "grant": grant })))
 }
 
 /// GET /admin/spaces/{id}/records — records in a space, newest first.

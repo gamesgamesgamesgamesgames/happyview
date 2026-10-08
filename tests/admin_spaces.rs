@@ -791,29 +791,69 @@ async fn grant_reads_are_paginated() {
 
 #[tokio::test]
 #[serial]
-async fn space_detail_lists_authors_who_are_not_members() {
+async fn covering_grant_prefers_the_space_grant_and_finds_non_member_authors() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
     let former = "did:plc:adminspaces-former";
     seed_blob_record(&app, &id, "main", former, "f1", "bafkformer").await;
     enable_inspector(&app).await;
+    let access = format!("/admin/spaces/{id}/access");
 
-    let body = json_body(get(&app, &format!("/admin/spaces/{id}"), None).await).await;
-    let authors: Vec<&str> = body["authors"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|a| a.as_str().unwrap())
-        .collect();
-    assert!(authors.contains(&former), "{authors:?}");
-    assert!(authors.contains(&MEMBER), "{authors:?}");
-    assert!(
-        !body["members"]
-            .as_array()
+    let body = json_body(get(&app, &access, None).await).await;
+    assert!(body["grant"].is_null());
+
+    // A grant for an account with nothing in this space doesn't cover it.
+    grant(&app, "account", "did:plc:adminspaces-elsewhere").await;
+    let body = json_body(get(&app, &access, None).await).await;
+    assert!(body["grant"].is_null());
+
+    // A former author's grant does, even though they aren't a member.
+    let former_grant = grant(&app, "account", former).await;
+    let body = json_body(get(&app, &access, None).await).await;
+    assert_eq!(body["grant"]["id"], former_grant);
+
+    // A space grant wins over account grants.
+    let space_grant = grant(&app, "space", &id).await;
+    let body = json_body(get(&app, &access, None).await).await;
+    assert_eq!(body["grant"]["id"], space_grant);
+}
+
+#[tokio::test]
+#[serial]
+async fn read_links_go_when_their_events_do() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    let grant_id = grant(&app, "space", &id).await;
+    get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+
+    let links = || async {
+        happyview::db::query_as::<(i64,)>("SELECT COUNT(*) FROM happyview_space_access_reads")
+            .fetch_one(&app.state.db)
+            .await
             .unwrap()
-            .iter()
-            .any(|m| m["did"] == former),
-        "the former author is not a member"
-    );
+            .0
+    };
+    assert_eq!(links().await, 1);
+
+    happyview::db::query(&adapt_sql(
+        "DELETE FROM happyview_event_logs WHERE event_type = 'space.moderator_read'",
+        app.state.db_backend,
+    ))
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(links().await, 0);
+    let body = json_body(
+        get(
+            &app,
+            &format!("/admin/spaces/access-grants/{grant_id}/reads"),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert!(body["events"].as_array().unwrap().is_empty());
 }

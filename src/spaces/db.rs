@@ -149,21 +149,37 @@ pub async fn count_space_records_by_collection(
         .map_err(|e| AppError::Internal(format!("failed to count space records: {e}")))
 }
 
-/// Every DID that has records in a space, whether or not it is still a member.
-pub async fn list_space_authors(
+/// Which of `dids` belong to a space, as a member or as the author of a record
+/// in it. Bounded by `dids`, not by the size of the space.
+pub async fn space_accounts_among(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     space_id: &str,
+    dids: &[String],
 ) -> Result<Vec<String>, AppError> {
+    if dids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; dids.len()].join(", ");
     let sql = adapt_sql(
-        "SELECT DISTINCT author_did FROM happyview_space_records WHERE space_id = ? ORDER BY author_did",
+        &format!(
+            "SELECT member_did FROM happyview_space_members WHERE space_id = ? AND member_did IN ({placeholders}) \
+             UNION SELECT DISTINCT author_did FROM happyview_space_records WHERE space_id = ? AND author_did IN ({placeholders})"
+        ),
         backend,
     );
-    let rows: Vec<(String,)> = crate::db::query_as(&sql)
-        .bind(space_id)
+    let mut q = crate::db::query_as::<(String,)>(&sql).bind(space_id);
+    for did in dids {
+        q = q.bind(did);
+    }
+    q = q.bind(space_id);
+    for did in dids {
+        q = q.bind(did);
+    }
+    let rows = q
         .fetch_all(pool)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to list space authors: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("failed to match space accounts: {e}")))?;
     Ok(rows.into_iter().map(|(did,)| did).collect())
 }
 

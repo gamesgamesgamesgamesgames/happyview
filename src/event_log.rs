@@ -396,11 +396,12 @@ pub async fn log_event(db: &AnyPool, event: EventLog, backend: DatabaseBackend) 
 /// Write an event and report failure. For audit events whose absence must stop
 /// the action they record; `log_event` is the best-effort form. Accepts a
 /// transaction so the event can commit or roll back with the change it records.
+/// Returns the new event's id.
 pub async fn write_event<'e, E>(
     executor: E,
     event: &EventLog,
     backend: DatabaseBackend,
-) -> Result<(), sqlx::Error>
+) -> Result<String, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Any>,
 {
@@ -423,8 +424,8 @@ where
         .bind(&detail_str)
         .bind(&created_at)
         .execute(executor)
-        .await
-        .map(|_| ())
+        .await?;
+    Ok(id)
 }
 
 #[cfg(test)]

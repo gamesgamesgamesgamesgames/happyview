@@ -586,17 +586,14 @@ pub(super) async fn grant_reads(
     let limit = params.limit.unwrap_or(100).clamp(1, 500);
     let after = params.cursor.as_deref().and_then(crate::db::decode_cursor);
 
-    // `detail` is compact JSON text on both backends, so the grant id appears
-    // as `"grant_id":"<id>"`.
-    let pattern = format!("%\"grant_id\":\"{}\"%", crate::db::escape_like(&id));
     let after_clause = if after.is_some() {
-        " AND (created_at > ? OR (created_at = ? AND id > ?))"
+        " AND (e.created_at > ? OR (e.created_at = ? AND e.id > ?))"
     } else {
         ""
     };
     let sql = adapt_sql(
         &format!(
-            "SELECT id, event_type, severity, actor_did, subject, detail, created_at FROM happyview_event_logs WHERE event_type = 'space.moderator_read' AND detail LIKE ? ESCAPE '\\'{after_clause} ORDER BY created_at ASC, id ASC LIMIT ?"
+            "SELECT e.id, e.event_type, e.severity, e.actor_did, e.subject, e.detail, e.created_at FROM happyview_space_access_reads r JOIN happyview_event_logs e ON e.id = r.event_id WHERE r.grant_id = ?{after_clause} ORDER BY e.created_at ASC, e.id ASC LIMIT ?"
         ),
         state.db_backend,
     );
@@ -610,7 +607,7 @@ pub(super) async fn grant_reads(
         String,
         String,
     )> = {
-        let mut q = crate::db::query_as(&sql).bind(&pattern);
+        let mut q = crate::db::query_as(&sql).bind(&id);
         if let Some((ts, last_id)) = &after {
             q = q.bind(ts).bind(ts).bind(last_id);
         }
