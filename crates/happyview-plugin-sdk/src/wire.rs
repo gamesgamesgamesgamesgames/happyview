@@ -874,6 +874,48 @@ pub struct JobCreate {
     pub auth: bool,
 }
 
+/// Read one of the current user's jobs. Needs `jobs:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobGet {
+    pub id: String,
+}
+
+/// List jobs across every user, newest first. Needs `jobs:read_any`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct JobListAny {
+    /// Statuses to include; empty means every status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_type: Option<String>,
+    /// Defaults to 50 on the host; the host caps it at 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// A job as plugins see it. Never carries the session fields
+/// (`inherit_auth`, `api_client_id`, `dpop_key_id`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobView {
+    pub id: String,
+    pub job_type: String,
+    pub status: String,
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default)]
+    pub progress: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Spaces
 // ---------------------------------------------------------------------------
@@ -3015,6 +3057,54 @@ mod jobs_tests {
     use super::*;
     use alloc::string::ToString;
     use serde_json::json;
+
+    #[test]
+    fn job_list_any_defaults_every_filter_when_absent() {
+        let spec: JobListAny = serde_json::from_str("{}").unwrap();
+        assert_eq!(spec, JobListAny::default());
+        assert_eq!(serde_json::to_string(&spec).unwrap(), "{}");
+    }
+
+    #[test]
+    fn job_view_round_trips_and_omits_absent_optionals() {
+        let view = JobView {
+            id: "j1".into(),
+            job_type: "instance.operation".into(),
+            status: "running".into(),
+            input: json!({"operationId": "o1"}),
+            progress: json!({"step": "apply"}),
+            result: None,
+            error: None,
+            created_by: "did:plc:a".into(),
+            created_at: "2026-10-07T00:00:00Z".into(),
+            started_at: None,
+            completed_at: None,
+        };
+        let text = serde_json::to_string(&view).unwrap();
+        assert!(!text.contains("result") && !text.contains("completed_at"));
+        assert_eq!(serde_json::from_str::<JobView>(&text).unwrap(), view);
+    }
+
+    #[test]
+    fn job_view_has_no_session_fields() {
+        let text = serde_json::to_string(&JobView {
+            id: "j".into(),
+            job_type: "t".into(),
+            status: "pending".into(),
+            input: json!({}),
+            progress: json!({}),
+            result: None,
+            error: None,
+            created_by: "did:plc:a".into(),
+            created_at: "x".into(),
+            started_at: None,
+            completed_at: None,
+        })
+        .unwrap();
+        for field in ["inherit_auth", "api_client_id", "dpop_key_id"] {
+            assert!(!text.contains(field), "{field} leaked: {text}");
+        }
+    }
 
     #[test]
     fn job_create_defaults_input_and_auth_when_absent() {

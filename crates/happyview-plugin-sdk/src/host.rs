@@ -29,13 +29,14 @@ use crate::wire::Response;
 use crate::wire::{
     ApiSurface, AtprotoBlobDownload, AttestSign, AttestVerify, BacklinksQuery, BlobData,
     CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
-    CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, JobProgressRequest, Label, LabelsGet,
-    LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoInfo, LinkedRepoRecordCreate,
-    LinkedRepoRecordDelete, LinkedRepoRecordPut, PluginError, RecordRef, RecordsCount, RecordsPage,
-    RecordsQuery, RecordsSearch, ScriptLogRequest, SpaceDelete, SpaceInfo, SpaceInviteCreate,
-    SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete,
-    SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite,
-    SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers, SpacesQuery, StrongRef, TableQuery,
+    CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, JobGet, JobListAny, JobProgressRequest,
+    JobView, Label, LabelsGet, LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoInfo,
+    LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut, PluginError, RecordRef,
+    RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, ScriptLogRequest, SpaceDelete,
+    SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo,
+    SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage,
+    SpaceUpdate, SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers,
+    SpacesQuery, StrongRef, TableQuery,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::wire::{AtprotoResolveService, JobShouldStopRequest, JobWaitRequest, LexiconGet};
@@ -97,6 +98,9 @@ extern "C" {
     fn host_linked_repo_upload_blob(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repo_call(req_ptr: i32, req_len: i32) -> i64;
     fn host_jobs_create(req_ptr: i32, req_len: i32) -> i64;
+    fn host_jobs_get(req_ptr: i32, req_len: i32) -> i64;
+    fn host_jobs_get_any(req_ptr: i32, req_len: i32) -> i64;
+    fn host_jobs_list_any(req_ptr: i32, req_len: i32) -> i64;
     fn host_spaces_info(req_ptr: i32, req_len: i32) -> i64;
     fn host_spaces_query(req_ptr: i32, req_len: i32) -> i64;
     fn host_spaces_members(req_ptr: i32, req_len: i32) -> i64;
@@ -720,6 +724,46 @@ pub fn jobs_create(spec: &JobCreate) -> Result<String, PluginError> {
     #[cfg(target_arch = "wasm32")]
     {
         call_spec(host_jobs_create, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// One of the current user's jobs, or `None` when there is no such job or
+/// another user created it. Needs `jobs:read`.
+pub fn jobs_get(spec: &JobGet) -> Result<Option<JobView>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_jobs_get, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Any job on the instance, or `None`. Needs `jobs:read_any`.
+pub fn jobs_get_any(spec: &JobGet) -> Result<Option<JobView>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_jobs_get_any, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Jobs across every user, newest first. Needs `jobs:read_any`.
+pub fn jobs_list_any(spec: &JobListAny) -> Result<Vec<JobView>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_jobs_list_any, spec)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {

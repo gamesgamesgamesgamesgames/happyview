@@ -58,6 +58,10 @@ pub enum PluginCapability {
     LinkedReposUse,
     #[serde(rename = "jobs:create")]
     JobsCreate,
+    #[serde(rename = "jobs:read")]
+    JobsRead,
+    #[serde(rename = "jobs:read_any")]
+    JobsReadAny,
     #[serde(rename = "spaces:read")]
     SpacesRead,
     #[serde(rename = "spaces:write")]
@@ -94,6 +98,8 @@ impl PluginCapability {
             AttestSign,
             LinkedReposUse,
             JobsCreate,
+            JobsRead,
+            JobsReadAny,
             SpacesRead,
             SpacesWrite,
             WasiClock,
@@ -124,6 +130,8 @@ impl PluginCapability {
             AttestSign => "attest:sign",
             LinkedReposUse => "linked_repos:use",
             JobsCreate => "jobs:create",
+            JobsRead => "jobs:read",
+            JobsReadAny => "jobs:read_any",
             SpacesRead => "spaces:read",
             SpacesWrite => "spaces:write",
             WasiClock => "wasi:clock",
@@ -140,7 +148,9 @@ impl PluginCapability {
     pub fn risk(&self) -> Risk {
         use PluginCapability::*;
         match self {
-            SecretsRead | KvRead | KvWrite | WasiClock | WasiRandom | ScriptHost => Risk::Low,
+            SecretsRead | KvRead | KvWrite | JobsRead | WasiClock | WasiRandom | ScriptHost => {
+                Risk::Low
+            }
             RecordsRead
             | NetworkRequest
             | NetworkRequestDefined
@@ -155,6 +165,7 @@ impl PluginCapability {
             | RecordsWrite
             | AttestSign
             | LinkedReposUse
+            | JobsReadAny
             | SpacesRead
             | SpacesWrite => Risk::High,
             DatabaseWrite | CallerCall => Risk::Critical,
@@ -213,6 +224,10 @@ impl PluginCapability {
             }
             JobsCreate => {
                 "Enqueue background jobs as the user who ran the script, optionally carrying that user's PDS session into the job."
+            }
+            JobsRead => "Read background jobs the user who ran the script created.",
+            JobsReadAny => {
+                "Read every background job on this instance, including other users' job input and results."
             }
             SpacesRead => {
                 "Read the members and records of every space this instance holds, regardless of each space's read policy."
@@ -393,6 +408,18 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
     Requirement {
         import: "host_jobs_create",
         any_of: &[PluginCapability::JobsCreate],
+    },
+    Requirement {
+        import: "host_jobs_get",
+        any_of: &[PluginCapability::JobsRead],
+    },
+    Requirement {
+        import: "host_jobs_get_any",
+        any_of: &[PluginCapability::JobsReadAny],
+    },
+    Requirement {
+        import: "host_jobs_list_any",
+        any_of: &[PluginCapability::JobsReadAny],
     },
     Requirement {
         import: "host_spaces_info",
@@ -743,6 +770,9 @@ mod tests {
             "host_linked_repo_upload_blob",
             "host_linked_repo_call",
             "host_jobs_create",
+            "host_jobs_get",
+            "host_jobs_get_any",
+            "host_jobs_list_any",
             "host_spaces_info",
             "host_spaces_query",
             "host_spaces_members",
@@ -772,6 +802,31 @@ mod tests {
             );
         }
         assert_eq!(requirement_for_import("host_teleport"), None);
+    }
+
+    #[test]
+    fn job_read_imports_map_to_their_capability() {
+        assert_eq!(
+            requirement_for_import("host_jobs_get").unwrap().any_of,
+            &[PluginCapability::JobsRead]
+        );
+        assert_eq!(
+            requirement_for_import("host_jobs_get_any").unwrap().any_of,
+            &[PluginCapability::JobsReadAny]
+        );
+        assert_eq!(
+            requirement_for_import("host_jobs_list_any").unwrap().any_of,
+            &[PluginCapability::JobsReadAny]
+        );
+        assert_eq!(
+            PluginCapability::parse_str("jobs:read"),
+            Some(PluginCapability::JobsRead)
+        );
+        assert_eq!(
+            PluginCapability::parse_str("jobs:read_any"),
+            Some(PluginCapability::JobsReadAny)
+        );
+        assert!(PluginCapability::JobsReadAny.risk() > PluginCapability::JobsRead.risk());
     }
 
     #[test]
