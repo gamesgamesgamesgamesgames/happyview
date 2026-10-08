@@ -204,7 +204,8 @@ const SWEEP_BATCH_SIZE: i64 = 5000;
 /// `cutoff` must be RFC3339 with a `+00:00` offset — the form `now_rfc3339()`
 /// writes. On SQLite `created_at` is TEXT and this is a string comparison, so a
 /// differently-formatted cutoff silently mis-selects rows.
-pub async fn sweep_with_cutoff(
+#[cfg(test)]
+async fn sweep_with_cutoff(
     db: &AnyPool,
     cutoff: &str,
     protected: ProtectedEvents,
@@ -283,38 +284,24 @@ async fn reclaim(db: &AnyPool, deleted: u64, backend: DatabaseBackend) -> bool {
     }
 }
 
-/// The protected retention in days. An unset or unparseable
-/// `space_access_log_retention_days` follows a general retention of `0`
-/// (keep everything) and is 365 days otherwise.
-pub fn effective_protected_retention(general_days: u32, protected: Option<&str>) -> u32 {
-    match protected.and_then(|v| v.trim().parse::<u32>().ok()) {
-        Some(days) => days,
-        None if general_days == 0 => 0,
-        None => DEFAULT_PROTECTED_RETENTION_DAYS,
-    }
-}
-
-/// When the oldest access grant that is still active was created. Protected
-/// events from then on are kept whatever their age, so a long grant never
-/// outlives the record of why it was made. `None` when no grant is active, or
-/// when the grants table doesn't exist.
-async fn oldest_active_grant(db: &AnyPool, backend: DatabaseBackend) -> Option<String> {
-    let sql = adapt_sql(
-        "SELECT MIN(created_at) FROM happyview_space_access_grants WHERE revoked_at IS NULL AND expires_at > ?",
-        backend,
-    );
-    crate::db::query_as::<(Option<String>,)>(&sql)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .fetch_one(db)
-        .await
-        .ok()
-        .and_then(|(oldest,)| oldest)
+/// When the oldest access grant still on record was created. Protected events
+/// from then on are kept whatever their age: a grant's reason and the reads
+/// under it last as long as the grant row does, which `sweep_ended_access_grants`
+/// removes once it has been over for the retention period.
+async fn oldest_grant(db: &AnyPool) -> Result<Option<String>, sqlx::Error> {
+    crate::db::query_as::<(Option<String>,)>(
+        "SELECT MIN(created_at) FROM happyview_space_access_grants",
+    )
+    .fetch_one(db)
+    .await
+    .map(|(oldest,)| oldest)
 }
 
 /// Sweep unprotected rows older than `retention_days` and protected rows
 /// older than `protected_retention_days`, then reclaim once. A value of `0`
-/// skips that pass. Protected rows newer than the oldest active access grant
-/// are kept regardless.
+/// skips that pass. Protected rows newer than the oldest access grant still on
+/// record are kept regardless; if that can't be read, the protected pass is
+/// skipped rather than risk deleting a grant's record.
 pub async fn run_retention_sweep(
     db: &AnyPool,
     retention_days: u32,
@@ -334,14 +321,19 @@ pub async fn run_retention_sweep(
         .await;
     }
     if protected_retention_days > 0 {
-        let mut cutoff = days_ago(protected_retention_days);
-        // Both are `to_rfc3339()` UTC text, so the earlier one sorts first.
-        if let Some(oldest) = oldest_active_grant(db, backend).await
-            && oldest < cutoff
-        {
-            cutoff = oldest;
+        match oldest_grant(db).await {
+            Ok(oldest) => {
+                let mut cutoff = days_ago(protected_retention_days);
+                // Both are `to_rfc3339()` UTC text, so the earlier one sorts first.
+                if let Some(oldest) = oldest
+                    && oldest < cutoff
+                {
+                    cutoff = oldest;
+                }
+                deleted += delete_before(db, &cutoff, ProtectedEvents::Only, backend).await;
+            }
+            Err(e) => tracing::warn!("skipping protected event cleanup: {e}"),
         }
-        deleted += delete_before(db, &cutoff, ProtectedEvents::Only, backend).await;
     }
     let vacuumed = reclaim(db, deleted, backend).await;
     SweepOutcome { deleted, vacuumed }
@@ -415,12 +407,11 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
             None => DEFAULT_RETENTION_DAYS,
         };
 
-        let protected_days = effective_protected_retention(
-            retention_days,
+        let protected_days =
             crate::admin::settings::get_setting(&db, SPACE_ACCESS_RETENTION_SETTING, backend)
                 .await
-                .as_deref(),
-        );
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(DEFAULT_PROTECTED_RETENTION_DAYS);
 
         let outcome = run_retention_sweep(&db, retention_days, protected_days, backend).await;
         if outcome.deleted > 0 {
@@ -645,6 +636,15 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create event_logs");
+        crate::db::query(
+            "CREATE TABLE happyview_space_access_grants (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create space_access_grants");
         pool
     }
 
@@ -755,15 +755,6 @@ mod tests {
 
         assert_eq!(outcome.deleted, 1);
         assert_eq!(remaining_ids(&pool).await, vec!["recent".to_string()]);
-    }
-
-    #[test]
-    fn unset_protected_retention_follows_a_keep_everything_general_setting() {
-        assert_eq!(effective_protected_retention(30, None), 365);
-        assert_eq!(effective_protected_retention(0, None), 0);
-        assert_eq!(effective_protected_retention(0, Some("abc")), 0);
-        assert_eq!(effective_protected_retention(0, Some(" 90 ")), 90);
-        assert_eq!(effective_protected_retention(30, Some("0")), 0);
     }
 
     #[tokio::test]

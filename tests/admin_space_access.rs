@@ -705,3 +705,66 @@ async fn retention_keeps_the_record_of_a_grant_that_is_still_active() {
     .collect();
     assert_eq!(left, vec!["granted-long-ago"]);
 }
+
+#[tokio::test]
+#[serial]
+async fn retention_keeps_an_ended_grants_record_while_its_row_remains() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let now = chrono::Utc::now();
+    let long_ago = (now - chrono::Duration::days(400)).to_rfc3339();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at) VALUES ('ended-grant', 'u', 'did:plc:u', 'account', 'did:plc:t', 'r', ?, ?)",
+        app.state.db_backend,
+    ))
+    .bind(&long_ago)
+    .bind((now - chrono::Duration::days(1)).to_rfc3339())
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_event_logs (id, event_type, severity, detail, created_at) VALUES ('granted', 'space.access_granted', 'info', '{}', ?)",
+        app.state.db_backend,
+    ))
+    .bind(&long_ago)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+    assert_eq!(
+        protected_count(&app).await,
+        1,
+        "the grant row is still stored"
+    );
+
+    // With the grants table unreadable, nothing protected is deleted.
+    rename_events_table(
+        &app,
+        "happyview_space_access_grants",
+        "happyview_space_access_grants_hidden",
+    )
+    .await;
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+    let remaining = protected_count(&app).await;
+    rename_events_table(
+        &app,
+        "happyview_space_access_grants_hidden",
+        "happyview_space_access_grants",
+    )
+    .await;
+    assert_eq!(
+        remaining, 1,
+        "a failed grant lookup skips the protected pass"
+    );
+}
+
+async fn protected_count(app: &TestApp) -> i64 {
+    happyview::db::query_as::<(i64,)>(
+        "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'space.access_granted'",
+    )
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap()
+    .0
+}
