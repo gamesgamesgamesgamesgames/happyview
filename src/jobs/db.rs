@@ -110,6 +110,42 @@ pub async fn get_job(state: &AppState, id: &str) -> Result<Option<Job>, AppError
     Ok(row.map(row_to_job))
 }
 
+/// Jobs across every user, newest first. Every value is a bound parameter:
+/// the `IN` list's placeholders are built from `statuses.len()`, never from
+/// the values themselves.
+pub async fn list_jobs_any(
+    state: &AppState,
+    statuses: &[String],
+    job_type: Option<&str>,
+    limit: u32,
+) -> Result<Vec<Job>, AppError> {
+    let mut sql = format!("SELECT {JOB_COLUMNS} FROM happyview_jobs WHERE 1 = 1");
+    if !statuses.is_empty() {
+        let placeholders = vec!["?"; statuses.len()].join(", ");
+        sql.push_str(&format!(" AND status IN ({placeholders})"));
+    }
+    if job_type.is_some() {
+        sql.push_str(" AND job_type = ?");
+    }
+    sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+
+    let sql = adapt_sql(&sql, state.db_backend);
+    let mut query = crate::db::query_as::<JobRow>(&sql);
+    for status in statuses {
+        query = query.bind(status.as_str());
+    }
+    if let Some(job_type) = job_type {
+        query = query.bind(job_type);
+    }
+    let rows: Vec<JobRow> = query
+        .bind(i64::from(limit))
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to list jobs: {e}")))?;
+
+    Ok(rows.into_iter().map(row_to_job).collect())
+}
+
 pub async fn list_jobs(
     state: &AppState,
     status_filter: Option<&str>,

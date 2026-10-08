@@ -7,13 +7,13 @@ use crate::AppState;
 use crate::plugin::caller::CallerSession;
 use crate::repo::PdsAuth;
 
-use happyview_plugin_sdk::wire::JobCreate;
+use happyview_plugin_sdk::wire::{JobCreate, JobGet, JobListAny, JobView};
 
 #[derive(Debug, thiserror::Error)]
 pub enum JobsError {
     #[error("{0}")]
     Invalid(String),
-    #[error("jobs.create requires an authenticated caller")]
+    #[error("this call requires an authenticated caller")]
     NoCaller,
     #[error("auth = true requires a DPoP session to carry into the job")]
     NoSession,
@@ -71,6 +71,60 @@ pub async fn create(
     )
     .await
     .map_err(|e| JobsError::Database(e.to_string()))
+}
+
+/// Drops the session fields (`inherit_auth`, `api_client_id`, `dpop_key_id`)
+/// so a plugin never sees what a job could act as.
+pub(crate) fn view(job: crate::jobs::Job) -> JobView {
+    JobView {
+        id: job.id,
+        job_type: job.job_type,
+        status: job.status,
+        input: job.input,
+        progress: job.progress,
+        result: job.result,
+        error: job.error,
+        created_by: job.created_by,
+        created_at: job.created_at,
+        started_at: job.started_at,
+        completed_at: job.completed_at,
+    }
+}
+
+/// One of the caller's own jobs. Another user's job answers `None`, exactly
+/// like a missing one, so a plugin cannot probe for ids it does not own.
+pub async fn get(
+    state: &AppState,
+    caller_did: Option<&str>,
+    spec: JobGet,
+) -> Result<Option<JobView>, JobsError> {
+    let caller_did = caller_did.ok_or(JobsError::NoCaller)?;
+    let job = crate::jobs::db::get_job(state, &spec.id)
+        .await
+        .map_err(|e| JobsError::Database(e.to_string()))?;
+    Ok(job.filter(|j| j.created_by == caller_did).map(view))
+}
+
+pub async fn get_any(state: &AppState, spec: JobGet) -> Result<Option<JobView>, JobsError> {
+    let job = crate::jobs::db::get_job(state, &spec.id)
+        .await
+        .map_err(|e| JobsError::Database(e.to_string()))?;
+    Ok(job.map(view))
+}
+
+const DEFAULT_LIST_LIMIT: u32 = 50;
+const MAX_LIST_LIMIT: u32 = 200;
+
+pub async fn list_any(state: &AppState, spec: JobListAny) -> Result<Vec<JobView>, JobsError> {
+    let limit = match spec.limit {
+        None => DEFAULT_LIST_LIMIT,
+        Some(0) => return Err(JobsError::Invalid("limit must be at least 1".into())),
+        Some(n) => n.min(MAX_LIST_LIMIT),
+    };
+    let jobs = crate::jobs::db::list_jobs_any(state, &spec.status, spec.job_type.as_deref(), limit)
+        .await
+        .map_err(|e| JobsError::Database(e.to_string()))?;
+    Ok(jobs.into_iter().map(view).collect())
 }
 
 #[cfg(test)]
@@ -293,5 +347,162 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, JobsError::NoSession), "{err}");
         assert_eq!(err.code(), "NO_SESSION");
+    }
+
+    async fn seed(state: &AppState, by: &str, job_type: &str) -> String {
+        crate::jobs::db::create_job(
+            state,
+            job_type,
+            &serde_json::json!({"k": 1}),
+            by,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("seed a job")
+    }
+
+    #[tokio::test]
+    async fn get_returns_the_callers_own_job_without_session_fields() {
+        let state = seeded_state().await;
+        let id = seed(&state, "did:plc:owner", "instance.operation").await;
+        let view = get(&state, Some("did:plc:owner"), JobGet { id: id.clone() })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.id, id);
+        assert_eq!(view.created_by, "did:plc:owner");
+        assert_eq!(view.input, serde_json::json!({"k": 1}));
+        let text = serde_json::to_string(&view).unwrap();
+        assert!(!text.contains("dpop_key_id") && !text.contains("api_client_id"));
+        assert!(!text.contains("inherit_auth"));
+    }
+
+    #[tokio::test]
+    async fn get_hides_another_users_job_exactly_like_a_missing_one() {
+        let state = seeded_state().await;
+        let id = seed(&state, "did:plc:owner", "t").await;
+        assert_eq!(
+            get(&state, Some("did:plc:other"), JobGet { id })
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            get(&state, Some("did:plc:other"), JobGet { id: "nope".into() })
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn get_without_a_caller_is_bad_input() {
+        let state = seeded_state().await;
+        let err = get(&state, None, JobGet { id: "x".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "BAD_INPUT");
+    }
+
+    #[tokio::test]
+    async fn get_any_reads_any_users_job() {
+        let state = seeded_state().await;
+        let id = seed(&state, "did:plc:owner", "t").await;
+        assert_eq!(
+            get_any(&state, JobGet { id: id.clone() })
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            id
+        );
+        assert_eq!(
+            get_any(&state, JobGet { id: "nope".into() }).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn list_any_filters_by_status_and_type_newest_first_and_caps_the_limit() {
+        let state = seeded_state().await;
+        let a = seed(&state, "did:plc:a", "instance.operation").await;
+        let b = seed(&state, "did:plc:b", "instance.operation").await;
+        seed(&state, "did:plc:c", "other").await;
+        let rows = list_any(
+            &state,
+            JobListAny {
+                status: vec!["pending".into()],
+                job_type: Some("instance.operation".into()),
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        let expected = vec![b, a];
+        assert_eq!(
+            rows.iter().map(|j| j.id.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(
+            list_any(
+                &state,
+                JobListAny {
+                    limit: Some(1000),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .len()
+                <= 200
+        );
+        assert_eq!(
+            list_any(
+                &state,
+                JobListAny {
+                    limit: Some(0),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap_err()
+            .code(),
+            "BAD_INPUT"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_any_status_filter_excludes_other_statuses() {
+        let state = seeded_state().await;
+        seed(&state, "did:plc:a", "t").await;
+        let rows = list_any(
+            &state,
+            JobListAny {
+                status: vec!["completed".into(), "failed".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_any_treats_hostile_values_as_data() {
+        let state = seeded_state().await;
+        seed(&state, "did:plc:a", "t").await;
+        let rows = list_any(
+            &state,
+            JobListAny {
+                status: vec!["pending' OR '1'='1".into()],
+                job_type: Some("t' OR '1'='1".into()),
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty());
     }
 }
