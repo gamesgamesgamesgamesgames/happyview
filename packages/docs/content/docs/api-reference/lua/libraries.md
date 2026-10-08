@@ -14,7 +14,7 @@ A library is a WASM plugin a script loads with `require`. Each has a namespace u
 | `happyview.atproto` | `atproto:read`, `attest:sign` | Service resolution, blob download, label lookup, and attestation signing and verification | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/atproto) |
 | `happyview.spaces` | `spaces:read`, `spaces:write` | Permissioned spaces: records, membership and invites | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/spaces) |
 | `happyview.linked_repos` | `linked_repos:use` | Record writes, blob uploads and XRPC calls through repos an admin has linked | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/linked-repos) |
-| `happyview.jobs` | `jobs:create` | Enqueue background jobs | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/jobs) |
+| `happyview.jobs` | `jobs:create`, `jobs:read`, `jobs:read_any` | Enqueue background jobs, and read them back (reading needs `happyview-jobs` 1.1.0 or later) | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/jobs) |
 | `happyview.http` | `network:request:unrestricted` | Outbound HTTP: `get`, `post`, `put`, `patch`, `delete`, `head` | [README](https://github.com/happyproto/plugins/tree/main/plugins/happyview/http) |
 
 The capability column is what an operator grants when installing the library, and it bounds what any script can do through it: `happyview.sql` with `database:write` can run any statement, `happyview.xrpc` with `caller:call` can invoke any procedure as the user. Install only what your scripts use.

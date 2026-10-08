@@ -643,3 +643,288 @@ async fn jobs_create_without_auth_leaves_dpop_ids_null() {
     assert!(api_client_id.is_none(), "{api_client_id:?}");
     assert!(dpop_key_id.is_none(), "{dpop_key_id:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Job reads through the real binding: `jobs_get` is scoped to the caller,
+// `jobs_get_any` / `jobs_list_any` are not, and none of them show the session
+// fields.
+// ---------------------------------------------------------------------------
+
+fn caller(did: &str) -> LibraryCallContext {
+    LibraryCallContext {
+        caller_did: Some(did.into()),
+        ..LibraryCallContext::default()
+    }
+}
+
+/// Create a job as `did` through the fixture's `jobs_create` and return its id.
+async fn create_job_as(app: &TestApp, plugin: &str, did: &str, job_type: &str) -> String {
+    let created = app
+        .state
+        .plugin_executor()
+        .call_library(
+            plugin,
+            "jobs_create",
+            &[json!({"job_type": job_type, "input": {"n": 1}, "auth": false})],
+            &caller(did),
+            0,
+        )
+        .await
+        .expect("create job");
+    created.as_str().expect("job id").to_string()
+}
+
+#[tokio::test]
+async fn jobs_get_returns_the_callers_own_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(linked_repos_plugin(
+            "sdk_linked_repos",
+            &["linked_repos:use", "jobs:create", "jobs:read"],
+        ))
+        .await;
+    let id = create_job_as(&app, "sdk_linked_repos", "did:plc:owner", "test.read").await;
+
+    let job = app
+        .state
+        .plugin_executor()
+        .call_library(
+            "sdk_linked_repos",
+            "jobs_get",
+            &[json!({ "id": id })],
+            &caller("did:plc:owner"),
+            0,
+        )
+        .await
+        .expect("jobs_get");
+    assert_eq!(job["id"], id);
+    assert_eq!(job["job_type"], "test.read");
+    assert_eq!(job["created_by"], "did:plc:owner");
+}
+
+#[tokio::test]
+async fn jobs_get_for_another_caller_is_null() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(linked_repos_plugin(
+            "sdk_linked_repos",
+            &["linked_repos:use", "jobs:create", "jobs:read"],
+        ))
+        .await;
+    let id = create_job_as(&app, "sdk_linked_repos", "did:plc:owner", "test.read").await;
+
+    let job = app
+        .state
+        .plugin_executor()
+        .call_library(
+            "sdk_linked_repos",
+            "jobs_get",
+            &[json!({ "id": id })],
+            &caller("did:plc:other"),
+            0,
+        )
+        .await
+        .expect("jobs_get");
+    assert_eq!(job, Value::Null);
+}
+
+#[tokio::test]
+async fn jobs_get_without_jobs_read_is_forbidden() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(linked_repos_plugin(
+            "sdk_linked_repos",
+            &["linked_repos:use", "jobs:create"],
+        ))
+        .await;
+    let id = create_job_as(&app, "sdk_linked_repos", "did:plc:owner", "test.read").await;
+
+    let err = app
+        .state
+        .plugin_executor()
+        .call_library(
+            "sdk_linked_repos",
+            "jobs_get",
+            &[json!({ "id": id })],
+            &caller("did:plc:owner"),
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("FORBIDDEN"), "{err}");
+}
+
+#[tokio::test]
+async fn jobs_list_any_sees_every_users_jobs() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(linked_repos_plugin(
+            "sdk_linked_repos",
+            &["linked_repos:use", "jobs:create", "jobs:read_any"],
+        ))
+        .await;
+    let a = create_job_as(&app, "sdk_linked_repos", "did:plc:owner", "test.list").await;
+    let b = create_job_as(&app, "sdk_linked_repos", "did:plc:other", "test.list").await;
+
+    let jobs = app
+        .state
+        .plugin_executor()
+        .call_library(
+            "sdk_linked_repos",
+            "jobs_list_any",
+            &[json!({"job_type": "test.list"})],
+            &caller("did:plc:staff"),
+            0,
+        )
+        .await
+        .expect("jobs_list_any");
+    let ids: Vec<&str> = jobs
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|j| j["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&a.as_str()), "{ids:?}");
+    assert!(ids.contains(&b.as_str()), "{ids:?}");
+}
+
+#[tokio::test]
+async fn jobs_list_any_without_jobs_read_any_is_forbidden() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(linked_repos_plugin(
+            "sdk_linked_repos",
+            &["linked_repos:use", "jobs:create", "jobs:read"],
+        ))
+        .await;
+
+    let err = app
+        .state
+        .plugin_executor()
+        .call_library(
+            "sdk_linked_repos",
+            "jobs_list_any",
+            &[json!({})],
+            &caller("did:plc:staff"),
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("FORBIDDEN"), "{err}");
+}
+
+#[tokio::test]
+async fn jobs_get_any_without_jobs_read_any_is_forbidden() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(linked_repos_plugin(
+            "sdk_linked_repos",
+            &["linked_repos:use", "jobs:create", "jobs:read"],
+        ))
+        .await;
+    let id = create_job_as(&app, "sdk_linked_repos", "did:plc:owner", "test.read").await;
+
+    let err = app
+        .state
+        .plugin_executor()
+        .call_library(
+            "sdk_linked_repos",
+            "jobs_get_any",
+            &[json!({ "id": id })],
+            &caller("did:plc:staff"),
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("FORBIDDEN"), "{err}");
+}
+
+#[tokio::test]
+async fn jobs_get_any_returns_another_users_job() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(linked_repos_plugin(
+            "sdk_linked_repos",
+            &["linked_repos:use", "jobs:create", "jobs:read_any"],
+        ))
+        .await;
+    let id = create_job_as(&app, "sdk_linked_repos", "did:plc:owner", "test.read").await;
+
+    let job = app
+        .state
+        .plugin_executor()
+        .call_library(
+            "sdk_linked_repos",
+            "jobs_get_any",
+            &[json!({ "id": id })],
+            &caller("did:plc:staff"),
+            0,
+        )
+        .await
+        .expect("jobs_get_any");
+    assert_eq!(job["id"], id);
+    assert_eq!(job["created_by"], "did:plc:owner");
+}
+
+#[tokio::test]
+async fn no_job_read_returns_session_fields() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(linked_repos_plugin(
+            "sdk_linked_repos",
+            &[
+                "linked_repos:use",
+                "jobs:create",
+                "jobs:read",
+                "jobs:read_any",
+            ],
+        ))
+        .await;
+    let id = create_job_as(&app, "sdk_linked_repos", "did:plc:owner", "test.fields").await;
+    let executor = app.state.plugin_executor();
+
+    let got = executor
+        .call_library(
+            "sdk_linked_repos",
+            "jobs_get",
+            &[json!({ "id": id })],
+            &caller("did:plc:owner"),
+            0,
+        )
+        .await
+        .expect("jobs_get");
+    let listed = executor
+        .call_library(
+            "sdk_linked_repos",
+            "jobs_list_any",
+            &[json!({"job_type": "test.fields"})],
+            &caller("did:plc:staff"),
+            0,
+        )
+        .await
+        .expect("jobs_list_any");
+
+    for (name, value) in [("jobs_get", got), ("jobs_list_any", listed)] {
+        let text = value.to_string();
+        assert!(text.contains(&id), "{name} returned nothing: {text}");
+        for field in ["inherit_auth", "api_client_id", "dpop_key_id"] {
+            assert!(!text.contains(field), "{name} leaked {field}: {text}");
+        }
+    }
+}

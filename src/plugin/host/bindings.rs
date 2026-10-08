@@ -472,6 +472,63 @@ pub(crate) fn define_host_functions(
         },
     )?;
 
+    // Reads of background jobs. `host_jobs_get` takes the caller DID from the
+    // call context (a plugin cannot set it) and hides other users' jobs; the
+    // `_any` pair need no caller, only the `jobs:read_any` capability.
+    imports.define("host_jobs_get", |caller, (req_ptr, req_len): (i32, i32)| {
+        Box::pin(async move {
+            host_app_caller_impl(
+                caller,
+                "host_jobs_get",
+                req_ptr,
+                req_len,
+                super::jobs::JobsError::code,
+                |state, caller_did, _session, spec: happyview_plugin_sdk::wire::JobGet| async move {
+                    super::jobs::get(&state, caller_did.as_deref(), spec).await
+                },
+            )
+            .await
+        })
+    })?;
+
+    imports.define(
+        "host_jobs_get_any",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_app_impl(
+                    caller,
+                    "host_jobs_get_any",
+                    req_ptr,
+                    req_len,
+                    super::jobs::JobsError::code,
+                    |state, spec: happyview_plugin_sdk::wire::JobGet| async move {
+                        super::jobs::get_any(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_jobs_list_any",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_app_impl(
+                    caller,
+                    "host_jobs_list_any",
+                    req_ptr,
+                    req_len,
+                    super::jobs::JobsError::code,
+                    |state, spec: happyview_plugin_sdk::wire::JobListAny| async move {
+                        super::jobs::list_any(&state, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
     // Async functions - spaces. Four reads need no caller; the eleven writes
     // act as `ctx.caller_did` and refuse before reaching the module when the
     // script context has none, via `require_spaces_caller`.

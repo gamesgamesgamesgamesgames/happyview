@@ -127,6 +127,9 @@ const EXPECTED_LINKED_REPOS_EXPORTS: &[&str] = &[
 
 const EXPECTED_LINKED_REPOS_IMPORTS: &[&str] = &[
     "env::host_jobs_create",
+    "env::host_jobs_get",
+    "env::host_jobs_get_any",
+    "env::host_jobs_list_any",
     "env::host_linked_repo_call",
     "env::host_linked_repo_create_record",
     "env::host_linked_repo_delete_record",
