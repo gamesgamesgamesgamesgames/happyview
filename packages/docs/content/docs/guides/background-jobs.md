@@ -120,6 +120,21 @@ end
 
 Enqueuing needs a caller: `jobs.create` raises `BAD_INPUT` when `ctx.caller_did` is `nil`, since the job runs as whoever enqueued it. Job types starting with `happyview.` are reserved for HappyView's own native jobs and are refused too.
 
+## Reading jobs from a script
+
+`jobs.get(id)` returns a job's status, progress, result and error. It answers `nil` unless `ctx.caller_did` created the job, so a job that belongs to someone else looks the same as one that doesn't exist.
+
+```lua
+local jobs = require("happyview.jobs")
+function handle(input, ctx)
+  local job = jobs.get(input.id)   -- nil unless ctx.caller_did created it
+  if not job then return { error = "NotFound", message = "No such job." } end
+  return { status = job.status, progress = job.progress }
+end
+```
+
+Reading other users' jobs needs the `jobs:read_any` capability. Job views never include the PDS session fields (`inherit_auth`, `api_client_id`, `dpop_key_id`).
+
 ## Authentication
 
 By default, jobs run **without PDS auth**. This is intentional. Most jobs don't need to write records on behalf of a user, and granting auth by default would give long-running background scripts access to a user's PDS session unnecessarily.

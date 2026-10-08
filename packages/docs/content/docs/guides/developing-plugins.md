@@ -334,6 +334,8 @@ Every host function except `host_log` is gated by a capability. The loader reads
 | `attest:sign` | High | Sign records with this instance's attestation key, producing a signature that asserts this instance vouches for the content. |
 | `linked_repos:use` | High | Write records and upload blobs through any repo an admin has linked to this instance, within the scopes that admin granted, and call any XRPC method through it, which only that repo's PDS constrains. |
 | `jobs:create` | Medium | Enqueue background jobs as the user who ran the script, optionally carrying that user's PDS session into the job. |
+| `jobs:read` | Low | Read background jobs the user who ran the script created. |
+| `jobs:read_any` | High | Read every background job on this instance, including other users' job input and results. |
 | `spaces:read` | High | Read the members and records of every space this instance holds, regardless of each space's read policy. |
 | `spaces:write` | High | Create spaces, write records into them, and manage their members and invites, as the user who ran the script and with that user's access. |
 
@@ -388,7 +390,7 @@ A plugin declaring `atproto:read` or `attest:sign` can import the matching funct
 
 ### Linked repos and jobs
 
-A plugin declaring `linked_repos:use` or `jobs:create` can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope:
+A plugin declaring `linked_repos:use`, `jobs:create`, `jobs:read` or `jobs:read_any` can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope:
 
 | Import | Capability | Spec → result |
 | --------------------------------- | ------------------- | ------------------------------------------------------------------------------- |
@@ -399,6 +401,11 @@ A plugin declaring `linked_repos:use` or `jobs:create` can import the matching f
 | `host_linked_repo_upload_blob`    | `linked_repos:use`  | `{did, bytes, mime_type}` → the PDS's blob reference |
 | `host_linked_repo_call`           | `linked_repos:use`  | `{did, method, params?, input?}` → the response |
 | `host_jobs_create`                | `jobs:create`       | `{job_type, input, auth}` → the job id |
+| `host_jobs_get`                   | `jobs:read`         | `{id}` → the job or `null`; only returns the caller's own jobs |
+| `host_jobs_get_any`               | `jobs:read_any`     | `{id}` → the job or `null` |
+| `host_jobs_list_any`              | `jobs:read_any`     | `{status?, job_type?, limit?}` → jobs, newest first; `limit` defaults to 50 and is capped at 200 |
+
+The plugin capability `jobs:read` is distinct from the admin user permission of the same name (see [Permissions](./permissions.md)): it controls what a plugin can read, not what an operator can see in the dashboard. Job views never include `inherit_auth`, `api_client_id` or `dpop_key_id`.
 
 Every import needs no caller session, except `host_jobs_create` with `auth` set, which requires the runner to hold a DPoP session.
 
