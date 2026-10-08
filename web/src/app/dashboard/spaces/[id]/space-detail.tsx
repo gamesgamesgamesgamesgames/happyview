@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
 import { ChevronLeft, ChevronRight, ExternalLink } from "lucide-react";
@@ -125,8 +125,14 @@ function SpaceDetailContent() {
     Boolean(detail && inspector?.enabled && canInspect),
   );
 
+  // Bumped by each records request and each change of grant or space; a
+  // response for an older request is dropped, so records fetched under a
+  // broader grant can't replace what the current grant covers.
+  const recordsRequest = useRef(0);
+
   const fetchRecords = useCallback(
     async (filters: { collection: string; repo: string }, cursor?: string) => {
+      const request = ++recordsRequest.current;
       setLoading(true);
       try {
         const data = await getAdminSpaceRecords(id, {
@@ -135,9 +141,11 @@ function SpaceDetailContent() {
           limit: PAGE_SIZE,
           cursor,
         });
+        if (request !== recordsRequest.current) return;
         setRecords(data.records);
         setNextCursor(data.cursor);
       } catch (e: unknown) {
+        if (request !== recordsRequest.current) return;
         if (e instanceof ApiError && e.message === SPACE_ACCESS_GRANT_REQUIRED) {
           access.drop();
           return;
@@ -155,6 +163,7 @@ function SpaceDetailContent() {
   );
 
   useEffect(() => {
+    recordsRequest.current += 1;
     if (!access.grant) {
       setRecords([]);
       setNextCursor(undefined);
