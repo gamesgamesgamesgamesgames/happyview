@@ -252,24 +252,18 @@ pub(super) async fn get_space_blob(
             .iter()
             .filter(|g| g.scope == GrantScope::Account)
             .collect();
-        account_grants.sort_by_key(|g| std::cmp::Reverse(parse_dt(&g.expires_at)));
-        for g in account_grants {
-            if let Some(author) = db::find_blob_author_did(
-                &state.db,
-                state.db_backend,
-                &space.id,
-                &params.cid,
-                Some(&g.target),
-            )
-            .await?
-            {
-                found = Some((g.clone(), author));
-                break;
-            }
-        }
-        if found.is_none() && grants.iter().all(|g| g.scope != GrantScope::Account) {
+        if account_grants.is_empty() {
             return Err(space_access::grant_required());
         }
+        account_grants.sort_by_key(|g| std::cmp::Reverse(parse_dt(&g.expires_at)));
+        // One lookup for every author whose record references the blob, then
+        // match grants in memory, however many account grants the caller holds.
+        let authors =
+            db::find_blob_authors(&state.db, state.db_backend, &space.id, &params.cid).await?;
+        found = account_grants
+            .into_iter()
+            .find(|g| authors.contains(&g.target))
+            .map(|g| (g.clone(), g.target.clone()));
     }
     let (grant, author_did) =
         found.ok_or_else(|| AppError::NotFound("Blob not found in this space".into()))?;

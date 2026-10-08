@@ -1325,6 +1325,27 @@ pub async fn find_blob_author_did(
     Ok(row.map(|(did,)| did))
 }
 
+/// Every author whose record in the space references `blob_cid`.
+pub async fn find_blob_authors(
+    pool: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    space_id: &str,
+    blob_cid: &str,
+) -> Result<Vec<String>, AppError> {
+    let pattern = format!("%\"$link\":\"{}\"%", crate::db::escape_like(blob_cid));
+    let sql = adapt_sql(
+        "SELECT DISTINCT author_did FROM happyview_space_records WHERE space_id = ? AND record LIKE ? ESCAPE '\\'",
+        backend,
+    );
+    let rows: Vec<(String,)> = crate::db::query_as(&sql)
+        .bind(space_id)
+        .bind(&pattern)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to find blob authors: {e}")))?;
+    Ok(rows.into_iter().map(|(did,)| did).collect())
+}
+
 // ---------------------------------------------------------------------------
 // Space Repos
 // ---------------------------------------------------------------------------
