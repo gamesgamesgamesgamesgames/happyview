@@ -692,6 +692,8 @@ async fn retention_keeps_the_record_of_a_grant_that_is_still_active() {
             .unwrap();
     }
 
+    link_grant_event(&app, "granted-long-ago", "long-grant").await;
+
     happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
 
     let left: Vec<String> = happyview::db::query_as::<(String,)>(
@@ -730,6 +732,7 @@ async fn retention_keeps_an_ended_grants_record_while_its_row_remains() {
     .execute(&app.state.db)
     .await
     .unwrap();
+    link_grant_event(&app, "granted", "ended-grant").await;
 
     happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
     assert_eq!(
@@ -793,6 +796,7 @@ async fn the_hold_lifts_once_the_grant_row_is_gone() {
     .execute(&app.state.db)
     .await
     .unwrap();
+    link_grant_event(&app, "granted", "long-over").await;
 
     happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
     assert_eq!(
@@ -812,4 +816,98 @@ async fn the_hold_lifts_once_the_grant_row_is_gone() {
         0,
         "released with the grant row"
     );
+}
+
+async fn link_grant_event(app: &TestApp, event_id: &str, grant_id: &str) {
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_access_grant_events (event_id, grant_id) VALUES (?, ?)",
+        app.state.db_backend,
+    ))
+    .bind(event_id)
+    .bind(grant_id)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn a_stored_grant_holds_only_its_own_records() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    let grant = json_body(
+        create_grant(
+            &app,
+            json!({ "scope": "account", "target": "did:plc:held", "reason": "r" }),
+        )
+        .await,
+    )
+    .await;
+    let grant_id = grant["id"].as_str().unwrap();
+    let old = (chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+    // Age every protected event, including the real grant event, past retention.
+    happyview::db::query(&adapt_sql(
+        "UPDATE happyview_event_logs SET created_at = ?",
+        app.state.db_backend,
+    ))
+    .bind(&old)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_event_logs (id, event_type, severity, detail, created_at) VALUES ('unrelated-purge', 'event_logs.purged', 'warn', '{}', ?)",
+        app.state.db_backend,
+    ))
+    .bind(&old)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+
+    let left: Vec<(String, String)> = happyview::db::query_as(
+        "SELECT event_type, detail FROM happyview_event_logs WHERE event_type IN ('space.access_granted', 'event_logs.purged')",
+    )
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].0, "space.access_granted");
+    assert!(left[0].1.contains(grant_id));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_general_retention_of_zero_is_audited_for_protected_events_too() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    // Protected retention is unset, so keeping everything changes it too.
+    put_setting(&app, "event_log_retention_days", "0").await;
+    let changes = events_of(&app, "event_logs.retention_changed").await;
+    let summary: Vec<(String, Value)> = changes
+        .iter()
+        .map(|(subject, detail)| {
+            (
+                subject.clone().unwrap(),
+                serde_json::from_str::<Value>(detail).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(summary.len(), 2, "{summary:?}");
+    assert!(summary.contains(&(
+        "event_log_retention_days".into(),
+        json!({ "from": 30, "to": 0 })
+    )));
+    assert!(summary.contains(&(
+        "space_access_log_retention_days".into(),
+        json!({ "from": 365, "to": 0 })
+    )));
+
+    // Setting protected retention explicitly ends the follow.
+    put_setting(&app, "space_access_log_retention_days", "365").await;
+    let last = events_of(&app, "event_logs.retention_changed").await;
+    let detail: Value = serde_json::from_str(&last.last().unwrap().1).unwrap();
+    assert_eq!(detail, json!({ "from": 0, "to": 365 }));
 }

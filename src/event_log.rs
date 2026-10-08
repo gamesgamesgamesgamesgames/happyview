@@ -207,7 +207,7 @@ async fn sweep_with_cutoff(
     protected: ProtectedEvents,
     backend: DatabaseBackend,
 ) -> SweepOutcome {
-    let deleted = delete_before(db, cutoff, protected, backend).await;
+    let deleted = delete_before(db, cutoff, protected, "", backend).await;
     let vacuumed = reclaim(db, deleted, backend).await;
     SweepOutcome { deleted, vacuumed }
 }
@@ -221,6 +221,7 @@ async fn delete_before(
     db: &AnyPool,
     cutoff: &str,
     protected: ProtectedEvents,
+    hold: &str,
     backend: DatabaseBackend,
 ) -> u64 {
     let filter = EventFilter {
@@ -232,7 +233,7 @@ async fn delete_before(
     let sql = adapt_sql(
         &format!(
             "DELETE FROM happyview_event_logs WHERE id IN \
-             (SELECT id FROM happyview_event_logs WHERE 1=1{frag} LIMIT ?)"
+             (SELECT id FROM happyview_event_logs WHERE 1=1{frag}{hold} LIMIT ?)"
         ),
         backend,
     );
@@ -284,24 +285,33 @@ async fn reclaim(db: &AnyPool, deleted: u64, backend: DatabaseBackend) -> bool {
     }
 }
 
-/// When the oldest access grant still on record was created. Protected events
-/// from then on are kept whatever their age: a grant's reason and the reads
-/// under it last as long as the grant row does, which `sweep_ended_access_grants`
-/// removes once it has been over for the retention period.
-async fn oldest_grant(db: &AnyPool) -> Result<Option<String>, sqlx::Error> {
-    crate::db::query_as::<(Option<String>,)>(
-        "SELECT MIN(created_at) FROM happyview_space_access_grants",
-    )
-    .fetch_one(db)
-    .await
-    .map(|(oldest,)| oldest)
+/// Excludes the protected events tied to an access grant that still exists: its
+/// grant and revocation events and the reads made under it. They last as long
+/// as the grant row does, which `sweep_ended_access_grants` removes once the
+/// grant has been over for the retention period. Unrelated events keep their
+/// own schedule.
+const HOLD_STORED_GRANT_RECORDS: &str = " AND id NOT IN (\
+    SELECT event_id FROM happyview_space_access_grant_events \
+        WHERE grant_id IN (SELECT id FROM happyview_space_access_grants) \
+    UNION SELECT event_id FROM happyview_space_access_reads \
+        WHERE grant_id IN (SELECT id FROM happyview_space_access_grants))";
+
+/// The protected retention in days. An unset or unparseable
+/// `space_access_log_retention_days` follows a general retention of `0`, which
+/// keeps everything, and is 365 days otherwise.
+pub fn effective_protected_retention(general_days: u32, protected: Option<&str>) -> u32 {
+    match protected.and_then(|v| v.trim().parse::<u32>().ok()) {
+        Some(days) => days,
+        None if general_days == 0 => 0,
+        None => DEFAULT_PROTECTED_RETENTION_DAYS,
+    }
 }
 
 /// Sweep unprotected rows older than `retention_days` and protected rows
 /// older than `protected_retention_days`, then reclaim once. A value of `0`
-/// skips that pass. Protected rows newer than the oldest access grant still on
-/// record are kept regardless; if that can't be read, the protected pass is
-/// skipped rather than risk deleting a grant's record.
+/// skips that pass. Protected rows tied to a grant that still exists are kept
+/// regardless; if that hold can't be checked, the delete fails and nothing
+/// protected is removed.
 pub async fn run_retention_sweep(
     db: &AnyPool,
     retention_days: u32,
@@ -316,24 +326,20 @@ pub async fn run_retention_sweep(
             db,
             &days_ago(retention_days),
             ProtectedEvents::Exclude,
+            "",
             backend,
         )
         .await;
     }
     if protected_retention_days > 0 {
-        match oldest_grant(db).await {
-            Ok(oldest) => {
-                let mut cutoff = days_ago(protected_retention_days);
-                // Both are `to_rfc3339()` UTC text, so the earlier one sorts first.
-                if let Some(oldest) = oldest
-                    && oldest < cutoff
-                {
-                    cutoff = oldest;
-                }
-                deleted += delete_before(db, &cutoff, ProtectedEvents::Only, backend).await;
-            }
-            Err(e) => tracing::warn!("skipping protected event cleanup: {e}"),
-        }
+        deleted += delete_before(
+            db,
+            &days_ago(protected_retention_days),
+            ProtectedEvents::Only,
+            HOLD_STORED_GRANT_RECORDS,
+            backend,
+        )
+        .await;
     }
     let vacuumed = reclaim(db, deleted, backend).await;
     SweepOutcome { deleted, vacuumed }
@@ -407,11 +413,12 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
             None => DEFAULT_RETENTION_DAYS,
         };
 
-        let protected_days =
+        let protected_days = effective_protected_retention(
+            retention_days,
             crate::admin::settings::get_setting(&db, SPACE_ACCESS_RETENTION_SETTING, backend)
                 .await
-                .and_then(|v| v.trim().parse::<u32>().ok())
-                .unwrap_or(DEFAULT_PROTECTED_RETENTION_DAYS);
+                .as_deref(),
+        );
 
         // Ended grants go first, so the protected pass below sees the hold
         // their deletion lifts in the same tick.
@@ -647,6 +654,17 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create space_access_grants");
+        for table in [
+            "happyview_space_access_grant_events",
+            "happyview_space_access_reads",
+        ] {
+            crate::db::query(&format!(
+                "CREATE TABLE {table} (event_id TEXT PRIMARY KEY, grant_id TEXT NOT NULL)"
+            ))
+            .execute(&pool)
+            .await
+            .expect("create link table");
+        }
         pool
     }
 
@@ -757,6 +775,15 @@ mod tests {
 
         assert_eq!(outcome.deleted, 1);
         assert_eq!(remaining_ids(&pool).await, vec!["recent".to_string()]);
+    }
+
+    #[test]
+    fn unset_protected_retention_follows_a_keep_everything_general_setting() {
+        assert_eq!(effective_protected_retention(30, None), 365);
+        assert_eq!(effective_protected_retention(0, None), 0);
+        assert_eq!(effective_protected_retention(0, Some("abc")), 0);
+        assert_eq!(effective_protected_retention(0, Some(" 90 ")), 90);
+        assert_eq!(effective_protected_retention(30, Some("0")), 0);
     }
 
     #[tokio::test]

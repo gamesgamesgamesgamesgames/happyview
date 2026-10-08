@@ -9,9 +9,11 @@ use crate::AppState;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{
-    DEFAULT_PROTECTED_RETENTION_DAYS, DEFAULT_RETENTION_DAYS, EventLog,
-    SPACE_ACCESS_RETENTION_SETTING, Severity, log_event, write_event,
+    DEFAULT_RETENTION_DAYS, EventLog, SPACE_ACCESS_RETENTION_SETTING, Severity,
+    effective_protected_retention, log_event, write_event,
 };
+
+const GENERAL_RETENTION_SETTING: &str = "event_log_retention_days";
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
@@ -52,55 +54,72 @@ const ENV_FALLBACKS: &[(&str, &str)] = &[
 ///
 /// Compares effective values, env fallback included, so a save that rewrites
 /// an unchanged value logs nothing.
-fn audited_setting_event(
+fn audited_setting_events(
     auth: &UserAuth,
     key: &str,
     before: &Option<String>,
     after: &Option<String>,
-) -> Option<EventLog> {
-    let event = match key {
+    other_retention: &Option<String>,
+) -> Vec<EventLog> {
+    let event = |subject: &str, event_type: &str, detail: serde_json::Value| EventLog {
+        event_type: event_type.to_string(),
+        severity: Severity::Warn,
+        actor_did: Some(auth.did.clone()),
+        subject: Some(subject.to_string()),
+        detail,
+    };
+    match key {
         crate::feature_flags::FeatureFlag::SPACE_INSPECTOR => {
             let on = |v: &Option<String>| {
                 v.as_deref()
                     .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
             };
             match (on(before), on(after)) {
-                (false, true) => Some(("space_inspector.enabled", serde_json::json!({}))),
-                (true, false) => Some(("space_inspector.disabled", serde_json::json!({}))),
-                _ => None,
+                (false, true) => vec![event(key, "space_inspector.enabled", serde_json::json!({}))],
+                (true, false) => vec![event(
+                    key,
+                    "space_inspector.disabled",
+                    serde_json::json!({}),
+                )],
+                _ => Vec::new(),
             }
         }
-        "event_log_retention_days" | SPACE_ACCESS_RETENTION_SETTING => {
-            // An unset or unparseable value counts as the default the
-            // retention sweep uses in its place.
-            let effective = |v: &Option<String>| -> u32 {
-                if key == SPACE_ACCESS_RETENTION_SETTING {
-                    v.as_deref()
-                        .and_then(|v| v.trim().parse().ok())
-                        .unwrap_or(DEFAULT_PROTECTED_RETENTION_DAYS)
-                } else {
-                    v.as_deref()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(DEFAULT_RETENTION_DAYS)
-                }
+        GENERAL_RETENTION_SETTING | SPACE_ACCESS_RETENTION_SETTING => {
+            // Effective values, as the retention sweep reads them: the protected
+            // retention depends on the general one, so a change to either can
+            // change both.
+            let (general, protected) = if key == GENERAL_RETENTION_SETTING {
+                ((before, after), (other_retention, other_retention))
+            } else {
+                ((other_retention, other_retention), (before, after))
             };
-            let (from, to) = (effective(before), effective(after));
-            (from != to).then(|| {
-                (
-                    "event_logs.retention_changed",
-                    serde_json::json!({ "from": from, "to": to }),
-                )
-            })
+            let general_days = |v: &Option<String>| -> u32 {
+                v.as_deref()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(DEFAULT_RETENTION_DAYS)
+            };
+            let (general_from, general_to) = (general_days(general.0), general_days(general.1));
+            let protected_from =
+                effective_protected_retention(general_from, protected.0.as_deref());
+            let protected_to = effective_protected_retention(general_to, protected.1.as_deref());
+
+            let mut events = Vec::new();
+            for (subject, from, to) in [
+                (GENERAL_RETENTION_SETTING, general_from, general_to),
+                (SPACE_ACCESS_RETENTION_SETTING, protected_from, protected_to),
+            ] {
+                if from != to {
+                    events.push(event(
+                        subject,
+                        "event_logs.retention_changed",
+                        serde_json::json!({ "from": from, "to": to }),
+                    ));
+                }
+            }
+            events
         }
-        _ => None,
-    };
-    event.map(|(event_type, detail)| EventLog {
-        event_type: event_type.to_string(),
-        severity: Severity::Warn,
-        actor_did: Some(auth.did.clone()),
-        subject: Some(key.to_string()),
-        detail,
-    })
+        _ => Vec::new(),
+    }
 }
 
 /// The env var value a key falls back to when it has no database row.
@@ -113,6 +132,23 @@ fn env_fallback(key: &str) -> Option<String> {
 
 /// Write a setting change and its audit event together, so an audited setting
 /// never changes without its protected record.
+/// A setting's value inside a transaction, env fallback included.
+async fn read_setting_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Any>,
+    backend: DatabaseBackend,
+    key: &str,
+) -> Result<Option<String>, AppError> {
+    let stored: Option<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT value FROM happyview_instance_settings WHERE key = ?",
+        backend,
+    ))
+    .bind(key)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to read setting: {e}")))?;
+    Ok(stored.map(|(v,)| v).or_else(|| env_fallback(key)))
+}
+
 async fn write_audited<'q>(
     state: &AppState,
     auth: &UserAuth,
@@ -130,39 +166,45 @@ async fn write_audited<'q>(
     // Serialize writers of this key before reading its current value, so two
     // concurrent changes can't both compare against the same old value and
     // leave the audit trail out of step with what was stored. Postgres takes a
-    // per-key advisory lock; SQLite takes its database write lock.
+    // per-key advisory lock; SQLite takes its database write lock. The two
+    // retention settings share a lock, since each affects the other's value.
+    let is_retention = key == GENERAL_RETENTION_SETTING || key == SPACE_ACCESS_RETENTION_SETTING;
+    let lock_key = if is_retention { "retention" } else { key };
     let lock_sql = match backend {
         DatabaseBackend::Postgres => "SELECT pg_advisory_xact_lock(hashtext($1))::text",
         DatabaseBackend::Sqlite => "UPDATE happyview_instance_settings SET key = key WHERE key = ?",
     };
     crate::db::query(lock_sql)
-        .bind(key)
+        .bind(lock_key)
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("failed to lock setting: {e}")))?;
 
-    let stored: Option<(String,)> = crate::db::query_as(&adapt_sql(
-        "SELECT value FROM happyview_instance_settings WHERE key = ?",
-        backend,
-    ))
-    .bind(key)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| AppError::Internal(format!("failed to read setting: {e}")))?;
-    let before = stored.map(|(v,)| v).or_else(|| env_fallback(key));
-    let event = audited_setting_event(auth, key, &before, &after);
+    let before = read_setting_in(&mut tx, backend, key).await?;
+    let other_retention = match key {
+        GENERAL_RETENTION_SETTING => {
+            read_setting_in(&mut tx, backend, SPACE_ACCESS_RETENTION_SETTING).await?
+        }
+        SPACE_ACCESS_RETENTION_SETTING => {
+            read_setting_in(&mut tx, backend, GENERAL_RETENTION_SETTING).await?
+        }
+        _ => None,
+    };
+    let events = audited_setting_events(auth, key, &before, &after, &other_retention);
 
     let affected = change
         .execute(&mut *tx)
         .await
         .map_err(|e| AppError::Internal(format!("failed to write setting: {e}")))?
         .rows_affected();
-    if affected > 0
-        && let Some(event) = &event
-    {
-        write_event(&mut *tx, event, state.db_backend)
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to record the setting change: {e}")))?;
+    if affected > 0 {
+        for event in &events {
+            write_event(&mut *tx, event, state.db_backend)
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to record the setting change: {e}"))
+                })?;
+        }
     }
     tx.commit()
         .await
