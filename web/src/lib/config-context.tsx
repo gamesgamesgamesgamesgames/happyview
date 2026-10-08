@@ -61,36 +61,50 @@ function ConfigErrorBanner({ errors }: { errors: string[] }) {
   )
 }
 
+async function loadConfig(): Promise<Config> {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`)
+  if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`)
+  const data = await res.json()
+  return {
+    public_url: data.public_url,
+    default_rate_limit_capacity: data.default_rate_limit_capacity,
+    default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
+    app_name: data.app_name ?? null,
+    logo_url: data.logo_url ?? null,
+    features: {
+      spaces: data.features?.spaces === true,
+      space_inspector: data.features?.space_inspector === true,
+    },
+    platform_managed: data.platform_managed === true,
+    configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
+  }
+}
+
 export function ConfigProvider({ children }: { children: React.ReactNode }) {
   const [config, setConfig] = useState<Config | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // Throws on failure, so a caller such as the settings page can report it;
+  // the config already loaded stays in place.
   const refreshConfig = useCallback(async () => {
-    try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`)
-      if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`)
-      const data = await res.json()
-      setConfig({
-        public_url: data.public_url,
-        default_rate_limit_capacity: data.default_rate_limit_capacity,
-        default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
-        app_name: data.app_name ?? null,
-        logo_url: data.logo_url ?? null,
-        features: {
-          spaces: data.features?.spaces === true,
-          space_inspector: data.features?.space_inspector === true,
-        },
-        platform_managed: data.platform_managed === true,
-        configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
-      })
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
+    setConfig(await loadConfig())
   }, [])
 
+  // Only the first load replaces the dashboard with an error screen; there is
+  // no config to fall back on yet.
   useEffect(() => {
-    refreshConfig()
-  }, [refreshConfig])
+    let cancelled = false
+    loadConfig()
+      .then((loaded) => {
+        if (!cancelled) setConfig(loaded)
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   if (error) {
     return <div style={{ padding: "2rem", color: "red" }}>Failed to load config: {error}</div>
