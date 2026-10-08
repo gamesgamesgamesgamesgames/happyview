@@ -483,7 +483,7 @@ async fn revoking_a_space_grant_logs_the_space_uri() {
     assert_eq!(revoked[1].0.as_deref(), Some("deleted-space"));
 }
 
-async fn rename_events_table(app: &TestApp, from: &str, to: &str) {
+async fn rename_table(app: &TestApp, from: &str, to: &str) {
     happyview::db::query(&format!("ALTER TABLE {from} RENAME TO {to}"))
         .execute(&app.state.db)
         .await
@@ -505,7 +505,7 @@ async fn a_grant_is_not_created_when_its_audit_event_cannot_be_written() {
     let app = TestApp::new().await;
     enable(&app).await;
 
-    rename_events_table(&app, "happyview_event_logs", "happyview_event_logs_hidden").await;
+    rename_table(&app, "happyview_event_logs", "happyview_event_logs_hidden").await;
     let resp = create_grant(
         &app,
         json!({ "scope": "account", "target": "did:plc:abc", "reason": "report" }),
@@ -513,7 +513,7 @@ async fn a_grant_is_not_created_when_its_audit_event_cannot_be_written() {
     .await;
     let status = resp.status();
     let grants = grant_count(&app).await;
-    rename_events_table(&app, "happyview_event_logs_hidden", "happyview_event_logs").await;
+    rename_table(&app, "happyview_event_logs_hidden", "happyview_event_logs").await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(grants, 0, "the grant rolls back with its audit event");
@@ -576,7 +576,7 @@ async fn the_inspector_stays_off_when_its_audit_event_cannot_be_written() {
     common::require_db!();
     let app = TestApp::new().await;
 
-    rename_events_table(&app, "happyview_event_logs", "happyview_event_logs_hidden").await;
+    rename_table(&app, "happyview_event_logs", "happyview_event_logs_hidden").await;
     let resp = send(
         &app,
         "PUT",
@@ -591,7 +591,7 @@ async fn the_inspector_stays_off_when_its_audit_event_cannot_be_written() {
         app.state.db_backend,
     )
     .await;
-    rename_events_table(&app, "happyview_event_logs_hidden", "happyview_event_logs").await;
+    rename_table(&app, "happyview_event_logs_hidden", "happyview_event_logs").await;
 
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(!enabled, "the setting rolls back with its audit event");
@@ -739,7 +739,7 @@ async fn retention_keeps_an_ended_grants_record_while_its_row_remains() {
     );
 
     // With the grants table unreadable, nothing protected is deleted.
-    rename_events_table(
+    rename_table(
         &app,
         "happyview_space_access_grants",
         "happyview_space_access_grants_hidden",
@@ -747,7 +747,7 @@ async fn retention_keeps_an_ended_grants_record_while_its_row_remains() {
     .await;
     happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
     let remaining = protected_count(&app).await;
-    rename_events_table(
+    rename_table(
         &app,
         "happyview_space_access_grants_hidden",
         "happyview_space_access_grants",
@@ -767,4 +767,49 @@ async fn protected_count(app: &TestApp) -> i64 {
     .await
     .unwrap()
     .0
+}
+
+#[tokio::test]
+#[serial]
+async fn the_hold_lifts_once_the_grant_row_is_gone() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let now = chrono::Utc::now();
+    let created = (now - chrono::Duration::days(800)).to_rfc3339();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at) VALUES ('long-over', 'u', 'did:plc:u', 'account', 'did:plc:t', 'r', ?, ?)",
+        app.state.db_backend,
+    ))
+    .bind(&created)
+    .bind((now - chrono::Duration::days(400)).to_rfc3339())
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_event_logs (id, event_type, severity, detail, created_at) VALUES ('granted', 'space.access_granted', 'info', '{}', ?)",
+        app.state.db_backend,
+    ))
+    .bind(&created)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+    assert_eq!(
+        protected_count(&app).await,
+        1,
+        "held while the grant row exists"
+    );
+
+    let removed =
+        happyview::event_log::sweep_ended_access_grants(&app.state.db, 365, app.state.db_backend)
+            .await
+            .unwrap();
+    assert_eq!(removed, 1);
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+    assert_eq!(
+        protected_count(&app).await,
+        0,
+        "released with the grant row"
+    );
 }

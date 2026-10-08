@@ -200,10 +200,6 @@ pub struct SweepOutcome {
 const SWEEP_BATCH_SIZE: i64 = 5000;
 
 /// Delete every event log row strictly older than `cutoff`, then reclaim.
-///
-/// `cutoff` must be RFC3339 with a `+00:00` offset — the form `now_rfc3339()`
-/// writes. On SQLite `created_at` is TEXT and this is a string comparison, so a
-/// differently-formatted cutoff silently mis-selects rows.
 #[cfg(test)]
 async fn sweep_with_cutoff(
     db: &AnyPool,
@@ -217,6 +213,10 @@ async fn sweep_with_cutoff(
 }
 
 /// Delete event log rows older than `cutoff` in batches, without reclaiming.
+///
+/// `cutoff` must be RFC3339 with a `+00:00` offset — the form `now_rfc3339()`
+/// writes. On SQLite `created_at` is TEXT and this is a string comparison, so a
+/// differently-formatted cutoff silently mis-selects rows.
 async fn delete_before(
     db: &AnyPool,
     cutoff: &str,
@@ -413,6 +413,14 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .unwrap_or(DEFAULT_PROTECTED_RETENTION_DAYS);
 
+        // Ended grants go first, so the protected pass below sees the hold
+        // their deletion lifts in the same tick.
+        match sweep_ended_access_grants(&db, protected_days, backend).await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "cleaned up ended space access grants"),
+            Err(e) => tracing::warn!("failed to clean up ended space access grants: {e}"),
+        }
+
         let outcome = run_retention_sweep(&db, retention_days, protected_days, backend).await;
         if outcome.deleted > 0 {
             tracing::info!(
@@ -420,12 +428,6 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
                 vacuumed = outcome.vacuumed,
                 "cleaned up old event logs"
             );
-        }
-
-        match sweep_ended_access_grants(&db, protected_days, backend).await {
-            Ok(0) => {}
-            Ok(count) => tracing::info!(count, "cleaned up ended space access grants"),
-            Err(e) => tracing::warn!("failed to clean up ended space access grants: {e}"),
         }
     }
 }
