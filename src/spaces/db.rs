@@ -1305,9 +1305,6 @@ fn parse_record_row(r: RecordRow) -> Result<SpaceRecord, AppError> {
     })
 }
 
-/// Find the author DID of any record in the space that contains a blob ref
-/// with the given CID. The CID appears in serialised record JSON as the
-/// `$link` value inside an ATProto blob ref object.
 /// A LIKE pattern matching a record that references `blob_cid` as a `$link`.
 /// LIKE metacharacters in the caller-supplied CID are escaped, so `%` and `_`
 /// match literally and can't be used to match another author's record.
@@ -1315,6 +1312,9 @@ fn blob_link_pattern(blob_cid: &str) -> String {
     format!("%\"$link\":\"{}\"%", crate::db::escape_like(blob_cid))
 }
 
+/// Find the author DID of any record in the space that contains a blob ref
+/// with the given CID. The CID appears in serialised record JSON as the
+/// `$link` value inside an ATProto blob ref object.
 pub async fn find_blob_author_did(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
