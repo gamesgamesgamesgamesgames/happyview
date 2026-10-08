@@ -22,6 +22,7 @@ PLUGIN_FIXTURES=(
   tests/fixtures/interpreter_echo/target/wasm32-unknown-unknown/release/interpreter_echo.wasm
   tests/fixtures/sdk_atproto/target/wasm32-unknown-unknown/release/sdk_atproto.wasm
   tests/fixtures/sdk_auth/target/wasm32-unknown-unknown/release/sdk_auth.wasm
+  tests/fixtures/sdk_blobs/target/wasm32-unknown-unknown/release/sdk_blobs.wasm
   tests/fixtures/sdk_caller/target/wasm32-unknown-unknown/release/sdk_caller.wasm
   tests/fixtures/sdk_http/target/wasm32-unknown-unknown/release/sdk_http.wasm
   tests/fixtures/sdk_linked_repos/target/wasm32-unknown-unknown/release/sdk_linked_repos.wasm

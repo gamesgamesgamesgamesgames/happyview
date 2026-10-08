@@ -5,6 +5,7 @@ exclude = [
     "tests/fixtures/test_library",
     "tests/fixtures/sdk_http",
     "tests/fixtures/sdk_auth",
+    "tests/fixtures/sdk_blobs",
     "tests/fixtures/sdk_objects",
     "tests/fixtures/sdk_caller",
     "tests/fixtures/sdk_atproto",
