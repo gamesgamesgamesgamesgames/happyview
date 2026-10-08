@@ -9,7 +9,7 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 
-import { getEvents, type EventLogEntry } from "@/lib/api";
+import { getEvents, getGrantReads, type EventLogEntry } from "@/lib/api";
 import { DataTable } from "@/components/data-table/data-table";
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header";
 import { DataTableToolbar } from "@/components/data-table/data-table-toolbar";
@@ -70,13 +70,111 @@ const KNOWN_KEYS = [
   "level",
 ] as const;
 
+// Detail keys the space access events render themselves.
+const SPACE_ACCESS_KEYS = ["grant_id", "reason", "uris"] as const;
+
+function isSpaceAccessEvent(eventType: string) {
+  return (
+    eventType === "space.access_granted" ||
+    eventType === "space.access_revoked" ||
+    eventType === "space.moderator_read"
+  );
+}
+
+function GrantReads({ grantId }: { grantId: string }) {
+  const [reads, setReads] = useState<EventLogEntry[] | null>(null);
+  const [cursor, setCursor] = useState<string | undefined>();
+  const [failed, setFailed] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    getGrantReads(grantId)
+      .then((r) => {
+        if (cancelled) return;
+        setReads(r.events);
+        setCursor(r.cursor);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [grantId]);
+
+  async function loadMore() {
+    if (!cursor) return;
+    setLoadingMore(true);
+    try {
+      const page = await getGrantReads(grantId, cursor);
+      setReads((current) => [...(current ?? []), ...page.events]);
+      setCursor(page.cursor);
+    } catch {
+      setFailed(true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <span className="text-muted-foreground text-sm">Reads under this grant</span>
+      {failed ? (
+        <p className="text-destructive text-xs">
+          Couldn&apos;t load the reads for this grant.
+        </p>
+      ) : reads === null ? (
+        <p className="text-muted-foreground text-xs">Loading…</p>
+      ) : reads.length === 0 ? (
+        <p className="text-muted-foreground text-xs">Nothing was read.</p>
+      ) : (
+        <ul className="flex flex-col gap-2">
+          {reads.map((r) => (
+            <li key={r.id} className="rounded border p-2 text-xs">
+              <div className="flex justify-between gap-2">
+                <span className="font-mono">{String(r.detail.action)}</span>
+                <span className="text-muted-foreground">
+                  {new Date(r.created_at).toLocaleString()}
+                </span>
+              </div>
+              {Array.isArray(r.detail.uris) && (
+                <ul className="mt-1 font-mono break-all">
+                  {(r.detail.uris as string[]).map((u) => (
+                    <li key={u}>{u}</li>
+                  ))}
+                </ul>
+              )}
+              {typeof r.detail.cid === "string" && (
+                <p className="mt-1 font-mono break-all">blob {r.detail.cid}</p>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {cursor && !failed && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="self-start"
+          disabled={loadingMore}
+          onClick={loadMore}
+        >
+          {loadingMore ? "Loading…" : "Load more"}
+        </Button>
+      )}
+    </div>
+  );
+}
+
 function EventDetailBody({ event }: { event: EventLogEntry }) {
   const d = event.detail;
 
-  // Collect any keys not in KNOWN_KEYS for the "Other" section
-  const otherKeys = Object.keys(d).filter(
-    (k) => !(KNOWN_KEYS as readonly string[]).includes(k),
-  );
+  // Collect any keys not rendered above for the "Other" section
+  const renderedKeys: readonly string[] = isSpaceAccessEvent(event.event_type)
+    ? [...KNOWN_KEYS, ...SPACE_ACCESS_KEYS]
+    : KNOWN_KEYS;
+  const otherKeys = Object.keys(d).filter((k) => !renderedKeys.includes(k));
   const otherDetail =
     otherKeys.length > 0
       ? Object.fromEntries(otherKeys.map((k) => [k, d[k]]))
@@ -129,6 +227,37 @@ function EventDetailBody({ event }: { event: EventLogEntry }) {
           </div>
         )}
       </div>
+
+      {/* Access grant */}
+      {isSpaceAccessEvent(event.event_type) &&
+        typeof d.grant_id === "string" && (
+          <div>
+            <span className="text-muted-foreground text-sm">Grant</span>
+            <p className="font-mono text-xs">{d.grant_id}</p>
+          </div>
+        )}
+      {event.event_type === "space.access_granted" &&
+        typeof d.grant_id === "string" && (
+          <>
+            <div>
+              <span className="text-muted-foreground text-sm">Reason</span>
+              <p className="text-sm break-words">{String(d.reason)}</p>
+            </div>
+            <GrantReads grantId={d.grant_id} />
+          </>
+        )}
+      {event.event_type === "space.moderator_read" &&
+        Array.isArray(d.uris) &&
+        d.uris.length > 0 && (
+          <div>
+            <span className="text-muted-foreground text-sm">Records read</span>
+            <ul className="font-mono text-xs break-all">
+              {(d.uris as string[]).map((uri) => (
+                <li key={uri}>{uri}</li>
+              ))}
+            </ul>
+          </div>
+        )}
 
       {/* Plugin log message */}
       {d.message != null && (

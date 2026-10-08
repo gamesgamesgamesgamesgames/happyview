@@ -194,7 +194,7 @@ async fn bounded_resolution<T>(
 ) -> Result<T, AppError> {
     tokio::time::timeout(limit, work)
         .await
-        .map_err(|_| AppError::BadRequest(format!("timed out resolving {}", input.trim())))?
+        .map_err(|_| AppError::BadGateway(format!("timed out resolving {}", input.trim())))?
 }
 
 /// A fixed reason for a failed DID document fetch.
@@ -203,6 +203,10 @@ async fn bounded_resolution<T>(
 /// would let any signed-in caller learn which hosts the server can reach by
 /// probing `did:web:<host>`, so only the DID and a coarse category are
 /// reported; the detail goes to the log.
+///
+/// A missing, forbidden or invalid document is the identifier's fault and is
+/// `BadRequest`. Rate limits and unreachable hosts may clear on a retry and are
+/// `BadGateway`, so a caller can tell a bad DID from a resolution that failed.
 fn did_document_failure(did: &str, failure: &BackfillFailure) -> AppError {
     tracing::debug!(
         did,
@@ -210,27 +214,32 @@ fn did_document_failure(did: &str, failure: &BackfillFailure) -> AppError {
         detail = %failure.message,
         "DID document fetch failed"
     );
-    let reason = match failure.kind {
-        BackfillErrorKind::DidDocNotFound => format!("DID document not found for {did}"),
-        BackfillErrorKind::DidDocForbidden => {
-            format!("access to the DID document for {did} was denied")
+    match failure.kind {
+        BackfillErrorKind::DidDocNotFound => {
+            AppError::BadRequest(format!("DID document not found for {did}"))
         }
-        BackfillErrorKind::DidDocInvalid => format!("DID document for {did} is invalid"),
+        BackfillErrorKind::DidDocForbidden => {
+            AppError::BadRequest(format!("access to the DID document for {did} was denied"))
+        }
+        BackfillErrorKind::DidDocInvalid => {
+            AppError::BadRequest(format!("DID document for {did} is invalid"))
+        }
         BackfillErrorKind::RateLimited => {
-            format!("DID document lookup for {did} was rate limited")
+            AppError::BadGateway(format!("DID document lookup for {did} was rate limited"))
         }
         BackfillErrorKind::DnsFailure
         | BackfillErrorKind::ConnectionFailed
         | BackfillErrorKind::Timeout
         | BackfillErrorKind::PdsServerError => {
-            format!("could not reach the DID document host for {did}")
+            AppError::BadGateway(format!("could not reach the DID document host for {did}"))
         }
         BackfillErrorKind::RepoNotFound
         | BackfillErrorKind::RepoDeactivated
         | BackfillErrorKind::RepoTakendown
-        | BackfillErrorKind::Other => format!("could not fetch DID document for {did}"),
-    };
-    AppError::BadRequest(reason)
+        | BackfillErrorKind::Other => {
+            AppError::BadRequest(format!("could not fetch DID document for {did}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -387,6 +396,45 @@ mod tests {
     }
 
     #[test]
+    fn transient_did_document_failures_are_bad_gateway() {
+        use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
+
+        let failure = |kind| BackfillFailure {
+            kind,
+            message: String::new(),
+            retry_after: None,
+        };
+        for kind in [
+            BackfillErrorKind::RateLimited,
+            BackfillErrorKind::DnsFailure,
+            BackfillErrorKind::ConnectionFailed,
+            BackfillErrorKind::Timeout,
+            BackfillErrorKind::PdsServerError,
+        ] {
+            assert!(
+                matches!(
+                    did_document_failure("did:plc:a", &failure(kind)),
+                    AppError::BadGateway(_)
+                ),
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            BackfillErrorKind::DidDocNotFound,
+            BackfillErrorKind::DidDocForbidden,
+            BackfillErrorKind::DidDocInvalid,
+        ] {
+            assert!(
+                matches!(
+                    did_document_failure("did:plc:a", &failure(kind)),
+                    AppError::BadRequest(_)
+                ),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
     fn did_document_failures_name_the_did_but_not_the_failure_detail() {
         use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
 
@@ -398,9 +446,10 @@ mod tests {
                     .into(),
                 retry_after: None,
             };
-            let AppError::BadRequest(msg) = did_document_failure("did:web:alice.test", &failure)
+            let (AppError::BadRequest(msg) | AppError::BadGateway(msg)) =
+                did_document_failure("did:web:alice.test", &failure)
             else {
-                panic!("expected BadRequest for {kind:?}");
+                panic!("expected BadRequest or BadGateway for {kind:?}");
             };
             assert!(msg.contains("did:web:alice.test"), "{kind:?}: {msg}");
             assert!(!msg.contains("internal.example"), "{kind:?}: {msg}");
@@ -416,8 +465,8 @@ mod tests {
             std::future::pending(),
         )
         .await;
-        let Err(AppError::BadRequest(msg)) = result else {
-            panic!("expected BadRequest, got {result:?}");
+        let Err(AppError::BadGateway(msg)) = result else {
+            panic!("expected BadGateway, got {result:?}");
         };
         assert_eq!(msg, "timed out resolving slow.test");
     }

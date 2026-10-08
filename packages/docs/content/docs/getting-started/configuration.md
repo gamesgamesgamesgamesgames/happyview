@@ -21,6 +21,9 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `PLC_URL` | no | `https://plc.directory` | [PLC directory](https://github.com/did-method-plc/did-method-plc) URL for DID resolution |
 | `STATIC_DIR` | no | `./web/out` | Directory containing the built dashboard static assets |
 | `EVENT_LOG_RETENTION_DAYS` | no | `30` | Number of days to keep event logs before automatic cleanup. Set to `0` to disable cleanup |
+| `SPACE_INSPECTOR_ENABLED` | no | `false` | Lets users with `spaces:inspect` request time-limited access to read records and blobs in private [spaces](../experimental/spaces/index.md) from the dashboard. Maps to **Enable Space Inspector** under **Settings > General**. Overridden by database setting if set via admin API |
+| `SPACE_INSPECTOR_MAX_GRANT_MINUTES` | no | `60` | The longest an access grant can last. Requests default to 60 minutes or this value, whichever is shorter; unparseable values fall back to `60`, anything below `5` is raised to `5`, and anything above `525600` (one year) is lowered to it. Maps to **Maximum Access Length (minutes)** under **Settings > General**. Overridden by database setting if set via admin API |
+| `SPACE_ACCESS_LOG_RETENTION_DAYS` | no | `365` | Days to keep [protected events](../guides/event-logs.md#protected-events) — space access grants and revocations, the reads made under them, inspector on/off switches, event log purges, and retention changes — before cleanup. Access grants that ended (expired or were revoked) longer ago than this are deleted on the same schedule. Set to `0` to keep them forever. When unset, it follows an `EVENT_LOG_RETENTION_DAYS` of `0` and is `365` otherwise. The events tied to an access grant that still exists (its grant and revocation events and the reads made under it) are kept regardless. Maps to **Space Access Log Retention (days)** under **Settings > General**. Overridden by database setting if set via admin API |
 | `JOB_WORKER_CONCURRENCY` | no | `1` | Number of background jobs that run at once. Values below 1 fall back to 1; values above 32 are capped at 32. Each running job uses database connections, so keep this below `DATABASE_MAX_CONNECTIONS`. |
 | `PLATFORM_API_KEY_HASH` | no | — | Hex SHA-256 of a key that a managed-hosting provider uses to administer this instance. Leave unset when self-hosting. See [Platform API](../api-reference/admin/platform.md) |
 | `TOKEN_ENCRYPTION_KEY` | no | --- | Base64-encoded 32-byte key for encrypting stored OAuth tokens. **Strongly recommended in production** |
@@ -66,6 +69,9 @@ SESSION_SECRET=change-me-in-production
 # PLC_URL=https://plc.directory
 # STATIC_DIR=./web/out
 # EVENT_LOG_RETENTION_DAYS=30
+# SPACE_INSPECTOR_ENABLED=false
+# SPACE_INSPECTOR_MAX_GRANT_MINUTES=60
+# SPACE_ACCESS_LOG_RETENTION_DAYS=365
 # TOKEN_ENCRYPTION_KEY=base64-encoded-32-byte-key
 # DEFAULT_RATE_LIMIT_CAPACITY=100
 # DEFAULT_RATE_LIMIT_REFILL_RATE=2.0

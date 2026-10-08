@@ -30,6 +30,59 @@ pub struct EventLog {
     pub detail: Value,
 }
 
+/// Events that record access to private data and changes to the audit trail
+/// itself. Manual purges never delete them; retention removes them on their
+/// own schedule (`space_access_log_retention_days`).
+pub const PROTECTED_EVENT_TYPES: &[&str] = &[
+    "space.access_granted",
+    "space.access_revoked",
+    "space.moderator_read",
+    "space_inspector.enabled",
+    "space_inspector.disabled",
+    "event_logs.purged",
+    "event_logs.retention_changed",
+];
+
+/// Setting key for how long protected events are kept before retention
+/// sweeps them, in days.
+pub const SPACE_ACCESS_RETENTION_SETTING: &str = "space_access_log_retention_days";
+
+/// Default retention for unprotected events, in days, when the setting is
+/// unset or unparseable.
+pub const DEFAULT_RETENTION_DAYS: u32 = 30;
+
+/// Default retention for protected events, in days, when the setting is unset
+/// or unparseable.
+pub const DEFAULT_PROTECTED_RETENTION_DAYS: u32 = 365;
+
+/// How an `EventFilter` treats `PROTECTED_EVENT_TYPES`.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub enum ProtectedEvents {
+    /// Match protected and unprotected rows alike.
+    #[default]
+    Include,
+    /// Match only unprotected rows.
+    Exclude,
+    /// Match only protected rows.
+    Only,
+}
+
+/// True when a filter names a protected type or a category containing one.
+pub fn names_protected(filter: &EventFilter) -> bool {
+    let type_hit = filter
+        .event_type
+        .as_deref()
+        .is_some_and(|t| PROTECTED_EVENT_TYPES.contains(&t));
+    let category_hit = filter.category.as_deref().is_some_and(|c| {
+        c.split(',').map(str::trim).any(|part| {
+            PROTECTED_EVENT_TYPES
+                .iter()
+                .any(|t| t.starts_with(&format!("{part}.")))
+        })
+    });
+    type_hit || category_hit
+}
+
 /// A filter over `happyview_event_logs`, shared by the admin list and count
 /// endpoints, the purge job, and the retention sweep.
 ///
@@ -49,6 +102,9 @@ pub struct EventFilter {
     pub after: Option<String>,
     /// Exclusive upper bound on `created_at`.
     pub before: Option<String>,
+    /// Whether protected event types (`PROTECTED_EVENT_TYPES`) are included,
+    /// excluded, or the only rows matched.
+    pub protected: ProtectedEvents,
 }
 
 impl EventFilter {
@@ -100,6 +156,19 @@ impl EventFilter {
             binds.push(before.clone());
         }
 
+        let placeholders = vec!["?"; PROTECTED_EVENT_TYPES.len()].join(",");
+        match self.protected {
+            ProtectedEvents::Include => {}
+            ProtectedEvents::Exclude => {
+                sql.push_str(&format!(" AND event_type NOT IN ({placeholders})"));
+                binds.extend(PROTECTED_EVENT_TYPES.iter().map(|t| t.to_string()));
+            }
+            ProtectedEvents::Only => {
+                sql.push_str(&format!(" AND event_type IN ({placeholders})"));
+                binds.extend(PROTECTED_EVENT_TYPES.iter().map(|t| t.to_string()));
+            }
+        }
+
         (sql, binds)
     }
 }
@@ -131,24 +200,40 @@ pub struct SweepOutcome {
 const SWEEP_BATCH_SIZE: i64 = 5000;
 
 /// Delete every event log row strictly older than `cutoff`, then reclaim.
+#[cfg(test)]
+async fn sweep_with_cutoff(
+    db: &AnyPool,
+    cutoff: &str,
+    protected: ProtectedEvents,
+    backend: DatabaseBackend,
+) -> SweepOutcome {
+    let deleted = delete_before(db, cutoff, protected, "", backend).await;
+    let vacuumed = reclaim(db, deleted, backend).await;
+    SweepOutcome { deleted, vacuumed }
+}
+
+/// Delete event log rows older than `cutoff` in batches, without reclaiming.
 ///
 /// `cutoff` must be RFC3339 with a `+00:00` offset — the form `now_rfc3339()`
 /// writes. On SQLite `created_at` is TEXT and this is a string comparison, so a
 /// differently-formatted cutoff silently mis-selects rows.
-pub async fn sweep_with_cutoff(
+async fn delete_before(
     db: &AnyPool,
     cutoff: &str,
+    protected: ProtectedEvents,
+    hold: &str,
     backend: DatabaseBackend,
-) -> SweepOutcome {
+) -> u64 {
     let filter = EventFilter {
         before: Some(cutoff.to_string()),
+        protected,
         ..Default::default()
     };
     let (frag, binds) = filter.build();
     let sql = adapt_sql(
         &format!(
             "DELETE FROM happyview_event_logs WHERE id IN \
-             (SELECT id FROM happyview_event_logs WHERE 1=1{frag} LIMIT ?)"
+             (SELECT id FROM happyview_event_logs WHERE 1=1{frag}{hold} LIMIT ?)"
         ),
         backend,
     );
@@ -176,42 +261,126 @@ pub async fn sweep_with_cutoff(
             break;
         }
     }
-
-    // Incremental auto-vacuum makes reclamation possible but never automatic;
-    // this is what returns the freed pages to the filesystem. Guarded on having
-    // deleted something, so an idle instance does not issue a pointless pragma
-    // every hour forever, and it runs once after the whole sweep rather than
-    // once per batch.
-    let mut vacuumed = false;
-    if deleted > 0 && backend == DatabaseBackend::Sqlite {
-        match crate::db::query("PRAGMA incremental_vacuum")
-            .execute(db)
-            .await
-        {
-            Ok(_) => vacuumed = true,
-            Err(e) => {
-                tracing::warn!(error = %e, "incremental_vacuum after event log cleanup failed")
-            }
-        }
-    }
-
-    SweepOutcome { deleted, vacuumed }
+    deleted
 }
 
-/// Sweep rows older than `retention_days`. A retention of `0` is a no-op.
+/// Incremental auto-vacuum makes reclamation possible but never automatic;
+/// this is what returns the freed pages to the filesystem. Guarded on having
+/// deleted something, so an idle instance does not issue a pointless pragma
+/// every hour forever, and called once after a whole sweep rather than once
+/// per batch or pass.
+async fn reclaim(db: &AnyPool, deleted: u64, backend: DatabaseBackend) -> bool {
+    if deleted == 0 || backend != DatabaseBackend::Sqlite {
+        return false;
+    }
+    match crate::db::query("PRAGMA incremental_vacuum")
+        .execute(db)
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "incremental_vacuum after event log cleanup failed");
+            false
+        }
+    }
+}
+
+/// Excludes the protected events tied to an access grant that still exists: its
+/// grant and revocation events and the reads made under it. They last as long
+/// as the grant row does, which `sweep_ended_access_grants` removes once the
+/// grant has been over for the retention period. Unrelated events keep their
+/// own schedule.
+const HOLD_STORED_GRANT_RECORDS: &str = " AND id NOT IN (\
+    SELECT event_id FROM happyview_space_access_grant_events \
+        WHERE grant_id IN (SELECT id FROM happyview_space_access_grants) \
+    UNION SELECT event_id FROM happyview_space_access_reads \
+        WHERE grant_id IN (SELECT id FROM happyview_space_access_grants))";
+
+/// The protected retention in days. An unset or unparseable
+/// `space_access_log_retention_days` follows a general retention of `0`, which
+/// keeps everything, and is 365 days otherwise.
+pub fn effective_protected_retention(general_days: u32, protected: Option<&str>) -> u32 {
+    match protected.and_then(|v| v.trim().parse::<u32>().ok()) {
+        Some(days) => days,
+        None if general_days == 0 => 0,
+        None => DEFAULT_PROTECTED_RETENTION_DAYS,
+    }
+}
+
+/// Sweep unprotected rows older than `retention_days` and protected rows
+/// older than `protected_retention_days`, then reclaim once. A value of `0`
+/// skips that pass. Protected rows tied to a grant that still exists are kept
+/// regardless; if that hold can't be checked, the delete fails and nothing
+/// protected is removed.
 pub async fn run_retention_sweep(
     db: &AnyPool,
     retention_days: u32,
+    protected_retention_days: u32,
     backend: DatabaseBackend,
 ) -> SweepOutcome {
-    if retention_days == 0 {
-        return SweepOutcome {
-            deleted: 0,
-            vacuumed: false,
-        };
+    let days_ago =
+        |days: u32| (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+    let mut deleted = 0;
+    if retention_days > 0 {
+        deleted += delete_before(
+            db,
+            &days_ago(retention_days),
+            ProtectedEvents::Exclude,
+            "",
+            backend,
+        )
+        .await;
     }
+    if protected_retention_days > 0 {
+        deleted += delete_before(
+            db,
+            &days_ago(protected_retention_days),
+            ProtectedEvents::Only,
+            HOLD_STORED_GRANT_RECORDS,
+            backend,
+        )
+        .await;
+    }
+    let vacuumed = reclaim(db, deleted, backend).await;
+    SweepOutcome { deleted, vacuumed }
+}
+
+/// Delete space access grants that ended (expired or were revoked) more than
+/// `retention_days` ago. Grants hold a moderator's DID and reason, so they
+/// follow the same schedule as the protected events that record them. `0`
+/// keeps them forever. Returns how many were deleted.
+pub async fn sweep_ended_access_grants(
+    db: &AnyPool,
+    retention_days: u32,
+    backend: DatabaseBackend,
+) -> Result<u64, sqlx::Error> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+    // Grant timestamps are written with `to_rfc3339()`, so they compare as text.
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
-    sweep_with_cutoff(db, &cutoff, backend).await
+    // Batched like the event sweep, so a long-disabled retention catching up
+    // doesn't become one huge transaction holding the write lock.
+    let sql = adapt_sql(
+        "DELETE FROM happyview_space_access_grants WHERE id IN \
+         (SELECT id FROM happyview_space_access_grants WHERE (revoked_at IS NOT NULL AND revoked_at < ?) OR expires_at < ? LIMIT ?)",
+        backend,
+    );
+    let mut deleted = 0;
+    loop {
+        let affected = crate::db::query(&sql)
+            .bind(&cutoff)
+            .bind(&cutoff)
+            .bind(SWEEP_BATCH_SIZE)
+            .execute(db)
+            .await?
+            .rows_affected();
+        deleted += affected;
+        if (affected as i64) < SWEEP_BATCH_SIZE {
+            break;
+        }
+    }
+    Ok(deleted)
 }
 
 /// Hourly retention sweep.
@@ -239,12 +408,27 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
                     error = %e,
                     "event_log_retention_days is not a valid non-negative integer, defaulting to 30"
                 );
-                30
+                DEFAULT_RETENTION_DAYS
             }),
-            None => 30,
+            None => DEFAULT_RETENTION_DAYS,
         };
 
-        let outcome = run_retention_sweep(&db, retention_days, backend).await;
+        let protected_days = effective_protected_retention(
+            retention_days,
+            crate::admin::settings::get_setting(&db, SPACE_ACCESS_RETENTION_SETTING, backend)
+                .await
+                .as_deref(),
+        );
+
+        // Ended grants go first, so the protected pass below sees the hold
+        // their deletion lifts in the same tick.
+        match sweep_ended_access_grants(&db, protected_days, backend).await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "cleaned up ended space access grants"),
+            Err(e) => tracing::warn!("failed to clean up ended space access grants: {e}"),
+        }
+
+        let outcome = run_retention_sweep(&db, retention_days, protected_days, backend).await;
         if outcome.deleted > 0 {
             tracing::info!(
                 count = outcome.deleted,
@@ -256,6 +440,23 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
 }
 
 pub async fn log_event(db: &AnyPool, event: EventLog, backend: DatabaseBackend) {
+    if let Err(e) = write_event(db, &event, backend).await {
+        tracing::warn!(event_type = %event.event_type, "failed to log event: {e}");
+    }
+}
+
+/// Write an event and report failure. For audit events whose absence must stop
+/// the action they record; `log_event` is the best-effort form. Accepts a
+/// transaction so the event can commit or roll back with the change it records.
+/// Returns the new event's id.
+pub async fn write_event<'e, E>(
+    executor: E,
+    event: &EventLog,
+    backend: DatabaseBackend,
+) -> Result<String, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
     let severity = event.severity.to_string();
     let detail_str = serde_json::to_string(&event.detail).unwrap_or_else(|_| "{}".to_string());
     let id = Uuid::new_v4().to_string();
@@ -266,7 +467,7 @@ pub async fn log_event(db: &AnyPool, event: EventLog, backend: DatabaseBackend) 
         backend,
     );
 
-    let result = crate::db::query(&sql)
+    crate::db::query(&sql)
         .bind(&id)
         .bind(&event.event_type)
         .bind(&severity)
@@ -274,12 +475,9 @@ pub async fn log_event(db: &AnyPool, event: EventLog, backend: DatabaseBackend) 
         .bind(&event.subject)
         .bind(&detail_str)
         .bind(&created_at)
-        .execute(db)
-        .await;
-
-    if let Err(e) = result {
-        tracing::warn!(event_type = %event.event_type, "failed to log event: {e}");
-    }
+        .execute(executor)
+        .await?;
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -447,19 +645,44 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create event_logs");
+        crate::db::query(
+            "CREATE TABLE happyview_space_access_grants (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create space_access_grants");
+        for table in [
+            "happyview_space_access_grant_events",
+            "happyview_space_access_reads",
+        ] {
+            crate::db::query(&format!(
+                "CREATE TABLE {table} (event_id TEXT PRIMARY KEY, grant_id TEXT NOT NULL)"
+            ))
+            .execute(&pool)
+            .await
+            .expect("create link table");
+        }
         pool
     }
 
-    async fn insert_at(pool: &AnyPool, id: &str, created_at: &str) {
+    async fn insert_typed(pool: &AnyPool, id: &str, event_type: &str, created_at: &str) {
         crate::db::query(
             "INSERT INTO happyview_event_logs (id, event_type, severity, detail, created_at)
-             VALUES (?, 'record.skipped', 'info', '{}', ?)",
+             VALUES (?, ?, 'info', '{}', ?)",
         )
         .bind(id)
+        .bind(event_type)
         .bind(created_at)
         .execute(pool)
         .await
         .expect("insert event");
+    }
+
+    async fn insert_at(pool: &AnyPool, id: &str, created_at: &str) {
+        insert_typed(pool, id, "record.skipped", created_at).await;
     }
 
     async fn remaining_ids(pool: &AnyPool) -> Vec<String> {
@@ -482,8 +705,13 @@ mod tests {
         insert_at(&pool, "boundary", "2026-07-08T16:00:00+00:00").await;
         insert_at(&pool, "newer", "2026-07-08T20:00:00+00:00").await;
 
-        let outcome =
-            sweep_with_cutoff(&pool, "2026-07-08T16:00:00+00:00", DatabaseBackend::Sqlite).await;
+        let outcome = sweep_with_cutoff(
+            &pool,
+            "2026-07-08T16:00:00+00:00",
+            ProtectedEvents::Exclude,
+            DatabaseBackend::Sqlite,
+        )
+        .await;
 
         assert_eq!(outcome.deleted, 1, "only the row before the cutoff goes");
         assert_eq!(
@@ -498,13 +726,23 @@ mod tests {
         let pool = pool_with_events().await;
         insert_at(&pool, "old", "2026-01-01T00:00:00+00:00").await;
 
-        let hit =
-            sweep_with_cutoff(&pool, "2026-07-08T16:00:00+00:00", DatabaseBackend::Sqlite).await;
+        let hit = sweep_with_cutoff(
+            &pool,
+            "2026-07-08T16:00:00+00:00",
+            ProtectedEvents::Exclude,
+            DatabaseBackend::Sqlite,
+        )
+        .await;
         assert_eq!(hit.deleted, 1);
         assert!(hit.vacuumed, "a sweep that freed pages reclaims them");
 
-        let miss =
-            sweep_with_cutoff(&pool, "2026-07-08T16:00:00+00:00", DatabaseBackend::Sqlite).await;
+        let miss = sweep_with_cutoff(
+            &pool,
+            "2026-07-08T16:00:00+00:00",
+            ProtectedEvents::Exclude,
+            DatabaseBackend::Sqlite,
+        )
+        .await;
         assert_eq!(miss.deleted, 0);
         assert!(
             !miss.vacuumed,
@@ -517,7 +755,7 @@ mod tests {
         let pool = pool_with_events().await;
         insert_at(&pool, "ancient", "2020-01-01T00:00:00+00:00").await;
 
-        let outcome = run_retention_sweep(&pool, 0, DatabaseBackend::Sqlite).await;
+        let outcome = run_retention_sweep(&pool, 0, 0, DatabaseBackend::Sqlite).await;
 
         assert_eq!(outcome.deleted, 0);
         assert!(!outcome.vacuumed);
@@ -533,9 +771,100 @@ mod tests {
         insert_at(&pool, "ancient", &ancient).await;
         insert_at(&pool, "recent", &recent).await;
 
-        let outcome = run_retention_sweep(&pool, 30, DatabaseBackend::Sqlite).await;
+        let outcome = run_retention_sweep(&pool, 30, 0, DatabaseBackend::Sqlite).await;
 
         assert_eq!(outcome.deleted, 1);
         assert_eq!(remaining_ids(&pool).await, vec!["recent".to_string()]);
+    }
+
+    #[test]
+    fn unset_protected_retention_follows_a_keep_everything_general_setting() {
+        assert_eq!(effective_protected_retention(30, None), 365);
+        assert_eq!(effective_protected_retention(0, None), 0);
+        assert_eq!(effective_protected_retention(0, Some("abc")), 0);
+        assert_eq!(effective_protected_retention(0, Some(" 90 ")), 90);
+        assert_eq!(effective_protected_retention(30, Some("0")), 0);
+    }
+
+    #[tokio::test]
+    async fn a_two_pass_sweep_reports_one_vacuum() {
+        let pool = pool_with_events().await;
+        let old = (chrono::Utc::now() - chrono::Duration::days(800)).to_rfc3339();
+        insert_typed(&pool, "plain", "record.skipped", &old).await;
+        insert_typed(&pool, "read", "space.moderator_read", &old).await;
+        let outcome = run_retention_sweep(&pool, 30, 365, DatabaseBackend::Sqlite).await;
+        assert_eq!(outcome.deleted, 2);
+        assert!(outcome.vacuumed);
+    }
+
+    #[test]
+    fn filter_modes_build_type_clauses() {
+        let excl = EventFilter {
+            protected: ProtectedEvents::Exclude,
+            ..Default::default()
+        };
+        let (sql, binds) = excl.build();
+        assert!(sql.contains("event_type NOT IN"));
+        assert_eq!(binds.len(), PROTECTED_EVENT_TYPES.len());
+        let only = EventFilter {
+            protected: ProtectedEvents::Only,
+            ..Default::default()
+        };
+        assert!(only.build().0.contains(" AND event_type IN ("));
+        assert!(!EventFilter::default().build().0.contains("event_type"));
+    }
+
+    #[test]
+    fn protected_names_are_detected() {
+        let by_type = EventFilter {
+            event_type: Some("space.moderator_read".into()),
+            ..Default::default()
+        };
+        assert!(names_protected(&by_type));
+        let by_category = EventFilter {
+            category: Some("record,space".into()),
+            ..Default::default()
+        };
+        assert!(names_protected(&by_category));
+        let purge_log = EventFilter {
+            category: Some("event_logs".into()),
+            ..Default::default()
+        };
+        assert!(names_protected(&purge_log));
+        let plain = EventFilter {
+            category: Some("record".into()),
+            severity: Some("info".into()),
+            ..Default::default()
+        };
+        assert!(!names_protected(&plain));
+    }
+
+    #[tokio::test]
+    async fn retention_keeps_protected_events_on_their_own_schedule() {
+        let pool = pool_with_events().await;
+        let now = chrono::Utc::now();
+        let days_ago = |d: i64| (now - chrono::Duration::days(d)).to_rfc3339();
+        insert_typed(&pool, "old-plain", "record.skipped", &days_ago(90)).await;
+        insert_typed(&pool, "old-read", "space.moderator_read", &days_ago(90)).await;
+        insert_typed(
+            &pool,
+            "ancient-read",
+            "space.moderator_read",
+            &days_ago(400),
+        )
+        .await;
+        insert_typed(&pool, "ancient-purge", "event_logs.purged", &days_ago(400)).await;
+
+        run_retention_sweep(&pool, 30, 365, DatabaseBackend::Sqlite).await;
+        assert_eq!(remaining_ids(&pool).await, vec!["old-read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn protected_retention_of_zero_keeps_them_forever() {
+        let pool = pool_with_events().await;
+        let ancient = (chrono::Utc::now() - chrono::Duration::days(4000)).to_rfc3339();
+        insert_typed(&pool, "ancient-read", "space.moderator_read", &ancient).await;
+        run_retention_sweep(&pool, 1, 0, DatabaseBackend::Sqlite).await;
+        assert_eq!(remaining_ids(&pool).await, vec!["ancient-read".to_string()]);
     }
 }

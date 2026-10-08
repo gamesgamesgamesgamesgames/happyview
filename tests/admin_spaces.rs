@@ -38,25 +38,14 @@ async fn get(app: &TestApp, uri: &str, key: Option<&str>) -> axum::response::Res
         .unwrap()
 }
 
-/// Mint an API key for the test admin limited to `permissions`.
-async fn api_key(app: &TestApp, permissions: &[&str]) -> String {
-    let (name, value) = app.admin_cookie();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/api-keys")
-        .header(name, value)
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({ "name": "moderator", "permissions": permissions }).to_string(),
-        ))
-        .unwrap();
-    let resp = app.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    json_body(resp).await["key"].as_str().unwrap().to_string()
-}
-
 /// A space the test admin neither created nor belongs to, holding one record.
 async fn seed_space(app: &TestApp) -> String {
+    seed_space_with_skey(app, "main").await
+}
+
+/// Like `seed_space`, but with a distinct id and record URI so more than one
+/// space can be seeded in the same test.
+async fn seed_space_with_skey(app: &TestApp, skey: &str) -> String {
     let now = now_rfc3339();
     let id = Uuid::new_v4().to_string();
     let space = Space {
@@ -65,7 +54,7 @@ async fn seed_space(app: &TestApp) -> String {
         authority_did: CREATOR.to_string(),
         creator_did: CREATOR.to_string(),
         type_nsid: "com.example.adminspaces".to_string(),
-        skey: "main".to_string(),
+        skey: skey.to_string(),
         display_name: Some("Private space".to_string()),
         description: None,
         read_policy: Policy::MemberList,
@@ -99,7 +88,7 @@ async fn seed_space(app: &TestApp) -> String {
         app.state.db_backend,
         &SpaceRecord {
             uri: format!(
-                "at://{CREATOR}/space/com.example.adminspaces/main/{MEMBER}/{COLLECTION}/1"
+                "at://{CREATOR}/space/com.example.adminspaces/{skey}/{MEMBER}/{COLLECTION}/1"
             ),
             space_id: id.clone(),
             author_did: MEMBER.to_string(),
@@ -127,12 +116,44 @@ async fn moderator_reads(app: &TestApp) -> Vec<(Option<String>, Option<String>, 
         .unwrap()
 }
 
+async fn enable_inspector(app: &TestApp) {
+    let (name, value) = app.admin_cookie();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/admin/settings/feature.space_inspector_enabled")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "value": "true" }).to_string()))
+        .unwrap();
+    assert_eq!(
+        app.router.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+async fn grant(app: &TestApp, scope: &str, target: &str) -> String {
+    let (name, value) = app.admin_cookie();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/spaces/access-grants")
+        .header(name, value)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "scope": scope, "target": target, "reason": "report" }).to_string(),
+        ))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    json_body(resp).await["id"].as_str().unwrap().to_string()
+}
+
 #[tokio::test]
 #[serial]
 async fn super_admin_lists_and_reads_spaces() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
+    enable_inspector(&app).await;
 
     let resp = get(&app, "/admin/spaces", None).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -150,6 +171,7 @@ async fn super_admin_lists_and_reads_spaces() {
     assert_eq!(body["collections"][0]["collection"], COLLECTION);
     assert_eq!(body["collections"][0]["count"], 1);
 
+    grant(&app, "space", &id).await;
     let resp = get(&app, &format!("/admin/spaces/{id}/records"), None).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
@@ -163,7 +185,8 @@ async fn spaces_read_does_not_grant_record_access() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
-    let key = api_key(&app, &["spaces:read"]).await;
+    enable_inspector(&app).await;
+    let key = common::api_key(&app, &["spaces:read"]).await;
 
     let resp = get(&app, &format!("/admin/spaces/{id}"), Some(&key)).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -182,11 +205,13 @@ async fn spaces_read_does_not_grant_record_access() {
 
 #[tokio::test]
 #[serial]
-async fn manage_records_reads_records_and_logs_the_read() {
+async fn inspect_reads_records_and_logs_the_read() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
-    let key = api_key(&app, &["spaces:manage-records"]).await;
+    enable_inspector(&app).await;
+    let grant_id = grant(&app, "space", &id).await;
+    let key = common::api_key(&app, &["spaces:inspect"]).await;
 
     let resp = get(
         &app,
@@ -212,6 +237,33 @@ async fn manage_records_reads_records_and_logs_the_read() {
     assert_eq!(detail["action"], "list_records");
     assert_eq!(detail["collection"], COLLECTION);
     assert_eq!(detail["space_id"], id);
+    assert_eq!(detail["grant_id"], grant_id);
+    assert_eq!(detail["scope"], "space");
+}
+
+#[tokio::test]
+#[serial]
+async fn metadata_routes_are_closed_while_the_inspector_is_off() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+
+    for uri in [
+        "/admin/spaces".to_string(),
+        format!("/admin/spaces/{id}"),
+        format!("/admin/accounts/{MEMBER}/spaces"),
+    ] {
+        let resp = get(&app, &uri, None).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+        assert_eq!(json_body(resp).await["error"], "SpaceInspectorDisabled");
+    }
+
+    let resp = get(&app, "/admin/spaces/inspector", None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the status route stays open so the dashboard can explain the state"
+    );
 }
 
 #[tokio::test]
@@ -220,6 +272,7 @@ async fn metadata_reads_are_not_logged() {
     common::require_db!();
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
+    enable_inspector(&app).await;
 
     assert_eq!(
         get(&app, "/admin/spaces", None).await.status(),
@@ -240,9 +293,33 @@ async fn unknown_space_is_not_found() {
     common::require_db!();
     let app = TestApp::new().await;
 
+    // Every route checks the switch before looking the space up.
+    for uri in [
+        "/admin/spaces/does-not-exist",
+        "/admin/spaces/does-not-exist/records",
+        "/admin/spaces/does-not-exist/blob?cid=bafyunknown",
+    ] {
+        let resp = get(&app, uri, None).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(resp).await["error"], "SpaceInspectorDisabled");
+    }
+
+    let key = common::api_key(&app, &["spaces:read"]).await;
+    let resp = get(&app, "/admin/spaces/does-not-exist/records", Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["error"], "InsufficientPermissions");
+
+    enable_inspector(&app).await;
     let resp = get(&app, "/admin/spaces/does-not-exist", None).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let resp = get(&app, "/admin/spaces/does-not-exist/records", None).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = get(
+        &app,
+        "/admin/spaces/does-not-exist/blob?cid=bafyunknown",
+        None,
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -253,6 +330,8 @@ async fn blob_outside_the_space_is_not_found() {
     let app = TestApp::new().await;
     let id = seed_space(&app).await;
 
+    enable_inspector(&app).await;
+    grant(&app, "space", &id).await;
     let resp = get(
         &app,
         &format!("/admin/spaces/{id}/blob?cid=bafyunknown"),
@@ -261,4 +340,553 @@ async fn blob_outside_the_space_is_not_found() {
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert!(moderator_reads(&app).await.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn manage_records_alone_no_longer_reads_contents() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    let key = common::api_key(&app, &["spaces:manage-records"]).await;
+    let resp = get(&app, &format!("/admin/spaces/{id}/records"), Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["error"], "InsufficientPermissions");
+}
+
+#[tokio::test]
+#[serial]
+async fn reads_need_the_switch_and_a_grant() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+
+    let resp = get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["error"], "SpaceInspectorDisabled");
+
+    enable_inspector(&app).await;
+    let resp = get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["error"], "SpaceAccessGrantRequired");
+    assert!(moderator_reads(&app).await.is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn disabling_the_switch_stops_existing_grants() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    grant(&app, "space", &id).await;
+
+    let (name, value) = app.admin_cookie();
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/admin/settings/feature.space_inspector_enabled")
+        .header(name, value)
+        .body(Body::empty())
+        .unwrap();
+    app.router.clone().oneshot(req).await.unwrap();
+
+    let resp = get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+    assert_eq!(json_body(resp).await["error"], "SpaceInspectorDisabled");
+}
+
+#[tokio::test]
+#[serial]
+async fn expired_revoked_and_foreign_grants_do_not_cover() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    let now = chrono::Utc::now();
+    let insert = adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at, revoked_at) VALUES (?, ?, ?, 'space', ?, 'r', ?, ?, ?)",
+        app.state.db_backend,
+    );
+    let admin_user_id: (String,) = happyview::db::query_as(&adapt_sql(
+        "SELECT id FROM happyview_users WHERE did = ?",
+        app.state.db_backend,
+    ))
+    .bind(&app.admin_did)
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    let rows = [
+        // expired
+        (
+            admin_user_id.0.clone(),
+            (now - chrono::Duration::minutes(1)).to_rfc3339(),
+            None,
+        ),
+        // revoked
+        (
+            admin_user_id.0.clone(),
+            (now + chrono::Duration::minutes(60)).to_rfc3339(),
+            Some(now.to_rfc3339()),
+        ),
+        // someone else's
+        (
+            "someone-else".to_string(),
+            (now + chrono::Duration::minutes(60)).to_rfc3339(),
+            None,
+        ),
+    ];
+    for (user_id, expires_at, revoked_at) in rows {
+        happyview::db::query(&insert)
+            .bind(Uuid::new_v4().to_string())
+            .bind(user_id)
+            .bind("did:plc:x")
+            .bind(&id)
+            .bind(now.to_rfc3339())
+            .bind(expires_at)
+            .bind(revoked_at)
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
+    let resp = get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+    assert_eq!(json_body(resp).await["error"], "SpaceAccessGrantRequired");
+}
+
+#[tokio::test]
+#[serial]
+async fn space_grant_covers_only_its_space() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let first = seed_space(&app).await;
+    let second = seed_space_with_skey(&app, "second").await;
+    enable_inspector(&app).await;
+    grant(&app, "space", &first).await;
+    assert_eq!(
+        get(&app, &format!("/admin/spaces/{first}/records"), None)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(&app, &format!("/admin/spaces/{second}/records"), None)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn account_grant_reads_only_that_author_in_a_space() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    grant(&app, "account", MEMBER).await;
+    assert_eq!(
+        get(
+            &app,
+            &format!("/admin/spaces/{id}/records?repo={MEMBER}"),
+            None
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(&app, &format!("/admin/spaces/{id}/records"), None)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+        "an account grant does not open every author in the space"
+    );
+    assert_eq!(
+        get(
+            &app,
+            &format!("/admin/spaces/{id}/records?repo={CREATOR}"),
+            None
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+/// Add a record by `author` that references `cid` as a blob.
+async fn seed_blob_record(
+    app: &TestApp,
+    space_id: &str,
+    skey: &str,
+    author: &str,
+    rkey: &str,
+    cid: &str,
+) {
+    spaces_db::upsert_space_record(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceRecord {
+            uri: format!("at://{CREATOR}/space/com.example.adminspaces/{skey}/{author}/{COLLECTION}/{rkey}"),
+            space_id: space_id.to_string(),
+            author_did: author.to_string(),
+            collection: COLLECTION.to_string(),
+            rkey: rkey.to_string(),
+            record: json!({ "$type": COLLECTION, "image": { "$type": "blob", "ref": { "$link": cid }, "mimeType": "image/png", "size": 1 } }),
+            cid: format!("bafyrei{rkey}"),
+            indexed_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn account_routes_span_spaces() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let first = seed_space(&app).await;
+    let second = seed_space_with_skey(&app, "second").await;
+    enable_inspector(&app).await;
+
+    let resp = get(&app, &format!("/admin/accounts/{MEMBER}/spaces"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let ids: Vec<&str> = body["spaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["space"]["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&first.as_str()) && ids.contains(&second.as_str()));
+    assert_eq!(body["spaces"][0]["record_count"], 1);
+    assert!(
+        moderator_reads(&app).await.is_empty(),
+        "listing an account's spaces reads no contents"
+    );
+
+    let resp = get(
+        &app,
+        &format!("/admin/accounts/{MEMBER}/space-records"),
+        None,
+    )
+    .await;
+    assert_eq!(json_body(resp).await["error"], "SpaceAccessGrantRequired");
+
+    let grant_id = grant(&app, "account", MEMBER).await;
+    let resp = get(
+        &app,
+        &format!("/admin/accounts/{MEMBER}/space-records"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["records"].as_array().unwrap().len(), 2);
+    assert!(
+        body["records"][0]["space_uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("at://did:plc:adminspaces-creator/space/")
+    );
+
+    let resp = get(
+        &app,
+        &format!("/admin/accounts/{MEMBER}/space-records?space={first}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        json_body(resp).await["records"].as_array().unwrap().len(),
+        1
+    );
+
+    let reads = moderator_reads(&app).await;
+    let (_, subject, detail) = reads.last().unwrap();
+    assert_eq!(subject.as_deref(), Some(MEMBER));
+    let detail: Value = serde_json::from_str(detail).unwrap();
+    assert_eq!(detail["action"], "list_account_records");
+    assert_eq!(detail["grant_id"], grant_id);
+
+    let resp = get(
+        &app,
+        &format!("/admin/accounts/{CREATOR}/space-records"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "the grant covers one account"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn account_grant_blob_access_follows_the_author() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    seed_blob_record(&app, &id, "main", MEMBER, "m1", "bafkshared").await;
+    seed_blob_record(&app, &id, "main", CREATOR, "c1", "bafkshared").await;
+    seed_blob_record(&app, &id, "main", CREATOR, "c2", "bafkcreatoronly").await;
+    enable_inspector(&app).await;
+    grant(&app, "account", MEMBER).await;
+
+    // Shared CID: covered because MEMBER's own record references it. The PDS
+    // endpoint can't be resolved for a test DID, so a covered request still
+    // surfaces as 404 — the proof that authorization passed is the logged
+    // read naming MEMBER, not the status code.
+    let shared = get(
+        &app,
+        &format!("/admin/spaces/{id}/blob?cid=bafkshared"),
+        None,
+    )
+    .await;
+    assert_eq!(shared.status(), StatusCode::NOT_FOUND);
+    let detail: Value =
+        serde_json::from_str(&moderator_reads(&app).await.last().unwrap().2).unwrap();
+    assert_eq!(detail["repo"], MEMBER);
+
+    // CREATOR-only CID: denied, because MEMBER's account grant covers only
+    // records MEMBER itself references. A 404 alone can't tell this apart
+    // from an authorized request whose PDS fetch fails (also 404 above), so
+    // the real check is that denial logs no read at all.
+    let reads_before = moderator_reads(&app).await.len();
+    let other = get(
+        &app,
+        &format!("/admin/spaces/{id}/blob?cid=bafkcreatoronly"),
+        None,
+    )
+    .await;
+    assert_eq!(other.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        moderator_reads(&app).await.len(),
+        reads_before,
+        "a denied request must not log a moderator read"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn grant_reads_lists_the_reads_made_under_a_grant() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    let grant_id = grant(&app, "space", &id).await;
+    get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+    let resp = get(
+        &app,
+        &format!("/admin/spaces/access-grants/{grant_id}/reads"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["events"].as_array().unwrap().len(), 1);
+    assert_eq!(body["events"][0]["detail"]["action"], "list_records");
+}
+
+#[tokio::test]
+#[serial]
+async fn account_spaces_include_membership_without_records() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    let lurker = "did:plc:adminspaces-lurker";
+    spaces_db::add_member(
+        &app.state.db,
+        app.state.db_backend,
+        &SpaceMember {
+            id: Uuid::new_v4().to_string(),
+            space_id: id.clone(),
+            did: lurker.to_string(),
+            access: MemberAccess::READ,
+            is_delegation: false,
+            granted_by: Some(CREATOR.to_string()),
+            created_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let resp = get(&app, &format!("/admin/accounts/{lurker}/spaces"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    let spaces = body["spaces"].as_array().unwrap();
+    assert_eq!(spaces.len(), 1);
+    assert_eq!(spaces[0]["space"]["id"], id);
+    assert_eq!(spaces[0]["record_count"], 0);
+
+    let resp = get(&app, &format!("/admin/accounts/{CREATOR}/spaces"), None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        json_body(resp).await["spaces"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the space's own DID is not a member and has no records in it"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn records_are_withheld_when_the_read_cannot_be_recorded() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    grant(&app, "space", &id).await;
+
+    happyview::db::query("ALTER TABLE happyview_event_logs RENAME TO happyview_event_logs_hidden")
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    let resp = get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+    let status = resp.status();
+    let body = json_body(resp).await;
+    happyview::db::query("ALTER TABLE happyview_event_logs_hidden RENAME TO happyview_event_logs")
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.get("records").is_none(), "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn grant_reads_are_paginated() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    let grant_id = grant(&app, "space", &id).await;
+    for _ in 0..3 {
+        get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+    }
+
+    let reads = format!("/admin/spaces/access-grants/{grant_id}/reads");
+    let first = json_body(get(&app, &format!("{reads}?limit=2"), None).await).await;
+    assert_eq!(first["events"].as_array().unwrap().len(), 2);
+    let cursor = first["cursor"]
+        .as_str()
+        .expect("a cursor while reads remain");
+
+    let second = json_body(
+        get(
+            &app,
+            &format!("{reads}?limit=2&cursor={}", urlencoding::encode(cursor)),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(second["events"].as_array().unwrap().len(), 1);
+    assert!(second.get("cursor").is_none());
+    assert_ne!(first["events"][0]["id"], second["events"][0]["id"]);
+    assert_ne!(first["events"][1]["id"], second["events"][0]["id"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn covering_grant_prefers_the_space_grant_and_finds_non_member_authors() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    let former = "did:plc:adminspaces-former";
+    seed_blob_record(&app, &id, "main", former, "f1", "bafkformer").await;
+    enable_inspector(&app).await;
+    let access = format!("/admin/spaces/{id}/access");
+
+    let body = json_body(get(&app, &access, None).await).await;
+    assert!(body["grant"].is_null());
+
+    // A grant for an account with nothing in this space doesn't cover it.
+    grant(&app, "account", "did:plc:adminspaces-elsewhere").await;
+    let body = json_body(get(&app, &access, None).await).await;
+    assert!(body["grant"].is_null());
+
+    // A former author's grant does, even though they aren't a member.
+    let former_grant = grant(&app, "account", former).await;
+    let body = json_body(get(&app, &access, None).await).await;
+    assert_eq!(body["grant"]["id"], former_grant);
+
+    // A space grant wins over account grants.
+    let space_grant = grant(&app, "space", &id).await;
+    let body = json_body(get(&app, &access, None).await).await;
+    assert_eq!(body["grant"]["id"], space_grant);
+}
+
+#[tokio::test]
+#[serial]
+async fn read_links_go_when_their_events_do() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let id = seed_space(&app).await;
+    enable_inspector(&app).await;
+    let grant_id = grant(&app, "space", &id).await;
+    get(&app, &format!("/admin/spaces/{id}/records"), None).await;
+
+    let links = || async {
+        happyview::db::query_as::<(i64,)>("SELECT COUNT(*) FROM happyview_space_access_reads")
+            .fetch_one(&app.state.db)
+            .await
+            .unwrap()
+            .0
+    };
+    assert_eq!(links().await, 1);
+
+    happyview::db::query(&adapt_sql(
+        "DELETE FROM happyview_event_logs WHERE event_type = 'space.moderator_read'",
+        app.state.db_backend,
+    ))
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(links().await, 0);
+    let body = json_body(
+        get(
+            &app,
+            &format!("/admin/spaces/access-grants/{grant_id}/reads"),
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert!(body["events"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn account_covering_grant_matches_only_that_account() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_inspector(&app).await;
+    let access = format!("/admin/accounts/{MEMBER}/access");
+
+    let body = json_body(get(&app, &access, None).await).await;
+    assert!(body["grant"].is_null());
+
+    grant(&app, "account", CREATOR).await;
+    let body = json_body(get(&app, &access, None).await).await;
+    assert!(
+        body["grant"].is_null(),
+        "another account's grant doesn't cover it"
+    );
+
+    let member_grant = grant(&app, "account", MEMBER).await;
+    let body = json_body(get(&app, &access, None).await).await;
+    assert_eq!(body["grant"]["id"], member_grant);
+}
+
+#[tokio::test]
+#[serial]
+async fn inspect_alone_can_read_the_inspector_status() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let key = common::api_key(&app, &["spaces:inspect"]).await;
+    let resp = get(&app, "/admin/spaces/inspector", Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }

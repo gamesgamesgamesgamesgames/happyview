@@ -1,16 +1,27 @@
 "use client"
 
-import { createContext, useContext, useEffect, useState } from "react"
+import { createContext, useCallback, useContext, useEffect, useState } from "react"
 import { TriangleAlert } from "lucide-react"
 
-interface ConfigContextType {
+interface Features {
+  spaces: boolean
+  space_inspector: boolean
+}
+
+interface Config {
   public_url: string
   default_rate_limit_capacity: number
   default_rate_limit_refill_rate: number
   app_name: string | null
   logo_url: string | null
+  features: Features
   platform_managed: boolean
   configErrors: string[]
+}
+
+interface ConfigContextType extends Config {
+  /** Re-fetch `/config`, e.g. after a setting that changes a feature flag. */
+  refreshConfig: () => Promise<void>
 }
 
 const ConfigContext = createContext<ConfigContextType>({
@@ -19,8 +30,10 @@ const ConfigContext = createContext<ConfigContextType>({
   default_rate_limit_refill_rate: 2.0,
   app_name: null,
   logo_url: null,
+  features: { spaces: false, space_inspector: false },
   platform_managed: false,
   configErrors: [],
+  refreshConfig: async () => {},
 })
 
 function ConfigErrorBanner({ errors }: { errors: string[] }) {
@@ -48,28 +61,49 @@ function ConfigErrorBanner({ errors }: { errors: string[] }) {
   )
 }
 
+async function loadConfig(): Promise<Config> {
+  const res = await fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`)
+  if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`)
+  const data = await res.json()
+  return {
+    public_url: data.public_url,
+    default_rate_limit_capacity: data.default_rate_limit_capacity,
+    default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
+    app_name: data.app_name ?? null,
+    logo_url: data.logo_url ?? null,
+    features: {
+      spaces: data.features?.spaces === true,
+      space_inspector: data.features?.space_inspector === true,
+    },
+    platform_managed: data.platform_managed === true,
+    configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
+  }
+}
+
 export function ConfigProvider({ children }: { children: React.ReactNode }) {
-  const [config, setConfig] = useState<ConfigContextType | null>(null)
+  const [config, setConfig] = useState<Config | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // Throws on failure, so a caller such as the settings page can report it;
+  // the config already loaded stays in place.
+  const refreshConfig = useCallback(async () => {
+    setConfig(await loadConfig())
+  }, [])
+
+  // Only the first load replaces the dashboard with an error screen; there is
+  // no config to fall back on yet.
   useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`Config fetch failed: ${res.status}`)
-        return res.json()
+    let cancelled = false
+    loadConfig()
+      .then((loaded) => {
+        if (!cancelled) setConfig(loaded)
       })
-      .then((data) => {
-        setConfig({
-          public_url: data.public_url,
-          default_rate_limit_capacity: data.default_rate_limit_capacity,
-          default_rate_limit_refill_rate: data.default_rate_limit_refill_rate,
-          app_name: data.app_name ?? null,
-          logo_url: data.logo_url ?? null,
-          platform_managed: data.platform_managed === true,
-          configErrors: Array.isArray(data.configErrors) ? data.configErrors : [],
-        })
+      .catch((e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
       })
-      .catch((e) => setError(e.message))
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   if (error) {
@@ -79,7 +113,7 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
   if (!config) return null
 
   return (
-    <ConfigContext.Provider value={config}>
+    <ConfigContext.Provider value={{ ...config, refreshConfig }}>
       {config.configErrors.length > 0 && (
         <ConfigErrorBanner errors={config.configErrors} />
       )}

@@ -21,8 +21,13 @@ import type {
   AdminListSpaceRecordsResponse,
   AdminListSpacesResponse,
   AdminSpaceDetail,
+  AccessGrant,
+  GrantScope,
+  InspectorStatus,
+  AdminAccountSpace,
+  AdminAccountRecord,
 } from "@/types/spaces";
-import type { EventsListResponse } from "@/types/events";
+import type { EventLogEntry, EventsListResponse } from "@/types/events";
 import type { ScriptVariableSummary } from "@/types/script-variables";
 import type {
   Script,
@@ -470,8 +475,13 @@ export function addUser(body: {
   });
 }
 
-export function resolveIdentity(identifier: string) {
-  const qs = new URLSearchParams({ identifier }).toString();
+export function resolveIdentity(
+  identifier: string,
+  options: { profile?: boolean } = {},
+) {
+  const params = new URLSearchParams({ identifier });
+  if (options.profile) params.set("profile", "true");
+  const qs = params.toString();
   return apiFetch<ResolvedIdentity>(`/admin/identity/resolve?${qs}`);
 }
 
@@ -614,6 +624,88 @@ export function getAdminSpaceRecords(
 /** Opening this URL is written to the event log. */
 export function adminSpaceBlobUrl(id: string, cid: string) {
   return `${BASE_PATH}/admin/spaces/${encodeURIComponent(id)}/blob?${new URLSearchParams({ cid })}`;
+}
+
+export const SPACE_ACCESS_GRANT_REQUIRED = "SpaceAccessGrantRequired";
+export const SPACE_INSPECTOR_DISABLED = "SpaceInspectorDisabled";
+
+export function getInspectorStatus() {
+  return apiFetch<InspectorStatus>("/admin/spaces/inspector");
+}
+
+/** The caller's active grant covering an account's records, if any. */
+export function getAccountAccess(did: string) {
+  return apiFetch<{ grant: AccessGrant | null }>(
+    `/admin/accounts/${encodeURIComponent(did)}/access`,
+  );
+}
+
+/** The caller's active grant covering a space's page, if any. */
+export function getSpaceAccess(id: string) {
+  return apiFetch<{ grant: AccessGrant | null }>(
+    `/admin/spaces/${encodeURIComponent(id)}/access`,
+  );
+}
+
+export function listAccessGrants(active = true) {
+  return apiFetch<{ grants: AccessGrant[] }>(
+    `/admin/spaces/access-grants?active=${active}`,
+  );
+}
+
+export function createAccessGrant(body: {
+  scope: GrantScope;
+  target: string;
+  reason: string;
+  duration_minutes: number;
+}) {
+  return apiFetch<AccessGrant>("/admin/spaces/access-grants", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function revokeAccessGrant(id: string) {
+  return apiFetch<AccessGrant>(
+    `/admin/spaces/access-grants/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+}
+
+/** One page of the reads made under a grant, oldest first. */
+export function getGrantReads(id: string, cursor?: string) {
+  const params = new URLSearchParams();
+  if (cursor) params.set("cursor", cursor);
+  const qs = params.toString();
+  return apiFetch<{ events: EventLogEntry[]; cursor?: string }>(
+    `/admin/spaces/access-grants/${encodeURIComponent(id)}/reads${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export function getAccountSpaces(did: string) {
+  return apiFetch<{ spaces: AdminAccountSpace[] }>(
+    `/admin/accounts/${encodeURIComponent(did)}/spaces`,
+  );
+}
+
+/** Reading an account's records is written to the event log. */
+export function getAccountSpaceRecords(
+  did: string,
+  options: {
+    space?: string;
+    collection?: string;
+    limit?: number;
+    cursor?: string;
+  } = {},
+) {
+  const params = new URLSearchParams();
+  if (options.space) params.set("space", options.space);
+  if (options.collection) params.set("collection", options.collection);
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.cursor) params.set("cursor", options.cursor);
+  return apiFetch<{ records: AdminAccountRecord[]; cursor?: string }>(
+    `/admin/accounts/${encodeURIComponent(did)}/space-records?${params}`,
+  );
 }
 
 export function deleteCollectionRecords(collection: string) {

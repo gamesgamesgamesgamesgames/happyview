@@ -1,0 +1,913 @@
+mod common;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use happyview::db::adapt_sql;
+use happyview::spaces::types::{AppAccess, Policy, Space, SpaceConfig};
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
+use serial_test::serial;
+use tower::ServiceExt;
+
+use common::app::TestApp;
+
+async fn json_body(resp: axum::response::Response) -> Value {
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body).unwrap_or(json!(null))
+}
+
+async fn send(
+    app: &TestApp,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> axum::response::Response {
+    let (name, value) = app.admin_cookie();
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(name, value);
+    let body = match body {
+        Some(b) => {
+            req = req.header("content-type", "application/json");
+            Body::from(b.to_string())
+        }
+        None => Body::empty(),
+    };
+    app.router
+        .clone()
+        .oneshot(req.body(body).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn put_setting(app: &TestApp, key: &str, value: &str) {
+    let resp = send(
+        app,
+        "PUT",
+        &format!("/admin/settings/{key}"),
+        Some(json!({ "value": value })),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+async fn events_of(app: &TestApp, event_type: &str) -> Vec<(Option<String>, String)> {
+    let sql = adapt_sql(
+        "SELECT subject, detail FROM happyview_event_logs WHERE event_type = ? ORDER BY created_at",
+        app.state.db_backend,
+    );
+    happyview::db::query_as(&sql)
+        .bind(event_type)
+        .fetch_all(&app.state.db)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn config_reports_the_inspector_switch() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let body = json_body(send(&app, "GET", "/config", None).await).await;
+    assert_eq!(body["features"]["space_inspector"], false);
+
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
+    let body = json_body(send(&app, "GET", "/config", None).await).await;
+    assert_eq!(body["features"]["space_inspector"], true);
+}
+
+#[tokio::test]
+#[serial]
+async fn inspector_is_off_by_default() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let resp = send(&app, "GET", "/admin/spaces/inspector", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["default_grant_minutes"], 60);
+    assert_eq!(body["max_grant_minutes"], 60);
+}
+
+#[tokio::test]
+#[serial]
+async fn toggling_the_inspector_logs_each_change() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
+    put_setting(&app, "feature.space_inspector_enabled", "false").await;
+    assert_eq!(events_of(&app, "space_inspector.enabled").await.len(), 1);
+    assert_eq!(events_of(&app, "space_inspector.disabled").await.len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn padded_true_turns_the_inspector_on() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    put_setting(&app, "feature.space_inspector_enabled", " true ").await;
+    let body = json_body(send(&app, "GET", "/admin/spaces/inspector", None).await).await;
+    assert_eq!(body["enabled"], true);
+    assert_eq!(events_of(&app, "space_inspector.enabled").await.len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn saving_the_same_value_twice_logs_once() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
+    put_setting(&app, "event_log_retention_days", "14").await;
+    put_setting(&app, "event_log_retention_days", "14").await;
+    assert_eq!(events_of(&app, "space_inspector.enabled").await.len(), 1);
+    let changes = events_of(&app, "event_logs.retention_changed").await;
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].0.as_deref(), Some("event_log_retention_days"));
+    let detail: Value = serde_json::from_str(&changes[0].1).unwrap();
+    assert_eq!(detail["from"], 30);
+    assert_eq!(detail["to"], 14);
+}
+
+#[tokio::test]
+#[serial]
+async fn saving_a_retention_default_logs_nothing() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    put_setting(&app, "space_access_log_retention_days", "365").await;
+    put_setting(&app, "event_log_retention_days", "30").await;
+    assert!(
+        events_of(&app, "event_logs.retention_changed")
+            .await
+            .is_empty(),
+        "an unset retention setting already holds its default"
+    );
+
+    put_setting(&app, "space_access_log_retention_days", "14").await;
+    let changes = events_of(&app, "event_logs.retention_changed").await;
+    assert_eq!(changes.len(), 1);
+    let detail: Value = serde_json::from_str(&changes[0].1).unwrap();
+    assert_eq!(detail["from"], 365);
+    assert_eq!(detail["to"], 14);
+}
+
+#[tokio::test]
+#[serial]
+async fn deleting_the_setting_counts_as_disabling() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    put_setting(&app, "feature.space_inspector_enabled", "true").await;
+    let resp = send(
+        &app,
+        "DELETE",
+        "/admin/settings/feature.space_inspector_enabled",
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(events_of(&app, "space_inspector.disabled").await.len(), 1);
+}
+
+async fn enable(app: &TestApp) {
+    put_setting(app, "feature.space_inspector_enabled", "true").await;
+}
+
+async fn create_grant(app: &TestApp, body: Value) -> axum::response::Response {
+    send(app, "POST", "/admin/spaces/access-grants", Some(body)).await
+}
+
+#[tokio::test]
+#[serial]
+async fn grant_creation_requires_the_inspector() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let resp = create_grant(
+        &app,
+        json!({ "scope": "account", "target": "did:plc:abc", "reason": "r" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["error"], "SpaceInspectorDisabled");
+}
+
+#[tokio::test]
+#[serial]
+async fn grant_is_created_logged_and_listed() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+
+    let resp = create_grant(
+        &app,
+        json!({ "scope": "account", "target": "did:plc:abc", "reason": "  report #12 ", "duration_minutes": 30 }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let grant = json_body(resp).await;
+    assert_eq!(grant["reason"], "report #12");
+    assert_eq!(grant["scope"], "account");
+    let created =
+        chrono::DateTime::parse_from_rfc3339(grant["created_at"].as_str().unwrap()).unwrap();
+    let expires =
+        chrono::DateTime::parse_from_rfc3339(grant["expires_at"].as_str().unwrap()).unwrap();
+    assert_eq!((expires - created).num_minutes(), 30);
+
+    let events = events_of(&app, "space.access_granted").await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0.as_deref(), Some("did:plc:abc"));
+    let detail: Value = serde_json::from_str(&events[0].1).unwrap();
+    assert_eq!(detail["grant_id"], grant["id"]);
+    assert_eq!(detail["reason"], "report #12");
+    assert_eq!(detail["expires_at"], grant["expires_at"]);
+
+    let list =
+        json_body(send(&app, "GET", "/admin/spaces/access-grants?active=true", None).await).await;
+    assert_eq!(list["grants"][0]["id"], grant["id"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn grant_input_is_validated() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+
+    let blank = create_grant(
+        &app,
+        json!({ "scope": "account", "target": "did:plc:abc", "reason": " \n " }),
+    )
+    .await;
+    assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+    let long = create_grant(
+        &app,
+        json!({ "scope": "account", "target": "did:plc:abc", "reason": "a".repeat(2001) }),
+    )
+    .await;
+    assert_eq!(long.status(), StatusCode::BAD_REQUEST);
+    let bad_did = create_grant(
+        &app,
+        json!({ "scope": "account", "target": "not-a-did", "reason": "r" }),
+    )
+    .await;
+    assert_eq!(bad_did.status(), StatusCode::BAD_REQUEST);
+    let no_space = create_grant(
+        &app,
+        json!({ "scope": "space", "target": "missing", "reason": "r" }),
+    )
+    .await;
+    assert_eq!(no_space.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[serial]
+async fn duration_is_clamped_to_the_instance_max() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    put_setting(&app, "space_inspector_max_grant_minutes", "20").await;
+
+    let grant = json_body(
+        create_grant(&app, json!({ "scope": "account", "target": "did:plc:abc", "reason": "r", "duration_minutes": 600 })).await,
+    )
+    .await;
+    let created =
+        chrono::DateTime::parse_from_rfc3339(grant["created_at"].as_str().unwrap()).unwrap();
+    let expires =
+        chrono::DateTime::parse_from_rfc3339(grant["expires_at"].as_str().unwrap()).unwrap();
+    assert_eq!((expires - created).num_minutes(), 20);
+}
+
+#[tokio::test]
+#[serial]
+async fn revoking_ends_the_grant_once() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    let grant = json_body(
+        create_grant(
+            &app,
+            json!({ "scope": "account", "target": "did:plc:abc", "reason": "r" }),
+        )
+        .await,
+    )
+    .await;
+    let id = grant["id"].as_str().unwrap();
+
+    let resp = send(
+        &app,
+        "DELETE",
+        &format!("/admin/spaces/access-grants/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_body(resp).await["revoked_at"].is_string());
+    send(
+        &app,
+        "DELETE",
+        &format!("/admin/spaces/access-grants/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        events_of(&app, "space.access_revoked").await.len(),
+        1,
+        "a second revoke is a no-op"
+    );
+
+    let list =
+        json_body(send(&app, "GET", "/admin/spaces/access-grants?active=true", None).await).await;
+    assert!(list["grants"].as_array().unwrap().is_empty());
+}
+
+/// Insert a grant owned by someone else, bypassing the API.
+async fn foreign_grant(app: &TestApp, scope: &str, target: &str) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(&id)
+        .bind("someone-else")
+        .bind("did:plc:someone-else")
+        .bind(scope)
+        .bind(target)
+        .bind("their reason")
+        .bind(now.to_rfc3339())
+        .bind((now + chrono::Duration::minutes(60)).to_rfc3339())
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+#[serial]
+async fn revoking_someone_elses_grant_needs_users_update() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    let id = foreign_grant(&app, "account", "did:plc:abc").await;
+
+    let key = common::api_key(&app, &["spaces:inspect"]).await;
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/admin/spaces/access-grants/{id}"))
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // The super admin holds users:update.
+    let resp = send(
+        &app,
+        "DELETE",
+        &format!("/admin/spaces/access-grants/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let detail: Value =
+        serde_json::from_str(&events_of(&app, "space.access_revoked").await[0].1).unwrap();
+    assert_eq!(detail["revoked_by"], app.admin_did);
+}
+
+async fn revoke_with_key(app: &TestApp, key: &str, id: &str) -> StatusCode {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/admin/spaces/access-grants/{id}"))
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::empty())
+        .unwrap();
+    app.router.clone().oneshot(req).await.unwrap().status()
+}
+
+#[tokio::test]
+#[serial]
+async fn owners_can_revoke_their_grant_with_users_update() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    let grant = json_body(
+        create_grant(
+            &app,
+            json!({ "scope": "account", "target": "did:plc:abc", "reason": "r" }),
+        )
+        .await,
+    )
+    .await;
+    let id = grant["id"].as_str().unwrap();
+
+    let key = common::api_key(&app, &["spaces:read"]).await;
+    assert_eq!(revoke_with_key(&app, &key, id).await, StatusCode::FORBIDDEN);
+
+    let key = common::api_key(&app, &["users:update"]).await;
+    assert_eq!(revoke_with_key(&app, &key, id).await, StatusCode::OK);
+    assert_eq!(events_of(&app, "space.access_revoked").await.len(), 1);
+}
+
+async fn seed_space(app: &TestApp) -> String {
+    let now = happyview::db::now_rfc3339();
+    let id = uuid::Uuid::new_v4().to_string();
+    let space = Space {
+        id: id.clone(),
+        did: "did:plc:spaceaccess-creator".to_string(),
+        authority_did: "did:plc:spaceaccess-creator".to_string(),
+        creator_did: "did:plc:spaceaccess-creator".to_string(),
+        type_nsid: "com.example.spaceaccess".to_string(),
+        skey: "main".to_string(),
+        display_name: None,
+        description: None,
+        read_policy: Policy::MemberList,
+        write_policy: Policy::MemberList,
+        app_access: AppAccess::Open,
+        config: SpaceConfig::default(),
+        revision: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    happyview::spaces::db::create_space(&app.state.db, app.state.db_backend, &space)
+        .await
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+#[serial]
+async fn revoking_a_space_grant_logs_the_space_uri() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    let space_id = seed_space(&app).await;
+    let grant = json_body(
+        create_grant(
+            &app,
+            json!({ "scope": "space", "target": space_id, "reason": "r" }),
+        )
+        .await,
+    )
+    .await;
+    let id = grant["id"].as_str().unwrap();
+    let resp = send(
+        &app,
+        "DELETE",
+        &format!("/admin/spaces/access-grants/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let granted = events_of(&app, "space.access_granted").await;
+    let revoked = events_of(&app, "space.access_revoked").await;
+    assert_eq!(
+        granted[0].0.as_deref(),
+        Some("at://did:plc:spaceaccess-creator/space/com.example.spaceaccess/main")
+    );
+    assert_eq!(revoked[0].0, granted[0].0);
+
+    // A grant whose space no longer exists falls back to the raw target.
+    let gone = foreign_grant(&app, "space", "deleted-space").await;
+    let resp = send(
+        &app,
+        "DELETE",
+        &format!("/admin/spaces/access-grants/{gone}"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let revoked = events_of(&app, "space.access_revoked").await;
+    assert_eq!(revoked[1].0.as_deref(), Some("deleted-space"));
+}
+
+async fn rename_table(app: &TestApp, from: &str, to: &str) {
+    happyview::db::query(&format!("ALTER TABLE {from} RENAME TO {to}"))
+        .execute(&app.state.db)
+        .await
+        .unwrap();
+}
+
+async fn grant_count(app: &TestApp) -> i64 {
+    happyview::db::query_as::<(i64,)>("SELECT COUNT(*) FROM happyview_space_access_grants")
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap()
+        .0
+}
+
+#[tokio::test]
+#[serial]
+async fn a_grant_is_not_created_when_its_audit_event_cannot_be_written() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+
+    rename_table(&app, "happyview_event_logs", "happyview_event_logs_hidden").await;
+    let resp = create_grant(
+        &app,
+        json!({ "scope": "account", "target": "did:plc:abc", "reason": "report" }),
+    )
+    .await;
+    let status = resp.status();
+    let grants = grant_count(&app).await;
+    rename_table(&app, "happyview_event_logs_hidden", "happyview_event_logs").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(grants, 0, "the grant rolls back with its audit event");
+}
+
+#[tokio::test]
+#[serial]
+async fn active_listing_keeps_an_old_grant_past_newer_ones() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    let old = json_body(
+        create_grant(
+            &app,
+            json!({ "scope": "account", "target": "did:plc:old", "reason": "r", "duration_minutes": 60 }),
+        )
+        .await,
+    )
+    .await;
+
+    // 200 newer, already-expired grants for the same user.
+    let user_id: (String,) = happyview::db::query_as(&adapt_sql(
+        "SELECT user_id FROM happyview_space_access_grants WHERE id = ?",
+        app.state.db_backend,
+    ))
+    .bind(old["id"].as_str().unwrap())
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    let insert = adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at) VALUES (?, ?, 'did:plc:x', 'account', 'did:plc:newer', 'r', ?, ?)",
+        app.state.db_backend,
+    );
+    let now = chrono::Utc::now();
+    for i in 0..200 {
+        happyview::db::query(&insert)
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&user_id.0)
+            .bind((now + chrono::Duration::seconds(i + 1)).to_rfc3339())
+            .bind((now - chrono::Duration::minutes(1)).to_rfc3339())
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
+
+    let list =
+        json_body(send(&app, "GET", "/admin/spaces/access-grants?active=true", None).await).await;
+    let ids: Vec<&str> = list["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![old["id"].as_str().unwrap()]);
+}
+
+#[tokio::test]
+#[serial]
+async fn the_inspector_stays_off_when_its_audit_event_cannot_be_written() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    rename_table(&app, "happyview_event_logs", "happyview_event_logs_hidden").await;
+    let resp = send(
+        &app,
+        "PUT",
+        "/admin/settings/feature.space_inspector_enabled",
+        Some(json!({ "value": "true" })),
+    )
+    .await;
+    let status = resp.status();
+    let enabled = happyview::feature_flags::is_enabled(
+        &app.state.db,
+        happyview::feature_flags::FeatureFlag::SPACE_INSPECTOR,
+        app.state.db_backend,
+    )
+    .await;
+    rename_table(&app, "happyview_event_logs_hidden", "happyview_event_logs").await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!enabled, "the setting rolls back with its audit event");
+}
+
+#[tokio::test]
+#[serial]
+async fn retention_removes_grants_that_ended_before_the_cutoff() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let now = chrono::Utc::now();
+    let days_ago = |d: i64| (now - chrono::Duration::days(d)).to_rfc3339();
+    let insert = adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at, revoked_at) VALUES (?, 'u', 'did:plc:u', 'account', 'did:plc:t', 'r', ?, ?, ?)",
+        app.state.db_backend,
+    );
+    for (id, expires_at, revoked_at) in [
+        ("expired-long-ago", days_ago(400), None),
+        (
+            "revoked-long-ago",
+            (now + chrono::Duration::days(1)).to_rfc3339(),
+            Some(days_ago(400)),
+        ),
+        ("expired-recently", days_ago(10), None),
+        (
+            "active",
+            (now + chrono::Duration::hours(1)).to_rfc3339(),
+            None,
+        ),
+    ] {
+        happyview::db::query(&insert)
+            .bind(id)
+            .bind(days_ago(500))
+            .bind(expires_at)
+            .bind(revoked_at)
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
+
+    let deleted =
+        happyview::event_log::sweep_ended_access_grants(&app.state.db, 365, app.state.db_backend)
+            .await
+            .unwrap();
+    assert_eq!(deleted, 2);
+    let mut left: Vec<String> =
+        happyview::db::query_as::<(String,)>("SELECT id FROM happyview_space_access_grants")
+            .fetch_all(&app.state.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+    left.sort();
+    assert_eq!(left, vec!["active", "expired-recently"]);
+
+    assert_eq!(
+        happyview::event_log::sweep_ended_access_grants(&app.state.db, 0, app.state.db_backend)
+            .await
+            .unwrap(),
+        0,
+        "0 keeps them forever"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn retention_keeps_the_record_of_a_grant_that_is_still_active() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let now = chrono::Utc::now();
+    let long_ago = (now - chrono::Duration::days(400)).to_rfc3339();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at) VALUES ('long-grant', 'u', 'did:plc:u', 'account', 'did:plc:t', 'r', ?, ?)",
+        app.state.db_backend,
+    ))
+    .bind(&long_ago)
+    .bind((now + chrono::Duration::days(30)).to_rfc3339())
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    let insert_event = adapt_sql(
+        "INSERT INTO happyview_event_logs (id, event_type, severity, detail, created_at) VALUES (?, 'space.access_granted', 'info', '{}', ?)",
+        app.state.db_backend,
+    );
+    for (id, created_at) in [
+        ("granted-long-ago", long_ago.clone()),
+        (
+            "before-the-grant",
+            (now - chrono::Duration::days(500)).to_rfc3339(),
+        ),
+    ] {
+        happyview::db::query(&insert_event)
+            .bind(id)
+            .bind(created_at)
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+    }
+
+    link_grant_event(&app, "granted-long-ago", "long-grant").await;
+
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+
+    let left: Vec<String> = happyview::db::query_as::<(String,)>(
+        "SELECT id FROM happyview_event_logs WHERE event_type = 'space.access_granted'",
+    )
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(id,)| id)
+    .collect();
+    assert_eq!(left, vec!["granted-long-ago"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn retention_keeps_an_ended_grants_record_while_its_row_remains() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let now = chrono::Utc::now();
+    let long_ago = (now - chrono::Duration::days(400)).to_rfc3339();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at) VALUES ('ended-grant', 'u', 'did:plc:u', 'account', 'did:plc:t', 'r', ?, ?)",
+        app.state.db_backend,
+    ))
+    .bind(&long_ago)
+    .bind((now - chrono::Duration::days(1)).to_rfc3339())
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_event_logs (id, event_type, severity, detail, created_at) VALUES ('granted', 'space.access_granted', 'info', '{}', ?)",
+        app.state.db_backend,
+    ))
+    .bind(&long_ago)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    link_grant_event(&app, "granted", "ended-grant").await;
+
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+    assert_eq!(
+        protected_count(&app).await,
+        1,
+        "the grant row is still stored"
+    );
+
+    // With the grants table unreadable, nothing protected is deleted.
+    rename_table(
+        &app,
+        "happyview_space_access_grants",
+        "happyview_space_access_grants_hidden",
+    )
+    .await;
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+    let remaining = protected_count(&app).await;
+    rename_table(
+        &app,
+        "happyview_space_access_grants_hidden",
+        "happyview_space_access_grants",
+    )
+    .await;
+    assert_eq!(
+        remaining, 1,
+        "a failed grant lookup skips the protected pass"
+    );
+}
+
+async fn protected_count(app: &TestApp) -> i64 {
+    happyview::db::query_as::<(i64,)>(
+        "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'space.access_granted'",
+    )
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap()
+    .0
+}
+
+#[tokio::test]
+#[serial]
+async fn the_hold_lifts_once_the_grant_row_is_gone() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let now = chrono::Utc::now();
+    let created = (now - chrono::Duration::days(800)).to_rfc3339();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_access_grants (id, user_id, user_did, scope, target, reason, created_at, expires_at) VALUES ('long-over', 'u', 'did:plc:u', 'account', 'did:plc:t', 'r', ?, ?)",
+        app.state.db_backend,
+    ))
+    .bind(&created)
+    .bind((now - chrono::Duration::days(400)).to_rfc3339())
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_event_logs (id, event_type, severity, detail, created_at) VALUES ('granted', 'space.access_granted', 'info', '{}', ?)",
+        app.state.db_backend,
+    ))
+    .bind(&created)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    link_grant_event(&app, "granted", "long-over").await;
+
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+    assert_eq!(
+        protected_count(&app).await,
+        1,
+        "held while the grant row exists"
+    );
+
+    let removed =
+        happyview::event_log::sweep_ended_access_grants(&app.state.db, 365, app.state.db_backend)
+            .await
+            .unwrap();
+    assert_eq!(removed, 1);
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+    assert_eq!(
+        protected_count(&app).await,
+        0,
+        "released with the grant row"
+    );
+}
+
+async fn link_grant_event(app: &TestApp, event_id: &str, grant_id: &str) {
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_space_access_grant_events (event_id, grant_id) VALUES (?, ?)",
+        app.state.db_backend,
+    ))
+    .bind(event_id)
+    .bind(grant_id)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn a_stored_grant_holds_only_its_own_records() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable(&app).await;
+    let grant = json_body(
+        create_grant(
+            &app,
+            json!({ "scope": "account", "target": "did:plc:held", "reason": "r" }),
+        )
+        .await,
+    )
+    .await;
+    let grant_id = grant["id"].as_str().unwrap();
+    let old = (chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+    // Age every protected event, including the real grant event, past retention.
+    happyview::db::query(&adapt_sql(
+        "UPDATE happyview_event_logs SET created_at = ?",
+        app.state.db_backend,
+    ))
+    .bind(&old)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+    happyview::db::query(&adapt_sql(
+        "INSERT INTO happyview_event_logs (id, event_type, severity, detail, created_at) VALUES ('unrelated-purge', 'event_logs.purged', 'warn', '{}', ?)",
+        app.state.db_backend,
+    ))
+    .bind(&old)
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+
+    happyview::event_log::run_retention_sweep(&app.state.db, 30, 365, app.state.db_backend).await;
+
+    let left: Vec<(String, String)> = happyview::db::query_as(
+        "SELECT event_type, detail FROM happyview_event_logs WHERE event_type IN ('space.access_granted', 'event_logs.purged')",
+    )
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].0, "space.access_granted");
+    assert!(left[0].1.contains(grant_id));
+}
+
+#[tokio::test]
+#[serial]
+async fn a_general_retention_of_zero_is_audited_for_protected_events_too() {
+    common::require_db!();
+    let app = TestApp::new().await;
+
+    // Protected retention is unset, so keeping everything changes it too.
+    put_setting(&app, "event_log_retention_days", "0").await;
+    let changes = events_of(&app, "event_logs.retention_changed").await;
+    let summary: Vec<(String, Value)> = changes
+        .iter()
+        .map(|(subject, detail)| {
+            (
+                subject.clone().unwrap(),
+                serde_json::from_str::<Value>(detail).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(summary.len(), 2, "{summary:?}");
+    assert!(summary.contains(&(
+        "event_log_retention_days".into(),
+        json!({ "from": 30, "to": 0 })
+    )));
+    assert!(summary.contains(&(
+        "space_access_log_retention_days".into(),
+        json!({ "from": 365, "to": 0 })
+    )));
+
+    // Setting protected retention explicitly ends the follow.
+    put_setting(&app, "space_access_log_retention_days", "365").await;
+    let last = events_of(&app, "event_logs.retention_changed").await;
+    let detail: Value = serde_json::from_str(&last.last().unwrap().1).unwrap();
+    assert_eq!(detail, json!({ "from": 0, "to": 365 }));
+}
