@@ -68,16 +68,21 @@ What still ran, so the gap is only the real interpreter's half of it:
   tests/e2e_scripts.rs, pin the save path through the interpreter_echo
   fixture, whose messages are its own.
 
-CI builds the plugin in its own job and runs all of the above against it, so
-this gap is a local one.
+CI fetches a pinned release of the plugin and runs all of the above against
+it, so this gap is a local one.
 
-To close it here, point HAPPYVIEW_LUA_PLUGIN at a directory holding the
-plugin's manifest.json beside the .wasm it names, and HAPPYVIEW_LUA_SRC at
-the plugin crate's src/ so a stale artefact fails rather than reporting.
-The plugin is built from the happyview-plugins repository, not this one:
-its crate needs wasi-sdk on CC_wasm32_wasip1 and builds for
-wasm32-wasip1. Copy its manifest.json and the built .wasm into one
-directory and point the variable there.
+To close it here, fetch that same release. The download needs no
+credentials, and the script holds the pinned version CI uses:
+
+  scripts/fetch-lua-plugin.sh
+  export HAPPYVIEW_LUA_PLUGIN=tests/fixtures/lua-plugin
+
+HAPPYVIEW_LUA_SRC is worth setting only for a module built by hand, where it
+points at the plugin crate's src/ and turns a stale artefact into a failure
+rather than a figure describing neither the code nor a comparison. Building
+one is the harder path and needs the happyproto/plugins repository with
+wasi-sdk on CC_wasm32_wasip1, for the wasm32-wasip1 target; a release asset
+needs neither.
 MESSAGE
 
 if [ "${1:-}" = "--require" ]; then

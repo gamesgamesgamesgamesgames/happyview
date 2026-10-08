@@ -13,3 +13,6 @@ build/
 next-env.d.ts
 bun.lock
 lcov.info
+
+# Fetched by scripts/fetch-lua-plugin.sh, not source.
+/tests/fixtures/lua-plugin/

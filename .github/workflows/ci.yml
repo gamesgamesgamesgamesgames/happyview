@@ -167,119 +167,8 @@ jobs:
       - name: Run crate tests
         run: cargo test --workspace --exclude happyview
 
-  # ---------------------------------------------------------------------------
-  # The Lua interpreter plugin — built here, consumed by e2e-tests
-  # ---------------------------------------------------------------------------
-  # The plugin lives in another repository and vendors PUC Lua, which compiles
-  # with clang from wasi-sdk. A job of its own keeps that 600 MB download off
-  # the suite that consumes the result, and makes a build failure name the
-  # interpreter rather than read as a broken e2e run.
-  lua-interpreter:
-    needs: changes
-    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
-    runs-on: depot-ubuntu-24.04
-    timeout-minutes: 20
-    env:
-      WASI_SDK_VERSION: "34.0"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          path: happyview
-
-      # Public, so no token. A sibling of the checkout above, which is what
-      # the patch below reaches across.
-      #
-      # `alpha` because the interpreter exists only there: `main` carries the
-      # four auth plugins and nothing else, so a default checkout holds no
-      # `happyview-lua` to build. A branch rather than a revision, and
-      # deliberately: this job's question is whether the SDK in this commit
-      # still builds that plugin, and a pinned revision would hide a plugin
-      # the SDK had broken until somebody bumped the pin. The cost is that a
-      # HappyView commit cannot be re-run against identical plugin source
-      # afterwards, which a pinned release replaces once the plugin publishes
-      # them.
-      - name: Checkout the plugins repository
-        uses: actions/checkout@v7
-        with:
-          repository: gamesgamesgamesgamesgames/happyview-plugins
-          ref: alpha
-          path: plugins
-
-      - name: Cache wasi-sdk
-        id: wasi-sdk
-        uses: actions/cache@v4
-        with:
-          path: /opt/wasi-sdk
-          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}-x86_64-linux
-
-      - name: Install wasi-sdk
-        if: steps.wasi-sdk.outputs.cache-hit != 'true'
-        run: |
-          curl -fsSL -o /tmp/wasi-sdk.tar.gz \
-            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION%%.*}/wasi-sdk-${WASI_SDK_VERSION}-x86_64-linux.tar.gz"
-          mkdir -p /opt/wasi-sdk
-          tar -xzf /tmp/wasi-sdk.tar.gz --strip-components=1 -C /opt/wasi-sdk
-
-      - name: Add WASI target
-        run: rustup target add wasm32-wasip1
-
-      # The plugin resolves `happyview-plugin-sdk` from a HappyView branch
-      # over git, so an unpatched build would answer for whatever that branch
-      # published rather than for the commit under test. Pointing the
-      # patch at the checkout above is what makes this job's result evidence
-      # about this commit's SDK.
-      - name: Resolve the SDK from this commit
-        run: |
-          {
-            echo
-            echo '[patch."https://github.com/gamesgamesgamesgamesgames/happyview"]'
-            echo 'happyview-plugin-sdk = { path = "../happyview/crates/happyview-plugin-sdk" }'
-          } >> plugins/Cargo.toml
-
-      # No `--locked`: the patch replaces the source the lockfile pins, so no
-      # locked resolution can satisfy it.
-      #
-      # `/opt/wasi-sdk` is where the plugins repository's own
-      # `.cargo/config.toml` points, so the `CC`/`AR`/`CFLAGS` variables and
-      # the linker's `-L` need no setting here.
-      - name: Build the interpreter
-        working-directory: plugins
-        run: cargo build --release -p happyview-lua --target wasm32-wasip1
-
-      # The manifest and the module it names, which are the two files the
-      # plugin's release publishes and the two the host loads. The destination
-      # name comes out of the manifest rather than being spelled twice, since
-      # a mismatch would reach the consuming job as a plugin that fails to
-      # load rather than as a staging error.
-      - name: Stage the plugin
-        run: |
-          # Assigned rather than substituted into the `cp` below, so a read
-          # that fails ends the step instead of staging the module under the
-          # name cargo gave it.
-          wasm=$(jq -r .wasm_file plugins/plugins/happyview-lua/manifest.json)
-          mkdir -p lua-plugin
-          cp plugins/plugins/happyview-lua/manifest.json lua-plugin/
-          cp "plugins/target/wasm32-wasip1/release/happyview_lua.wasm" \
-            "lua-plugin/$wasm"
-          # A size and a hash beside a recorded figure is what makes the
-          # figure checkable against the build it claims.
-          {
-            echo '## Lua interpreter plugin'
-            echo '```'
-            ls -l lua-plugin
-            sha256sum lua-plugin/*.wasm
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload the plugin
-        uses: actions/upload-artifact@v7
-        with:
-          name: happyview-lua-plugin
-          path: lua-plugin
-
   e2e-tests:
-    needs: [changes, lua-interpreter]
+    needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
     runs-on: depot-ubuntu-24.04
     # Headroom for the differential step, which rebuilds the library under a
@@ -292,15 +181,10 @@ jobs:
       # rather than on each of the three steps that reach one.
       #
       # `HAPPYVIEW_LUA_SRC`, which would turn a stale artefact into a failure,
-      # is deliberately unset. It compares the module's modification time
-      # against the plugin's sources, and this job holds neither usefully: the
-      # sources live in the other repository, and the module's time records
-      # either the build job writing it or the download extracting it — a step
-      # order either way, with a checkout stamping every source file later
-      # than both, so the comparison refuses a module that is exactly right.
-      # What the guard protects a developer from — a hand-staged artefact
-      # going quietly out of date — provenance answers here: the module is
-      # built from this commit, in this run, by the job above.
+      # is deliberately unset: it compares the module's modification time
+      # against the plugin's sources, and this job holds no sources to compare
+      # one against. What that guard protects a developer from — a hand-staged
+      # artefact going quietly out of date — the pinned hash answers here.
       HAPPYVIEW_LUA_PLUGIN: ${{ github.workspace }}/lua-plugin
     services:
       postgres:
@@ -334,11 +218,32 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
 
-      - name: Download the Lua interpreter plugin
-        uses: actions/download-artifact@v8
-        with:
-          name: happyview-lua-plugin
-          path: lua-plugin
+      # The interpreter is a published artefact of happyproto/plugins, and the
+      # script holds the pinned version: the module these tests load is the
+      # one an operator installs, and a HappyView commit stays re-runnable
+      # against it after the plugin's source has moved on. Building it from a
+      # branch instead answered for whichever source that branch held at the
+      # time, and for a module nobody ships. The same script fills the browser
+      # stack's mount and a developer's `HAPPYVIEW_LUA_PLUGIN`, so the pin
+      # means one thing everywhere.
+      #
+      # Whether the plugin still *compiles* against this commit's SDK is the
+      # plugins repository's question, and its CI asks it on every push by
+      # resolving the SDK from this repository's `alpha`. Asked here is the
+      # complement: that this host loads and drives the published module.
+      - name: Fetch the Lua interpreter plugin
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-lua-plugin.sh lua-plugin
+          # The module's identity beside the figures a recorded run reports is
+          # what makes those figures checkable against what produced them.
+          {
+            echo '## Lua interpreter plugin'
+            echo '```'
+            ls -l lua-plugin
+            sha256sum lua-plugin/*.wasm
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build plugin fixtures
         run: bash scripts/build-plugin-fixtures.sh
@@ -351,7 +256,7 @@ jobs:
         run: bash scripts/check-plugin-fixtures.sh --require
 
       # Same reasoning for the interpreter: the targets that load it skip when
-      # it is absent, so a download that produced nothing would leave them
+      # it is absent, so a fetch that produced nothing would leave them
       # skipping inside a green run — among them the three refusal messages an
       # operator reads when a script will not save.
       - name: Verify the Lua interpreter is present
