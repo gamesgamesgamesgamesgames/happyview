@@ -480,18 +480,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The stack's `lua` interpreter is this fixture, bind-mounted by
+      # The stack's `lua` interpreter is the published plugin, bind-mounted by
       # docker-compose.e2e.yml, and saving a script asks the interpreter its
-      # language names whether the body is one it can run. The artefact is
-      # gitignored and this job builds no Rust otherwise, so without the two
-      # steps below the mount is empty, every save is refused and
-      # `globalSetup` stops the run. The fixture is named rather than left to
-      # `--require` alone: this job builds one, not all thirteen.
-      - name: Build the stack's interpreter
-        run: bash scripts/build-plugin-fixtures.sh interpreter_echo
-
-      - name: Verify the stack's interpreter is built
-        run: bash scripts/check-plugin-fixtures.sh --require interpreter_echo
+      # language names whether the body is one it can run. The directory is
+      # gitignored, so without this step Docker binds an empty one, every save
+      # is refused and `globalSetup` stops the run. Same pinned version as
+      # `e2e-tests`, since the script is the one place it is written down.
+      - name: Fetch the stack's interpreter
+        run: bash scripts/fetch-lua-plugin.sh
 
       - name: Start E2E services
         run: docker compose -f docker-compose.e2e.yml -f docker-compose.e2e.ci.yml up -d --build --wait

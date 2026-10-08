@@ -3,11 +3,12 @@ import { loginAsTestAdmin } from "./auth-helper";
 
 /**
  * Saving a script is checked by the interpreter its language names, and this
- * stack's `lua` interpreter is the echo fixture (see the volume comment in
- * `docker-compose.e2e.yml`). The fixture judges no real body, so what these
- * assert is the *path*: that a save asks an interpreter, and that what the
- * interpreter answers is what the operator is shown. Whether a given Lua
- * body is good is pinned by Rust tests against the real plugin, not here.
+ * stack's `lua` interpreter is the published Lua plugin (see the volume
+ * comment in `docker-compose.e2e.yml`). So these assert both halves: that a
+ * save asks an interpreter and shows the operator what it answered, and that
+ * the answers are real Lua judgements. The bodies below are therefore Lua,
+ * not fixture directives — a body that parses but defines no `handle`, and
+ * one that does not parse.
  */
 const ID = "xrpc.query:test.e2e.scriptvalidate";
 
@@ -23,10 +24,11 @@ test.describe("Script validation reaches the interpreter", () => {
   test("a refusal from the interpreter is the message the operator sees", async ({
     page,
   }) => {
-    // Both are directives the fixture recognises, so each answer comes from
-    // the interpreter rather than from anything on the host.
+    // Parses, defines no `handle`. A missing handle is a sentence about the
+    // script's shape, so it is the interpreter's own words rather than a
+    // compilation failure at a line.
     const missingHandle = await page.request.post("/admin/scripts", {
-      data: { id: ID, body: "no-handle" },
+      data: { id: ID, body: "local x = 1\n" },
     });
     expect(missingHandle.status()).toBe(400);
     expect((await missingHandle.json()).error).toBe(
@@ -34,7 +36,7 @@ test.describe("Script validation reaches the interpreter", () => {
     );
 
     const willNotParse = await page.request.post("/admin/scripts", {
-      data: { id: ID, body: "invalid, says the body" },
+      data: { id: ID, body: "function handle(\n" },
     });
     expect(willNotParse.status()).toBe(400);
     expect((await willNotParse.json()).error).toContain(

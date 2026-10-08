@@ -106,21 +106,13 @@ services:
       - caddy_data:/caddy-data:ro
       # Saving a script asks the interpreter its language names whether the
       # body is one it can run, so a stack with nothing claiming `lua`
-      # refuses every save and the three script specs fail. The real Lua
-      # interpreter is built elsewhere and needs a C toolchain, so the echo
-      # fixture stands in under a manifest claiming `lua`: enough to answer
-      # `validate`, and not enough to judge a body. `globalSetup` refuses a
-      # run where the fixture is unbuilt, because an empty directory here
-      # reads as three broken specs.
-      #
-      # The second bind needs the fixture's own `manifest.json` to exist as
-      # its mountpoint: the parent bind is read-only, so a path the runtime
-      # has to create inside it fails the container. Deleting that manifest
-      # as the redundant-looking one of a pair is therefore what breaks this.
-      # `tests/e2e_stack_interpreter.rs` is what keeps the overlaid manifest
-      # from drifting out of step with the module.
-      - ./tests/fixtures/interpreter_echo:/app/plugins/lua:ro
-      - ./scripts/e2e-lua-stand-in-manifest.json:/app/plugins/lua/manifest.json:ro
+      # refuses every save and the script specs fail. This is the published
+      # interpreter, fetched by `scripts/fetch-lua-plugin.sh` — which has to
+      # run before `up`, since Docker answers a missing bind source with an
+      # empty directory and the stack would come up with no interpreter at
+      # all. `globalSetup` refuses such a run, because an empty directory
+      # here otherwise reads as several broken specs.
+      - ./tests/fixtures/lua-plugin:/app/plugins/lua:ro
     depends_on:
       postgres:
         condition: service_healthy
