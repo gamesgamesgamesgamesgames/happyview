@@ -18,35 +18,7 @@ use crate::blobs;
 use crate::cid_verify::BYTES_B64;
 use crate::db::DatabaseBackend;
 use crate::error::{AppError, ScriptErrorType};
-use crate::lexicon::ParsedLexicon;
-
-/// What `defs.main.output.encoding` says.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutputEncoding {
-    /// `application/json`, or no declaration at all.
-    Json,
-    /// A media type the lexicon pins, so the script does not have to name one
-    /// and cannot contradict it.
-    Fixed(String),
-    /// `*/*` — the script names the concrete type, as `getBlob` does.
-    Any,
-}
-
-pub fn output_encoding(lexicon: &ParsedLexicon) -> OutputEncoding {
-    let declared = lexicon
-        .output
-        .as_ref()
-        .and_then(|output| output.get("encoding"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("");
-
-    match declared {
-        "" | "application/json" => OutputEncoding::Json,
-        "*/*" => OutputEncoding::Any,
-        concrete => OutputEncoding::Fixed(concrete.to_string()),
-    }
-}
+use crate::script::encoding::Encoding;
 
 /// What the script asked for, read from its return value and before any
 /// storage is touched.
@@ -175,10 +147,10 @@ pub async fn resolve(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     method: &str,
-    encoding: &OutputEncoding,
+    encoding: &Encoding,
     value: Value,
 ) -> Result<ScriptResponse, AppError> {
-    let OutputEncoding::Json = encoding else {
+    let Encoding::Json = encoding else {
         let payload = payload(method, &value)?;
 
         let (bytes, stored_type, cid) = match payload {
@@ -196,7 +168,7 @@ pub async fn resolve(
         // one. A missing type is refused rather than defaulted, because a
         // wrong content type on a download surfaces far from its cause.
         let content_type = match encoding {
-            OutputEncoding::Fixed(declared) => declared.clone(),
+            Encoding::Fixed(declared) => declared.clone(),
             _ => stored_type.ok_or_else(|| {
                 refuse(
                     method,
@@ -219,30 +191,9 @@ pub async fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexicon::ProcedureAction;
     use crate::test_support::migrated_memory_pool;
 
     const METHOD: &str = "at.example.getThing";
-
-    /// A query lexicon whose output encoding is whatever the caller names.
-    fn lexicon(encoding: Option<&str>) -> ParsedLexicon {
-        let output = match encoding {
-            Some(e) => json!({ "encoding": e }),
-            None => json!({}),
-        };
-        ParsedLexicon::parse(
-            json!({
-                "lexicon": 1,
-                "id": METHOD,
-                "defs": { "main": { "type": "query", "output": output } }
-            }),
-            1,
-            None,
-            ProcedureAction::Create,
-            None,
-        )
-        .expect("the fixture lexicon should parse")
-    }
 
     fn blob_ref(cid: &str, mime: Option<&str>) -> Value {
         let mut value = json!({ "$type": "blob", "ref": { "$link": cid } });
@@ -250,26 +201,6 @@ mod tests {
             value["mimeType"] = json!(mime);
         }
         value
-    }
-
-    #[test]
-    fn the_encoding_comes_from_the_lexicon() {
-        assert_eq!(output_encoding(&lexicon(None)), OutputEncoding::Json);
-        assert_eq!(
-            output_encoding(&lexicon(Some("application/json"))),
-            OutputEncoding::Json
-        );
-        assert_eq!(output_encoding(&lexicon(Some("*/*"))), OutputEncoding::Any);
-        assert_eq!(
-            output_encoding(&lexicon(Some("application/wasm"))),
-            OutputEncoding::Fixed("application/wasm".into())
-        );
-        // Whitespace around a declaration should not make it a media type of
-        // its own.
-        assert_eq!(
-            output_encoding(&lexicon(Some("  application/json  "))),
-            OutputEncoding::Json
-        );
     }
 
     /// The gate itself. A JSON method's value is passed through untouched even
@@ -286,7 +217,7 @@ mod tests {
             json!({ "$bytes": "aGk=", "mimeType": "text/plain" }),
             json!({ "avatar": blob_ref("bafkreibogus", Some("image/png")) }),
         ] {
-            let answer = resolve(&pool, backend, METHOD, &OutputEncoding::Json, value.clone())
+            let answer = resolve(&pool, backend, METHOD, &Encoding::Json, value.clone())
                 .await
                 .expect("a JSON method should answer");
             match answer {
@@ -306,15 +237,9 @@ mod tests {
             .await
             .expect("store");
 
-        let answer = resolve(
-            &pool,
-            backend,
-            METHOD,
-            &OutputEncoding::Any,
-            blob_ref(&cid, None),
-        )
-        .await
-        .expect("serve");
+        let answer = resolve(&pool, backend, METHOD, &Encoding::Any, blob_ref(&cid, None))
+            .await
+            .expect("serve");
 
         match answer {
             ScriptResponse::Bytes {
@@ -339,7 +264,7 @@ mod tests {
             &pool,
             DatabaseBackend::Sqlite,
             METHOD,
-            &OutputEncoding::Any,
+            &Encoding::Any,
             json!({ "$bytes": "aGVsbG8=", "mimeType": "text/plain" }),
         )
         .await
@@ -368,7 +293,7 @@ mod tests {
             &pool,
             DatabaseBackend::Sqlite,
             METHOD,
-            &OutputEncoding::Fixed("application/wasm".into()),
+            &Encoding::Fixed("application/wasm".into()),
             json!({ "$bytes": "aGk=", "mimeType": "text/plain" }),
         )
         .await
@@ -397,7 +322,7 @@ mod tests {
         ];
 
         for (value, expected) in cases {
-            let error = resolve(&pool, backend, METHOD, &OutputEncoding::Any, value.clone())
+            let error = resolve(&pool, backend, METHOD, &Encoding::Any, value.clone())
                 .await
                 .expect_err(&format!("{value} should be refused"));
             match error {
@@ -417,7 +342,7 @@ mod tests {
             &pool,
             DatabaseBackend::Sqlite,
             METHOD,
-            &OutputEncoding::Any,
+            &Encoding::Any,
             blob_ref("bafkreinotstored", Some("application/wasm")),
         )
         .await
