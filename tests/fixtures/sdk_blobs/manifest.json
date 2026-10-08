@@ -1,0 +1,12 @@
+{
+  "id": "sdk_blobs",
+  "name": "SDK blobs fixture",
+  "version": "1.0.0",
+  "api_version": "2",
+  "plugin_type": "library",
+  "namespace": "blobs_fixture",
+  "capabilities": ["blobs:read", "blobs:write"],
+  "allowed_hosts": [],
+  "dependencies": [],
+  "wasm_file": "target/wasm32-unknown-unknown/release/sdk_blobs.wasm"
+}

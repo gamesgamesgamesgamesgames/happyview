@@ -3,7 +3,6 @@ pub(crate) mod procedure;
 pub(crate) mod query;
 pub(crate) mod scope_check;
 
-use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
@@ -566,13 +565,72 @@ pub async fn xrpc_get(
 }
 
 /// Catch-all POST handler for XRPC procedures.
+/// A JSON body, read as strictly as the `Json` extractor did: the media type
+/// has to say JSON, and the bytes have to parse.
+fn json_body(parts: &Parts, raw: &axum::body::Bytes) -> Result<serde_json::Value, AppError> {
+    let declared = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let mime = declared.split(';').next().unwrap_or("").trim();
+    if !(mime.eq_ignore_ascii_case("application/json")
+        || mime.to_ascii_lowercase().ends_with("+json"))
+    {
+        return Err(AppError::BadRequest(
+            "this method expects a JSON body; set content-type: application/json".into(),
+        ));
+    }
+
+    serde_json::from_slice(raw)
+        .map_err(|e| AppError::BadRequest(format!("request body is not valid JSON: {e}")))
+}
+
+/// Store a byte body and describe it to the script as a blob ref.
+///
+/// The media type recorded is the caller's, since `*/*` means the caller
+/// decides; a lexicon that pins one supplies it when the caller does not.
+async fn ingest_body(
+    state: &AppState,
+    parts: &Parts,
+    lexicon: &crate::lexicon::ParsedLexicon,
+    raw: &axum::body::Bytes,
+) -> Result<serde_json::Value, AppError> {
+    if raw.is_empty() {
+        return Err(AppError::BadRequest(
+            "this method expects a body of bytes, and none was sent".into(),
+        ));
+    }
+
+    let declared = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or("").trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let mime = match (declared, crate::script::encoding::of_input(lexicon)) {
+        (Some(sent), _) => sent,
+        (None, crate::script::Encoding::Fixed(pinned)) => pinned,
+        (None, _) => "application/octet-stream".to_string(),
+    };
+
+    let cid = crate::blobs::put(&state.db, state.db_backend, raw, &mime).await?;
+    serde_json::to_value(crate::blobs::BlobRef::new(cid, mime, raw.len() as i64))
+        .map_err(|e| AppError::Internal(format!("failed to describe a stored blob: {e}")))
+}
+
 pub async fn xrpc_post(
     State(state): State<AppState>,
     Path(method): Path<String>,
     RawQuery(raw_query): RawQuery,
     xrpc_claims: XrpcClaims,
     parts: Parts,
-    Json(body): Json<serde_json::Value>,
+    // Bytes rather than `Json`, because whether this body is JSON at all is
+    // the lexicon's to declare: `uploadBlob` takes `*/*`, and an extractor
+    // chosen before the method is known cannot honour that. A method whose
+    // lexicon says JSON is parsed exactly as strictly as before.
+    raw_body: axum::body::Bytes,
 ) -> Result<Response, AppError> {
     let raw_query = raw_query.unwrap_or_default();
     let mut params = parse_query_params(&raw_query);
@@ -642,10 +700,23 @@ pub async fn xrpc_post(
                     let claims = claims.as_ref().ok_or_else(|| {
                         AppError::Auth("XRPC procedures require DPoP authentication".into())
                     })?;
-                    forward_to_caller_pds(&state, claims, &method, &body, &parts).await?
+                    forward_to_caller_pds(
+                        &state,
+                        claims,
+                        &method,
+                        &json_body(&parts, &raw_body)?,
+                        &parts,
+                    )
+                    .await?
                 }
                 crate::proxy_config::ProxyRouting::Authority => {
-                    proxy_to_authority(&state, &method, &raw_query, Some(&body)).await?
+                    proxy_to_authority(
+                        &state,
+                        &method,
+                        &raw_query,
+                        Some(&json_body(&parts, &raw_body)?),
+                    )
+                    .await?
                 }
             };
 
@@ -683,6 +754,16 @@ pub async fn xrpc_post(
         // Re-bind to a reference with matching lifetime
         service_auth_claims_owned = c;
         (&service_auth_claims_owned, None)
+    };
+
+    // `input.encoding` decides what the script receives. Bytes are stored
+    // before the script runs and reach it as an ordinary blob ref, so a script
+    // authorizes and records a body without ever carrying it — which is the
+    // same two-step `uploadBlob` and `createRecord` already describe.
+    let body = if crate::script::encoding::of_input(&lexicon).is_bytes() {
+        ingest_body(&state, &parts, &lexicon, &raw_body).await?
+    } else {
+        json_body(&parts, &raw_body)?
     };
 
     let mut response =

@@ -27,7 +27,7 @@ use crate::abi::read_packed;
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::wire::Response;
 use crate::wire::{
-    ApiSurface, AtprotoBlobDownload, AttestSign, AttestVerify, BacklinksQuery, BlobData,
+    ApiSurface, AtprotoBlobDownload, AttestSign, AttestVerify, BacklinksQuery, BlobData, BlobInfo,
     CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
     CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, JobGet, JobListAny, JobProgressRequest,
     JobView, Label, LabelsGet, LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoInfo,
@@ -39,7 +39,10 @@ use crate::wire::{
     SpacesQuery, StrongRef, TableQuery,
 };
 #[cfg(target_arch = "wasm32")]
-use crate::wire::{AtprotoResolveService, JobShouldStopRequest, JobWaitRequest, LexiconGet};
+use crate::wire::{
+    AtprotoResolveService, BlobLookup, BlobPut, BlobStored, JobShouldStopRequest, JobWaitRequest,
+    LexiconGet,
+};
 
 /// The wire types these wrappers send and receive. Defined in [`crate::wire`],
 /// which the host imports too; re-exported here as the import path plugins use.
@@ -82,6 +85,9 @@ extern "C" {
     fn host_records_index_put(req_ptr: i32, req_len: i32) -> i64;
     fn host_records_index_delete(req_ptr: i32, req_len: i32) -> i64;
     fn host_lexicon_get(req_ptr: i32, req_len: i32) -> i64;
+    fn host_blob_put(req_ptr: i32, req_len: i32) -> i64;
+    fn host_blob_get(req_ptr: i32, req_len: i32) -> i64;
+    fn host_blob_stat(req_ptr: i32, req_len: i32) -> i64;
     fn host_atproto_resolve_service(req_ptr: i32, req_len: i32) -> i64;
     fn host_atproto_blob_download(req_ptr: i32, req_len: i32) -> i64;
     fn host_labels_get(req_ptr: i32, req_len: i32) -> i64;
@@ -344,6 +350,20 @@ fn call_spec<S: serde::Serialize, R: serde::de::DeserializeOwned>(
     decode_required::<R>(packed).map_err(PluginError::from)
 }
 
+/// The same, for a read whose answer may be absent: the host writes nothing
+/// rather than an envelope, which is how "not held" is said without being an
+/// error.
+#[cfg(target_arch = "wasm32")]
+fn call_spec_optional<S: serde::Serialize, R: serde::de::DeserializeOwned>(
+    import: unsafe extern "C" fn(i32, i32) -> i64,
+    spec: &S,
+) -> Result<Option<R>, PluginError> {
+    let bytes = serde_json::to_vec(spec).map_err(PluginError::from)?;
+    // SAFETY: `bytes` is live for the duration of the call.
+    let packed = unsafe { import(bytes.as_ptr() as i32, bytes.len() as i32) };
+    decode_optional::<R>(packed).map_err(PluginError::from)
+}
+
 /// A write whose only answer is `{"ok": null}`. Whatever value does come
 /// back is discarded rather than failing on a shape a future host might vary.
 #[cfg(target_arch = "wasm32")]
@@ -581,6 +601,68 @@ pub fn atproto_resolve_service(did: &str) -> Result<Option<String>, PluginError>
         let _ = did;
         Err(HostError::NotWasm.into())
     }
+}
+
+/// Store bytes, answering the CID they are filed under. Needs `blobs:write`.
+///
+/// The key is the hash of the content, so storing the same bytes twice
+/// answers the same CID and stores one copy.
+pub fn blob_put(bytes: &[u8], mime_type: &str) -> Result<String, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let stored: BlobStored = call_spec(
+            host_blob_put,
+            &BlobPut {
+                bytes: bytes.to_vec(),
+                mime_type: mime_type.into(),
+            },
+        )?;
+        Ok(stored.cid)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (bytes, mime_type);
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Read a stored blob. `Ok(None)` means nothing is stored under `cid`, which
+/// is an ordinary outcome rather than an error. Needs `blobs:read`.
+///
+/// This transfers the bytes, so prefer [`blob_stat`] when only the size or
+/// media type is wanted.
+pub fn blob_get(cid: &str) -> Result<Option<BlobData>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec_optional(host_blob_get, &BlobLookup { cid: cid.into() })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = cid;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// A stored blob's media type and size, without transferring it. `Ok(None)`
+/// means nothing is stored under `cid`. Needs `blobs:read`.
+pub fn blob_stat(cid: &str) -> Result<Option<BlobInfo>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec_optional(host_blob_stat, &BlobLookup { cid: cid.into() })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = cid;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Whether a blob is stored. Needs `blobs:read`.
+///
+/// Derived from [`blob_stat`] rather than being an import of its own, so
+/// there is no second answer to the same question that could disagree.
+pub fn blob_exists(cid: &str) -> Result<bool, PluginError> {
+    Ok(blob_stat(cid)?.is_some())
 }
 
 /// Download a blob from a repo. Needs `atproto:read`.

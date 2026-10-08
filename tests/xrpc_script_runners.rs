@@ -625,3 +625,197 @@ async fn every_run_moves_the_script_counters() {
     }
     assert!(counters.script_runtime_us.load(Ordering::Relaxed) > 0);
 }
+
+// ---------------------------------------------------------------------------
+// The lexicon's declared encodings
+// ---------------------------------------------------------------------------
+
+/// A second query method, so both encodings can be exercised against one app:
+/// two `TestApp`s in a test share a database and spend minutes contending for
+/// it.
+const QUERY_BYTES: &str = "games.gamesgamesgamesgames.getArtifact";
+
+/// `list_games_query_lexicon` under another id and output encoding, so the
+/// declaration is the only difference between the two endpoints below.
+fn query_lexicon_for(id: &str, encoding: &str) -> Value {
+    let mut lexicon = common::fixtures::list_games_query_lexicon();
+    lexicon["id"] = json!(id);
+    lexicon["defs"]["main"]["output"] = json!({ "encoding": encoding });
+    lexicon
+}
+
+async fn call_method(app: &TestApp, method: &str) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/xrpc/{method}"))
+                .header("x-client-key", "hvc_test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// The runner has to consult the lexicon, not just run the script.
+///
+/// The echo fixture answers with its own `execute` input, an object that is
+/// neither of the byte forms. Declared as JSON that is a 200; declared `*/*`
+/// it has to be refused, naming what a byte-returning script should have
+/// produced. Deleting the runner's call to `script::response::resolve` answers
+/// 200 for both, which is what makes this a test of the wiring rather than of
+/// the helper.
+#[tokio::test]
+async fn the_output_encoding_decides_how_a_query_answers() {
+    require_fixture!();
+
+    let app = TestApp::new().await;
+    upload_lexicon(&app, query_lexicon_for(QUERY, "application/json")).await;
+    upload_lexicon(&app, query_lexicon_for(QUERY_BYTES, "*/*")).await;
+    seed_script_as(&app, &format!("xrpc.query:{QUERY}"), "echo me", "lua").await;
+    seed_script_as(&app, &format!("xrpc.query:{QUERY_BYTES}"), "echo me", "lua").await;
+    interpreter(&app).await;
+
+    let resp = call_method(&app, QUERY).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a json-declared query should answer with the value as it stands"
+    );
+
+    let resp = call_method(&app, QUERY_BYTES).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a */*-declared query must not answer an ordinary object as JSON"
+    );
+    let body = json_body(resp).await;
+    assert_eq!(body["error"], "script_error");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("blob ref") && message.contains("$bytes"),
+        "the refusal should name both accepted forms, got {message:?}"
+    );
+}
+
+/// A procedure taking bytes, as `uploadBlob` declares them.
+const PROCEDURE_BYTES: &str = "games.gamesgamesgamesgames.uploadArtifact";
+
+fn procedure_lexicon_taking_bytes(id: &str) -> Value {
+    let mut lexicon = common::fixtures::create_game_procedure_lexicon();
+    lexicon["id"] = json!(id);
+    lexicon["defs"]["main"]["input"] = json!({ "encoding": "*/*" });
+    lexicon["defs"]["main"]["output"] = json!({ "encoding": "application/json" });
+    lexicon
+}
+
+async fn post_bytes(
+    app: &TestApp,
+    method: &str,
+    content_type: Option<&str>,
+    bytes: &[u8],
+) -> axum::response::Response {
+    let cookie = app.admin_cookie();
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/xrpc/{method}"))
+        .header(cookie.0, cookie.1)
+        .header("x-client-key", "hvc_test");
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    app.router
+        .clone()
+        .oneshot(request.body(Body::from(bytes.to_vec())).unwrap())
+        .await
+        .unwrap()
+}
+
+/// A procedure whose lexicon takes bytes is handed a blob ref, not a parsed
+/// body — and the bytes are stored before the script runs, so the script
+/// authorizes and records without ever carrying them.
+///
+/// The echo fixture answers with its own `execute` input, so what the script
+/// received is readable straight off the response.
+#[tokio::test]
+async fn a_byte_input_reaches_the_script_as_a_stored_blob_ref() {
+    require_fixture!();
+
+    let app = TestApp::new().await;
+    upload_lexicon(&app, procedure_lexicon_taking_bytes(PROCEDURE_BYTES)).await;
+    seed_script_as(
+        &app,
+        &format!("xrpc.procedure:{PROCEDURE_BYTES}"),
+        "echo me",
+        "lua",
+    )
+    .await;
+    interpreter(&app).await;
+
+    // Deliberately not valid UTF-8, so nothing can be quietly treating this
+    // as text.
+    let artifact: &[u8] = &[0x00, 0x61, 0xff, 0x73, 0x6d];
+    let resp = post_bytes(&app, PROCEDURE_BYTES, Some("application/wasm"), artifact).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let echoed = json_body(resp).await;
+    let input = &echoed["input"];
+    assert_eq!(input["$type"], "blob", "the script saw {input}");
+    assert_eq!(input["mimeType"], "application/wasm");
+    assert_eq!(input["size"], artifact.len());
+
+    // The CID is the one the network would mint for these bytes, so a client
+    // can verify what it uploaded without trusting us.
+    let expected = happyview::cid_verify::raw_cid(artifact)
+        .expect("a CID for the artifact")
+        .to_string();
+    assert_eq!(input["ref"]["$link"], expected);
+
+    // And the bytes are actually at rest under it.
+    let stored = happyview::blobs::get(&app.state.db, app.state.db_backend, &expected)
+        .await
+        .expect("read the blob back")
+        .expect("the ingest should have stored it");
+    assert_eq!(stored.bytes, artifact);
+    assert_eq!(stored.mime_type, "application/wasm");
+}
+
+/// `*/*` means the caller names the type, so an absent body has nothing to
+/// store and is refused rather than stored empty.
+#[tokio::test]
+async fn a_byte_input_refuses_an_empty_body() {
+    require_fixture!();
+
+    let app = TestApp::new().await;
+    upload_lexicon(&app, procedure_lexicon_taking_bytes(PROCEDURE_BYTES)).await;
+    seed_script_as(
+        &app,
+        &format!("xrpc.procedure:{PROCEDURE_BYTES}"),
+        "echo me",
+        "lua",
+    )
+    .await;
+    interpreter(&app).await;
+
+    let resp = post_bytes(&app, PROCEDURE_BYTES, Some("application/wasm"), b"").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A JSON-declared procedure keeps rejecting a body that is not JSON, which
+/// the `Json` extractor used to do before the handler read bytes itself.
+#[tokio::test]
+async fn a_json_procedure_still_requires_a_json_body() {
+    require_fixture!();
+
+    let app = procedure_app("echo me").await;
+
+    let resp = post_bytes(&app, PROCEDURE, Some("application/wasm"), b"\x00not json").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = post_bytes(&app, PROCEDURE, Some("application/json"), b"{ not json").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = post_bytes(&app, PROCEDURE, Some("application/json"), b"{}").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}

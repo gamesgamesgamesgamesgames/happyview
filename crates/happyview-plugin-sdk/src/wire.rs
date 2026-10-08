@@ -760,6 +760,41 @@ pub struct BlobData {
     pub size: u64,
 }
 
+/// Store bytes, which are filed under the CID of their own content. Needs
+/// `blobs:write`. `bytes` travels the way a [`BlobData`]'s do.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobPut {
+    #[serde(
+        serialize_with = "serialize_body",
+        deserialize_with = "deserialize_body_flexible_required"
+    )]
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+}
+
+/// Where stored bytes landed. The host computes the CID from the content, so
+/// this is the answer rather than something the caller chose.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobStored {
+    pub cid: String,
+}
+
+/// Name a stored blob. Needs `blobs:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobLookup {
+    pub cid: String,
+}
+
+/// What a blob is, without transferring it. Absent rather than present with
+/// zeroes when nothing is stored under the CID, which is also how a caller
+/// asks whether it is held at all.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlobInfo {
+    pub cid: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
 /// Look up labels applied to a set of URIs. Needs `atproto:read`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabelsGet {

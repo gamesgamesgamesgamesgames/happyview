@@ -50,6 +50,10 @@ pub enum PluginCapability {
     CallerCall,
     #[serde(rename = "records:write")]
     RecordsWrite,
+    #[serde(rename = "blobs:read")]
+    BlobsRead,
+    #[serde(rename = "blobs:write")]
+    BlobsWrite,
     #[serde(rename = "atproto:read")]
     AtprotoRead,
     #[serde(rename = "attest:sign")]
@@ -94,6 +98,8 @@ impl PluginCapability {
             CallerWrite,
             CallerCall,
             RecordsWrite,
+            BlobsRead,
+            BlobsWrite,
             AtprotoRead,
             AttestSign,
             LinkedReposUse,
@@ -126,6 +132,8 @@ impl PluginCapability {
             CallerWrite => "caller:write",
             CallerCall => "caller:call",
             RecordsWrite => "records:write",
+            BlobsRead => "blobs:read",
+            BlobsWrite => "blobs:write",
             AtprotoRead => "atproto:read",
             AttestSign => "attest:sign",
             LinkedReposUse => "linked_repos:use",
@@ -152,6 +160,8 @@ impl PluginCapability {
                 Risk::Low
             }
             RecordsRead
+            | BlobsRead
+            | BlobsWrite
             | NetworkRequest
             | NetworkRequestDefined
             | LibraryCall
@@ -212,6 +222,12 @@ impl PluginCapability {
             }
             RecordsWrite => {
                 "Write to this instance's record index directly, bypassing the network. This can replace the body of a record that arrived from the network while its CID and indexed time stay as the network set them."
+            }
+            BlobsRead => {
+                "Read any byte content this instance stores, and its media type and size, given its content address."
+            }
+            BlobsWrite => {
+                "Store byte content in this instance's database, consuming disk without limit other than the instance's own. Content is addressed by its hash, so a write cannot replace or alter content already stored."
             }
             AtprotoRead => {
                 "Resolve any DID's service endpoints, download blobs from any repo on the network, look up labels applied to any URI, and verify this instance's attestation signatures."
@@ -360,6 +376,18 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
     Requirement {
         import: "host_records_index_delete",
         any_of: &[PluginCapability::RecordsWrite],
+    },
+    Requirement {
+        import: "host_blob_put",
+        any_of: &[PluginCapability::BlobsWrite],
+    },
+    Requirement {
+        import: "host_blob_get",
+        any_of: &[PluginCapability::BlobsRead],
+    },
+    Requirement {
+        import: "host_blob_stat",
+        any_of: &[PluginCapability::BlobsRead],
     },
     Requirement {
         import: "host_atproto_resolve_service",
@@ -755,6 +783,9 @@ mod tests {
             "host_caller_upload_blob",
             "host_caller_xrpc_query",
             "host_caller_xrpc_procedure",
+            "host_blob_put",
+            "host_blob_get",
+            "host_blob_stat",
             "host_records_index_put",
             "host_records_index_delete",
             "host_lexicon_get",
@@ -1029,6 +1060,48 @@ mod tests {
             let req = requirement_for_import(import).expect(import);
             assert_eq!(req.any_of, &[expected], "{import}");
         }
+    }
+
+    /// Reading stored bytes and storing them are separate decisions: a
+    /// plugin that serves content need not be able to add any, and one that
+    /// ingests need not be able to read back what others stored. Existence is
+    /// answered by `host_blob_stat`, so there is no fourth import.
+    #[test]
+    fn blob_imports_map_to_their_capability() {
+        for (import, expected) in [
+            ("host_blob_put", PluginCapability::BlobsWrite),
+            ("host_blob_get", PluginCapability::BlobsRead),
+            ("host_blob_stat", PluginCapability::BlobsRead),
+        ] {
+            let req = requirement_for_import(import).expect(import);
+            assert_eq!(req.any_of, &[expected], "{import}");
+        }
+    }
+
+    /// Storing bytes consumes the operator's disk and reading them reaches
+    /// content the instance holds, so neither is low risk; neither reaches
+    /// another account's data or replaces anything, so neither is critical.
+    #[test]
+    fn blob_capabilities_sit_between_kv_and_raw_sql() {
+        for capability in [PluginCapability::BlobsRead, PluginCapability::BlobsWrite] {
+            assert!(
+                capability.risk() > PluginCapability::KvWrite.risk(),
+                "{capability:?} should outrank the key-value store"
+            );
+            assert!(
+                capability.risk() < PluginCapability::DatabaseWrite.risk(),
+                "{capability:?} should not rank with raw SQL"
+            );
+        }
+        // Content addressing is the reason a write cannot replace anything,
+        // and the consent dialog has to say so.
+        assert!(
+            PluginCapability::BlobsWrite
+                .description()
+                .contains("cannot replace"),
+            "{}",
+            PluginCapability::BlobsWrite.description()
+        );
     }
 
     /// The six linked-repo imports share one capability — each re-reads its

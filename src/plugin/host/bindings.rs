@@ -940,6 +940,21 @@ pub(crate) fn define_host_functions(
     )?;
 
     // Async functions - AT Protocol network reads and attestation
+    imports.define("host_blob_put", |caller, (req_ptr, req_len): (i32, i32)| {
+        Box::pin(async move { host_blob_put_impl(caller, req_ptr, req_len).await })
+    })?;
+
+    imports.define("host_blob_get", |caller, (req_ptr, req_len): (i32, i32)| {
+        Box::pin(async move { host_blob_get_impl(caller, req_ptr, req_len).await })
+    })?;
+
+    imports.define(
+        "host_blob_stat",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_blob_stat_impl(caller, req_ptr, req_len).await })
+        },
+    )?;
+
     imports.define(
         "host_atproto_resolve_service",
         |caller, (req_ptr, req_len): (i32, i32)| {
@@ -2117,6 +2132,134 @@ async fn host_atproto_resolve_service_impl(
             }
             Err(e) => atproto_error_envelope(e),
         };
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: store bytes under the CID of their content.
+///
+/// The caller does not choose the key, so a plugin cannot file bytes under a
+/// CID they do not hash to, and storing the same content twice is the row
+/// already there.
+async fn host_blob_put_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_blob_put";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let req: happyview_plugin_sdk::wire::BlobPut = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(ctx) = build_host_context(caller.data()) else {
+        return 0;
+    };
+
+    let response =
+        match crate::blobs::put(&ctx.db, ctx.db_backend, &req.bytes, &req.mime_type).await {
+            Ok(cid) => serde_json::to_vec(&serde_json::json!({ "ok": { "cid": cid } })),
+            Err(e) => serde_json::to_vec(&serde_json::json!({
+                "error": { "code": "BLOB_ERROR", "message": e.to_string(), "retryable": false }
+            })),
+        }
+        .unwrap_or_default();
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: read a stored blob's bytes.
+async fn host_blob_get_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_blob_get";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let req: happyview_plugin_sdk::wire::BlobLookup = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(ctx) = build_host_context(caller.data()) else {
+        return 0;
+    };
+
+    let response = match crate::blobs::get(&ctx.db, ctx.db_backend, &req.cid).await {
+        // Absent is `0`, the same "nothing here" a `kv` miss answers, rather
+        // than an error: asking for a blob that is not held is an ordinary
+        // outcome.
+        Ok(None) => return 0,
+        Ok(Some(blob)) => {
+            let size = blob.bytes.len() as u64;
+            serde_json::to_vec(
+                &serde_json::json!({ "ok": happyview_plugin_sdk::wire::BlobData {
+                bytes: blob.bytes,
+                mime_type: blob.mime_type,
+                size,
+            } }),
+            )
+        }
+        Err(e) => serde_json::to_vec(&serde_json::json!({
+            "error": { "code": "BLOB_ERROR", "message": e.to_string(), "retryable": false }
+        })),
+    }
+    .unwrap_or_default();
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: a stored blob's media type and size, without its bytes.
+///
+/// Answering `0` for an absent blob is what lets a caller ask whether one is
+/// held without transferring it, so there is no separate existence import to
+/// drift from this one.
+async fn host_blob_stat_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_blob_stat";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let req: happyview_plugin_sdk::wire::BlobLookup = match serde_json::from_slice(&bytes) {
+        Ok(r) => r,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let Some(ctx) = build_host_context(caller.data()) else {
+        return 0;
+    };
+
+    let response = match crate::blobs::stat(&ctx.db, ctx.db_backend, &req.cid).await {
+        Ok(None) => return 0,
+        Ok(Some(stat)) => serde_json::to_vec(
+            &serde_json::json!({ "ok": happyview_plugin_sdk::wire::BlobInfo {
+                cid: req.cid,
+                mime_type: stat.mime_type,
+                size: stat.size as u64,
+            } }),
+        ),
+        Err(e) => serde_json::to_vec(&serde_json::json!({
+            "error": { "code": "BLOB_ERROR", "message": e.to_string(), "retryable": false }
+        })),
+    }
+    .unwrap_or_default();
     write_guest_response(caller, &response).await
 }
 
