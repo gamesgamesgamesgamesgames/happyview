@@ -104,7 +104,7 @@ export default function GeneralSettingsPage() {
     event_log_retention_days: "30",
     "feature.space_inspector_enabled": "",
     logo_uri: "",
-    space_access_log_retention_days: "365",
+    space_access_log_retention_days: "",
     space_inspector_max_grant_minutes: "60",
     tos_uri: "",
     policy_uri: "",
@@ -169,10 +169,9 @@ export default function GeneralSettingsPage() {
           "",
         ),
         logo_uri: val("logo_uri", ""),
-        space_access_log_retention_days: val(
-          "space_access_log_retention_days",
-          "365",
-        ),
+        // Left empty when unset: an empty field isn't saved, so the setting keeps
+        // following the event log retention.
+        space_access_log_retention_days: val("space_access_log_retention_days", ""),
         space_inspector_max_grant_minutes: val(
           "space_inspector_max_grant_minutes",
           "60",
@@ -678,13 +677,16 @@ export default function GeneralSettingsPage() {
                 space_access_log_retention_days: e.target.value,
               }))
             }
-            placeholder="365"
+            placeholder={
+              values.event_log_retention_days.trim() === "0" ? "0" : "365"
+            }
             disabled={!canManage}
           />
           <p className="text-muted-foreground text-xs">
             How long to keep records of space access: grants, the reads made
             under them, inspector changes, and purges. These can&apos;t be
-            purged by hand. 0 keeps them forever.
+            purged by hand. 0 keeps them forever. Left blank, it keeps them
+            forever while event log retention is 0, and for 365 days otherwise.
           </p>
         </div>
 
