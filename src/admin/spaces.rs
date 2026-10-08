@@ -298,8 +298,7 @@ pub(super) async fn get_space_blob(
         now,
     ) {
         if let Some(author) =
-            db::find_blob_author_did(&state.db, state.db_backend, &space.id, &params.cid, None)
-                .await?
+            db::find_blob_author_did(&state.db, state.db_backend, &space.id, &params.cid).await?
         {
             found = Some((g.clone(), author));
         }
@@ -357,6 +356,23 @@ pub(super) async fn list_account_spaces(
             .map(|(space, count)| serde_json::json!({ "space": space_json(space), "record_count": count }))
             .collect::<Vec<_>>(),
     })))
+}
+
+/// GET /admin/accounts/{did}/access — the caller's active grant covering this
+/// account's records, by the same rule `space-records` enforces.
+/// `{ "grant": null }` when none does.
+pub(super) async fn account_covering_grant(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(did): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let grants = space_access::active_grants(&state, &auth).await?;
+    let grant = space_access::select_covering(
+        &grants,
+        &space_access::Covers::Account { did: &did },
+        chrono::Utc::now(),
+    );
+    Ok(Json(serde_json::json!({ "grant": grant })))
 }
 
 /// GET /admin/accounts/{did}/space-records — one account's records across

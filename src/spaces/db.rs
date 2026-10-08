@@ -1308,33 +1308,26 @@ fn parse_record_row(r: RecordRow) -> Result<SpaceRecord, AppError> {
 /// Find the author DID of any record in the space that contains a blob ref
 /// with the given CID. The CID appears in serialised record JSON as the
 /// `$link` value inside an ATProto blob ref object.
+/// A LIKE pattern matching a record that references `blob_cid` as a `$link`.
+/// LIKE metacharacters in the caller-supplied CID are escaped, so `%` and `_`
+/// match literally and can't be used to match another author's record.
+fn blob_link_pattern(blob_cid: &str) -> String {
+    format!("%\"$link\":\"{}\"%", crate::db::escape_like(blob_cid))
+}
+
 pub async fn find_blob_author_did(
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
     space_id: &str,
     blob_cid: &str,
-    author_did: Option<&str>,
 ) -> Result<Option<String>, AppError> {
-    // Escape LIKE metacharacters in the caller-supplied CID so `%`/`_` are matched
-    // literally and can't be used to match another author's record (L8).
-    let pattern = format!("%\"$link\":\"{}\"%", crate::db::escape_like(blob_cid));
-    let author_clause = if author_did.is_some() {
-        " AND author_did = ?"
-    } else {
-        ""
-    };
     let sql = adapt_sql(
-        &format!(
-            "SELECT author_did FROM happyview_space_records WHERE space_id = ?{author_clause} AND record LIKE ? ESCAPE '\\' LIMIT 1"
-        ),
+        "SELECT author_did FROM happyview_space_records WHERE space_id = ? AND record LIKE ? ESCAPE '\\' LIMIT 1",
         backend,
     );
-    let mut q = crate::db::query_as::<(String,)>(&sql).bind(space_id);
-    if let Some(author) = author_did {
-        q = q.bind(author);
-    }
-    let row = q
-        .bind(&pattern)
+    let row = crate::db::query_as::<(String,)>(&sql)
+        .bind(space_id)
+        .bind(blob_link_pattern(blob_cid))
         .fetch_optional(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to find blob author: {e}")))?;
@@ -1348,14 +1341,13 @@ pub async fn find_blob_authors(
     space_id: &str,
     blob_cid: &str,
 ) -> Result<Vec<String>, AppError> {
-    let pattern = format!("%\"$link\":\"{}\"%", crate::db::escape_like(blob_cid));
     let sql = adapt_sql(
         "SELECT DISTINCT author_did FROM happyview_space_records WHERE space_id = ? AND record LIKE ? ESCAPE '\\'",
         backend,
     );
     let rows: Vec<(String,)> = crate::db::query_as(&sql)
         .bind(space_id)
-        .bind(&pattern)
+        .bind(blob_link_pattern(blob_cid))
         .fetch_all(pool)
         .await
         .map_err(|e| AppError::Internal(format!("failed to find blob authors: {e}")))?;

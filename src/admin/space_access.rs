@@ -59,7 +59,11 @@ pub(super) async fn inspector_status(
     State(state): State<AppState>,
     auth: UserAuth,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    auth.require(Permission::SpacesRead).await?;
+    // Either permission: a moderator who can request access needs to know
+    // whether they can, even without `spaces:read`.
+    if !auth.has(Permission::SpacesInspect) {
+        auth.require(Permission::SpacesRead).await?;
+    }
     let config = load_config(&state.db, state.db_backend).await;
     Ok(Json(serde_json::json!({
         "enabled": config.enabled,

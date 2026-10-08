@@ -102,6 +102,10 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route("/spaces/{id}/blob", get(spaces::get_space_blob))
         .route("/accounts/{did}/spaces", get(spaces::list_account_spaces))
         .route(
+            "/accounts/{did}/access",
+            get(spaces::account_covering_grant),
+        )
+        .route(
             "/accounts/{did}/space-records",
             get(spaces::list_account_space_records),
         )

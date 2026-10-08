@@ -857,3 +857,36 @@ async fn read_links_go_when_their_events_do() {
     .await;
     assert!(body["events"].as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+#[serial]
+async fn account_covering_grant_matches_only_that_account() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    enable_inspector(&app).await;
+    let access = format!("/admin/accounts/{MEMBER}/access");
+
+    let body = json_body(get(&app, &access, None).await).await;
+    assert!(body["grant"].is_null());
+
+    grant(&app, "account", CREATOR).await;
+    let body = json_body(get(&app, &access, None).await).await;
+    assert!(
+        body["grant"].is_null(),
+        "another account's grant doesn't cover it"
+    );
+
+    let member_grant = grant(&app, "account", MEMBER).await;
+    let body = json_body(get(&app, &access, None).await).await;
+    assert_eq!(body["grant"]["id"], member_grant);
+}
+
+#[tokio::test]
+#[serial]
+async fn inspect_alone_can_read_the_inspector_status() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let key = common::api_key(&app, &["spaces:inspect"]).await;
+    let resp = get(&app, "/admin/spaces/inspector", Some(&key)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
