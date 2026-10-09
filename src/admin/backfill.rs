@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::time::Duration;
@@ -1894,98 +1893,54 @@ async fn run_pipelined_resolve_and_fetch(
     };
     let mut pds_workers: HashMap<String, mpsc::Sender<WorkUnit>> = HashMap::new();
     let mut worker_handles = FuturesUnordered::new();
-    let mut overflow: Vec<(WorkUnit, String)> = Vec::new();
+    // Units a PDS worker had no room for yet, per PDS, in arrival order.
+    let mut waiting: HashMap<String, VecDeque<WorkUnit>> = HashMap::new();
+    let mut rx_open = true;
+    // Retries the waiting units even when nothing new arrives: once the
+    // window is full, the resolver sends nothing until units complete, and
+    // units only complete once the workers get them.
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_stop_check = std::time::Instant::now();
 
     loop {
-        if cancelled.load(Ordering::Relaxed) {
+        if cancelled.load(Ordering::Relaxed) || (!rx_open && waiting.is_empty()) {
             break;
         }
-
-        let poll_state = Arc::clone(&state);
-        let poll_job_id = Arc::clone(&queue.job_id);
-        let poll_cancelled = Arc::clone(cancelled);
-        let pair = tokio::select! {
-            result = rx.recv() => result,
-            _ = async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if poll_cancelled.load(Ordering::Relaxed) || should_stop_worker(&poll_state, &poll_job_id).await {
-                        poll_cancelled.store(true, Ordering::Relaxed);
-                        return;
-                    }
+        tokio::select! {
+            received = rx.recv(), if rx_open => match received {
+                Some((unit, pds_endpoint)) => {
+                    waiting.entry(pds_endpoint).or_default().push_back(unit);
                 }
-            } => None,
-        };
-        let Some(pair) = pair else {
-            break;
-        };
-
-        // Also drain any overflow from previous iterations
-        overflow.push(pair);
-        let mut still_pending = Vec::new();
-        for (unit, pds_endpoint) in overflow.drain(..) {
-            if cancelled.load(Ordering::Relaxed) {
-                break;
-            }
-            if let Some(pds_tx) = pds_workers.get(&pds_endpoint) {
-                match pds_tx.try_send(unit.clone()) {
-                    Ok(()) => continue,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        still_pending.push((unit, pds_endpoint));
-                        continue;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        // Worker finished; replaced below.
+                None => rx_open = false,
+            },
+            _ = tick.tick() => {
+                if last_stop_check.elapsed() >= Duration::from_millis(500) {
+                    last_stop_check = std::time::Instant::now();
+                    if should_stop_worker(&state, &queue.job_id).await {
+                        cancelled.store(true, Ordering::Relaxed);
                     }
                 }
             }
-            pds_workers.retain(|_, tx| !tx.is_closed());
-            spawn_pds_worker(
-                &worker_ctx,
-                &mut pds_workers,
-                &mut worker_handles,
-                pds_endpoint,
-                unit,
-            );
         }
-        overflow = still_pending;
-
-        // Drain any completed worker handles to avoid unbounded accumulation
-        while let Some(result) = worker_handles.next().now_or_never() {
-            if let Some(Err(e)) = result {
-                tracing::warn!(error = %e, "PDS worker task panicked");
-            }
-        }
-    }
-
-    // Drain remaining overflow after the channel closes.
-    for (unit, pds_endpoint) in overflow.drain(..) {
         if cancelled.load(Ordering::Relaxed) {
             break;
         }
-        pds_workers.retain(|_, tx| !tx.is_closed());
-        if let Some(pds_tx) = pds_workers.get(&pds_endpoint) {
-            // Bounded channel, so this can block — but only until the worker
-            // consumes, and every worker in the map is running (startup is no
-            // longer gated on a permit). When it *was* gated, a worker parked
-            // waiting for a permit could never drain this queue, this send
-            // blocked forever, `pds_workers` was never dropped, and no running
-            // worker could exit to release a permit: the job deadlocked.
-            if pds_tx.send(unit).await.is_err() {
-                tracing::warn!(
-                    pds = %pds_endpoint,
-                    "PDS worker exited before taking a unit; it stays queued for the next run"
-                );
-            }
-            continue;
-        }
-        spawn_pds_worker(
+        dispatch_waiting(
             &worker_ctx,
             &mut pds_workers,
             &mut worker_handles,
-            pds_endpoint,
-            unit,
+            &mut waiting,
         );
+
+        // Drain any completed worker handles to avoid unbounded accumulation.
+        // An empty set is ready with `None`, which ends the drain rather than
+        // spinning on it.
+        while let Some(Some(result)) = worker_handles.next().now_or_never() {
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "PDS worker task panicked");
+            }
+        }
     }
 
     // Drop all PDS senders so workers know no more units are coming.
@@ -2022,6 +1977,43 @@ async fn run_pipelined_resolve_and_fetch(
         processed_repos.load(Ordering::Relaxed),
         total_records.load(Ordering::Relaxed),
     ))
+}
+
+/// Hand each PDS's waiting units to its worker until the worker's channel is
+/// full, starting a worker for a PDS that has none (or whose worker exited).
+/// Only PDSes with units waiting are visited, so a long backlog for one host
+/// costs nothing per unit received for another.
+///
+/// Never blocks: every worker starts consuming the moment it exists (see
+/// `FetchContext::requests`), and a full channel just leaves the rest waiting
+/// for the next call.
+fn dispatch_waiting(
+    template: &FetchContext,
+    workers: &mut HashMap<String, mpsc::Sender<WorkUnit>>,
+    handles: &mut FuturesUnordered<tokio::task::JoinHandle<()>>,
+    waiting: &mut HashMap<String, VecDeque<WorkUnit>>,
+) {
+    for (pds_endpoint, units) in waiting.iter_mut() {
+        while let Some(unit) = units.pop_front() {
+            let Some(pds_tx) = workers.get(pds_endpoint) else {
+                spawn_pds_worker(template, workers, handles, pds_endpoint.clone(), unit);
+                continue;
+            };
+            match pds_tx.try_send(unit) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(unit)) => {
+                    units.push_front(unit);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(unit)) => {
+                    // The worker finished; replace it.
+                    workers.remove(pds_endpoint);
+                    spawn_pds_worker(template, workers, handles, pds_endpoint.clone(), unit);
+                }
+            }
+        }
+    }
+    waiting.retain(|_, units| !units.is_empty());
 }
 
 /// Start a PDS worker with `first` already queued, and register its sender.
@@ -5194,6 +5186,46 @@ mod tests {
 
         let job = job_row(&state, &job_id).await;
         assert_eq!((job.status.as_str(), job.processed_repos), ("completed", 2));
+    }
+
+    /// One PDS, more units than its worker's channel holds, and slow fetches.
+    /// The units its worker cannot take yet wait in the dispatcher. Once the
+    /// window is full nothing new arrives to prompt a retry, so the waiting
+    /// units must be retried on their own or the job stalls.
+    #[tokio::test]
+    async fn units_waiting_on_a_busy_pds_worker_are_dispatched_without_new_arrivals() {
+        let mock = MockServer::start().await;
+        let state = pipeline_state(&mock, &[POST]).await;
+        let dids: Vec<String> = (0..151).map(|i| format!("did:plc:u{i:04}")).collect();
+        let dids: Vec<&str> = dids.iter().map(String::as_str).collect();
+        mount_relay_page(&mock, POST, None, &dids[..150], Some("c1")).await;
+        mount_relay_page(&mock, POST, Some("c1"), &dids[150..], None).await;
+        mount_plc(&mock).await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.listRecords"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"records": []}))
+                    .set_delay(Duration::from_millis(30)),
+            )
+            .expect(151)
+            .mount(&mock)
+            .await;
+
+        let job_id = create_backfill_job(&state, Some(POST), &[])
+            .await
+            .expect("create job");
+        run_to_end(&state, &job_id, 150).await;
+
+        let job = job_row(&state, &job_id).await;
+        assert_eq!(
+            (job.status.as_str(), job.processed_repos),
+            ("completed", 151)
+        );
+        assert_eq!(
+            count_for_job(&state, "happyview_backfill_queue", &job_id).await,
+            0
+        );
     }
 
     /// Review focus 2: `did:plc:a` is enqueued while the resolver is past it
