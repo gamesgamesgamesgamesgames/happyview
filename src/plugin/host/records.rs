@@ -874,12 +874,15 @@ pub async fn table_query(
 
 /// Upsert one record into the local index, bypassing the network.
 ///
-/// `indexed_at` and `cid` describe what arrived from the network, so an update
-/// leaves both alone: the stored CID describes the version the PDS holds and is
-/// what strongRefs point at, and a local edit does not change either. An insert
-/// may record a CID the caller was given by the network, and otherwise stores
-/// an empty one rather than NULL — the column is NOT NULL on both backends, and
-/// `cid_verify` already reads an empty CID as "nothing to check".
+/// This is index-only: nothing is written to a PDS, so Jetstream never echoes
+/// it back. `indexed_at` and `cid` describe what arrived from the network, so
+/// an update leaves both alone (unlike writes that will be echoed, which clear
+/// `indexed_at` so the echo re-stamps it): the stored CID describes the version
+/// the PDS holds and is what strongRefs point at, and a local edit does not
+/// change either. An insert may record a CID the caller was given by the
+/// network, and otherwise stores an empty one rather than NULL — the column is
+/// NOT NULL on both backends, and `cid_verify` already reads an empty CID as
+/// "nothing to check".
 pub async fn index_put(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
