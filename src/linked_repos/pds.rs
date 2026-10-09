@@ -147,8 +147,9 @@ async fn post_json(
 /// operation succeeded whether or not we managed to index it, and the record
 /// will be indexed anyway when Jetstream echoes it back.
 ///
-/// `indexed_at` is left alone: it is network-arrival provenance, and this
-/// record has not come back over the firehose yet. See [`crate::db::NO_INDEXED_AT`].
+/// `indexed_at` is cleared (NULL on insert and on update): it is
+/// network-arrival provenance, and this write has not come back over the
+/// firehose yet, so the echo re-stamps it. See [`crate::db::NO_INDEXED_AT`].
 ///
 /// Public so tests can exercise the statement directly. They need to: the
 /// errors are swallowed here, so a column/bind mismatch would be invisible in

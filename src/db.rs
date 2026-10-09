@@ -17,9 +17,10 @@ use std::sync::LazyLock;
 /// `indexed_at` records when a record arrived *from the network*, so only the
 /// Jetstream consumer (`record_handler`) and backfill may write it. Everything
 /// else — `Record:save()`, `save_local()`, the built-in XRPC procedure
-/// handlers, linked-repo writes — binds this on insert and omits the column
-/// from its `ON CONFLICT` branch, so a real arrival time survives an
-/// AppView-side edit.
+/// handlers, linked-repo writes — binds this on insert. Writes that Jetstream
+/// will echo back also set `indexed_at = NULL` in their `ON CONFLICT` branch,
+/// so the echo re-stamps the row; `index_put`, which is index-only and never
+/// echoed, omits the column there and keeps its existing value.
 ///
 /// It has to be an explicit NULL rather than an omitted column: SQLite still
 /// declares `indexed_at TEXT DEFAULT (datetime('now'))` while Postgres dropped

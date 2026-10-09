@@ -901,7 +901,7 @@ pub async fn index_put(
         r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (uri) DO UPDATE
-               SET record = EXCLUDED.record, indexed_at = NULL"#,
+               SET record = EXCLUDED.record"#,
         backend,
     );
     crate::db::query(&upsert_sql)
@@ -962,7 +962,8 @@ pub enum MirrorError {
 /// caller-supplied one on insert only: the PDS has just stated which version
 /// it holds, and the stored CID exists to describe exactly that, so the
 /// statement replaces whatever the row had. `indexed_at` is still the network
-/// echo's to set: bound NULL on insert, untouched on update.
+/// echo's to set: bound NULL on insert and cleared on update, so the
+/// identical echo re-stamps the row.
 pub async fn mirror_network_write(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -1747,10 +1748,10 @@ mod tests {
         assert_eq!(row.0.as_deref(), Some("cid1"));
     }
 
-    /// A local edit leaves the CID alone and clears `indexed_at`, so the
-    /// identical Jetstream echo re-stamps the row.
+    /// `index_put` is index-only and never echoed, so a local edit leaves
+    /// both columns alone.
     #[tokio::test]
-    async fn index_put_clears_indexed_at_and_leaves_the_cid_alone() {
+    async fn index_put_leaves_network_provenance_alone() {
         let pool = seeded_pool().await;
         crate::db::query(
             "UPDATE happyview_records SET indexed_at = ?, cid = ? WHERE uri = 'at://a/c/1'",
@@ -1782,7 +1783,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(row.0, None, "the identical echo must re-stamp the row");
+        assert_eq!(row.0.as_deref(), Some("2026-01-01T00:00:00Z"));
         assert_eq!(row.1.as_deref(), Some("bafyoriginal"));
     }
 
