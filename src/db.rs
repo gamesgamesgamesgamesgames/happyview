@@ -387,11 +387,60 @@ pub fn journal_size_limit_bytes() -> u64 {
     parse_journal_size_limit(std::env::var("SQLITE_JOURNAL_SIZE_LIMIT").ok().as_deref())
 }
 
+/// Parse `SQLITE_SYNCHRONOUS`. `NORMAL` is the default: in WAL mode a crash
+/// can lose the last transactions but cannot corrupt the database, and it
+/// drops the fsync SQLite's compiled-in `FULL` issues on every commit. `FULL`
+/// is there for operators who want the old durability. Anything else falls
+/// back to `NORMAL` rather than failing boot over a tuning knob.
+pub fn parse_sqlite_synchronous(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        None | Some("") => "NORMAL",
+        Some(v) if v.eq_ignore_ascii_case("NORMAL") => "NORMAL",
+        Some(v) if v.eq_ignore_ascii_case("FULL") => "FULL",
+        Some(v) => {
+            tracing::warn!(
+                value = v,
+                "SQLITE_SYNCHRONOUS must be NORMAL or FULL; using NORMAL"
+            );
+            "NORMAL"
+        }
+    }
+}
+
+/// Resolve the configured `synchronous` level from the environment.
+pub fn sqlite_synchronous() -> &'static str {
+    parse_sqlite_synchronous(std::env::var("SQLITE_SYNCHRONOUS").ok().as_deref())
+}
+
+/// Rows `ANALYZE` samples per index when `PRAGMA optimize` decides to run it.
+/// Without a limit the first optimize after an upgrade reads every index of a
+/// multi-gigabyte database in full.
+pub const SQLITE_ANALYSIS_LIMIT: u32 = 1000;
+
+/// Refresh planner statistics on the tables SQLite judges to need them.
+///
+/// `0x10002` is `0x02` (run ANALYZE where useful) plus `0x10000` (consider
+/// every table, not only those this connection has queried). The startup
+/// connection has queried nothing, so without the high bit this is a no-op.
+/// Both pragmas must share one connection: `analysis_limit` is per connection.
+pub async fn sqlite_optimize(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let limit_sql = adapt_sql(
+        &format!("PRAGMA analysis_limit = {SQLITE_ANALYSIS_LIMIT}"),
+        DatabaseBackend::Sqlite,
+    );
+    crate::db::query(&limit_sql).execute(&mut *conn).await?;
+    let optimize_sql = adapt_sql("PRAGMA optimize = 0x10002", DatabaseBackend::Sqlite);
+    crate::db::query(&optimize_sql).execute(&mut *conn).await?;
+    Ok(())
+}
+
 /// Apply per-connection SQLite pragmas to every pooled connection.
 ///
-/// `journal_size_limit` is per-connection and not persisted in the database
-/// file, so unlike `journal_mode` it cannot be set once against the pool — that
-/// would reach only whichever single connection served the statement.
+/// `journal_size_limit` and `synchronous` are per-connection and not persisted
+/// in the database file, so unlike `journal_mode` they cannot be set once
+/// against the pool — that would reach only whichever single connection served
+/// the statement.
 fn with_sqlite_pragmas(
     opts: PoolOptions<sqlx::Any>,
     backend: DatabaseBackend,
@@ -400,6 +449,7 @@ fn with_sqlite_pragmas(
         return opts;
     }
     let limit = journal_size_limit_bytes();
+    let synchronous = sqlite_synchronous();
     opts.after_connect(move |conn, _meta| {
         Box::pin(async move {
             let sql = if limit == u64::MAX {
@@ -407,7 +457,13 @@ fn with_sqlite_pragmas(
             } else {
                 format!("PRAGMA journal_size_limit = {limit}")
             };
+            let sql = adapt_sql(&sql, DatabaseBackend::Sqlite);
             crate::db::query(&sql).execute(&mut *conn).await?;
+            let sync_sql = adapt_sql(
+                &format!("PRAGMA synchronous = {synchronous}"),
+                DatabaseBackend::Sqlite,
+            );
+            crate::db::query(&sync_sql).execute(&mut *conn).await?;
             Ok(())
         })
     })
@@ -489,6 +545,12 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
 
     migrator.run(&pool).await.expect("Failed to run migrations");
 
+    if backend == DatabaseBackend::Sqlite
+        && let Err(e) = sqlite_optimize(&pool).await
+    {
+        tracing::warn!(error = %e, "PRAGMA optimize after migrations failed");
+    }
+
     pool
 }
 
@@ -505,9 +567,13 @@ pub fn sqlite_path_from_url(url: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(path))
 }
 
+/// Upper bound on the computed backfill pool size. SQLite allows one writer,
+/// and every open connection is another reader that can keep the WAL from
+/// rewinding, so its pool stays small; `BACKFILL_DATABASE_MAX_CONNECTIONS`
+/// still overrides it.
 pub fn backfill_pool_ceiling(backend: DatabaseBackend) -> u32 {
     match backend {
-        DatabaseBackend::Sqlite => 64,
+        DatabaseBackend::Sqlite => 16,
         DatabaseBackend::Postgres => 256,
     }
 }
@@ -1032,7 +1098,7 @@ mod tests {
 
     #[test]
     fn backfill_pool_ceiling_values() {
-        assert_eq!(backfill_pool_ceiling(DatabaseBackend::Sqlite), 64);
+        assert_eq!(backfill_pool_ceiling(DatabaseBackend::Sqlite), 16);
         assert_eq!(backfill_pool_ceiling(DatabaseBackend::Postgres), 256);
     }
 
@@ -1041,7 +1107,7 @@ mod tests {
         let needed = needed_backfill_connections(10, 3, 100);
         let capped = needed.min(backfill_pool_ceiling(DatabaseBackend::Sqlite));
         assert_eq!(needed, 134);
-        assert_eq!(capped, 64);
+        assert_eq!(capped, 16);
     }
 
     #[test]
@@ -1169,6 +1235,124 @@ mod tests {
                 "journal_size_limit pragma did not reach a pooled connection"
             );
         }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    // -----------------------------------------------------------------------
+    // synchronous
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sqlite_synchronous_defaults_to_normal() {
+        assert_eq!(parse_sqlite_synchronous(None), "NORMAL");
+        assert_eq!(parse_sqlite_synchronous(Some("")), "NORMAL");
+        assert_eq!(parse_sqlite_synchronous(Some("normal")), "NORMAL");
+    }
+
+    #[test]
+    fn sqlite_synchronous_allows_full() {
+        assert_eq!(parse_sqlite_synchronous(Some("FULL")), "FULL");
+        assert_eq!(parse_sqlite_synchronous(Some(" full ")), "FULL");
+    }
+
+    #[test]
+    fn sqlite_synchronous_rejects_other_levels() {
+        // OFF can corrupt the database on power loss and EXTRA buys nothing
+        // over FULL in WAL mode, so neither is offered.
+        assert_eq!(parse_sqlite_synchronous(Some("OFF")), "NORMAL");
+        assert_eq!(parse_sqlite_synchronous(Some("banana")), "NORMAL");
+    }
+
+    async fn synchronous_on_every_connection(env_value: Option<&str>) -> Vec<i64> {
+        let path = std::env::temp_dir().join(format!("hv-sync-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+
+        // SAFETY: callers are `#[serial]`; nothing else reads or writes this
+        // variable concurrently.
+        unsafe {
+            match env_value {
+                Some(v) => std::env::set_var("SQLITE_SYNCHRONOUS", v),
+                None => std::env::remove_var("SQLITE_SYNCHRONOUS"),
+            }
+        }
+        let pool = connect(&url, DatabaseBackend::Sqlite).await;
+        unsafe {
+            std::env::remove_var("SQLITE_SYNCHRONOUS");
+        }
+
+        let mut conns = Vec::new();
+        for _ in 0..4 {
+            conns.push(pool.acquire().await.expect("failed to acquire connection"));
+        }
+        let mut levels = Vec::new();
+        for mut conn in conns {
+            let (level,): (i64,) = crate::db::query_as("PRAGMA synchronous")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("failed to read synchronous");
+            levels.push(level);
+        }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        levels
+    }
+
+    /// `PRAGMA synchronous` reads back 1 for NORMAL and 2 for FULL.
+    #[tokio::test]
+    #[serial]
+    async fn synchronous_normal_reaches_pooled_connections() {
+        assert_eq!(
+            synchronous_on_every_connection(None).await,
+            vec![1, 1, 1, 1]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn synchronous_full_reaches_pooled_connections() {
+        assert_eq!(
+            synchronous_on_every_connection(Some("FULL")).await,
+            vec![2, 2, 2, 2]
+        );
+    }
+
+    /// `PRAGMA optimize` with the "every table" bit analyzes a table this
+    /// connection never queried, which is the startup case.
+    #[tokio::test]
+    #[serial]
+    async fn optimize_writes_planner_statistics() {
+        let path = std::env::temp_dir().join(format!("hv-optimize-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = connect(&url, DatabaseBackend::Sqlite).await;
+
+        for i in 0..200 {
+            crate::db::query(
+                "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+                 VALUES (?, 'did:plc:opt', 'app.test.post', ?, '{}', 'bafyreitestcid', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+            )
+            .bind(format!("at://did:plc:opt/app.test.post/{i}"))
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .expect("seed record");
+        }
+
+        sqlite_optimize(&pool).await.expect("optimize");
+
+        let (rows,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'happyview_records'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("sqlite_stat1 should exist after optimize");
+        assert!(rows > 0, "optimize did not analyze happyview_records");
 
         drop(pool);
         let _ = std::fs::remove_file(&path);
