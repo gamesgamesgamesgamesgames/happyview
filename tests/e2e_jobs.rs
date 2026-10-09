@@ -465,6 +465,25 @@ async fn job_row(app: &TestApp, id: &str) -> (String, Option<String>, Option<Str
         .expect("job_row: select failed")
 }
 
+/// When a job ran, as the worker recorded it. Both columns are written with
+/// the same `now_rfc3339()`, so they are UTC at a fixed offset and compare
+/// lexicographically.
+async fn job_window(app: &TestApp, id: &str) -> (String, String) {
+    let sql = adapt_sql(
+        "SELECT started_at, completed_at FROM happyview_jobs WHERE id = ?",
+        app.state.db_backend,
+    );
+    let row = happyview::db::query_as::<(Option<String>, Option<String>)>(&sql)
+        .bind(id)
+        .fetch_one(&app.state.db)
+        .await
+        .expect("job_window: select failed");
+    (
+        row.0.expect("a job that ran records a start"),
+        row.1.expect("a job that finished records an end"),
+    )
+}
+
 /// Poll until the job leaves the pending/running states, or time out.
 async fn await_terminal_status(
     app: &TestApp,
@@ -544,36 +563,36 @@ async fn two_workers_run_two_jobs_at_once() {
         .register(echo_interpreter::plugin("lua"))
         .await;
 
-    // Each job burns guest CPU for about three seconds, so a single worker
-    // could never have both running at the same moment.
+    // Each job burns guest CPU for about three seconds, so two jobs whose
+    // recorded intervals overlap can only have been running at once.
     let burn = burn::calibrate(&app.state, "interpreter_echo").await;
     seed_script(&app, "job.run:test.slow", &burn.source()).await;
     let a = seed_job(&app, "test.slow", "pending").await;
     let b = seed_job(&app, "test.slow", "pending").await;
 
     let workers = happyview::jobs::worker::spawn_workers(app.state.clone(), 2);
-
-    // Watch for up to ten seconds. A single worker can never show both jobs
-    // running at once however long it is watched, so the window only has to
-    // outlast a slow runner's start-up, not match the burn.
-    let mut both_running = false;
-    for _ in 0..100 {
-        let (sa, _, _) = job_row(&app, &a).await;
-        let (sb, _, _) = job_row(&app, &b).await;
-        if sa == "running" && sb == "running" {
-            both_running = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    let (status_a, _, error_a) = await_terminal_status(&app, &a).await;
+    let (status_b, _, error_b) = await_terminal_status(&app, &b).await;
     for w in &workers {
         w.abort();
     }
 
     assert_eq!(workers.len(), 2);
+    assert_eq!(status_a, "completed", "job a: {error_a:?}");
+    assert_eq!(status_b, "completed", "job b: {error_b:?}");
+
+    // Concurrency is read off the two recorded intervals rather than caught in
+    // the act. Polling for both rows to say `running` has to be scheduled
+    // during the overlap, and it competes for threads and pool connections
+    // with the two burning guests it is watching -- so a runner slow enough
+    // wakes it after both jobs are done and it reports a concurrency failure
+    // that never happened.
+    let (a_start, a_end) = job_window(&app, &a).await;
+    let (b_start, b_end) = job_window(&app, &b).await;
     assert!(
-        both_running,
-        "expected both jobs to be running concurrently"
+        a_start < b_end && b_start < a_end,
+        "the jobs ran one after the other, not at once: \
+         a {a_start}..{a_end}, b {b_start}..{b_end}"
     );
 }
 

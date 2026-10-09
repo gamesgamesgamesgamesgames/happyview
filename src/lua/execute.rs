@@ -286,6 +286,7 @@ pub async fn execute_procedure_script(
         backend,
         method,
         &crate::script::encoding::of_output(lexicon),
+        &crate::script::response::declared_errors(lexicon),
         json_value,
     )
     .await?;
@@ -404,6 +405,7 @@ pub async fn execute_query_script(
         backend,
         method,
         &crate::script::encoding::of_output(lexicon),
+        &crate::script::response::declared_errors(lexicon),
         json_value,
     )
     .await?;

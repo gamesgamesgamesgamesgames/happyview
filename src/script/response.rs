@@ -10,6 +10,9 @@
 //! a response that legitimately contains a blob ref in one of its fields
 //! cannot be mistaken for a request to serve that blob.
 
+use std::collections::BTreeSet;
+
+use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -18,6 +21,7 @@ use crate::blobs;
 use crate::cid_verify::BYTES_B64;
 use crate::db::DatabaseBackend;
 use crate::error::{AppError, ScriptErrorType};
+use crate::lexicon::ParsedLexicon;
 use crate::script::encoding::Encoding;
 
 /// What the script asked for, read from its return value and before any
@@ -41,6 +45,11 @@ enum Payload {
 #[derive(Debug)]
 pub enum ScriptResponse {
     Json(Value),
+    /// An error the method's lexicon declares. JSON like any other answer, but
+    /// at 400: every atproto client decides whether a call failed from the
+    /// status before it looks at the body, so a refusal at 200 is read as a
+    /// successful response that happens to contain an `error` field.
+    Failure(Value),
     Bytes {
         bytes: Vec<u8>,
         content_type: String,
@@ -55,7 +64,7 @@ impl ScriptResponse {
     /// request, for a payload nobody reads out of a log row.
     pub fn log_detail(&self) -> Value {
         match self {
-            ScriptResponse::Json(value) => value.clone(),
+            ScriptResponse::Json(value) | ScriptResponse::Failure(value) => value.clone(),
             ScriptResponse::Bytes {
                 bytes,
                 content_type,
@@ -66,7 +75,7 @@ impl ScriptResponse {
 
     pub fn response_size(&self) -> usize {
         match self {
-            ScriptResponse::Json(value) => value.to_string().len(),
+            ScriptResponse::Json(value) | ScriptResponse::Failure(value) => value.to_string().len(),
             ScriptResponse::Bytes { bytes, .. } => bytes.len(),
         }
     }
@@ -74,6 +83,9 @@ impl ScriptResponse {
     pub fn into_response(self) -> Response {
         match self {
             ScriptResponse::Json(value) => axum::Json(value).into_response(),
+            ScriptResponse::Failure(value) => {
+                (StatusCode::BAD_REQUEST, axum::Json(value)).into_response()
+            }
             ScriptResponse::Bytes {
                 bytes,
                 content_type,
@@ -95,6 +107,33 @@ fn is_failure(value: &Value) -> bool {
         return false;
     }
     object.get("$type").and_then(Value::as_str) != Some("blob") && !object.contains_key("$bytes")
+}
+
+/// The error names `defs.main.errors` declares. A refusal is recognised by the
+/// lexicon naming it, not by the value's shape alone -- the same reason the
+/// encoding decides JSON against bytes.
+pub fn declared_errors(lexicon: &ParsedLexicon) -> BTreeSet<String> {
+    lexicon
+        .raw
+        .pointer("/defs/main/errors")
+        .and_then(Value::as_array)
+        .map(|errors| {
+            errors
+                .iter()
+                .filter_map(|error| error.get("name").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a value is a refusal naming an error this method declares.
+fn declared_failure(value: &Value, declared: &BTreeSet<String>) -> bool {
+    is_failure(value)
+        && value
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|name| declared.contains(name))
 }
 
 fn refuse(method: &str, message: impl Into<String>) -> AppError {
@@ -162,14 +201,22 @@ pub async fn resolve(
     backend: DatabaseBackend,
     method: &str,
     encoding: &Encoding,
+    declared_errors: &BTreeSet<String>,
     value: Value,
 ) -> Result<ScriptResponse, AppError> {
+    // A refusal answers JSON whatever the success encoding is, which is how
+    // `com.atproto.sync.getBlob` behaves: it declares `*/*` and still answers
+    // `BlobNotFound` as JSON at 400.
+    if declared_failure(&value, declared_errors) {
+        return Ok(ScriptResponse::Failure(value));
+    }
+
     let Encoding::Json = encoding else {
-        // An error is JSON whatever the success encoding is, which is how
-        // `com.atproto.sync.getBlob` behaves: it declares `*/*` and still
-        // answers `BlobNotFound` as JSON. Without this a `*/*` method has no
-        // way to say "not found" at all -- a script's structured failure is a
-        // table, and the byte forms below would refuse it.
+        // A refusal the lexicon does not declare still cannot be bytes, so it
+        // keeps the 200 it has always answered rather than being refused by
+        // the byte forms below: a script's failure is a table, and naming an
+        // error the lexicon omits is a reason to fix the lexicon, not to turn
+        // the method into a 500.
         if is_failure(&value) {
             return Ok(ScriptResponse::Json(value));
         }
@@ -218,6 +265,14 @@ mod tests {
 
     const METHOD: &str = "at.example.getThing";
 
+    fn no_errors() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    fn declaring(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
     fn blob_ref(cid: &str, mime: Option<&str>) -> Value {
         let mut value = json!({ "$type": "blob", "ref": { "$link": cid } });
         if let Some(mime) = mime {
@@ -240,14 +295,19 @@ mod tests {
             json!({ "$bytes": "aGk=", "mimeType": "text/plain" }),
             json!({ "avatar": blob_ref("bafkreibogus", Some("image/png")) }),
         ] {
-            let answer = resolve(&pool, backend, METHOD, &Encoding::Json, value.clone())
-                .await
-                .expect("a JSON method should answer");
+            let answer = resolve(
+                &pool,
+                backend,
+                METHOD,
+                &Encoding::Json,
+                &no_errors(),
+                value.clone(),
+            )
+            .await
+            .expect("a JSON method should answer");
             match answer {
                 ScriptResponse::Json(passed) => assert_eq!(passed, value),
-                ScriptResponse::Bytes { .. } => {
-                    panic!("a json-declared method answered with bytes: {value}")
-                }
+                other => panic!("a json-declared method answered {other:?}: {value}"),
             }
         }
     }
@@ -260,9 +320,16 @@ mod tests {
             .await
             .expect("store");
 
-        let answer = resolve(&pool, backend, METHOD, &Encoding::Any, blob_ref(&cid, None))
-            .await
-            .expect("serve");
+        let answer = resolve(
+            &pool,
+            backend,
+            METHOD,
+            &Encoding::Any,
+            &no_errors(),
+            blob_ref(&cid, None),
+        )
+        .await
+        .expect("serve");
 
         match answer {
             ScriptResponse::Bytes {
@@ -276,7 +343,7 @@ mod tests {
                 assert_eq!(content_type, "application/wasm");
                 assert_eq!(served.as_deref(), Some(cid.as_str()));
             }
-            ScriptResponse::Json(_) => panic!("expected bytes"),
+            other => panic!("expected bytes, got {other:?}"),
         }
     }
 
@@ -288,6 +355,7 @@ mod tests {
             DatabaseBackend::Sqlite,
             METHOD,
             &Encoding::Any,
+            &no_errors(),
             json!({ "$bytes": "aGVsbG8=", "mimeType": "text/plain" }),
         )
         .await
@@ -303,7 +371,7 @@ mod tests {
                 assert_eq!(content_type, "text/plain");
                 assert!(cid.is_none(), "inline bytes came from no row");
             }
-            ScriptResponse::Json(_) => panic!("expected bytes"),
+            other => panic!("expected bytes, got {other:?}"),
         }
     }
 
@@ -317,6 +385,7 @@ mod tests {
             DatabaseBackend::Sqlite,
             METHOD,
             &Encoding::Fixed("application/wasm".into()),
+            &no_errors(),
             json!({ "$bytes": "aGk=", "mimeType": "text/plain" }),
         )
         .await
@@ -326,7 +395,7 @@ mod tests {
             ScriptResponse::Bytes { content_type, .. } => {
                 assert_eq!(content_type, "application/wasm")
             }
-            ScriptResponse::Json(_) => panic!("expected bytes"),
+            other => panic!("expected bytes, got {other:?}"),
         }
     }
 
@@ -345,9 +414,16 @@ mod tests {
         ];
 
         for (value, expected) in cases {
-            let error = resolve(&pool, backend, METHOD, &Encoding::Any, value.clone())
-                .await
-                .expect_err(&format!("{value} should be refused"));
+            let error = resolve(
+                &pool,
+                backend,
+                METHOD,
+                &Encoding::Any,
+                &no_errors(),
+                value.clone(),
+            )
+            .await
+            .expect_err(&format!("{value} should be refused"));
             match error {
                 AppError::ScriptError { message, .. } => assert!(
                     message.contains(expected),
@@ -366,6 +442,7 @@ mod tests {
             DatabaseBackend::Sqlite,
             METHOD,
             &Encoding::Any,
+            &no_errors(),
             blob_ref("bafkreinotstored", Some("application/wasm")),
         )
         .await
@@ -392,13 +469,32 @@ mod tests {
                 DatabaseBackend::Sqlite,
                 METHOD,
                 &encoding,
+                &declaring(&["ReleaseNotFound"]),
                 failure.clone(),
             )
             .await
             .expect("a failure should answer");
             match answer {
+                ScriptResponse::Failure(value) => assert_eq!(value, failure),
+                other => panic!("a declared failure answered as {other:?}"),
+            }
+
+            // The lexicon not declaring it is a reason to fix the lexicon, not
+            // to refuse the method: it keeps the 200 it has always answered
+            // rather than failing the byte checks below.
+            let answer = resolve(
+                &pool,
+                DatabaseBackend::Sqlite,
+                METHOD,
+                &encoding,
+                &no_errors(),
+                failure.clone(),
+            )
+            .await
+            .expect("an undeclared failure should still answer");
+            match answer {
                 ScriptResponse::Json(value) => assert_eq!(value, failure),
-                ScriptResponse::Bytes { .. } => panic!("a failure was sent as bytes"),
+                other => panic!("an undeclared failure answered as {other:?}"),
             }
         }
     }
@@ -416,23 +512,77 @@ mod tests {
 
         let mut blob = blob_ref(&cid, Some("application/wasm"));
         blob["error"] = json!("a field of the payload, not a refusal");
-        match resolve(&pool, backend, METHOD, &Encoding::Any, blob)
+        let declared = declaring(&["a field of the payload, not a refusal"]);
+        match resolve(&pool, backend, METHOD, &Encoding::Any, &declared, blob)
             .await
             .expect("serve")
         {
             ScriptResponse::Bytes { bytes, .. } => assert_eq!(bytes, b"\x00\x01wasm"),
-            ScriptResponse::Json(_) => panic!("a blob ref was read as a refusal"),
+            other => panic!("a blob ref was read as {other:?}, not bytes"),
         }
 
         let inline =
             json!({ "$bytes": "aGk=", "mimeType": "text/plain", "error": "not a refusal" });
-        match resolve(&pool, backend, METHOD, &Encoding::Any, inline)
-            .await
-            .expect("serve")
+        match resolve(
+            &pool,
+            backend,
+            METHOD,
+            &Encoding::Any,
+            &declaring(&["not a refusal"]),
+            inline,
+        )
+        .await
+        .expect("serve")
         {
             ScriptResponse::Bytes { bytes, .. } => assert_eq!(bytes, b"hi"),
-            ScriptResponse::Json(_) => panic!("$bytes was read as a refusal"),
+            other => panic!("$bytes was read as {other:?}, not bytes"),
         }
+    }
+
+    /// The status is the whole point: every atproto client reads it before the
+    /// body, so a refusal rendered at 200 is indistinguishable from an answer
+    /// that happens to carry an `error` field. Asserting the variant alone
+    /// would pass with `into_response` still answering 200.
+    #[test]
+    fn a_refusal_renders_at_400_and_an_answer_at_200() {
+        let failure = json!({ "error": "ReleaseNotFound", "message": "no such release" });
+
+        let response = ScriptResponse::Failure(failure.clone()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = ScriptResponse::Json(failure).into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The lexicon is the contract, so the names come from it rather than from
+    /// a guess about which strings look like errors.
+    #[test]
+    fn the_declared_errors_are_read_off_the_lexicon() {
+        let parse = |main: Value| {
+            ParsedLexicon::parse(
+                json!({ "lexicon": 1, "id": "at.example.getThing", "defs": { "main": main } }),
+                1,
+                None,
+                crate::lexicon::ProcedureAction::Create,
+                None,
+            )
+            .expect("the fixture lexicon should parse")
+        };
+
+        let declared = declared_errors(&parse(json!({
+            "type": "query",
+            "errors": [{ "name": "ReleaseNotFound" }, { "name": "ArtifactNotHeld" }],
+        })));
+        assert_eq!(
+            declared,
+            declaring(&["ArtifactNotHeld", "ReleaseNotFound"]),
+            "both declared names should be read"
+        );
+
+        assert!(
+            declared_errors(&parse(json!({ "type": "query" }))).is_empty(),
+            "a lexicon declaring no errors should yield none"
+        );
     }
 
     /// The event log must not carry the payload. A megabyte of base64 per
