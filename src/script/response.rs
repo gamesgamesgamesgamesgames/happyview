@@ -83,6 +83,20 @@ impl ScriptResponse {
     }
 }
 
+/// Whether a returned value is a script's structured failure rather than an
+/// answer: an object carrying a string `error`, and neither of the byte forms.
+/// Both tests matter -- a blob ref or a `$bytes` table could carry a field
+/// called `error` of its own, and that is a payload, not a refusal.
+fn is_failure(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if !object.get("error").is_some_and(Value::is_string) {
+        return false;
+    }
+    object.get("$type").and_then(Value::as_str) != Some("blob") && !object.contains_key("$bytes")
+}
+
 fn refuse(method: &str, message: impl Into<String>) -> AppError {
     AppError::ScriptError {
         error_type: ScriptErrorType::Runtime,
@@ -151,6 +165,15 @@ pub async fn resolve(
     value: Value,
 ) -> Result<ScriptResponse, AppError> {
     let Encoding::Json = encoding else {
+        // An error is JSON whatever the success encoding is, which is how
+        // `com.atproto.sync.getBlob` behaves: it declares `*/*` and still
+        // answers `BlobNotFound` as JSON. Without this a `*/*` method has no
+        // way to say "not found" at all -- a script's structured failure is a
+        // table, and the byte forms below would refuse it.
+        if is_failure(&value) {
+            return Ok(ScriptResponse::Json(value));
+        }
+
         let payload = payload(method, &value)?;
 
         let (bytes, stored_type, cid) = match payload {
@@ -352,6 +375,64 @@ mod tests {
             matches!(error, AppError::NotFound(_)),
             "expected a not-found, got {error:?}"
         );
+    }
+
+    /// A `*/*` method has to be able to say "not found". `getBlob` declares
+    /// `*/*` and answers `BlobNotFound` as JSON, so a structured failure is
+    /// passed through rather than refused for not being bytes.
+    #[tokio::test]
+    async fn a_byte_method_can_still_answer_a_structured_failure() {
+        let pool = migrated_memory_pool().await;
+        let failure =
+            json!({ "error": "ReleaseNotFound", "message": "no release at that version" });
+
+        for encoding in [Encoding::Any, Encoding::Fixed("application/wasm".into())] {
+            let answer = resolve(
+                &pool,
+                DatabaseBackend::Sqlite,
+                METHOD,
+                &encoding,
+                failure.clone(),
+            )
+            .await
+            .expect("a failure should answer");
+            match answer {
+                ScriptResponse::Json(value) => assert_eq!(value, failure),
+                ScriptResponse::Bytes { .. } => panic!("a failure was sent as bytes"),
+            }
+        }
+    }
+
+    /// The two tests are both needed: a payload may legitimately carry a field
+    /// called `error`, and reading that as a refusal would send JSON where a
+    /// caller asked for bytes.
+    #[tokio::test]
+    async fn a_byte_payload_carrying_an_error_field_is_still_bytes() {
+        let pool = migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        let cid = crate::blobs::put(&pool, backend, b"\x00\x01wasm", "application/wasm")
+            .await
+            .expect("store");
+
+        let mut blob = blob_ref(&cid, Some("application/wasm"));
+        blob["error"] = json!("a field of the payload, not a refusal");
+        match resolve(&pool, backend, METHOD, &Encoding::Any, blob)
+            .await
+            .expect("serve")
+        {
+            ScriptResponse::Bytes { bytes, .. } => assert_eq!(bytes, b"\x00\x01wasm"),
+            ScriptResponse::Json(_) => panic!("a blob ref was read as a refusal"),
+        }
+
+        let inline =
+            json!({ "$bytes": "aGk=", "mimeType": "text/plain", "error": "not a refusal" });
+        match resolve(&pool, backend, METHOD, &Encoding::Any, inline)
+            .await
+            .expect("serve")
+        {
+            ScriptResponse::Bytes { bytes, .. } => assert_eq!(bytes, b"hi"),
+            ScriptResponse::Json(_) => panic!("$bytes was read as a refusal"),
+        }
     }
 
     /// The event log must not carry the payload. A megabyte of base64 per
