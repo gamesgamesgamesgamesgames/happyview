@@ -86,6 +86,63 @@ pub fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// Attempts `retry_on_busy` makes before giving the error back.
+pub const BUSY_RETRY_ATTEMPTS: u32 = 3;
+
+/// Whether a write failed only because another writer held the lock, which a
+/// short wait can fix: SQLite `BUSY`/`LOCKED` under any extended code once the
+/// busy timeout has run out, and Postgres serialization failures and
+/// deadlocks. Everything else is final.
+pub fn is_retryable_write_error(e: &sqlx::Error) -> bool {
+    let Some(db) = e.as_database_error() else {
+        return false;
+    };
+    let Some(code) = db.code() else {
+        return false;
+    };
+    if db.try_downcast_ref::<sqlx::sqlite::SqliteError>().is_some() {
+        // Extended result codes keep the primary code in the low byte.
+        return code.parse::<i32>().is_ok_and(|c| matches!(c & 0xff, 5 | 6));
+    }
+    matches!(code.as_ref(), "40001" | "40P01")
+}
+
+/// Run a write, retrying up to `BUSY_RETRY_ATTEMPTS` times with backoff while
+/// it fails retryably. The final error is returned for the caller to log;
+/// nothing is swallowed here.
+pub async fn retry_on_busy<T, F, Fut>(mut op: F) -> Result<T, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    let mut attempt: u32 = 1;
+    loop {
+        match op().await {
+            Err(e) if attempt < BUSY_RETRY_ATTEMPTS && is_retryable_write_error(&e) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// The `WHERE` of `ON CONFLICT (uri) DO UPDATE`, so an upsert leaves a row
+/// alone when neither its CID nor its body changed. That avoids rewriting the
+/// row and its indexes, and keeps its original `indexed_at`. A stored row with
+/// no `indexed_at` (one written locally, before the network echoed it) always
+/// updates, so the echo stamps it.
+pub fn record_changed_clause(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Sqlite => {
+            "happyview_records.cid IS NOT excluded.cid OR happyview_records.record IS NOT excluded.record OR happyview_records.indexed_at IS NULL"
+        }
+        DatabaseBackend::Postgres => {
+            "happyview_records.cid IS DISTINCT FROM excluded.cid OR happyview_records.record IS DISTINCT FROM excluded.record OR happyview_records.indexed_at IS NULL"
+        }
+    }
+}
+
 /// Database backend type, auto-detected from DATABASE_URL or set via DATABASE_BACKEND.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -811,6 +868,85 @@ mod tests {
         assert_eq!(escape_like("a%b_c"), "a\\%b\\_c");
         // Backslash is escaped first so it can't form a spurious escape sequence.
         assert_eq!(escape_like("a\\%"), "a\\\\\\%");
+    }
+
+    // -----------------------------------------------------------------------
+    // retry_on_busy
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_busy_write_is_retried_until_the_lock_clears() {
+        sqlx::any::install_default_drivers();
+        let path = std::env::temp_dir().join(format!("hv-busy-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let holder_pool = PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect holder");
+        crate::db::query("PRAGMA journal_mode = WAL")
+            .execute(&holder_pool)
+            .await
+            .expect("enable WAL");
+        crate::db::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&holder_pool)
+            .await
+            .expect("create table");
+        // A second pool that never waits on a lock, so a held write lock
+        // surfaces as SQLITE_BUSY at once.
+        let writer = PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    crate::db::query("PRAGMA busy_timeout = 0")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect writer");
+
+        let mut holder = holder_pool.acquire().await.expect("acquire holder");
+        crate::db::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .expect("take the write lock");
+
+        let err = crate::db::query("INSERT INTO t (id) VALUES (1)")
+            .execute(&writer)
+            .await
+            .expect_err("the write lock is held");
+        assert!(is_retryable_write_error(&err), "{err}");
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            crate::db::query("COMMIT")
+                .execute(&mut *holder)
+                .await
+                .expect("release the write lock");
+        });
+
+        retry_on_busy(|| crate::db::query("INSERT INTO t (id) VALUES (1)").execute(&writer))
+            .await
+            .expect("the retried write lands once the lock clears");
+        release.await.expect("release task");
+
+        let dup = crate::db::query("INSERT INTO t (id) VALUES (1)")
+            .execute(&writer)
+            .await
+            .expect_err("duplicate key");
+        assert!(
+            !is_retryable_write_error(&dup),
+            "a constraint failure is final: {dup}"
+        );
+
+        drop(writer);
+        drop(holder_pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     // -----------------------------------------------------------------------

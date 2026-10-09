@@ -151,60 +151,59 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
 
             let now = now_rfc3339();
             let backend = state.db_backend;
-            let insert_sql = adapt_sql(
-                r#"
-                INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (uri) DO UPDATE
-                    SET record = EXCLUDED.record,
-                        cid = EXCLUDED.cid,
-                        indexed_at = ?
-                "#,
+            let record_json = serde_json::to_string(&rec_to_store).unwrap_or_default();
+            let upsert_sql = adapt_sql(
+                &format!(
+                    "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+                     ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at \
+                     WHERE {}",
+                    crate::db::record_changed_clause(backend)
+                ),
                 backend,
             );
-            match crate::db::query(&insert_sql)
-                .bind(&uri)
-                .bind(&record.did)
-                .bind(&record.collection)
-                .bind(&record.rkey)
-                .bind(serde_json::to_string(&rec_to_store).unwrap_or_default())
-                .bind(cid)
-                .bind(&now)
-                .bind(&now)
-                .bind(&now)
-                .execute(db)
-                .await
-            {
-                Ok(_) => {
-                    let _ = crate::record_refs::sync_refs(
-                        db,
-                        &uri,
-                        &record.collection,
-                        &rec_to_store,
-                        backend,
-                    )
-                    .await;
-
-                    if state.verbose_event_logging.load(Ordering::Relaxed) {
-                        log_event(
-                            db,
-                            EventLog {
-                                event_type: "record.created".to_string(),
-                                severity: Severity::Info,
-                                actor_did: None,
-                                subject: Some(uri.clone()),
-                                detail: serde_json::json!({
-                                    "collection": record.collection,
-                                    "did": record.did,
-                                    "rkey": record.rkey,
-                                }),
-                            },
-                            backend,
-                        )
-                        .await;
+            let written = crate::db::retry_on_busy(|| {
+                upsert_record_and_refs(
+                    db,
+                    &upsert_sql,
+                    &uri,
+                    record,
+                    &record_json,
+                    cid,
+                    &now,
+                    &rec_to_store,
+                    backend,
+                )
+            })
+            .await;
+            match written {
+                Ok(changed) => {
+                    // An identical redelivery changed nothing, so there is
+                    // nothing new to log or to fetch labels for.
+                    if changed {
+                        if state.verbose_event_logging.load(Ordering::Relaxed) {
+                            log_event(
+                                db,
+                                EventLog {
+                                    event_type: "record.created".to_string(),
+                                    severity: Severity::Info,
+                                    actor_did: None,
+                                    subject: Some(uri.clone()),
+                                    detail: serde_json::json!({
+                                        "collection": record.collection,
+                                        "did": record.did,
+                                        "rkey": record.rkey,
+                                    }),
+                                },
+                                backend,
+                            )
+                            .await;
+                        }
+                        crate::labeler::backfill_labels_for_uri(
+                            Arc::new(state.clone()),
+                            uri.clone(),
+                        );
                     }
-
-                    crate::labeler::backfill_labels_for_uri(Arc::new(state.clone()), uri.clone());
                     RecordOutcome::Matched
                 }
                 Err(e) => {
@@ -273,7 +272,9 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
             }
 
             let delete_sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-            match crate::db::query(&delete_sql).bind(&uri).execute(db).await {
+            match crate::db::retry_on_busy(|| crate::db::query(&delete_sql).bind(&uri).execute(db))
+                .await
+            {
                 Ok(_) => {
                     if state.verbose_event_logging.load(Ordering::Relaxed) {
                         log_event(
@@ -320,6 +321,43 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
         }
         _ => RecordOutcome::Errored,
     }
+}
+
+/// Upsert one record and, only when the stored row changed, its refs, in one
+/// transaction: one commit per record, and a refs failure cannot leave a
+/// record without them. Returns whether the row was inserted or changed.
+#[allow(clippy::too_many_arguments)]
+async fn upsert_record_and_refs(
+    db: &sqlx::AnyPool,
+    upsert_sql: &str,
+    uri: &str,
+    event: &RecordEvent,
+    record_json: &str,
+    cid: &str,
+    now: &str,
+    rec_to_store: &Value,
+    backend: crate::db::DatabaseBackend,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = db.begin().await?;
+    let changed = crate::db::query(upsert_sql)
+        .bind(uri)
+        .bind(&event.did)
+        .bind(&event.collection)
+        .bind(&event.rkey)
+        .bind(record_json)
+        .bind(cid)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        > 0;
+    if changed {
+        crate::record_refs::sync_refs_in(&mut tx, uri, &event.collection, rec_to_store, backend)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(changed)
 }
 
 /// Handle a `com.atproto.lexicon.schema` record event for tracked network lexicons.
@@ -413,7 +451,15 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
         "delete" => {
             // Remove from lexicons table and registry.
             let delete_sql = adapt_sql("DELETE FROM happyview_lexicons WHERE id = ?", backend);
-            let _ = crate::db::query(&delete_sql).bind(nsid).execute(db).await;
+            if let Err(e) =
+                crate::db::retry_on_busy(|| crate::db::query(&delete_sql).bind(nsid).execute(db))
+                    .await
+            {
+                // The registry keeps the lexicon too, so it and the table
+                // cannot disagree; the next delete event retries.
+                tracing::error!(nsid, error = %e, "failed to delete network lexicon from event");
+                return;
+            }
 
             let was_present = lexicons.remove(nsid).await;
             if was_present {
@@ -521,19 +567,7 @@ mod tests {
         }
 
         let state = test_state_with_pool(pool);
-        let parsed = ParsedLexicon::parse(
-            serde_json::json!({
-                "lexicon": 1,
-                "id": NSID,
-                "defs": {"main": {"type": "record", "key": "tid"}},
-            }),
-            1,
-            Some(NSID.to_string()),
-            ProcedureAction::Upsert,
-            None,
-        )
-        .expect("parse test lexicon");
-        state.lexicons.upsert(parsed).await;
+        register_tracked_lexicon(&state).await;
         state
     }
 
@@ -585,6 +619,221 @@ mod tests {
             record: Some(serde_json::json!({"text": "hello"})),
             cid: None,
         }
+    }
+
+    /// `tracked_state` on the real migrated schema, which the refs tests need:
+    /// `tracked_state`'s hand-written `happyview_record_refs` has no
+    /// `collection` column.
+    async fn migrated_tracked_state() -> AppState {
+        let state = test_state_with_pool(crate::test_support::migrated_memory_pool().await);
+        register_tracked_lexicon(&state).await;
+        state
+    }
+
+    async fn register_tracked_lexicon(state: &AppState) {
+        let parsed = ParsedLexicon::parse(
+            serde_json::json!({
+                "lexicon": 1,
+                "id": NSID,
+                "defs": {"main": {"type": "record", "key": "tid"}},
+            }),
+            1,
+            Some(NSID.to_string()),
+            ProcedureAction::Upsert,
+            None,
+        )
+        .expect("parse test lexicon");
+        state.lexicons.upsert(parsed).await;
+    }
+
+    fn create_with(rkey: &str, body: serde_json::Value) -> RecordEvent {
+        RecordEvent {
+            did: "did:plc:abc".to_string(),
+            collection: NSID.to_string(),
+            rkey: rkey.to_string(),
+            action: "create".to_string(),
+            record: Some(body),
+            cid: None,
+        }
+    }
+
+    async fn indexed_at(state: &AppState, uri: &str) -> Option<String> {
+        let sql = adapt_sql(
+            "SELECT indexed_at FROM happyview_records WHERE uri = ?",
+            state.db_backend,
+        );
+        let (at,): (Option<String>,) = crate::db::query_as(&sql)
+            .bind(uri)
+            .fetch_one(&state.db)
+            .await
+            .expect("read indexed_at");
+        at
+    }
+
+    async fn clear_indexed_at(state: &AppState, uri: &str) {
+        let sql = adapt_sql(
+            "UPDATE happyview_records SET indexed_at = NULL WHERE uri = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(uri)
+            .execute(&state.db)
+            .await
+            .expect("clear indexed_at");
+    }
+
+    async fn ref_count(state: &AppState, uri: &str) -> i64 {
+        let sql = adapt_sql(
+            "SELECT COUNT(*) FROM happyview_record_refs WHERE source_uri = ?",
+            state.db_backend,
+        );
+        let (n,): (i64,) = crate::db::query_as(&sql)
+            .bind(uri)
+            .fetch_one(&state.db)
+            .await
+            .expect("count refs");
+        n
+    }
+
+    async fn delete_refs(state: &AppState, uri: &str) {
+        let sql = adapt_sql(
+            "DELETE FROM happyview_record_refs WHERE source_uri = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(uri)
+            .execute(&state.db)
+            .await
+            .expect("delete refs");
+    }
+
+    /// An identical redelivery leaves the row alone: same `indexed_at`, and its
+    /// refs are not rewritten (deleted here so a rewrite would show). A real
+    /// change rewrites both. A row with no `indexed_at` (written locally) is
+    /// stamped by an identical echo, which also writes its refs.
+    async fn assert_redelivery_semantics(state: &AppState, rkey: &str) {
+        let uri = format!("at://did:plc:abc/{NSID}/{rkey}");
+        let body =
+            serde_json::json!({"text": "hi", "subject": "at://did:plc:other/app.test.post/1"});
+
+        assert_eq!(
+            handle_record_event(state, &create_with(rkey, body.clone())).await,
+            RecordOutcome::Matched
+        );
+        let first = indexed_at(state, &uri).await;
+        assert!(first.is_some());
+        assert_eq!(ref_count(state, &uri).await, 1);
+
+        delete_refs(state, &uri).await;
+        assert_eq!(
+            handle_record_event(state, &create_with(rkey, body.clone())).await,
+            RecordOutcome::Matched
+        );
+        assert_eq!(
+            indexed_at(state, &uri).await,
+            first,
+            "an identical record keeps indexed_at"
+        );
+        assert_eq!(
+            ref_count(state, &uri).await,
+            0,
+            "an identical record does not rewrite refs"
+        );
+
+        // A locally written record has no indexed_at; the identical echo stamps it.
+        clear_indexed_at(state, &uri).await;
+        assert_eq!(
+            handle_record_event(state, &create_with(rkey, body)).await,
+            RecordOutcome::Matched
+        );
+        assert!(
+            indexed_at(state, &uri).await.is_some(),
+            "an identical echo stamps a row with no indexed_at"
+        );
+        assert_eq!(
+            ref_count(state, &uri).await,
+            1,
+            "the stamped row gets its refs"
+        );
+
+        let stamped = indexed_at(state, &uri).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let changed =
+            serde_json::json!({"text": "edited", "subject": "at://did:plc:other/app.test.post/1"});
+        assert_eq!(
+            handle_record_event(state, &create_with(rkey, changed)).await,
+            RecordOutcome::Matched
+        );
+        assert_ne!(
+            indexed_at(state, &uri).await,
+            stamped,
+            "a changed record is re-indexed"
+        );
+        assert_eq!(
+            ref_count(state, &uri).await,
+            1,
+            "a changed record rewrites refs"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identical_redelivery_is_a_no_op() {
+        let state = migrated_tracked_state().await;
+        assert_redelivery_semantics(&state, "noop").await;
+    }
+
+    #[tokio::test]
+    async fn identical_redelivery_is_a_no_op_on_postgres() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        register_tracked_lexicon(&state).await;
+        let rkey = format!("noop{}", uuid::Uuid::new_v4().simple());
+        assert_redelivery_semantics(&state, &rkey).await;
+
+        let sql = adapt_sql(
+            "DELETE FROM happyview_records WHERE uri = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(format!("at://did:plc:abc/{NSID}/{rkey}"))
+            .execute(&state.db)
+            .await
+            .expect("clean up");
+    }
+
+    /// The record and its refs commit together: a refs write that fails takes
+    /// the record with it, and the failure is logged rather than dropped.
+    #[tokio::test]
+    async fn a_failed_refs_write_rolls_back_the_record() {
+        let state = migrated_tracked_state().await;
+        crate::db::query("DROP TABLE happyview_record_refs")
+            .execute(&state.db)
+            .await
+            .expect("drop refs table");
+
+        let outcome = handle_record_event(
+            &state,
+            &create_with(
+                "rkey1",
+                serde_json::json!({"subject": "at://did:plc:other/app.test.post/1"}),
+            ),
+        )
+        .await;
+
+        assert_eq!(outcome, RecordOutcome::Errored);
+        assert!(
+            !record_exists(&state).await,
+            "the record must roll back with its refs"
+        );
+        let (errors,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'record.created' AND severity = 'error'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("count error events");
+        assert_eq!(errors, 1);
     }
 
     async fn skipped_event_count(state: &AppState) -> i64 {

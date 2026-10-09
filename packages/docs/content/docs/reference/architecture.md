@@ -196,7 +196,7 @@ sequenceDiagram
 | `rkey`       | text        | Record key                          |
 | `record`     | jsonb       | Record value                        |
 | `cid`        | text        | Content identifier                  |
-| `indexed_at` | timestamptz | When HappyView indexed this record  |
+| `indexed_at` | timestamptz | When HappyView indexed this version of the record. Redelivering an identical record (same CID and body) keeps the original value |
 
 ### `lexicons`
 

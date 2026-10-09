@@ -104,8 +104,51 @@ fn collect_at_uris(value: &Value, uris: &mut HashSet<String>) {
     }
 }
 
-/// Update record_refs for a given source record.
-/// Deletes old refs and inserts new ones.
+/// Refs per multi-row INSERT: three bound parameters each, under SQLite's 999.
+pub const REFS_PER_INSERT: usize = 300;
+
+/// Replace `source_uri`'s refs with those in `record`, on a connection the
+/// caller owns, so they can share the caller's transaction.
+pub async fn sync_refs_in(
+    conn: &mut sqlx::AnyConnection,
+    source_uri: &str,
+    collection: &str,
+    record: &Value,
+    backend: DatabaseBackend,
+) -> Result<(), sqlx::Error> {
+    let delete_sql = adapt_sql(
+        "DELETE FROM happyview_record_refs WHERE source_uri = ?",
+        backend,
+    );
+    crate::db::query(&delete_sql)
+        .bind(source_uri)
+        .execute(&mut *conn)
+        .await?;
+
+    let targets: Vec<String> = extract_at_uris(record).into_iter().collect();
+    for chunk in targets.chunks(REFS_PER_INSERT) {
+        let placeholders = vec!["(?, ?, ?)"; chunk.len()].join(", ");
+        let insert_sql = adapt_sql(
+            &format!(
+                "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES {placeholders} ON CONFLICT DO NOTHING"
+            ),
+            backend,
+        );
+        let mut insert = crate::db::query(&insert_sql);
+        for target in chunk {
+            insert = insert
+                .bind(source_uri)
+                .bind(target.as_str())
+                .bind(collection);
+        }
+        insert.execute(&mut *conn).await?;
+    }
+
+    Ok(())
+}
+
+/// Update record_refs for a given source record: delete the old refs and
+/// insert the new ones, in one transaction.
 pub async fn sync_refs(
     db: &sqlx::AnyPool,
     source_uri: &str,
@@ -113,33 +156,9 @@ pub async fn sync_refs(
     record: &Value,
     backend: DatabaseBackend,
 ) -> Result<(), sqlx::Error> {
-    let uris = extract_at_uris(record);
-
-    // Delete existing refs for this source
-    let delete_sql = adapt_sql(
-        "DELETE FROM happyview_record_refs WHERE source_uri = ?",
-        backend,
-    );
-    crate::db::query(&delete_sql)
-        .bind(source_uri)
-        .execute(db)
-        .await?;
-
-    // Insert new refs
-    let insert_sql = adapt_sql(
-        "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
-        backend,
-    );
-    for target_uri in &uris {
-        crate::db::query(&insert_sql)
-            .bind(source_uri)
-            .bind(target_uri)
-            .bind(collection)
-            .execute(db)
-            .await?;
-    }
-
-    Ok(())
+    let mut tx = db.begin().await?;
+    sync_refs_in(&mut tx, source_uri, collection, record, backend).await?;
+    tx.commit().await
 }
 
 #[cfg(test)]
@@ -188,5 +207,56 @@ mod tests {
         let val = json!({"a": "at://did:plc:x/c/1", "b": "at://did:plc:x/c/1"});
         let uris = extract_at_uris(&val);
         assert_eq!(uris.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sync_refs_replaces_a_records_refs_in_one_go() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        crate::db::query(
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+             VALUES ('at://did:plc:s/app.test.post/1', 'did:plc:s', 'app.test.post', '1', '{}', 'bafyreiabc', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed record");
+        let targets: Vec<String> = (0..(REFS_PER_INSERT + 5))
+            .map(|i| format!("at://did:plc:t/app.test.post/{i}"))
+            .collect();
+        let record = json!({ "refs": targets });
+
+        sync_refs(
+            &pool,
+            "at://did:plc:s/app.test.post/1",
+            "app.test.post",
+            &record,
+            backend,
+        )
+        .await
+        .expect("sync refs");
+        let (count,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_record_refs")
+            .fetch_one(&pool)
+            .await
+            .expect("count refs");
+        assert_eq!(
+            count as usize,
+            REFS_PER_INSERT + 5,
+            "every ref lands across insert chunks"
+        );
+
+        sync_refs(
+            &pool,
+            "at://did:plc:s/app.test.post/1",
+            "app.test.post",
+            &json!({}),
+            backend,
+        )
+        .await
+        .expect("clear refs");
+        let (count,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_record_refs")
+            .fetch_one(&pool)
+            .await
+            .expect("count refs");
+        assert_eq!(count, 0);
     }
 }
