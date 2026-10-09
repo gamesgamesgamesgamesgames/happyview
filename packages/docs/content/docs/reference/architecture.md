@@ -157,29 +157,30 @@ sequenceDiagram
     A->>H: POST /admin/backfill
     H->>D: Create backfill_jobs record (status = running)
 
-    rect rgb(240, 248, 255)
-    note over H,Relay: Phase 1: Discovery
-    H->>Relay: listReposByCollection (paginated)
-    Relay-->>H: List of DIDs
-    H->>D: Insert backfill_repos rows
-    end
-
     rect rgb(240, 255, 240)
-    note over H,PDS: Phase 2: Pipelined resolve + fetch (concurrent)
-    par Resolver task
-        loop Unresolved DIDs
+    note over H,PDS: Discovery, resolution and fetching run concurrently
+    par Discovery (network backfills)
+        loop Each collection, while the queue has room
+            H->>Relay: listReposByCollection (one page)
+            Relay-->>H: DIDs
+            H->>D: Queue (did, collection) units, save the relay cursor
+        end
+    and Resolver task
+        loop Unresolved units
             H->>PLC: Resolve DID document
             PLC-->>H: PDS endpoint
-            H->>D: Update backfill_repos.pds_endpoint
+            H->>D: Record the unit's PDS
         end
     and Fetcher task
-        loop Resolved DIDs (as they arrive)
-            H->>PDS: listRecords (paginated)
+        loop Resolved units (as they arrive)
+            H->>PDS: listRecords for the unit's collection (paginated)
             PDS-->>H: Records
-            H->>D: UPSERT each record
+            H->>D: UPSERT each page
+            H->>D: Delete the completed unit, bump counters
         end
     end
     end
+    Note over H,D: At most BACKFILL_DISCOVERY_WINDOW units are queued per job
 
     H->>D: Mark job completed (or failed)
 ```

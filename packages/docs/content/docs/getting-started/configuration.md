@@ -37,6 +37,7 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `BACKFILL_CONCURRENT_DIDS_PER_PDS` | no | `3` | How many repos to fetch concurrently from each PDS during backfill. Overridden by database setting if set via admin API |
 | `BACKFILL_CONCURRENT_RESOLUTION` | no | `100` | How many DID document lookups to run in parallel during PDS resolution. Overridden by database setting if set via admin API |
 | `BACKFILL_RETENTION_DAYS` | no | `28` | Days to keep per-repo detail data from completed backfill jobs. `0` to keep indefinitely. Overridden by database setting if set via admin API |
+| `BACKFILL_DISCOVERY_WINDOW` | no | `50000` | Most repos a backfill keeps queued at once. Discovery pauses while the queue is full and resumes as repos finish, so a network backfill never stores the whole network's repo list |
 | `BACKFILL_DATABASE_MAX_CONNECTIONS` | no | auto-calculated | Override the backfill connection pool size. Auto-calculated from concurrency settings if not set, capped at 16 on SQLite and 256 on Postgres |
 | `VERBOSE_EVENT_LOGGING` | no | `false` | Log every record index, hook execution, and hook skip to the event log. High write volume — recommended only for debugging. Overridden by database setting if set via admin API |
 | `RUST_LOG` | no | `happyview=debug,tower_http=debug,sqlx=warn` | Log filter (uses `tracing_subscriber::EnvFilter`) |
@@ -79,6 +80,7 @@ SESSION_SECRET=change-me-in-production
 # BACKFILL_CONCURRENT_DIDS_PER_PDS=3
 # BACKFILL_CONCURRENT_RESOLUTION=100
 # BACKFILL_RETENTION_DAYS=28
+# BACKFILL_DISCOVERY_WINDOW=50000
 # VERBOSE_EVENT_LOGGING=false
 # RUST_LOG=happyview=debug,tower_http=debug,sqlx=warn
 # APP_NAME=My App
