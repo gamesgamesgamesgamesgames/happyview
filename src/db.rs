@@ -1323,6 +1323,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn synchronous_normal_reaches_backfill_pool_connections() {
+        let path = std::env::temp_dir().join(format!("hv-bf-sync-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+
+        // SAFETY: callers are `#[serial]`; nothing else reads or writes this
+        // variable concurrently.
+        unsafe {
+            std::env::remove_var("SQLITE_SYNCHRONOUS");
+        }
+        let pool = connect_backfill_pool(&url, DatabaseBackend::Sqlite).await;
+
+        let mut conns = Vec::new();
+        for _ in 0..4 {
+            conns.push(pool.acquire().await.expect("failed to acquire connection"));
+        }
+        for mut conn in conns {
+            let (level,): (i64,) = crate::db::query_as("PRAGMA synchronous")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("failed to read synchronous");
+            assert_eq!(level, 1);
+        }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     /// `PRAGMA optimize` with the "every table" bit analyzes a table this
     /// connection never queried, which is the startup case.
     #[tokio::test]
