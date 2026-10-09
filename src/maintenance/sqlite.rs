@@ -72,26 +72,30 @@ pub fn checkpoint_interval_secs() -> u64 {
 /// The connection's busy timeout is shortened for the checkpoint and put back
 /// before it returns to the pool. If putting it back fails, the connection is
 /// closed instead: one left at the short timeout would fail ordinary writes
-/// under contention.
+/// under contention. The same holds if the future is dropped mid-checkpoint.
 pub async fn checkpoint_truncate(pool: &AnyPool) -> Result<CheckpointOutcome, sqlx::Error> {
-    let mut conn = pool.acquire().await?;
+    let mut guard = ShortTimeoutGuard {
+        conn: pool.acquire().await?,
+        armed: true,
+    };
+    let conn = &mut guard.conn;
     crate::db::query(&pragma_sql(&format!(
         "PRAGMA busy_timeout = {CHECKPOINT_BUSY_TIMEOUT_MS}"
     )))
-    .execute(&mut *conn)
+    .execute(&mut **conn)
     .await?;
     let checkpoint =
         crate::db::query_as::<(i64, i64, i64)>(&pragma_sql("PRAGMA wal_checkpoint(TRUNCATE)"))
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut **conn)
             .await;
     let restored = crate::db::query(&pragma_sql(&format!(
         "PRAGMA busy_timeout = {}",
         crate::db::SQLITE_BUSY_TIMEOUT_MS
     )))
-    .execute(&mut *conn)
+    .execute(&mut **conn)
     .await;
-    if restored.is_err() {
-        conn.close_on_drop();
+    if restored.is_ok() {
+        guard.armed = false;
     }
     let (busy, wal_frames, checkpointed_frames) = checkpoint?;
     restored?;
@@ -105,6 +109,21 @@ pub async fn checkpoint_truncate(pool: &AnyPool) -> Result<CheckpointOutcome, sq
         *last = Some(outcome.clone());
     }
     Ok(outcome)
+}
+
+/// Closes the connection on drop while it may still carry the short busy
+/// timeout, so a cancelled checkpoint never returns it to the pool that way.
+struct ShortTimeoutGuard {
+    conn: sqlx::pool::PoolConnection<sqlx::Any>,
+    armed: bool,
+}
+
+impl Drop for ShortTimeoutGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.conn.close_on_drop();
+        }
+    }
 }
 
 fn pragma_sql(sql: &str) -> String {
