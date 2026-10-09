@@ -277,6 +277,8 @@ curl http://127.0.0.1:3000/admin/backfill/status -H "$AUTH"
 
 The `status` field tracks the overall job state (`running`, `pausing`, `paused`, `cancelling`, `cancelled`, `completed`, `failed`). The `stage` field tracks the current processing phase (`pending`, `discovering_repos`, `resolving_and_fetching`, `completed`, `failed`, `cancelled`). The `resolved_repos` counter tracks PDS resolution progress during the pipelined phase, while `processed_repos` tracks record fetching progress.
 
+The three repo counters count work units. A unit is one repo under one collection: a network backfill discovers repos per collection, so a repo found under two collections is two units and counts twice. A unit for an account-targeted job covers every collection the job targets, so there one unit is one account. `total_repos` is the number discovered so far while a network backfill is still listing repos from the relay.
+
 `scope` is `network` when repos are discovered through the relay and `dids` when the job targets specific accounts. `did` is set only when a job targets exactly one account.
 
 ## List repos for a job

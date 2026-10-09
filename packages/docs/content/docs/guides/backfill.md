@@ -15,10 +15,10 @@ See the [admin API](../api-reference/admin/backfill.md) for endpoint details.
 
 A backfill job starts with a discovery phase and then pipelines resolution and fetching concurrently:
 
-1. **Discovering repos** — HappyView calls the relay's `com.atproto.sync.listReposByCollection` to find repos that contain records for each target collection. Discovered DIDs are stored in a tracking table so progress can be resumed.
-2. **Resolving PDS + Fetching records** (pipelined) — Resolution and fetching run concurrently. As each DID is resolved (via PLC directory or `did:web`), it's immediately handed off for record fetching — there's no need to wait for all DIDs to resolve before fetching begins. HappyView calls `com.atproto.repo.listRecords` on each PDS for the target collection(s), upserting each record into the local database. PDS endpoints are processed concurrently (up to 10 PDS hosts, 3 DIDs per host).
+1. **Discovering repos** — HappyView calls the relay's `com.atproto.sync.listReposByCollection` to find repos that contain records for each target collection. Each discovered repo becomes a work unit for the collection it was listed under, so it is fetched only for that collection. At most `BACKFILL_DISCOVERY_WINDOW` units (50,000 by default) are queued at once: discovery pauses while the queue is full and resumes as units finish, and finished units are deleted. The relay cursor for each collection is saved after every page, so a paused or restarted job carries on where it stopped.
+2. **Resolving PDS + Fetching records** (pipelined, alongside discovery) — Resolution and fetching run concurrently. As each DID is resolved (via PLC directory or `did:web`), it's immediately handed off for record fetching — there's no need to wait for all DIDs to resolve before fetching begins. HappyView calls `com.atproto.repo.listRecords` on each PDS for the target collection(s), upserting each record into the local database. PDS endpoints are processed concurrently (up to 10 PDS hosts, 3 DIDs per host).
 
-Progress counters (`total_repos`, `resolved_repos`, `processed_repos`, `total_records`) and the current `stage` are updated in real time. The dashboard's Backfill page shows live progress, and clicking a job opens a detail sheet with a stage-by-stage progress log.
+Progress counters (`total_repos`, `resolved_repos`, `processed_repos`, `total_records`) and the current `stage` are updated in real time. The repo counters count work units, so a repo discovered under two collections counts twice. The dashboard's Backfill page shows live progress, and clicking a job opens a detail sheet with a stage-by-stage progress log.
 
 ### Rate limiting
 

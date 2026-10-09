@@ -492,9 +492,9 @@ sequenceDiagram
 | `did`             | text        | Target DID (null = all)                                  |
 | `status`          | text        | pending, running, pausing, paused, cancelling, cancelled, completed, failed |
 | `stage`           | text        | pending, discovering_repos, resolving_and_fetching, completed, failed, cancelled |
-| `total_repos`     | integer     | Total DIDs discovered                                    |
-| `resolved_repos`  | integer     | DIDs with PDS endpoint resolved                          |
-| `processed_repos` | integer     | DIDs with records fetched                                |
+| `total_repos`     | integer     | Work units discovered (a unit is one repo under one collection; one per account for account-targeted jobs) |
+| `resolved_repos`  | integer     | Units with PDS endpoint resolved                         |
+| `processed_repos` | integer     | Units with records fetched                               |
 | `total_records`   | integer     | Total records indexed                                    |
 | `error`           | text        | Error message if failed                                  |
 | `started_at`      | timestamptz |                                                          |

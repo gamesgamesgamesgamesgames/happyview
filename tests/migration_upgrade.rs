@@ -32,6 +32,13 @@ const SEED_INSERT: &str = "INSERT INTO records (uri, did, collection, rkey, reco
 const SEED_ASSERT: &str =
     "SELECT did FROM happyview_records WHERE uri = 'at://did:plc:legacy/app.test.post/rk1'";
 
+// A backfill job from before the bounded queue. A UUID literal, since
+// v2.0.0's Postgres `backfill_jobs.id` is a UUID column.
+const SEED_JOB_INSERT: &str = "INSERT INTO backfill_jobs (id, status, created_at) \
+     VALUES ('00000000-0000-0000-0000-00000000b001', 'running', '2026-01-01T00:00:00Z')";
+const SEED_JOB_ASSERT: &str = "SELECT queue_version, discovery_complete FROM happyview_backfill_jobs \
+     WHERE id = '00000000-0000-0000-0000-00000000b001'";
+
 /// Copy every `.sql` migration in `src` whose 14-digit timestamp prefix is
 /// ≤ `cutoff` into `dest`, reproducing the migration set of that release.
 fn stage_baseline_migrations(src: &str, dest: &Path, cutoff: &str) {
@@ -70,6 +77,10 @@ async fn assert_upgrade_preserves_data(pool: &AnyPool, migrations_dir: &str) {
         .execute(pool)
         .await
         .expect("seed a v2.0.0-era record");
+    sqlx::query(SEED_JOB_INSERT)
+        .execute(pool)
+        .await
+        .expect("seed a v2.0.0-era backfill job");
 
     // 3. Upgrade: apply the full current migration set on top of the v2.0.0 schema.
     Migrator::new(Path::new(migrations_dir))
@@ -85,6 +96,14 @@ async fn assert_upgrade_preserves_data(pool: &AnyPool, migrations_dir: &str) {
         .await
         .expect("seeded record should survive the upgrade");
     assert_eq!(did, "did:plc:legacy");
+
+    // 5. A job from before the bounded queue keeps its repo rows and needs no
+    //    discovery: it finishes on the legacy path.
+    let (queue_version, discovery_complete): (i32, i32) = sqlx::query_as(SEED_JOB_ASSERT)
+        .fetch_one(pool)
+        .await
+        .expect("seeded backfill job should survive the upgrade");
+    assert_eq!((queue_version, discovery_complete), (1, 1));
 
     let _ = std::fs::remove_dir_all(&baseline_dir);
 }

@@ -803,7 +803,7 @@ async fn complete_unit(
             crate::db::query(&stats)
                 .bind(job_id)
                 .bind(pds)
-                .bind(records)
+                .bind(i64::from(records))
                 .execute(&mut *tx)
                 .await?;
             removed
@@ -935,7 +935,7 @@ async fn add_late_records(
         crate::db::query(&stats)
             .bind(job_id)
             .bind(pds)
-            .bind(records)
+            .bind(i64::from(records))
             .execute(&mut *tx)
             .await?;
     }
@@ -1488,9 +1488,43 @@ struct ResolverRun {
     /// collections fails once per unit, and the detail table is keyed per
     /// DID, so the DID is recorded once.
     recorded: HashSet<String>,
+    /// PDS endpoints resolved this run, so a DID queued under several
+    /// collections is looked up once rather than once per unit.
+    resolved_dids: ResolvedDids,
     max_attempts: u32,
     attempted: i32,
     next_cancel_check: i32,
+}
+
+/// DIDs a resolver has looked up this run, most recent `RESOLVED_DID_CACHE`.
+#[derive(Default)]
+struct ResolvedDids {
+    pds: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+/// DIDs the resolver remembers. A DID's units are queued close together (one
+/// per collection, each page of each collection's relay listing at a time),
+/// so a small cache catches nearly every repeat.
+const RESOLVED_DID_CACHE: usize = 10_000;
+
+impl ResolvedDids {
+    fn get(&self, did: &str) -> Option<String> {
+        self.pds.get(did).cloned()
+    }
+
+    /// Remember `did`'s PDS, forgetting the oldest entry once full.
+    fn insert(&mut self, did: &str, pds: &str) {
+        if self.pds.insert(did.to_string(), pds.to_string()).is_some() {
+            return;
+        }
+        self.order.push_back(did.to_string());
+        if self.order.len() > RESOLVED_DID_CACHE
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.pds.remove(&oldest);
+        }
+    }
 }
 
 /// Hand the fetcher every unit an earlier run resolved but never fetched, a
@@ -1539,6 +1573,7 @@ async fn run_resolver(ctx: ResolverContext) -> Result<(), String> {
         deferred: DeferredQueue::new(),
         deferred_units: HashSet::new(),
         recorded: HashSet::new(),
+        resolved_dids: ResolvedDids::default(),
         max_attempts: load_max_attempts(&ctx.state).await,
         attempted: 0,
         next_cancel_check: random_batch_threshold(10),
@@ -1573,14 +1608,38 @@ async fn run_resolver(ctx: ResolverContext) -> Result<(), String> {
         };
         after = Some(last);
 
-        let fresh: Vec<WorkUnit> = page
-            .into_iter()
-            .filter(|unit| !run.deferred_units.contains(unit))
-            .collect();
+        // Units of a DID this run already resolved need no lookup, and the
+        // rest are looked up once per DID however many collections queued it.
+        let mut known: Vec<(WorkUnit, String)> = Vec::new();
+        let mut lookups: Vec<(String, Vec<WorkUnit>)> = Vec::new();
+        let mut lookup_index: HashMap<String, usize> = HashMap::new();
+        for unit in page {
+            if run.deferred_units.contains(&unit) {
+                continue;
+            }
+            if let Some(pds) = run.resolved_dids.get(&unit.did) {
+                known.push((unit, pds));
+                continue;
+            }
+            match lookup_index.get(&unit.did) {
+                Some(&i) => lookups[i].1.push(unit),
+                None => {
+                    lookup_index.insert(unit.did.clone(), lookups.len());
+                    lookups.push((unit.did.clone(), vec![unit]));
+                }
+            }
+        }
+        for (unit, pds) in known {
+            if !handle_resolution(&ctx, &mut run, unit, Ok(pds), 1).await {
+                warn_fetcher_gone(&ctx, &run);
+                break 'scan;
+            }
+        }
+
         let stream_state = ctx.state.clone();
         let stream_cancelled = Arc::clone(&ctx.cancelled);
-        let mut results = stream::iter(fresh)
-            .map(move |unit| {
+        let mut results = stream::iter(lookups)
+            .map(move |(did, units)| {
                 let state = stream_state.clone();
                 let cancelled = Arc::clone(&stream_cancelled);
                 async move {
@@ -1590,26 +1649,23 @@ async fn run_resolver(ctx: ResolverContext) -> Result<(), String> {
                     let result = profile::resolve_pds_endpoint_once(
                         &state.http,
                         &state.config.plc_url,
-                        &unit.did,
+                        &did,
                     )
                     .await;
-                    Some((unit, result))
+                    Some((units, result))
                 }
             })
             .buffer_unordered(ctx.concurrency);
 
         while let Some(item) = results.next().await {
-            let Some((unit, result)) = item else {
+            let Some((units, result)) = item else {
                 break 'scan;
             };
-            if !handle_resolution(&ctx, &mut run, unit, result, 1).await {
-                tracing::warn!(
-                    job_id = %ctx.queue.job_id,
-                    deferred_queued = run.deferred.len(),
-                    "fetcher channel closed while resolving; abandoning the remaining units — \
-                     they will not be fetched, counted, or recorded as errors"
-                );
-                break 'scan;
+            for unit in units {
+                if !handle_resolution(&ctx, &mut run, unit, result.clone(), 1).await {
+                    warn_fetcher_gone(&ctx, &run);
+                    break 'scan;
+                }
             }
             run.attempted += 1;
             if run.attempted >= run.next_cancel_check {
@@ -1648,6 +1704,15 @@ async fn run_resolver(ctx: ResolverContext) -> Result<(), String> {
     // `ctx.tx` drops here, which is how the fetcher learns no more units are
     // coming. That is why the deferred pass has to finish first.
     Ok(())
+}
+
+fn warn_fetcher_gone(ctx: &ResolverContext, run: &ResolverRun) {
+    tracing::warn!(
+        job_id = %ctx.queue.job_id,
+        deferred_queued = run.deferred.len(),
+        "fetcher channel closed while resolving; abandoning the remaining units — \
+         they will not be fetched, counted, or recorded as errors"
+    );
 }
 
 /// Between passes, while discovery is still enqueueing, retry the deferred
@@ -1697,6 +1762,7 @@ async fn handle_resolution(
         Ok(pds) => {
             run.cooldowns.record_success(&host);
             run.deferred_units.remove(&unit);
+            run.resolved_dids.insert(&unit.did, &pds);
             return on_resolved(ctx, unit, pds).await;
         }
         Err(failure) => failure,
@@ -1752,12 +1818,19 @@ async fn retry_deferred_resolution(
     item: DeferredItem<WorkUnit>,
 ) -> bool {
     let attempts = item.attempts + 1;
-    let result = profile::resolve_pds_endpoint_once(
-        &ctx.state.http,
-        &ctx.state.config.plc_url,
-        &item.payload.did,
-    )
-    .await;
+    // Another unit of the same DID may have resolved since this one was
+    // deferred.
+    let result = match run.resolved_dids.get(&item.payload.did) {
+        Some(pds) => Ok(pds),
+        None => {
+            profile::resolve_pds_endpoint_once(
+                &ctx.state.http,
+                &ctx.state.config.plc_url,
+                &item.payload.did,
+            )
+            .await
+        }
+    };
     if handle_resolution(ctx, run, item.payload, result, attempts).await {
         return true;
     }
@@ -5093,7 +5166,7 @@ mod tests {
             count_for_job(&state, "happyview_backfill_completions", &job_id).await,
             3
         );
-        let (repos, completed, stats_records): (i32, i32, i32) = crate::db::query_as(
+        let (repos, completed, stats_records): (i64, i64, i64) = crate::db::query_as(
             "SELECT repos, completed_repos, records FROM happyview_backfill_pds_stats WHERE job_id = ? AND pds_endpoint = ?",
         )
         .bind(&job_id)
@@ -5102,6 +5175,17 @@ mod tests {
         .await
         .expect("pds stats");
         assert_eq!((repos, completed, stats_records), (3, 3, 4));
+        let lookups = mock
+            .received_requests()
+            .await
+            .expect("requests are recorded")
+            .iter()
+            .filter(|r| r.url.path() == "/did:plc:a")
+            .count();
+        assert_eq!(
+            lookups, 1,
+            "a DID queued under two collections is resolved once"
+        );
     }
 
     #[tokio::test]
@@ -5840,7 +5924,7 @@ mod tests {
             "SELECT repos, completed_repos, records FROM happyview_backfill_pds_stats WHERE job_id = ?",
             state.db_backend,
         );
-        let stats: (i32, i32, i32) = crate::db::query_as(&sql)
+        let stats: (i64, i64, i64) = crate::db::query_as(&sql)
             .bind(&job_id)
             .fetch_one(&state.db)
             .await

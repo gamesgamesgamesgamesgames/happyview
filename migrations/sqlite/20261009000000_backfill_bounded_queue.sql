@@ -33,7 +33,8 @@ CREATE TABLE happyview_backfill_cursors (
 );
 
 -- Per-PDS progress, maintained as counters instead of a GROUP BY over every
--- unit.
+-- unit. 64-bit (SQLite's INTEGER already is): one large PDS can pass 2^31
+-- records over a network backfill.
 CREATE TABLE happyview_backfill_pds_stats (
     job_id          TEXT NOT NULL REFERENCES happyview_backfill_jobs(id) ON DELETE CASCADE,
     pds_endpoint    TEXT NOT NULL,

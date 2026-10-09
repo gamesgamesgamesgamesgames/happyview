@@ -33,14 +33,14 @@ CREATE TABLE happyview_backfill_cursors (
 );
 
 -- Per-PDS progress, maintained as counters instead of a GROUP BY over every
--- unit.
+-- unit. 64-bit: one large PDS can pass 2^31 records over a network backfill.
 CREATE TABLE happyview_backfill_pds_stats (
     job_id          TEXT NOT NULL REFERENCES happyview_backfill_jobs(id) ON DELETE CASCADE,
     pds_endpoint    TEXT NOT NULL,
-    repos           INTEGER NOT NULL DEFAULT 0,
-    completed_repos INTEGER NOT NULL DEFAULT 0,
-    records         INTEGER NOT NULL DEFAULT 0,
-    errors          INTEGER NOT NULL DEFAULT 0,
+    repos           BIGINT NOT NULL DEFAULT 0,
+    completed_repos BIGINT NOT NULL DEFAULT 0,
+    records         BIGINT NOT NULL DEFAULT 0,
+    errors          BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (job_id, pds_endpoint)
 );
 
