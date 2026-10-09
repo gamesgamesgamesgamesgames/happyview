@@ -575,17 +575,6 @@ async fn discover_repos_from_relay(
 // Pipelined Phase 2+3: Resolve PDS endpoints and fetch records concurrently
 // ---------------------------------------------------------------------------
 
-/// Finish resolving one DID: persist its PDS endpoint, publish the resolved
-/// event, bump the resolved-repo counter (flushing to the DB on schedule),
-/// and hand the `(did, pds)` pair to the fetcher.
-///
-/// Shared by the resolver's primary stream and its deferred-retry drain so
-/// both paths do exactly the same thing on success, rather than the drain
-/// pass repeating this by hand.
-///
-/// Returns `false` once `tx_resolver` has closed — the fetcher already
-/// exited, so there is nothing left to resolve for.
-#[allow(clippy::too_many_arguments)]
 /// Unresolved DIDs the resolver reads per query.
 const RESOLVE_PAGE_SIZE: i64 = 1000;
 
@@ -611,6 +600,17 @@ async fn unresolved_page(
     Ok(rows.into_iter().map(|(did,)| did).collect())
 }
 
+/// Finish resolving one DID: persist its PDS endpoint, publish the resolved
+/// event, bump the resolved-repo counter (flushing to the DB on schedule),
+/// and hand the `(did, pds)` pair to the fetcher.
+///
+/// Shared by the resolver's primary stream and its deferred-retry drain so
+/// both paths do exactly the same thing on success, rather than the drain
+/// pass repeating this by hand.
+///
+/// Returns `false` once `tx_resolver` has closed — the fetcher already
+/// exited, so there is nothing left to resolve for.
+#[allow(clippy::too_many_arguments)]
 async fn on_resolved(
     resolver_state: &AppState,
     resolver_job_id: &str,

@@ -268,6 +268,17 @@ async fn rebuild_pages(
         }
     }
 
+    // Record that a rebuild has started before any page commits, so a crash
+    // or error ahead of the first cursor write resumes on the next boot rather
+    // than mistaking its own (or live ingest's) refs for an already-built table.
+    if cursor.is_none() {
+        crate::db::retry_on_busy(|| async {
+            let mut conn = db.acquire().await?;
+            put_setting(&mut conn, backend, REFS_REBUILD_CURSOR_SETTING, "").await
+        })
+        .await?;
+    }
+
     let page_sql = adapt_sql(
         "SELECT uri, collection, record FROM happyview_records WHERE uri > ? ORDER BY uri LIMIT ?",
         backend,
@@ -548,5 +559,35 @@ mod tests {
             rebuild_once(&pool, backend).await.expect("again"),
             RebuildOutcome::AlreadyDone
         );
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_that_never_committed_a_page_resumes_instead_of_skipping() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        seed_ref_bearing_records(&pool, 1200).await;
+
+        // Starts, then stops before committing a page.
+        assert_eq!(rebuild_pages(&pool, backend, Some(0)).await.unwrap(), None);
+        assert_eq!(refs(&pool).await, 0);
+
+        // Live ingest writes a ref in the meantime.
+        let body = json!({"subject": "at://did:plc:t/app.test.post/live"});
+        seed_record(&pool, "live", &body).await;
+        sync_refs(
+            &pool,
+            "at://did:plc:r/app.test.post/live",
+            "app.test.post",
+            &body,
+            backend,
+        )
+        .await
+        .expect("live refs");
+
+        assert_eq!(
+            rebuild_once(&pool, backend).await.expect("resume"),
+            RebuildOutcome::Rebuilt { records: 1201 }
+        );
+        assert_eq!(refs(&pool).await, 3 + 1);
     }
 }
