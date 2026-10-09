@@ -171,7 +171,7 @@ pub async fn index_write(
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (uri) DO UPDATE
                SET record = EXCLUDED.record,
-                   cid = EXCLUDED.cid"#,
+                   cid = EXCLUDED.cid, indexed_at = NULL"#,
         backend,
     );
     let _ = crate::db::query(&sql)

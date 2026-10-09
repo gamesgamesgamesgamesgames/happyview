@@ -274,7 +274,7 @@ async fn handle_create_record(
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (uri) DO UPDATE
                     SET record = EXCLUDED.record,
-                        cid = EXCLUDED.cid
+                        cid = EXCLUDED.cid, indexed_at = NULL
                 "#,
                 backend,
             );
@@ -362,7 +362,7 @@ async fn handle_put_record(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (uri) DO UPDATE
                 SET record = EXCLUDED.record,
-                    cid = EXCLUDED.cid
+                    cid = EXCLUDED.cid, indexed_at = NULL
             "#,
             backend,
         );

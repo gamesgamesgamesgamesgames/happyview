@@ -949,6 +949,32 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    #[tokio::test]
+    async fn postgres_serialization_and_deadlock_codes_are_retryable() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
+            return;
+        }
+        let pool = connect(&url, DatabaseBackend::Postgres).await;
+        for code in ["40001", "40P01"] {
+            let sql =
+                format!("DO $$ BEGIN RAISE EXCEPTION 'forced' USING ERRCODE = '{code}'; END $$");
+            let err = query(&sql)
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert!(is_retryable_write_error(&err), "{code}: {err}");
+        }
+        let err = query("SELECT * FROM happyview_no_such_table_t3")
+            .execute(&pool)
+            .await
+            .expect_err("missing table");
+        assert!(!is_retryable_write_error(&err), "{err}");
+    }
+
     // -----------------------------------------------------------------------
     // DatabaseBackend detection
     // -----------------------------------------------------------------------

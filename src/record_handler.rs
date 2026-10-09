@@ -671,11 +671,16 @@ mod tests {
     }
 
     async fn clear_indexed_at(state: &AppState, uri: &str) {
+        set_indexed_at(state, uri, None).await;
+    }
+
+    async fn set_indexed_at(state: &AppState, uri: &str, at: Option<&str>) {
         let sql = adapt_sql(
-            "UPDATE happyview_records SET indexed_at = NULL WHERE uri = ?",
+            "UPDATE happyview_records SET indexed_at = ? WHERE uri = ?",
             state.db_backend,
         );
         crate::db::query(&sql)
+            .bind(at)
             .bind(uri)
             .execute(&state.db)
             .await
@@ -756,8 +761,7 @@ mod tests {
             "the stamped row gets its refs"
         );
 
-        let stamped = indexed_at(state, &uri).await;
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        set_indexed_at(state, &uri, Some("2020-01-01T00:00:00+00:00")).await;
         let changed =
             serde_json::json!({"text": "edited", "subject": "at://did:plc:other/app.test.post/1"});
         assert_eq!(
@@ -765,8 +769,8 @@ mod tests {
             RecordOutcome::Matched
         );
         assert_ne!(
-            indexed_at(state, &uri).await,
-            stamped,
+            indexed_at(state, &uri).await.as_deref(),
+            Some("2020-01-01T00:00:00+00:00"),
             "a changed record is re-indexed"
         );
         assert_eq!(
@@ -792,6 +796,60 @@ mod tests {
         let rkey = format!("noop{}", uuid::Uuid::new_v4().simple());
         assert_redelivery_semantics(&state, &rkey).await;
 
+        let sql = adapt_sql(
+            "DELETE FROM happyview_records WHERE uri = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(format!("at://did:plc:abc/{NSID}/{rkey}"))
+            .execute(&state.db)
+            .await
+            .expect("clean up");
+    }
+
+    /// A record indexed at T1, edited locally (which clears `indexed_at`), then
+    /// echoed back identically by Jetstream, is stamped again rather than left
+    /// at T1.
+    async fn assert_local_edit_is_restamped_by_echo(state: &AppState, rkey: &str) {
+        let uri = format!("at://did:plc:abc/{NSID}/{rkey}");
+        let old = "2020-01-01T00:00:00+00:00";
+        let body = serde_json::json!({"text": "v1"});
+        assert_eq!(
+            handle_record_event(state, &create_with(rkey, body)).await,
+            RecordOutcome::Matched
+        );
+        set_indexed_at(state, &uri, Some(old)).await;
+
+        let edited = serde_json::json!({"text": "v2"});
+        crate::linked_repos::pds::index_write(state, "did:plc:abc", NSID, &uri, "", &edited).await;
+        assert_eq!(
+            indexed_at(state, &uri).await,
+            None,
+            "a local edit clears indexed_at"
+        );
+
+        // The echo carries no CID, matching the empty one the local write stored.
+        let _ = handle_record_event(state, &create_with(rkey, edited)).await;
+        let restamped = indexed_at(state, &uri).await;
+        assert!(restamped.is_some(), "the echo re-stamps the edited row");
+        assert_ne!(restamped.as_deref(), Some(old));
+    }
+
+    #[tokio::test]
+    async fn a_local_edit_is_restamped_by_the_identical_echo() {
+        let state = migrated_tracked_state().await;
+        assert_local_edit_is_restamped_by_echo(&state, "local").await;
+    }
+
+    #[tokio::test]
+    async fn a_local_edit_is_restamped_by_the_identical_echo_on_postgres() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        register_tracked_lexicon(&state).await;
+        let rkey = format!("local{}", uuid::Uuid::new_v4().simple());
+        assert_local_edit_is_restamped_by_echo(&state, &rkey).await;
         let sql = adapt_sql(
             "DELETE FROM happyview_records WHERE uri = ?",
             state.db_backend,

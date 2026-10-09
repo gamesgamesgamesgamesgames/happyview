@@ -901,7 +901,7 @@ pub async fn index_put(
         r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (uri) DO UPDATE
-               SET record = EXCLUDED.record"#,
+               SET record = EXCLUDED.record, indexed_at = NULL"#,
         backend,
     );
     crate::db::query(&upsert_sql)
@@ -974,7 +974,7 @@ pub async fn mirror_network_write(
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (uri) DO UPDATE
                SET record = EXCLUDED.record,
-                   cid = EXCLUDED.cid"#,
+                   cid = EXCLUDED.cid, indexed_at = NULL"#,
         backend,
     );
     crate::db::query(&upsert_sql)
@@ -1747,10 +1747,10 @@ mod tests {
         assert_eq!(row.0.as_deref(), Some("cid1"));
     }
 
-    /// A local edit says nothing about what the network holds, so neither
-    /// column may be disturbed by one.
+    /// A local edit leaves the CID alone and clears `indexed_at`, so the
+    /// identical Jetstream echo re-stamps the row.
     #[tokio::test]
-    async fn index_put_leaves_network_provenance_alone() {
+    async fn index_put_clears_indexed_at_and_leaves_the_cid_alone() {
         let pool = seeded_pool().await;
         crate::db::query(
             "UPDATE happyview_records SET indexed_at = ?, cid = ? WHERE uri = 'at://a/c/1'",
@@ -1782,7 +1782,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(row.0.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(row.0, None, "the identical echo must re-stamp the row");
         assert_eq!(row.1.as_deref(), Some("bafyoriginal"));
     }
 
@@ -1859,7 +1859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mirrored_put_replaces_the_cid_and_leaves_indexed_at() {
+    async fn mirrored_put_replaces_the_cid_and_clears_indexed_at() {
         let pool = seeded_pool().await;
         crate::db::query("UPDATE happyview_records SET indexed_at = ? WHERE uri = 'at://a/c/2'")
             .bind("2026-01-01T00:00:00Z")
@@ -1884,7 +1884,7 @@ mod tests {
 
         let (cid, indexed_at) = provenance(&pool, "at://a/c/2").await;
         assert_eq!(cid.as_deref(), Some("bafyv2"));
-        assert_eq!(indexed_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(indexed_at, None, "the identical echo must re-stamp the row");
         let got = records_get(&pool, Sqlite, "at://a/c/2")
             .await
             .unwrap()
