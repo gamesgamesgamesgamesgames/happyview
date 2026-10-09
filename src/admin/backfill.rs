@@ -586,6 +586,31 @@ async fn discover_repos_from_relay(
 /// Returns `false` once `tx_resolver` has closed — the fetcher already
 /// exited, so there is nothing left to resolve for.
 #[allow(clippy::too_many_arguments)]
+/// Unresolved DIDs the resolver reads per query.
+const RESOLVE_PAGE_SIZE: i64 = 1000;
+
+/// The next page of a job's unresolved DIDs after `after`, in DID order.
+/// Paging bounds the resolver's memory and keeps each read short, where one
+/// `fetch_all` held every unresolved DID (6.86M on one tenant) and a read
+/// snapshot open for the whole scan.
+async fn unresolved_page(
+    state: &AppState,
+    job_id: &str,
+    after: Option<&str>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let sql = adapt_sql(
+        "SELECT did FROM happyview_backfill_repos WHERE job_id = ? AND pds_endpoint IS NULL AND did > ? ORDER BY did LIMIT ?",
+        state.db_backend,
+    );
+    let rows: Vec<(String,)> = crate::db::query_as(&sql)
+        .bind(job_id)
+        .bind(after.unwrap_or(""))
+        .bind(RESOLVE_PAGE_SIZE)
+        .fetch_all(&state.backfill_db)
+        .await?;
+    Ok(rows.into_iter().map(|(did,)| did).collect())
+}
+
 async fn on_resolved(
     resolver_state: &AppState,
     resolver_job_id: &str,
@@ -709,16 +734,6 @@ async fn run_pipelined_resolve_and_fetch(
     let resolver_recorder = Arc::clone(&recorder);
 
     let resolver_handle = tokio::spawn(async move {
-        let sql = adapt_sql(
-            "SELECT did FROM happyview_backfill_repos WHERE job_id = ? AND pds_endpoint IS NULL",
-            resolver_state.db_backend,
-        );
-        let unresolved: Vec<(String,)> = crate::db::query_as(&sql)
-            .bind(&resolver_job_id)
-            .fetch_all(&resolver_state.backfill_db)
-            .await
-            .unwrap_or_default();
-
         let mut attempted: i32 = 0;
         let mut next_flush = random_batch_threshold(100);
         let mut next_cancel_check = random_batch_threshold(10);
@@ -729,100 +744,117 @@ async fn run_pipelined_resolve_and_fetch(
         let mut cooldowns = HostCooldowns::new();
         let mut deferred: DeferredQueue<String> = DeferredQueue::new();
 
-        let stream_state = resolver_state.clone();
-        let stream_cancelled = Arc::clone(&resolver_cancelled);
-        let mut results = stream::iter(unresolved)
-            .map(move |(did,)| {
-                let state = stream_state.clone();
-                let cancelled = Arc::clone(&stream_cancelled);
-                async move {
-                    if cancelled.load(Ordering::Relaxed) {
-                        return None;
-                    }
-                    let result = profile::resolve_pds_endpoint_once(
-                        &state.http,
-                        &state.config.plc_url,
-                        &did,
-                    )
-                    .await;
-                    Some((did, result))
+        let mut after: Option<String> = None;
+        'pages: loop {
+            let page = match unresolved_page(&resolver_state, &resolver_job_id, after.as_deref())
+                .await
+            {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::error!(job_id = %resolver_job_id, error = %e, "failed to read unresolved backfill repos");
+                    break 'pages;
                 }
-            })
-            .buffer_unordered(resolution_concurrency);
-
-        while let Some(item) = results.next().await {
-            let Some((did, result)) = item else {
-                break;
             };
+            let Some(last) = page.last().cloned() else {
+                break 'pages;
+            };
+            after = Some(last);
 
-            match result {
-                Ok(pds) => {
-                    let host = profile::did_doc_host(&resolver_state.config.plc_url, &did);
-                    cooldowns.record_success(&host);
-                    if !on_resolved(
-                        &resolver_state,
-                        &resolver_job_id,
-                        did,
-                        pds,
-                        &resolver_resolved,
-                        &mut next_flush,
-                        &tx_resolver,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            job_id = %resolver_job_id,
-                            deferred_queued = deferred.len(),
-                            "fetcher channel closed while resolving; abandoning the \
-                             remaining resolved DIDs — they will not be fetched, \
-                             counted, or recorded as errors"
-                        );
-                        break;
+            let stream_state = resolver_state.clone();
+            let stream_cancelled = Arc::clone(&resolver_cancelled);
+            let mut results = stream::iter(page)
+                .map(move |did| {
+                    let state = stream_state.clone();
+                    let cancelled = Arc::clone(&stream_cancelled);
+                    async move {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        let result = profile::resolve_pds_endpoint_once(
+                            &state.http,
+                            &state.config.plc_url,
+                            &did,
+                        )
+                        .await;
+                        Some((did, result))
                     }
-                }
-                Err(failure) => {
-                    let host = profile::did_doc_host(&resolver_state.config.plc_url, &did);
-                    let now = std::time::Instant::now();
-                    let attempts = 1;
+                })
+                .buffer_unordered(resolution_concurrency);
 
-                    if failure.kind.is_retryable() && attempts < max_attempts {
-                        cooldowns.record_failure(&host, failure.retry_after, now);
-                        deferred.push(DeferredItem {
-                            payload: did.clone(),
-                            host,
-                            attempts,
-                            eligible_at: now,
-                        });
-                    } else {
-                        resolver_recorder
-                            .record(
-                                &resolver_state,
-                                &resolver_job_id,
-                                &did,
-                                None,
-                                "resolve",
-                                &failure,
-                                attempts,
-                            )
-                            .await;
-                        tracing::warn!(
+            while let Some(item) = results.next().await {
+                let Some((did, result)) = item else {
+                    break 'pages;
+                };
+
+                match result {
+                    Ok(pds) => {
+                        let host = profile::did_doc_host(&resolver_state.config.plc_url, &did);
+                        cooldowns.record_success(&host);
+                        if !on_resolved(
+                            &resolver_state,
+                            &resolver_job_id,
                             did,
-                            kind = failure.kind.as_str(),
-                            attempts,
-                            "giving up resolving PDS endpoint: {}",
-                            failure.message
-                        );
+                            pds,
+                            &resolver_resolved,
+                            &mut next_flush,
+                            &tx_resolver,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                job_id = %resolver_job_id,
+                                deferred_queued = deferred.len(),
+                                "fetcher channel closed while resolving; abandoning the \
+                                 remaining resolved DIDs — they will not be fetched, \
+                                 counted, or recorded as errors"
+                            );
+                            break 'pages;
+                        }
+                    }
+                    Err(failure) => {
+                        let host = profile::did_doc_host(&resolver_state.config.plc_url, &did);
+                        let now = std::time::Instant::now();
+                        let attempts = 1;
+
+                        if failure.kind.is_retryable() && attempts < max_attempts {
+                            cooldowns.record_failure(&host, failure.retry_after, now);
+                            deferred.push(DeferredItem {
+                                payload: did.clone(),
+                                host,
+                                attempts,
+                                eligible_at: now,
+                            });
+                        } else {
+                            resolver_recorder
+                                .record(
+                                    &resolver_state,
+                                    &resolver_job_id,
+                                    &did,
+                                    None,
+                                    "resolve",
+                                    &failure,
+                                    attempts,
+                                )
+                                .await;
+                            tracing::warn!(
+                                did,
+                                kind = failure.kind.as_str(),
+                                attempts,
+                                "giving up resolving PDS endpoint: {}",
+                                failure.message
+                            );
+                        }
                     }
                 }
-            }
 
-            attempted += 1;
-            if attempted >= next_cancel_check {
-                if should_stop_worker(&resolver_state, &resolver_job_id).await {
-                    resolver_cancelled.store(true, Ordering::Relaxed);
-                    break;
+                attempted += 1;
+                if attempted >= next_cancel_check {
+                    if should_stop_worker(&resolver_state, &resolver_job_id).await {
+                        resolver_cancelled.store(true, Ordering::Relaxed);
+                        break 'pages;
+                    }
+                    next_cancel_check = attempted + random_batch_threshold(10);
                 }
-                next_cancel_check = attempted + random_batch_threshold(10);
             }
         }
 
@@ -3577,6 +3609,68 @@ mod tests {
 
     async fn migrated_state() -> AppState {
         test_state_with_pool(crate::test_support::migrated_memory_pool().await)
+    }
+
+    async fn seed_legacy_repo(
+        state: &AppState,
+        job_id: &str,
+        did: &str,
+        pds: Option<&str>,
+        status: &str,
+    ) {
+        crate::db::query(
+            "INSERT INTO happyview_backfill_repos (job_id, did, pds_endpoint, status) VALUES (?, ?, ?, ?)",
+        )
+        .bind(job_id)
+        .bind(did)
+        .bind(pds)
+        .bind(status)
+        .execute(&state.db)
+        .await
+        .expect("seed legacy repo");
+    }
+
+    #[tokio::test]
+    async fn the_resolver_reads_unresolved_repos_a_page_at_a_time() {
+        let state = migrated_state().await;
+        crate::db::query(
+            "INSERT INTO happyview_backfill_jobs (id, status, stage, created_at) \
+             VALUES ('page-job', 'running', 'resolving_and_fetching', '2026-01-01T00:00:00+00:00')",
+        )
+        .execute(&state.db)
+        .await
+        .expect("seed job");
+        let mut expected = Vec::new();
+        for i in 0..2500 {
+            let did = format!("did:plc:p{i:05}");
+            let resolved = i % 10 == 0;
+            seed_legacy_repo(
+                &state,
+                "page-job",
+                &did,
+                resolved.then_some("https://pds.test"),
+                "pending",
+            )
+            .await;
+            if !resolved {
+                expected.push(did);
+            }
+        }
+
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = unresolved_page(&state, "page-job", after.as_deref())
+                .await
+                .expect("page");
+            assert!(page.len() as i64 <= RESOLVE_PAGE_SIZE);
+            let Some(last) = page.last().cloned() else {
+                break;
+            };
+            after = Some(last);
+            seen.extend(page);
+        }
+        assert_eq!(seen, expected, "every unresolved DID once, in order");
     }
 
     /// Resolves `did:` entries to themselves and `<name>.test` handles to
