@@ -20,6 +20,13 @@ async fn json_body(resp: axum::response::Response) -> Value {
 async fn status_reports_backend_and_vacuum_state() {
     common::require_db!();
     let app = TestApp::new().await;
+    if app.state.db_backend == DatabaseBackend::Sqlite {
+        // The first scheduled checkpoint is a minute out; drive one so the
+        // status has an outcome to report.
+        happyview::maintenance::sqlite::checkpoint_truncate(&app.state.db)
+            .await
+            .expect("checkpoint");
+    }
 
     let resp = app
         .router
@@ -41,6 +48,40 @@ async fn status_reports_backend_and_vacuum_state() {
     assert!(
         body["journal_size_limit"].is_number(),
         "journal_size_limit missing or not a number: {body}"
+    );
+    assert!(
+        body.as_object()
+            .is_some_and(|o| o.contains_key("checkpoint")),
+        "checkpoint key missing: {body}"
+    );
+    if app.state.db_backend == DatabaseBackend::Sqlite {
+        let checkpoint = &body["checkpoint"];
+        assert!(
+            checkpoint.is_object(),
+            "checkpoint should be an outcome: {body}"
+        );
+        assert!(
+            checkpoint["at"].is_string(),
+            "checkpoint.at missing: {body}"
+        );
+        assert!(
+            checkpoint["busy"].is_boolean(),
+            "checkpoint.busy missing: {body}"
+        );
+        assert!(
+            checkpoint["wal_frames"].is_i64(),
+            "wal_frames missing: {body}"
+        );
+        assert!(
+            checkpoint["checkpointed_frames"].is_i64(),
+            "checkpointed_frames missing: {body}"
+        );
+    } else {
+        assert!(body["checkpoint"].is_null(), "null on Postgres: {body}");
+    }
+    assert!(
+        body["checkpoint_interval_secs"].is_u64(),
+        "checkpoint_interval_secs missing: {body}"
     );
 
     // `disk`/`feasibility` are only meaningful for a file-backed SQLite

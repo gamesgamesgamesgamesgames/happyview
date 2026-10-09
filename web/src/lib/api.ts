@@ -715,6 +715,13 @@ export interface DatabaseStatus {
     last_result: VacuumResult | null;
   };
   journal_size_limit: number;
+  checkpoint: {
+    at: string;
+    busy: boolean;
+    wal_frames: number;
+    checkpointed_frames: number;
+  } | null;
+  checkpoint_interval_secs: number;
 }
 
 export function getDatabaseStatus() {

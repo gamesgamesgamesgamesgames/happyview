@@ -986,6 +986,16 @@ async fn main() {
     ));
 
     {
+        let interval = happyview::maintenance::sqlite::checkpoint_interval_secs();
+        let checkpoint_every = (interval > 0).then(|| std::time::Duration::from_secs(interval));
+        tokio::spawn(happyview::maintenance::sqlite::run(
+            state.db.clone(),
+            state.db_backend,
+            checkpoint_every,
+        ));
+    }
+
+    {
         let db = state.db.clone();
         let flag = state.verbose_event_logging.clone();
         let backend = state.db_backend;

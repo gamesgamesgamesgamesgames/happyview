@@ -12,6 +12,7 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `DATABASE_BACKEND` | no | auto-detected | Force `sqlite` or `postgres`. Auto-detected from `DATABASE_URL` scheme if not set |
 | `SQLITE_JOURNAL_SIZE_LIMIT` | no | `67108864` (64 MiB) | Bytes. Caps how large the SQLite write-ahead log is allowed to grow before it's truncated back down after a checkpoint, bounding disk usage from WAL growth. SQLite-only; ignored on Postgres |
 | `SQLITE_SYNCHRONOUS` | no | `NORMAL` | SQLite `synchronous` level for every connection: `NORMAL` or `FULL`. In WAL mode `NORMAL` cannot corrupt the database, but a crash or power loss can lose the last few transactions. `FULL` syncs the write-ahead log on every commit. SQLite-only; ignored on Postgres |
+| `SQLITE_CHECKPOINT_INTERVAL_SECS` | no | `60` | Seconds between `wal_checkpoint(TRUNCATE)` runs, which empty the write-ahead log even while readers are busy. `0` disables them. The latest result is shown on **Settings > Database**. SQLite-only; ignored on Postgres |
 | `PUBLIC_URL` | yes | --- | Public-facing URL for HappyView (used for OAuth callbacks, e.g. `https://happyview.example.com`). **For local development, use `http://127.0.0.1:3000` — not `localhost`** (see note below). Do **not** include the base path — see `BASE_PATH` |
 | `BASE_PATH` | no | _(none)_ | Subpath prefix for mounting HappyView behind a reverse proxy (e.g. `/hv`). Must start with `/` and have no trailing slash. When set, all routes are served under this prefix and the dashboard is accessible at `https://example.com/hv/`. See [Reverse proxy subpath](deployment/production.md#reverse-proxy-subpath) |
 | `SESSION_SECRET` | no | dev default | Secret key for signing session cookies (at least 64 characters). **Must be set in production** |
@@ -65,6 +66,7 @@ SESSION_SECRET=change-me-in-production
 # PORT=3000
 # SQLITE_JOURNAL_SIZE_LIMIT=67108864
 # SQLITE_SYNCHRONOUS=NORMAL
+# SQLITE_CHECKPOINT_INTERVAL_SECS=60
 # JETSTREAM_URL=wss://jetstream1.us-east.bsky.network
 # RELAY_URL=https://bsky.network
 # PLC_URL=https://plc.directory

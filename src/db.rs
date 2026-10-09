@@ -368,6 +368,11 @@ pub fn decode_cursor(cursor: &str) -> Option<(String, String)> {
 /// so a single large delete permanently inflates disk usage.
 pub const DEFAULT_JOURNAL_SIZE_LIMIT: u64 = 67_108_864;
 
+/// Milliseconds a SQLite connection waits on a lock before `SQLITE_BUSY`.
+/// sqlx sets the same 5 s on every connection it opens; this names it so a
+/// caller that changes it temporarily can put it back.
+pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5000;
+
 /// Parse `SQLITE_JOURNAL_SIZE_LIMIT`. `-1` means "no limit" and is represented
 /// as `u64::MAX`; anything unparseable falls back to the default rather than
 /// failing boot over a maintenance knob.
@@ -527,7 +532,7 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
             .await
             .expect("Failed to enable WAL mode");
 
-        crate::db::query("PRAGMA busy_timeout = 5000")
+        crate::db::query(&format!("PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"))
             .execute(&pool)
             .await
             .expect("Failed to set busy timeout");
@@ -637,7 +642,7 @@ pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPo
             .await
             .expect("Failed to enable WAL mode on backfill pool");
 
-        crate::db::query("PRAGMA busy_timeout = 5000")
+        crate::db::query(&format!("PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"))
             .execute(&pool)
             .await
             .expect("Failed to set busy timeout on backfill pool");
