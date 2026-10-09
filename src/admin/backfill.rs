@@ -1630,7 +1630,7 @@ async fn run_resolver(ctx: ResolverContext) -> Result<(), String> {
             }
         }
         for (unit, pds) in known {
-            if !handle_resolution(&ctx, &mut run, unit, Ok(pds), 1).await {
+            if !on_cached(&ctx, &mut run, unit, pds).await {
                 warn_fetcher_gone(&ctx, &run);
                 break 'scan;
             }
@@ -1820,18 +1820,19 @@ async fn retry_deferred_resolution(
     let attempts = item.attempts + 1;
     // Another unit of the same DID may have resolved since this one was
     // deferred.
-    let result = match run.resolved_dids.get(&item.payload.did) {
-        Some(pds) => Ok(pds),
+    let handed_on = match run.resolved_dids.get(&item.payload.did) {
+        Some(pds) => on_cached(ctx, run, item.payload, pds).await,
         None => {
-            profile::resolve_pds_endpoint_once(
+            let result = profile::resolve_pds_endpoint_once(
                 &ctx.state.http,
                 &ctx.state.config.plc_url,
                 &item.payload.did,
             )
-            .await
+            .await;
+            handle_resolution(ctx, run, item.payload, result, attempts).await
         }
     };
-    if handle_resolution(ctx, run, item.payload, result, attempts).await {
+    if handed_on {
         return true;
     }
     tracing::warn!(
@@ -1841,6 +1842,20 @@ async fn retry_deferred_resolution(
          queued units — they will not be fetched, counted, or recorded as errors"
     );
     false
+}
+
+/// Resolve a unit from the DID cache. No request was sent, so the host's
+/// cooldown is left exactly as it was: for `did:plc` the host is the shared
+/// PLC directory, and treating a cache hit as a success there would clear a
+/// rate limit it never lifted. Returns false once the fetcher has gone away.
+async fn on_cached(
+    ctx: &ResolverContext,
+    run: &mut ResolverRun,
+    unit: WorkUnit,
+    pds: String,
+) -> bool {
+    run.deferred_units.remove(&unit);
+    on_resolved(ctx, unit, pds).await
 }
 
 /// Record a resolve give-up (once per DID) and take the unit out of the queue,
@@ -3495,7 +3510,7 @@ async fn run_backfill_job_with(state: AppState, job_id: String, window: i64) {
         match queued_units(&state, &job_id).await {
             Ok(0) => {}
             Ok(left) => {
-                pause_with_units_left(&state, &job_id, left).await;
+                pause_with_units_left(&state, &job_id, collection.as_deref(), left).await;
                 return;
             }
             Err(e) => {
@@ -3528,11 +3543,35 @@ async fn run_backfill_job_with(state: AppState, job_id: String, window: i64) {
 
 /// Pause a bounded job that ran out of work to do with units still queued,
 /// rather than mark it completed with work left.
-async fn pause_with_units_left(state: &AppState, job_id: &str, left: i64) {
-    tracing::warn!(
-        job_id,
-        left,
-        "backfill run ended with units still queued; pausing the job so it can be resumed"
+///
+/// The reason goes in the job's `error`, so the dashboard can tell this from
+/// a pause an operator asked for. Resuming clears it.
+async fn pause_with_units_left(
+    state: &AppState,
+    job_id: &str,
+    collection: Option<&str>,
+    left: i64,
+) {
+    let reason = format!("paused: {left} units could not be completed; resume to retry");
+    tracing::warn!(job_id, left, "{reason}");
+    let sql = adapt_sql(
+        "UPDATE happyview_backfill_jobs SET status = 'paused', error = ? WHERE id = ?",
+        state.db_backend,
+    );
+    job_write(state, job_id, "pause", || {
+        crate::db::query(&sql)
+            .bind(&reason)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
+    publish_event(
+        state,
+        super::types::BackfillEvent::JobCompleted {
+            job_id: job_id.to_string(),
+            status: "paused".to_string(),
+            error: Some(reason.clone()),
+        },
     );
     log_event(
         &state.db,
@@ -3540,16 +3579,16 @@ async fn pause_with_units_left(state: &AppState, job_id: &str, left: i64) {
             event_type: "backfill.units_left".to_string(),
             severity: Severity::Warn,
             actor_did: None,
-            subject: Some(job_id.to_string()),
+            subject: collection.map(str::to_string),
             detail: serde_json::json!({
                 "job_id": job_id,
                 "queued_units": left,
+                "reason": reason,
             }),
         },
         state.db_backend,
     )
     .await;
-    finalise_pause(state, job_id).await;
 }
 
 /// Work through a job's queue, discovering more alongside while discovery is
@@ -3981,7 +4020,7 @@ pub(super) async fn resume_backfill(
         ))),
         Some(_) => {
             let sql = adapt_sql(
-                "UPDATE happyview_backfill_jobs SET status = 'running' WHERE id = ?",
+                "UPDATE happyview_backfill_jobs SET status = 'running', error = NULL WHERE id = ?",
                 state.db_backend,
             );
             crate::db::retry_on_busy(|| {
@@ -5482,6 +5521,100 @@ mod tests {
         assert_eq!((job.status.as_str(), job.discovery_complete), ("failed", 0));
     }
 
+    /// A unit resolved from the DID cache sends no request, so it must leave
+    /// the PLC directory's rate-limit cooldown exactly as it found it.
+    #[tokio::test]
+    async fn a_cache_hit_leaves_the_plc_cooldown_in_force() {
+        let mock = MockServer::start().await;
+        let state = pipeline_state(&mock, &[POST, LIKE]).await;
+        let reset = chrono::Utc::now().timestamp() + 60;
+        Mock::given(method("GET"))
+            .and(path("/did:plc:y"))
+            .respond_with(
+                ResponseTemplate::new(429).insert_header("ratelimit-reset", reset.to_string()),
+            )
+            .mount(&mock)
+            .await;
+        seed_job(
+            &state,
+            "cooldown",
+            None,
+            "network",
+            "resolving_and_fetching",
+            2,
+            true,
+        )
+        .await;
+        for (collection, did) in [
+            (POST, "did:plc:x"),
+            (LIKE, "did:plc:x"),
+            (POST, "did:plc:y"),
+        ] {
+            seed_unit(&state, "cooldown", collection, did, None).await;
+        }
+        let (tx, _rx) = mpsc::channel(16);
+        let ctx = ResolverContext {
+            state: state.clone(),
+            queue: bounded_queue("cooldown"),
+            resolved: Arc::new(AtomicI32::new(0)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            recorder: Arc::new(
+                super::super::backfill_errors::ErrorRecorder::new(&state, "cooldown").await,
+            ),
+            concurrency: 1,
+            tx,
+        };
+        let mut run = ResolverRun {
+            cooldowns: HostCooldowns::new(),
+            deferred: DeferredQueue::new(),
+            deferred_units: HashSet::new(),
+            recorded: HashSet::new(),
+            resolved_dids: ResolvedDids::default(),
+            max_attempts: 3,
+            attempted: 0,
+            next_cancel_check: i32::MAX,
+        };
+        run.resolved_dids.insert("did:plc:x", &mock.uri());
+        let host = profile::did_doc_host(&state.config.plc_url, "did:plc:y");
+
+        let limited =
+            profile::resolve_pds_endpoint_once(&state.http, &state.config.plc_url, "did:plc:y")
+                .await;
+        let y = WorkUnit {
+            did: "did:plc:y".to_string(),
+            collection: POST.to_string(),
+        };
+        assert!(handle_resolution(&ctx, &mut run, y, limited, 1).await);
+        let gate = run
+            .cooldowns
+            .eligible_at(&host)
+            .expect("PLC is cooling down");
+        assert!(gate > std::time::Instant::now() + Duration::from_secs(30));
+
+        // A cache hit while scanning a page...
+        let x_post = WorkUnit {
+            did: "did:plc:x".to_string(),
+            collection: POST.to_string(),
+        };
+        assert!(on_cached(&ctx, &mut run, x_post, mock.uri()).await);
+        // ...and one while draining deferred retries.
+        let x_like = WorkUnit {
+            did: "did:plc:x".to_string(),
+            collection: LIKE.to_string(),
+        };
+        let item = DeferredItem {
+            payload: x_like,
+            host: host.clone(),
+            attempts: 1,
+            eligible_at: std::time::Instant::now(),
+        };
+        assert!(retry_deferred_resolution(&ctx, &mut run, item).await);
+
+        assert_eq!(run.cooldowns.eligible_at(&host), Some(gate));
+        assert_eq!(run.cooldowns.consecutive_failures(&host), 1);
+        assert_eq!(ctx.resolved.load(Ordering::Relaxed), 2);
+    }
+
     /// A unit whose completion could not be committed is still queued when the
     /// run ends. The job is paused with that work left, never completed.
     #[tokio::test]
@@ -5510,10 +5643,20 @@ mod tests {
             count_for_job(&state, "happyview_backfill_queue", &job_id).await,
             1
         );
+        let (error,): (Option<String>,) =
+            crate::db::query_as("SELECT error FROM happyview_backfill_jobs WHERE id = ?")
+                .bind(&job_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("job error");
+        assert_eq!(
+            error.as_deref(),
+            Some("paused: 1 units could not be completed; resume to retry")
+        );
         let (logged,): (i64,) = crate::db::query_as(
             "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'backfill.units_left' AND subject = ?",
         )
-        .bind(&job_id)
+        .bind(POST)
         .fetch_one(&state.db)
         .await
         .expect("count events");
