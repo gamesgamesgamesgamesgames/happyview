@@ -91,6 +91,7 @@ pub struct AppState {
     pub lexicons: LexiconRegistry,
     pub collections_tx: watch::Sender<Vec<String>>,
     pub labeler_subscriptions_tx: watch::Sender<()>,
+    pub labeler_subscription_cache: Arc<labeler::SubscriptionCache>,
     pub rate_limiter: Arc<RateLimiter>,
     pub oauth: Arc<auth::OAuthClientRegistry>,
     pub oauth_state_store: DbStateStore,

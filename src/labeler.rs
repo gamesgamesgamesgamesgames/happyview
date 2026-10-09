@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -47,6 +48,62 @@ struct Label {
 #[derive(Deserialize)]
 struct QueryLabelsResponse {
     labels: Vec<Label>,
+}
+
+// ---------------------------------------------------------------------------
+// Subscription cache
+// ---------------------------------------------------------------------------
+
+/// Active labeler subscription DIDs, cached so ingest does not query
+/// `happyview_labeler_subscriptions` for every record and every backfill page.
+///
+/// Every path that adds, changes or removes a subscription calls
+/// `invalidate`. The generation counter keeps a load that raced an
+/// invalidation from caching what it read before the change.
+#[derive(Default)]
+pub struct SubscriptionCache {
+    generation: AtomicU64,
+    active: std::sync::RwLock<Option<Arc<Vec<String>>>>,
+}
+
+impl SubscriptionCache {
+    pub async fn active(&self, db: &sqlx::AnyPool) -> Result<Arc<Vec<String>>, sqlx::Error> {
+        if let Some(cached) = self.active.read().ok().and_then(|slot| slot.clone()) {
+            return Ok(cached);
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        let rows: Vec<(String,)> = crate::db::query_as(
+            "SELECT did FROM happyview_labeler_subscriptions WHERE status = 'active'",
+        )
+        .fetch_all(db)
+        .await?;
+        let dids = Arc::new(rows.into_iter().map(|(did,)| did).collect::<Vec<_>>());
+        if let Ok(mut slot) = self.active.write()
+            && self.generation.load(Ordering::Acquire) == generation
+        {
+            *slot = Some(Arc::clone(&dids));
+        }
+        Ok(dids)
+    }
+
+    pub fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut slot) = self.active.write() {
+            *slot = None;
+        }
+    }
+}
+
+/// Whether any labeler subscription is active. A failed read counts as none:
+/// labels are fetched again on a later write, and ingest must not stop for them.
+pub async fn has_active_subscriptions(state: &AppState) -> bool {
+    match state.labeler_subscription_cache.active(&state.db).await {
+        Ok(dids) => !dids.is_empty(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read labeler subscriptions");
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,14 +523,10 @@ async fn backfill_labels_for_uri_inner(
     state: &AppState,
     uri: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let subscriptions: Vec<(String,)> = crate::db::query_as(
-        "SELECT did FROM happyview_labeler_subscriptions WHERE status = 'active'",
-    )
-    .fetch_all(&state.db)
-    .await?;
+    let subscriptions = state.labeler_subscription_cache.active(&state.db).await?;
 
-    for (labeler_did,) in subscriptions {
-        if let Err(e) = backfill_from_labeler(state, &labeler_did, uri).await {
+    for labeler_did in subscriptions.iter() {
+        if let Err(e) = backfill_from_labeler(state, labeler_did, uri).await {
             tracing::warn!(
                 labeler = %labeler_did, uri = %uri,
                 "failed to backfill labels from labeler: {e}"
@@ -665,6 +718,36 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    #[tokio::test]
+    async fn the_subscription_cache_serves_reads_until_invalidated() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        crate::db::query(
+            "INSERT INTO happyview_labeler_subscriptions (did, status) VALUES ('did:plc:labeler', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed subscription");
+
+        let cache = SubscriptionCache::default();
+        assert_eq!(
+            *cache.active(&pool).await.expect("load"),
+            vec!["did:plc:labeler".to_string()]
+        );
+
+        crate::db::query("DELETE FROM happyview_labeler_subscriptions")
+            .execute(&pool)
+            .await
+            .expect("remove subscription");
+        assert_eq!(
+            cache.active(&pool).await.expect("cached").len(),
+            1,
+            "a cached read must not query the table"
+        );
+
+        cache.invalidate();
+        assert!(cache.active(&pool).await.expect("reload").is_empty());
+    }
 
     const TEST_SRC: &str = "did:plc:labelgctest";
 

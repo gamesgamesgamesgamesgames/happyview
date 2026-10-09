@@ -199,10 +199,12 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
                             )
                             .await;
                         }
-                        crate::labeler::backfill_labels_for_uri(
-                            Arc::new(state.clone()),
-                            uri.clone(),
-                        );
+                        if crate::labeler::has_active_subscriptions(state).await {
+                            crate::labeler::backfill_labels_for_uri(
+                                Arc::new(state.clone()),
+                                uri.clone(),
+                            );
+                        }
                     }
                     RecordOutcome::Matched
                 }

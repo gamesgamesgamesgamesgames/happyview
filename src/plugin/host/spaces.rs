@@ -604,6 +604,9 @@ mod tests {
             lexicons: LexiconRegistry::new(),
             collections_tx,
             labeler_subscriptions_tx,
+            labeler_subscription_cache: std::sync::Arc::new(
+                crate::labeler::SubscriptionCache::default(),
+            ),
             rate_limiter: crate::rate_limit::RateLimiter::new(
                 crate::rate_limit::RateLimitDefaults {
                     query_cost: 1,

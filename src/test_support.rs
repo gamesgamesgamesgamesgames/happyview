@@ -195,6 +195,7 @@ pub fn test_state_with_pool_on(
         lexicons: LexiconRegistry::new(),
         collections_tx: tx,
         labeler_subscriptions_tx: labeler_tx,
+        labeler_subscription_cache: Arc::new(crate::labeler::SubscriptionCache::default()),
         rate_limiter: crate::rate_limit::RateLimiter::new(crate::rate_limit::RateLimitDefaults {
             query_cost: 1,
             procedure_cost: 1,

@@ -935,6 +935,7 @@ async fn main() {
         lexicons,
         collections_tx,
         labeler_subscriptions_tx,
+        labeler_subscription_cache: Arc::new(happyview::labeler::SubscriptionCache::default()),
         rate_limiter,
         oauth: oauth_registry,
         oauth_state_store,

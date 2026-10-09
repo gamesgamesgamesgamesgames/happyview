@@ -70,11 +70,13 @@ async fn set_stage(state: &AppState, job_id: &str, stage: &str) {
         "UPDATE happyview_backfill_jobs SET stage = ? WHERE id = ?",
         state.db_backend,
     );
-    let _ = crate::db::query(&sql)
-        .bind(stage)
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    job_write(state, job_id, "stage", || {
+        crate::db::query(&sql)
+            .bind(stage)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
     publish_event(
         state,
         super::types::BackfillEvent::JobStageChanged {
@@ -99,11 +101,13 @@ async fn update_job_counter(state: &AppState, job_id: &str, column: &str, value:
         }
     };
     let sql = adapt_sql(query, state.db_backend);
-    let _ = crate::db::query(&sql)
-        .bind(value)
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    job_write(state, job_id, "counter", || {
+        crate::db::query(&sql)
+            .bind(value)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
 }
 
 async fn count_repos(state: &AppState, job_id: &str) -> i32 {
@@ -121,6 +125,44 @@ async fn count_repos(state: &AppState, job_id: &str) -> i32 {
 
 fn publish_event(state: &AppState, event: super::types::BackfillEvent) {
     let _ = state.backfill_events_tx.send(event);
+}
+
+/// Run one bookkeeping write for a job, retrying while the database is busy.
+/// A write that still fails is logged and recorded in the event log rather
+/// than dropped, so a counter or stage that stopped moving can be traced.
+pub(super) async fn job_write<T, F, Fut>(
+    state: &AppState,
+    job_id: &str,
+    what: &'static str,
+    op: F,
+) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    match crate::db::retry_on_busy(op).await {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::error!(job_id, what, error = %e, "backfill bookkeeping write failed");
+            log_event(
+                &state.db,
+                EventLog {
+                    event_type: "backfill.write_failed".to_string(),
+                    severity: Severity::Error,
+                    actor_did: None,
+                    subject: Some(job_id.to_string()),
+                    detail: serde_json::json!({
+                        "job_id": job_id,
+                        "write": what,
+                        "error": e.to_string(),
+                    }),
+                },
+                state.db_backend,
+            )
+            .await;
+            None
+        }
+    }
 }
 
 /// Current job state, straight from the database.
@@ -223,12 +265,14 @@ async fn fail_job(state: &AppState, job_id: &str, error: &str) {
         "UPDATE happyview_backfill_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
         state.db_backend,
     );
-    let _ = crate::db::query(&sql)
-        .bind(&now)
-        .bind(error)
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    job_write(state, job_id, "fail", || {
+        crate::db::query(&sql)
+            .bind(&now)
+            .bind(error)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
     publish_event(
         state,
         super::types::BackfillEvent::JobCompleted {
@@ -267,10 +311,12 @@ async fn request_cancel(state: &AppState, job_id: &str) {
         "UPDATE happyview_backfill_jobs SET status = 'cancelling' WHERE id = ? AND status IN ('running', 'paused')",
         state.db_backend,
     );
-    let _ = crate::db::query(&sql)
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    job_write(state, job_id, "request_cancel", || {
+        crate::db::query(&sql)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
 }
 
 async fn finalise_cancel(state: &AppState, job_id: &str) {
@@ -279,11 +325,13 @@ async fn finalise_cancel(state: &AppState, job_id: &str) {
         "UPDATE happyview_backfill_jobs SET status = 'cancelled', completed_at = ?, error = 'cancelled by user' WHERE id = ?",
         state.db_backend,
     );
-    let _ = crate::db::query(&sql)
-        .bind(&now)
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    job_write(state, job_id, "cancel", || {
+        crate::db::query(&sql)
+            .bind(&now)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
     publish_event(
         state,
         super::types::BackfillEvent::JobCompleted {
@@ -299,10 +347,12 @@ async fn request_pause(state: &AppState, job_id: &str) {
         "UPDATE happyview_backfill_jobs SET status = 'pausing' WHERE id = ? AND status = 'running'",
         state.db_backend,
     );
-    let _ = crate::db::query(&sql)
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    job_write(state, job_id, "request_pause", || {
+        crate::db::query(&sql)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
 }
 
 async fn finalise_pause(state: &AppState, job_id: &str) {
@@ -310,10 +360,12 @@ async fn finalise_pause(state: &AppState, job_id: &str) {
         "UPDATE happyview_backfill_jobs SET status = 'paused' WHERE id = ?",
         state.db_backend,
     );
-    let _ = crate::db::query(&sql)
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    job_write(state, job_id, "pause", || {
+        crate::db::query(&sql)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
     publish_event(
         state,
         super::types::BackfillEvent::JobCompleted {
@@ -336,14 +388,16 @@ async fn complete_job(
         "UPDATE happyview_backfill_jobs SET status = 'completed', stage = 'completed', completed_at = ?, processed_repos = ?, total_records = ?, error = ? WHERE id = ?",
         state.db_backend,
     );
-    let _ = crate::db::query(&sql)
-        .bind(&now)
-        .bind(processed_repos)
-        .bind(total_records)
-        .bind(error)
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    job_write(state, job_id, "complete", || {
+        crate::db::query(&sql)
+            .bind(&now)
+            .bind(processed_repos)
+            .bind(total_records)
+            .bind(error)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
     publish_event(
         state,
         super::types::BackfillEvent::JobCompleted {
@@ -1106,12 +1160,14 @@ async fn run_pipelined_resolve_and_fetch(
         "UPDATE happyview_backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
         state.db_backend,
     );
-    let _ = crate::db::query(&sql)
-        .bind(final_repos)
-        .bind(final_records)
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    job_write(&state, job_id, "counters", || {
+        crate::db::query(&sql)
+            .bind(final_repos)
+            .bind(final_records)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
 
     (final_repos, final_records)
 }
@@ -1852,12 +1908,14 @@ async fn run_fetching_phase(
                                 "UPDATE happyview_backfill_repos SET status = 'completed', records_fetched = ? WHERE job_id = ? AND did = ?",
                                 state.db_backend,
                             );
-                            let _ = crate::db::query(&sql)
-                                .bind(did_records)
-                                .bind(job_id.as_str())
-                                .bind(&did)
-                                .execute(&state.backfill_db)
-                                .await;
+                            job_write(&state, job_id.as_str(), "complete_repo", || {
+                                crate::db::query(&sql)
+                                    .bind(did_records)
+                                    .bind(job_id.as_str())
+                                    .bind(&did)
+                                    .execute(&state.backfill_db)
+                            })
+                            .await;
 
                             let repos = processed_repos.fetch_add(1, Ordering::Relaxed) + 1;
                             let records = total_records.load(Ordering::Relaxed);
@@ -1871,12 +1929,14 @@ async fn run_fetching_phase(
                                     "UPDATE happyview_backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
                                     backend,
                                 );
-                                let _ = crate::db::query(&sql)
-                                    .bind(repos)
-                                    .bind(records)
-                                    .bind(job_id.as_str())
-                                    .execute(&state.backfill_db)
-                                    .await;
+                                job_write(&state, job_id.as_str(), "counters", || {
+                                    crate::db::query(&sql)
+                                        .bind(repos)
+                                        .bind(records)
+                                        .bind(job_id.as_str())
+                                        .execute(&state.backfill_db)
+                                })
+                                .await;
 
                                 if should_stop_worker(&state, job_id.as_str()).await {
                                     cancelled.store(true, Ordering::Relaxed);
@@ -1978,12 +2038,14 @@ async fn run_fetching_phase(
         "UPDATE happyview_backfill_jobs SET processed_repos = ?, total_records = ? WHERE id = ?",
         state.db_backend,
     );
-    let _ = crate::db::query(&sql)
-        .bind(final_repos)
-        .bind(final_records)
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    job_write(&state, job_id, "counters", || {
+        crate::db::query(&sql)
+            .bind(final_repos)
+            .bind(final_records)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
 
     (final_repos, final_records)
 }
@@ -1997,27 +2059,36 @@ struct PreparedRecord {
     cid: String,
 }
 
-async fn batch_upsert_records(state: &AppState, batch: &[PreparedRecord]) {
+/// Write one `listRecords` page in one transaction: the multi-row upsert, then
+/// refs for exactly the rows it inserted or changed. The upsert's `WHERE`
+/// skips unchanged rows, which keep their refs and `indexed_at`. Returns the
+/// URIs written.
+async fn write_records_page(
+    state: &AppState,
+    batch: &[PreparedRecord],
+) -> Result<Vec<String>, sqlx::Error> {
     if batch.is_empty() {
-        return;
+        return Ok(Vec::new());
     }
-
     let backend = state.db_backend;
     let now = now_rfc3339();
 
-    // Build multi-row INSERT. 8 params per row; ON CONFLICT uses EXCLUDED.
-    let placeholders: Vec<String> = (0..batch.len())
-        .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?)".to_string())
-        .collect();
-    let raw_sql = format!(
-        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES {} ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at",
-        placeholders.join(", ")
+    // 8 params per row; a page is at most 100 rows, under SQLite's 999.
+    let placeholders = vec!["(?, ?, ?, ?, ?, ?, ?, ?)"; batch.len()].join(", ");
+    let upsert_sql = adapt_sql(
+        &format!(
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES {placeholders} \
+             ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at \
+             WHERE {} RETURNING uri",
+            crate::db::record_changed_clause(backend)
+        ),
+        backend,
     );
-    let sql = adapt_sql(&raw_sql, backend);
 
-    let mut query = crate::db::query(&sql);
+    let mut tx = state.backfill_db.begin().await?;
+    let mut upsert = crate::db::query_as::<(String,)>(&upsert_sql);
     for rec in batch {
-        query = query
+        upsert = upsert
             .bind(&rec.uri)
             .bind(&rec.did)
             .bind(&rec.collection)
@@ -2027,64 +2098,66 @@ async fn batch_upsert_records(state: &AppState, batch: &[PreparedRecord]) {
             .bind(&now)
             .bind(&now);
     }
+    let written: Vec<String> = upsert
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|(uri,)| uri)
+        .collect();
 
-    if let Err(e) = query.execute(&state.backfill_db).await {
-        tracing::warn!(batch_size = batch.len(), "batch record upsert failed: {e}");
-    }
-
-    // Batch sync_refs: delete old refs for all URIs, then insert new ones.
-    let uris: Vec<&str> = batch.iter().map(|r| r.uri.as_str()).collect();
-    let delete_placeholders: Vec<&str> = (0..uris.len()).map(|_| "?").collect();
-    let delete_raw = format!(
-        "DELETE FROM happyview_record_refs WHERE source_uri IN ({})",
-        delete_placeholders.join(", ")
-    );
-    let delete_sql = adapt_sql(&delete_raw, backend);
-    let mut del_query = crate::db::query(&delete_sql);
-    for uri in &uris {
-        del_query = del_query.bind(*uri);
-    }
-    let _ = del_query.execute(&state.backfill_db).await;
-
-    // Collect all new refs and batch insert them
-    let mut all_refs: Vec<(&str, String, &str)> = Vec::new();
-    for rec in batch {
-        let record_val: serde_json::Value =
-            serde_json::from_str(&rec.record_json).unwrap_or_default();
-        for target_uri in crate::record_refs::extract_at_uris(&record_val) {
-            all_refs.push((&rec.uri, target_uri, &rec.collection));
-        }
-    }
-
-    // Insert refs in chunks to stay within SQLite's param limit (3 params per ref)
-    for chunk in all_refs.chunks(300) {
-        let ref_placeholders: Vec<&str> = (0..chunk.len()).map(|_| "(?, ?, ?)").collect();
-        let ref_raw = format!(
-            "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES {} ON CONFLICT DO NOTHING",
-            ref_placeholders.join(", ")
+    if !written.is_empty() {
+        let delete_sql = adapt_sql(
+            &format!(
+                "DELETE FROM happyview_record_refs WHERE source_uri IN ({})",
+                vec!["?"; written.len()].join(", ")
+            ),
+            backend,
         );
-        let ref_sql = adapt_sql(&ref_raw, backend);
-        let mut ref_query = crate::db::query(&ref_sql);
-        for (source, target, collection) in chunk {
-            ref_query = ref_query.bind(*source).bind(target).bind(*collection);
+        let mut delete = crate::db::query(&delete_sql);
+        for uri in &written {
+            delete = delete.bind(uri.as_str());
         }
-        let _ = ref_query.execute(&state.backfill_db).await;
+        delete.execute(&mut *tx).await?;
+
+        let written_uris: HashSet<&str> = written.iter().map(String::as_str).collect();
+        let mut refs: Vec<(&str, String, &str)> = Vec::new();
+        for rec in batch
+            .iter()
+            .filter(|rec| written_uris.contains(rec.uri.as_str()))
+        {
+            let value: Value = serde_json::from_str(&rec.record_json).unwrap_or_default();
+            for target in crate::record_refs::extract_at_uris(&value) {
+                refs.push((&rec.uri, target, &rec.collection));
+            }
+        }
+        for chunk in refs.chunks(crate::record_refs::REFS_PER_INSERT) {
+            let ref_sql = adapt_sql(
+                &format!(
+                    "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES {} ON CONFLICT DO NOTHING",
+                    vec!["(?, ?, ?)"; chunk.len()].join(", ")
+                ),
+                backend,
+            );
+            let mut insert = crate::db::query(&ref_sql);
+            for (source, target, collection) in chunk {
+                insert = insert.bind(*source).bind(target.as_str()).bind(*collection);
+            }
+            insert.execute(&mut *tx).await?;
+        }
     }
 
-    // Queue label backfill only if there are active labeler subscriptions.
-    // Check once per batch instead of spawning a task per record.
-    let has_subscriptions: bool = crate::db::query_as::<(i64,)>(
-        "SELECT COUNT(*) FROM happyview_labeler_subscriptions WHERE status = 'active'",
-    )
-    .fetch_one(&state.db)
-    .await
-    .map(|(c,)| c > 0)
-    .unwrap_or(false);
+    tx.commit().await?;
+    Ok(written)
+}
 
-    if has_subscriptions {
-        for rec in batch {
-            crate::labeler::backfill_labels_for_uri(Arc::new(state.clone()), rec.uri.clone());
-        }
+/// Fetch labels for freshly written records, when any labeler is subscribed.
+async fn queue_label_backfill(state: &AppState, uris: &[String]) {
+    if uris.is_empty() || !crate::labeler::has_active_subscriptions(state).await {
+        return;
+    }
+    let shared = Arc::new(state.clone());
+    for uri in uris {
+        crate::labeler::backfill_labels_for_uri(Arc::clone(&shared), uri.clone());
     }
 }
 
@@ -2231,8 +2304,26 @@ async fn fetch_records_page_loop(
             });
         }
 
-        count += batch.len() as u32;
-        batch_upsert_records(state, &batch).await;
+        match crate::db::retry_on_busy(|| write_records_page(state, &batch)).await {
+            Ok(written) => {
+                count += batch.len() as u32;
+                queue_label_backfill(state, &written).await;
+            }
+            Err(e) => {
+                tracing::error!(did, collection, error = %e, "failed to write a page of backfilled records");
+                // The page rolled back, so it is not counted, and a retry
+                // resumes from the cursor that fetched it.
+                return FetchOutcome::Failed {
+                    count,
+                    cursor,
+                    failure: crate::admin::backfill_errors::BackfillFailure {
+                        kind: crate::admin::backfill_errors::BackfillErrorKind::Other,
+                        message: format!("database write failed: {e}"),
+                        retry_after: None,
+                    },
+                };
+            }
+        }
 
         match body.cursor {
             Some(c) if page_count > 0 => cursor = Some(c),
@@ -2785,10 +2876,13 @@ pub(super) async fn resume_backfill(
                 "UPDATE happyview_backfill_jobs SET status = 'running' WHERE id = ?",
                 state.db_backend,
             );
-            let _ = crate::db::query(&sql)
-                .bind(&job_id)
-                .execute(&state.backfill_db)
-                .await;
+            crate::db::retry_on_busy(|| {
+                crate::db::query(&sql)
+                    .bind(&job_id)
+                    .execute(&state.backfill_db)
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to resume backfill job: {e}")))?;
 
             let spawn_state = state.clone();
             let spawn_job_id = job_id.clone();
@@ -3472,6 +3566,10 @@ mod tests {
     use super::*;
 
     use crate::test_support::{memory_pool, test_state_with_pool};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const POST: &str = "app.test.post";
 
     // -----------------------------------------------------------------------
     // Account-targeted jobs
@@ -4350,5 +4448,188 @@ mod tests {
         .expect_err("should 404 for an unknown job");
 
         assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Page writes
+    // -----------------------------------------------------------------------
+
+    fn prepared(rkey: &str, body: serde_json::Value) -> PreparedRecord {
+        PreparedRecord {
+            uri: format!("at://did:plc:page/{POST}/{rkey}"),
+            did: "did:plc:page".to_string(),
+            collection: POST.to_string(),
+            rkey: rkey.to_string(),
+            record_json: body.to_string(),
+            cid: format!("bafy{rkey}"),
+        }
+    }
+
+    async fn ref_count(state: &AppState, uri: &str) -> i64 {
+        let sql = adapt_sql(
+            "SELECT COUNT(*) FROM happyview_record_refs WHERE source_uri = ?",
+            state.db_backend,
+        );
+        crate::db::query_as::<(i64,)>(&sql)
+            .bind(uri)
+            .fetch_one(&state.db)
+            .await
+            .expect("count refs")
+            .0
+    }
+
+    /// An identical page writes nothing and leaves refs alone (they are
+    /// deleted here so a rewrite would show); an edited row is written and
+    /// its refs rebuilt.
+    async fn assert_page_writes_only_changes(state: &AppState, prefix: &str) {
+        let subject = "at://did:plc:t/app.test.post/1";
+        let page = vec![
+            prepared(
+                &format!("{prefix}a"),
+                serde_json::json!({"subject": subject}),
+            ),
+            prepared(&format!("{prefix}b"), serde_json::json!({"text": "plain"})),
+        ];
+        let linked = page[0].uri.clone();
+
+        let written = write_records_page(state, &page).await.expect("first write");
+        assert_eq!(written.len(), 2);
+        assert_eq!(ref_count(state, &linked).await, 1);
+
+        let sql = adapt_sql(
+            "DELETE FROM happyview_record_refs WHERE source_uri = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(&linked)
+            .execute(&state.db)
+            .await
+            .expect("delete refs");
+        let again = write_records_page(state, &page)
+            .await
+            .expect("identical write");
+        assert!(
+            again.is_empty(),
+            "an identical page writes nothing: {again:?}"
+        );
+        assert_eq!(
+            ref_count(state, &linked).await,
+            0,
+            "unchanged rows keep their refs untouched"
+        );
+
+        let mut edited = page;
+        edited[0].record_json =
+            serde_json::json!({"subject": subject, "text": "edited"}).to_string();
+        let changed = write_records_page(state, &edited)
+            .await
+            .expect("edited write");
+        assert_eq!(changed, vec![linked.clone()]);
+        assert_eq!(
+            ref_count(state, &linked).await,
+            1,
+            "a changed row gets its refs rebuilt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backfill_page_skips_unchanged_rows() {
+        let state = migrated_state().await;
+        assert_page_writes_only_changes(&state, "s").await;
+    }
+
+    #[tokio::test]
+    async fn a_backfill_page_skips_unchanged_rows_on_postgres() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        let prefix = format!("p{}", Uuid::new_v4().simple());
+        assert_page_writes_only_changes(&state, &prefix).await;
+
+        let sql = adapt_sql(
+            "DELETE FROM happyview_records WHERE uri LIKE ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(format!("at://did:plc:page/{POST}/{prefix}%"))
+            .execute(&state.db)
+            .await
+            .expect("clean up");
+    }
+
+    /// A page that cannot be written rolls back whole and becomes a fetch
+    /// failure the recorder keeps, rather than a warning nobody reads.
+    #[tokio::test]
+    async fn a_page_that_cannot_be_written_is_a_fetch_failure() {
+        let mock = MockServer::start().await;
+        let state = migrated_state().await;
+        crate::db::query("DROP TABLE happyview_record_refs")
+            .execute(&state.db)
+            .await
+            .expect("drop refs table");
+        let value = serde_json::json!({"$type": POST, "subject": "at://did:plc:t/app.test.post/1"});
+        let cid = crate::cid_verify::compute_record_cid(&value)
+            .expect("cid")
+            .to_string();
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.listRecords"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "records": [{"uri": format!("at://did:plc:f/{POST}/1"), "cid": cid, "value": value}]
+            })))
+            .mount(&mock)
+            .await;
+
+        let outcome = fetch_records_page_loop(
+            &state,
+            &mock.uri(),
+            "did:plc:f",
+            POST,
+            None,
+            &AtomicBool::new(false),
+        )
+        .await;
+
+        match outcome {
+            FetchOutcome::Failed {
+                count,
+                cursor,
+                failure,
+            } => {
+                assert_eq!(failure.kind, BackfillErrorKind::Other);
+                assert!(
+                    failure.message.contains("database write failed"),
+                    "{}",
+                    failure.message
+                );
+                assert_eq!((count, cursor), (0, None));
+            }
+            FetchOutcome::Complete { .. } => {
+                panic!("a page that cannot be written must not complete")
+            }
+        }
+        let (records,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_records")
+            .fetch_one(&state.db)
+            .await
+            .expect("count records");
+        assert_eq!(records, 0, "the page rolls back whole");
+    }
+
+    #[tokio::test]
+    async fn a_bookkeeping_write_that_fails_is_logged_not_dropped() {
+        let state = migrated_state().await;
+        let result = job_write(&state, "job-x", "test_write", || {
+            crate::db::query("UPDATE no_such_table SET x = 1").execute(&state.backfill_db)
+        })
+        .await;
+        assert!(result.is_none());
+
+        let (logged,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'backfill.write_failed' AND subject = 'job-x'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("count events");
+        assert_eq!(logged, 1);
     }
 }
