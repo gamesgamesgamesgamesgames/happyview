@@ -142,7 +142,16 @@ function statusBadge(job: BackfillJob) {
         </Badge>
       );
     case "paused":
-      return (
+      // A job only carries an error while paused when HappyView paused it
+      // itself, with work it could not finish.
+      return job.error ? (
+        <Badge
+          title={job.error}
+          className="bg-amber-500/15 text-amber-700 dark:text-amber-400 hover:bg-amber-500/25 border-amber-500/20"
+        >
+          paused automatically
+        </Badge>
+      ) : (
         <Badge className="bg-gray-500/15 text-gray-700 dark:text-gray-400 hover:bg-gray-500/25 border-gray-500/20">
           paused
         </Badge>
@@ -562,13 +571,18 @@ export default function BackfillPage() {
                   <AlertDialogHeader>
                     <AlertDialogTitle>Clear all job details?</AlertDialogTitle>
                     <AlertDialogDescription>
-                      This will permanently delete per-repo detail data for all backfill jobs.
+                      This will permanently delete per-repo detail data for all completed, cancelled and failed backfill jobs.
                     </AlertDialogDescription>
                   </AlertDialogHeader>
                   <AlertDialogFooter>
                     <AlertDialogCancel>Cancel</AlertDialogCancel>
                     <AlertDialogAction onClick={async () => {
-                      await flushAllBackfillDetails();
+                      try {
+                        await flushAllBackfillDetails();
+                      } catch (e: unknown) {
+                        toastError("Failed to clear job details", e);
+                        return;
+                      }
                       toast.success("All job details cleared");
                       setSelectedJobId(null);
                       load();
@@ -717,6 +731,17 @@ function JobDetail({
   const allDone = job.status === "completed";
   const isActive = job.status === "running" || job.status === "cancelling" || job.status === "pausing";
   const isPaused = job.status === "paused" || job.status === "pausing";
+  // Discovery runs alongside resolving and fetching on the bounded queue.
+  const discovering = job.discovery_complete === false;
+  const bounded = job.recent_completions_limit != null;
+  // A bounded job's queue is its work, so the server only clears a finished
+  // one; a legacy job can be cleared whenever it isn't running.
+  const flushable =
+    !isActive &&
+    (!bounded || job.status === "completed" || job.status === "cancelled" || job.status === "failed");
+  // Set only when HappyView paused the job itself; an operator's pause has no
+  // reason, and resuming clears it.
+  const pauseReason = job.status === "paused" ? job.error : null;
 
   // Detail data state
   const [discoveredRepos, setDiscoveredRepos] = useState<BackfillRepoEntry[]>([]);
@@ -781,7 +806,11 @@ function JobDetail({
   function isPhasePaused(phase: (typeof PROGRESS_PHASES)[number]): boolean {
     if (!isPaused) return false;
     if (job.stage === "resolving_and_fetching") {
-      return phase === "resolving_pds" || phase === "fetching_records";
+      return (
+        phase === "resolving_pds" ||
+        phase === "fetching_records" ||
+        (phase === "discovering_repos" && discovering)
+      );
     }
     if (job.stage === "discovering_repos") {
       return phase === "discovering_repos";
@@ -914,6 +943,7 @@ function JobDetail({
           processed_repos: maxCount(e.processed_repos, j.processed_repos),
           total_records: maxCount(e.total_records, j.total_records),
           error_counts: e.error_counts ?? j.error_counts,
+          discovery_complete: e.discovery_complete ?? j.discovery_complete,
         }));
       } else if (e.type === "job_counters") {
         update((j) => ({
@@ -1006,7 +1036,14 @@ function JobDetail({
           )}
         </div>
 
-        {job.error && (
+        {pauseReason ? (
+          <div>
+            <span className="text-muted-foreground text-sm">Paused automatically</span>
+            <div className="bg-amber-500/10 text-amber-700 dark:text-amber-400 mt-1 rounded-md p-3 text-xs whitespace-pre-wrap">
+              {pauseReason}
+            </div>
+          </div>
+        ) : job.error && (
           <div>
             <span className="text-muted-foreground text-sm">Error</span>
             <div className="bg-destructive/10 text-destructive mt-1 rounded-md p-3 font-mono text-xs whitespace-pre-wrap">
@@ -1020,15 +1057,20 @@ function JobDetail({
           <div className="mt-1 rounded-md border divide-y">
             <ProgressRow
               label="Discovering repos"
-              active={isActive && job.stage === "discovering_repos"}
+              active={isActive && (job.stage === "discovering_repos" || discovering)}
               reached={hasReached("discovering_repos")}
               paused={isPhasePaused("discovering_repos")}
               value={job.total_repos != null ? <AnimatedNumber value={job.total_repos} /> : undefined}
-              suffix="repos found"
+              suffix={discovering ? "found so far" : "repos found"}
               loading={discoveredOpen && discoveredReached && !discoveredLoaded}
               open={discoveredOpen}
               onOpenChange={setDiscoveredOpen}
             >
+              {bounded && discoveredLoaded && (
+                <p className="px-3 pt-2 text-xs text-muted-foreground">
+                  Repos waiting to be fetched. Finished repos move to Fetching records.
+                </p>
+              )}
               {discoveredRepos.length > 0 ? (
                 <VirtualList
                   items={discoveredRepos}
@@ -1045,7 +1087,9 @@ function JobDetail({
                   )}
                 />
               ) : discoveredLoaded ? (
-                <p className="py-3 text-center text-xs text-muted-foreground">No repos discovered yet.</p>
+                <p className="py-3 text-center text-xs text-muted-foreground">
+                  {bounded ? "No repos waiting." : "No repos discovered yet."}
+                </p>
               ) : null}
             </ProgressRow>
             <ProgressRow
@@ -1113,6 +1157,11 @@ function JobDetail({
               open={fetchedOpen}
               onOpenChange={setFetchedOpen}
             >
+              {job.recent_completions_limit != null && fetchedLoaded && (
+                <p className="px-3 pt-2 text-xs text-muted-foreground">
+                  The {job.recent_completions_limit.toLocaleString()} most recently fetched repos.
+                </p>
+              )}
               {fetchedWithRecords.length > 0 ? (
                 <VirtualList
                   items={fetchedWithRecords}
@@ -1192,7 +1241,7 @@ function JobDetail({
         </div>
       </div>
       <SheetFooter className="border-t flex-row justify-end gap-2">
-        {canFlush && !isActive && (
+        {canFlush && flushable && (
           <AlertDialog>
             <AlertDialogTrigger asChild>
               <Button variant="outline" size="sm">Clear details</Button>
@@ -1207,7 +1256,12 @@ function JobDetail({
               <AlertDialogFooter>
                 <AlertDialogCancel>Cancel</AlertDialogCancel>
                 <AlertDialogAction onClick={async () => {
-                  await flushBackfillDetails(job.id);
+                  try {
+                    await flushBackfillDetails(job.id);
+                  } catch (e: unknown) {
+                    toastError("Failed to clear job details", e);
+                    return;
+                  }
                   toast.success("Job details cleared");
                   setDiscoveredRepos([]);
                   setDiscoveredCursor(null);
@@ -1321,9 +1375,11 @@ function VirtualList<T>({
         {virtualItems.map((virtualRow) => {
           const item = items[virtualRow.index];
           if (!item) return null;
+          // Keyed by position: a repo found under two collections is two
+          // queued units, so a DID is not unique within a list.
           return (
             <div
-              key={getKey(item)}
+              key={virtualRow.index}
               style={{
                 position: "absolute",
                 top: 0,

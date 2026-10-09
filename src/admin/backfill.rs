@@ -158,7 +158,7 @@ where
 /// A snapshot is how it resyncs.
 async fn build_job_snapshot(state: &AppState, job_id: &str) -> Option<super::types::BackfillEvent> {
     let sql = adapt_sql(
-        "SELECT status, stage, total_repos, resolved_repos, processed_repos, total_records, error_counts \
+        "SELECT status, stage, total_repos, resolved_repos, processed_repos, total_records, error_counts, discovery_complete \
          FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     );
@@ -171,6 +171,7 @@ async fn build_job_snapshot(state: &AppState, job_id: &str) -> Option<super::typ
         Option<i32>,
         Option<i32>,
         Option<String>,
+        i32,
     )> = crate::db::query_as(&sql)
         .bind(job_id)
         .fetch_optional(&state.backfill_db)
@@ -178,8 +179,16 @@ async fn build_job_snapshot(state: &AppState, job_id: &str) -> Option<super::typ
         .ok()
         .flatten();
 
-    let (status, stage, total_repos, resolved_repos, processed_repos, total_records, error_counts) =
-        row?;
+    let (
+        status,
+        stage,
+        total_repos,
+        resolved_repos,
+        processed_repos,
+        total_records,
+        error_counts,
+        discovery_complete,
+    ) = row?;
 
     Some(super::types::BackfillEvent::JobSnapshot {
         job_id: job_id.to_string(),
@@ -192,6 +201,7 @@ async fn build_job_snapshot(state: &AppState, job_id: &str) -> Option<super::typ
         error_counts: error_counts
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| serde_json::json!({})),
+        discovery_complete: discovery_complete != 0,
     })
 }
 
@@ -4065,7 +4075,7 @@ pub(super) async fn backfill_status(
     let backend = state.db_backend;
 
     let sql = adapt_sql(
-        "SELECT id, collection, did, scope, status, stage, total_repos, resolved_repos, processed_repos, total_records, error, started_at, completed_at, created_at FROM happyview_backfill_jobs ORDER BY created_at DESC",
+        "SELECT id, collection, did, scope, status, stage, total_repos, resolved_repos, processed_repos, total_records, error, started_at, completed_at, created_at, queue_version, discovery_complete FROM happyview_backfill_jobs ORDER BY created_at DESC",
         backend,
     );
     #[allow(clippy::type_complexity)]
@@ -4084,6 +4094,8 @@ pub(super) async fn backfill_status(
         Option<String>,
         Option<String>,
         String,
+        i32,
+        i32,
     )> = crate::db::query_as(&sql)
         .fetch_all(&state.backfill_db)
         .await
@@ -4107,6 +4119,8 @@ pub(super) async fn backfill_status(
                 started_at,
                 completed_at,
                 created_at,
+                queue_version,
+                discovery_complete,
             )| {
                 BackfillJob {
                     id,
@@ -4123,6 +4137,10 @@ pub(super) async fn backfill_status(
                     started_at,
                     completed_at,
                     created_at,
+                    discovery_complete: discovery_complete != 0,
+                    recent_completions_limit: (QueueVersion::from_column(queue_version)
+                        == QueueVersion::Bounded)
+                        .then_some(RECENT_COMPLETIONS_PER_JOB),
                 }
             },
         )
@@ -4209,6 +4227,30 @@ pub(super) struct ReposQuery {
     limit: Option<i32>,
 }
 
+/// A job's queue version, or `None` for an unknown job.
+async fn job_queue_version(
+    state: &AppState,
+    job_id: &str,
+) -> Result<Option<QueueVersion>, AppError> {
+    let sql = adapt_sql(
+        "SELECT queue_version FROM happyview_backfill_jobs WHERE id = ?",
+        state.db_backend,
+    );
+    crate::db::query_as::<(i32,)>(&sql)
+        .bind(job_id)
+        .fetch_optional(&state.backfill_db)
+        .await
+        .map(|row| row.map(|(version,)| QueueVersion::from_column(version)))
+        .map_err(|e| AppError::Internal(format!("failed to query backfill job: {e}")))
+}
+
+/// `GET /admin/backfill/{id}/repos`.
+///
+/// A bounded job keeps no row per completed repo, so `phase=fetched` lists
+/// its recent-completions log (`RECENT_COMPLETIONS_PER_JOB`, newest first).
+/// `phase=resolved` and the default list its queued units. A legacy job
+/// lists its `happyview_backfill_repos` rows as it always did. Cursors are
+/// opaque and only valid for the listing that issued them.
 pub(super) async fn backfill_repos(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
@@ -4217,30 +4259,49 @@ pub(super) async fn backfill_repos(
 ) -> Result<Json<super::types::BackfillReposResponse>, AppError> {
     auth.require(Permission::BackfillRead).await?;
 
-    let limit = query.limit.unwrap_or(50).min(100);
-    let phase_filter = match query.phase.as_deref() {
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let cursor = query.cursor.as_deref();
+    let page = match job_queue_version(&state, &job_id).await? {
+        Some(QueueVersion::Bounded) => match query.phase.as_deref() {
+            Some("fetched") => recent_completions_page(&state, &job_id, cursor, limit).await?,
+            phase => {
+                queued_units_page(&state, &job_id, phase == Some("resolved"), cursor, limit).await?
+            }
+        },
+        // An unknown job lists nothing, as it always has.
+        Some(QueueVersion::Legacy) | None => {
+            legacy_repos_page(&state, &job_id, query.phase.as_deref(), cursor, limit).await?
+        }
+    };
+    Ok(Json(page))
+}
+
+/// A legacy job's repo rows, keyset-paged by DID.
+async fn legacy_repos_page(
+    state: &AppState,
+    job_id: &str,
+    phase: Option<&str>,
+    cursor: Option<&str>,
+    limit: i32,
+) -> Result<super::types::BackfillReposResponse, AppError> {
+    let phase_filter = match phase {
         Some("resolved") => " AND pds_endpoint IS NOT NULL",
         Some("fetched") => " AND status = 'completed'",
         _ => "",
     };
-    let cursor_filter = if query.cursor.is_some() {
-        " AND did > ?"
-    } else {
-        ""
-    };
-
-    let sql_str = format!(
-        "SELECT did, pds_endpoint, status, records_fetched FROM happyview_backfill_repos WHERE job_id = ?{phase_filter}{cursor_filter} ORDER BY did ASC LIMIT ?",
+    let cursor_filter = if cursor.is_some() { " AND did > ?" } else { "" };
+    let sql = adapt_sql(
+        &format!(
+            "SELECT did, pds_endpoint, status, records_fetched FROM happyview_backfill_repos WHERE job_id = ?{phase_filter}{cursor_filter} ORDER BY did ASC LIMIT ?",
+        ),
+        state.db_backend,
     );
-    let sql = adapt_sql(&sql_str, state.db_backend);
-
-    let mut q = crate::db::query_as::<(String, Option<String>, String, i32)>(&sql).bind(&job_id);
-    if let Some(ref cursor) = query.cursor {
+    let mut q = crate::db::query_as::<(String, Option<String>, String, i32)>(&sql).bind(job_id);
+    if let Some(cursor) = cursor {
         q = q.bind(cursor);
     }
-    q = q.bind(limit + 1);
-
-    let rows: Vec<(String, Option<String>, String, i32)> = q
+    let rows = q
+        .bind(limit + 1)
         .fetch_all(&state.backfill_db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to query backfill repos: {e}")))?;
@@ -4258,16 +4319,125 @@ pub(super) async fn backfill_repos(
             },
         )
         .collect();
-
     let cursor = if has_more {
         repos.last().map(|r| r.did.clone())
     } else {
         None
     };
-
-    Ok(Json(super::types::BackfillReposResponse { repos, cursor }))
+    Ok(super::types::BackfillReposResponse { repos, cursor })
 }
 
+/// A bounded job's recent completions, newest first, paged by log id.
+async fn recent_completions_page(
+    state: &AppState,
+    job_id: &str,
+    cursor: Option<&str>,
+    limit: i32,
+) -> Result<super::types::BackfillReposResponse, AppError> {
+    let before = cursor
+        .map(|c| {
+            c.parse::<i64>()
+                .map_err(|_| AppError::BadRequest(format!("invalid cursor: {c}")))
+        })
+        .transpose()?;
+    let sql = adapt_sql(
+        &format!(
+            "SELECT id, did, pds_endpoint, records_fetched FROM happyview_backfill_completions \
+             WHERE job_id = ?{} ORDER BY id DESC LIMIT ?",
+            if before.is_some() { " AND id < ?" } else { "" }
+        ),
+        state.db_backend,
+    );
+    let mut q = crate::db::query_as::<(i64, String, String, i32)>(&sql).bind(job_id);
+    if let Some(id) = before {
+        q = q.bind(id);
+    }
+    let rows = q
+        .bind(limit + 1)
+        .fetch_all(&state.backfill_db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to query backfill completions: {e}")))?;
+
+    let has_more = rows.len() > limit as usize;
+    let rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
+    let cursor = if has_more {
+        rows.last().map(|(id, ..)| id.to_string())
+    } else {
+        None
+    };
+    let repos = rows
+        .into_iter()
+        .map(
+            |(_, did, pds_endpoint, records_fetched)| super::types::BackfillRepoEntry {
+                did,
+                pds_endpoint: Some(pds_endpoint),
+                status: "completed".to_string(),
+                records_fetched,
+            },
+        )
+        .collect();
+    Ok(super::types::BackfillReposResponse { repos, cursor })
+}
+
+/// A bounded job's queued units in `(collection, did)` order, paged by a
+/// `collection|did` cursor. Neither an NSID nor a DID contains `|`.
+async fn queued_units_page(
+    state: &AppState,
+    job_id: &str,
+    resolved_only: bool,
+    cursor: Option<&str>,
+    limit: i32,
+) -> Result<super::types::BackfillReposResponse, AppError> {
+    let after = cursor
+        .map(|c| {
+            c.split_once('|')
+                .ok_or_else(|| AppError::BadRequest(format!("invalid cursor: {c}")))
+        })
+        .transpose()?;
+    let mut sql = String::from(
+        "SELECT collection, did, pds_endpoint FROM happyview_backfill_queue WHERE job_id = ?",
+    );
+    if resolved_only {
+        sql.push_str(" AND pds_endpoint IS NOT NULL");
+    }
+    if after.is_some() {
+        sql.push_str(" AND (collection > ? OR (collection = ? AND did > ?))");
+    }
+    sql.push_str(" ORDER BY collection, did LIMIT ?");
+    let sql = adapt_sql(&sql, state.db_backend);
+
+    let mut q = crate::db::query_as::<(String, String, Option<String>)>(&sql).bind(job_id);
+    if let Some((collection, did)) = after {
+        q = q.bind(collection).bind(collection).bind(did);
+    }
+    let rows = q
+        .bind(limit + 1)
+        .fetch_all(&state.backfill_db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to query backfill queue: {e}")))?;
+
+    let has_more = rows.len() > limit as usize;
+    let rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
+    let cursor = if has_more {
+        rows.last()
+            .map(|(collection, did, _)| format!("{collection}|{did}"))
+    } else {
+        None
+    };
+    let repos = rows
+        .into_iter()
+        .map(|(_, did, pds_endpoint)| super::types::BackfillRepoEntry {
+            did,
+            pds_endpoint,
+            status: "pending".to_string(),
+            records_fetched: 0,
+        })
+        .collect();
+    Ok(super::types::BackfillReposResponse { repos, cursor })
+}
+
+/// `GET /admin/backfill/{id}/pds-summary`. A bounded job reads its per-PDS
+/// counters; a legacy job aggregates its repo rows as before.
 pub(super) async fn backfill_pds_summary(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
@@ -4275,26 +4445,31 @@ pub(super) async fn backfill_pds_summary(
 ) -> Result<Json<super::types::PdsSummaryResponse>, AppError> {
     auth.require(Permission::BackfillRead).await?;
 
-    let sql = adapt_sql(
-        "SELECT pds_endpoint, COUNT(*) as total_repos, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_repos, SUM(records_fetched) as total_records FROM happyview_backfill_repos WHERE job_id = ? AND pds_endpoint IS NOT NULL GROUP BY pds_endpoint ORDER BY COUNT(*) DESC",
-        state.db_backend,
-    );
-
-    let rows: Vec<(String, i32, i32, i64)> = crate::db::query_as(&sql)
+    let bounded = job_queue_version(&state, &job_id).await? == Some(QueueVersion::Bounded);
+    // The bounded counters are 64-bit; the response's are not.
+    let sql = if bounded {
+        "SELECT pds_endpoint, repos, completed_repos, records FROM happyview_backfill_pds_stats \
+         WHERE job_id = ? ORDER BY repos DESC, pds_endpoint ASC"
+    } else {
+        "SELECT pds_endpoint, COUNT(*) as total_repos, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_repos, SUM(records_fetched) as total_records FROM happyview_backfill_repos WHERE job_id = ? AND pds_endpoint IS NOT NULL GROUP BY pds_endpoint ORDER BY COUNT(*) DESC"
+    };
+    let sql = adapt_sql(sql, state.db_backend);
+    let rows: Vec<(String, i64, i64, i64)> = crate::db::query_as(&sql)
         .bind(&job_id)
         .fetch_all(&state.backfill_db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to query PDS summary: {e}")))?;
 
-    let pds_endpoints: Vec<super::types::PdsSummaryEntry> = rows
+    let saturate = |n: i64| i32::try_from(n).unwrap_or(i32::MAX);
+    let pds_endpoints = rows
         .into_iter()
         .map(
             |(pds_endpoint, total_repos, completed_repos, total_records)| {
                 super::types::PdsSummaryEntry {
                     pds_endpoint,
-                    total_repos,
-                    completed_repos,
-                    total_records: total_records as i32,
+                    total_repos: saturate(total_repos),
+                    completed_repos: saturate(completed_repos),
+                    total_records: saturate(total_records),
                 }
             },
         )
@@ -4580,6 +4755,46 @@ pub(super) async fn retry_failed_backfill(
 // Flush endpoints
 // ---------------------------------------------------------------------------
 
+/// Per-job detail a flush or the retention sweep clears: a legacy job's repo
+/// rows, and a bounded job's recent completions and PDS summary.
+const BACKFILL_DETAIL_TABLES: [&str; 3] = [
+    "happyview_backfill_repos",
+    "happyview_backfill_completions",
+    "happyview_backfill_pds_stats",
+];
+
+/// A bounded job's live work. A running or paused job still needs it, so it
+/// is cleared only once the job has finished. A cancelled or failed job can
+/// leave up to a window of units behind.
+const BACKFILL_WORK_TABLES: [&str; 2] = ["happyview_backfill_queue", "happyview_backfill_cursors"];
+
+/// Statuses a job never leaves.
+const FINISHED_STATUSES: [&str; 3] = ["completed", "cancelled", "failed"];
+
+const FINISHED_JOBS: &str =
+    "SELECT id FROM happyview_backfill_jobs WHERE status IN ('completed', 'cancelled', 'failed')";
+
+/// Run one detail delete, retrying while the database is busy. Returns the
+/// rows deleted.
+async fn delete_detail_rows(state: &AppState, sql: &str, binds: &[&str]) -> Result<u64, AppError> {
+    let sql = adapt_sql(sql, state.db_backend);
+    crate::db::retry_on_busy(|| {
+        let mut q = crate::db::query(&sql);
+        for value in binds {
+            q = q.bind(*value);
+        }
+        q.execute(&state.backfill_db)
+    })
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(|e| AppError::Internal(format!("failed to flush backfill details: {e}")))
+}
+
+/// `DELETE /admin/backfill/{id}/details`.
+///
+/// A bounded job is flushed only once it has finished: its queue is its
+/// work, not detail, and a flush that took it from a running or paused job
+/// would lose repos. A legacy job is flushed in any state, as it always was.
 pub(super) async fn flush_backfill_details(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
@@ -4588,32 +4803,59 @@ pub(super) async fn flush_backfill_details(
     auth.require(Permission::BackfillCreate).await?;
 
     let sql = adapt_sql(
-        "DELETE FROM happyview_backfill_repos WHERE job_id = ?",
+        "SELECT status, queue_version FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     );
-    crate::db::query(&sql)
+    let job: Option<(String, i32)> = crate::db::query_as(&sql)
         .bind(&job_id)
-        .execute(&state.backfill_db)
+        .fetch_optional(&state.backfill_db)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to flush backfill details: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("failed to query backfill job: {e}")))?;
+    if let Some((status, version)) = job
+        && QueueVersion::from_column(version) == QueueVersion::Bounded
+        && !FINISHED_STATUSES.contains(&status.as_str())
+    {
+        return Err(AppError::Conflict(format!(
+            "job is {status}; only completed, cancelled or failed jobs can be flushed"
+        )));
+    }
+
+    for table in BACKFILL_DETAIL_TABLES {
+        delete_detail_rows(
+            &state,
+            &format!("DELETE FROM {table} WHERE job_id = ?"),
+            &[job_id.as_str()],
+        )
+        .await?;
+    }
+    for table in BACKFILL_WORK_TABLES {
+        delete_detail_rows(
+            &state,
+            &format!("DELETE FROM {table} WHERE job_id = ? AND job_id IN ({FINISHED_JOBS})"),
+            &[job_id.as_str()],
+        )
+        .await?;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `DELETE /admin/backfill/details`: every detail and leftover queue row of
+/// every finished job.
 pub(super) async fn flush_all_backfill_details(
     State(state): State<AppState>,
     auth: UserAuth,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::BackfillCreate).await?;
 
-    let sql = adapt_sql(
-        "DELETE FROM happyview_backfill_repos WHERE job_id IN (SELECT id FROM happyview_backfill_jobs WHERE status IN ('completed', 'cancelled', 'failed'))",
-        state.db_backend,
-    );
-    crate::db::query(&sql)
-        .execute(&state.backfill_db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to flush backfill details: {e}")))?;
+    for table in BACKFILL_DETAIL_TABLES.iter().chain(&BACKFILL_WORK_TABLES) {
+        delete_detail_rows(
+            &state,
+            &format!("DELETE FROM {table} WHERE job_id IN ({FINISHED_JOBS})"),
+            &[],
+        )
+        .await?;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -4621,6 +4863,27 @@ pub(super) async fn flush_all_backfill_details(
 // ---------------------------------------------------------------------------
 // Retention cleanup
 // ---------------------------------------------------------------------------
+
+/// Delete every detail and leftover queue row of jobs that finished before
+/// `cutoff` (RFC 3339). Returns the rows deleted.
+pub(crate) async fn sweep_backfill_details(
+    state: &AppState,
+    cutoff: &str,
+) -> Result<u64, AppError> {
+    let mut deleted = 0;
+    for table in BACKFILL_DETAIL_TABLES.iter().chain(&BACKFILL_WORK_TABLES) {
+        deleted += delete_detail_rows(
+            state,
+            &format!(
+                "DELETE FROM {table} WHERE job_id IN ({FINISHED_JOBS} \
+                 AND completed_at IS NOT NULL AND completed_at < ?)"
+            ),
+            &[cutoff],
+        )
+        .await?;
+    }
+    Ok(deleted)
+}
 
 pub async fn run_backfill_retention_cleanup(state: &AppState) {
     use super::settings::get_setting;
@@ -4643,31 +4906,17 @@ pub async fn run_backfill_retention_cleanup(state: &AppState) {
             continue;
         }
 
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
-        let cutoff_str = cutoff.to_rfc3339();
-
-        let sql = adapt_sql(
-            "DELETE FROM happyview_backfill_repos WHERE job_id IN (SELECT id FROM happyview_backfill_jobs WHERE completed_at IS NOT NULL AND completed_at < ?)",
-            state.db_backend,
-        );
-        match crate::db::query(&sql)
-            .bind(&cutoff_str)
-            .execute(&state.backfill_db)
-            .await
-        {
-            Ok(result) => {
-                let deleted = result.rows_affected();
-                if deleted > 0 {
-                    tracing::info!(
-                        deleted,
-                        retention_days,
-                        "cleaned up old backfill detail rows"
-                    );
-                }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days)).to_rfc3339();
+        match sweep_backfill_details(state, &cutoff).await {
+            Ok(0) => {}
+            Ok(deleted) => {
+                tracing::info!(
+                    deleted,
+                    retention_days,
+                    "cleaned up old backfill detail rows"
+                );
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "backfill retention cleanup failed");
-            }
+            Err(e) => tracing::warn!(error = %e, "backfill retention cleanup failed"),
         }
     }
 }
@@ -6350,7 +6599,8 @@ mod tests {
                 resolved_repos INTEGER,
                 processed_repos INTEGER,
                 total_records INTEGER,
-                error_counts TEXT
+                error_counts TEXT,
+                discovery_complete INTEGER NOT NULL DEFAULT 1
             )",
         )
         .execute(&pool)
@@ -6401,6 +6651,7 @@ mod tests {
                 processed_repos,
                 total_records,
                 error_counts,
+                discovery_complete,
             } => {
                 assert_eq!(job_id, "job-1");
                 assert_eq!(status, "running");
@@ -6410,6 +6661,7 @@ mod tests {
                 assert_eq!(processed_repos, Some(2));
                 assert_eq!(total_records, Some(50));
                 assert_eq!(error_counts, serde_json::json!({"dns_failure": 2}));
+                assert!(discovery_complete);
             }
             other => panic!("expected JobSnapshot, got {other:?}"),
         }
@@ -6436,6 +6688,683 @@ mod tests {
         let state = state_with_job("job-3", "running", "discovering_repos", None).await;
 
         assert!(build_job_snapshot(&state, "does-not-exist").await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Detail endpoints
+    // -----------------------------------------------------------------------
+
+    async fn seed_completion(state: &AppState, job_id: &str, did: &str, records: i32) {
+        let sql = adapt_sql(
+            "INSERT INTO happyview_backfill_completions (job_id, did, collection, pds_endpoint, records_fetched) \
+             VALUES (?, ?, 'app.test.post', 'https://pds.test', ?)",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(job_id)
+            .bind(did)
+            .bind(records)
+            .execute(&state.db)
+            .await
+            .expect("seed completion");
+    }
+
+    async fn seed_pds_stats(state: &AppState, job_id: &str, pds: &str, repos: i64) {
+        let sql = adapt_sql(
+            "INSERT INTO happyview_backfill_pds_stats (job_id, pds_endpoint, repos) VALUES (?, ?, ?)",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(job_id)
+            .bind(pds)
+            .bind(repos)
+            .execute(&state.db)
+            .await
+            .expect("seed pds stats");
+    }
+
+    async fn seed_cursor(state: &AppState, job_id: &str) {
+        let sql = adapt_sql(
+            "INSERT INTO happyview_backfill_cursors (job_id, collection, relay_cursor, done) VALUES (?, 'app.test.post', NULL, 1)",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(job_id)
+            .execute(&state.db)
+            .await
+            .expect("seed cursor");
+    }
+
+    /// Give a seeded job its final status and when it got there.
+    async fn finish_job(state: &AppState, job_id: &str, status: &str, completed_at: &str) {
+        let sql = adapt_sql(
+            "UPDATE happyview_backfill_jobs SET status = ?, completed_at = ? WHERE id = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(status)
+            .bind(completed_at)
+            .bind(job_id)
+            .execute(&state.db)
+            .await
+            .expect("finish job");
+    }
+
+    /// One row in every per-job table a flush or the retention sweep clears.
+    async fn seed_every_detail(state: &AppState, job_id: &str) {
+        seed_unit(state, job_id, POST, "did:plc:left", None).await;
+        seed_cursor(state, job_id).await;
+        seed_completion(state, job_id, "did:plc:done", 1).await;
+        seed_pds_stats(state, job_id, "https://pds.test", 1).await;
+        seed_legacy_repo(state, job_id, "did:plc:legacy", None, "completed").await;
+    }
+
+    const EVERY_DETAIL_TABLE: [&str; 5] = [
+        "happyview_backfill_queue",
+        "happyview_backfill_cursors",
+        "happyview_backfill_completions",
+        "happyview_backfill_pds_stats",
+        "happyview_backfill_repos",
+    ];
+
+    async fn assert_detail_rows(state: &AppState, job_id: &str, expected: i64) {
+        for table in EVERY_DETAIL_TABLE {
+            assert_eq!(
+                count_for_job(state, table, job_id).await,
+                expected,
+                "{table} rows of {job_id}"
+            );
+        }
+    }
+
+    fn repos_query(
+        phase: Option<&str>,
+        cursor: Option<String>,
+        limit: i32,
+    ) -> axum::extract::Query<ReposQuery> {
+        axum::extract::Query(ReposQuery {
+            phase: phase.map(str::to_string),
+            cursor,
+            limit: Some(limit),
+        })
+    }
+
+    fn dids(response: &super::super::types::BackfillReposResponse) -> Vec<&str> {
+        response.repos.iter().map(|r| r.did.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn the_job_list_says_which_queue_a_job_is_on() {
+        let state = migrated_state().await;
+        seed_job(
+            &state,
+            "bounded",
+            Some(POST),
+            "network",
+            "resolving_and_fetching",
+            2,
+            false,
+        )
+        .await;
+        seed_job(
+            &state,
+            "legacy",
+            Some(POST),
+            "network",
+            "completed",
+            1,
+            true,
+        )
+        .await;
+
+        let Json(jobs) = backfill_status(State(state.clone()), super_auth(&state))
+            .await
+            .expect("status");
+        let job = |id: &str| jobs.iter().find(|j| j.id == id).expect("job listed");
+        assert!(!job("bounded").discovery_complete);
+        assert_eq!(
+            job("bounded").recent_completions_limit,
+            Some(RECENT_COMPLETIONS_PER_JOB)
+        );
+        assert!(job("legacy").discovery_complete);
+        assert_eq!(job("legacy").recent_completions_limit, None);
+    }
+
+    #[tokio::test]
+    async fn a_bounded_job_lists_its_recent_completions_newest_first() {
+        let state = migrated_state().await;
+        seed_job(
+            &state,
+            "recent",
+            Some(POST),
+            "network",
+            "resolving_and_fetching",
+            2,
+            true,
+        )
+        .await;
+        for (did, records) in [("did:plc:1", 1), ("did:plc:2", 2), ("did:plc:3", 3)] {
+            seed_completion(&state, "recent", did, records).await;
+        }
+
+        let Json(first) = backfill_repos(
+            State(state.clone()),
+            Path("recent".to_string()),
+            super_auth(&state),
+            repos_query(Some("fetched"), None, 2),
+        )
+        .await
+        .expect("first page");
+        assert_eq!(dids(&first), ["did:plc:3", "did:plc:2"]);
+        assert!(first.repos.iter().all(|r| r.status == "completed"));
+        assert_eq!(first.repos[0].records_fetched, 3);
+        assert_eq!(
+            first.repos[0].pds_endpoint.as_deref(),
+            Some("https://pds.test")
+        );
+
+        let Json(rest) = backfill_repos(
+            State(state.clone()),
+            Path("recent".to_string()),
+            super_auth(&state),
+            repos_query(Some("fetched"), first.cursor.clone(), 2),
+        )
+        .await
+        .expect("second page");
+        assert_eq!(dids(&rest), ["did:plc:1"]);
+        assert_eq!(rest.cursor, None);
+    }
+
+    #[tokio::test]
+    async fn a_bounded_job_lists_queued_units_by_collection_then_did() {
+        let state = migrated_state().await;
+        seed_job(
+            &state,
+            "queued",
+            None,
+            "network",
+            "resolving_and_fetching",
+            2,
+            false,
+        )
+        .await;
+        seed_unit(
+            &state,
+            "queued",
+            LIKE,
+            "did:plc:b",
+            Some("https://pds.test"),
+        )
+        .await;
+        seed_unit(&state, "queued", POST, "did:plc:a", None).await;
+        seed_unit(
+            &state,
+            "queued",
+            POST,
+            "did:plc:c",
+            Some("https://pds.test"),
+        )
+        .await;
+        // The same repo under a second collection is a second unit.
+        seed_unit(&state, "queued", POST, "did:plc:b", None).await;
+
+        let Json(resolved) = backfill_repos(
+            State(state.clone()),
+            Path("queued".to_string()),
+            super_auth(&state),
+            repos_query(Some("resolved"), None, 1),
+        )
+        .await
+        .expect("resolved page");
+        assert_eq!(dids(&resolved), ["did:plc:b"]);
+        let Json(resolved_rest) = backfill_repos(
+            State(state.clone()),
+            Path("queued".to_string()),
+            super_auth(&state),
+            repos_query(Some("resolved"), resolved.cursor.clone(), 1),
+        )
+        .await
+        .expect("resolved rest");
+        assert_eq!(dids(&resolved_rest), ["did:plc:c"]);
+        assert_eq!(resolved_rest.cursor, None);
+
+        let mut every = Vec::new();
+        let mut cursor = None;
+        loop {
+            let Json(page) = backfill_repos(
+                State(state.clone()),
+                Path("queued".to_string()),
+                super_auth(&state),
+                repos_query(Some("discovered"), cursor, 2),
+            )
+            .await
+            .expect("queued page");
+            assert!(page.repos.iter().all(|r| r.status == "pending"));
+            every.extend(page.repos.into_iter().map(|r| r.did));
+            cursor = page.cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(every, ["did:plc:b", "did:plc:a", "did:plc:b", "did:plc:c"]);
+    }
+
+    #[tokio::test]
+    async fn an_account_job_pages_its_queue_with_the_all_collections_unit() {
+        let state = migrated_state().await;
+        seed_job(
+            &state,
+            "accounts",
+            None,
+            "dids",
+            "resolving_and_fetching",
+            2,
+            true,
+        )
+        .await;
+        for did in ["did:plc:x", "did:plc:y"] {
+            seed_unit(&state, "accounts", ALL_COLLECTIONS, did, None).await;
+        }
+
+        let Json(first) = backfill_repos(
+            State(state.clone()),
+            Path("accounts".to_string()),
+            super_auth(&state),
+            repos_query(None, None, 1),
+        )
+        .await
+        .expect("first page");
+        assert_eq!(dids(&first), ["did:plc:x"]);
+        let Json(rest) = backfill_repos(
+            State(state.clone()),
+            Path("accounts".to_string()),
+            super_auth(&state),
+            repos_query(None, first.cursor.clone(), 1),
+        )
+        .await
+        .expect("second page");
+        assert_eq!(dids(&rest), ["did:plc:y"]);
+        assert_eq!(rest.cursor, None);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_job_keeps_listing_its_repo_rows() {
+        let state = migrated_state().await;
+        seed_job(&state, "old", Some(POST), "network", "completed", 1, true).await;
+        seed_legacy_repo(&state, "old", "did:plc:y", None, "pending").await;
+        seed_legacy_repo(
+            &state,
+            "old",
+            "did:plc:z",
+            Some("https://pds.test"),
+            "completed",
+        )
+        .await;
+        let sql = adapt_sql(
+            "UPDATE happyview_backfill_repos SET records_fetched = 4 WHERE did = 'did:plc:z'",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .execute(&state.db)
+            .await
+            .expect("set records");
+
+        let Json(fetched) = backfill_repos(
+            State(state.clone()),
+            Path("old".to_string()),
+            super_auth(&state),
+            repos_query(Some("fetched"), None, 10),
+        )
+        .await
+        .expect("fetched");
+        assert_eq!(dids(&fetched), ["did:plc:z"]);
+        assert_eq!(fetched.repos[0].records_fetched, 4);
+
+        let Json(first) = backfill_repos(
+            State(state.clone()),
+            Path("old".to_string()),
+            super_auth(&state),
+            repos_query(None, None, 1),
+        )
+        .await
+        .expect("first");
+        assert_eq!(dids(&first), ["did:plc:y"]);
+        assert_eq!(
+            first.cursor.as_deref(),
+            Some("did:plc:y"),
+            "a DID cursor, as before"
+        );
+        let Json(rest) = backfill_repos(
+            State(state.clone()),
+            Path("old".to_string()),
+            super_auth(&state),
+            repos_query(None, first.cursor.clone(), 1),
+        )
+        .await
+        .expect("rest");
+        assert_eq!(dids(&rest), ["did:plc:z"]);
+
+        crate::db::query(&adapt_sql(
+            "INSERT INTO happyview_backfill_repos (job_id, did, pds_endpoint, status, records_fetched) \
+             VALUES ('old', 'did:plc:w', 'https://pds.test', 'completed', 6)",
+            state.db_backend,
+        ))
+        .execute(&state.db)
+        .await
+        .expect("seed another repo");
+        let Json(summary) = backfill_pds_summary(
+            State(state.clone()),
+            Path("old".to_string()),
+            super_auth(&state),
+        )
+        .await
+        .expect("summary");
+        let rows: Vec<(&str, i32, i32, i32)> = summary
+            .pds_endpoints
+            .iter()
+            .map(|p| {
+                (
+                    p.pds_endpoint.as_str(),
+                    p.total_repos,
+                    p.completed_repos,
+                    p.total_records,
+                )
+            })
+            .collect();
+        assert_eq!(rows, [("https://pds.test", 2, 2, 10)]);
+    }
+
+    #[tokio::test]
+    async fn a_bounded_job_rejects_a_cursor_it_did_not_issue() {
+        let state = migrated_state().await;
+        seed_job(
+            &state,
+            "cursor",
+            Some(POST),
+            "network",
+            "resolving_and_fetching",
+            2,
+            true,
+        )
+        .await;
+        for phase in [Some("fetched"), Some("resolved"), None] {
+            let page = backfill_repos(
+                State(state.clone()),
+                Path("cursor".to_string()),
+                super_auth(&state),
+                repos_query(phase, Some("did:plc:abc".to_string()), 10),
+            )
+            .await;
+            assert!(
+                matches!(page, Err(AppError::BadRequest(_))),
+                "phase {phase:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pds_summary_reads_the_aggregate_for_a_bounded_job() {
+        let state = migrated_state().await;
+        seed_job(
+            &state,
+            "summary",
+            Some(POST),
+            "network",
+            "resolving_and_fetching",
+            2,
+            true,
+        )
+        .await;
+        let sql = adapt_sql(
+            "INSERT INTO happyview_backfill_pds_stats (job_id, pds_endpoint, repos, completed_repos, records, errors) VALUES \
+             ('summary', 'https://a.test', 5, 3, 40, 1), ('summary', 'https://b.test', 9, 9, 90, 0), \
+             ('summary', 'https://c.test', 1, 1, 5000000000, 0)",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .execute(&state.db)
+            .await
+            .expect("seed stats");
+
+        let Json(summary) = backfill_pds_summary(
+            State(state.clone()),
+            Path("summary".to_string()),
+            super_auth(&state),
+        )
+        .await
+        .expect("summary");
+        let rows: Vec<(&str, i32, i32, i32)> = summary
+            .pds_endpoints
+            .iter()
+            .map(|p| {
+                (
+                    p.pds_endpoint.as_str(),
+                    p.total_repos,
+                    p.completed_repos,
+                    p.total_records,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("https://b.test", 9, 9, 90),
+                ("https://a.test", 5, 3, 40),
+                ("https://c.test", 1, 1, i32::MAX),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_bounded_job_refuses_a_flush() {
+        let state = migrated_state().await;
+        for status in ["running", "pausing", "paused", "cancelling"] {
+            seed_job(
+                &state,
+                status,
+                Some(POST),
+                "network",
+                "resolving_and_fetching",
+                2,
+                false,
+            )
+            .await;
+            let sql = adapt_sql(
+                "UPDATE happyview_backfill_jobs SET status = ? WHERE id = ?",
+                state.db_backend,
+            );
+            crate::db::query(&sql)
+                .bind(status)
+                .bind(status)
+                .execute(&state.db)
+                .await
+                .expect("set status");
+            seed_every_detail(&state, status).await;
+
+            let flushed = flush_backfill_details(
+                State(state.clone()),
+                Path(status.to_string()),
+                super_auth(&state),
+            )
+            .await;
+
+            assert!(matches!(flushed, Err(AppError::Conflict(_))), "{status}");
+            assert_detail_rows(&state, status, 1).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn flushing_a_finished_bounded_job_clears_every_row_it_left() {
+        let state = migrated_state().await;
+        for status in FINISHED_STATUSES {
+            seed_job(
+                &state,
+                status,
+                Some(POST),
+                "network",
+                "resolving_and_fetching",
+                2,
+                false,
+            )
+            .await;
+            finish_job(&state, status, status, "2026-01-01T00:00:00+00:00").await;
+            seed_every_detail(&state, status).await;
+
+            let flushed = flush_backfill_details(
+                State(state.clone()),
+                Path(status.to_string()),
+                super_auth(&state),
+            )
+            .await
+            .expect("flush");
+
+            assert_eq!(flushed, StatusCode::NO_CONTENT);
+            assert_detail_rows(&state, status, 0).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legacy_job_is_flushed_in_any_state_as_before() {
+        let state = migrated_state().await;
+        seed_job(
+            &state,
+            "old-running",
+            Some(POST),
+            "network",
+            "fetching_records",
+            1,
+            true,
+        )
+        .await;
+        seed_legacy_repo(&state, "old-running", "did:plc:legacy", None, "pending").await;
+
+        flush_backfill_details(
+            State(state.clone()),
+            Path("old-running".to_string()),
+            super_auth(&state),
+        )
+        .await
+        .expect("flush");
+
+        assert_eq!(
+            count_for_job(&state, "happyview_backfill_repos", "old-running").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn flushing_every_job_clears_only_finished_ones() {
+        let state = migrated_state().await;
+        for status in FINISHED_STATUSES {
+            seed_job(
+                &state,
+                status,
+                Some(POST),
+                "network",
+                "resolving_and_fetching",
+                2,
+                false,
+            )
+            .await;
+            finish_job(&state, status, status, "2026-01-01T00:00:00+00:00").await;
+            seed_every_detail(&state, status).await;
+        }
+        seed_job(
+            &state,
+            "live",
+            Some(POST),
+            "network",
+            "resolving_and_fetching",
+            2,
+            false,
+        )
+        .await;
+        seed_every_detail(&state, "live").await;
+
+        flush_all_backfill_details(State(state.clone()), super_auth(&state))
+            .await
+            .expect("flush all");
+
+        for status in FINISHED_STATUSES {
+            assert_detail_rows(&state, status, 0).await;
+        }
+        assert_detail_rows(&state, "live", 1).await;
+    }
+
+    #[tokio::test]
+    async fn the_retention_sweep_clears_every_detail_table_of_old_jobs() {
+        let state = migrated_state().await;
+        for status in FINISHED_STATUSES {
+            let old = format!("old-{status}");
+            seed_job(&state, &old, Some(POST), "network", "completed", 2, true).await;
+            finish_job(&state, &old, status, "2020-01-01T00:00:00+00:00").await;
+            seed_every_detail(&state, &old).await;
+        }
+        seed_job(
+            &state,
+            "new-done",
+            Some(POST),
+            "network",
+            "completed",
+            2,
+            true,
+        )
+        .await;
+        finish_job(&state, "new-done", "completed", "2099-01-01T00:00:00+00:00").await;
+        seed_every_detail(&state, "new-done").await;
+        // A paused job is not finished, whatever its completed_at says.
+        seed_job(
+            &state,
+            "paused",
+            Some(POST),
+            "network",
+            "resolving_and_fetching",
+            2,
+            false,
+        )
+        .await;
+        finish_job(&state, "paused", "paused", "2020-01-01T00:00:00+00:00").await;
+        seed_every_detail(&state, "paused").await;
+
+        let deleted = sweep_backfill_details(&state, "2026-01-01T00:00:00+00:00")
+            .await
+            .expect("sweep");
+
+        assert_eq!(deleted, 15);
+        for status in FINISHED_STATUSES {
+            assert_detail_rows(&state, &format!("old-{status}"), 0).await;
+        }
+        assert_detail_rows(&state, "new-done", 1).await;
+        assert_detail_rows(&state, "paused", 1).await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_job_deletes_every_row_it_left() {
+        let state = migrated_state().await;
+        seed_job(
+            &state,
+            "gone",
+            Some(POST),
+            "network",
+            "resolving_and_fetching",
+            2,
+            false,
+        )
+        .await;
+        finish_job(&state, "gone", "cancelled", "2026-01-01T00:00:00+00:00").await;
+        seed_every_detail(&state, "gone").await;
+
+        let sql = adapt_sql(
+            "DELETE FROM happyview_backfill_jobs WHERE id = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind("gone")
+            .execute(&state.db)
+            .await
+            .expect("delete job");
+
+        assert_detail_rows(&state, "gone", 0).await;
     }
 
     // -----------------------------------------------------------------------

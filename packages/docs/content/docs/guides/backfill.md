@@ -31,12 +31,16 @@ A backfill job has both a `status` (overall state) and a `stage` (current phase)
 | Status       | Description                                          |
 | ------------ | ---------------------------------------------------- |
 | `running`    | Job is actively processing                           |
+| `pausing`    | Pause requested, waiting for the worker to stop      |
+| `paused`     | Worker has stopped; resume to carry on               |
 | `cancelling` | Cancel requested, waiting for the worker to stop     |
 | `cancelled`  | Worker has stopped and cleaned up                    |
 | `completed`  | Worker finished processing all resolvable repos      |
 | `failed`     | An error occurred                                    |
 
 The `stage` field tracks which phase the job is in: `pending`, `discovering_repos`, `resolving_and_fetching`, `completed`, `failed`, or `cancelled`.
+
+If a job runs out of work while repos it could not complete are still queued, HappyView pauses it rather than marking it completed, and records why in the job's `error` (for example "paused: 3 units could not be completed; resume to retry"). The dashboard shows such a job as **paused automatically** with that reason. Resuming it retries the queued repos.
 
 ## Cancelling a job
 
@@ -51,10 +55,10 @@ This means there may be a short delay between clicking Cancel and the job fully 
 
 Backfill jobs survive server restarts. On startup, HappyView checks for jobs that were running when the server last stopped:
 
-- **Running** jobs are re-spawned and resume from where they left off. Each phase is idempotent — discovery skips already-known DIDs, resolution skips already-resolved endpoints, and fetching skips already-completed repos.
+- **Running** jobs are re-spawned and resume from where they left off. Discovery continues from each collection's saved relay cursor, queued repos keep their resolved PDS, and finished repos have already left the queue. A repo cut short by the pause is fetched again; re-fetching an unchanged record does not rewrite it.
 - **Cancelling** jobs (where the cancel was requested but the worker hadn't stopped yet) are immediately finalised as `cancelled`.
 
-Per-DID progress is tracked in the database, so a job that was halfway through fetching records will pick up from the next unprocessed repo, not start over.
+The queue is kept in the database, so a job that was halfway through fetching records will pick up from the next queued repo, not start over.
 
 ## Re-running backfills
 
@@ -70,22 +74,24 @@ The dashboard's backfill detail panel includes expandable sections for each proc
 
 ### Per-repo tracking
 
-Every DID discovered during a backfill job is tracked in the database with its PDS endpoint, processing status, and record count. This data powers three expandable sections:
+A backfill keeps a bounded queue of the repos it is working on, counters for its progress, a per-PDS summary and its 1,000 most recently fetched repos. These power three expandable sections:
 
-- **Discovering repos** — lists all DIDs discovered for the job, with profile avatars and handles resolved from the Bluesky API.
+- **Discovering repos** — the repos queued right now, with profile avatars and handles resolved from the Bluesky API. The count beside it is everything discovered so far, labelled "found so far" until discovery finishes.
 - **Resolving PDS** — summarises PDS endpoints involved in the job, showing how many repos each PDS is responsible for and how many have been processed.
-- **Fetching records** — lists completed repos with their record counts and PDS hostnames.
+- **Fetching records** — the most recently fetched repos with their record counts.
+
+Jobs created before the bounded queue keep their original row-per-repo detail until it is cleared.
 
 All three sections update in real time via SSE (Server-Sent Events) while the job is running.
 
 ### Data retention
 
-Per-repo detail data is retained after job completion to support post-mortem analysis. A background task runs daily and deletes detail rows for jobs completed more than 28 days ago (configurable via the `backfill_retention_days` setting in **Settings > General**, or the `BACKFILL_RETENTION_DAYS` environment variable). Set to `0` to keep data indefinitely.
+Per-repo detail data is retained after job completion to support post-mortem analysis. A background task runs daily and deletes the detail rows, and any repos left queued by a cancelled or failed job, of jobs that finished more than 28 days ago (configurable via the `backfill_retention_days` setting in **Settings > General**, or the `BACKFILL_RETENTION_DAYS` environment variable). Set to `0` to keep data indefinitely.
 
 You can also manually clear detail data:
 
-- **Per-job**: "Clear details" button in the job detail panel footer.
-- **All completed jobs**: "Clear all details" button on the Backfill page header.
+- **Per-job**: "Clear details" button in the job detail panel footer. A job created before the bounded queue can be cleared whenever it isn't running; any other job only once it is completed, cancelled or failed, since its queue is work it still has to do.
+- **All finished jobs**: "Clear all details" button on the Backfill page header clears every completed, cancelled and failed job.
 
 Both actions require the `backfill:create` permission.
 
