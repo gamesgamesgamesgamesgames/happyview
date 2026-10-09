@@ -878,13 +878,14 @@ async fn drop_unresolvable(
         > 0)
 }
 
-/// Give a unit's window slot back after trying to take it out of the queue.
+/// Give a fetched unit's window slot back after trying to complete it.
 ///
 /// `removed` is what the write returned: `Some(false)` means there was no row
 /// to remove, so no slot to free. A write that failed (`None`) leaves the row
-/// behind, but the slot is freed anyway: this run will not retry the unit, and
-/// holding its slot for good could stall discovery behind it. The window
-/// undercounts by one until the job restarts and recounts.
+/// behind, but the slot is freed anyway: the unit is resolved, so this run
+/// will not pick it up again, and holding its slot for good could stall
+/// discovery behind it. The window undercounts by one until the job restarts
+/// and recounts; the job is paused rather than completed with the unit left.
 fn release_slot(queue: &JobQueue, removed: Option<bool>) {
     if removed != Some(false) {
         queue.window.release(1);
@@ -1132,12 +1133,14 @@ async fn job_total_repos(state: &AppState, job_id: &str) -> Result<i32, sqlx::Er
     Ok(total.unwrap_or(0))
 }
 
-/// One `listReposByCollection` page, sleeping through rate limits.
+/// One `listReposByCollection` page, sleeping through rate limits. `Ok(None)`
+/// means the job stopped while it waited out a rate limit.
 async fn fetch_relay_page(
     state: &AppState,
     url: &str,
     collection: &str,
-) -> Result<ListReposResponse, String> {
+    cancelled: &AtomicBool,
+) -> Result<Option<ListReposResponse>, String> {
     let resp = loop {
         let r = state
             .http
@@ -1148,7 +1151,17 @@ async fn fetch_relay_page(
         if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             let wait = parse_retry_after(r.headers());
             tracing::warn!(collection, wait, "rate limited by relay, sleeping");
-            tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+            // In slices, so a pause or cancel is not held up by a long reset.
+            let until = tokio::time::Instant::now() + Duration::from_secs(wait);
+            while tokio::time::Instant::now() < until {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                tokio::time::sleep_until(
+                    until.min(tokio::time::Instant::now() + Duration::from_secs(1)),
+                )
+                .await;
+            }
             continue;
         }
         break r;
@@ -1158,6 +1171,7 @@ async fn fetch_relay_page(
     }
     resp.json()
         .await
+        .map(Some)
         .map_err(|e| format!("invalid relay response: {e}"))
 }
 
@@ -1266,8 +1280,12 @@ async fn discover_collection(
         if let Some(ref c) = cursor {
             url.push_str(&format!("&cursor={c}"));
         }
-        let body = match fetch_relay_page(state, &url, collection).await {
-            Ok(body) => body,
+        let body = match fetch_relay_page(state, &url, collection, cancelled).await {
+            Ok(Some(body)) => body,
+            Ok(None) => {
+                queue.window.settle(page_limit, 0);
+                return Ok(false);
+            }
             Err(e) => {
                 queue.window.settle(page_limit, 0);
                 return Err(DiscoveryError::Relay(e));
@@ -1779,7 +1797,12 @@ async fn give_up_resolution(
         drop_unresolvable(&ctx.state, &ctx.queue, &unit)
     })
     .await;
-    release_slot(&ctx.queue, removed);
+    // Only a removed row frees a slot. A drop that failed leaves the unit
+    // unresolved, so a later pass gives it up again and frees it then;
+    // freeing it now too would count the slot twice.
+    if removed == Some(true) {
+        ctx.queue.window.release(1);
+    }
 }
 
 /// Record a resolved unit and hand it to the fetcher. Returns false once the
@@ -3392,6 +3415,24 @@ async fn run_backfill_job_with(state: AppState, job_id: String, window: i64) {
         _ => {}
     }
 
+    // A unit can stay queued when a write about it failed (its PDS was never
+    // stored, or its completion was never committed). The job is not done:
+    // leave it paused so resuming picks those units up again.
+    if version == QueueVersion::Bounded {
+        match queued_units(&state, &job_id).await {
+            Ok(0) => {}
+            Ok(left) => {
+                pause_with_units_left(&state, &job_id, left).await;
+                return;
+            }
+            Err(e) => {
+                let error = format!("failed to read the backfill queue: {e}");
+                fail_job(&state, &job_id, &error).await;
+                return;
+            }
+        }
+    }
+
     complete_job(&state, &job_id, final_processed, final_records, None).await;
 
     log_event(
@@ -3410,6 +3451,32 @@ async fn run_backfill_job_with(state: AppState, job_id: String, window: i64) {
         backend,
     )
     .await;
+}
+
+/// Pause a bounded job that ran out of work to do with units still queued,
+/// rather than mark it completed with work left.
+async fn pause_with_units_left(state: &AppState, job_id: &str, left: i64) {
+    tracing::warn!(
+        job_id,
+        left,
+        "backfill run ended with units still queued; pausing the job so it can be resumed"
+    );
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "backfill.units_left".to_string(),
+            severity: Severity::Warn,
+            actor_did: None,
+            subject: Some(job_id.to_string()),
+            detail: serde_json::json!({
+                "job_id": job_id,
+                "queued_units": left,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
+    finalise_pause(state, job_id).await;
 }
 
 /// Work through a job's queue, discovering more alongside while discovery is
@@ -5329,6 +5396,79 @@ mod tests {
 
         let job = job_row(&state, &job_id).await;
         assert_eq!((job.status.as_str(), job.discovery_complete), ("failed", 0));
+    }
+
+    /// A unit whose completion could not be committed is still queued when the
+    /// run ends. The job is paused with that work left, never completed.
+    #[tokio::test]
+    async fn a_run_that_leaves_units_queued_pauses_rather_than_completes() {
+        let mock = MockServer::start().await;
+        let state = pipeline_state(&mock, &[POST]).await;
+        crate::db::query(
+            "CREATE TRIGGER refuse_unit_deletes BEFORE DELETE ON happyview_backfill_queue \
+             BEGIN SELECT RAISE(ABORT, 'unit deletes refused'); END",
+        )
+        .execute(&state.db)
+        .await
+        .expect("create trigger");
+        mount_plc(&mock).await;
+        mount_records(&mock, "did:plc:stuck", POST, 1).await;
+        forbid_other_record_fetches(&mock).await;
+
+        let job_id = create_backfill_job(&state, Some(POST), &["did:plc:stuck".to_string()])
+            .await
+            .expect("create job");
+        run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+        let job = job_row(&state, &job_id).await;
+        assert_eq!(job.status, "paused");
+        assert_eq!(
+            count_for_job(&state, "happyview_backfill_queue", &job_id).await,
+            1
+        );
+        let (logged,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'backfill.units_left' AND subject = ?",
+        )
+        .bind(&job_id)
+        .fetch_one(&state.db)
+        .await
+        .expect("count events");
+        assert_eq!(logged, 1);
+    }
+
+    /// A relay rate limit can ask for a two-minute wait; a pause must not have
+    /// to sit it out.
+    #[tokio::test]
+    async fn a_pause_interrupts_a_relay_rate_limit_wait() {
+        let mock = MockServer::start().await;
+        let state = pipeline_state(&mock, &[POST]).await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.sync.listReposByCollection"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+            .mount(&mock)
+            .await;
+
+        let job_id = create_backfill_job(&state, Some(POST), &[])
+            .await
+            .expect("create job");
+        let pauser = {
+            let state = state.clone();
+            let job_id = job_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                request_pause(&state, &job_id).await;
+            })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            run_backfill_job_with(state.clone(), job_id.clone(), DEFAULT_DISCOVERY_WINDOW),
+        )
+        .await
+        .expect("the pause should not wait out the rate limit");
+        pauser.await.expect("pauser");
+
+        let job = job_row(&state, &job_id).await;
+        assert_eq!((job.status.as_str(), job.discovery_complete), ("paused", 0));
     }
 
     #[tokio::test]
