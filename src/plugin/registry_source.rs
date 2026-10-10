@@ -18,6 +18,10 @@ use serde::Deserialize;
 
 use super::official_registry::{OfficialPlugin, ReleaseEntry};
 
+/// How many of a package's releases one refresh reads. The registry clamps a
+/// page to 100, so asking for its ceiling costs the same as asking for less.
+const RELEASES_PER_PACKAGE: u32 = 100;
+
 /// Where to look for packages, and under whose authority.
 #[derive(Debug, Clone)]
 pub struct RegistrySource {
@@ -77,6 +81,12 @@ struct ProfileRecord {
 }
 
 #[derive(Debug, Deserialize)]
+struct ListReleases {
+    #[serde(default)]
+    releases: Vec<ReleaseView>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ReleaseView {
     #[serde(default)]
     record: ReleaseRecord,
@@ -86,6 +96,8 @@ struct ReleaseView {
 
 #[derive(Debug, Default, Deserialize)]
 struct ReleaseRecord {
+    #[serde(default)]
+    version: Option<String>,
     #[serde(default)]
     artifacts: Artifacts,
 }
@@ -160,23 +172,42 @@ pub async fn fetch_catalogue(
             continue;
         };
 
-        let release: ReleaseView = match get(
+        // Every release rather than just the latest: the update preview lists
+        // each version between what is installed and what is current, so a
+        // catalogue carrying only the newest would show one entry where the
+        // GitHub walk showed several. `RELEASES_PER_PACKAGE` is the registry's
+        // own ceiling, so this is one request either way.
+        let listing: ListReleases = match get(
             client,
-            "getRelease",
+            "listReleases",
             format!(
-                "{base}/xrpc/at.happyproto.registry.getRelease?did={}&slug={}&version={}",
+                "{base}/xrpc/at.happyproto.registry.listReleases?did={}&slug={}&limit={RELEASES_PER_PACKAGE}",
                 urlencoding::encode(&package.did),
                 urlencoding::encode(&slug),
-                urlencoding::encode(&version),
             ),
         )
         .await
         {
             Ok(view) => view,
             Err(e) => {
-                tracing::warn!(plugin = %slug, error = %e, "registry_source: release unreadable");
+                tracing::warn!(plugin = %slug, error = %e, "registry_source: releases unreadable");
                 continue;
             }
+        };
+
+        // The module comes from the release the package calls current; the
+        // others are listed for the preview but are not what gets installed.
+        let Some(release) = listing
+            .releases
+            .iter()
+            .find(|r| r.record.version.as_deref() == Some(version.as_str()))
+        else {
+            tracing::warn!(
+                plugin = %slug,
+                version = %version,
+                "registry_source: the package names a current version its releases do not list"
+            );
+            continue;
         };
 
         let Some(wasm_url) = release
@@ -213,15 +244,24 @@ pub async fn fetch_catalogue(
                 .icon
                 .as_ref()
                 .and_then(|a| a.url.clone()),
-            latest_version: version.clone(),
+            latest_version: version,
             manifest_url,
             wasm_url,
-            releases: vec![ReleaseEntry {
-                version,
-                name: package.record.name.clone().unwrap_or_else(|| slug.clone()),
-                published_at: release.indexed_at.unwrap_or_default(),
-                body: String::new(),
-            }],
+            releases: listing
+                .releases
+                .iter()
+                .filter_map(|r| {
+                    Some(ReleaseEntry {
+                        version: r.record.version.clone()?,
+                        name: format!("{slug}-v{}", r.record.version.as_deref()?),
+                        published_at: r.indexed_at.clone().unwrap_or_default(),
+                        // A release record carries no notes, so there is no
+                        // changelog to show. The GitHub walk had the release
+                        // body; the registry has no field for it.
+                        body: String::new(),
+                    })
+                })
+                .collect(),
         });
     }
 

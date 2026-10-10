@@ -120,6 +120,22 @@ impl RegistryConfig {
     /// fallback. Read here rather than in [`Self::production`] because
     /// `production` backs test fixtures, which should not depend on the
     /// environment.
+    /// Apply `PLUGIN_GITHUB_API_BASE`, which redirects the GitHub fallback.
+    /// A stack that should reach nothing live points this at a closed port and
+    /// sets `PLUGIN_REGISTRY_URL` empty; the catalogue is then empty, which is
+    /// what an offline stack should show rather than whatever the internet
+    /// happened to answer.
+    pub fn with_github_base_from_env(mut self) -> Self {
+        let Ok(configured) = std::env::var("PLUGIN_GITHUB_API_BASE") else {
+            return self;
+        };
+        let configured = configured.trim();
+        if !configured.is_empty() {
+            self.api_base = configured.trim_end_matches('/').to_string();
+        }
+        self
+    }
+
     pub fn with_registry_from_env(mut self) -> Self {
         let Ok(configured) = std::env::var("PLUGIN_REGISTRY_URL") else {
             return self;
@@ -406,6 +422,40 @@ mod tests {
             "required_secrets": [],
             "auth_type": "oauth2",
         })
+    }
+
+    /// The GitHub fallback is redirectable too, so a stack that should reach
+    /// nothing live can close both sources. Serial, because it moves process
+    /// environment.
+    #[test]
+    #[serial]
+    fn plugin_github_api_base_redirects_the_fallback() {
+        // SAFETY: `#[serial]` keeps this off every other env reader.
+        unsafe {
+            std::env::remove_var("PLUGIN_GITHUB_API_BASE");
+        }
+        assert_eq!(
+            RegistryConfig::production()
+                .with_github_base_from_env()
+                .api_base,
+            "https://api.github.com",
+            "unset should leave the default"
+        );
+
+        unsafe {
+            std::env::set_var("PLUGIN_GITHUB_API_BASE", "  http://127.0.0.1:9/  ");
+        }
+        assert_eq!(
+            RegistryConfig::production()
+                .with_github_base_from_env()
+                .api_base,
+            "http://127.0.0.1:9",
+            "a configured base should be used, trimmed of space and trailing slash"
+        );
+
+        unsafe {
+            std::env::remove_var("PLUGIN_GITHUB_API_BASE");
+        }
     }
 
     /// An operator can point the catalogue at their own registry, or turn it

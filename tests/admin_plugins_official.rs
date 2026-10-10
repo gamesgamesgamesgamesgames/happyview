@@ -316,16 +316,30 @@ async fn the_registry_is_preferred_over_the_github_walk() {
         .mount(&registry)
         .await;
     Mock::given(method("GET"))
-        .and(path("/xrpc/at.happyproto.registry.getRelease"))
+        .and(path("/xrpc/at.happyproto.registry.listReleases"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "uri": "at://did:plc:pub/at.happyproto.plugin.release/happyview-http:1.0.0",
-            "record": {
-                "version": "1.0.0",
-                "artifacts": {
-                    "package": { "url": "https://example.com/d/happyview-http.wasm" }
+            "releases": [
+                {
+                    "uri": "at://did:plc:pub/at.happyproto.plugin.release/happyview-http:1.0.0",
+                    "record": {
+                        "version": "1.0.0",
+                        "artifacts": {
+                            "package": { "url": "https://example.com/d/happyview-http.wasm" }
+                        }
+                    },
+                    "indexedAt": "2026-10-01T00:00:00.000000+00:00"
+                },
+                {
+                    "uri": "at://did:plc:pub/at.happyproto.plugin.release/happyview-http:0.9.0",
+                    "record": {
+                        "version": "0.9.0",
+                        "artifacts": {
+                            "package": { "url": "https://example.com/old/happyview-http.wasm" }
+                        }
+                    },
+                    "indexedAt": "2026-09-01T00:00:00.000000+00:00"
                 }
-            },
-            "indexedAt": "2026-10-01T00:00:00.000000+00:00"
+            ]
         })))
         .mount(&registry)
         .await;
@@ -380,6 +394,17 @@ async fn the_registry_is_preferred_over_the_github_walk() {
         plugins[0]["manifest_url"],
         "https://example.com/d/manifest.json"
     );
+    // Every listed release, so the update preview can name each version
+    // between what is installed and what is current -- not just the newest.
+    // Read off the cache rather than the response: the browse endpoint serves
+    // a summary, and the releases are what `compute_update_info` consumes.
+    let cached = app.state.official_registry.read().await;
+    let versions: Vec<&str> = cached.plugins["happyview-http"]
+        .releases
+        .iter()
+        .map(|r| r.version.as_str())
+        .collect();
+    assert_eq!(versions, vec!["1.0.0", "0.9.0"]);
 }
 
 /// An empty registry must not empty the catalogue. Replacing a working plugin
