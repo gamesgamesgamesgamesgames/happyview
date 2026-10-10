@@ -936,6 +936,9 @@ async fn main() {
     tokio::spawn(happyview::event_log::spawn_retention_cleanup(
         state.db.clone(),
         state.db_backend,
+        happyview::event_log::parse_dead_letter_retention_days(
+            std::env::var("DEAD_LETTER_RETENTION_DAYS").ok().as_deref(),
+        ),
     ));
 
     {

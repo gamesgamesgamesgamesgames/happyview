@@ -214,17 +214,81 @@ pub async fn run_retention_sweep(
     sweep_with_cutoff(db, &cutoff, backend).await
 }
 
-/// Hourly retention sweep.
+/// Days resolved script dead letters are kept unless
+/// `DEAD_LETTER_RETENTION_DAYS` says otherwise.
+pub const DEFAULT_DEAD_LETTER_RETENTION_DAYS: u32 = 30;
+
+/// Parse `DEAD_LETTER_RETENTION_DAYS`. `0` keeps resolved dead letters
+/// indefinitely; anything unparseable falls back to the default.
+pub fn parse_dead_letter_retention_days(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_DEAD_LETTER_RETENTION_DAYS)
+}
+
+/// Delete script dead letters resolved more than `retention_days` ago, in
+/// batches for the same reasons as the event log sweep. Unresolved rows are
+/// never touched: they are failures nobody has dealt with yet. Each row holds
+/// a script's full input payload, and one failing hook during a backfill
+/// writes one per record, so resolved rows add up. Returns the rows deleted.
+pub async fn sweep_resolved_dead_letters(
+    db: &AnyPool,
+    retention_days: u32,
+    backend: DatabaseBackend,
+) -> u64 {
+    if retention_days == 0 {
+        return 0;
+    }
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
+    let sql = adapt_sql(
+        "DELETE FROM happyview_dead_letter_scripts WHERE id IN \
+         (SELECT id FROM happyview_dead_letter_scripts WHERE resolved_at IS NOT NULL AND resolved_at < ? LIMIT ?)",
+        backend,
+    );
+
+    let mut deleted: u64 = 0;
+    loop {
+        let affected = match crate::db::query(&sql)
+            .bind(&cutoff)
+            .bind(SWEEP_BATCH_SIZE)
+            .execute(db)
+            .await
+        {
+            Ok(result) => result.rows_affected(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to clean up resolved dead letters");
+                break;
+            }
+        };
+        deleted += affected;
+        if (affected as i64) < SWEEP_BATCH_SIZE {
+            break;
+        }
+    }
+    deleted
+}
+
+/// Hourly retention sweep for event logs and resolved dead letters.
 ///
-/// The retention value is re-read every iteration rather than captured at
-/// spawn, so an operator can change it without a restart. A value of `0`
-/// therefore skips the sweep and leaves this task running — it must not return,
-/// or disabling retention once would be permanent until the process restarts.
-pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
+/// The event log retention value is re-read every iteration rather than
+/// captured at spawn, so an operator can change it without a restart. A value
+/// of `0` therefore skips the sweep and leaves this task running — it must not
+/// return, or disabling retention once would be permanent until the process
+/// restarts.
+pub async fn spawn_retention_cleanup(
+    db: AnyPool,
+    backend: DatabaseBackend,
+    dead_letter_retention_days: u32,
+) {
     let interval = tokio::time::Duration::from_secs(3600);
 
     loop {
         tokio::time::sleep(interval).await;
+
+        let dead_letters =
+            sweep_resolved_dead_letters(&db, dead_letter_retention_days, backend).await;
+        if dead_letters > 0 {
+            tracing::info!(count = dead_letters, "cleaned up resolved dead letters");
+        }
 
         let retention_days = match crate::admin::settings::get_setting(
             &db,
@@ -251,6 +315,18 @@ pub async fn spawn_retention_cleanup(db: AnyPool, backend: DatabaseBackend) {
                 vacuumed = outcome.vacuumed,
                 "cleaned up old event logs"
             );
+        }
+
+        // The event log sweep reclaims pages only when it deleted something;
+        // dead letters need the same when they were the only deletion.
+        if dead_letters > 0
+            && !outcome.vacuumed
+            && backend == DatabaseBackend::Sqlite
+            && let Err(e) = crate::db::query("PRAGMA incremental_vacuum")
+                .execute(&db)
+                .await
+        {
+            tracing::warn!(error = %e, "incremental_vacuum after dead letter cleanup failed");
         }
     }
 }
@@ -537,5 +613,81 @@ mod tests {
 
         assert_eq!(outcome.deleted, 1);
         assert_eq!(remaining_ids(&pool).await, vec!["recent".to_string()]);
+    }
+
+    #[test]
+    fn dead_letter_retention_defaults_to_thirty_days() {
+        assert_eq!(parse_dead_letter_retention_days(None), 30);
+        assert_eq!(parse_dead_letter_retention_days(Some("banana")), 30);
+        assert_eq!(parse_dead_letter_retention_days(Some("7")), 7);
+        assert_eq!(
+            parse_dead_letter_retention_days(Some("0")),
+            0,
+            "0 keeps them"
+        );
+    }
+
+    /// Only rows resolved before the cutoff go. Recently resolved rows stay,
+    /// and unresolved rows stay however old, because they are work nobody has
+    /// looked at yet.
+    #[tokio::test]
+    async fn the_sweep_deletes_only_dead_letters_resolved_past_retention() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let marker = format!("dl-sweep-{}", Uuid::new_v4());
+            let old = (chrono::Utc::now() - chrono::Duration::days(40)).to_rfc3339();
+            let recent = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+            let insert = adapt_sql(
+                "INSERT INTO happyview_dead_letter_scripts (script_ref, host_kind, host_id, payload, error, created_at, resolved_at) \
+                 VALUES (?, 'record', ?, '{}', 'boom', ?, ?)",
+                backend,
+            );
+            for (host_id, resolved_at) in [
+                ("resolved-old", Some(old.as_str())),
+                ("resolved-recent", Some(recent.as_str())),
+                ("unresolved-old", None),
+            ] {
+                crate::db::query(&insert)
+                    .bind(&marker)
+                    .bind(host_id)
+                    .bind(&old)
+                    .bind(resolved_at)
+                    .execute(&pool)
+                    .await
+                    .expect("seed dead letter");
+            }
+
+            assert_eq!(
+                sweep_resolved_dead_letters(&pool, 0, backend).await,
+                0,
+                "0 disables the sweep"
+            );
+            assert!(sweep_resolved_dead_letters(&pool, 30, backend).await >= 1);
+
+            let left: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+                "SELECT host_id FROM happyview_dead_letter_scripts WHERE script_ref = ? ORDER BY host_id",
+                backend,
+            ))
+            .bind(&marker)
+            .fetch_all(&pool)
+            .await
+            .expect("remaining rows");
+            assert_eq!(
+                left,
+                vec![
+                    ("resolved-recent".to_string(),),
+                    ("unresolved-old".to_string(),)
+                ],
+                "{backend:?}"
+            );
+
+            crate::db::query(&adapt_sql(
+                "DELETE FROM happyview_dead_letter_scripts WHERE script_ref = ?",
+                backend,
+            ))
+            .bind(&marker)
+            .execute(&pool)
+            .await
+            .expect("clean up");
+        }
     }
 }
