@@ -48,6 +48,24 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// the delta to the current epoch, and that sum must not overflow.
 pub const UNBOUNDED_TICKS: u64 = u64::MAX / 2;
 
+/// The native stack a guest's frames may take, which wasmtime's default holds
+/// to 512 KiB. A guest cannot see this stack at all: a C interpreter measures
+/// the shadow stack in its own linear memory, and each level of its recursion
+/// costs far more native stack than shadow stack, so the native one runs out
+/// first and the run ends in a trap rather than the language's own error.
+/// QuickJS-ng's parser is the steepest case measured, at well over twenty
+/// times; 16 MiB is what lets an interpreter's own limit fire first for every
+/// shape tried, nested source included, where 8 MiB still trapped on source
+/// nested five thousand deep. It is reserved per fiber and committed only as
+/// it is touched, so it costs a run that recurses that deep and nothing else.
+pub const MAX_WASM_STACK: usize = 16 << 20;
+
+/// Each call runs on a fiber of this size, and what is left above
+/// [`MAX_WASM_STACK`] is all the stack a host function gets. Wasmtime does not
+/// bound that: a host function that overruns it aborts the process. 2 MiB is
+/// more than the 1.5 MiB its defaults left.
+pub const ASYNC_STACK_SIZE: usize = MAX_WASM_STACK + (2 << 20);
+
 /// WASM runtime for executing plugins
 pub struct WasmRuntime {
     engine: Engine,
@@ -108,6 +126,8 @@ impl WasmRuntime {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        config.max_wasm_stack(MAX_WASM_STACK);
+        config.async_stack_size(ASYNC_STACK_SIZE);
 
         let engine = Engine::new(&config)?;
 
@@ -629,6 +649,54 @@ mod tests {
         // We can verify fuel is enabled by checking we can set it on a store
         let mut store = wasmtime::Store::new(runtime.engine(), ());
         assert!(store.set_fuel(1000).is_ok());
+    }
+
+    /// Calls itself `depth` times; each frame holds a return address and a
+    /// frame pointer at the least, so 100 000 of them is well past the 512 KiB
+    /// wasmtime allows by default.
+    const RECURSE: &str = r#"(module
+        (func $down (export "down") (param i32) (result i32)
+            local.get 0
+            i32.eqz
+            if (result i32)
+                i32.const 0
+            else
+                local.get 0
+                i32.const 1
+                i32.sub
+                call $down
+                i32.const 1
+                i32.add
+            end))"#;
+
+    async fn recurse(depth: i32) -> Result<i32, wasmtime::Error> {
+        let runtime = WasmRuntime::without_ticker().unwrap();
+        let module = runtime.compile(&wat::parse_str(RECURSE).unwrap()).unwrap();
+        let mut store = wasmtime::Store::new(runtime.engine(), ());
+        store.set_fuel(u64::MAX).unwrap();
+        store.set_epoch_deadline(UNBOUNDED_TICKS);
+        let instance = Instance::new_async(&mut store, &module, &[]).await.unwrap();
+        let down = instance
+            .get_typed_func::<i32, i32>(&mut store, "down")
+            .unwrap();
+        down.call_async(&mut store, depth).await
+    }
+
+    #[tokio::test]
+    async fn a_guest_recursing_past_the_default_stack_still_returns() {
+        assert_eq!(recurse(100_000).await.unwrap(), 100_000);
+    }
+
+    /// A guest with no limit of its own still ends at the ceiling, as a trap
+    /// the store survives rather than a fault that takes the process down.
+    #[tokio::test]
+    async fn unbounded_recursion_ends_in_a_stack_overflow_trap() {
+        let error = recurse(i32::MAX).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Trap>(),
+            Some(&Trap::StackOverflow),
+            "{error:?}"
+        );
     }
 
     #[test]
