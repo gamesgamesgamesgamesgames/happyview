@@ -48,6 +48,18 @@ impl<T> Response<T> {
     }
 }
 
+/// What `host_call_library_wait_any` answers when one of the handles it was
+/// given has settled: the call's own `{ok}`/`{error}` envelope, exactly as
+/// `host_call_library` would have answered it, with the handle beside it. A
+/// wait the host refuses outright is a bare `{error}` envelope with no
+/// `handle`, which is how the two failures stay apart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LibraryCallSettled {
+    pub handle: u32,
+    #[serde(flatten)]
+    pub outcome: Response<Value>,
+}
+
 /// A structured plugin error. `code` is a free-form string; the host relays it
 /// verbatim to whoever called the plugin. Known there as `PluginEnvelopeError`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2037,6 +2049,52 @@ mod tests {
         let err = parsed.into_result().unwrap_err();
         assert_eq!(err.code, "HTTP_ERROR");
         assert!(err.retryable);
+    }
+
+    #[test]
+    fn a_settled_call_is_its_envelope_with_the_handle_beside_it() {
+        let ok = LibraryCallSettled {
+            handle: 3,
+            outcome: Response::Ok {
+                ok: serde_json::json!({"status": 200}),
+            },
+        };
+        let value = serde_json::to_value(&ok).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"handle": 3, "ok": {"status": 200}})
+        );
+        assert_eq!(
+            serde_json::from_value::<LibraryCallSettled>(value).unwrap(),
+            ok
+        );
+
+        let failed = LibraryCallSettled {
+            handle: 7,
+            outcome: Response::Err {
+                error: PluginError::new("HTTP_ERROR", "boom"),
+            },
+        };
+        let value = serde_json::to_value(&failed).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"handle": 7, "error": {"code": "HTTP_ERROR", "message": "boom", "retryable": false}})
+        );
+        assert_eq!(
+            serde_json::from_value::<LibraryCallSettled>(value).unwrap(),
+            failed
+        );
+
+        // A null result is still a result.
+        let null: LibraryCallSettled =
+            serde_json::from_value(serde_json::json!({"handle": 1, "ok": null})).unwrap();
+        assert_eq!(null.outcome.into_result().unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn a_refused_wait_is_not_a_settled_call() {
+        let refused = serde_json::json!({"error": {"code": "BAD_INPUT", "message": "no", "retryable": false}});
+        assert!(serde_json::from_value::<LibraryCallSettled>(refused).is_err());
     }
 
     #[test]
