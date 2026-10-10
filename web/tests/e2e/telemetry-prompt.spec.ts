@@ -4,6 +4,14 @@ import { loginAsTestAdmin } from "./auth-helper";
 
 const TOAST = /help shape happyview/i;
 
+// The telemetry toast itself, rather than whichever toast is on screen. The
+// dashboard raises others -- a plugin update, for one -- and a bare
+// `getByRole("button", { name: /^review$/i })` matches theirs too, which is a
+// strict-mode violation rather than a wrong click.
+function telemetryToast(page: import("@playwright/test").Page) {
+  return page.getByRole("listitem").filter({ hasText: TOAST });
+}
+
 /**
  * Stub the consent read.
  *
@@ -72,7 +80,7 @@ test.describe("telemetry prompt", () => {
         res.url().includes("/admin/settings/telemetry/dismiss") &&
         res.request().method() === "POST",
     );
-    await page.getByRole("button", { name: /^review$/i }).click();
+    await telemetryToast(page).getByRole("button", { name: /^review$/i }).click();
 
     await dismissed;
     await expect(page).toHaveURL(/\/dashboard\/settings\/telemetry\/?$/);
@@ -90,7 +98,7 @@ test.describe("telemetry prompt", () => {
         res.url().includes("/admin/settings/telemetry/dismiss") &&
         res.request().method() === "POST",
     );
-    await page.getByRole("button", { name: /close toast/i }).click();
+    await telemetryToast(page).getByLabel(/close toast/i).click();
 
     // The write is what makes it stick across browsers and admins; a toast
     // that merely disappears would be back on the next page load.

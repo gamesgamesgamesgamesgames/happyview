@@ -891,7 +891,7 @@ async fn main() {
             happyview::plugin::official_registry::OfficialRegistryState::default(),
         ));
     let official_registry_config =
-        happyview::plugin::official_registry::RegistryConfig::production();
+        happyview::plugin::official_registry::RegistryConfig::production().with_registry_from_env();
     happyview::plugin::official_registry::spawn_refresh_task(
         http.clone(),
         official_registry_config.clone(),
