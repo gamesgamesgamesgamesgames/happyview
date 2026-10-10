@@ -1,7 +1,7 @@
 //! What the Jetstream consumer is doing now, for the admin status endpoint.
 //! Process-wide: there is one consumer per process.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use serde::Serialize;
@@ -25,12 +25,16 @@ pub struct JetstreamStatus {
     pub lag_ms: Option<i64>,
     /// Events waiting in each worker's queue.
     pub worker_queue_depths: Vec<usize>,
+    /// Per worker, when the job it is applying (or retrying) started, in unix
+    /// milliseconds; `None` when idle. Queue depths do not count that job.
+    pub worker_busy_since_ms: Vec<Option<i64>>,
 }
 
 #[derive(Default)]
 struct Live {
     status: JetstreamStatus,
     depths: Option<Arc<Vec<AtomicUsize>>>,
+    busy_since: Option<Arc<Vec<AtomicI64>>>,
 }
 
 static LIVE: LazyLock<Mutex<Live>> = LazyLock::new(Mutex::default);
@@ -58,8 +62,10 @@ pub fn applied(point: &CursorPoint) {
     live.status.applied_time_us = Some(point.time_us());
 }
 
-pub fn set_worker_depths(depths: Arc<Vec<AtomicUsize>>) {
-    live().depths = Some(depths);
+pub fn set_workers(depths: Arc<Vec<AtomicUsize>>, busy_since: Arc<Vec<AtomicI64>>) {
+    let mut live = live();
+    live.depths = Some(depths);
+    live.busy_since = Some(busy_since);
 }
 
 pub fn snapshot() -> JetstreamStatus {
@@ -75,6 +81,11 @@ fn snapshot_at(now_us: i64) -> JetstreamStatus {
         .as_ref()
         .map(|depths| depths.iter().map(|d| d.load(Ordering::Relaxed)).collect())
         .unwrap_or_default();
+    status.worker_busy_since_ms = live
+        .busy_since
+        .as_ref()
+        .map(|busy| super::workers::busy_since_values(busy))
+        .unwrap_or_default();
     status
 }
 
@@ -84,7 +95,13 @@ mod tests {
 
     #[test]
     fn a_snapshot_reports_lag_and_queue_depths() {
-        set_worker_depths(Arc::new(vec![AtomicUsize::new(3), AtomicUsize::new(0)]));
+        set_workers(
+            Arc::new(vec![AtomicUsize::new(3), AtomicUsize::new(0)]),
+            Arc::new(vec![
+                AtomicI64::new(1_700_000_000_000),
+                AtomicI64::new(i64::MIN),
+            ]),
+        );
         connected(Protocol::V2, "js.example.com", Some(7));
         applied(&CursorPoint::V2 {
             seq: 42,
@@ -100,6 +117,10 @@ mod tests {
         assert_eq!(status.applied_seq, Some(42));
         assert_eq!(status.lag_ms, Some(2_500));
         assert_eq!(status.worker_queue_depths, vec![3, 0]);
+        assert_eq!(
+            status.worker_busy_since_ms,
+            vec![Some(1_700_000_000_000), None]
+        );
 
         disconnected();
         assert!(!snapshot_at(3_500_000).connected);

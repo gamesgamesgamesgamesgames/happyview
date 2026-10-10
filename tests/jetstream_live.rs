@@ -1402,3 +1402,36 @@ async fn a_future_cursor_on_a_time_cursor_does_not_loop() {
         vec![json!({"reason": "future_cursor", "from_seq": time})]
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn the_status_endpoint_reports_the_live_stream() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    mock.push(
+        (701..=703).map(|s| js::create(s, "did:plc:status", GAME, &format!("r{s}"), game("x"))),
+    );
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 703 applied", applied_through(&app, 703).await);
+    // The status is process-wide, so wait for this test's consumer by its
+    // host and seq rather than trusting the first read.
+    wait_until!("the status shows seq 703", {
+        let status = app.get_json("/admin/jetstream/status").await;
+        status["applied_seq"] == json!(703) && status["host"] == json!(mock.host())
+    });
+    let status = app.get_json("/admin/jetstream/status").await;
+    assert_eq!(status["protocol"], json!("v2"));
+    assert_eq!(status["connected"], json!(true));
+    assert_eq!(status["compression"], json!(true));
+    assert_eq!(status["dictionary_id"], json!(js::DICTIONARY_A));
+    assert_eq!(
+        status["worker_queue_depths"].as_array().map(Vec::len),
+        Some(8)
+    );
+    assert_eq!(
+        status["worker_busy_since_ms"].as_array().map(Vec::len),
+        Some(8)
+    );
+    assert!(status["lag_ms"].as_i64().is_some_and(|lag| lag > 0));
+}

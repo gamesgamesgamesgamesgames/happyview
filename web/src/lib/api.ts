@@ -740,6 +740,28 @@ export function cancelVacuum() {
   });
 }
 
+// Jetstream
+
+export interface JetstreamStatus {
+  protocol: "v2" | "v1" | null;
+  host: string | null;
+  connected: boolean;
+  compression: boolean;
+  dictionary_id: number | null;
+  /** The newest event that it and every event before it have been applied. Null on v1, which has no seq. */
+  applied_seq: number | null;
+  applied_time_us: number | null;
+  lag_ms: number | null;
+  /** Events waiting in each worker's queue, not counting the one being applied. */
+  worker_queue_depths: number[];
+  /** Per worker, when its current job started (unix ms); null when idle. */
+  worker_busy_since_ms: (number | null)[];
+}
+
+export function getJetstreamStatus() {
+  return apiFetch<JetstreamStatus>("/admin/jetstream/status");
+}
+
 // Telemetry
 
 export interface TelemetrySettings {

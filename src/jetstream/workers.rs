@@ -17,7 +17,7 @@ use std::any::Any;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -90,6 +90,7 @@ pub struct Job {
 pub struct WorkerPool {
     senders: Vec<mpsc::Sender<Job>>,
     depths: Arc<Vec<AtomicUsize>>,
+    busy_since: Arc<Vec<AtomicI64>>,
     watermark: Arc<WatermarkHandle>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -123,6 +124,8 @@ impl WorkerPool {
         let workers = workers.max(1);
         let depths: Arc<Vec<AtomicUsize>> =
             Arc::new((0..workers).map(|_| AtomicUsize::new(0)).collect());
+        let busy_since: Arc<Vec<AtomicI64>> =
+            Arc::new((0..workers).map(|_| AtomicI64::new(IDLE)).collect());
         let (senders, tasks) = (0..workers)
             .map(|index| {
                 let (tx, rx) = mpsc::channel(capacity.max(1));
@@ -132,6 +135,7 @@ impl WorkerPool {
                     apply: Arc::clone(&apply),
                     watermark: Arc::clone(&watermark),
                     depths: Arc::clone(&depths),
+                    busy_since: Arc::clone(&busy_since),
                     retry: retry.clone(),
                     on_give_up: Arc::clone(&on_give_up),
                 }));
@@ -141,6 +145,7 @@ impl WorkerPool {
         Self {
             senders,
             depths,
+            busy_since,
             watermark,
             tasks,
         }
@@ -168,6 +173,17 @@ impl WorkerPool {
         Arc::clone(&self.depths)
     }
 
+    /// When each worker's current job started, in unix milliseconds. A job
+    /// being applied or retried is not in the queue depth, so this is what
+    /// shows a worker stuck on one event.
+    pub fn busy_since_counters(&self) -> Arc<Vec<AtomicI64>> {
+        Arc::clone(&self.busy_since)
+    }
+
+    pub fn busy_since(&self) -> Vec<Option<i64>> {
+        busy_since_values(&self.busy_since)
+    }
+
     pub fn depths(&self) -> Vec<usize> {
         self.depths
             .iter()
@@ -176,12 +192,27 @@ impl WorkerPool {
     }
 }
 
+/// The `busy_since` value of a worker with no job in hand.
+const IDLE: i64 = i64::MIN;
+
+/// Reads a `busy_since` set as `None` for idle workers.
+pub fn busy_since_values(busy_since: &[AtomicI64]) -> Vec<Option<i64>> {
+    busy_since
+        .iter()
+        .map(|since| match since.load(Ordering::Relaxed) {
+            IDLE => None,
+            ms => Some(ms),
+        })
+        .collect()
+}
+
 struct Worker {
     index: usize,
     rx: mpsc::Receiver<Job>,
     apply: ApplyFn,
     watermark: Arc<WatermarkHandle>,
     depths: Arc<Vec<AtomicUsize>>,
+    busy_since: Arc<Vec<AtomicI64>>,
     retry: RetryPolicy,
     on_give_up: GiveUpFn,
 }
@@ -189,7 +220,10 @@ struct Worker {
 async fn run_worker(mut worker: Worker) {
     while let Some(Job { ticket, event }) = worker.rx.recv().await {
         worker.depths[worker.index].fetch_sub(1, Ordering::Relaxed);
+        worker.busy_since[worker.index]
+            .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
         apply_with_retries(&worker, event).await;
+        worker.busy_since[worker.index].store(IDLE, Ordering::Relaxed);
         worker.watermark.complete(ticket);
     }
 }
@@ -761,6 +795,7 @@ mod tests {
         let pool = WorkerPool {
             senders: vec![tx],
             depths: Arc::new(vec![AtomicUsize::new(0)]),
+            busy_since: Arc::new(vec![AtomicI64::new(IDLE)]),
             watermark: Arc::clone(&watermark),
             tasks: Vec::new(),
         };
@@ -774,5 +809,59 @@ mod tests {
             })
         );
         assert_eq!(pool.depths(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn a_worker_retrying_an_event_reports_when_it_started() {
+        let healthy = Arc::new(AtomicBool::new(false));
+        let apply: ApplyFn = {
+            let healthy = Arc::clone(&healthy);
+            Arc::new(move |_event: Event| {
+                let healthy = Arc::clone(&healthy);
+                async move {
+                    if healthy.load(Ordering::SeqCst) {
+                        ApplyOutcome::Applied
+                    } else {
+                        ApplyOutcome::Unavailable("down".into())
+                    }
+                }
+                .boxed()
+            })
+        };
+        let (on_give_up, _gave_up) = recording_give_up();
+        let watermark = Arc::new(WatermarkHandle::new());
+        let pool = WorkerPool::spawn(
+            2,
+            8,
+            apply,
+            Arc::clone(&watermark),
+            fast_retry(2),
+            on_give_up,
+        );
+        assert_eq!(pool.busy_since(), vec![None, None]);
+
+        let before = chrono::Utc::now().timestamp_millis();
+        let did = "did:plc:stuck";
+        send(&pool, &watermark, event(did, 1)).await;
+        let stuck = worker_for(did, 2);
+        wait_for("the worker to take the job", || {
+            pool.busy_since()[stuck].is_some()
+        })
+        .await;
+
+        // The queue is empty, but the worker is busy with the retried job.
+        assert_eq!(pool.depths(), vec![0, 0]);
+        let busy = pool.busy_since();
+        assert!(busy[stuck].is_some_and(|ms| ms >= before));
+        assert_eq!(busy[1 - stuck], None);
+
+        healthy.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), watermark.wait_idle())
+            .await
+            .expect("drained");
+        wait_for("the worker to go idle", || {
+            pool.busy_since() == vec![None, None]
+        })
+        .await;
     }
 }

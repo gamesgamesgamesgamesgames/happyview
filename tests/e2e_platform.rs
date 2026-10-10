@@ -486,3 +486,27 @@ async fn super_user_requires_platform_principal() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(supers(&app).await, vec!["did:plc:testadmin".to_string()]);
 }
+
+#[tokio::test]
+#[serial]
+async fn platform_key_can_read_the_jetstream_status() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(
+            Method::GET,
+            "/admin/jetstream/status",
+            PLATFORM_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(body["worker_queue_depths"].is_array());
+    assert!(body["worker_busy_since_ms"].is_array());
+}

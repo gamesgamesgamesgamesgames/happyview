@@ -428,7 +428,7 @@ async fn run(
         retry,
         apply::give_up_fn(state.clone()),
     );
-    status::set_worker_depths(pool.depth_counters());
+    status::set_workers(pool.depth_counters(), pool.busy_since_counters());
 
     let mut session = Session::new(&settings);
     // The seq of the last v2 event handed to the pool. The pool outlives the
