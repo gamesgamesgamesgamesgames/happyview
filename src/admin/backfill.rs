@@ -3182,10 +3182,19 @@ struct PreparedRecord {
     cid: String,
 }
 
-/// Write one `listRecords` page in one transaction: the multi-row upsert, then
-/// refs for exactly the rows it inserted or changed. The upsert's `WHERE`
-/// skips unchanged rows, which keep their refs and `indexed_at`. Returns the
-/// URIs written.
+/// Rows per multi-row upsert of a records page: 8 bound parameters each.
+/// `listRecords` is asked for 100 records, but nothing stops a PDS sending
+/// more, and the page must not grow one statement past the backend's
+/// parameter limit.
+const RECORDS_PER_UPSERT: usize = 100;
+
+/// Write one `listRecords` page in one transaction: multi-row upserts of at
+/// most `RECORDS_PER_UPSERT` rows, each followed by refs for exactly the rows
+/// it inserted or changed. The upsert's `WHERE` skips unchanged rows, which
+/// keep their refs and `indexed_at`. Returns the URIs written.
+///
+/// A URI repeated within the page is written once, with its last copy:
+/// Postgres refuses to upsert one row twice in a statement (`21000`).
 async fn write_records_page(
     state: &AppState,
     batch: &[PreparedRecord],
@@ -3193,11 +3202,36 @@ async fn write_records_page(
     if batch.is_empty() {
         return Ok(Vec::new());
     }
-    let backend = state.db_backend;
+    let last: HashMap<&str, usize> = batch
+        .iter()
+        .enumerate()
+        .map(|(i, rec)| (rec.uri.as_str(), i))
+        .collect();
+    let records: Vec<&PreparedRecord> = batch
+        .iter()
+        .enumerate()
+        .filter(|(i, rec)| last[rec.uri.as_str()] == *i)
+        .map(|(_, rec)| rec)
+        .collect();
     let now = now_rfc3339();
 
-    // 8 params per row; a page is at most 100 rows, under SQLite's 999.
-    let placeholders = vec!["(?, ?, ?, ?, ?, ?, ?, ?)"; batch.len()].join(", ");
+    let mut tx = state.backfill_db.begin().await?;
+    let mut written = Vec::new();
+    for chunk in records.chunks(RECORDS_PER_UPSERT) {
+        written.extend(write_records_chunk(&mut tx, state.db_backend, &now, chunk).await?);
+    }
+    tx.commit().await?;
+    Ok(written)
+}
+
+/// One upsert of `write_records_page`, and the refs of the rows it wrote.
+async fn write_records_chunk(
+    conn: &mut sqlx::AnyConnection,
+    backend: crate::db::DatabaseBackend,
+    now: &str,
+    chunk: &[&PreparedRecord],
+) -> Result<Vec<String>, sqlx::Error> {
+    let placeholders = vec!["(?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
     let upsert_sql = adapt_sql(
         &format!(
             "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES {placeholders} \
@@ -3207,10 +3241,8 @@ async fn write_records_page(
         ),
         backend,
     );
-
-    let mut tx = state.backfill_db.begin().await?;
     let mut upsert = crate::db::query_as::<(String,)>(&upsert_sql);
-    for rec in batch {
+    for rec in chunk {
         upsert = upsert
             .bind(&rec.uri)
             .bind(&rec.did)
@@ -3218,58 +3250,57 @@ async fn write_records_page(
             .bind(&rec.rkey)
             .bind(&rec.record_json)
             .bind(&rec.cid)
-            .bind(&now)
-            .bind(&now);
+            .bind(now)
+            .bind(now);
     }
     let written: Vec<String> = upsert
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?
         .into_iter()
         .map(|(uri,)| uri)
         .collect();
+    if written.is_empty() {
+        return Ok(written);
+    }
 
-    if !written.is_empty() {
-        let delete_sql = adapt_sql(
+    let delete_sql = adapt_sql(
+        &format!(
+            "DELETE FROM happyview_record_refs WHERE source_uri IN ({})",
+            vec!["?"; written.len()].join(", ")
+        ),
+        backend,
+    );
+    let mut delete = crate::db::query(&delete_sql);
+    for uri in &written {
+        delete = delete.bind(uri.as_str());
+    }
+    delete.execute(&mut *conn).await?;
+
+    let written_uris: HashSet<&str> = written.iter().map(String::as_str).collect();
+    let mut refs: Vec<(&str, String, &str)> = Vec::new();
+    for rec in chunk
+        .iter()
+        .filter(|rec| written_uris.contains(rec.uri.as_str()))
+    {
+        let value: Value = serde_json::from_str(&rec.record_json).unwrap_or_default();
+        for target in crate::record_refs::extract_at_uris(&value) {
+            refs.push((&rec.uri, target, &rec.collection));
+        }
+    }
+    for refs_chunk in refs.chunks(crate::record_refs::REFS_PER_INSERT) {
+        let ref_sql = adapt_sql(
             &format!(
-                "DELETE FROM happyview_record_refs WHERE source_uri IN ({})",
-                vec!["?"; written.len()].join(", ")
+                "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES {} ON CONFLICT DO NOTHING",
+                vec!["(?, ?, ?)"; refs_chunk.len()].join(", ")
             ),
             backend,
         );
-        let mut delete = crate::db::query(&delete_sql);
-        for uri in &written {
-            delete = delete.bind(uri.as_str());
+        let mut insert = crate::db::query(&ref_sql);
+        for (source, target, collection) in refs_chunk {
+            insert = insert.bind(*source).bind(target.as_str()).bind(*collection);
         }
-        delete.execute(&mut *tx).await?;
-
-        let written_uris: HashSet<&str> = written.iter().map(String::as_str).collect();
-        let mut refs: Vec<(&str, String, &str)> = Vec::new();
-        for rec in batch
-            .iter()
-            .filter(|rec| written_uris.contains(rec.uri.as_str()))
-        {
-            let value: Value = serde_json::from_str(&rec.record_json).unwrap_or_default();
-            for target in crate::record_refs::extract_at_uris(&value) {
-                refs.push((&rec.uri, target, &rec.collection));
-            }
-        }
-        for chunk in refs.chunks(crate::record_refs::REFS_PER_INSERT) {
-            let ref_sql = adapt_sql(
-                &format!(
-                    "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES {} ON CONFLICT DO NOTHING",
-                    vec!["(?, ?, ?)"; chunk.len()].join(", ")
-                ),
-                backend,
-            );
-            let mut insert = crate::db::query(&ref_sql);
-            for (source, target, collection) in chunk {
-                insert = insert.bind(*source).bind(target.as_str()).bind(*collection);
-            }
-            insert.execute(&mut *tx).await?;
-        }
+        insert.execute(&mut *conn).await?;
     }
-
-    tx.commit().await?;
     Ok(written)
 }
 
@@ -8332,6 +8363,82 @@ mod tests {
             .execute(&state.db)
             .await
             .expect("clean up");
+    }
+
+    /// A page far past `limit` (more bound parameters than either backend
+    /// takes in one statement) is written in chunks, and a URI repeated in a
+    /// page is written once, with its last copy.
+    async fn assert_oversized_page_with_repeats_is_written(state: &AppState, prefix: &str) {
+        let mut page: Vec<PreparedRecord> = (0..9000)
+            .map(|i| prepared(&format!("{prefix}n{i:05}"), serde_json::json!({"n": i})))
+            .collect();
+        let repeated = page[150].uri.clone();
+        let mut last = prepared(
+            &format!("{prefix}n00150"),
+            serde_json::json!({"subject": "at://did:plc:t/app.test.post/1"}),
+        );
+        last.cid = "bafylast".to_string();
+        page.push(last);
+
+        let written = write_records_page(state, &page)
+            .await
+            .expect("oversized write");
+        assert_eq!(written.len(), 9000);
+
+        let sql = adapt_sql(
+            "SELECT COUNT(*) FROM happyview_records WHERE uri LIKE ?",
+            state.db_backend,
+        );
+        let (rows,): (i64,) = crate::db::query_as(&sql)
+            .bind(format!("at://did:plc:page/{POST}/{prefix}%"))
+            .fetch_one(&state.db)
+            .await
+            .expect("count rows");
+        assert_eq!(rows, 9000);
+        let sql = adapt_sql(
+            "SELECT cid FROM happyview_records WHERE uri = ?",
+            state.db_backend,
+        );
+        let (cid,): (String,) = crate::db::query_as(&sql)
+            .bind(&repeated)
+            .fetch_one(&state.db)
+            .await
+            .expect("repeated row");
+        assert_eq!(cid, "bafylast", "the last copy wins");
+        assert_eq!(ref_count(state, &repeated).await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_page_with_repeats_is_written() {
+        let state = migrated_state().await;
+        assert_oversized_page_with_repeats_is_written(&state, "o").await;
+    }
+
+    #[tokio::test]
+    async fn an_oversized_page_with_repeats_is_written_on_postgres() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        let prefix = format!("o{}", Uuid::new_v4().simple());
+        assert_oversized_page_with_repeats_is_written(&state, &prefix).await;
+
+        for table in ["happyview_record_refs", "happyview_records"] {
+            let column = if table == "happyview_records" {
+                "uri"
+            } else {
+                "source_uri"
+            };
+            let sql = adapt_sql(
+                &format!("DELETE FROM {table} WHERE {column} LIKE ?"),
+                state.db_backend,
+            );
+            crate::db::query(&sql)
+                .bind(format!("at://did:plc:page/{POST}/{prefix}%"))
+                .execute(&state.db)
+                .await
+                .expect("clean up");
+        }
     }
 
     /// A page that cannot be written rolls back whole and becomes a fetch
