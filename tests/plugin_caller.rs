@@ -657,7 +657,7 @@ async fn a_created_record_is_mirrored_into_the_index() {
 
 #[tokio::test]
 #[serial]
-async fn a_put_record_replaces_the_mirrored_cid_and_keeps_indexed_at() {
+async fn a_put_record_replaces_the_mirrored_cid_and_clears_indexed_at() {
     common::require_db!();
     let app = TestApp::new_with_encryption().await;
     install_caller_fixture(&app).await;
@@ -710,7 +710,9 @@ async fn a_put_record_replaces_the_mirrored_cid_and_keeps_indexed_at() {
 
     let row = indexed(&app, &uri).await.expect("the row is still there");
     assert_eq!(row["cid"], "bafynew");
-    assert_eq!(row["indexed_at"], "2026-01-01T00:00:00+00:00");
+    // The PDS write comes back over Jetstream, and that echo stamps the
+    // arrival time. Until it does, the mirrored row has none.
+    assert!(row["indexed_at"].is_null(), "{row}");
     assert_eq!(
         row["record"],
         json!({ "$type": "com.example.post", "text": "second" })
