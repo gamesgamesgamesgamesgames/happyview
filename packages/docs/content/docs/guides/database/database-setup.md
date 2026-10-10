@@ -46,7 +46,7 @@ HappyView runs migrations automatically on startup for both backends.
 
 HappyView applies any pending migrations every time it starts, before it serves requests. Most take milliseconds. One that builds an index over `happyview_records` scales with that table, and so does the boot that applies it.
 
-**SQLite** builds an index inside the migration's transaction, which holds the database's write lock. On a records table of several gigabytes, expect a boot that takes minutes rather than seconds, during which HappyView is not serving. The build sorts every row, so it also needs free disk around the size of the new index while it runs. Let it finish: stopping the process rolls the migration back, and the next boot starts the build over.
+**SQLite** builds an index inside the migration's transaction, which holds the database's write lock. On a records table of several gigabytes, expect a boot that takes minutes rather than seconds, during which HappyView is not serving. Plan for free disk of roughly two to three times the size of the new index while it runs: the build sorts every row, spilling to temporary storage, and writes the index into the write-ahead log, which is copied into the database file at the next checkpoint before the log is truncated. Let it finish: stopping the process rolls the migration back, and the next boot starts the build over.
 
 **Postgres** builds these indexes with `CREATE INDEX CONCURRENTLY`, which keeps reads and writes flowing while it builds but still has to scan the whole table. If a build fails partway, Postgres leaves an invalid index behind. HappyView drops it on the next boot and builds it again, so a restart is the fix.
 

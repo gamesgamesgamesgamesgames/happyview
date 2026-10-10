@@ -330,7 +330,7 @@ curl "http://127.0.0.1:3000/admin/backfill/$JOB_ID/repos?phase=fetched&limit=10"
 GET /admin/backfill/{id}/pds-summary
 ```
 
-Aggregated PDS breakdown for a backfill job. Requires `BackfillRead`. No pagination — returns all PDS endpoints in one response, sorted by repo count descending. For jobs on the bounded queue the counts are kept per PDS as the job runs, and `total_repos` counts repos resolved to that PDS.
+Aggregated PDS breakdown for a backfill job. Requires `BackfillRead`. No pagination — returns all PDS endpoints in one response, sorted by repo count descending. For jobs on the bounded queue the counts are kept per PDS as the job runs, and `total_repos` counts work units resolved to that PDS, like the other counters: a repo queued under two collections counts twice.
 
 ```sh tab="cURL" tab-group="language"
 curl "http://127.0.0.1:3000/admin/backfill/$JOB_ID/pds-summary" -H "$AUTH"

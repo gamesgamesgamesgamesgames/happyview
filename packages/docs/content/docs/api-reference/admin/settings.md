@@ -151,7 +151,7 @@ curl http://127.0.0.1:3000/admin/settings/db-info -H "$AUTH"
   "backend": "sqlite",
   "server_max_connections": null,
   "main_pool_size": 32,
-  "backfill_pool_size": 64,
+  "backfill_pool_size": 16,
   "restart_recommended": false
 }
 ```
