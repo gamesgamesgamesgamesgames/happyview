@@ -394,6 +394,10 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
         any_of: &[PluginCapability::AtprotoRead],
     },
     Requirement {
+        import: "host_atproto_resolve_identity",
+        any_of: &[PluginCapability::AtprotoRead],
+    },
+    Requirement {
         import: "host_atproto_blob_download",
         any_of: &[PluginCapability::AtprotoRead],
     },
@@ -1042,7 +1046,7 @@ mod tests {
         assert!(PluginCapability::CallerWrite.risk() < PluginCapability::CallerCall.risk());
     }
 
-    /// The five AT Protocol/attestation imports: all but signing read the
+    /// The six AT Protocol/attestation imports: all but signing read the
     /// network or the label/record tables, so they share `atproto:read`;
     /// only producing a signature needs the stronger `attest:sign`.
     #[test]
@@ -1050,6 +1054,10 @@ mod tests {
         for (import, expected) in [
             (
                 "host_atproto_resolve_service",
+                PluginCapability::AtprotoRead,
+            ),
+            (
+                "host_atproto_resolve_identity",
                 PluginCapability::AtprotoRead,
             ),
             ("host_atproto_blob_download", PluginCapability::AtprotoRead),

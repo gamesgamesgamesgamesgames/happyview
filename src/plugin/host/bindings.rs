@@ -965,6 +965,15 @@ pub(crate) fn define_host_functions(
     )?;
 
     imports.define(
+        "host_atproto_resolve_identity",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(
+                async move { host_atproto_resolve_identity_impl(caller, req_ptr, req_len).await },
+            )
+        },
+    )?;
+
+    imports.define(
         "host_atproto_blob_download",
         |caller, (req_ptr, req_len): (i32, i32)| {
             Box::pin(async move { host_atproto_blob_download_impl(caller, req_ptr, req_len).await })
@@ -2132,6 +2141,59 @@ async fn host_atproto_resolve_service_impl(
             }
             Err(e) => atproto_error_envelope(e),
         };
+    write_guest_response(caller, &response).await
+}
+
+/// Host function: resolve a handle or a DID to both.
+///
+/// `handle` comes back only when it was confirmed in both directions, which
+/// is what makes it safe to display; the DID is whatever the identifier
+/// resolved to.
+async fn host_atproto_resolve_identity_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    const IMPORT: &str = "host_atproto_resolve_identity";
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(IMPORT).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: happyview_plugin_sdk::wire::AtprotoResolveIdentity =
+        match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+        };
+    let Some(app_state) = caller.data().app_state.clone() else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "HOST_ERROR",
+                "this instance has no app state to resolve against",
+            ),
+        )
+        .await;
+    };
+    let response = match crate::identity::resolve_verified(
+        &app_state.http,
+        &app_state.config.plc_url,
+        &spec.identifier,
+    )
+    .await
+    {
+        Ok(identity) => serde_json::to_vec(&serde_json::json!({
+            "ok": happyview_plugin_sdk::wire::ResolvedIdentity {
+                did: identity.did,
+                handle: identity.handle,
+            }
+        }))
+        .unwrap_or_default(),
+        Err(e) => error_envelope("HOST_ERROR", e),
+    };
     write_guest_response(caller, &response).await
 }
 

@@ -739,6 +739,26 @@ pub struct AtprotoResolveService {
     pub did: String,
 }
 
+/// Resolve a handle or a DID to both. Needs `atproto:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AtprotoResolveIdentity {
+    /// A handle, with or without a leading `@`, or a DID.
+    pub identifier: String,
+}
+
+/// What an identifier resolved to.
+///
+/// `handle` is present only when the handle resolves to this DID *and* the
+/// DID document claims that handle. A one-directional match is how a handle
+/// gets impersonated, so an unconfirmed one is reported as absent rather than
+/// returned for display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedIdentity {
+    pub did: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+}
+
 /// Download a blob from a repo, by the DID that owns it and the blob's CID.
 /// Needs `atproto:read`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2776,6 +2796,46 @@ mod atproto_tests {
         assert_eq!(
             serde_json::from_value::<AtprotoResolveService>(value).unwrap(),
             spec
+        );
+    }
+
+    #[test]
+    fn atproto_resolve_identity_round_trips() {
+        let spec = AtprotoResolveIdentity {
+            identifier: "alice.test".to_string(),
+        };
+        let value = serde_json::to_value(&spec).unwrap();
+        assert_eq!(value["identifier"], "alice.test");
+        assert_eq!(
+            serde_json::from_value::<AtprotoResolveIdentity>(value).unwrap(),
+            spec
+        );
+    }
+
+    /// An unconfirmed handle is absent rather than null, and reads back as
+    /// `None` either way.
+    #[test]
+    fn resolved_identity_omits_an_unconfirmed_handle() {
+        let bare = ResolvedIdentity {
+            did: "did:plc:abc".to_string(),
+            handle: None,
+        };
+        let value = serde_json::to_value(&bare).unwrap();
+        assert_eq!(value, serde_json::json!({"did": "did:plc:abc"}));
+        assert_eq!(
+            serde_json::from_value::<ResolvedIdentity>(value).unwrap(),
+            bare
+        );
+
+        let named = ResolvedIdentity {
+            did: "did:plc:abc".to_string(),
+            handle: Some("alice.test".to_string()),
+        };
+        let value = serde_json::to_value(&named).unwrap();
+        assert_eq!(value["handle"], "alice.test");
+        assert_eq!(
+            serde_json::from_value::<ResolvedIdentity>(value).unwrap(),
+            named
         );
     }
 
