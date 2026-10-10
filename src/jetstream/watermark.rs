@@ -111,8 +111,14 @@ impl WatermarkHandle {
         self.lock().next_ticket()
     }
 
-    pub fn has_retired(&self, ticket: u64) -> bool {
-        self.lock().has_retired(ticket)
+    /// `applied`, if `ticket` has retired; read together, so a ticket
+    /// retiring in between cannot pair an old point with a passed check.
+    pub fn applied_if_retired(&self, ticket: u64) -> Option<CursorPoint> {
+        let watermark = self.lock();
+        watermark
+            .has_retired(ticket)
+            .then(|| watermark.applied())
+            .flatten()
     }
 
     /// Wait until every dispatched event has been applied.
@@ -157,6 +163,24 @@ mod tests {
         w.complete(new);
         assert!(w.has_retired(barrier));
         assert_eq!(w.next_ticket(), new + 1);
+    }
+
+    #[test]
+    fn the_applied_point_is_withheld_until_the_ticket_retires() {
+        let w = WatermarkHandle::new();
+        assert_eq!(w.applied_if_retired(0), None, "nothing applied yet");
+        let old = w.begin(p(12));
+        let barrier = w.next_ticket();
+        let new = w.begin(p(1));
+        w.complete(old);
+        assert_eq!(w.applied(), Some(p(12)));
+        assert_eq!(
+            w.applied_if_retired(barrier),
+            None,
+            "the old numbering's point is withheld"
+        );
+        w.complete(new);
+        assert_eq!(w.applied_if_retired(barrier), Some(p(1)));
     }
 
     #[test]

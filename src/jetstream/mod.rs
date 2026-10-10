@@ -131,8 +131,12 @@ impl Session {
 
 enum SessionEnd {
     CollectionsChanged,
-    Closed { delivered: bool },
+    Closed {
+        delivered: bool,
+    },
     Rejected(Rejection),
+    /// `FutureCursor`, with a witnessed time to resume by instead.
+    Renumbered,
 }
 
 /// A subscription the server refused before upgrading, by its XRPC error
@@ -340,7 +344,8 @@ async fn resume_without_seq(
 /// Log a refusal that will not fix itself on a quick retry; returns how long
 /// to wait before trying again. The retry keeps its cursor rather than
 /// starting at the tip: a tip resume waiting on it would skip everything
-/// from the saved cursor to whenever the refusals stop.
+/// from the saved cursor to whenever the refusals stop. A pending gap stays,
+/// for when the retry has no cursor left either.
 async fn invalid_request(
     state: &AppState,
     settings: &Settings,
@@ -348,7 +353,6 @@ async fn invalid_request(
     message: String,
 ) -> Duration {
     session.from_tip = false;
-    session.pending_gap = None;
     let retry = settings.invalid_request_retry;
     tracing::error!(
         %message,
@@ -404,6 +408,7 @@ async fn log_gap(
 enum Ended {
     CollectionsChanged,
     Closed(String),
+    Renumbered,
 }
 
 async fn run(
@@ -461,6 +466,7 @@ async fn run(
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
+            SessionEnd::Renumbered => backoff = MIN_BACKOFF,
             SessionEnd::Rejected(rejection) => {
                 match handle_rejection(
                     &state,
@@ -518,6 +524,10 @@ async fn run_session(
         Protocol::V1 => cursor::resume_cursor(&stored, host, protocol),
     };
     session.sent_cursor = resume;
+    if resume.is_some() {
+        // Not a resume from the tip after all, so nothing to report.
+        session.pending_gap = None;
+    }
 
     if protocol == Protocol::V2 && session.compression && session.dictionary.is_none() {
         match compression::fetch_dictionary(
@@ -685,7 +695,10 @@ async fn run_session(
                             // The seq resumed from is past the server's next
                             // one: its seqs started over or went back. The
                             // new, lower seqs must not be dropped as already
-                            // seen, nor the old ones resumed from again.
+                            // seen, nor the old ones resumed from again. A
+                            // witnessed time means the same on the new
+                            // numbering, so with one saved the stream is
+                            // picked up from it rather than from the tip.
                             "FutureCursor" => {
                                 floor = None;
                                 *last_dispatched = None;
@@ -697,6 +710,9 @@ async fn run_session(
                                     "from_seq": resume,
                                 }))
                                 .await;
+                                if stored.time_us.is_some() {
+                                    break Ended::Renumbered;
+                                }
                             }
                             _ => {}
                         }
@@ -739,6 +755,10 @@ async fn run_session(
             tracing::info!("collection filter changed, reconnecting to jetstream");
             SessionEnd::CollectionsChanged
         }
+        Ended::Renumbered => {
+            tracing::warn!("jetstream's seqs started over; reconnecting by witnessed time");
+            SessionEnd::Renumbered
+        }
         Ended::Closed(reason) => {
             tracing::warn!(%reason, "jetstream disconnected");
             log_event(
@@ -780,16 +800,20 @@ async fn flush(
     barrier: &mut Option<u64>,
     last_saved: &mut Option<CursorPoint>,
 ) {
-    let Some(point) = watermark.applied() else {
-        return;
+    let point = match *barrier {
+        Some(ticket) => {
+            let Some(point) = watermark.applied_if_retired(ticket) else {
+                return;
+            };
+            *barrier = None;
+            point
+        }
+        None => match watermark.applied() {
+            Some(point) => point,
+            None => return,
+        },
     };
     status::applied(&point);
-    if let Some(ticket) = *barrier {
-        if !watermark.has_retired(ticket) {
-            return;
-        }
-        *barrier = None;
-    }
     if *last_saved == Some(point) {
         return;
     }

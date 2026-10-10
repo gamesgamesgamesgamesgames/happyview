@@ -923,11 +923,14 @@ async fn a_clamped_time_cursor_logs_the_gap() {
 }
 
 /// The server's seqs started over below the saved one: it answers the
-/// resume with `#info FutureCursor` and streams from its tip. The consumer
-/// drops its dedup floor, so the new, lower seqs apply and are saved.
+/// resume with `#info FutureCursor` and would stream from its tip. A
+/// witnessed time means the same on the new numbering, so the consumer
+/// reconnects by the saved one and picks up the renumbered events from
+/// there, not just those from the tip. It drops its dedup floor, so the
+/// new, lower seqs apply and are saved.
 #[tokio::test]
 #[serial]
-async fn a_future_cursor_restarts_the_seq_floor() {
+async fn a_future_cursor_resumes_by_witnessed_time() {
     let Some(app) = app().await else { return };
     let mock = MockJetstream::start().await;
     mock.push(
@@ -936,17 +939,62 @@ async fn a_future_cursor_restarts_the_seq_floor() {
     let _consumer = start(&app, settings(&mock));
     wait_until!("seq 12 applied", applied_through(&app, 12).await);
 
+    // Renumbered from 1, witnessed after seq 12 was.
     mock.reset_events();
-    mock.push((1..=3).map(|s| js::create(s, "did:plc:after", GAME, &format!("r{s}"), game("x"))));
-    mock.notice_next("FutureCursor", "cursor 12 is past the next seq 4");
+    mock.push((1..=5).map(|s| {
+        js::witnessed_later(
+            js::create(s, "did:plc:after", GAME, &format!("r{s}"), game("x")),
+            js::witnessed_us(20) - js::BASE_US,
+        )
+    }));
+    mock.set_tip(4);
+    mock.notice_next("FutureCursor", "cursor 12 is past the next seq 6");
     mock.kick();
 
     wait_until!(
-        "the new seq 3 saved",
-        setting(&app, "jetstream_seq").await.as_deref() == Some("3")
+        "the new seq 5 saved",
+        setting(&app, "jetstream_seq").await.as_deref() == Some("5")
     );
-    assert_eq!(mock.connections()[1].param("cursor").as_deref(), Some("12"));
-    assert_eq!(rkeys(&app, "did:plc:after").await, vec!["r1", "r2", "r3"]);
+    let connections = mock.connections();
+    assert_eq!(connections[1].param("cursor").as_deref(), Some("12"));
+    assert_eq!(
+        connections[2].param("cursor"),
+        Some(js::witnessed_us(12).to_string()),
+        "reconnects by the saved witnessed time"
+    );
+    assert_eq!(
+        rkeys(&app, "did:plc:after").await,
+        vec!["r1", "r2", "r3", "r4", "r5"],
+        "the events before the tip were recovered"
+    );
+    assert_eq!(
+        events(&app, "jetstream.gap").await,
+        vec![json!({"reason": "future_cursor", "from_seq": 12})]
+    );
+}
+
+/// `FutureCursor` with no witnessed time saved: the stream goes on from the
+/// tip, with the new, lower seqs applied and saved, and the gap logged.
+#[tokio::test]
+#[serial]
+async fn a_future_cursor_without_a_time_resumes_from_the_tip() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    set_setting(&app, "jetstream_seq", "12").await;
+    set_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.push(
+        (1..=5).map(|s| js::create(s, "did:plc:tipafter", GAME, &format!("r{s}"), game("x"))),
+    );
+    mock.set_tip(4);
+    mock.notice_next("FutureCursor", "cursor 12 is past the next seq 6");
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!(
+        "the new seq 5 saved",
+        setting(&app, "jetstream_seq").await.as_deref() == Some("5")
+    );
+    assert_eq!(mock.connections()[0].param("cursor").as_deref(), Some("12"));
+    assert_eq!(rkeys(&app, "did:plc:tipafter").await, vec!["r4", "r5"]);
     assert_eq!(
         events(&app, "jetstream.gap").await,
         vec![json!({"reason": "future_cursor", "from_seq": 12})]
@@ -1211,7 +1259,13 @@ async fn an_old_numbering_seq_is_not_saved_after_a_future_cursor() {
     let mock = MockJetstream::start().await;
     let (old_did, new_did) = ("did:plc:oldnumbering", "did:plc:newnumbering");
     let old = |s: i64| js::create(s, old_did, GAME, &format!("r{s}"), game("x"));
-    let new = |s: i64| js::create(s, new_did, GAME, &format!("r{s}"), game("x"));
+    // Renumbered from 1, witnessed after the old seqs were.
+    let new = |s: i64| {
+        js::witnessed_later(
+            js::create(s, new_did, GAME, &format!("r{s}"), game("x")),
+            js::witnessed_us(20) - js::BASE_US,
+        )
+    };
     let fast_drain = || Settings {
         drain_timeout: Duration::from_millis(200),
         ..settings(&mock)
@@ -1265,4 +1319,47 @@ async fn an_old_numbering_seq_is_not_saved_after_a_future_cursor() {
     );
     assert_eq!(rkeys(&app, new_did).await, vec!["r1", "r2", "r3"]);
     assert!(!seqs.seen().contains(&12), "{:?}", seqs.seen());
+}
+
+/// A `CursorTooOld` resume from the tip that is refused a few more times
+/// (the retries still have no cursor): the gap is logged once the tip
+/// connection finally succeeds.
+#[tokio::test]
+#[serial]
+async fn a_cursor_too_old_gap_outlasts_the_refusals_after_it() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    set_setting(&app, "jetstream_seq", "5").await;
+    set_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(400, "CursorTooOld", "cursor 5 below lookback floor 90");
+    for _ in 0..3 {
+        mock.reject_next_bare(400);
+    }
+    mock.set_retention_floor(90);
+    mock.push(
+        (100..=102).map(|s| js::create(s, "did:plc:outlast", GAME, &format!("r{s}"), game("x"))),
+    );
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 102 applied", applied_through(&app, 102).await);
+    let connections = mock.connections();
+    assert_eq!(connections.len(), 5, "{connections:?}");
+    assert!(
+        connections[1..].iter().all(|c| c.param("cursor").is_none()),
+        "{connections:?}"
+    );
+    assert_eq!(
+        events(&app, "jetstream.invalid_request").await.len(),
+        2,
+        "the second and third unexplained 400s wait"
+    );
+    assert_eq!(
+        events(&app, "jetstream.gap").await,
+        vec![json!({
+            "reason": "cursor_too_old",
+            "message": "cursor 5 below lookback floor 90",
+            "after_seq": 5,
+            "resumed_at_seq": 100,
+        })]
+    );
 }

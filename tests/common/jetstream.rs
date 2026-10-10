@@ -37,6 +37,23 @@ pub fn witnessed_us(seq: i64) -> i64 {
     BASE_US + seq * 1_000
 }
 
+/// `event` witnessed `by_us` later than its seq says, as the events of a
+/// server whose seqs started over are.
+pub fn witnessed_later(mut event: Value, by_us: i64) -> Value {
+    let time = wire_time(event_witnessed_us(&event) + by_us);
+    event["time"] = json!(time);
+    event["witnessedAt"] = json!(time);
+    event
+}
+
+/// When a scripted event was witnessed.
+fn event_witnessed_us(event: &Value) -> i64 {
+    let time = event["witnessedAt"].as_str().expect("witnessedAt");
+    chrono::DateTime::parse_from_rfc3339(time)
+        .expect("witnessedAt is RFC 3339")
+        .timestamp_micros()
+}
+
 fn wire_time(us: i64) -> String {
     chrono::DateTime::from_timestamp_micros(us)
         .expect("time in range")
@@ -152,7 +169,7 @@ pub fn sync(seq: i64, did: &str) -> Value {
 fn to_v1(payload: &Value) -> Option<Value> {
     let kind = payload["$type"].as_str()?.rsplit('#').next()?;
     let did = payload["did"].clone();
-    let time_us = witnessed_us(payload["seq"].as_i64()?);
+    let time_us = event_witnessed_us(payload);
     match kind {
         "commit" => {
             let mut commit = json!({
@@ -216,6 +233,7 @@ struct Inner {
     rejections: VecDeque<(u16, Option<Value>)>,
     notices: VecDeque<(String, String)>,
     retention_floor: Option<i64>,
+    tip: Option<i64>,
     served_dictionary: Option<u32>,
     accepted_dictionaries: HashSet<u32>,
     connections: Vec<Connection>,
@@ -309,14 +327,20 @@ impl MockJetstream {
         self.shared.lock().retention_floor = Some(seq);
     }
 
+    /// Where a `FutureCursor` connection starts: scripted events before
+    /// `seq` count as already past. Without one it gets them all.
+    pub fn set_tip(&self, seq: i64) {
+        self.shared.lock().tip = Some(seq);
+    }
+
     /// Forget every scripted event, as a server whose seqs started over.
     pub fn reset_events(&self) {
         self.shared.lock().events.clear();
     }
 
     /// Send an `#info` frame first on the next v2 connection. After a
-    /// `FutureCursor` notice that connection ignores its cursor and gets
-    /// every scripted event, as from the live tip.
+    /// `FutureCursor` notice that connection ignores its cursor and starts
+    /// at the tip (`set_tip`).
     pub fn notice_next(&self, name: &str, message: &str) {
         self.shared
             .lock()
@@ -373,7 +397,7 @@ fn select(
             let after_cursor = match cursor {
                 None => true,
                 Some(c) if c < TIMESTAMP_CURSOR_MIN => seq >= c,
-                Some(c) => witnessed_us(seq) >= c,
+                Some(c) => event_witnessed_us(event) >= c,
             };
             let retained = floor.is_none_or(|floor| seq >= floor);
             let is_commit = event["$type"]
@@ -463,6 +487,9 @@ async fn v2_subscribe(
             .is_some_and(|(name, _)| name == "FutureCursor")
         {
             params.retain(|(k, _)| k != "cursor");
+            if let Some(tip) = inner.tip {
+                params.push(("cursor".to_string(), tip.to_string()));
+            }
         }
         let mut frames: Vec<String> = Vec::new();
         if let Some((name, message)) = notice {
