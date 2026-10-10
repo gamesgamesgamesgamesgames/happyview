@@ -10,6 +10,7 @@ pub mod library;
 pub mod loader;
 pub mod memory;
 pub mod official_registry;
+pub mod registry_source;
 mod runtime;
 pub mod secrets;
 mod types;

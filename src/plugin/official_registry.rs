@@ -1,4 +1,10 @@
-//! Cache of plugins discovered from the official `happyview-plugins` repo.
+//! The plugin catalogue cache.
+//!
+//! Filled from an AT Protocol registry where one is configured (see
+//! [`registry_source`](super::registry_source)), and from walking
+//! [`OFFICIAL_REPO`]'s GitHub releases otherwise. The GitHub walk is the
+//! fallback rather than the source: it can only ever describe one org's
+//! plugins.
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -6,7 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-pub const OFFICIAL_REPO: &str = "gamesgamesgamesgamesgames/happyview-plugins";
+/// The repo the GitHub fallback reads. Only a fallback: the catalogue comes
+/// from the registry, and this answers while the registry has nothing to say.
+pub const OFFICIAL_REPO: &str = "happyproto/plugins";
 
 /// A release entry for the update preview UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,16 +104,45 @@ use crate::plugin::loader;
 
 #[derive(Debug, Clone)]
 pub struct RegistryConfig {
+    /// The registry to read the catalogue from. `None` leaves only the GitHub
+    /// fallback, which is what a test wanting deterministic output passes.
+    pub registry: Option<super::registry_source::RegistrySource>,
     /// Base URL for the GitHub REST API, e.g. `https://api.github.com`.
     pub api_base: String,
     /// Base URL for release asset downloads, e.g.
-    /// `https://github.com/gamesgamesgamesgamesgames/happyview-plugins/releases/download`.
+    /// `https://github.com/happyproto/plugins/releases/download`.
     pub release_base: String,
 }
 
 impl RegistryConfig {
+    /// Apply `PLUGIN_REGISTRY_URL`: a URL points the catalogue at that
+    /// registry, and an empty value turns it off, leaving only the GitHub
+    /// fallback. Read here rather than in [`Self::production`] because
+    /// `production` backs test fixtures, which should not depend on the
+    /// environment.
+    pub fn with_registry_from_env(mut self) -> Self {
+        let Ok(configured) = std::env::var("PLUGIN_REGISTRY_URL") else {
+            return self;
+        };
+        let configured = configured.trim();
+        self.registry = if configured.is_empty() {
+            tracing::info!(
+                "official_registry: PLUGIN_REGISTRY_URL is empty, reading the catalogue \
+                 from {OFFICIAL_REPO} only"
+            );
+            None
+        } else {
+            Some(super::registry_source::RegistrySource {
+                base_url: configured.to_string(),
+                ..super::registry_source::RegistrySource::production()
+            })
+        };
+        self
+    }
+
     pub fn production() -> Self {
         Self {
+            registry: Some(super::registry_source::RegistrySource::production()),
             api_base: "https://api.github.com".into(),
             release_base: format!("https://github.com/{}/releases/download", OFFICIAL_REPO),
         }
@@ -197,6 +234,32 @@ pub async fn refresh_full(
     config: &RegistryConfig,
     state: &SharedRegistry,
 ) -> Result<(), RegistryError> {
+    // The registry describes whatever anyone published; the GitHub walk
+    // describes one org's releases. Prefer the registry, and fall back only
+    // when it has nothing to offer -- an empty catalogue would otherwise
+    // replace a working plugin list with no plugin list, which is worse than
+    // the staleness the fallback carries.
+    if let Some(source) = &config.registry {
+        match super::registry_source::fetch_catalogue(client, source).await {
+            Ok(plugins) if !plugins.is_empty() => {
+                let count = plugins.len();
+                let mut guard = state.write().await;
+                guard.plugins = plugins.into_iter().map(|p| (p.id.clone(), p)).collect();
+                guard.last_refreshed_at = Some(crate::db::now_rfc3339());
+                tracing::info!(count, "official_registry: catalogue read from the registry");
+                return Ok(());
+            }
+            Ok(_) => tracing::info!(
+                "official_registry: the registry listed no installable package, \
+                 falling back to {OFFICIAL_REPO}"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "official_registry: registry unreadable, falling back to {OFFICIAL_REPO}"
+            ),
+        }
+    }
+
     let releases = fetch_releases(client, config).await?;
     let grouped = group_releases(releases);
 
@@ -255,6 +318,7 @@ pub fn spawn_refresh_task(client: reqwest::Client, config: RegistryConfig, state
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn make_release(tag: &str) -> GithubRelease {
         GithubRelease {
@@ -344,14 +408,61 @@ mod tests {
         })
     }
 
+    /// An operator can point the catalogue at their own registry, or turn it
+    /// off entirely and keep only the GitHub fallback. Serial, because it
+    /// moves process environment.
+    #[test]
+    #[serial]
+    fn plugin_registry_url_redirects_or_disables_the_registry() {
+        // SAFETY: `#[serial]` keeps this off every other env reader.
+        unsafe {
+            std::env::remove_var("PLUGIN_REGISTRY_URL");
+        }
+        assert_eq!(
+            RegistryConfig::production()
+                .with_registry_from_env()
+                .registry
+                .map(|r| r.base_url)
+                .as_deref(),
+            Some("https://api.happyproto.at"),
+            "unset should leave the default registry"
+        );
+
+        unsafe {
+            std::env::set_var("PLUGIN_REGISTRY_URL", "  https://registry.example.com  ");
+        }
+        assert_eq!(
+            RegistryConfig::production()
+                .with_registry_from_env()
+                .registry
+                .map(|r| r.base_url)
+                .as_deref(),
+            Some("https://registry.example.com"),
+            "a configured url should be used, trimmed"
+        );
+
+        unsafe {
+            std::env::set_var("PLUGIN_REGISTRY_URL", "");
+        }
+        assert!(
+            RegistryConfig::production()
+                .with_registry_from_env()
+                .registry
+                .is_none(),
+            "an empty value should leave only the GitHub fallback"
+        );
+
+        unsafe {
+            std::env::remove_var("PLUGIN_REGISTRY_URL");
+        }
+    }
+
     #[tokio::test]
     async fn refresh_full_populates_cache_from_mock_github() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path(
-                "/repos/gamesgamesgamesgamesgames/happyview-plugins/releases",
-            ))
+            .and(path("/repos/happyproto/plugins/releases"))
             .and(query_param("per_page", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 gh_release_json("steam-v1.2.0", "- steam 1.2.0 notes"),
@@ -378,6 +489,8 @@ mod tests {
         let state: SharedRegistry = Arc::new(RwLock::new(OfficialRegistryState::default()));
 
         let config = RegistryConfig {
+            // The GitHub fallback, deterministically.
+            registry: None,
             api_base: server.uri(),
             release_base: format!("{}/download", server.uri()),
         };
@@ -404,9 +517,7 @@ mod tests {
     async fn refresh_full_retains_previous_cache_on_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path(
-                "/repos/gamesgamesgamesgamesgames/happyview-plugins/releases",
-            ))
+            .and(path("/repos/happyproto/plugins/releases"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
@@ -429,6 +540,8 @@ mod tests {
         }));
 
         let config = RegistryConfig {
+            // The GitHub fallback, deterministically.
+            registry: None,
             api_base: server.uri(),
             release_base: format!("{}/download", server.uri()),
         };
