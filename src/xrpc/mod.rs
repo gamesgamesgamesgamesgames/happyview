@@ -18,6 +18,23 @@ use crate::lexicon::LexiconType;
 use crate::rate_limit::CheckResult;
 use crate::resolve::resolve_nsid_authority;
 
+/// Decode one query-string component.
+///
+/// A query string is form-urlencoded, which the URL standard requires of the
+/// query and which `URLSearchParams`, a browser `fetch` and most HTTP clients
+/// all produce -- so a space arrives as `+`, not `%20`. Percent-decoding alone
+/// left it as a literal plus, and a search for `Integration Demo` therefore
+/// looked for `Integration+Demo` and matched nothing.
+///
+/// The replacement runs first and a real plus survives it: `a+b` is read as
+/// `a b`, while an encoded one is `a%2Bb`, carries no plus to replace, and
+/// percent-decodes to `a+b` afterwards.
+fn decode_component(raw: &str) -> String {
+    urlencoding::decode(&raw.replace('+', " "))
+        .unwrap_or_default()
+        .into_owned()
+}
+
 /// Parse a raw query string into a map where repeated keys become JSON arrays.
 /// Single-value keys remain as JSON strings for backward compatibility.
 pub(crate) fn parse_query_params(query: &str) -> HashMap<String, Value> {
@@ -27,14 +44,8 @@ pub(crate) fn parse_query_params(query: &str) -> HashMap<String, Value> {
             continue;
         }
         let (key, value) = match pair.split_once('=') {
-            Some((k, v)) => (
-                urlencoding::decode(k).unwrap_or_default().into_owned(),
-                urlencoding::decode(v).unwrap_or_default().into_owned(),
-            ),
-            None => (
-                urlencoding::decode(pair).unwrap_or_default().into_owned(),
-                String::new(),
-            ),
+            Some((k, v)) => (decode_component(k), decode_component(v)),
+            None => (decode_component(pair), String::new()),
         };
         multi.entry(key).or_default().push(value);
     }
@@ -804,6 +815,26 @@ mod tests {
         assert_eq!(arr[0], "a");
         assert_eq!(arr[1], "b");
         assert_eq!(arr[2], "c");
+    }
+
+    /// A space reaches us as `+`, because that is what form-urlencoding --
+    /// and therefore `URLSearchParams` and every browser `fetch` -- sends. A
+    /// plus that was meant literally arrives as `%2B` and must survive.
+    #[test]
+    fn parse_query_params_reads_plus_as_a_space() {
+        let params = parse_query_params("q=Integration+Demo&tag=c%2B%2B&both=a+b%2Bc");
+
+        assert_eq!(params["q"], json!("Integration Demo"));
+        assert_eq!(params["tag"], json!("c++"));
+        assert_eq!(params["both"], json!("a b+c"));
+    }
+
+    /// Keys are form-urlencoded too.
+    #[test]
+    fn parse_query_params_reads_plus_in_a_key() {
+        let params = parse_query_params("a+key=value");
+
+        assert_eq!(params["a key"], json!("value"));
     }
 
     #[test]
