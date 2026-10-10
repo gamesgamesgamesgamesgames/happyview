@@ -139,6 +139,7 @@ path = "tests/lua_differential.rs"
 required-features = ["lua-reference"]
 
 [dev-dependencies]
+axum = { version = "0.8", features = ["multipart", "ws"] }
 wiremock = "0.6"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

@@ -1,200 +1,220 @@
+//! The Jetstream consumer.
+//!
+//! One task reads the websocket and hands each event to the worker that owns
+//! its DID (`workers`), which applies it (`apply`). The cursor saved is the
+//! applied watermark (`watermark`, `cursor`), never the last frame read, so a
+//! crash re-delivers events rather than skipping them. The v2
+//! `subscribeEvents` stream is preferred, zstd-compressed with the server's
+//! dictionary (`compression`).
+
 pub mod apply;
 pub mod compression;
 pub mod config;
 pub mod cursor;
 pub mod event;
+pub mod status;
 pub mod watermark;
 pub mod workers;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use futures_util::StreamExt;
-use serde::Deserialize;
-use serde_json::Value;
-use sqlx::AnyPool;
-use tokio::sync::{Semaphore, watch};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::AppState;
-use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
-use crate::record_handler::{self, LEXICON_SCHEMA_COLLECTION, RecordEvent, RecordOutcome};
+use config::{Protocol, ProtocolChoice, Settings};
+use event::{CursorPoint, Frame};
+use watermark::WatermarkHandle;
+use workers::{Job, RetryPolicy, WorkerPool};
 
-// ---------------------------------------------------------------------------
-// Jetstream event types
-// ---------------------------------------------------------------------------
+const MIN_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// The cursor is saved after this many events or `FLUSH_INTERVAL`, whichever
+/// comes first, and when a session ends.
+const FLUSH_EVERY_EVENTS: u64 = 1000;
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// Events each worker may have queued before reading the socket waits.
+const WORKER_QUEUE_CAPACITY: usize = 512;
+/// How long a session waits for its in-flight events before reconnecting
+/// anyway. The cursor then stops before them, so they are re-delivered.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Deserialize)]
-struct JetstreamEvent {
-    #[serde(rename = "kind")]
-    event_type: String,
-    did: String,
-    time_us: i64,
-    commit: Option<CommitEvent>,
-    identity: Option<IdentityEvent>,
+/// Start the consumer with settings from the environment.
+pub fn spawn(state: AppState, collections_rx: watch::Receiver<Vec<String>>) -> JoinHandle<()> {
+    let settings = Settings::from_env(&state.config.jetstream_url);
+    spawn_with(state, collections_rx, settings)
 }
 
-#[derive(Deserialize)]
-struct CommitEvent {
-    #[serde(default)]
-    rev: Option<String>,
-    operation: String,
-    collection: String,
-    rkey: String,
-    record: Option<Value>,
-    cid: Option<String>,
+pub fn spawn_with(
+    state: AppState,
+    collections_rx: watch::Receiver<Vec<String>>,
+    settings: Settings,
+) -> JoinHandle<()> {
+    tokio::spawn(run(state, collections_rx, settings))
 }
 
-#[derive(Deserialize)]
-struct IdentityEvent {
-    did: String,
-    handle: Option<String>,
+/// Connection state carried across reconnects.
+struct Session {
+    protocol: Protocol,
+    compression: bool,
+    dictionary: Option<Arc<compression::Dictionary>>,
 }
 
-// ---------------------------------------------------------------------------
-// Cursor persistence
-// ---------------------------------------------------------------------------
-
-async fn load_cursor(db: &AnyPool, backend: DatabaseBackend) -> Option<i64> {
-    let sql = adapt_sql(
-        "SELECT value FROM happyview_instance_settings WHERE key = ?",
-        backend,
-    );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
-        .bind("jetstream_cursor")
-        .fetch_optional(db)
-        .await
-        .ok()?;
-    row.and_then(|(v,)| v.parse::<i64>().ok())
-}
-
-async fn save_cursor(db: &AnyPool, backend: DatabaseBackend, cursor: i64) {
-    let now = now_rfc3339();
-    let sql = adapt_sql(
-        r#"
-        INSERT INTO happyview_instance_settings (key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?
-        "#,
-        backend,
-    );
-    if let Err(e) = crate::db::query(&sql)
-        .bind("jetstream_cursor")
-        .bind(cursor.to_string())
-        .bind(&now)
-        .bind(cursor.to_string())
-        .bind(&now)
-        .execute(db)
-        .await
-    {
-        tracing::warn!("failed to save jetstream cursor: {e}");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// URL builder
-// ---------------------------------------------------------------------------
-
-fn build_subscribe_url(base_url: &str, collections: &[String]) -> String {
-    let base = base_url.trim_end_matches('/');
-    let mut url = format!("{base}/subscribe?compress=false");
-
-    let mut has_lexicon_schema = false;
-    for col in collections {
-        url.push_str(&format!("&wantedCollections={col}"));
-        if col == LEXICON_SCHEMA_COLLECTION {
-            has_lexicon_schema = true;
+impl Session {
+    fn new(settings: &Settings) -> Self {
+        Self {
+            protocol: match settings.protocol {
+                ProtocolChoice::V1 => Protocol::V1,
+                ProtocolChoice::Auto | ProtocolChoice::V2 => Protocol::V2,
+            },
+            compression: settings.compression,
+            dictionary: None,
         }
     }
-
-    if !has_lexicon_schema {
-        url.push_str(&format!("&wantedCollections={LEXICON_SCHEMA_COLLECTION}"));
-    }
-
-    url
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Spawn a background task that connects to Jetstream's WebSocket stream and
-/// processes record + identity events. Uses exponential backoff on disconnects.
-pub fn spawn(state: AppState, mut collections_rx: watch::Receiver<Vec<String>>) {
-    tokio::spawn(async move {
-        let mut backoff = Duration::from_secs(2);
-        let max_backoff = Duration::from_secs(60);
-
-        loop {
-            match run(&state, &mut collections_rx).await {
-                Ok(()) => {
-                    // Clean reconnect (collection change) — reset backoff.
-                    backoff = Duration::from_secs(2);
-                    tracing::info!("jetstream reconnecting due to collection change");
-                }
-                Err(e) => {
-                    tracing::warn!("jetstream disconnected: {e}");
-                    tracing::info!(
-                        backoff_secs = backoff.as_secs(),
-                        "reconnecting to jetstream after backoff"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(max_backoff);
-                }
-            }
-        }
-    });
+enum SessionEnd {
+    CollectionsChanged,
+    Closed { delivered: bool },
 }
 
-// ---------------------------------------------------------------------------
-// Connection loop
-// ---------------------------------------------------------------------------
+/// Why the read loop stopped.
+enum Ended {
+    CollectionsChanged,
+    Closed(String),
+}
 
 async fn run(
+    state: AppState,
+    mut collections_rx: watch::Receiver<Vec<String>>,
+    settings: Settings,
+) {
+    // One pool and one watermark for the consumer's life, so a DID's events
+    // stay in order across reconnects.
+    let watermark = Arc::new(WatermarkHandle::new());
+    let pool = WorkerPool::spawn(
+        settings.workers,
+        WORKER_QUEUE_CAPACITY,
+        apply::apply_fn(state.clone(), collections_rx.clone()),
+        Arc::clone(&watermark),
+        RetryPolicy::default(),
+        apply::give_up_fn(state.clone()),
+    );
+    status::set_worker_depths(pool.depth_counters());
+
+    let mut session = Session::new(&settings);
+    let mut backoff = MIN_BACKOFF;
+    loop {
+        let end = run_session(
+            &state,
+            &mut collections_rx,
+            &settings,
+            &mut session,
+            &pool,
+            &watermark,
+        )
+        .await;
+        status::disconnected();
+        match end {
+            SessionEnd::CollectionsChanged => backoff = MIN_BACKOFF,
+            SessionEnd::Closed { delivered } => {
+                if delivered {
+                    backoff = MIN_BACKOFF;
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+/// One connection: subscribe, read until it ends, drain the workers, save
+/// the cursor.
+async fn run_session(
     state: &AppState,
     collections_rx: &mut watch::Receiver<Vec<String>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    settings: &Settings,
+    session: &mut Session,
+    pool: &WorkerPool,
+    watermark: &WatermarkHandle,
+) -> SessionEnd {
     let db = &state.db;
     let backend = state.db_backend;
+    let host = settings.endpoint.host.as_str();
+    let protocol = session.protocol;
+    let collections = collections_rx.borrow_and_update().clone();
 
-    // Build subscribe URL with current collections.
-    let collections = collections_rx.borrow().clone();
-    let url = build_subscribe_url(&state.config.jetstream_url, &collections);
-
-    // Load cursor from DB; skip if older than 72 hours.
-    let cursor = load_cursor(db, backend).await;
-    let subscribe_url = if let Some(c) = cursor {
-        let now_us = chrono::Utc::now().timestamp_micros();
-        let age_hours = (now_us - c) as f64 / 3_600_000_000.0;
-        if age_hours > 72.0 {
-            tracing::warn!(
-                cursor = c,
-                age_hours = age_hours,
-                "jetstream cursor is older than 72 hours, skipping it"
-            );
-            url
-        } else {
-            format!("{url}&cursor={c}")
+    let stored = match cursor::load(db, backend).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load the jetstream cursor");
+            return SessionEnd::Closed { delivered: false };
         }
-    } else {
-        url
+    };
+    let resume = cursor::resume_cursor(&stored, host, protocol);
+
+    if protocol == Protocol::V2 && session.compression && session.dictionary.is_none() {
+        match compression::fetch_dictionary(
+            &state.http,
+            &config::dictionary_url(&settings.endpoint),
+        )
+        .await
+        {
+            Ok(dictionary) => session.dictionary = Some(Arc::new(dictionary)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not fetch the jetstream zstd dictionary; subscribing uncompressed"
+                );
+                session.compression = false;
+            }
+        }
+    }
+    let dictionary = match protocol {
+        Protocol::V2 if session.compression => session.dictionary.clone(),
+        _ => None,
+    };
+    let dictionary_id = dictionary.as_ref().map(|d| d.id);
+    let url = match protocol {
+        Protocol::V2 => config::v2_url(&settings.endpoint, &collections, resume, dictionary_id),
+        Protocol::V1 => config::v1_url(&settings.endpoint, &collections, resume),
     };
 
-    tracing::info!(url = %subscribe_url, "connecting to jetstream");
-
-    let (ws, _): (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        _,
-    ) = tokio::time::timeout(
-        Duration::from_secs(15),
-        tokio_tungstenite::connect_async(&subscribe_url),
+    tracing::info!(%url, protocol = protocol.as_str(), "connecting to jetstream");
+    let ws = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(url.as_str()),
     )
     .await
-    .map_err(|_| "jetstream websocket connection timed out after 15s")??;
+    {
+        Ok(Ok((ws, _))) => ws,
+        Ok(Err(tungstenite::Error::Http(response))) => {
+            let status = response.status().as_u16();
+            let body = String::from_utf8_lossy(response.body().as_deref().unwrap_or_default())
+                .into_owned();
+            tracing::warn!(status, %body, "jetstream refused the subscription");
+            return SessionEnd::Closed { delivered: false };
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "jetstream connection failed");
+            return SessionEnd::Closed { delivered: false };
+        }
+        Err(_) => {
+            tracing::warn!(
+                "jetstream connection timed out after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            );
+            return SessionEnd::Closed { delivered: false };
+        }
+    };
 
+    status::connected(protocol, host, dictionary_id);
     log_event(
         db,
         EventLog {
@@ -202,314 +222,155 @@ async fn run(
             severity: Severity::Info,
             actor_did: None,
             subject: None,
-            detail: serde_json::json!({ "url": subscribe_url }),
+            detail: serde_json::json!({
+                "url": url,
+                "protocol": protocol.as_str(),
+                "compression": dictionary_id.is_some(),
+                "dictionary_id": dictionary_id,
+            }),
         },
         backend,
     )
     .await;
 
     let (_write, mut read) = ws.split();
+    // A seq cursor is inclusive, so the event at it was applied already.
+    let mut floor = match (protocol, resume) {
+        (Protocol::V2, Some(c)) if c < cursor::TIMESTAMP_CURSOR_MIN => Some(c),
+        _ => None,
+    };
+    let mut delivered = false;
+    let mut since_flush: u64 = 0;
+    let mut last_saved: Option<CursorPoint> = None;
+    let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut collections_changed = std::pin::pin!(async {
+        if collections_rx.changed().await.is_err() {
+            // The sender is gone, so the filter can never change again.
+            std::future::pending::<()>().await;
+        }
+    });
 
-    let semaphore = Arc::new(Semaphore::new(50));
-
-    // Cursor batching state: save every 1000 events or 5 seconds.
-    let mut latest_cursor: Option<i64> = cursor;
-    let mut events_since_flush: u64 = 0;
-    let mut last_flush = Instant::now();
-    let flush_interval = Duration::from_secs(5);
-    const FLUSH_EVENT_THRESHOLD: u64 = 1000;
-
-    loop {
+    let ended = loop {
         tokio::select! {
-            msg = read.next() => {
-                let msg = match msg {
-                    Some(Ok(m)) => m,
-                    Some(Err(e)) => {
-                        tracing::warn!("jetstream websocket read error: {e}");
-                        // Flush cursor before returning error.
-                        if let Some(c) = latest_cursor {
-                            save_cursor(db, backend, c).await;
+            message = read.next() => {
+                let message = match message {
+                    Some(Ok(message)) => message,
+                    Some(Err(e)) => break Ended::Closed(e.to_string()),
+                    None => break Ended::Closed("connection closed".to_string()),
+                };
+                let text = match message {
+                    Message::Text(text) => text.as_str().to_owned(),
+                    Message::Binary(frame) => match dictionary.as_deref() {
+                        Some(dictionary) => match dictionary.decode(&frame) {
+                            Ok(text) => text,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "skipping an undecodable jetstream frame");
+                                continue;
+                            }
+                        },
+                        None => {
+                            tracing::debug!("ignoring a binary frame on an uncompressed subscription");
+                            continue;
                         }
-                        log_event(
-                            db,
-                            EventLog {
-                                event_type: "jetstream.disconnected".to_string(),
-                                severity: Severity::Warn,
-                                actor_did: None,
-                                subject: None,
-                                detail: serde_json::json!({ "reason": e.to_string() }),
-                            },
-                            backend,
-                        )
-                        .await;
-                        return Err(e.into());
-                    }
-                    None => {
-                        tracing::info!("jetstream websocket stream ended");
-                        break;
-                    }
+                    },
+                    Message::Close(_) => break Ended::Closed("close frame".to_string()),
+                    _ => continue,
                 };
-
-                let text = match msg {
-                    Message::Text(t) => t,
-                    Message::Close(_) => {
-                        tracing::info!("jetstream websocket received close frame");
-                        break;
-                    }
-                    other => {
-                        tracing::debug!(msg_type = ?other, "ignoring non-text websocket message");
-                        continue;
-                    }
+                let frame = match protocol {
+                    Protocol::V2 => event::parse_v2(&text),
+                    Protocol::V1 => event::parse_v1(&text),
                 };
-
-                let event: JetstreamEvent = match serde_json::from_str(&text) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::warn!("skipping unparseable jetstream event: {e}");
-                        continue;
-                    }
-                };
-
-                state
-                    .telemetry_counters
-                    .jetstream_received
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                // Update cursor tracking.
-                latest_cursor = Some(event.time_us);
-                events_since_flush += 1;
-
-                match event.event_type.as_str() {
-                    "commit" => {
-                        if let Some(commit) = event.commit {
-                            tracing::debug!(
-                                operation = %commit.operation,
-                                collection = %commit.collection,
-                                did = %event.did,
-                                rkey = %commit.rkey,
-                                "received commit event from jetstream"
-                            );
-
-                            let record_event = RecordEvent {
-                                did: event.did.clone(),
-                                collection: commit.collection,
-                                rkey: commit.rkey,
-                                action: commit.operation,
-                                record: commit.record,
-                                cid: commit.cid,
-                                rev: commit.rev,
-                            };
-
-                            let sem = semaphore.clone();
-                            let state = state.clone();
-                            tokio::spawn(async move {
-                                let _permit = sem.acquire().await.unwrap();
-                                let outcome =
-                                    record_handler::handle_record_event(&state, &record_event)
-                                        .await;
-
-                                match outcome {
-                                    RecordOutcome::Matched => {
-                                        state
-                                            .telemetry_counters
-                                            .jetstream_matched
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    RecordOutcome::Skipped => {
-                                        state
-                                            .telemetry_counters
-                                            .jetstream_skipped
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    RecordOutcome::SchemaEvent
-                                    | RecordOutcome::Errored
-                                    | RecordOutcome::Unavailable
-                                    | RecordOutcome::Invalid => {}
-                                }
-                            });
+                match frame {
+                    Ok(Frame::Event(event)) => {
+                        state
+                            .telemetry_counters
+                            .jetstream_received
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Some(seq) = event.cursor.seq() {
+                            if floor.is_some_and(|floor| seq <= floor) {
+                                continue;
+                            }
+                            floor = Some(seq);
+                        }
+                        delivered = true;
+                        let ticket = watermark.begin(event.cursor);
+                        pool.dispatch(Job { ticket, event }).await;
+                        since_flush += 1;
+                        if since_flush >= FLUSH_EVERY_EVENTS {
+                            flush(state, host, watermark, &mut last_saved).await;
+                            since_flush = 0;
                         }
                     }
-                    "identity" => {
-                        if let Some(identity) = event.identity {
-                            tracing::debug!(
-                                did = %identity.did,
-                                handle = ?identity.handle,
-                                "received identity event from jetstream"
-                            );
-                        }
+                    Ok(Frame::Info { name, message }) => {
+                        tracing::info!(name, ?message, "jetstream notice");
                     }
-                    "account" => {
-                        tracing::debug!(
-                            did = %event.did,
-                            "received account event from jetstream (ignored)"
-                        );
+                    Ok(Frame::Error { error, message }) => {
+                        break Ended::Closed(format!("{error}: {}", message.unwrap_or_default()));
                     }
-                    other => {
-                        tracing::debug!(event_type = %other, "unknown jetstream event type");
-                    }
-                }
-
-                // Flush cursor periodically.
-                if (events_since_flush >= FLUSH_EVENT_THRESHOLD
-                    || last_flush.elapsed() >= flush_interval)
-                    && let Some(c) = latest_cursor
-                {
-                    save_cursor(db, backend, c).await;
-                    events_since_flush = 0;
-                    last_flush = Instant::now();
+                    Ok(Frame::Skip) => {}
+                    Err(e) => tracing::warn!(error = %e, "skipping an unparseable jetstream frame"),
                 }
             }
-            _ = collections_rx.changed() => {
-                let new_collections = collections_rx.borrow_and_update().clone();
-                tracing::info!(?new_collections, "collection filter changed, reconnecting to jetstream");
-
-                // Flush cursor before reconnecting.
-                if let Some(c) = latest_cursor {
-                    save_cursor(db, backend, c).await;
-                }
-
-                return Ok(());
+            _ = ticker.tick() => {
+                flush(state, host, watermark, &mut last_saved).await;
+                since_flush = 0;
             }
+            _ = &mut collections_changed => break Ended::CollectionsChanged,
+        }
+    };
+
+    if tokio::time::timeout(DRAIN_TIMEOUT, watermark.wait_idle())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            in_flight = watermark.in_flight(),
+            "jetstream events still applying; the saved cursor stops before them"
+        );
+    }
+    flush(state, host, watermark, &mut last_saved).await;
+
+    match ended {
+        Ended::CollectionsChanged => {
+            tracing::info!("collection filter changed, reconnecting to jetstream");
+            SessionEnd::CollectionsChanged
+        }
+        Ended::Closed(reason) => {
+            tracing::warn!(%reason, "jetstream disconnected");
+            log_event(
+                db,
+                EventLog {
+                    event_type: "jetstream.disconnected".to_string(),
+                    severity: Severity::Warn,
+                    actor_did: None,
+                    subject: None,
+                    detail: serde_json::json!({ "reason": reason }),
+                },
+                backend,
+            )
+            .await;
+            SessionEnd::Closed { delivered }
         }
     }
-
-    // Stream ended cleanly — flush cursor and log disconnect.
-    if let Some(c) = latest_cursor {
-        save_cursor(db, backend, c).await;
-    }
-
-    log_event(
-        db,
-        EventLog {
-            event_type: "jetstream.disconnected".to_string(),
-            severity: Severity::Warn,
-            actor_did: None,
-            subject: None,
-            detail: serde_json::json!({ "reason": "connection closed" }),
-        },
-        backend,
-    )
-    .await;
-
-    Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_build_subscribe_url_basic() {
-        let url = build_subscribe_url(
-            "https://jetstream.example.com",
-            &["app.bsky.feed.post".to_string()],
-        );
-        assert!(url.starts_with("https://jetstream.example.com/subscribe?compress=false"));
-        assert!(url.contains("&wantedCollections=app.bsky.feed.post"));
-        assert!(url.contains(&format!("&wantedCollections={LEXICON_SCHEMA_COLLECTION}")));
+/// Save the applied watermark when it moved.
+async fn flush(
+    state: &AppState,
+    host: &str,
+    watermark: &WatermarkHandle,
+    last_saved: &mut Option<CursorPoint>,
+) {
+    let Some(point) = watermark.applied() else {
+        return;
+    };
+    status::applied(&point);
+    if *last_saved == Some(point) {
+        return;
     }
-
-    #[test]
-    fn test_build_subscribe_url_strips_trailing_slash() {
-        let url = build_subscribe_url(
-            "https://jetstream.example.com/",
-            &["app.bsky.feed.post".to_string()],
-        );
-        assert!(url.starts_with("https://jetstream.example.com/subscribe"));
-        assert!(!url.contains("//subscribe"));
-    }
-
-    #[test]
-    fn test_build_subscribe_url_does_not_duplicate_lexicon_schema() {
-        let url = build_subscribe_url(
-            "https://jetstream.example.com",
-            &[
-                "app.bsky.feed.post".to_string(),
-                LEXICON_SCHEMA_COLLECTION.to_string(),
-            ],
-        );
-        let count = url.matches(LEXICON_SCHEMA_COLLECTION).count();
-        assert_eq!(
-            count, 1,
-            "lexicon schema collection should appear exactly once"
-        );
-    }
-
-    #[test]
-    fn test_build_subscribe_url_empty_collections() {
-        let url = build_subscribe_url("https://jetstream.example.com", &[]);
-        assert!(url.contains(&format!("&wantedCollections={LEXICON_SCHEMA_COLLECTION}")));
-    }
-
-    #[test]
-    fn test_deserialize_commit_event() {
-        let json = r#"{
-            "kind": "commit",
-            "did": "did:plc:abc123",
-            "time_us": 1700000000000000,
-            "commit": {
-                "operation": "create",
-                "collection": "app.bsky.feed.post",
-                "rkey": "3k2y6e7wh4k2a",
-                "record": {"text": "hello world", "$type": "app.bsky.feed.post"},
-                "cid": "bafyreiabc123"
-            }
-        }"#;
-
-        let event: JetstreamEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.event_type, "commit");
-        assert_eq!(event.did, "did:plc:abc123");
-        assert_eq!(event.time_us, 1700000000000000);
-
-        let commit = event.commit.unwrap();
-        assert_eq!(commit.operation, "create");
-        assert_eq!(commit.collection, "app.bsky.feed.post");
-        assert_eq!(commit.rkey, "3k2y6e7wh4k2a");
-        assert!(commit.record.is_some());
-        assert_eq!(commit.cid.as_deref(), Some("bafyreiabc123"));
-    }
-
-    #[test]
-    fn test_deserialize_identity_event() {
-        let json = r#"{
-            "kind": "identity",
-            "did": "did:plc:abc123",
-            "time_us": 1700000000000000,
-            "identity": {
-                "did": "did:plc:abc123",
-                "handle": "alice.bsky.social"
-            }
-        }"#;
-
-        let event: JetstreamEvent = serde_json::from_str(json).unwrap();
-        assert_eq!(event.event_type, "identity");
-
-        let identity = event.identity.unwrap();
-        assert_eq!(identity.did, "did:plc:abc123");
-        assert_eq!(identity.handle.as_deref(), Some("alice.bsky.social"));
-    }
-
-    #[test]
-    fn test_deserialize_delete_commit_no_record() {
-        let json = r#"{
-            "kind": "commit",
-            "did": "did:plc:abc123",
-            "time_us": 1700000000000000,
-            "commit": {
-                "operation": "delete",
-                "collection": "app.bsky.feed.post",
-                "rkey": "3k2y6e7wh4k2a"
-            }
-        }"#;
-
-        let event: JetstreamEvent = serde_json::from_str(json).unwrap();
-        let commit = event.commit.unwrap();
-        assert_eq!(commit.operation, "delete");
-        assert!(commit.record.is_none());
-        assert!(commit.cid.is_none());
+    match cursor::save(&state.db, state.db_backend, host, &point).await {
+        Ok(()) => *last_saved = Some(point),
+        Err(e) => tracing::warn!(error = %e, "failed to save the jetstream cursor"),
     }
 }
