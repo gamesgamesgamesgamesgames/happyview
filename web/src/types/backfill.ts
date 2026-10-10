@@ -14,6 +14,12 @@ export interface BackfillJob {
   completed_at: string | null
   created_at: string
   error_counts?: Record<string, number>
+  // False while a network job is still listing repos from the relay; until
+  // then `total_repos` counts the repos discovered so far.
+  discovery_complete?: boolean
+  // Set for jobs on the bounded queue: how many recent completions the
+  // `fetched` repo list keeps. Null for jobs created before it.
+  recent_completions_limit?: number | null
 }
 
 export interface BackfillRepoEntry {
@@ -53,6 +59,7 @@ export interface BackfillEvent {
   status?: string
   error?: string | null
   error_counts?: Record<string, number>
+  discovery_complete?: boolean
 }
 
 export interface BlueskyProfile {

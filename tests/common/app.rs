@@ -165,6 +165,9 @@ impl TestApp {
             lexicons,
             collections_tx,
             labeler_subscriptions_tx,
+            labeler_subscription_cache: std::sync::Arc::new(
+                happyview::labeler::SubscriptionCache::default(),
+            ),
             rate_limiter: happyview::rate_limit::RateLimiter::new(
                 happyview::rate_limit::RateLimitDefaults {
                     query_cost: 1,

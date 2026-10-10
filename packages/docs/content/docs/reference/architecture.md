@@ -157,29 +157,30 @@ sequenceDiagram
     A->>H: POST /admin/backfill
     H->>D: Create backfill_jobs record (status = running)
 
-    rect rgb(240, 248, 255)
-    note over H,Relay: Phase 1: Discovery
-    H->>Relay: listReposByCollection (paginated)
-    Relay-->>H: List of DIDs
-    H->>D: Insert backfill_repos rows
-    end
-
     rect rgb(240, 255, 240)
-    note over H,PDS: Phase 2: Pipelined resolve + fetch (concurrent)
-    par Resolver task
-        loop Unresolved DIDs
+    note over H,PDS: Discovery, resolution and fetching run concurrently
+    par Discovery (network backfills)
+        loop Each collection, while the queue has room
+            H->>Relay: listReposByCollection (one page)
+            Relay-->>H: DIDs
+            H->>D: Queue (did, collection) units, save the relay cursor
+        end
+    and Resolver task
+        loop Unresolved units
             H->>PLC: Resolve DID document
             PLC-->>H: PDS endpoint
-            H->>D: Update backfill_repos.pds_endpoint
+            H->>D: Record the unit's PDS
         end
     and Fetcher task
-        loop Resolved DIDs (as they arrive)
-            H->>PDS: listRecords (paginated)
+        loop Resolved units (as they arrive)
+            H->>PDS: listRecords for the unit's collection (paginated)
             PDS-->>H: Records
-            H->>D: UPSERT each record
+            H->>D: UPSERT each page
+            H->>D: Delete the completed unit, bump counters
         end
     end
     end
+    Note over H,D: At most BACKFILL_DISCOVERY_WINDOW units are queued per job
 
     H->>D: Mark job completed (or failed)
 ```
@@ -196,7 +197,7 @@ sequenceDiagram
 | `rkey`       | text        | Record key                          |
 | `record`     | jsonb       | Record value                        |
 | `cid`        | text        | Content identifier                  |
-| `indexed_at` | timestamptz | When HappyView indexed this record  |
+| `indexed_at` | timestamptz | When HappyView indexed this version of the record. Redelivering an identical record (same CID and body) keeps the original value. A local write that Jetstream will echo back (an XRPC procedure, a `happyview.record` mirror, a linked-repo write) stores `NULL`, on insert and on update, until the echo stamps it. A plugin's direct local-index write gets no echo, so an update through it keeps the existing value |
 
 ### `lexicons`
 
@@ -491,9 +492,9 @@ sequenceDiagram
 | `did`             | text        | Target DID (null = all)                                  |
 | `status`          | text        | pending, running, pausing, paused, cancelling, cancelled, completed, failed |
 | `stage`           | text        | pending, discovering_repos, resolving_and_fetching, completed, failed, cancelled |
-| `total_repos`     | integer     | Total DIDs discovered                                    |
-| `resolved_repos`  | integer     | DIDs with PDS endpoint resolved                          |
-| `processed_repos` | integer     | DIDs with records fetched                                |
+| `total_repos`     | integer     | Work units discovered (a unit is one repo under one collection; one per account for account-targeted jobs) |
+| `resolved_repos`  | integer     | Units with PDS endpoint resolved                         |
+| `processed_repos` | integer     | Units with records fetched                               |
 | `total_records`   | integer     | Total records indexed                                    |
 | `error`           | text        | Error message if failed                                  |
 | `started_at`      | timestamptz |                                                          |

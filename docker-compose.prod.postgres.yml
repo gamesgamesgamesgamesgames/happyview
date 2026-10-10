@@ -167,6 +167,11 @@ services:
       # The dev default (`happyview=debug`) is very noisy in production.
       RUST_LOG: ${RUST_LOG:-happyview=info,tower_http=info,sqlx=warn}
       EVENT_LOG_RETENTION_DAYS: ${EVENT_LOG_RETENTION_DAYS:-30}
+      # Days to keep script dead letters once resolved. 0 keeps them.
+      DEAD_LETTER_RETENTION_DAYS: ${DEAD_LETTER_RETENTION_DAYS:-30}
+      # Most work units a backfill keeps queued at once. Lower it on a small
+      # disk.
+      BACKFILL_DISCOVERY_WINDOW: ${BACKFILL_DISCOVERY_WINDOW:-50000}
       DEFAULT_RATE_LIMIT_CAPACITY: ${DEFAULT_RATE_LIMIT_CAPACITY:-100}
       DEFAULT_RATE_LIMIT_REFILL_RATE: ${DEFAULT_RATE_LIMIT_REFILL_RATE:-2.0}
       # Backfill concurrency. Each of these feeds the backfill pool size — see

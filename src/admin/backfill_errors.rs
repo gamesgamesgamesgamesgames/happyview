@@ -289,18 +289,24 @@ pub async fn persist_failure(
     );
 
     let now = crate::db::now_rfc3339();
-    let result = crate::db::query(&sql)
-        .bind(job_id)
-        .bind(did)
-        .bind(collection)
-        .bind(phase)
-        .bind(failure.kind.as_str())
-        .bind(&failure.message)
-        .bind(attempts as i32)
-        .bind(&now)
-        .execute(&state.backfill_db)
-        .await;
+    let result = crate::db::retry_on_busy(|| {
+        crate::db::query(&sql)
+            .bind(job_id)
+            .bind(did)
+            .bind(collection)
+            .bind(phase)
+            .bind(failure.kind.as_str())
+            .bind(&failure.message)
+            .bind(attempts as i32)
+            .bind(&now)
+            .execute(&state.backfill_db)
+    })
+    .await;
 
+    if let Err(e) = &result {
+        // The count is already recorded; only this detail row is missing.
+        tracing::warn!(job_id, did, error = %e, "failed to store a backfill error row");
+    }
     result.is_ok()
 }
 
@@ -309,11 +315,14 @@ pub async fn flush_error_counts(state: &AppState, job_id: &str, counts: &ErrorCo
         "UPDATE happyview_backfill_jobs SET error_counts = ? WHERE id = ?",
         state.db_backend,
     );
-    let _ = crate::db::query(&sql)
-        .bind(counts.to_json().to_string())
-        .bind(job_id)
-        .execute(&state.backfill_db)
-        .await;
+    let json = counts.to_json().to_string();
+    super::backfill::job_write(state, job_id, "error_counts", || {
+        crate::db::query(&sql)
+            .bind(&json)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await;
 }
 
 use std::sync::Mutex;

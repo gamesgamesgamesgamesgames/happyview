@@ -222,6 +222,8 @@ interface BackfillJob {
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
+  discovery_complete: boolean;
+  recent_completions_limit: number | null;
 }
 
 const response = await fetch("http://127.0.0.1:3000/admin/backfill/status", {
@@ -270,14 +272,22 @@ curl http://127.0.0.1:3000/admin/backfill/status -H "$AUTH"
     "error": null,
     "started_at": "2025-01-01T00:01:00Z",
     "completed_at": "2025-01-01T00:05:00Z",
-    "created_at": "2025-01-01T00:00:00Z"
+    "created_at": "2025-01-01T00:00:00Z",
+    "discovery_complete": true,
+    "recent_completions_limit": 1000
   }
 ]
 ```
 
 The `status` field tracks the overall job state (`running`, `pausing`, `paused`, `cancelling`, `cancelled`, `completed`, `failed`). The `stage` field tracks the current processing phase (`pending`, `discovering_repos`, `resolving_and_fetching`, `completed`, `failed`, `cancelled`). The `resolved_repos` counter tracks PDS resolution progress during the pipelined phase, while `processed_repos` tracks record fetching progress.
 
+The three repo counters count work units. A unit is one repo under one collection: a network backfill discovers repos per collection, so a repo found under two collections is two units and counts twice. A unit for an account-targeted job covers every collection the job targets, so there one unit is one account. `total_repos` is the number discovered so far while a network backfill is still listing repos from the relay.
+
 `scope` is `network` when repos are discovered through the relay and `dids` when the job targets specific accounts. `did` is set only when a job targets exactly one account.
+
+`discovery_complete` is `false` while a network job is still listing repos from the relay. Discovery runs alongside resolving and fetching, and until it finishes `total_repos` counts the repos discovered so far. `recent_completions_limit` is set for jobs on the bounded queue (every job created after upgrading to the release that introduced it), which keep only that many completed repos for the `fetched` list. It is `null` for jobs created before that upgrade.
+
+A job HappyView paused itself, because it ran out of work with repos it could not complete still queued, has `status` `paused` and the reason in `error` (for example `"paused: 3 units could not be completed; resume to retry"`). A job an operator paused has no `error`. Resuming clears it.
 
 ## List repos for a job
 
@@ -285,13 +295,17 @@ The `status` field tracks the overall job state (`running`, `pausing`, `paused`,
 GET /admin/backfill/{id}/repos
 ```
 
-Paginated list of per-DID tracking rows for a backfill job. Requires `BackfillRead`.
+Paginated per-repo detail for a backfill job. Requires `BackfillRead`.
 
-| Param    | Type   | Required | Description                                                                        |
-| -------- | ------ | -------- | ---------------------------------------------------------------------------------- |
-| `phase`  | string | no       | Filter: `discovered` (all), `resolved` (PDS known), `fetched` (completed)          |
-| `cursor` | string | no       | Keyset cursor (DID) for pagination                                                 |
-| `limit`  | number | no       | Max results per page (default 50, max 100)                                         |
+| Param    | Type   | Required | Description                                                                                                       |
+| -------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------- |
+| `phase`  | string | no       | `fetched`: recently completed repos. `resolved`: queued repos whose PDS is known. Anything else: every queued repo |
+| `cursor` | string | no       | Opaque cursor from a previous response with the same `phase`                                                      |
+| `limit`  | number | no       | Max results per page (default 50, max 100)                                                                        |
+
+A running backfill keeps at most `BACKFILL_DISCOVERY_WINDOW` repos queued and deletes each one when it finishes. `fetched` therefore lists the job's most recent completions, newest first, up to `recent_completions_limit` (1,000). The other phases list what is queued now, ordered by collection and then DID; queued repos have `status` `pending`. A repo queued under two collections appears once for each. `resolved` and the other queued phases share one cursor format. A `fetched` cursor sent to a queued phase, a queued-phase cursor sent to `fetched`, or a DID cursor kept from a job created before the bounded queue gets `400`.
+
+Jobs created before the bounded queue (`recent_completions_limit` is `null`) keep a row for every repo and list them all in DID order as before: `fetched` lists completed repos, `resolved` repos whose PDS is known, and anything else every repo. Their cursor is the last DID.
 
 ```sh tab="cURL" tab-group="language"
 curl "http://127.0.0.1:3000/admin/backfill/$JOB_ID/repos?phase=fetched&limit=10" -H "$AUTH"
@@ -316,7 +330,7 @@ curl "http://127.0.0.1:3000/admin/backfill/$JOB_ID/repos?phase=fetched&limit=10"
 GET /admin/backfill/{id}/pds-summary
 ```
 
-Aggregated PDS breakdown for a backfill job. Requires `BackfillRead`. No pagination — returns all PDS endpoints in one response, sorted by repo count descending.
+Aggregated PDS breakdown for a backfill job. Requires `BackfillRead`. No pagination — returns all PDS endpoints in one response, sorted by repo count descending. For jobs on the bounded queue the counts are kept per PDS as the job runs, and `total_repos` counts work units resolved to that PDS, like the other counters: a repo queued under two collections counts twice.
 
 ```sh tab="cURL" tab-group="language"
 curl "http://127.0.0.1:3000/admin/backfill/$JOB_ID/pds-summary" -H "$AUTH"
@@ -350,6 +364,7 @@ Events are sent with `event: event` and a JSON `data` payload. Each event has a 
 | `job_counters`     | Updated progress counters                         |
 | `job_stage_changed`| The job moved to a new processing stage           |
 | `job_completed`    | The job finished (completed, failed, or cancelled) |
+| `job_snapshot`     | The job's current status, stage, counters, error counts and `discovery_complete`, sent on connect and after the stream falls behind |
 
 ## Flush job details
 
@@ -357,7 +372,9 @@ Events are sent with `event: event` and a JSON `data` payload. Each event has a 
 DELETE /admin/backfill/{id}/details
 ```
 
-Delete all per-repo tracking rows for a single backfill job. Requires `BackfillCreate`.
+Delete the per-repo detail of one backfill job: its recent completions, its PDS summary, any repos left queued and, for jobs created before the bounded queue, its repo rows. Requires `BackfillCreate`.
+
+A job on the bounded queue can be flushed only once it is `completed`, `cancelled` or `failed`, since its queue is the work it still has to do. Flushing one that is running, pausing, paused or cancelling returns `409`. A job created before the bounded queue can be flushed in any state, as before.
 
 ```sh tab="cURL" tab-group="language"
 curl -X DELETE "http://127.0.0.1:3000/admin/backfill/$JOB_ID/details" -H "$AUTH"
@@ -371,7 +388,7 @@ curl -X DELETE "http://127.0.0.1:3000/admin/backfill/$JOB_ID/details" -H "$AUTH"
 DELETE /admin/backfill/details
 ```
 
-Delete per-repo tracking rows for all completed, cancelled, and failed backfill jobs. Requires `BackfillCreate`.
+Delete the per-repo detail and leftover queue of every completed, cancelled and failed backfill job. Requires `BackfillCreate`.
 
 ```sh tab="cURL" tab-group="language"
 curl -X DELETE "http://127.0.0.1:3000/admin/backfill/details" -H "$AUTH"

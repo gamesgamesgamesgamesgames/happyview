@@ -11,6 +11,8 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `DATABASE_URL` | yes | --- | Database connection string. SQLite (`sqlite://path/to/db?mode=rwc`) or Postgres (`postgres://user:pass@host/db`) |
 | `DATABASE_BACKEND` | no | auto-detected | Force `sqlite` or `postgres`. Auto-detected from `DATABASE_URL` scheme if not set |
 | `SQLITE_JOURNAL_SIZE_LIMIT` | no | `67108864` (64 MiB) | Bytes. Caps how large the SQLite write-ahead log is allowed to grow before it's truncated back down after a checkpoint, bounding disk usage from WAL growth. SQLite-only; ignored on Postgres |
+| `SQLITE_SYNCHRONOUS` | no | `NORMAL` | SQLite `synchronous` level for every connection: `NORMAL` or `FULL`. In WAL mode `NORMAL` cannot corrupt the database, but a crash or power loss can lose the last few transactions. `FULL` syncs the write-ahead log on every commit. SQLite-only; ignored on Postgres |
+| `SQLITE_CHECKPOINT_INTERVAL_SECS` | no | `60` | Seconds between `wal_checkpoint(TRUNCATE)` runs, which wait briefly for readers, then empty the write-ahead log. `0` disables them. The latest result is shown on **Settings > Database**. SQLite-only; ignored on Postgres |
 | `PUBLIC_URL` | yes | --- | Public-facing URL for HappyView (used for OAuth callbacks, e.g. `https://happyview.example.com`). **For local development, use `http://127.0.0.1:3000` — not `localhost`** (see note below). Do **not** include the base path — see `BASE_PATH` |
 | `BASE_PATH` | no | _(none)_ | Subpath prefix for mounting HappyView behind a reverse proxy (e.g. `/hv`). Must start with `/` and have no trailing slash. When set, all routes are served under this prefix and the dashboard is accessible at `https://example.com/hv/`. See [Reverse proxy subpath](deployment/production.md#reverse-proxy-subpath) |
 | `SESSION_SECRET` | no | dev default | Secret key for signing session cookies (at least 64 characters). **Must be set in production** |
@@ -23,6 +25,7 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `SCRIPT_INSTRUCTION_LIMIT` | no | `1000000` | Lua VM instructions a query, procedure, record or label script may execute per run, from loading the chunk to `handle` returning, before it fails with `timeout`. An integer from `1000` to `1000000000`. Job scripts are not limited. The **Instruction limit** setting in Settings → General takes precedence when set. See [Lua Scripting](../guides/lua-scripting.md#sandbox) |
 | `SCRIPT_WALL_CLOCK_SECONDS` | no | `10` | Seconds a query, procedure, record or label script may spend running, before it fails with `timeout`. Time spent awaiting the host — an HTTP request, a database read — is not charged against it. An integer from `1` to `300`. Job scripts are not clocked. The **Request wall clock** setting in Settings → General takes precedence when set |
 | `EVENT_LOG_RETENTION_DAYS` | no | `30` | Number of days to keep event logs before automatic cleanup. Set to `0` to disable cleanup |
+| `DEAD_LETTER_RETENTION_DAYS` | no | `30` | Days to keep script dead letters after they are resolved; the hourly cleanup deletes older ones. Unresolved dead letters are never deleted. `0` keeps resolved ones indefinitely |
 | `JOB_WORKER_CONCURRENCY` | no | `1` | Number of background jobs that run at once. Values below 1 fall back to 1; values above 32 are capped at 32. Each running job uses database connections, so keep this below `DATABASE_MAX_CONNECTIONS`. |
 | `PLATFORM_API_KEY_HASH` | no | — | Hex SHA-256 of a key that a managed-hosting provider uses to administer this instance. Leave unset when self-hosting. See [Platform API](../api-reference/admin/platform.md) |
 | `TOKEN_ENCRYPTION_KEY` | no | --- | Base64-encoded 32-byte key for encrypting stored OAuth tokens. **Strongly recommended in production** |
@@ -35,7 +38,8 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `BACKFILL_CONCURRENT_DIDS_PER_PDS` | no | `3` | How many repos to fetch concurrently from each PDS during backfill. Overridden by database setting if set via admin API |
 | `BACKFILL_CONCURRENT_RESOLUTION` | no | `100` | How many DID document lookups to run in parallel during PDS resolution. Overridden by database setting if set via admin API |
 | `BACKFILL_RETENTION_DAYS` | no | `28` | Days to keep per-repo detail data from completed backfill jobs. `0` to keep indefinitely. Overridden by database setting if set via admin API |
-| `BACKFILL_DATABASE_MAX_CONNECTIONS` | no | auto-calculated | Override the backfill connection pool size. Auto-calculated from concurrency settings if not set |
+| `BACKFILL_DISCOVERY_WINDOW` | no | `50000` | Most work units a backfill keeps queued at once. A unit is one repo under one collection it was discovered in (a repo found under two collections is two units). Discovery pauses while the queue is full and resumes as units finish, so a network backfill never stores the whole network's repo list |
+| `BACKFILL_DATABASE_MAX_CONNECTIONS` | no | auto-calculated | Override the backfill connection pool size. Auto-calculated from concurrency settings if not set, capped at 16 on SQLite and 256 on Postgres |
 | `VERBOSE_EVENT_LOGGING` | no | `false` | Log every record index, hook execution, and hook skip to the event log. High write volume — recommended only for debugging. Overridden by database setting if set via admin API |
 | `RUST_LOG` | no | `happyview=debug,tower_http=debug,sqlx=warn` | Log filter (uses `tracing_subscriber::EnvFilter`) |
 | `APP_NAME` | no | --- | Application name shown on OAuth authorization screens. Overridden by database setting if set via admin API |
@@ -63,11 +67,14 @@ SESSION_SECRET=change-me-in-production
 # HOST=0.0.0.0
 # PORT=3000
 # SQLITE_JOURNAL_SIZE_LIMIT=67108864
+# SQLITE_SYNCHRONOUS=NORMAL
+# SQLITE_CHECKPOINT_INTERVAL_SECS=60
 # JETSTREAM_URL=wss://jetstream1.us-east.bsky.network
 # RELAY_URL=https://bsky.network
 # PLC_URL=https://plc.directory
 # STATIC_DIR=./web/out
 # EVENT_LOG_RETENTION_DAYS=30
+# DEAD_LETTER_RETENTION_DAYS=30
 # TOKEN_ENCRYPTION_KEY=base64-encoded-32-byte-key
 # DEFAULT_RATE_LIMIT_CAPACITY=100
 # DEFAULT_RATE_LIMIT_REFILL_RATE=2.0
@@ -75,6 +82,7 @@ SESSION_SECRET=change-me-in-production
 # BACKFILL_CONCURRENT_DIDS_PER_PDS=3
 # BACKFILL_CONCURRENT_RESOLUTION=100
 # BACKFILL_RETENTION_DAYS=28
+# BACKFILL_DISCOVERY_WINDOW=50000
 # VERBOSE_EVENT_LOGGING=false
 # RUST_LOG=happyview=debug,tower_http=debug,sqlx=warn
 # APP_NAME=My App

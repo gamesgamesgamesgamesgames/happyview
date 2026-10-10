@@ -32,6 +32,13 @@ const SEED_INSERT: &str = "INSERT INTO records (uri, did, collection, rkey, reco
 const SEED_ASSERT: &str =
     "SELECT did FROM happyview_records WHERE uri = 'at://did:plc:legacy/app.test.post/rk1'";
 
+// A backfill job from before the bounded queue. A UUID literal, since
+// v2.0.0's Postgres `backfill_jobs.id` is a UUID column.
+const SEED_JOB_INSERT: &str = "INSERT INTO backfill_jobs (id, status, created_at) \
+     VALUES ('00000000-0000-0000-0000-00000000b001', 'running', '2026-01-01T00:00:00Z')";
+const SEED_JOB_ASSERT: &str = "SELECT queue_version, discovery_complete FROM happyview_backfill_jobs \
+     WHERE id = '00000000-0000-0000-0000-00000000b001'";
+
 /// Copy every `.sql` migration in `src` whose 14-digit timestamp prefix is
 /// ≤ `cutoff` into `dest`, reproducing the migration set of that release.
 fn stage_baseline_migrations(src: &str, dest: &Path, cutoff: &str) {
@@ -70,6 +77,10 @@ async fn assert_upgrade_preserves_data(pool: &AnyPool, migrations_dir: &str) {
         .execute(pool)
         .await
         .expect("seed a v2.0.0-era record");
+    sqlx::query(SEED_JOB_INSERT)
+        .execute(pool)
+        .await
+        .expect("seed a v2.0.0-era backfill job");
 
     // 3. Upgrade: apply the full current migration set on top of the v2.0.0 schema.
     Migrator::new(Path::new(migrations_dir))
@@ -85,6 +96,14 @@ async fn assert_upgrade_preserves_data(pool: &AnyPool, migrations_dir: &str) {
         .await
         .expect("seeded record should survive the upgrade");
     assert_eq!(did, "did:plc:legacy");
+
+    // 5. A job from before the bounded queue keeps its repo rows and needs no
+    //    discovery: it finishes on the legacy path.
+    let (queue_version, discovery_complete): (i32, i32) = sqlx::query_as(SEED_JOB_ASSERT)
+        .fetch_one(pool)
+        .await
+        .expect("seeded backfill job should survive the upgrade");
+    assert_eq!((queue_version, discovery_complete), (1, 1));
 
     let _ = std::fs::remove_dir_all(&baseline_dir);
 }
@@ -212,4 +231,136 @@ async fn sqlite_backfill_scope_marks_existing_single_did_jobs() {
     pool.close().await;
     let _ = std::fs::remove_dir_all(&baseline_dir);
     let _ = std::fs::remove_file(&tmp_db);
+}
+
+/// A throwaway database on the `TEST_DATABASE_URL` Postgres server, handed to
+/// `body` by URL and dropped afterwards even when `body` panics. `None` when
+/// the URL names no Postgres server, which the caller reports as a skip.
+async fn with_scratch_postgres<F, Fut>(prefix: &str, body: F) -> Option<()>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let base_url = std::env::var("TEST_DATABASE_URL").ok()?;
+    sqlx::any::install_default_drivers();
+    if happyview::db::DatabaseBackend::from_url(&base_url)
+        != happyview::db::DatabaseBackend::Postgres
+    {
+        return None;
+    }
+    let (server, _db) = base_url
+        .rsplit_once('/')
+        .expect("TEST_DATABASE_URL should have a database path");
+    let scratch_db = format!("{prefix}_{}", uuid::Uuid::new_v4().simple());
+    let admin = AnyPool::connect(&base_url)
+        .await
+        .expect("connect to admin database");
+    happyview::db::query(&format!("CREATE DATABASE {scratch_db}"))
+        .execute(&admin)
+        .await
+        .expect("create scratch database");
+
+    use futures::FutureExt;
+    let outcome = std::panic::AssertUnwindSafe(body(format!("{server}/{scratch_db}")))
+        .catch_unwind()
+        .await;
+
+    let _ = happyview::db::query(&format!("DROP DATABASE {scratch_db} WITH (FORCE)"))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    Some(())
+}
+
+/// Instances booting together on a fresh database all come up. sqlx's own
+/// migration lock blocks inside a statement, which a `CREATE INDEX
+/// CONCURRENTLY` in another session waits out while that session holds the
+/// lock: Postgres reported a deadlock and failed one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+async fn postgres_instances_migrating_at_once_all_boot() {
+    let ran = with_scratch_postgres("hv_concurrent", |url| async move {
+        let boots = (0..4).map(|_| {
+            let url = url.clone();
+            tokio::spawn(async move {
+                let pool =
+                    happyview::db::connect(&url, happyview::db::DatabaseBackend::Postgres).await;
+                pool.close().await;
+            })
+        });
+        for boot in futures::future::join_all(boots).await {
+            boot.expect("every instance migrates and boots");
+        }
+    })
+    .await;
+    if ran.is_none() {
+        eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
+}
+
+/// A `CREATE INDEX CONCURRENTLY` that fails partway leaves an invalid index of
+/// its name, and sqlx records nothing, so the migration runs again at the next
+/// boot. That run must build the index rather than let `IF NOT EXISTS` keep
+/// the invalid one.
+#[tokio::test]
+#[serial_test::serial]
+async fn postgres_boot_rebuilds_an_index_a_failed_concurrent_build_left_invalid() {
+    let ran = with_scratch_postgres("hv_invalid_index", |url| async move {
+        use happyview::db::{self, DatabaseBackend};
+        let pool = db::connect(&url, DatabaseBackend::Postgres).await;
+
+        // Rewind to before the index's migration, then fail a concurrent
+        // build of that name: two rows share a collection, so a unique build
+        // on it fails and leaves the index invalid.
+        db::query("DELETE FROM _sqlx_migrations WHERE version >= 20261009000001")
+            .execute(&pool)
+            .await
+            .expect("rewind migrations");
+        db::query("DROP INDEX idx_records_collection_created_at_uri")
+            .execute(&pool)
+            .await
+            .expect("drop the built index");
+        db::query(
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) VALUES \
+             ('at://did:plc:a/app.test.post/1', 'did:plc:a', 'app.test.post', '1', '{}', 'c1', NOW()), \
+             ('at://did:plc:a/app.test.post/2', 'did:plc:a', 'app.test.post', '2', '{}', 'c2', NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed records");
+        db::query(
+            "CREATE UNIQUE INDEX CONCURRENTLY idx_records_collection_created_at_uri \
+             ON happyview_records (collection)",
+        )
+        .execute(&pool)
+        .await
+        .expect_err("a unique build over duplicates fails");
+        pool.close().await;
+
+        let pool = db::connect(&url, DatabaseBackend::Postgres).await;
+        let (valid, unique): (bool, bool) = db::query_as(
+            "SELECT i.indisvalid, i.indisunique FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             WHERE c.relname = 'idx_records_collection_created_at_uri'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the index exists");
+        assert!(valid, "the index is valid after the retry");
+        assert!(!unique, "the retry built the migration's index");
+        let (applied,): (i64,) =
+            db::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version >= 20261009000001")
+                .fetch_one(&pool)
+                .await
+                .expect("count migrations");
+        assert_eq!(applied, 3);
+        pool.close().await;
+    })
+    .await;
+    if ran.is_none() {
+        eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
 }

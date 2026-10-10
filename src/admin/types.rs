@@ -81,6 +81,13 @@ pub(crate) struct BackfillJob {
     pub(crate) started_at: Option<String>,
     pub(crate) completed_at: Option<String>,
     pub(crate) created_at: String,
+    /// False while a network job is still listing repos from the relay; until
+    /// then `total_repos` is the count discovered so far.
+    pub(crate) discovery_complete: bool,
+    /// For jobs on the bounded queue, how many of the most recent completions
+    /// `repos?phase=fetched` lists. `None` for older jobs, which list every
+    /// completed repo.
+    pub(crate) recent_completions_limit: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +142,7 @@ pub enum BackfillEvent {
         processed_repos: Option<i32>,
         total_records: Option<i32>,
         error_counts: serde_json::Value,
+        discovery_complete: bool,
     },
 }
 
@@ -159,9 +167,9 @@ pub(crate) struct BackfillReposResponse {
 #[derive(Serialize)]
 pub(crate) struct PdsSummaryEntry {
     pub(crate) pds_endpoint: String,
-    pub(crate) total_repos: i32,
-    pub(crate) completed_repos: i32,
-    pub(crate) total_records: i32,
+    pub(crate) total_repos: i64,
+    pub(crate) completed_repos: i64,
+    pub(crate) total_records: i64,
 }
 
 #[derive(Serialize)]

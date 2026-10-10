@@ -874,12 +874,15 @@ pub async fn table_query(
 
 /// Upsert one record into the local index, bypassing the network.
 ///
-/// `indexed_at` and `cid` describe what arrived from the network, so an update
-/// leaves both alone: the stored CID describes the version the PDS holds and is
-/// what strongRefs point at, and a local edit does not change either. An insert
-/// may record a CID the caller was given by the network, and otherwise stores
-/// an empty one rather than NULL — the column is NOT NULL on both backends, and
-/// `cid_verify` already reads an empty CID as "nothing to check".
+/// This is index-only: nothing is written to a PDS, so Jetstream never echoes
+/// it back. `indexed_at` and `cid` describe what arrived from the network, so
+/// an update leaves both alone (unlike writes that will be echoed, which clear
+/// `indexed_at` so the echo re-stamps it): the stored CID describes the version
+/// the PDS holds and is what strongRefs point at, and a local edit does not
+/// change either. An insert may record a CID the caller was given by the
+/// network, and otherwise stores an empty one rather than NULL — the column is
+/// NOT NULL on both backends, and `cid_verify` already reads an empty CID as
+/// "nothing to check".
 pub async fn index_put(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -962,7 +965,8 @@ pub enum MirrorError {
 /// caller-supplied one on insert only: the PDS has just stated which version
 /// it holds, and the stored CID exists to describe exactly that, so the
 /// statement replaces whatever the row had. `indexed_at` is still the network
-/// echo's to set: bound NULL on insert, untouched on update.
+/// echo's to set: bound NULL on insert and cleared on update, so the
+/// identical echo re-stamps the row.
 pub async fn mirror_network_write(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -974,7 +978,7 @@ pub async fn mirror_network_write(
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT (uri) DO UPDATE
                SET record = EXCLUDED.record,
-                   cid = EXCLUDED.cid"#,
+                   cid = EXCLUDED.cid, indexed_at = NULL"#,
         backend,
     );
     crate::db::query(&upsert_sql)
@@ -1747,8 +1751,8 @@ mod tests {
         assert_eq!(row.0.as_deref(), Some("cid1"));
     }
 
-    /// A local edit says nothing about what the network holds, so neither
-    /// column may be disturbed by one.
+    /// `index_put` is index-only and never echoed, so a local edit leaves
+    /// both columns alone.
     #[tokio::test]
     async fn index_put_leaves_network_provenance_alone() {
         let pool = seeded_pool().await;
@@ -1859,7 +1863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mirrored_put_replaces_the_cid_and_leaves_indexed_at() {
+    async fn mirrored_put_replaces_the_cid_and_clears_indexed_at() {
         let pool = seeded_pool().await;
         crate::db::query("UPDATE happyview_records SET indexed_at = ? WHERE uri = 'at://a/c/2'")
             .bind("2026-01-01T00:00:00Z")
@@ -1884,7 +1888,7 @@ mod tests {
 
         let (cid, indexed_at) = provenance(&pool, "at://a/c/2").await;
         assert_eq!(cid.as_deref(), Some("bafyv2"));
-        assert_eq!(indexed_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(indexed_at, None, "the identical echo must re-stamp the row");
         let got = records_get(&pool, Sqlite, "at://a/c/2")
             .await
             .unwrap()
@@ -2580,6 +2584,76 @@ mod tests {
                 "on {backend:?}: {err}"
             );
             assert!(err.to_string().contains("score"), "{err}");
+        }
+    }
+
+    /// The default listing (no custom sort) reads
+    /// `idx_records_collection_created_at_uri` in order, on both backends.
+    #[tokio::test]
+    async fn the_default_records_listing_walks_the_collection_created_at_index() {
+        let spec = RecordsQuery {
+            collection: "app.test.post".into(),
+            did: None,
+            filter: None,
+            sort: None,
+            limit: Some(50),
+            cursor: Some(crate::db::encode_cursor(
+                "2026-01-01T00:00:00+00:00",
+                "at://did:plc:a/app.test.post/1",
+            )),
+        };
+        let (sql, binds) = records_query_sql(&spec, Sqlite).unwrap();
+        assert_eq!(binds.len(), 4, "the collection and three cursor values");
+        let sql = crate::test_support::inline_binds(
+            &sql,
+            &[
+                "'app.test.post'",
+                "'2026-01-01T00:00:00+00:00'",
+                "'2026-01-01T00:00:00+00:00'",
+                "'at://did:plc:a/app.test.post/1'",
+                "50",
+            ],
+        );
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
+            crate::test_support::assert_index_without_sort(
+                &plan,
+                "idx_records_collection_created_at_uri",
+                backend,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_superseded_record_indexes_are_gone() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let sql = match backend {
+                Sqlite => {
+                    "SELECT name FROM sqlite_master WHERE type = 'index' \
+                     AND name IN ('idx_records_collection', 'idx_records_created_at_uri')"
+                }
+                Postgres => {
+                    "SELECT indexname FROM pg_indexes \
+                     WHERE indexname IN ('idx_records_collection', 'idx_records_created_at_uri')"
+                }
+            };
+            let left: Vec<(String,)> = crate::db::query_as(sql)
+                .fetch_all(&pool)
+                .await
+                .expect("list indexes");
+            assert!(left.is_empty(), "{backend:?} still has {left:?}");
+
+            if backend == Postgres {
+                // A failed CONCURRENTLY build leaves an index behind marked invalid.
+                let (valid,): (bool,) = crate::db::query_as(
+                    "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                     WHERE c.relname = 'idx_records_collection_created_at_uri'",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("new index exists");
+                assert!(valid);
+            }
         }
     }
 }

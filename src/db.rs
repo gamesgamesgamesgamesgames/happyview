@@ -17,9 +17,10 @@ use std::sync::LazyLock;
 /// `indexed_at` records when a record arrived *from the network*, so only the
 /// Jetstream consumer (`record_handler`) and backfill may write it. Everything
 /// else — `Record:save()`, `save_local()`, the built-in XRPC procedure
-/// handlers, linked-repo writes — binds this on insert and omits the column
-/// from its `ON CONFLICT` branch, so a real arrival time survives an
-/// AppView-side edit.
+/// handlers, linked-repo writes — binds this on insert. Writes that Jetstream
+/// will echo back also set `indexed_at = NULL` in their `ON CONFLICT` branch,
+/// so the echo re-stamps the row; `index_put`, which is index-only and never
+/// echoed, omits the column there and keeps its existing value.
 ///
 /// It has to be an explicit NULL rather than an omitted column: SQLite still
 /// declares `indexed_at TEXT DEFAULT (datetime('now'))` while Postgres dropped
@@ -84,6 +85,63 @@ pub fn escape_like(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// Attempts `retry_on_busy` makes before giving the error back.
+pub const BUSY_RETRY_ATTEMPTS: u32 = 3;
+
+/// Whether a write failed only because another writer held the lock, which a
+/// short wait can fix: SQLite `BUSY`/`LOCKED` under any extended code once the
+/// busy timeout has run out, and Postgres serialization failures and
+/// deadlocks. Everything else is final.
+pub fn is_retryable_write_error(e: &sqlx::Error) -> bool {
+    let Some(db) = e.as_database_error() else {
+        return false;
+    };
+    let Some(code) = db.code() else {
+        return false;
+    };
+    if db.try_downcast_ref::<sqlx::sqlite::SqliteError>().is_some() {
+        // Extended result codes keep the primary code in the low byte.
+        return code.parse::<i32>().is_ok_and(|c| matches!(c & 0xff, 5 | 6));
+    }
+    matches!(code.as_ref(), "40001" | "40P01")
+}
+
+/// Run a write, retrying up to `BUSY_RETRY_ATTEMPTS` times with backoff while
+/// it fails retryably. The final error is returned for the caller to log;
+/// nothing is swallowed here.
+pub async fn retry_on_busy<T, F, Fut>(mut op: F) -> Result<T, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    let mut attempt: u32 = 1;
+    loop {
+        match op().await {
+            Err(e) if attempt < BUSY_RETRY_ATTEMPTS && is_retryable_write_error(&e) => {
+                tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// The `WHERE` of `ON CONFLICT (uri) DO UPDATE`, so an upsert leaves a row
+/// alone when neither its CID nor its body changed. That avoids rewriting the
+/// row and its indexes, and keeps its original `indexed_at`. A stored row with
+/// no `indexed_at` (one written locally, before the network echoed it) always
+/// updates, so the echo stamps it.
+pub fn record_changed_clause(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Sqlite => {
+            "happyview_records.cid IS NOT excluded.cid OR happyview_records.record IS NOT excluded.record OR happyview_records.indexed_at IS NULL"
+        }
+        DatabaseBackend::Postgres => {
+            "happyview_records.cid IS DISTINCT FROM excluded.cid OR happyview_records.record IS DISTINCT FROM excluded.record OR happyview_records.indexed_at IS NULL"
+        }
+    }
 }
 
 /// Database backend type, auto-detected from DATABASE_URL or set via DATABASE_BACKEND.
@@ -368,6 +426,11 @@ pub fn decode_cursor(cursor: &str) -> Option<(String, String)> {
 /// so a single large delete permanently inflates disk usage.
 pub const DEFAULT_JOURNAL_SIZE_LIMIT: u64 = 67_108_864;
 
+/// Milliseconds a SQLite connection waits on a lock before `SQLITE_BUSY`.
+/// sqlx sets the same 5 s on every connection it opens; this names it so a
+/// caller that changes it temporarily can put it back.
+pub const SQLITE_BUSY_TIMEOUT_MS: u64 = 5000;
+
 /// Parse `SQLITE_JOURNAL_SIZE_LIMIT`. `-1` means "no limit" and is represented
 /// as `u64::MAX`; anything unparseable falls back to the default rather than
 /// failing boot over a maintenance knob.
@@ -387,11 +450,60 @@ pub fn journal_size_limit_bytes() -> u64 {
     parse_journal_size_limit(std::env::var("SQLITE_JOURNAL_SIZE_LIMIT").ok().as_deref())
 }
 
+/// Parse `SQLITE_SYNCHRONOUS`. `NORMAL` is the default: in WAL mode a crash
+/// can lose the last transactions but cannot corrupt the database, and it
+/// drops the fsync SQLite's compiled-in `FULL` issues on every commit. `FULL`
+/// is there for operators who want the old durability. Anything else falls
+/// back to `NORMAL` rather than failing boot over a tuning knob.
+pub fn parse_sqlite_synchronous(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        None | Some("") => "NORMAL",
+        Some(v) if v.eq_ignore_ascii_case("NORMAL") => "NORMAL",
+        Some(v) if v.eq_ignore_ascii_case("FULL") => "FULL",
+        Some(v) => {
+            tracing::warn!(
+                value = v,
+                "SQLITE_SYNCHRONOUS must be NORMAL or FULL; using NORMAL"
+            );
+            "NORMAL"
+        }
+    }
+}
+
+/// Resolve the configured `synchronous` level from the environment.
+pub fn sqlite_synchronous() -> &'static str {
+    parse_sqlite_synchronous(std::env::var("SQLITE_SYNCHRONOUS").ok().as_deref())
+}
+
+/// Rows `ANALYZE` samples per index when `PRAGMA optimize` decides to run it.
+/// Without a limit the first optimize after an upgrade reads every index of a
+/// multi-gigabyte database in full.
+pub const SQLITE_ANALYSIS_LIMIT: u32 = 1000;
+
+/// Refresh planner statistics on the tables SQLite judges to need them.
+///
+/// `0x10002` is `0x02` (run ANALYZE where useful) plus `0x10000` (consider
+/// every table, not only those this connection has queried). The startup
+/// connection has queried nothing, so without the high bit this is a no-op.
+/// Both pragmas must share one connection: `analysis_limit` is per connection.
+pub async fn sqlite_optimize(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let limit_sql = adapt_sql(
+        &format!("PRAGMA analysis_limit = {SQLITE_ANALYSIS_LIMIT}"),
+        DatabaseBackend::Sqlite,
+    );
+    crate::db::query(&limit_sql).execute(&mut *conn).await?;
+    let optimize_sql = adapt_sql("PRAGMA optimize = 0x10002", DatabaseBackend::Sqlite);
+    crate::db::query(&optimize_sql).execute(&mut *conn).await?;
+    Ok(())
+}
+
 /// Apply per-connection SQLite pragmas to every pooled connection.
 ///
-/// `journal_size_limit` is per-connection and not persisted in the database
-/// file, so unlike `journal_mode` it cannot be set once against the pool — that
-/// would reach only whichever single connection served the statement.
+/// `journal_size_limit` and `synchronous` are per-connection and not persisted
+/// in the database file, so unlike `journal_mode` they cannot be set once
+/// against the pool — that would reach only whichever single connection served
+/// the statement.
 fn with_sqlite_pragmas(
     opts: PoolOptions<sqlx::Any>,
     backend: DatabaseBackend,
@@ -400,6 +512,7 @@ fn with_sqlite_pragmas(
         return opts;
     }
     let limit = journal_size_limit_bytes();
+    let synchronous = sqlite_synchronous();
     opts.after_connect(move |conn, _meta| {
         Box::pin(async move {
             let sql = if limit == u64::MAX {
@@ -407,7 +520,13 @@ fn with_sqlite_pragmas(
             } else {
                 format!("PRAGMA journal_size_limit = {limit}")
             };
+            let sql = adapt_sql(&sql, DatabaseBackend::Sqlite);
             crate::db::query(&sql).execute(&mut *conn).await?;
+            let sync_sql = adapt_sql(
+                &format!("PRAGMA synchronous = {synchronous}"),
+                DatabaseBackend::Sqlite,
+            );
+            crate::db::query(&sync_sql).execute(&mut *conn).await?;
             Ok(())
         })
     })
@@ -471,7 +590,7 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
             .await
             .expect("Failed to enable WAL mode");
 
-        crate::db::query("PRAGMA busy_timeout = 5000")
+        crate::db::query(&format!("PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"))
             .execute(&pool)
             .await
             .expect("Failed to set busy timeout");
@@ -487,9 +606,117 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
         .await
         .unwrap_or_else(|e| panic!("Failed to load migrations from {migration_dir}: {e}"));
 
-    migrator.run(&pool).await.expect("Failed to run migrations");
+    match backend {
+        DatabaseBackend::Sqlite => migrator.run(&pool).await,
+        DatabaseBackend::Postgres => migrate_postgres(&pool, &migrator).await,
+    }
+    .expect("Failed to run migrations");
+
+    if backend == DatabaseBackend::Sqlite
+        && let Err(e) = sqlite_optimize(&pool).await
+    {
+        tracing::warn!(error = %e, "PRAGMA optimize after migrations failed");
+    }
 
     pool
+}
+
+/// The advisory lock HappyView holds over its Postgres migrations.
+///
+/// sqlx's migrator takes its own lock with `pg_advisory_lock`, which blocks
+/// inside a statement, and a blocked statement is a transaction that
+/// `CREATE INDEX CONCURRENTLY` waits out. So a second instance booting while
+/// the first builds an index waits on the builder's lock while the builder
+/// waits on it: Postgres reports a deadlock and one of them fails. Taking this
+/// lock first with `pg_try_advisory_lock`, between short sleeps, means a
+/// waiting instance never holds a statement open, and by the time it reaches
+/// sqlx's lock nobody else holds it.
+const PG_MIGRATION_LOCK_KEY: i64 = 0x6876_6d69_6772_6174;
+
+/// How long a booting instance sleeps between tries at the migration lock.
+const PG_MIGRATION_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How often a waiting instance says it is still waiting. An index build on
+/// a large table can hold the lock for a long time, and silence would look
+/// like a hang.
+const PG_MIGRATION_LOCK_REPORT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Indexes a `-- no-transaction` migration builds `CONCURRENTLY`.
+///
+/// A concurrent build that fails partway leaves an index of that name marked
+/// invalid: never read, still written. sqlx records nothing for the failed
+/// migration, so it runs again on the next boot, but its `IF NOT EXISTS` would
+/// find the invalid index and skip the build. [`migrate_postgres`] drops each
+/// of these that is invalid before migrating, so the retry builds it afresh.
+const CONCURRENTLY_BUILT_INDEXES: &[&str] = &["idx_records_collection_created_at_uri"];
+
+/// Run `migrator` against Postgres under [`PG_MIGRATION_LOCK_KEY`], after
+/// dropping any invalid leftover of [`CONCURRENTLY_BUILT_INDEXES`].
+async fn migrate_postgres(
+    pool: &AnyPool,
+    migrator: &Migrator,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    let mut conn = pool.acquire().await?;
+
+    let started = std::time::Instant::now();
+    let mut last_report: Option<std::time::Instant> = None;
+    loop {
+        let sql = adapt_sql("SELECT pg_try_advisory_lock(?)", DatabaseBackend::Postgres);
+        let (locked,): (bool,) = crate::db::query_as(&sql)
+            .bind(PG_MIGRATION_LOCK_KEY)
+            .fetch_one(&mut *conn)
+            .await?;
+        if locked {
+            break;
+        }
+        if last_report.is_none_or(|at| at.elapsed() >= PG_MIGRATION_LOCK_REPORT) {
+            tracing::info!(
+                waited_secs = started.elapsed().as_secs(),
+                "another instance is running migrations; waiting for it to finish"
+            );
+            last_report = Some(std::time::Instant::now());
+        }
+        tokio::time::sleep(PG_MIGRATION_LOCK_RETRY).await;
+    }
+
+    let outcome = async {
+        for index in CONCURRENTLY_BUILT_INDEXES {
+            let sql = adapt_sql(
+                "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname = ? AND pg_table_is_visible(c.oid) AND NOT i.indisvalid",
+                DatabaseBackend::Postgres,
+            );
+            let invalid: Option<(i32,)> = crate::db::query_as(&sql)
+                .bind(*index)
+                .fetch_optional(&mut *conn)
+                .await?;
+            if invalid.is_some() {
+                tracing::warn!(
+                    index,
+                    "dropping an index a failed concurrent build left invalid"
+                );
+                let sql = adapt_sql(
+                    &format!("DROP INDEX CONCURRENTLY IF EXISTS {index}"),
+                    DatabaseBackend::Postgres,
+                );
+                crate::db::query(&sql).execute(&mut *conn).await?;
+            }
+        }
+        // `run` would do, but its `Acquire` bound is not general enough for
+        // the compiler to prove `connect`'s future `Send`. `run_direct` is
+        // what `run` calls once it has the connection.
+        migrator.run_direct(None, &mut *conn, false).await
+    }
+    .await;
+
+    let sql = adapt_sql("SELECT pg_advisory_unlock(?)", DatabaseBackend::Postgres);
+    let unlocked = crate::db::query(&sql)
+        .bind(PG_MIGRATION_LOCK_KEY)
+        .execute(&mut *conn)
+        .await;
+    outcome?;
+    unlocked?;
+    Ok(())
 }
 
 /// Extract the filesystem path from a `sqlite://` URL, dropping query params.
@@ -505,9 +732,13 @@ pub fn sqlite_path_from_url(url: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(path))
 }
 
+/// Upper bound on the computed backfill pool size. SQLite allows one writer,
+/// and every open connection is another reader that can keep the WAL from
+/// rewinding, so its pool stays small; `BACKFILL_DATABASE_MAX_CONNECTIONS`
+/// still overrides it.
 pub fn backfill_pool_ceiling(backend: DatabaseBackend) -> u32 {
     match backend {
-        DatabaseBackend::Sqlite => 64,
+        DatabaseBackend::Sqlite => 16,
         DatabaseBackend::Postgres => 256,
     }
 }
@@ -571,7 +802,7 @@ pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPo
             .await
             .expect("Failed to enable WAL mode on backfill pool");
 
-        crate::db::query("PRAGMA busy_timeout = 5000")
+        crate::db::query(&format!("PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"))
             .execute(&pool)
             .await
             .expect("Failed to set busy timeout on backfill pool");
@@ -654,6 +885,84 @@ mod tests {
 
     const UNMAPPABLE_DECLTYPES: &[&str] =
         &["boolean", "bool", "date", "time", "datetime", "timestamp"];
+
+    /// Every index a Postgres migration builds `CONCURRENTLY` is one
+    /// `migrate_postgres` knows to repair. A failed build leaves the index
+    /// invalid, and one missing from [`CONCURRENTLY_BUILT_INDEXES`] would stay
+    /// that way, skipped by its own `IF NOT EXISTS` on every retry.
+    #[test]
+    fn concurrently_built_indexes_are_all_repairable() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        let mut found = 0;
+        for entry in std::fs::read_dir(&dir).expect("migrations dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "sql") {
+                continue;
+            }
+            let sql = std::fs::read_to_string(&path).expect("read migration");
+            let code = sql
+                .lines()
+                .map(|line| line.split("--").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            let words: Vec<&str> = code.split_whitespace().collect();
+            for (i, pair) in words.windows(2).enumerate() {
+                if pair != ["index", "concurrently"] || i == 0 {
+                    continue;
+                }
+                if !matches!(words[i - 1], "create" | "unique") {
+                    continue;
+                }
+                let mut rest = words[i + 2..].iter();
+                let mut name = rest.next().copied().unwrap_or("");
+                if name == "if" {
+                    name = rest.nth(2).copied().unwrap_or("");
+                }
+                let name = name.split('(').next().unwrap_or("");
+                assert!(
+                    CONCURRENTLY_BUILT_INDEXES.contains(&name),
+                    "{} builds {name:?} concurrently; list it in CONCURRENTLY_BUILT_INDEXES",
+                    path.display()
+                );
+                found += 1;
+            }
+        }
+        assert!(found > 0, "found no concurrent index builds to check");
+    }
+
+    /// A `-- no-transaction` migration exists to run `CREATE INDEX
+    /// CONCURRENTLY`, which Postgres refuses inside a transaction block — and
+    /// Postgres runs a string of several statements as one implicit
+    /// transaction. So each such file holds exactly one statement.
+    #[test]
+    fn no_transaction_migrations_hold_exactly_one_statement() {
+        for dir in ["migrations/sqlite", "migrations/postgres"] {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+            for entry in std::fs::read_dir(&dir).expect("migrations dir") {
+                let path = entry.expect("dir entry").path();
+                if path.extension().is_none_or(|e| e != "sql") {
+                    continue;
+                }
+                let sql = std::fs::read_to_string(&path).expect("read migration");
+                if !sql.starts_with("-- no-transaction") {
+                    continue;
+                }
+                let code: String = sql
+                    .lines()
+                    .map(|line| line.split("--").next().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let statements = code.split(';').filter(|s| !s.trim().is_empty()).count();
+                assert_eq!(
+                    statements,
+                    1,
+                    "{} must hold exactly one statement",
+                    path.display()
+                );
+            }
+        }
+    }
 
     #[test]
     fn sqlite_migrations_declare_no_unmappable_column_types() {
@@ -740,6 +1049,111 @@ mod tests {
         assert_eq!(escape_like("a%b_c"), "a\\%b\\_c");
         // Backslash is escaped first so it can't form a spurious escape sequence.
         assert_eq!(escape_like("a\\%"), "a\\\\\\%");
+    }
+
+    // -----------------------------------------------------------------------
+    // retry_on_busy
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_busy_write_is_retried_until_the_lock_clears() {
+        sqlx::any::install_default_drivers();
+        let path = std::env::temp_dir().join(format!("hv-busy-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let holder_pool = PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("connect holder");
+        crate::db::query("PRAGMA journal_mode = WAL")
+            .execute(&holder_pool)
+            .await
+            .expect("enable WAL");
+        crate::db::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&holder_pool)
+            .await
+            .expect("create table");
+        // A second pool that never waits on a lock, so a held write lock
+        // surfaces as SQLITE_BUSY at once.
+        let writer = PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    crate::db::query("PRAGMA busy_timeout = 0")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .expect("connect writer");
+
+        let mut holder = holder_pool.acquire().await.expect("acquire holder");
+        crate::db::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .expect("take the write lock");
+
+        let err = crate::db::query("INSERT INTO t (id) VALUES (1)")
+            .execute(&writer)
+            .await
+            .expect_err("the write lock is held");
+        assert!(is_retryable_write_error(&err), "{err}");
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            crate::db::query("COMMIT")
+                .execute(&mut *holder)
+                .await
+                .expect("release the write lock");
+        });
+
+        retry_on_busy(|| crate::db::query("INSERT INTO t (id) VALUES (1)").execute(&writer))
+            .await
+            .expect("the retried write lands once the lock clears");
+        release.await.expect("release task");
+
+        let dup = crate::db::query("INSERT INTO t (id) VALUES (1)")
+            .execute(&writer)
+            .await
+            .expect_err("duplicate key");
+        assert!(
+            !is_retryable_write_error(&dup),
+            "a constraint failure is final: {dup}"
+        );
+
+        drop(writer);
+        drop(holder_pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[tokio::test]
+    async fn postgres_serialization_and_deadlock_codes_are_retryable() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
+            return;
+        }
+        let pool = connect(&url, DatabaseBackend::Postgres).await;
+        for code in ["40001", "40P01"] {
+            let sql =
+                format!("DO $$ BEGIN RAISE EXCEPTION 'forced' USING ERRCODE = '{code}'; END $$");
+            let err = query(&sql)
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert!(is_retryable_write_error(&err), "{code}: {err}");
+        }
+        let err = query("SELECT * FROM happyview_no_such_table_t3")
+            .execute(&pool)
+            .await
+            .expect_err("missing table");
+        assert!(!is_retryable_write_error(&err), "{err}");
     }
 
     // -----------------------------------------------------------------------
@@ -1032,7 +1446,7 @@ mod tests {
 
     #[test]
     fn backfill_pool_ceiling_values() {
-        assert_eq!(backfill_pool_ceiling(DatabaseBackend::Sqlite), 64);
+        assert_eq!(backfill_pool_ceiling(DatabaseBackend::Sqlite), 16);
         assert_eq!(backfill_pool_ceiling(DatabaseBackend::Postgres), 256);
     }
 
@@ -1041,7 +1455,7 @@ mod tests {
         let needed = needed_backfill_connections(10, 3, 100);
         let capped = needed.min(backfill_pool_ceiling(DatabaseBackend::Sqlite));
         assert_eq!(needed, 134);
-        assert_eq!(capped, 64);
+        assert_eq!(capped, 16);
     }
 
     #[test]
@@ -1169,6 +1583,155 @@ mod tests {
                 "journal_size_limit pragma did not reach a pooled connection"
             );
         }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    // -----------------------------------------------------------------------
+    // synchronous
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sqlite_synchronous_defaults_to_normal() {
+        assert_eq!(parse_sqlite_synchronous(None), "NORMAL");
+        assert_eq!(parse_sqlite_synchronous(Some("")), "NORMAL");
+        assert_eq!(parse_sqlite_synchronous(Some("normal")), "NORMAL");
+    }
+
+    #[test]
+    fn sqlite_synchronous_allows_full() {
+        assert_eq!(parse_sqlite_synchronous(Some("FULL")), "FULL");
+        assert_eq!(parse_sqlite_synchronous(Some(" full ")), "FULL");
+    }
+
+    #[test]
+    fn sqlite_synchronous_rejects_other_levels() {
+        // OFF can corrupt the database on power loss and EXTRA buys nothing
+        // over FULL in WAL mode, so neither is offered.
+        assert_eq!(parse_sqlite_synchronous(Some("OFF")), "NORMAL");
+        assert_eq!(parse_sqlite_synchronous(Some("banana")), "NORMAL");
+    }
+
+    async fn synchronous_on_every_connection(env_value: Option<&str>) -> Vec<i64> {
+        let path = std::env::temp_dir().join(format!("hv-sync-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+
+        // SAFETY: callers are `#[serial]`; nothing else reads or writes this
+        // variable concurrently.
+        unsafe {
+            match env_value {
+                Some(v) => std::env::set_var("SQLITE_SYNCHRONOUS", v),
+                None => std::env::remove_var("SQLITE_SYNCHRONOUS"),
+            }
+        }
+        let pool = connect(&url, DatabaseBackend::Sqlite).await;
+        unsafe {
+            std::env::remove_var("SQLITE_SYNCHRONOUS");
+        }
+
+        let mut conns = Vec::new();
+        for _ in 0..4 {
+            conns.push(pool.acquire().await.expect("failed to acquire connection"));
+        }
+        let mut levels = Vec::new();
+        for mut conn in conns {
+            let (level,): (i64,) = crate::db::query_as("PRAGMA synchronous")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("failed to read synchronous");
+            levels.push(level);
+        }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        levels
+    }
+
+    /// `PRAGMA synchronous` reads back 1 for NORMAL and 2 for FULL.
+    #[tokio::test]
+    #[serial]
+    async fn synchronous_normal_reaches_pooled_connections() {
+        assert_eq!(
+            synchronous_on_every_connection(None).await,
+            vec![1, 1, 1, 1]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn synchronous_full_reaches_pooled_connections() {
+        assert_eq!(
+            synchronous_on_every_connection(Some("FULL")).await,
+            vec![2, 2, 2, 2]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn synchronous_normal_reaches_backfill_pool_connections() {
+        let path = std::env::temp_dir().join(format!("hv-bf-sync-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+
+        // SAFETY: callers are `#[serial]`; nothing else reads or writes this
+        // variable concurrently.
+        unsafe {
+            std::env::remove_var("SQLITE_SYNCHRONOUS");
+        }
+        let pool = connect_backfill_pool(&url, DatabaseBackend::Sqlite).await;
+
+        let mut conns = Vec::new();
+        for _ in 0..4 {
+            conns.push(pool.acquire().await.expect("failed to acquire connection"));
+        }
+        for mut conn in conns {
+            let (level,): (i64,) = crate::db::query_as("PRAGMA synchronous")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("failed to read synchronous");
+            assert_eq!(level, 1);
+        }
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// `PRAGMA optimize` with the "every table" bit analyzes a table this
+    /// connection never queried, which is the startup case.
+    #[tokio::test]
+    #[serial]
+    async fn optimize_writes_planner_statistics() {
+        let path = std::env::temp_dir().join(format!("hv-optimize-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = connect(&url, DatabaseBackend::Sqlite).await;
+
+        for i in 0..200 {
+            crate::db::query(
+                "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+                 VALUES (?, 'did:plc:opt', 'app.test.post', ?, '{}', 'bafyreitestcid', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+            )
+            .bind(format!("at://did:plc:opt/app.test.post/{i}"))
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .expect("seed record");
+        }
+
+        sqlite_optimize(&pool).await.expect("optimize");
+
+        let (rows,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'happyview_records'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("sqlite_stat1 should exist after optimize");
+        assert!(rows > 0, "optimize did not analyze happyview_records");
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

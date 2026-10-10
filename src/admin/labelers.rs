@@ -71,6 +71,7 @@ pub(super) async fn add(
         .map_err(|e| AppError::Internal(format!("failed to add labeler subscription: {e}")))?;
 
     // Notify the labeler consumer to pick up the new subscription.
+    state.labeler_subscription_cache.invalidate();
     let _ = state.labeler_subscriptions_tx.send(());
 
     log_event(
@@ -118,6 +119,7 @@ pub(super) async fn update(
         )));
     }
 
+    state.labeler_subscription_cache.invalidate();
     let _ = state.labeler_subscriptions_tx.send(());
 
     log_event(
@@ -168,6 +170,7 @@ pub(super) async fn delete(
         .execute(&state.db)
         .await;
 
+    state.labeler_subscription_cache.invalidate();
     let _ = state.labeler_subscriptions_tx.send(());
 
     log_event(

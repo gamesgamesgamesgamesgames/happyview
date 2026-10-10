@@ -8,6 +8,10 @@ use crate::auth::Claims;
 use crate::db::adapt_sql;
 use crate::error::AppError;
 
+/// The collection listing without a `did`, served from
+/// `idx_records_collection_indexed_at` in order.
+pub(crate) const LIST_RECORDS_SQL: &str = "SELECT uri, did, record FROM happyview_records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?";
+
 pub(crate) async fn handle_query(
     state: &AppState,
     method: &str,
@@ -72,10 +76,7 @@ pub(crate) async fn handle_query(
             .await
             .map_err(|e| AppError::Internal(format!("DB query failed: {e}")))?
     } else {
-        let sql = adapt_sql(
-            "SELECT uri, did, record FROM happyview_records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
-            backend,
-        );
+        let sql = adapt_sql(LIST_RECORDS_SQL, backend);
         crate::db::query_as(&sql)
             .bind(collection)
             .bind(limit)
@@ -131,4 +132,23 @@ pub(super) async fn handle_get_record(state: &AppState, uri: &str) -> Result<Res
         .map(|obj| obj.insert("uri".to_string(), json!(uri)));
 
     Ok(Json(json!({ "record": record })).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_xrpc_listing_walks_the_collection_indexed_at_index() {
+        let sql =
+            crate::test_support::inline_binds(LIST_RECORDS_SQL, &["'app.test.post'", "50", "0"]);
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
+            crate::test_support::assert_index_without_sort(
+                &plan,
+                "idx_records_collection_indexed_at",
+                backend,
+            );
+        }
+    }
 }

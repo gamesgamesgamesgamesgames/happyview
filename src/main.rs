@@ -135,66 +135,18 @@ async fn main() {
     happyview::maintenance::nsid_audit::run(&db_pool, db_backend).await;
     happyview::maintenance::lexicon_ids::run(&db_pool, db_backend).await;
 
-    // Backfill record_refs in the background (first run after upgrade)
+    // Populate record_refs once, for records indexed before the table existed.
     {
         let db_bg = db_pool.clone();
-        let backend = db_backend;
         tokio::spawn(async move {
-            let count: (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_record_refs")
-                .fetch_one(&db_bg)
-                .await
-                .expect("failed to count record_refs");
-
-            if count.0 == 0 {
-                info!("backfilling record_refs table in background...");
-                let total: (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_records")
-                    .fetch_one(&db_bg)
-                    .await
-                    .expect("failed to count records");
-                let total = total.0 as usize;
-
-                let batch_size = 1000i64;
-                let mut offset = 0i64;
-                let mut processed = 0usize;
-
-                let query = db::adapt_sql(
-                    "SELECT uri, collection, record FROM happyview_records ORDER BY uri LIMIT ? OFFSET ?",
-                    backend,
-                );
-
-                loop {
-                    let batch: Vec<(String, String, String)> = crate::db::query_as(&query)
-                        .bind(batch_size)
-                        .bind(offset)
-                        .fetch_all(&db_bg)
-                        .await
-                        .expect("failed to fetch records for backfill");
-
-                    if batch.is_empty() {
-                        break;
-                    }
-
-                    for (uri, collection, record_str) in &batch {
-                        let record: serde_json::Value =
-                            serde_json::from_str(record_str).unwrap_or(serde_json::Value::Null);
-                        if let Err(e) = happyview::record_refs::sync_refs(
-                            &db_bg, uri, collection, &record, backend,
-                        )
-                        .await
-                        {
-                            warn!(uri = uri.as_str(), "failed to backfill refs: {e}");
-                        }
-                    }
-
-                    processed += batch.len();
-                    offset += batch_size;
-
-                    if processed.is_multiple_of(10000) || processed == total {
-                        info!("backfill progress: {processed}/{total}");
-                    }
+            match happyview::record_refs::rebuild_once(&db_bg, db_backend).await {
+                Ok(happyview::record_refs::RebuildOutcome::Rebuilt { records }) => {
+                    info!(records, "record_refs rebuild complete");
                 }
-
-                info!("backfill complete: processed {processed} records");
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(error = %e, "record_refs rebuild failed; will resume on next startup")
+                }
             }
         });
     }
@@ -935,6 +887,7 @@ async fn main() {
         lexicons,
         collections_tx,
         labeler_subscriptions_tx,
+        labeler_subscription_cache: Arc::new(happyview::labeler::SubscriptionCache::default()),
         rate_limiter,
         oauth: oauth_registry,
         oauth_state_store,
@@ -983,7 +936,20 @@ async fn main() {
     tokio::spawn(happyview::event_log::spawn_retention_cleanup(
         state.db.clone(),
         state.db_backend,
+        happyview::event_log::parse_dead_letter_retention_days(
+            std::env::var("DEAD_LETTER_RETENTION_DAYS").ok().as_deref(),
+        ),
     ));
+
+    {
+        let interval = happyview::maintenance::sqlite::checkpoint_interval_secs();
+        let checkpoint_every = (interval > 0).then(|| std::time::Duration::from_secs(interval));
+        tokio::spawn(happyview::maintenance::sqlite::run(
+            state.db.clone(),
+            state.db_backend,
+            checkpoint_every,
+        ));
+    }
 
     {
         let db = state.db.clone();
