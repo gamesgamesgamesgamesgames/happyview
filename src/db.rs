@@ -636,6 +636,11 @@ const PG_MIGRATION_LOCK_KEY: i64 = 0x6876_6d69_6772_6174;
 /// How long a booting instance sleeps between tries at the migration lock.
 const PG_MIGRATION_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How often a waiting instance says it is still waiting. An index build on
+/// a large table can hold the lock for a long time, and silence would look
+/// like a hang.
+const PG_MIGRATION_LOCK_REPORT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Indexes a `-- no-transaction` migration builds `CONCURRENTLY`.
 ///
 /// A concurrent build that fails partway leaves an index of that name marked
@@ -653,7 +658,8 @@ async fn migrate_postgres(
 ) -> Result<(), sqlx::migrate::MigrateError> {
     let mut conn = pool.acquire().await?;
 
-    let mut announced = false;
+    let started = std::time::Instant::now();
+    let mut last_report: Option<std::time::Instant> = None;
     loop {
         let sql = adapt_sql("SELECT pg_try_advisory_lock(?)", DatabaseBackend::Postgres);
         let (locked,): (bool,) = crate::db::query_as(&sql)
@@ -663,9 +669,12 @@ async fn migrate_postgres(
         if locked {
             break;
         }
-        if !announced {
-            tracing::info!("another instance is running migrations; waiting for it to finish");
-            announced = true;
+        if last_report.is_none_or(|at| at.elapsed() >= PG_MIGRATION_LOCK_REPORT) {
+            tracing::info!(
+                waited_secs = started.elapsed().as_secs(),
+                "another instance is running migrations; waiting for it to finish"
+            );
+            last_report = Some(std::time::Instant::now());
         }
         tokio::time::sleep(PG_MIGRATION_LOCK_RETRY).await;
     }
@@ -876,6 +885,51 @@ mod tests {
 
     const UNMAPPABLE_DECLTYPES: &[&str] =
         &["boolean", "bool", "date", "time", "datetime", "timestamp"];
+
+    /// Every index a Postgres migration builds `CONCURRENTLY` is one
+    /// `migrate_postgres` knows to repair. A failed build leaves the index
+    /// invalid, and one missing from [`CONCURRENTLY_BUILT_INDEXES`] would stay
+    /// that way, skipped by its own `IF NOT EXISTS` on every retry.
+    #[test]
+    fn concurrently_built_indexes_are_all_repairable() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        let mut found = 0;
+        for entry in std::fs::read_dir(&dir).expect("migrations dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "sql") {
+                continue;
+            }
+            let sql = std::fs::read_to_string(&path).expect("read migration");
+            let code = sql
+                .lines()
+                .map(|line| line.split("--").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            let words: Vec<&str> = code.split_whitespace().collect();
+            for (i, pair) in words.windows(2).enumerate() {
+                if pair != ["index", "concurrently"] || i == 0 {
+                    continue;
+                }
+                if !matches!(words[i - 1], "create" | "unique") {
+                    continue;
+                }
+                let mut rest = words[i + 2..].iter();
+                let mut name = rest.next().copied().unwrap_or("");
+                if name == "if" {
+                    name = rest.nth(2).copied().unwrap_or("");
+                }
+                let name = name.split('(').next().unwrap_or("");
+                assert!(
+                    CONCURRENTLY_BUILT_INDEXES.contains(&name),
+                    "{} builds {name:?} concurrently; list it in CONCURRENTLY_BUILT_INDEXES",
+                    path.display()
+                );
+                found += 1;
+            }
+        }
+        assert!(found > 0, "found no concurrent index builds to check");
+    }
 
     /// A `-- no-transaction` migration exists to run `CREATE INDEX
     /// CONCURRENTLY`, which Postgres refuses inside a transaction block — and
