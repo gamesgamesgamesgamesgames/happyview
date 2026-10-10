@@ -8,7 +8,8 @@
 //! could not be reached (`db::is_unavailable`), which the worker retries until
 //! it applies; `Failed` for any other error, which it retries a few times and
 //! then gives up (`give_up_fn` logs that); `Applied` otherwise, including a
-//! write the record pipeline skipped or a tombstone refused.
+//! write the record pipeline skipped or a tombstone refused, and a commit it
+//! found invalid (logged once as `jetstream.record_invalid`).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -37,8 +38,9 @@ pub fn apply_fn(state: AppState, collections: watch::Receiver<Vec<String>>) -> A
 }
 
 /// The worker's `GiveUpFn`: logs `jetstream.apply_failed` for an event that
-/// kept failing, with the record's URI (or the event's kind), its seq and
-/// the last error.
+/// kept failing, with the record's URI (or the event's kind, and an account
+/// event's status), its seq and the last error. It is the one error event a
+/// failed event writes; the attempts before it are only traced.
 pub fn give_up_fn(state: AppState) -> GiveUpFn {
     Arc::new(move |event: Event, error: String| {
         let state = state.clone();
@@ -47,7 +49,9 @@ pub fn give_up_fn(state: AppState) -> GiveUpFn {
                 EventKind::Commit(commit) => serde_json::json!({
                     "uri": format!("at://{}/{}/{}", event.did, commit.collection, commit.rkey),
                 }),
-                EventKind::Account { .. } => serde_json::json!({ "kind": "account" }),
+                EventKind::Account { status, .. } => {
+                    serde_json::json!({ "kind": "account", "status": status })
+                }
                 EventKind::Identity { .. } => serde_json::json!({ "kind": "identity" }),
                 EventKind::Sync { .. } => serde_json::json!({ "kind": "sync" }),
             };
@@ -71,7 +75,7 @@ pub fn give_up_fn(state: AppState) -> GiveUpFn {
 pub async fn apply_event(state: &AppState, tracked: &[String], event: Event) -> ApplyOutcome {
     let Event { did, cursor, kind } = event;
     match kind {
-        EventKind::Commit(commit) => apply_commit(state, did, commit).await,
+        EventKind::Commit(commit) => apply_commit(state, did, cursor, commit).await,
         EventKind::Account {
             active: false,
             status,
@@ -115,7 +119,12 @@ fn failed(e: &sqlx::Error) -> ApplyOutcome {
     }
 }
 
-async fn apply_commit(state: &AppState, did: String, commit: Commit) -> ApplyOutcome {
+async fn apply_commit(
+    state: &AppState,
+    did: String,
+    cursor: CursorPoint,
+    commit: Commit,
+) -> ApplyOutcome {
     let event = RecordEvent {
         did,
         collection: commit.collection,
@@ -154,6 +163,39 @@ async fn apply_commit(state: &AppState, did: String, commit: Commit) -> ApplyOut
             event.action,
             uri()
         )),
+        // Retrying cannot help, so the event is skipped, with one warning.
+        RecordOutcome::Invalid => {
+            state
+                .telemetry_counters
+                .jetstream_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            let uri = uri();
+            let error = invalid_reason(&event);
+            tracing::warn!(uri, error, "skipping an invalid jetstream commit");
+            log(
+                state,
+                "jetstream.record_invalid",
+                Severity::Warn,
+                &event.did,
+                serde_json::json!({ "uri": uri, "seq": cursor.seq(), "error": error }),
+            )
+            .await;
+            ApplyOutcome::Applied
+        }
+    }
+}
+
+/// Why the record pipeline found `event` invalid.
+fn invalid_reason(event: &RecordEvent) -> String {
+    match event.action.as_str() {
+        "create" | "update" if event.record.is_none() => {
+            format!("the {} carries no record", event.action)
+        }
+        "create" | "update" | "delete" if event.collection == LEXICON_SCHEMA_COLLECTION => {
+            "the lexicon schema could not be applied".to_string()
+        }
+        "create" | "update" | "delete" => "the database refused the record's data".to_string(),
+        action => format!("unknown operation {action:?}"),
     }
 }
 
@@ -221,22 +263,11 @@ async fn account_purged(
             log(state, event_type, Severity::Info, did, detail).await;
             ApplyOutcome::Applied
         }
+        // The worker retries the event; `give_up_fn` logs it if it never
+        // applies.
         Err(e) => {
-            let outcome = failed(&e);
-            tracing::error!(did, error = %e, "failed to purge an account's records");
-            // While the database is unreachable the log could not be
-            // written either; the worker retries the event.
-            if matches!(outcome, ApplyOutcome::Failed(_)) {
-                log(
-                    state,
-                    event_type,
-                    Severity::Error,
-                    did,
-                    serde_json::json!({ "error": e.to_string(), "seq": cursor.seq() }),
-                )
-                .await;
-            }
-            outcome
+            tracing::warn!(did, error = %e, "failed to purge an account's records");
+            failed(&e)
         }
     }
 }
@@ -350,20 +381,10 @@ async fn repo_resynced(
             .await;
             ApplyOutcome::Applied
         }
+        // As for an account purge, `give_up_fn` logs it if it never applies.
         Err(e) => {
-            let outcome = failed(&e);
-            tracing::error!(did, error = %e, "failed to purge a resynced repo");
-            if matches!(outcome, ApplyOutcome::Failed(_)) {
-                log(
-                    state,
-                    "jetstream.sync_purged",
-                    Severity::Error,
-                    did,
-                    serde_json::json!({ "error": e.to_string(), "rev": rev }),
-                )
-                .await;
-            }
-            outcome
+            tracing::warn!(did, error = %e, "failed to purge a resynced repo");
+            failed(&e)
         }
     }
 }
@@ -787,16 +808,186 @@ mod tests {
         }
     }
 
+    /// Retrying a commit that can never apply would only stall its worker,
+    /// so it is skipped with one warning.
     #[tokio::test]
-    async fn a_malformed_commit_fails() {
-        let state = sqlite_state().await;
-        let did = unique_did();
-        let mut event = commit(&did, 1, "a", "create");
-        if let EventKind::Commit(commit) = &mut event.kind {
-            commit.record = None;
+    async fn an_invalid_commit_is_skipped_with_one_warning() {
+        for state in states().await {
+            let did = unique_did();
+            let mut no_body = commit(&did, 1, "a", "create");
+            if let EventKind::Commit(commit) = &mut no_body.kind {
+                commit.record = None;
+            }
+            apply(&state, no_body).await;
+            let mut unknown = commit(&did, 2, "b", "create");
+            if let EventKind::Commit(commit) = &mut unknown.kind {
+                commit.operation = "frobnicate".into();
+            }
+            apply(&state, unknown).await;
+
+            assert!(rkeys(&state, &did).await.is_empty());
+            let mut details = logged(&state, "jetstream.record_invalid", &did).await;
+            details.sort_by_key(|d| d["seq"].as_i64());
+            assert_eq!(
+                details,
+                vec![
+                    serde_json::json!({
+                        "uri": format!("at://{did}/{NSID}/a"),
+                        "seq": 1,
+                        "error": "the create carries no record",
+                    }),
+                    serde_json::json!({
+                        "uri": format!("at://{did}/{NSID}/b"),
+                        "seq": 2,
+                        "error": "unknown operation \"frobnicate\"",
+                    }),
+                ]
+            );
+            clean_up(&state, &did).await;
         }
-        let outcome = apply_event(&state, &[NSID.to_string()], event).await;
-        assert!(matches!(outcome, ApplyOutcome::Failed(_)), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_sync_keeps_local_writes_and_untracked_collections() {
+        const OTHER: &str = "app.test.untracked";
+        for state in states().await {
+            let did = unique_did();
+            apply(&state, commit(&did, 1, "a", "create")).await;
+            insert_local(&state, &did, "local").await;
+            let sql = adapt_sql(
+                "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+                 VALUES (?, ?, ?, 'other', '{}', '', ?, ?)",
+                state.db_backend,
+            );
+            crate::db::query(&sql)
+                .bind(format!("at://{did}/{OTHER}/other"))
+                .bind(&did)
+                .bind(OTHER)
+                .bind(now_rfc3339())
+                .bind(now_rfc3339())
+                .execute(&state.db)
+                .await
+                .expect("insert an untracked network record");
+
+            apply(&state, sync(&did, 2, Some(rev_at(2)))).await;
+
+            assert_eq!(rkeys(&state, &did).await, vec!["local", "other"]);
+            assert_eq!(
+                logged(&state, "jetstream.sync_purged", &did).await,
+                vec![serde_json::json!({"purged": 1, "rev": rev_at(2)})]
+            );
+            clean_up(&state, &did).await;
+        }
+    }
+
+    /// Make every delete of `did`'s records fail with an ordinary (not
+    /// unavailable) error. Returns the statement that undoes it.
+    async fn refuse_deletes(state: &AppState, did: &str) -> Vec<String> {
+        let name = format!("refuse_{}", did.replace([':', '.'], "_"));
+        let (create, drop): (Vec<String>, Vec<String>) = match state.db_backend {
+            crate::db::DatabaseBackend::Sqlite => (
+                vec![format!(
+                    "CREATE TRIGGER {name} BEFORE DELETE ON happyview_records \
+                     WHEN OLD.did = '{did}' BEGIN SELECT RAISE(ABORT, 'refused'); END"
+                )],
+                vec![format!("DROP TRIGGER {name}")],
+            ),
+            crate::db::DatabaseBackend::Postgres => (
+                vec![
+                    format!(
+                        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                         BEGIN IF OLD.did = '{did}' THEN RAISE EXCEPTION 'refused'; END IF; \
+                         RETURN OLD; END $$"
+                    ),
+                    format!(
+                        "CREATE TRIGGER {name} BEFORE DELETE ON happyview_records \
+                         FOR EACH ROW EXECUTE FUNCTION {name}()"
+                    ),
+                ],
+                vec![
+                    format!("DROP TRIGGER {name} ON happyview_records"),
+                    format!("DROP FUNCTION {name}()"),
+                ],
+            ),
+        };
+        for sql in create {
+            crate::db::query(&sql)
+                .execute(&state.db)
+                .await
+                .expect("create the trigger");
+        }
+        drop
+    }
+
+    /// A purge that keeps failing writes no error event per attempt; giving
+    /// it up writes exactly one `jetstream.apply_failed`.
+    #[tokio::test]
+    async fn a_purge_that_keeps_failing_logs_one_error_when_given_up() {
+        use super::super::watermark::WatermarkHandle;
+        use super::super::workers::{Job, RetryPolicy, WorkerPool};
+        use std::time::Duration;
+
+        for state in states().await {
+            let did = unique_did();
+            apply(&state, commit(&did, 1, "a", "create")).await;
+            let undo = refuse_deletes(&state, &did).await;
+
+            let outcome = apply_event(&state, &[], account(&did, 2, false, Some("deleted"))).await;
+            assert!(matches!(outcome, ApplyOutcome::Failed(_)), "{outcome:?}");
+
+            let (_tx, rx) = tokio::sync::watch::channel(vec![NSID.to_string()]);
+            let watermark = Arc::new(WatermarkHandle::new());
+            let pool = WorkerPool::spawn(
+                1,
+                4,
+                apply_fn(state.clone(), rx),
+                Arc::clone(&watermark),
+                RetryPolicy {
+                    delays: vec![Duration::from_millis(1); 3],
+                    max_unavailable_delay: Duration::from_millis(2),
+                },
+                give_up_fn(state.clone()),
+            );
+            for event in [
+                account(&did, 3, false, Some("takendown")),
+                sync(&did, 4, None),
+            ] {
+                let ticket = watermark.begin(event.cursor);
+                pool.dispatch(Job { ticket, event }).await;
+            }
+            tokio::time::timeout(Duration::from_secs(30), watermark.wait_idle())
+                .await
+                .expect("both events are given up");
+            drop(pool);
+
+            for event_type in [
+                "jetstream.account_deleted",
+                "jetstream.account_takendown",
+                "jetstream.sync_purged",
+            ] {
+                assert!(
+                    logged(&state, event_type, &did).await.is_empty(),
+                    "{event_type}"
+                );
+            }
+            let mut gave_up = logged(&state, "jetstream.apply_failed", &did).await;
+            gave_up.sort_by_key(|d| d["seq"].as_i64());
+            assert_eq!(gave_up.len(), 2, "{gave_up:?}");
+            assert_eq!(gave_up[0]["kind"], "account");
+            assert_eq!(gave_up[0]["status"], "takendown");
+            assert_eq!(gave_up[0]["seq"], 3);
+            assert_eq!(gave_up[1]["kind"], "sync");
+            assert_eq!(gave_up[1]["seq"], 4);
+            assert_eq!(rkeys(&state, &did).await, vec!["a"]);
+
+            for sql in undo {
+                crate::db::query(&sql)
+                    .execute(&state.db)
+                    .await
+                    .expect("drop the trigger");
+            }
+            clean_up(&state, &did).await;
+        }
     }
 
     #[tokio::test]
@@ -820,7 +1011,12 @@ mod tests {
             assert_eq!(
                 details,
                 vec![
-                    serde_json::json!({"kind": "account", "seq": 2, "error": "bang"}),
+                    serde_json::json!({
+                        "kind": "account",
+                        "status": "deleted",
+                        "seq": 2,
+                        "error": "bang",
+                    }),
                     serde_json::json!({
                         "uri": format!("at://{did}/{NSID}/a"),
                         "seq": 1,

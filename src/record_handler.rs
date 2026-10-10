@@ -40,6 +40,12 @@ pub enum RecordOutcome {
     /// `db::is_unavailable`); the same event should apply once it is back.
     /// A caller that does not retry treats it like `Errored`.
     Unavailable,
+    /// The event can never be applied as it stands: a write with no record
+    /// body, an unknown operation, a lexicon schema that does not parse, or
+    /// data the database refuses (see `db::is_invalid_data`). Retrying it
+    /// cannot help. A caller that does not distinguish it treats it like
+    /// `Errored`.
+    Invalid,
 }
 
 /// Process a record event: upsert/delete the record in the database, run index
@@ -53,8 +59,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
 
     // Handle lexicon schema events for tracked network lexicons.
     if record.collection == LEXICON_SCHEMA_COLLECTION {
-        handle_lexicon_schema_event(state, &record.did, record).await;
-        return RecordOutcome::SchemaEvent;
+        return handle_lexicon_schema_event(state, &record.did, record).await;
     }
 
     // Skip records whose collection is not tracked by a registered record-type lexicon.
@@ -75,7 +80,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
         "create" | "update" => {
             let rec = match &record.record {
                 Some(r) => r,
-                None => return RecordOutcome::Errored,
+                None => return RecordOutcome::Invalid,
             };
             let cid = record.cid.as_deref().unwrap_or_default();
 
@@ -331,15 +336,17 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
                 }
             }
         }
-        _ => RecordOutcome::Errored,
+        _ => RecordOutcome::Invalid,
     }
 }
 
-/// `Unavailable` when `e` means the database could not be reached, otherwise
-/// `Errored`.
+/// `Unavailable` when `e` means the database could not be reached, `Invalid`
+/// when it refused the data itself, otherwise `Errored`.
 fn failed_write_outcome(e: &sqlx::Error) -> RecordOutcome {
     if crate::db::is_unavailable(e) {
         RecordOutcome::Unavailable
+    } else if crate::db::is_invalid_data(e) {
+        RecordOutcome::Invalid
     } else {
         RecordOutcome::Errored
     }
@@ -465,8 +472,14 @@ async fn delete_record(
     tx.commit().await
 }
 
-/// Handle a `com.atproto.lexicon.schema` record event for tracked network lexicons.
-pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &RecordEvent) {
+/// Handle a `com.atproto.lexicon.schema` record event for tracked network
+/// lexicons. `SchemaEvent` when it was applied or is not one HappyView
+/// tracks; a database error is classified like a record write's.
+pub async fn handle_lexicon_schema_event(
+    state: &AppState,
+    did: &str,
+    record: &RecordEvent,
+) -> RecordOutcome {
     let db = &state.db;
     let lexicons = &state.lexicons;
     let collections_tx = &state.collections_tx;
@@ -479,23 +492,29 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
         "SELECT target_collection FROM happyview_lexicons WHERE id = ? AND source = 'network' AND authority_did = ?",
         backend,
     );
-    let tracked: Option<(Option<String>,)> = crate::db::query_as(&select_sql)
+    let tracked: Option<(Option<String>,)> = match crate::db::query_as(&select_sql)
         .bind(nsid)
         .bind(did)
         .fetch_optional(db)
         .await
-        .unwrap_or(None);
+    {
+        Ok(tracked) => tracked,
+        Err(e) => {
+            tracing::warn!(nsid, error = %e, "failed to look up a network lexicon for its event");
+            return failed_write_outcome(&e);
+        }
+    };
 
     let target_collection = match tracked {
         Some((tc,)) => tc,
-        None => return, // Not a tracked network lexicon.
+        None => return RecordOutcome::SchemaEvent, // Not a tracked network lexicon.
     };
 
     match record.action.as_str() {
         "create" | "update" => {
             let rec = match &record.record {
                 Some(r) => r,
-                None => return,
+                None => return RecordOutcome::Invalid,
             };
 
             let parsed = match ParsedLexicon::parse(
@@ -508,7 +527,7 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(nsid, "failed to parse lexicon schema event: {e}");
-                    return;
+                    return RecordOutcome::Invalid;
                 }
             };
 
@@ -529,20 +548,23 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
                 "#,
                 backend,
             );
-            if let Err(e) = crate::db::query(&upsert_sql)
-                .bind(nsid)
-                .bind(serde_json::to_string(rec).unwrap_or_default())
-                .bind(&target_collection)
-                .bind(did)
-                .bind(&now)
-                .bind(&now)
-                .bind(&now)
-                .bind(&now)
-                .execute(db)
-                .await
+            let lexicon_json = serde_json::to_string(rec).unwrap_or_default();
+            if let Err(e) = crate::db::retry_on_busy(|| {
+                crate::db::query(&upsert_sql)
+                    .bind(nsid)
+                    .bind(&lexicon_json)
+                    .bind(&target_collection)
+                    .bind(did)
+                    .bind(&now)
+                    .bind(&now)
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(db)
+            })
+            .await
             {
                 tracing::warn!(nsid, "failed to upsert lexicon from event: {e}");
-                return;
+                return failed_write_outcome(&e);
             }
 
             lexicons.upsert(parsed).await;
@@ -560,10 +582,11 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
                 crate::db::retry_on_busy(|| crate::db::query(&delete_sql).bind(nsid).execute(db))
                     .await
             {
-                // The registry keeps the lexicon too, so it and the table
-                // cannot disagree; the next delete event retries.
+                // Leave the registry alone too, so it and the table still
+                // agree. The outcome says whether the caller should retry
+                // this event (the Jetstream worker does); nothing else will.
                 tracing::error!(nsid, error = %e, "failed to delete network lexicon from event");
-                return;
+                return failed_write_outcome(&e);
             }
 
             let was_present = lexicons.remove(nsid).await;
@@ -573,8 +596,9 @@ pub async fn handle_lexicon_schema_event(state: &AppState, did: &str, record: &R
                 let _ = collections_tx.send(collections);
             }
         }
-        _ => {}
+        _ => return RecordOutcome::Invalid,
     }
+    RecordOutcome::SchemaEvent
 }
 
 #[cfg(test)]
@@ -1627,5 +1651,98 @@ mod tests {
             "the create must see the tombstone it waited for"
         );
         clean_up_rkey(&state, &rkey).await;
+    }
+
+    fn schema_event(action: &str) -> RecordEvent {
+        RecordEvent {
+            did: "did:plc:abc".to_string(),
+            collection: LEXICON_SCHEMA_COLLECTION.to_string(),
+            rkey: "com.example.schema".to_string(),
+            action: action.to_string(),
+            record: (action != "delete").then(|| {
+                serde_json::json!({
+                    "lexicon": 1,
+                    "id": "com.example.schema",
+                    "defs": {"main": {"type": "record", "key": "tid"}},
+                })
+            }),
+            cid: None,
+            rev: None,
+        }
+    }
+
+    /// A schema event cannot be dropped because the database was down: the
+    /// caller is told to retry it.
+    #[tokio::test]
+    async fn a_schema_event_during_an_outage_is_unavailable() {
+        let state = migrated_tracked_state().await;
+        state.db.close().await;
+        for action in ["create", "update", "delete"] {
+            assert_eq!(
+                handle_record_event(&state, &schema_event(action)).await,
+                RecordOutcome::Unavailable,
+                "{action}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_schema_event_whose_query_fails_is_errored() {
+        let state = migrated_tracked_state().await;
+        crate::db::query("DROP TABLE happyview_lexicons")
+            .execute(&state.db)
+            .await
+            .expect("drop lexicons table");
+        assert_eq!(
+            handle_record_event(&state, &schema_event("create")).await,
+            RecordOutcome::Errored
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schema_event_for_an_untracked_lexicon_changes_nothing() {
+        let state = migrated_tracked_state().await;
+        assert_eq!(
+            handle_record_event(&state, &schema_event("create")).await,
+            RecordOutcome::SchemaEvent
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_with_no_body_or_an_unknown_operation_is_invalid() {
+        let state = migrated_tracked_state().await;
+        let mut no_body = create_event();
+        no_body.record = None;
+        assert_eq!(
+            handle_record_event(&state, &no_body).await,
+            RecordOutcome::Invalid
+        );
+        let mut unknown = create_event();
+        unknown.action = "frobnicate".to_string();
+        assert_eq!(
+            handle_record_event(&state, &unknown).await,
+            RecordOutcome::Invalid
+        );
+        assert!(!record_exists(&state).await);
+    }
+
+    /// Postgres text cannot hold a NUL byte (`22021`), so a record keyed by
+    /// one can never be stored: it is invalid, not a failure worth retrying.
+    #[tokio::test]
+    async fn a_record_postgres_cannot_store_is_invalid() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        if state.db_backend != crate::db::DatabaseBackend::Postgres {
+            return;
+        }
+        register_tracked_lexicon(&state).await;
+        let rkey = format!("nul{}\0", uuid::Uuid::new_v4().simple());
+        let event = create_with(&rkey, serde_json::json!({"text": "hello"}));
+        assert_eq!(
+            handle_record_event(&state, &event).await,
+            RecordOutcome::Invalid
+        );
     }
 }

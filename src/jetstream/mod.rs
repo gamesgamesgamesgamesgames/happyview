@@ -323,7 +323,8 @@ async fn run(
                                     }
                                     RecordOutcome::SchemaEvent
                                     | RecordOutcome::Errored
-                                    | RecordOutcome::Unavailable => {}
+                                    | RecordOutcome::Unavailable
+                                    | RecordOutcome::Invalid => {}
                                 }
                             });
                         }
