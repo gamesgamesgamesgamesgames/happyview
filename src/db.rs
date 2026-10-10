@@ -1286,7 +1286,7 @@ mod tests {
                 &format!(
                     "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at, rev) \
                      VALUES (?, 'did:plc:rev', 'app.test.post', 'r', '{{}}', ?, ?, ?, ?) \
-                     ON CONFLICT (uri) DO UPDATE SET cid = excluded.cid, rev = excluded.rev \
+                     ON CONFLICT (uri) DO UPDATE SET cid = excluded.cid, rev = COALESCE(excluded.rev, happyview_records.rev) \
                      WHERE {}",
                     record_upsert_where(backend)
                 ),
@@ -1307,8 +1307,11 @@ mod tests {
                 ("c50", Some(tid(50)), ("c50", Some(tid(50)))),
                 ("c40", Some(tid(40)), ("c50", Some(tid(50)))),
                 ("c60", Some(tid(60)), ("c60", Some(tid(60)))),
-                ("c-none", None, ("c-none", None)),
-                ("c10", Some(tid(10)), ("c10", Some(tid(10)))),
+                // A write without a rev applies but keeps the stored rev, so
+                // an older delivery after it is still refused.
+                ("c-none", None, ("c-none", Some(tid(60)))),
+                ("c10", Some(tid(10)), ("c-none", Some(tid(60)))),
+                ("c70", Some(tid(70)), ("c70", Some(tid(70)))),
             ] {
                 crate::db::query(&upsert)
                     .bind(&uri)

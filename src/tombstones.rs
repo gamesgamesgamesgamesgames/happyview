@@ -78,28 +78,54 @@ fn placeholders(n: usize) -> String {
     vec!["?"; n].join(", ")
 }
 
-async fn advisory_xact_lock(
-    conn: &mut AnyConnection,
-    class: i32,
-    key: &str,
-) -> Result<(), sqlx::Error> {
-    crate::db::query(&format!(
-        "SELECT pg_advisory_xact_lock({class}, hashtext($1))"
-    ))
-    .bind(key)
-    .execute(&mut *conn)
-    .await?;
+/// The distinct advisory lock keys (`hashtext`) of `keys`, ascending. Keys
+/// are hashed by Postgres in chunks (the `Any` driver cannot bind an array)
+/// and sorted once across all of them, so every transaction locks a given
+/// set of keys in the same order. Two strings whose hashes collide share a
+/// lock and appear once. Postgres only.
+async fn lock_key_order(conn: &mut AnyConnection, keys: &[&str]) -> Result<Vec<i32>, sqlx::Error> {
+    let mut hashes = Vec::with_capacity(keys.len());
+    for chunk in keys.chunks(LOOKUP_CHUNK) {
+        let values = (1..=chunk.len())
+            .map(|i| format!("(${i}::text)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT DISTINCT hashtext(k) AS h FROM (VALUES {values}) v(k)");
+        let mut query = crate::db::query_as::<(i32,)>(&sql);
+        for key in chunk {
+            query = query.bind(*key);
+        }
+        hashes.extend(query.fetch_all(&mut *conn).await?.into_iter().map(|(h,)| h));
+    }
+    hashes.sort_unstable();
+    hashes.dedup();
+    Ok(hashes)
+}
+
+/// Take `class`'s transaction-scoped advisory lock on each of `keys`, in
+/// ascending key order with each key locked once (see `lock_key_order`).
+async fn lock_keys(conn: &mut AnyConnection, class: i32, keys: &[&str]) -> Result<(), sqlx::Error> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let sql = format!("SELECT pg_advisory_xact_lock({class}, $1)");
+    for hash in lock_key_order(conn, keys).await? {
+        crate::db::query(&sql)
+            .bind(hash)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
 }
 
 /// On Postgres, lock each of `uris` until the caller's transaction ends, so
 /// a tombstone check and the write it guards are not interleaved with another
-/// writer's on the same record. Locks are taken in sorted order with
-/// duplicates dropped, so two batches that share URIs cannot deadlock on
-/// them (a deadlock between two URIs whose hashes collide is still possible;
-/// Postgres aborts one with `40P01`, which `retry_on_busy` retries). Lock
-/// every URI a transaction will touch here, before its first check. A no-op
-/// on SQLite, where `begin_write` already holds the database's write lock.
+/// writer's on the same record. Every transaction takes its locks in
+/// ascending lock-key order, each key once, so two transactions that lock
+/// overlapping sets of URIs in one call cannot deadlock on them. Lock every
+/// URI a transaction will touch in one call, before its first check, and
+/// after any `lock_dids`. A no-op on SQLite, where `begin_write` already
+/// holds the database's write lock.
 pub async fn lock_uris(
     conn: &mut AnyConnection,
     backend: DatabaseBackend,
@@ -108,28 +134,31 @@ pub async fn lock_uris(
     if backend != DatabaseBackend::Postgres {
         return Ok(());
     }
-    let mut uris = uris.to_vec();
-    uris.sort_unstable();
-    uris.dedup();
-    for uri in uris {
-        advisory_xact_lock(conn, URI_LOCK_CLASS, uri).await?;
-    }
-    Ok(())
+    lock_keys(conn, URI_LOCK_CLASS, uris).await
 }
 
-/// On Postgres, lock the account `did` until the caller's transaction ends,
-/// so a DID tombstone, its purge and a write for the account are not
-/// interleaved. Take it before any `lock_uris` in the same transaction. A
-/// no-op on SQLite.
+/// On Postgres, lock each of the accounts `dids` until the caller's
+/// transaction ends, so a DID tombstone, its purge and writes for the account
+/// are not interleaved. Same ordering as `lock_uris`; lock DIDs before URIs,
+/// all of them in one call. A no-op on SQLite.
+pub async fn lock_dids(
+    conn: &mut AnyConnection,
+    backend: DatabaseBackend,
+    dids: &[&str],
+) -> Result<(), sqlx::Error> {
+    if backend != DatabaseBackend::Postgres {
+        return Ok(());
+    }
+    lock_keys(conn, DID_LOCK_CLASS, dids).await
+}
+
+/// `lock_dids` for one account.
 pub async fn lock_did(
     conn: &mut AnyConnection,
     backend: DatabaseBackend,
     did: &str,
 ) -> Result<(), sqlx::Error> {
-    if backend != DatabaseBackend::Postgres {
-        return Ok(());
-    }
-    advisory_xact_lock(conn, DID_LOCK_CLASS, did).await
+    lock_dids(conn, backend, &[did]).await
 }
 
 /// The URIs among `candidates` that a record or DID tombstone supersedes.
@@ -232,7 +261,8 @@ pub async fn write_record_tombstone(
 /// Record that the account `did` was deleted. `rev` orders the deletion
 /// against commit revs; `seq` is the Jetstream seq, when there is one.
 /// Takes the DID's lock (`lock_did`), so call it inside a `begin_write`
-/// transaction.
+/// transaction, before any `lock_uris` in that transaction: DIDs are always
+/// locked before URIs.
 pub async fn write_did_tombstone(
     conn: &mut AnyConnection,
     backend: DatabaseBackend,
@@ -265,6 +295,11 @@ pub async fn write_did_tombstone(
 /// batches, optionally only in `collections`. Local writes still awaiting
 /// their echo are left alone. Each batch is its own `begin_write`
 /// transaction holding the DID's lock. Returns the records deleted.
+///
+/// The caller must commit any transaction of its own that holds the DID's
+/// lock (the one that wrote the DID tombstone, say) before calling this.
+/// Otherwise the purge waits forever on a lock its caller holds, and Postgres
+/// cannot report it as a deadlock because the holder is idle in transaction.
 pub async fn purge_did_records(
     db: &AnyPool,
     backend: DatabaseBackend,
@@ -736,6 +771,13 @@ mod tests {
         lock_did(&mut tx, DatabaseBackend::Sqlite, "did:plc:a")
             .await
             .expect("no-op did lock");
+        lock_dids(
+            &mut tx,
+            DatabaseBackend::Sqlite,
+            &["did:plc:a", "did:plc:b"],
+        )
+        .await
+        .expect("no-op did locks");
         tx.commit().await.expect("commit");
     }
 
@@ -778,6 +820,74 @@ mod tests {
                 lock_is_free(&pool, DID_LOCK_CLASS, &did).await,
                 "released at commit"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_keys_are_taken_in_hash_order_once_each_on_postgres() {
+        for (pool, backend) in test_pools().await {
+            if backend != DatabaseBackend::Postgres {
+                continue;
+            }
+            let mut conn = pool.acquire().await.expect("connection");
+            // Two distinct strings whose hashes collide.
+            let (a, b): (String, String) = crate::db::query_as(
+                "SELECT MIN(k), MAX(k) FROM \
+                 (SELECT 'k' || i AS k FROM generate_series(1, 300000) i) s \
+                 GROUP BY hashtext(k) HAVING COUNT(*) > 1 LIMIT 1",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .expect("find a hashtext collision");
+            assert_ne!(a, b);
+
+            let keys = ["zeta", "alpha", "mid", "alpha", a.as_str(), b.as_str()];
+            let mut reversed = keys;
+            reversed.reverse();
+            let order = lock_key_order(&mut conn, &keys).await.expect("order");
+            assert_eq!(order.len(), 4, "duplicates and collisions lock once");
+            assert!(
+                order.windows(2).all(|w| w[0] < w[1]),
+                "ascending: {order:?}"
+            );
+            assert_eq!(
+                lock_key_order(&mut conn, &reversed).await.expect("order"),
+                order,
+                "input order does not matter"
+            );
+
+            // Keys spread over several lookup chunks still come back in one
+            // global order.
+            let many: Vec<String> = (0..LOOKUP_CHUNK * 2 + 7)
+                .map(|i| format!("key{i}"))
+                .collect();
+            let many: Vec<&str> = many.iter().map(String::as_str).collect();
+            let order = lock_key_order(&mut conn, &many).await.expect("order");
+            assert_eq!(order.len(), many.len());
+            assert!(order.windows(2).all(|w| w[0] < w[1]));
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_dids_locks_every_did_on_postgres() {
+        for (pool, backend) in test_pools().await {
+            if backend != DatabaseBackend::Postgres {
+                continue;
+            }
+            let (one, two) = (unique("did:plc:a"), unique("did:plc:b"));
+            let mut tx = begin_write(&pool, backend).await.expect("begin");
+            lock_dids(&mut tx, backend, &[&two, &one, &two])
+                .await
+                .expect("lock dids");
+            for did in [&one, &two] {
+                assert!(
+                    !lock_is_free(&pool, DID_LOCK_CLASS, did).await,
+                    "{did} is locked"
+                );
+                assert!(lock_is_free(&pool, URI_LOCK_CLASS, did).await);
+            }
+            tx.commit().await.expect("commit");
+            assert!(lock_is_free(&pool, DID_LOCK_CLASS, &one).await);
         }
     }
 
