@@ -713,3 +713,340 @@ async fn a_fresh_instance_with_a_stuck_event_resumes_past_what_it_dispatched() {
     assert_eq!(rkeys(&app, did).await, vec!["r1", "r2", "r3", "r4"]);
     assert_eq!(received(&app), base + 4);
 }
+
+/// A Jetstream without v2 answers 404; `auto` falls back to v1, which still
+/// applies commits and account deletions (v1 never sends `#sync`).
+#[tokio::test]
+#[serial]
+async fn v1_serves_when_v2_answers_404() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    mock.disable_v2();
+    mock.push([
+        js::create(1, "did:plc:v1", GAME, "a", game("a")),
+        js::create(2, "did:plc:v1", GAME, "b", game("b")),
+        js::create(3, "did:plc:v1gone", GAME, "c", game("c")),
+        js::account(4, "did:plc:v1gone", false, Some("deleted")),
+        js::sync(5, "did:plc:v1"),
+        js::create(6, "did:plc:v1", GAME, "d", game("d")),
+    ]);
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!(
+        "the v1 cursor reaches seq 6",
+        setting(&app, "jetstream_cursor").await == Some(js::witnessed_us(6).to_string())
+    );
+    let connections = mock.connections();
+    assert_eq!(connections[0].path, "v2");
+    assert_eq!(connections[1].path, "v1");
+    assert_eq!(connections[1].param("compress").as_deref(), Some("false"));
+    assert_eq!(rkeys(&app, "did:plc:v1").await, vec!["a", "b", "d"]);
+    assert!(rkeys(&app, "did:plc:v1gone").await.is_empty());
+    assert_eq!(
+        setting(&app, "jetstream_seq").await,
+        None,
+        "v1 has no seq to save"
+    );
+}
+
+/// A seq cursor below the server's retention is refused before the upgrade.
+/// The consumer resumes by the witnessed time it saved alongside, which the
+/// server clamps up to its floor with an `#info OutdatedCursor`: that notice
+/// is the gap.
+#[tokio::test]
+#[serial]
+async fn a_cursor_past_retention_resumes_by_witnessed_time() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    set_setting(&app, "jetstream_seq", "5").await;
+    set_setting(&app, "jetstream_cursor", &js::witnessed_us(5).to_string()).await;
+    set_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.set_retention_floor(90);
+    mock.push((100..=102).map(|s| js::create(s, "did:plc:gap", GAME, &format!("r{s}"), game("x"))));
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 102 applied", applied_through(&app, 102).await);
+    let connections = mock.connections();
+    assert_eq!(connections[0].param("cursor").as_deref(), Some("5"));
+    assert_eq!(
+        connections[1].param("cursor"),
+        Some(js::witnessed_us(5).to_string()),
+        "the retry resumes by witnessed time"
+    );
+    assert_eq!(connections.len(), 2, "{connections:?}");
+    assert_eq!(
+        events(&app, "jetstream.gap").await,
+        vec![json!({"reason": "OutdatedCursor", "message": "cursor clamped to seq 90"})]
+    );
+    assert_eq!(
+        rkeys(&app, "did:plc:gap").await,
+        vec!["r100", "r101", "r102"]
+    );
+}
+
+/// With no witnessed time saved, a refused seq leaves only the live tip; the
+/// range lost is logged once the first event shows where the stream resumed.
+#[tokio::test]
+#[serial]
+async fn a_cursor_past_retention_without_a_time_resumes_from_the_tip() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    set_setting(&app, "jetstream_seq", "5").await;
+    set_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.set_retention_floor(90);
+    mock.push((100..=102).map(|s| js::create(s, "did:plc:tip", GAME, &format!("r{s}"), game("x"))));
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 102 applied", applied_through(&app, 102).await);
+    let connections = mock.connections();
+    assert_eq!(connections[0].param("cursor").as_deref(), Some("5"));
+    assert_eq!(
+        connections[1].param("cursor"),
+        None,
+        "the retry starts at the live tip"
+    );
+    assert_eq!(
+        events(&app, "jetstream.gap").await,
+        vec![json!({
+            "reason": "CursorTooOld",
+            "message": "cursor 5 below lookback floor 90",
+            "after_seq": 5,
+            "resumed_at_seq": 100,
+        })]
+    );
+    assert_eq!(
+        rkeys(&app, "did:plc:tip").await,
+        vec!["r100", "r101", "r102"]
+    );
+}
+
+/// The seq refused is the last one dispatched, ahead of the saved one (an
+/// event is still applying). The retry must not bring it back through
+/// `last_dispatched`: it resumes by witnessed time, and the mock refuses
+/// every seq below its floor, so a retry of the seq would loop forever.
+#[tokio::test]
+#[serial]
+async fn a_refused_dispatched_seq_is_not_retried() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    let did = "did:plc:refused";
+    let event = |s: i64| js::create(s, did, GAME, &format!("r{s:02}"), game("x"));
+    mock.push((1..=2).map(event));
+    let base = received(&app);
+    let _consumer = start(
+        &app,
+        Settings {
+            drain_timeout: Duration::from_millis(200),
+            ..settings(&mock)
+        },
+    );
+    wait_until!("seq 2 applied", applied_through(&app, 2).await);
+
+    let blocker = Blocker::hold(&app, &format!("at://{did}/{GAME}/r03")).await;
+    mock.push([event(3)]);
+    mock.kick();
+    wait_until!("seq 3 dispatched", received(&app) == base + 3);
+
+    mock.set_retention_floor(10);
+    mock.push((10..=12).map(event));
+    mock.kick();
+    wait_until!(
+        "a reconnect past the refusal",
+        mock.connections().len() >= 4
+    );
+    let connections = mock.connections();
+    assert_eq!(
+        setting(&app, "jetstream_seq").await.as_deref(),
+        Some("2"),
+        "seq 3 is still applying"
+    );
+    assert_eq!(
+        connections[2].param("cursor").as_deref(),
+        Some("3"),
+        "resumes past the dispatched seq 3, which is refused"
+    );
+    assert_eq!(
+        connections[3].param("cursor"),
+        Some(js::witnessed_us(2).to_string()),
+        "then by the saved witnessed time, not the refused seq"
+    );
+
+    blocker.release().await;
+    wait_until!("seq 12 applied", applied_through(&app, 12).await);
+    assert_eq!(
+        rkeys(&app, did).await,
+        vec!["r01", "r02", "r03", "r10", "r11", "r12"]
+    );
+    assert!(
+        mock.connections()[3..].iter().all(|c| c
+            .param("cursor")
+            .and_then(|c| c.parse::<i64>().ok())
+            .is_none_or(|c| c >= 10)),
+        "a refused seq was retried: {:?}",
+        mock.connections()
+    );
+}
+
+/// A timestamp cursor (the pre-upgrade one) older than retention is clamped
+/// by the server with an `#info OutdatedCursor` notice, which is a gap too.
+#[tokio::test]
+#[serial]
+async fn a_clamped_time_cursor_logs_the_gap() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    set_setting(&app, "jetstream_cursor", &js::witnessed_us(1).to_string()).await;
+    mock.notice_next("OutdatedCursor", "cursor clamped to seq 90");
+    mock.push((1..=2).map(|s| js::create(s, "did:plc:clamped", GAME, &format!("r{s}"), game("x"))));
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 2 applied", applied_through(&app, 2).await);
+    assert_eq!(
+        events(&app, "jetstream.gap").await,
+        vec![json!({"reason": "OutdatedCursor", "message": "cursor clamped to seq 90"})]
+    );
+}
+
+/// The server's seqs started over below the saved one: it answers the
+/// resume with `#info FutureCursor` and streams from its tip. The consumer
+/// drops its dedup floor, so the new, lower seqs apply and are saved.
+#[tokio::test]
+#[serial]
+async fn a_future_cursor_restarts_the_seq_floor() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    mock.push(
+        (10..=12).map(|s| js::create(s, "did:plc:before", GAME, &format!("r{s}"), game("x"))),
+    );
+    let _consumer = start(&app, settings(&mock));
+    wait_until!("seq 12 applied", applied_through(&app, 12).await);
+
+    mock.reset_events();
+    mock.push((1..=3).map(|s| js::create(s, "did:plc:after", GAME, &format!("r{s}"), game("x"))));
+    mock.notice_next("FutureCursor", "cursor 12 is past the next seq 4");
+    mock.kick();
+
+    wait_until!(
+        "the new seq 3 saved",
+        setting(&app, "jetstream_seq").await.as_deref() == Some("3")
+    );
+    assert_eq!(mock.connections()[1].param("cursor").as_deref(), Some("12"));
+    assert_eq!(rkeys(&app, "did:plc:after").await, vec!["r1", "r2", "r3"]);
+    assert_eq!(
+        events(&app, "jetstream.gap").await,
+        vec![json!({"reason": "future_cursor", "from_seq": 12})]
+    );
+}
+
+/// The server retrains its dictionary: a reconnect offering the old one is
+/// refused, and the consumer refetches and offers the new one.
+#[tokio::test]
+#[serial]
+async fn a_rotated_dictionary_is_refetched() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    mock.push((1..=3).map(|s| js::create(s, "did:plc:dict", GAME, &format!("r{s}"), game("x"))));
+    let _consumer = start(&app, settings(&mock));
+    wait_until!("seq 3 applied", applied_through(&app, 3).await);
+
+    mock.serve_dictionary(Some(js::DICTIONARY_B));
+    mock.accept_dictionaries(&[js::DICTIONARY_B]);
+    mock.push((4..=6).map(|s| js::create(s, "did:plc:dict", GAME, &format!("r{s}"), game("x"))));
+    mock.kick();
+
+    wait_until!("seq 6 applied", applied_through(&app, 6).await);
+    let connections = mock.connections();
+    assert!(
+        connections.iter().any(|c| {
+            c.param("zstdDictionary") == Some(js::DICTIONARY_A.to_string())
+                && c.param("cursor").as_deref() == Some("3")
+        }),
+        "the reconnect first offered the retired dictionary: {connections:?}"
+    );
+    assert_eq!(
+        connections
+            .last()
+            .expect("connections")
+            .param("zstdDictionary"),
+        Some(js::DICTIONARY_B.to_string())
+    );
+    assert_eq!(rkeys(&app, "did:plc:dict").await.len(), 6);
+}
+
+/// When refetching gives back the same refused dictionary, compression is
+/// dropped rather than the stream.
+#[tokio::test]
+#[serial]
+async fn compression_falls_back_when_the_dictionary_stays_unknown() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    mock.accept_dictionaries(&[]);
+    mock.push((1..=3).map(|s| js::create(s, "did:plc:plain", GAME, &format!("r{s}"), game("x"))));
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 3 applied", applied_through(&app, 3).await);
+    let connections = mock.connections();
+    assert_eq!(
+        connections[0].param("zstdDictionary"),
+        Some(js::DICTIONARY_A.to_string())
+    );
+    assert_eq!(connections[1].param("zstdDictionary"), None);
+    assert_eq!(rkeys(&app, "did:plc:plain").await.len(), 3);
+}
+
+/// `InvalidRequest` will not fix itself on a quick retry: it is logged as an
+/// error and retried after `invalid_request_retry` (an hour in production).
+#[tokio::test]
+#[serial]
+async fn an_invalid_request_is_logged_and_retried_later() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    mock.reject_next(400, "InvalidRequest", "collections: bad nsid");
+    mock.push([js::create(1, "did:plc:invalid", GAME, "a", game("a"))]);
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 1 applied", applied_through(&app, 1).await);
+    assert_eq!(
+        events(&app, "jetstream.invalid_request").await,
+        vec![json!({"message": "collections: bad nsid", "retry_in_secs": 0})]
+    );
+}
+
+/// A 400 with no body to classify: first drop the dictionary, then the seq
+/// cursor (for the witnessed time), and the third time in a row treat it as
+/// `InvalidRequest`.
+#[tokio::test]
+#[serial]
+async fn an_unexplained_400_steps_down_then_waits() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    set_setting(&app, "jetstream_seq", "5").await;
+    set_setting(&app, "jetstream_cursor", &js::witnessed_us(5).to_string()).await;
+    set_setting(&app, "jetstream_host", &mock.host()).await;
+    for _ in 0..3 {
+        mock.reject_next_bare(400);
+    }
+    mock.push((6..=8).map(|s| js::create(s, "did:plc:bare", GAME, &format!("r{s}"), game("x"))));
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 8 applied", applied_through(&app, 8).await);
+    let connections = mock.connections();
+    let shape: Vec<(Option<String>, Option<String>)> = connections
+        .iter()
+        .map(|c| (c.param("cursor"), c.param("zstdDictionary")))
+        .collect();
+    let time = js::witnessed_us(5).to_string();
+    assert_eq!(
+        shape,
+        vec![
+            (Some("5".into()), Some(js::DICTIONARY_A.to_string())),
+            (Some("5".into()), None),
+            (Some(time.clone()), None),
+            (Some(time), None),
+        ]
+    );
+    assert_eq!(
+        events(&app, "jetstream.invalid_request").await,
+        vec![json!({"message": "HTTP 400", "retry_in_secs": 0})]
+    );
+    assert_eq!(rkeys(&app, "did:plc:bare").await, vec!["r6", "r7", "r8"]);
+}

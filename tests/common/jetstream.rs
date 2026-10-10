@@ -1,6 +1,6 @@
 //! A scripted Jetstream: the v2 `subscribeEvents` and v1 `/subscribe`
 //! websockets and `getZstdDictionary`, enough to drive the consumer through
-//! cursor resumes, compression and pre-upgrade errors.
+//! cursor resumes, compression, pre-upgrade errors and a retention floor.
 //!
 //! Events are scripted as v2 payloads with `push`. A connection gets every
 //! scripted event at or after its cursor (all of them without one) that its
@@ -213,8 +213,9 @@ impl Connection {
 struct Inner {
     events: Vec<Value>,
     v2_disabled: bool,
-    rejections: VecDeque<(u16, Value)>,
+    rejections: VecDeque<(u16, Option<Value>)>,
     notices: VecDeque<(String, String)>,
+    retention_floor: Option<i64>,
     served_dictionary: Option<u32>,
     accepted_dictionaries: HashSet<u32>,
     connections: Vec<Connection>,
@@ -293,10 +294,29 @@ impl MockJetstream {
         self.shared
             .lock()
             .rejections
-            .push_back((status, json!({"error": error, "message": message})));
+            .push_back((status, Some(json!({"error": error, "message": message}))));
     }
 
-    /// Send an `#info` frame first on the next v2 connection.
+    /// Refuse the next v2 connection before upgrading, with no body at all.
+    pub fn reject_next_bare(&self, status: u16) {
+        self.shared.lock().rejections.push_back((status, None));
+    }
+
+    /// Keep only the events from `seq` on, as a server past its lookback
+    /// does: a v2 seq cursor below it is refused with `CursorTooOld`, and a
+    /// witnessed-time cursor below it is clamped with `#info OutdatedCursor`.
+    pub fn set_retention_floor(&self, seq: i64) {
+        self.shared.lock().retention_floor = Some(seq);
+    }
+
+    /// Forget every scripted event, as a server whose seqs started over.
+    pub fn reset_events(&self) {
+        self.shared.lock().events.clear();
+    }
+
+    /// Send an `#info` frame first on the next v2 connection. After a
+    /// `FutureCursor` notice that connection ignores its cursor and gets
+    /// every scripted event, as from the live tip.
     pub fn notice_next(&self, name: &str, message: &str) {
         self.shared
             .lock()
@@ -329,8 +349,14 @@ impl Drop for MockJetstream {
 }
 
 /// The scripted events a connection gets: at or after its cursor (a seq, or
-/// a witnessed time from 1e15 up), commits only in its collections.
-fn select(events: &[Value], params: &[(String, String)], collection_param: &str) -> Vec<Value> {
+/// a witnessed time from 1e15 up) and the retention floor, commits only in
+/// its collections.
+fn select(
+    events: &[Value],
+    params: &[(String, String)],
+    collection_param: &str,
+    floor: Option<i64>,
+) -> Vec<Value> {
     let collections: Vec<&str> = params
         .iter()
         .filter(|(k, _)| k == collection_param)
@@ -349,13 +375,14 @@ fn select(events: &[Value], params: &[(String, String)], collection_param: &str)
                 Some(c) if c < TIMESTAMP_CURSOR_MIN => seq >= c,
                 Some(c) => witnessed_us(seq) >= c,
             };
+            let retained = floor.is_none_or(|floor| seq >= floor);
             let is_commit = event["$type"]
                 .as_str()
                 .is_some_and(|t| t.ends_with("#commit"));
             let wanted = !is_commit
                 || collections.is_empty()
                 || collections.contains(&event["collection"].as_str().unwrap_or_default());
-            after_cursor && wanted
+            after_cursor && retained && wanted
         })
         .cloned()
         .collect()
@@ -378,11 +405,11 @@ async fn v2_subscribe(
             return (StatusCode::NOT_FOUND, "404 page not found").into_response();
         }
         if let Some((status, body)) = inner.rejections.pop_front() {
-            return (
-                StatusCode::from_u16(status).expect("status"),
-                axum::Json(body),
-            )
-                .into_response();
+            let status = StatusCode::from_u16(status).expect("status");
+            return match body {
+                Some(body) => (status, axum::Json(body)).into_response(),
+                None => status.into_response(),
+            };
         }
         let requested = params
             .iter()
@@ -403,8 +430,42 @@ async fn v2_subscribe(
             Some(id) => Some(fixture_dictionary(id)),
             None => None,
         };
+        let mut params = params;
+        let mut notice = inner.notices.pop_front();
+        if let Some(floor) = inner.retention_floor {
+            let cursor = params
+                .iter()
+                .position(|(k, _)| k == "cursor")
+                .map(|i| (i, params[i].1.parse::<i64>().expect("numeric cursor")));
+            match cursor {
+                Some((_, c)) if c < TIMESTAMP_CURSOR_MIN && c < floor => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({
+                            "error": "CursorTooOld",
+                            "message": format!("cursor {c} below lookback floor {floor}"),
+                        })),
+                    )
+                        .into_response();
+                }
+                Some((i, c)) if c >= TIMESTAMP_CURSOR_MIN && c < witnessed_us(floor) => {
+                    params[i].1 = floor.to_string();
+                    notice = Some((
+                        "OutdatedCursor".to_string(),
+                        format!("cursor clamped to seq {floor}"),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if notice
+            .as_ref()
+            .is_some_and(|(name, _)| name == "FutureCursor")
+        {
+            params.retain(|(k, _)| k != "cursor");
+        }
         let mut frames: Vec<String> = Vec::new();
-        if let Some((name, message)) = inner.notices.pop_front() {
+        if let Some((name, message)) = notice {
             frames.push(
                 json!({"$type": "message", "payload": {
                     "$type": "network.bsky.jetstream.subscribeEvents#info",
@@ -415,7 +476,7 @@ async fn v2_subscribe(
             );
         }
         frames.extend(
-            select(&inner.events, &params, "collections")
+            select(&inner.events, &params, "collections", inner.retention_floor)
                 .into_iter()
                 .map(|p| json!({"$type": "message", "payload": p}).to_string()),
         );
@@ -438,11 +499,16 @@ async fn v1_subscribe(
             path: "v1",
             query: query.clone(),
         });
-        select(&inner.events, &params, "wantedCollections")
-            .iter()
-            .filter_map(to_v1)
-            .map(|f| f.to_string())
-            .collect()
+        select(
+            &inner.events,
+            &params,
+            "wantedCollections",
+            inner.retention_floor,
+        )
+        .iter()
+        .filter_map(to_v1)
+        .map(|f| f.to_string())
+        .collect()
     };
     let kick = shared.kick.subscribe();
     ws.on_upgrade(move |socket| serve(socket, frames, None, kick))

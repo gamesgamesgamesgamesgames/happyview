@@ -66,20 +66,47 @@ pub fn spawn_with(
 
 /// Connection state carried across reconnects.
 struct Session {
+    choice: ProtocolChoice,
     protocol: Protocol,
     compression: bool,
     dictionary: Option<Arc<compression::Dictionary>>,
+    /// The cursor the last connection asked for.
+    sent_cursor: Option<i64>,
+    /// A saved seq the server refused (`CursorTooOld`) or that belongs to
+    /// seq numbering it no longer has (`FutureCursor`). While it is still the
+    /// saved one, resumes go by the saved witnessed time instead.
+    stale_seq: Option<i64>,
+    /// Connect without a cursor: neither the saved seq nor a witnessed time
+    /// will do. Cleared by the first event.
+    from_tip: bool,
+    /// A resume from the tip that lost events, reported once the first event
+    /// shows where the stream picked up again.
+    pending_gap: Option<Gap>,
+    /// 400s in a row with no error name to go by (`handle_rejection`).
+    unexplained_400s: u32,
+}
+
+struct Gap {
+    reason: String,
+    after_seq: Option<i64>,
+    message: String,
 }
 
 impl Session {
     fn new(settings: &Settings) -> Self {
         Self {
+            choice: settings.protocol,
             protocol: match settings.protocol {
                 ProtocolChoice::V1 => Protocol::V1,
                 ProtocolChoice::Auto | ProtocolChoice::V2 => Protocol::V2,
             },
             compression: settings.compression,
             dictionary: None,
+            sent_cursor: None,
+            stale_seq: None,
+            from_tip: false,
+            pending_gap: None,
+            unexplained_400s: 0,
         }
     }
 }
@@ -87,6 +114,235 @@ impl Session {
 enum SessionEnd {
     CollectionsChanged,
     Closed { delivered: bool },
+    Rejected(Rejection),
+}
+
+/// A subscription the server refused before upgrading, by its XRPC error
+/// name. v1 errors are plain text and land in `Other` (or `NotFound`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Rejection {
+    NotFound,
+    CursorTooOld(String),
+    UnknownDictionary(String),
+    InvalidRequest(String),
+    Unavailable,
+    /// `message` is `HTTP <status>`, then the body if there was one.
+    Other {
+        status: u16,
+        message: String,
+    },
+}
+
+/// The body is whatever arrived with the headers, so it can be cut short or
+/// missing; a known error name in the text still counts.
+fn classify_rejection(status: u16, body: &[u8]) -> Rejection {
+    #[derive(serde::Deserialize)]
+    struct XrpcError {
+        error: String,
+        #[serde(default)]
+        message: Option<String>,
+    }
+    let text = String::from_utf8_lossy(body);
+    let parsed: Option<XrpcError> = serde_json::from_slice(body).ok();
+    let name = parsed.as_ref().map(|e| e.error.clone()).or_else(|| {
+        ["CursorTooOld", "UnknownZstdDictionary", "InvalidRequest"]
+            .into_iter()
+            .find(|name| text.contains(name))
+            .map(str::to_string)
+    });
+    let message = parsed
+        .and_then(|e| e.message)
+        .unwrap_or_else(|| text.trim().to_string());
+    match (status, name.as_deref()) {
+        (404, _) => Rejection::NotFound,
+        (503, _) => Rejection::Unavailable,
+        (400, Some("CursorTooOld")) => Rejection::CursorTooOld(message),
+        (400, Some("UnknownZstdDictionary")) => Rejection::UnknownDictionary(message),
+        (400, Some("InvalidRequest")) => Rejection::InvalidRequest(message),
+        _ if message.is_empty() => Rejection::Other {
+            status,
+            message: format!("HTTP {status}"),
+        },
+        _ => Rejection::Other {
+            status,
+            message: format!("HTTP {status}: {message}"),
+        },
+    }
+}
+
+/// What to do about a refusal. Returns how long to wait before the next
+/// attempt, or `None` for the ordinary backoff.
+async fn handle_rejection(
+    state: &AppState,
+    settings: &Settings,
+    session: &mut Session,
+    last_dispatched: &mut Option<i64>,
+    rejection: Rejection,
+) -> Option<Duration> {
+    match rejection {
+        Rejection::NotFound
+            if session.choice == ProtocolChoice::Auto && session.protocol == Protocol::V2 =>
+        {
+            tracing::info!("jetstream has no v2 endpoint; subscribing to v1 /subscribe");
+            session.protocol = Protocol::V1;
+            // v1 resumes by witnessed time only.
+            *last_dispatched = None;
+            Some(Duration::ZERO)
+        }
+        Rejection::CursorTooOld(message) => {
+            resume_without_seq(state, session, last_dispatched, "CursorTooOld", message).await;
+            Some(Duration::ZERO)
+        }
+        Rejection::UnknownDictionary(message) => {
+            let refused = session.dictionary.as_ref().map(|d| d.id);
+            match compression::fetch_dictionary(
+                &state.http,
+                &config::dictionary_url(&settings.endpoint),
+            )
+            .await
+            {
+                Ok(dictionary) if Some(dictionary.id) != refused => {
+                    tracing::info!(
+                        old = ?refused,
+                        new = dictionary.id,
+                        "jetstream rotated its zstd dictionary"
+                    );
+                    session.dictionary = Some(Arc::new(dictionary));
+                }
+                _ => {
+                    tracing::warn!(
+                        %message,
+                        "jetstream refuses its own zstd dictionary; subscribing uncompressed"
+                    );
+                    session.compression = false;
+                    session.dictionary = None;
+                }
+            }
+            Some(Duration::ZERO)
+        }
+        Rejection::InvalidRequest(message) => Some(invalid_request(state, settings, message).await),
+        // tungstenite hands over only the body bytes that came with the
+        // headers, so a 400 may arrive with nothing to classify. Step down
+        // through what could be wrong with the request, and only then wait.
+        Rejection::Other {
+            status: 400,
+            message,
+        } => {
+            session.unexplained_400s += 1;
+            match session.unexplained_400s {
+                1 => {
+                    tracing::warn!(%message, "jetstream refused the subscription; retrying uncompressed");
+                    session.compression = false;
+                    session.dictionary = None;
+                }
+                2 => {
+                    resume_without_seq(state, session, last_dispatched, "HTTP 400", message).await;
+                }
+                _ => return Some(invalid_request(state, settings, message).await),
+            }
+            Some(Duration::ZERO)
+        }
+        Rejection::NotFound => {
+            tracing::warn!("jetstream answered 404 for the subscription");
+            None
+        }
+        Rejection::Unavailable => {
+            tracing::warn!("jetstream is unavailable; retrying");
+            None
+        }
+        Rejection::Other { message, .. } => {
+            tracing::warn!(%message, "jetstream refused the subscription");
+            None
+        }
+    }
+}
+
+/// Stop resuming by seq: the refused one, the saved one and the last one
+/// dispatched all go. The next connection resumes by the saved witnessed
+/// time, or from the live tip when there is none or it was just refused.
+async fn resume_without_seq(
+    state: &AppState,
+    session: &mut Session,
+    last_dispatched: &mut Option<i64>,
+    reason: &str,
+    message: String,
+) {
+    *last_dispatched = None;
+    let stored = match cursor::load(&state.db, state.db_backend).await {
+        Ok(stored) => stored,
+        Err(e) => {
+            // The next attempt tries again, and is likely refused again.
+            tracing::warn!(error = %e, "failed to load the jetstream cursor");
+            return;
+        }
+    };
+    session.stale_seq = stored.seq;
+    let sent_time = session
+        .sent_cursor
+        .is_some_and(|c| c >= cursor::TIMESTAMP_CURSOR_MIN);
+    if stored.time_us.is_some() && !sent_time {
+        tracing::warn!(
+            %message,
+            reason,
+            "jetstream refused the seq cursor; resuming by witnessed time"
+        );
+        return;
+    }
+    tracing::warn!(
+        %message,
+        reason,
+        "jetstream refused the cursor and no witnessed time is left; resuming from the live tip"
+    );
+    session.from_tip = true;
+    if session.sent_cursor.is_some() {
+        session.pending_gap = Some(Gap {
+            reason: reason.to_string(),
+            after_seq: stored.seq,
+            message,
+        });
+    }
+}
+
+/// Log a refusal that will not fix itself on a quick retry; returns how long
+/// to wait before trying again.
+async fn invalid_request(state: &AppState, settings: &Settings, message: String) -> Duration {
+    let retry = settings.invalid_request_retry;
+    tracing::error!(
+        %message,
+        retry_in_secs = retry.as_secs(),
+        "jetstream rejected the subscription as invalid"
+    );
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "jetstream.invalid_request".to_string(),
+            severity: Severity::Error,
+            actor_did: None,
+            subject: None,
+            detail: serde_json::json!({
+                "message": message,
+                "retry_in_secs": retry.as_secs(),
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
+    retry
+}
+
+async fn log_gap(state: &AppState, detail: serde_json::Value) {
+    log_event(
+        &state.db,
+        EventLog {
+            event_type: "jetstream.gap".to_string(),
+            severity: Severity::Warn,
+            actor_did: None,
+            subject: None,
+            detail,
+        },
+        state.db_backend,
+    )
+    .await;
 }
 
 /// Why the read loop stopped.
@@ -117,7 +373,11 @@ async fn run(
     let mut session = Session::new(&settings);
     // The seq of the last v2 event handed to the pool. The pool outlives the
     // session, so a reconnect resumes past it rather than at the saved
-    // cursor, which stops before any event still applying.
+    // cursor, which stops before any event still applying. Seqs are local to
+    // one host; this needs no host of its own only because the endpoint is
+    // fixed for the life of `run()`. Every path that gives up on a seq
+    // (refused, renumbered, v1) clears it, or `v2_resume` would bring that
+    // seq back.
     let mut last_dispatched: Option<i64> = None;
     let mut backoff = MIN_BACKOFF;
     loop {
@@ -146,6 +406,23 @@ async fn run(
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
+            SessionEnd::Rejected(rejection) => {
+                match handle_rejection(
+                    &state,
+                    &settings,
+                    &mut session,
+                    &mut last_dispatched,
+                    rejection,
+                )
+                .await
+                {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
+                }
+            }
         }
     }
 }
@@ -167,20 +444,25 @@ async fn run_session(
     let protocol = session.protocol;
     let collections = collections_rx.borrow_and_update().clone();
 
-    let stored = match cursor::load(db, backend).await {
+    let mut stored = match cursor::load(db, backend).await {
         Ok(stored) => stored,
         Err(e) => {
             tracing::warn!(error = %e, "failed to load the jetstream cursor");
             return SessionEnd::Closed { delivered: false };
         }
     };
+    if stored.seq.is_some() && stored.seq == session.stale_seq {
+        stored.seq = None;
+    }
     let resume = match protocol {
+        _ if session.from_tip => None,
         Protocol::V2 => v2_resume(
             cursor::resume_cursor(&stored, host, protocol),
             *last_dispatched,
         ),
         Protocol::V1 => cursor::resume_cursor(&stored, host, protocol),
     };
+    session.sent_cursor = resume;
 
     if protocol == Protocol::V2 && session.compression && session.dictionary.is_none() {
         match compression::fetch_dictionary(
@@ -219,10 +501,8 @@ async fn run_session(
         Ok(Ok((ws, _))) => ws,
         Ok(Err(tungstenite::Error::Http(response))) => {
             let status = response.status().as_u16();
-            let body = String::from_utf8_lossy(response.body().as_deref().unwrap_or_default())
-                .into_owned();
-            tracing::warn!(status, %body, "jetstream refused the subscription");
-            return SessionEnd::Closed { delivered: false };
+            let body = response.body().as_deref().unwrap_or_default();
+            return SessionEnd::Rejected(classify_rejection(status, body));
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "jetstream connection failed");
@@ -238,6 +518,7 @@ async fn run_session(
     };
 
     status::connected(protocol, host, dictionary_id);
+    session.unexplained_400s = 0;
     log_event(
         db,
         EventLog {
@@ -313,6 +594,16 @@ async fn run_session(
                             floor = Some(seq);
                             *last_dispatched = Some(seq);
                         }
+                        session.from_tip = false;
+                        if let Some(gap) = session.pending_gap.take() {
+                            log_gap(state, serde_json::json!({
+                                "reason": gap.reason,
+                                "message": gap.message,
+                                "after_seq": gap.after_seq,
+                                "resumed_at_seq": event.cursor.seq(),
+                            }))
+                            .await;
+                        }
                         state
                             .telemetry_counters
                             .jetstream_received
@@ -328,6 +619,31 @@ async fn run_session(
                     }
                     Ok(Frame::Info { name, message }) => {
                         tracing::info!(name, ?message, "jetstream notice");
+                        match name.as_str() {
+                            // A timestamp cursor older than the server keeps
+                            // was moved up: the events in between are gone.
+                            "OutdatedCursor" => {
+                                log_gap(state, serde_json::json!({ "reason": name, "message": message }))
+                                    .await;
+                            }
+                            // The seq resumed from is past the server's next
+                            // one: its seqs started over or went back. The
+                            // new, lower seqs must not be dropped as already
+                            // seen, nor the old ones resumed from again.
+                            "FutureCursor" => {
+                                floor = None;
+                                *last_dispatched = None;
+                                if stored.seq.is_some() {
+                                    session.stale_seq = stored.seq;
+                                }
+                                log_gap(state, serde_json::json!({
+                                    "reason": "future_cursor",
+                                    "from_seq": resume,
+                                }))
+                                .await;
+                            }
+                            _ => {}
+                        }
                     }
                     Ok(Frame::Error { error, message }) => {
                         break Ended::Closed(format!("{error}: {}", message.unwrap_or_default()));
@@ -437,6 +753,64 @@ mod tests {
             v2_resume(Some(T), Some(25)),
             Some(25),
             "a seq on this host beats a witnessed time"
+        );
+    }
+
+    #[test]
+    fn refusals_are_classified_by_their_xrpc_error_name() {
+        assert_eq!(
+            classify_rejection(404, b"404 page not found"),
+            Rejection::NotFound
+        );
+        assert_eq!(
+            classify_rejection(503, br#"{"error":"ServiceUnavailable"}"#),
+            Rejection::Unavailable
+        );
+        assert_eq!(
+            classify_rejection(
+                400,
+                br#"{"error":"CursorTooOld","message":"cursor 5 below lookback floor 9"}"#
+            ),
+            Rejection::CursorTooOld("cursor 5 below lookback floor 9".into())
+        );
+        assert_eq!(
+            classify_rejection(
+                400,
+                br#"{"error":"UnknownZstdDictionary","message":"current dictionary id is 7"}"#
+            ),
+            Rejection::UnknownDictionary("current dictionary id is 7".into())
+        );
+        assert_eq!(
+            classify_rejection(400, br#"{"error":"InvalidRequest","message":"bad"}"#),
+            Rejection::InvalidRequest("bad".into())
+        );
+        assert_eq!(
+            classify_rejection(400, br#"{"error":"CursorTooOld","mess"#),
+            Rejection::CursorTooOld(r#"{"error":"CursorTooOld","mess"#.into()),
+            "a body cut short still names its error"
+        );
+        assert_eq!(
+            classify_rejection(400, b"bad request"),
+            Rejection::Other {
+                status: 400,
+                message: "HTTP 400: bad request".into()
+            }
+        );
+        assert_eq!(
+            classify_rejection(400, b""),
+            Rejection::Other {
+                status: 400,
+                message: "HTTP 400".into()
+            },
+            "no body at all"
+        );
+        assert_eq!(
+            classify_rejection(400, br#"{"error":"SomethingNew"}"#),
+            Rejection::Other {
+                status: 400,
+                message: r#"HTTP 400: {"error":"SomethingNew"}"#.into()
+            },
+            "an error name this version does not know"
         );
     }
 }
