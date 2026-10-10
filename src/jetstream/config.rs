@@ -14,6 +14,9 @@ pub const MAX_WORKERS: usize = 64;
 /// How long to wait after the server rejects the subscription as invalid,
 /// which retrying sooner will not fix.
 pub const INVALID_REQUEST_RETRY: Duration = Duration::from_secs(3600);
+/// How long a session waits for its in-flight events before reconnecting
+/// anyway. The saved cursor then stops before them.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub const V2_SUBSCRIBE_PATH: &str = "/xrpc/network.bsky.jetstream.subscribeEvents";
 pub const V1_SUBSCRIBE_PATH: &str = "/subscribe";
@@ -209,6 +212,7 @@ pub struct Settings {
     pub compression: bool,
     pub workers: usize,
     pub invalid_request_retry: Duration,
+    pub drain_timeout: Duration,
 }
 
 impl Settings {
@@ -220,6 +224,7 @@ impl Settings {
             compression: parse_compression(var("JETSTREAM_COMPRESSION").as_deref()),
             workers: parse_workers(var("JETSTREAM_WORKERS").as_deref()),
             invalid_request_retry: INVALID_REQUEST_RETRY,
+            drain_timeout: DRAIN_TIMEOUT,
         }
     }
 }

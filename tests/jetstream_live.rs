@@ -4,10 +4,14 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use happyview::db::DatabaseBackend;
 use happyview::db::adapt_sql;
-use happyview::jetstream::config::{ProtocolChoice, Settings, parse_endpoint};
+use happyview::jetstream::config::{DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint};
+use happyview::jetstream::workers::RetryPolicy;
 use happyview::lexicon::{ParsedLexicon, ProcedureAction};
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -72,6 +76,15 @@ fn settings(mock: &MockJetstream) -> Settings {
         compression: true,
         workers: 8,
         invalid_request_retry: Duration::from_millis(100),
+        drain_timeout: DRAIN_TIMEOUT,
+    }
+}
+
+/// Retries in milliseconds, so a test never waits on the production backoff.
+fn fast_retries() -> RetryPolicy {
+    RetryPolicy {
+        delays: vec![Duration::from_millis(10); 3],
+        max_unavailable_delay: Duration::from_millis(50),
     }
 }
 
@@ -80,7 +93,7 @@ fn start(app: &TestApp, settings: Settings) -> Consumer {
     let mut state = app.state.clone();
     state.config.jetstream_url = settings.endpoint.ws_base.clone();
     Consumer {
-        handle: happyview::jetstream::spawn_with(state, rx, settings),
+        handle: happyview::jetstream::spawn_with(state, rx, settings, Some(fast_retries())),
         _collections: tx,
     }
 }
@@ -181,7 +194,9 @@ async fn insert_local(app: &TestApp, did: &str, rkey: &str) {
 }
 
 /// 1,000 records, each created then deleted, spread over 100 DIDs and 8
-/// workers: every one ends deleted, because a DID's events never race.
+/// workers: every one ends deleted. This alone cannot catch a race (a delete
+/// that overtook its create tombstones it, with the same result), so the
+/// two tests after it use scripts whose outcome depends on the order.
 #[tokio::test]
 #[serial]
 async fn creates_and_deletes_of_one_uri_never_race() {
@@ -400,4 +415,301 @@ async fn a_takedown_purges_the_records() {
         events(&app, "jetstream.account_takendown").await,
         vec![json!({"purged": 1, "seq": 2, "status": "takendown"})]
     );
+}
+
+/// One event of a per-DID script, built from its seq and DID.
+type Step = dyn Fn(i64, &str) -> Value;
+
+/// Push one script per DID, interleaved in groups of four DIDs so a DID's
+/// events sit a few frames apart, each on its own seq. Returns the last seq.
+fn interleave(mock: &MockJetstream, dids: usize, steps: &[&Step]) -> i64 {
+    let mut seq = 0;
+    let mut script = Vec::new();
+    for group in (0..dids).step_by(4) {
+        for step in steps {
+            for d in group..(group + 4).min(dids) {
+                seq += 1;
+                script.push(step(seq, &format!("did:plc:order{d}")));
+            }
+        }
+    }
+    mock.push(script);
+    seq
+}
+
+/// Per DID, `create a`, `#sync`, `create b`: only b survives, and only when
+/// the three apply in order. A sync applied before `a` leaves it, and one
+/// applied after `b` purges it.
+#[tokio::test]
+#[serial]
+async fn a_sync_between_creates_applies_in_order() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    let last = interleave(
+        &mock,
+        1000,
+        &[
+            &|seq, did| js::create(seq, did, GAME, "a", game("a")),
+            &|seq, did| js::sync(seq, did),
+            &|seq, did| js::create(seq, did, GAME, "b", game("b")),
+        ],
+    );
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("every event applied", applied_through(&app, last).await);
+    assert_eq!(
+        count(
+            &app,
+            "SELECT COUNT(*) FROM happyview_records WHERE rkey = 'a'"
+        )
+        .await,
+        0,
+        "a sync ran before the create it should have purged"
+    );
+    assert_eq!(
+        count(
+            &app,
+            "SELECT COUNT(*) FROM happyview_records WHERE rkey = 'b'"
+        )
+        .await,
+        1000,
+        "a create ran before the sync that then purged it"
+    );
+}
+
+/// Per DID, `create a`, account deleted, account reactivated, then `create c`
+/// at a later rev: c exists and a does not. A `create c` that overtook the
+/// deletion would be purged by it.
+#[tokio::test]
+#[serial]
+async fn a_deleted_then_reactivated_account_applies_in_order() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    let last = interleave(
+        &mock,
+        1000,
+        &[
+            &|seq, did| js::create(seq, did, GAME, "a", game("a")),
+            &|seq, did| js::account(seq, did, false, Some("deleted")),
+            &|seq, did| js::account(seq, did, true, None),
+            &|seq, did| js::create(seq, did, GAME, "c", game("c")),
+        ],
+    );
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("every event applied", applied_through(&app, last).await);
+    assert_eq!(
+        count(
+            &app,
+            "SELECT COUNT(*) FROM happyview_records WHERE rkey = 'a'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &app,
+            "SELECT COUNT(*) FROM happyview_records WHERE rkey = 'c'"
+        )
+        .await,
+        1000,
+        "a create ran before the account deletion that then purged it"
+    );
+    assert_eq!(
+        count(&app, "SELECT COUNT(*) FROM happyview_did_tombstones").await,
+        0,
+        "every reactivation lifted its tombstone"
+    );
+}
+
+/// The advisory-lock class `tombstones::lock_uris` takes a record URI's lock
+/// in (`URI_LOCK_CLASS`).
+const URI_LOCK_CLASS: i32 = 0x6876_7201;
+
+/// Holds back writes until released: on Postgres the advisory lock that
+/// applying `uri` waits on, on SQLite the database's write lock (so every
+/// write waits, retried as unavailable).
+struct Blocker {
+    conn: sqlx::pool::PoolConnection<sqlx::Any>,
+    backend: DatabaseBackend,
+}
+
+impl Blocker {
+    async fn hold(app: &TestApp, uri: &str) -> Self {
+        let backend = app.state.db_backend;
+        let mut conn = app.state.db.acquire().await.expect("blocker connection");
+        match backend {
+            DatabaseBackend::Postgres => {
+                happyview::db::query(&format!(
+                    "SELECT pg_advisory_lock({URI_LOCK_CLASS}, hashtext($1))::text"
+                ))
+                .bind(uri)
+                .execute(&mut *conn)
+                .await
+                .expect("take the record's lock");
+            }
+            DatabaseBackend::Sqlite => {
+                happyview::db::query("BEGIN IMMEDIATE")
+                    .execute(&mut *conn)
+                    .await
+                    .expect("take the write lock");
+            }
+        }
+        Self { conn, backend }
+    }
+
+    async fn release(mut self) {
+        let sql = match self.backend {
+            DatabaseBackend::Postgres => "SELECT pg_advisory_unlock_all()::text",
+            DatabaseBackend::Sqlite => "COMMIT",
+        };
+        happyview::db::query(sql)
+            .execute(&mut *self.conn)
+            .await
+            .expect("release the blocker");
+    }
+}
+
+/// Watches `jetstream_seq` until dropped and records whether it ever went
+/// backwards.
+struct SeqWatch {
+    went_back: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+impl SeqWatch {
+    fn start(app: &TestApp) -> Self {
+        let went_back = Arc::new(AtomicBool::new(false));
+        let (db, backend) = (app.state.db.clone(), app.state.db_backend);
+        let flag = Arc::clone(&went_back);
+        let task = tokio::spawn(async move {
+            let sql = adapt_sql(
+                "SELECT value FROM happyview_instance_settings WHERE key = 'jetstream_seq'",
+                backend,
+            );
+            let mut highest = i64::MIN;
+            loop {
+                let seq = happyview::db::query_as::<(String,)>(&sql)
+                    .fetch_optional(&db)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|(v,)| v.parse::<i64>().ok());
+                if let Some(seq) = seq {
+                    if seq < highest {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    highest = highest.max(seq);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        Self { went_back, task }
+    }
+
+    fn went_back(&self) -> bool {
+        self.went_back.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SeqWatch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn received(app: &TestApp) -> u64 {
+    app.state
+        .telemetry_counters
+        .jetstream_received
+        .load(Ordering::Relaxed)
+}
+
+/// A session whose events are still applying when its drain times out: the
+/// reconnect resumes after the last event dispatched, not at the saved
+/// cursor, so nothing still queued is dispatched again and the saved seq
+/// never moves backwards.
+#[tokio::test]
+#[serial]
+async fn a_drain_timeout_does_not_redispatch_queued_events() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    let did = "did:plc:drain";
+    let event = |s: i64| js::create(s, did, GAME, &format!("r{s}"), game("x"));
+    mock.push((1..=3).map(event));
+    let seqs = SeqWatch::start(&app);
+    let base = received(&app);
+    let _consumer = start(
+        &app,
+        Settings {
+            drain_timeout: Duration::from_millis(200),
+            ..settings(&mock)
+        },
+    );
+    wait_until!("seq 3 applied", applied_through(&app, 3).await);
+
+    let blocker = Blocker::hold(&app, &format!("at://{did}/{GAME}/r4")).await;
+    mock.push((4..=8).map(event));
+    mock.kick();
+    wait_until!("seqs 4-8 dispatched", received(&app) == base + 8);
+    assert_eq!(mock.connections()[1].param("cursor").as_deref(), Some("3"));
+
+    mock.kick();
+    wait_until!(
+        "a reconnect after the drain timeout",
+        mock.connections().len() >= 3
+    );
+    assert_eq!(
+        mock.connections()[2].param("cursor").as_deref(),
+        Some("8"),
+        "resumes after what the pool already holds, not at the saved seq 3"
+    );
+
+    blocker.release().await;
+    wait_until!("seq 8 applied", applied_through(&app, 8).await);
+    let expected: Vec<String> = (1..=8).map(|s| format!("r{s}")).collect();
+    assert_eq!(rkeys(&app, did).await, expected);
+    assert_eq!(received(&app), base + 8, "an event was dispatched twice");
+    assert!(!seqs.went_back(), "jetstream_seq moved backwards");
+}
+
+/// A fresh instance (no saved cursor) whose first event is stuck: a
+/// reconnect resumes after what it dispatched rather than at the live tip,
+/// which would skip whatever arrived in between.
+#[tokio::test]
+#[serial]
+async fn a_fresh_instance_with_a_stuck_event_resumes_past_what_it_dispatched() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    let did = "did:plc:stuck";
+    mock.push((1..=4).map(|s| js::create(s, did, GAME, &format!("r{s}"), game("x"))));
+    let blocker = Blocker::hold(&app, &format!("at://{did}/{GAME}/r1")).await;
+    let base = received(&app);
+    let _consumer = start(
+        &app,
+        Settings {
+            drain_timeout: Duration::from_millis(200),
+            ..settings(&mock)
+        },
+    );
+    wait_until!("seqs 1-4 dispatched", received(&app) == base + 4);
+    assert_eq!(
+        setting(&app, "jetstream_seq").await,
+        None,
+        "nothing applied yet"
+    );
+
+    mock.kick();
+    wait_until!("a reconnect", mock.connections().len() >= 2);
+    assert_eq!(mock.connections()[0].param("cursor"), None);
+    assert_eq!(
+        mock.connections()[1].param("cursor").as_deref(),
+        Some("4"),
+        "resumes after the dispatched events, not at the tip"
+    );
+
+    blocker.release().await;
+    wait_until!("seq 4 applied", applied_through(&app, 4).await);
+    assert_eq!(rkeys(&app, did).await, vec!["r1", "r2", "r3", "r4"]);
+    assert_eq!(received(&app), base + 4);
 }

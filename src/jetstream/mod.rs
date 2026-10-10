@@ -41,22 +41,27 @@ const FLUSH_EVERY_EVENTS: u64 = 1000;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// Events each worker may have queued before reading the socket waits.
 const WORKER_QUEUE_CAPACITY: usize = 512;
-/// How long a session waits for its in-flight events before reconnecting
-/// anyway. The cursor then stops before them, so they are re-delivered.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Start the consumer with settings from the environment.
 pub fn spawn(state: AppState, collections_rx: watch::Receiver<Vec<String>>) -> JoinHandle<()> {
     let settings = Settings::from_env(&state.config.jetstream_url);
-    spawn_with(state, collections_rx, settings)
+    spawn_with(state, collections_rx, settings, None)
 }
 
+/// Start the consumer with `settings`, retrying failed events by `retry`
+/// (`RetryPolicy::default()` when `None`).
 pub fn spawn_with(
     state: AppState,
     collections_rx: watch::Receiver<Vec<String>>,
     settings: Settings,
+    retry: Option<RetryPolicy>,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(state, collections_rx, settings))
+    tokio::spawn(run(
+        state,
+        collections_rx,
+        settings,
+        retry.unwrap_or_default(),
+    ))
 }
 
 /// Connection state carried across reconnects.
@@ -94,6 +99,7 @@ async fn run(
     state: AppState,
     mut collections_rx: watch::Receiver<Vec<String>>,
     settings: Settings,
+    retry: RetryPolicy,
 ) {
     // One pool and one watermark for the consumer's life, so a DID's events
     // stay in order across reconnects.
@@ -103,12 +109,16 @@ async fn run(
         WORKER_QUEUE_CAPACITY,
         apply::apply_fn(state.clone(), collections_rx.clone()),
         Arc::clone(&watermark),
-        RetryPolicy::default(),
+        retry,
         apply::give_up_fn(state.clone()),
     );
     status::set_worker_depths(pool.depth_counters());
 
     let mut session = Session::new(&settings);
+    // The seq of the last v2 event handed to the pool. The pool outlives the
+    // session, so a reconnect resumes past it rather than at the saved
+    // cursor, which stops before any event still applying.
+    let mut last_dispatched: Option<i64> = None;
     let mut backoff = MIN_BACKOFF;
     loop {
         let end = run_session(
@@ -118,11 +128,17 @@ async fn run(
             &mut session,
             &pool,
             &watermark,
+            &mut last_dispatched,
         )
         .await;
         status::disconnected();
         match end {
-            SessionEnd::CollectionsChanged => backoff = MIN_BACKOFF,
+            SessionEnd::CollectionsChanged => {
+                // A newly tracked collection needs the events from the saved
+                // cursor on, including those already dispatched.
+                last_dispatched = None;
+                backoff = MIN_BACKOFF;
+            }
             SessionEnd::Closed { delivered } => {
                 if delivered {
                     backoff = MIN_BACKOFF;
@@ -143,6 +159,7 @@ async fn run_session(
     session: &mut Session,
     pool: &WorkerPool,
     watermark: &WatermarkHandle,
+    last_dispatched: &mut Option<i64>,
 ) -> SessionEnd {
     let db = &state.db;
     let backend = state.db_backend;
@@ -157,7 +174,13 @@ async fn run_session(
             return SessionEnd::Closed { delivered: false };
         }
     };
-    let resume = cursor::resume_cursor(&stored, host, protocol);
+    let resume = match protocol {
+        Protocol::V2 => v2_resume(
+            cursor::resume_cursor(&stored, host, protocol),
+            *last_dispatched,
+        ),
+        Protocol::V1 => cursor::resume_cursor(&stored, host, protocol),
+    };
 
     if protocol == Protocol::V2 && session.compression && session.dictionary.is_none() {
         match compression::fetch_dictionary(
@@ -283,16 +306,17 @@ async fn run_session(
                 };
                 match frame {
                     Ok(Frame::Event(event)) => {
-                        state
-                            .telemetry_counters
-                            .jetstream_received
-                            .fetch_add(1, Ordering::Relaxed);
                         if let Some(seq) = event.cursor.seq() {
                             if floor.is_some_and(|floor| seq <= floor) {
                                 continue;
                             }
                             floor = Some(seq);
+                            *last_dispatched = Some(seq);
                         }
+                        state
+                            .telemetry_counters
+                            .jetstream_received
+                            .fetch_add(1, Ordering::Relaxed);
                         delivered = true;
                         let ticket = watermark.begin(event.cursor);
                         pool.dispatch(Job { ticket, event }).await;
@@ -320,7 +344,7 @@ async fn run_session(
         }
     };
 
-    if tokio::time::timeout(DRAIN_TIMEOUT, watermark.wait_idle())
+    if tokio::time::timeout(settings.drain_timeout, watermark.wait_idle())
         .await
         .is_err()
     {
@@ -355,6 +379,19 @@ async fn run_session(
     }
 }
 
+/// Where a v2 session resumes: `saved` (from `cursor::resume_cursor`), or
+/// past `last_dispatched` when that is further on. `last_dispatched` is a
+/// seq on this host, so it wins over a witnessed-time cursor.
+fn v2_resume(saved: Option<i64>, last_dispatched: Option<i64>) -> Option<i64> {
+    match (saved, last_dispatched) {
+        (Some(saved), Some(dispatched)) if saved < cursor::TIMESTAMP_CURSOR_MIN => {
+            Some(saved.max(dispatched))
+        }
+        (_, Some(dispatched)) => Some(dispatched),
+        (saved, None) => saved,
+    }
+}
+
 /// Save the applied watermark when it moved.
 async fn flush(
     state: &AppState,
@@ -372,5 +409,34 @@ async fn flush(
     match cursor::save(&state.db, state.db_backend, host, &point).await {
         Ok(()) => *last_saved = Some(point),
         Err(e) => tracing::warn!(error = %e, "failed to save the jetstream cursor"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reconnect_resumes_past_what_was_dispatched() {
+        const T: i64 = 1_779_719_000_000_000;
+        assert_eq!(
+            v2_resume(None, None),
+            None,
+            "a fresh instance starts at the tip"
+        );
+        assert_eq!(v2_resume(Some(10), None), Some(10));
+        assert_eq!(v2_resume(Some(T), None), Some(T));
+        assert_eq!(
+            v2_resume(None, Some(7)),
+            Some(7),
+            "nothing saved yet, but events are queued"
+        );
+        assert_eq!(v2_resume(Some(10), Some(25)), Some(25));
+        assert_eq!(v2_resume(Some(10), Some(4)), Some(10));
+        assert_eq!(
+            v2_resume(Some(T), Some(25)),
+            Some(25),
+            "a seq on this host beats a witnessed time"
+        );
     }
 }
