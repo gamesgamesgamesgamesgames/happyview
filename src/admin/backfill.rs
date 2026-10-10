@@ -988,18 +988,9 @@ async fn add_late_records(
     let backend = state.db_backend;
     let job_id = queue.job_id.as_str();
     let mut tx = state.backfill_db.begin().await?;
-    let counter = adapt_sql(
-        &format!(
-            "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
-            saturating_counter("total_records", "?", backend)
-        ),
-        backend,
-    );
-    crate::db::query(&counter)
-        .bind(records)
-        .bind(job_id)
-        .execute(&mut *tx)
-        .await?;
+    // The PDS's stats row before the job row, the order `mark_resolved` and
+    // `complete_unit` lock them in, so that none of them can deadlock another
+    // on Postgres.
     if queue.version == QueueVersion::Bounded {
         let stats = adapt_sql(
             "INSERT INTO happyview_backfill_pds_stats (job_id, pds_endpoint, records) VALUES (?, ?, ?) \
@@ -1013,6 +1004,18 @@ async fn add_late_records(
             .execute(&mut *tx)
             .await?;
     }
+    let counter = adapt_sql(
+        &format!(
+            "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
+            saturating_counter("total_records", "?", backend)
+        ),
+        backend,
+    );
+    crate::db::query(&counter)
+        .bind(records)
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await
 }
 
