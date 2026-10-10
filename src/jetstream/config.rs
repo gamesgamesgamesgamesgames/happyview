@@ -123,7 +123,12 @@ pub fn parse_endpoint(url: &str) -> Endpoint {
         "ws" | "http" => ("ws", "http"),
         _ => ("wss", "https"),
     };
-    let host = rest.to_ascii_lowercase();
+    // Hostnames are case-insensitive, a path prefix is not.
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = format!("{}{path}", authority.to_ascii_lowercase());
     Endpoint {
         ws_base: format!("{ws}://{host}"),
         http_base: format!("{http}://{host}"),
@@ -314,6 +319,18 @@ mod tests {
         assert_eq!(
             parse_endpoint("WSS://JS.Example.com"),
             parse_endpoint("js.example.com")
+        );
+    }
+
+    #[test]
+    fn only_the_authority_is_lowercased() {
+        assert_eq!(
+            parse_endpoint("https://Example.com/Prefix"),
+            endpoint(
+                "wss://example.com/Prefix",
+                "https://example.com/Prefix",
+                "example.com/Prefix"
+            )
         );
     }
 
