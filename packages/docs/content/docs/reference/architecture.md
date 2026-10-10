@@ -154,15 +154,15 @@ sequenceDiagram
 
 **Failures.**
 
-- A database outage is retried indefinitely, up to 30 seconds apart, so ingest pauses rather than skipping events. While paused, the consumer cannot notice a collection change or a shutdown until the queue drains.
+- A database outage is retried indefinitely with growing delays, at most every 16 seconds by default, so ingest pauses rather than skipping events. While paused, the consumer cannot notice a collection change or a shutdown until the queue drains.
 - Any other failure is retried for about 31 seconds, then logged as `jetstream.apply_failed` and skipped.
 - Invalid input (no record body, an unknown operation, data the database rejects) is skipped at once with one `jetstream.record_invalid` warning.
 
 **Recovering a cursor.**
 
-- A cursor older than Jetstream keeps resumes from the stored witnessed time, or from the live tip when there is none, and logs `jetstream.gap`. A [backfill](../guides/backfill.md) recovers what was missed.
+- A cursor older than Jetstream keeps resumes from the stored witnessed time. Jetstream clamps that to its oldest event and announces the gap with `#info OutdatedCursor`, which is logged as `jetstream.gap` with reason `outdated_cursor`. Only when there is no stored time does HappyView resume from the live tip, logged as `cursor_too_old`. A [backfill](../guides/backfill.md) recovers what was missed.
 - If the server renumbers its seqs (`FutureCursor`), HappyView resumes by witnessed time too.
-- An unexplained 400 first drops compression, then the seq cursor (only if the cursor was a seq), then retries hourly and logs `jetstream.invalid_request`.
+- An unexplained 400 first drops compression, then the seq cursor (only when a seq was sent and a witnessed time is saved; otherwise it goes straight to the hourly retry and keeps the cursor), then retries hourly and logs `jetstream.invalid_request`.
 - Under `auto`, a 404 falls back to v1 until the process restarts.
 
 **Edge cases of revs and tombstones.**

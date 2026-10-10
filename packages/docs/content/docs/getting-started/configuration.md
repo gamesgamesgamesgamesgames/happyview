@@ -18,10 +18,10 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `SESSION_SECRET` | no | dev default | Secret key for signing session cookies (at least 64 characters). **Must be set in production** |
 | `HOST` | no | `0.0.0.0` | Bind host |
 | `PORT` | no | `3000` | Bind port |
-| `JETSTREAM_URL` | no | `wss://jetstream1.us-east.bsky.network` | Jetstream host for real-time record streaming. A URL ending in `/subscribe` (the v1 path) is accepted and means the same host |
+| `JETSTREAM_URL` | no | `wss://jetstream1.us-east.bsky.network` | Jetstream host for real-time record streaming. The scheme can be `ws`, `wss`, `http` or `https`, and a v1 or v2 subscribe path, a trailing slash and a query string are ignored, so all of them name the same host |
 | `JETSTREAM_PROTOCOL` | no | `auto` | `auto` subscribes to the v2 stream (`/xrpc/network.bsky.jetstream.subscribeEvents`) and falls back to v1 (`/subscribe`) when the host answers 404. A fallback lasts until HappyView restarts. `v2` or `v1` uses only that one |
 | `JETSTREAM_COMPRESSION` | no | `true` | Receive v2 events zstd-compressed with the host's dictionary. When the dictionary cannot be fetched, or the host keeps refusing it, HappyView subscribes uncompressed instead. `false` always subscribes uncompressed. v1 is always uncompressed |
-| `JETSTREAM_WORKERS` | no | `8` | Workers applying events in parallel, 1 to 64. A repo's events always go to the same worker, in order. See [Real-time indexing](../reference/architecture.md#real-time-indexing) |
+| `JETSTREAM_WORKERS` | no | `8` | Workers applying events in parallel, 1 to 64. Larger values are capped at 64, and 0 or an invalid value uses 8 with a warning. A repo's events always go to the same worker, in order. See [Real-time indexing](../reference/architecture.md#real-time-indexing) |
 | `RELAY_URL` | no | `https://bsky.network` | Relay URL for [backfill](../guides/backfill.md) repo discovery |
 | `PLC_URL` | no | `https://plc.directory` | [PLC directory](https://github.com/did-method-plc/did-method-plc) URL for DID resolution |
 | `STATIC_DIR` | no | `./web/out` | Directory containing the built dashboard static assets |
