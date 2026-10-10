@@ -116,6 +116,27 @@ TEST_DATABASE_URL=postgres://happyview:happyview@localhost:5433/happyview_test c
 docker compose -f docker-compose.test.yml down
 ```
 
+The same suite runs against SQLite when `TEST_DATABASE_URL` names a SQLite
+file. CI covers only Postgres, so run it this way once when you change SQL,
+migrations or anything that touches the write path:
+
+```bash
+dir=$(mktemp -d)
+TEST_DATABASE_URL="sqlite://$dir/e2e.db?mode=rwc" cargo test --tests -- --test-threads=1
+```
+
+For a change that affects storage or ingest cost, measure it.
+`scripts/measure-backfill-storage.sh [dids-file] [collection]` backfills a fixed
+list of repos (`scripts/measure-backfill-dids.txt` by default) into a fresh
+SQLite database. It reports the write-ahead log's peak, the database size and,
+on Linux, the bytes the server wrote (`write_bytes` reads `unavailable` on other
+systems, which have no `/proc/<pid>/io`). It reaches the real PLC directory and
+PDSes, so run it on your branch and on `alpha` back to back, and put both
+summaries in the pull request. The storage settings it exercises
+(`SQLITE_SYNCHRONOUS`, `SQLITE_CHECKPOINT_INTERVAL_SECS`,
+`BACKFILL_DISCOVERY_WINDOW`, `DEAD_LETTER_RETENTION_DAYS`) are documented in
+`packages/docs/content/docs/getting-started/configuration.md`.
+
 A test whose plugin module is missing skips rather than fails, so this job
 asserts the fixtures are there before running them:
 
@@ -125,6 +146,14 @@ bash scripts/check-plugin-fixtures.sh --require
 
 It names every artefact it could not find; the `e2e-tests` job in
 `.github/workflows/ci.yml` carries the build command for each one.
+
+`scripts/build-plugin-fixtures.sh` can fail in a worktree created inside the
+main checkout (for example under `.worktrees/`) with "current package believes
+it's in a workspace when it's not". Cargo walks up from a fixture and finds the
+parent checkout's `Cargo.toml`, whose `workspace.exclude` may lack a fixture
+your branch added. Create the worktree outside the checkout
+(`git worktree add ../my-branch -b my-branch`), or bring the parent's
+`Cargo.toml` up to date with your branch.
 
 The real Lua interpreter plugin is another repository's artefact and needs a C
 toolchain, so nothing here can build it and the targets that load it skip.
