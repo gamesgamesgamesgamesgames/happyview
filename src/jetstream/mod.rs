@@ -1,4 +1,6 @@
+pub mod compression;
 pub mod config;
+pub mod event;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
