@@ -742,6 +742,32 @@ mod tests {
         assert!(validate_capabilities(&m, &module_importing_kv_get()).is_ok());
     }
 
+    /// The two concurrent-call imports reach nothing `host_call_library` does
+    /// not, so they sit behind the same capability and no other.
+    #[test]
+    fn validate_capabilities_gates_the_concurrent_call_imports_on_library_call() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "env" "host_call_library_start" (func (param i32 i32 i32 i32 i32 i32) (result i32)))
+                (import "env" "host_call_library_wait_any" (func (param i32 i32) (result i64)))
+                (memory (export "memory") 1))"#,
+        )
+        .unwrap();
+        let undeclared = manifest(
+            r#"{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                "capabilities":[]}"#,
+        );
+        let err = validate_capabilities(&undeclared, &wasm).unwrap_err();
+        assert!(matches!(err, LoadError::CapabilityMismatch(_)), "{err}");
+        assert!(err.to_string().contains("library:call"), "{err}");
+
+        let declared = manifest(
+            r#"{"id":"x","name":"X","version":"1.0.0","api_version":"2","plugin_type":"library",
+                "capabilities":["library:call"]}"#,
+        );
+        assert!(validate_capabilities(&declared, &wasm).is_ok());
+    }
+
     fn module_importing_wasi(name: &str) -> Vec<u8> {
         wat::parse_str(format!(
             r#"(module (import "wasi_snapshot_preview1" "{name}" (func)) (memory (export "memory") 1))"#
