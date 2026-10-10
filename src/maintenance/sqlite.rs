@@ -29,6 +29,16 @@ pub const BUSY_WARN_AFTER: u32 = 10;
 /// ingest.
 pub const CHECKPOINT_BUSY_TIMEOUT_MS: u64 = 1000;
 
+/// Quick retries for a checkpoint that came back busy without waiting.
+/// SQLite never waits on the checkpoint lock, so a TRUNCATE that collides
+/// with a writer's own PASSIVE autocheckpoint reports busy at once. That
+/// collision clears in milliseconds, and without a retry it costs a whole
+/// interval of WAL growth.
+pub const LOCK_COLLISION_RETRIES: u32 = 5;
+
+/// Pause between those retries.
+pub const LOCK_COLLISION_RETRY_DELAY: Duration = Duration::from_millis(20);
+
 /// How often `PRAGMA optimize` runs after the one at startup.
 pub const OPTIMIZE_INTERVAL: Duration = Duration::from_secs(86_400);
 
@@ -155,8 +165,33 @@ impl BusyTracker {
     }
 }
 
+/// Run `attempt`, retrying while it comes back busy faster than the busy
+/// timeout could have elapsed, which means it lost the checkpoint lock rather
+/// than waited on readers. A busy result after waiting on readers is not
+/// retried: another wait would hold off writers again for nothing.
+async fn retry_lock_collisions<F, Fut>(mut attempt: F) -> Result<CheckpointOutcome, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<CheckpointOutcome, sqlx::Error>>,
+{
+    let waited_on_readers = Duration::from_millis(CHECKPOINT_BUSY_TIMEOUT_MS / 2);
+    let mut retries = 0;
+    loop {
+        let started = tokio::time::Instant::now();
+        let outcome = attempt().await?;
+        if !outcome.busy
+            || started.elapsed() >= waited_on_readers
+            || retries == LOCK_COLLISION_RETRIES
+        {
+            return Ok(outcome);
+        }
+        retries += 1;
+        tokio::time::sleep(LOCK_COLLISION_RETRY_DELAY).await;
+    }
+}
+
 async fn run_checkpoint(pool: &AnyPool, busy: &mut BusyTracker) {
-    match checkpoint_truncate(pool).await {
+    match retry_lock_collisions(|| checkpoint_truncate(pool)).await {
         Ok(outcome) => {
             if outcome.busy {
                 tracing::debug!(
@@ -257,6 +292,56 @@ mod tests {
         );
     }
 
+    fn outcome(busy: bool) -> CheckpointOutcome {
+        CheckpointOutcome {
+            at: String::new(),
+            busy,
+            wal_frames: if busy { -1 } else { 0 },
+            checkpointed_frames: if busy { -1 } else { 0 },
+        }
+    }
+
+    /// Runs `retry_lock_collisions` over scripted attempts, each taking
+    /// `took`, and returns the final outcome and how many
+    /// attempts ran.
+    async fn retry_script(script: Vec<bool>, took: Duration) -> (CheckpointOutcome, usize) {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let result = retry_lock_collisions(|| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let busy = script.get(n).copied().unwrap_or(true);
+            async move {
+                tokio::time::sleep(took).await;
+                Ok::<_, sqlx::Error>(outcome(busy))
+            }
+        })
+        .await
+        .expect("checkpoint");
+        (result, attempts.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_that_lost_the_lock_is_retried_until_it_runs() {
+        let (result, attempts) = retry_script(vec![true, true, false], Duration::ZERO).await;
+        assert!(!result.busy);
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn lock_collision_retries_are_bounded() {
+        let (result, attempts) = retry_script(vec![], Duration::ZERO).await;
+        assert!(result.busy);
+        assert_eq!(attempts, 1 + LOCK_COLLISION_RETRIES as usize);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_busy_after_waiting_on_readers_is_not_retried() {
+        let waited = Duration::from_millis(CHECKPOINT_BUSY_TIMEOUT_MS);
+        let (result, attempts) = retry_script(vec![true, false], waited).await;
+        assert!(result.busy);
+        assert_eq!(attempts, 1);
+    }
+
     #[tokio::test]
     async fn a_checkpoint_returns_its_connection_with_the_normal_busy_timeout() {
         sqlx::any::install_default_drivers();
@@ -294,7 +379,7 @@ mod tests {
         remove_db_files(&path);
     }
 
-    /// Writes 3000 rows of 4 KiB into a file-backed database while three
+    /// Writes 6000 rows of 4 KiB into a file-backed database while three
     /// staggered readers keep a read transaction open at every instant, and
     /// returns the largest the `-wal` file got and how many times it was seen
     /// to shrink sharply (a truncate).
@@ -338,7 +423,7 @@ mod tests {
         let mut peak = 0u64;
         let mut last = 0u64;
         let mut truncations = 0u32;
-        for i in 0..3000i64 {
+        for i in 0..6000i64 {
             crate::db::query("INSERT INTO wal_load (id, body) VALUES (?, ?)")
                 .bind(i)
                 .bind(body.clone())
