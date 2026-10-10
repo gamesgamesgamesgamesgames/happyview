@@ -51,7 +51,12 @@ pub async fn acquire_test_lock() -> Option<AnyPool> {
         return None;
     }
 
-    sqlx::any::install_default_drivers();
+    // Migrate before taking the lock. A test blocked on `pg_advisory_lock(42)`
+    // holds a statement open, and a migration building an index
+    // `CONCURRENTLY` waits for every open statement to finish, so a holder
+    // migrating a fresh database would wait on a waiter that waits on it, a
+    // cycle Postgres cannot see to break.
+    test_pool().await.close().await;
 
     let lock_pool = sqlx::any::AnyPoolOptions::new()
         .max_connections(1)

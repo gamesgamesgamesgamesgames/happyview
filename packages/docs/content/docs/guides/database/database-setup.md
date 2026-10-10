@@ -42,6 +42,18 @@ HappyView runs migrations automatically on startup for both backends.
 - You need Postgres-specific features (e.g., advanced JSON queries in Lua scripts)
 - You already have a Postgres infrastructure
 
+## Migrations at startup
+
+HappyView applies any pending migrations every time it starts, before it serves requests. Most take milliseconds. One that builds an index over `happyview_records` scales with that table, and so does the boot that applies it.
+
+**SQLite** builds an index inside the migration's transaction, which holds the database's write lock. On a records table of several gigabytes, expect a boot that takes minutes rather than seconds, during which HappyView is not serving. The build sorts every row, so it also needs free disk around the size of the new index while it runs. Let it finish: stopping the process rolls the migration back, and the next boot starts the build over.
+
+**Postgres** builds these indexes with `CREATE INDEX CONCURRENTLY`, which keeps reads and writes flowing while it builds but still has to scan the whole table. If a build fails partway, Postgres leaves an invalid index behind. HappyView drops it on the next boot and builds it again, so a restart is the fix.
+
+**Multiple replicas on Postgres.** HappyView takes a database-wide lock while it migrates. A replica that starts while another holds it waits for that migration to finish, which takes as long as the slowest index build. When an upgrade carries a migration like this, roll it out to one replica first and start the rest once it is serving. Replicas still on an older release take the lock differently, and one that starts during a concurrent index build can fail with `deadlock detected`. Restarting it after the build finishes is enough.
+
+The `happyview_records` index on `(collection, created_at DESC, uri DESC)` is one of these. It replaces the `idx_records_created_at_uri` and `idx_records_collection` indexes, which the same upgrade drops.
+
 ## Environment variables
 
 | Variable | Description |

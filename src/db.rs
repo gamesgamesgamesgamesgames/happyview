@@ -606,7 +606,11 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
         .await
         .unwrap_or_else(|e| panic!("Failed to load migrations from {migration_dir}: {e}"));
 
-    migrator.run(&pool).await.expect("Failed to run migrations");
+    match backend {
+        DatabaseBackend::Sqlite => migrator.run(&pool).await,
+        DatabaseBackend::Postgres => migrate_postgres(&pool, &migrator).await,
+    }
+    .expect("Failed to run migrations");
 
     if backend == DatabaseBackend::Sqlite
         && let Err(e) = sqlite_optimize(&pool).await
@@ -615,6 +619,95 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
     }
 
     pool
+}
+
+/// The advisory lock HappyView holds over its Postgres migrations.
+///
+/// sqlx's migrator takes its own lock with `pg_advisory_lock`, which blocks
+/// inside a statement, and a blocked statement is a transaction that
+/// `CREATE INDEX CONCURRENTLY` waits out. So a second instance booting while
+/// the first builds an index waits on the builder's lock while the builder
+/// waits on it: Postgres reports a deadlock and one of them fails. Taking this
+/// lock first with `pg_try_advisory_lock`, between short sleeps, means a
+/// waiting instance never holds a statement open, and by the time it reaches
+/// sqlx's lock nobody else holds it.
+const PG_MIGRATION_LOCK_KEY: i64 = 0x6876_6d69_6772_6174;
+
+/// How long a booting instance sleeps between tries at the migration lock.
+const PG_MIGRATION_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Indexes a `-- no-transaction` migration builds `CONCURRENTLY`.
+///
+/// A concurrent build that fails partway leaves an index of that name marked
+/// invalid: never read, still written. sqlx records nothing for the failed
+/// migration, so it runs again on the next boot, but its `IF NOT EXISTS` would
+/// find the invalid index and skip the build. [`migrate_postgres`] drops each
+/// of these that is invalid before migrating, so the retry builds it afresh.
+const CONCURRENTLY_BUILT_INDEXES: &[&str] = &["idx_records_collection_created_at_uri"];
+
+/// Run `migrator` against Postgres under [`PG_MIGRATION_LOCK_KEY`], after
+/// dropping any invalid leftover of [`CONCURRENTLY_BUILT_INDEXES`].
+async fn migrate_postgres(
+    pool: &AnyPool,
+    migrator: &Migrator,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    let mut conn = pool.acquire().await?;
+
+    let mut announced = false;
+    loop {
+        let sql = adapt_sql("SELECT pg_try_advisory_lock(?)", DatabaseBackend::Postgres);
+        let (locked,): (bool,) = crate::db::query_as(&sql)
+            .bind(PG_MIGRATION_LOCK_KEY)
+            .fetch_one(&mut *conn)
+            .await?;
+        if locked {
+            break;
+        }
+        if !announced {
+            tracing::info!("another instance is running migrations; waiting for it to finish");
+            announced = true;
+        }
+        tokio::time::sleep(PG_MIGRATION_LOCK_RETRY).await;
+    }
+
+    let outcome = async {
+        for index in CONCURRENTLY_BUILT_INDEXES {
+            let sql = adapt_sql(
+                "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname = ? AND pg_table_is_visible(c.oid) AND NOT i.indisvalid",
+                DatabaseBackend::Postgres,
+            );
+            let invalid: Option<(i32,)> = crate::db::query_as(&sql)
+                .bind(*index)
+                .fetch_optional(&mut *conn)
+                .await?;
+            if invalid.is_some() {
+                tracing::warn!(
+                    index,
+                    "dropping an index a failed concurrent build left invalid"
+                );
+                let sql = adapt_sql(
+                    &format!("DROP INDEX CONCURRENTLY IF EXISTS {index}"),
+                    DatabaseBackend::Postgres,
+                );
+                crate::db::query(&sql).execute(&mut *conn).await?;
+            }
+        }
+        // `run` would do, but its `Acquire` bound is not general enough for
+        // the compiler to prove `connect`'s future `Send`. `run_direct` is
+        // what `run` calls once it has the connection.
+        migrator.run_direct(None, &mut *conn, false).await
+    }
+    .await;
+
+    let sql = adapt_sql("SELECT pg_advisory_unlock(?)", DatabaseBackend::Postgres);
+    let unlocked = crate::db::query(&sql)
+        .bind(PG_MIGRATION_LOCK_KEY)
+        .execute(&mut *conn)
+        .await;
+    outcome?;
+    unlocked?;
+    Ok(())
 }
 
 /// Extract the filesystem path from a `sqlite://` URL, dropping query params.
@@ -783,6 +876,39 @@ mod tests {
 
     const UNMAPPABLE_DECLTYPES: &[&str] =
         &["boolean", "bool", "date", "time", "datetime", "timestamp"];
+
+    /// A `-- no-transaction` migration exists to run `CREATE INDEX
+    /// CONCURRENTLY`, which Postgres refuses inside a transaction block — and
+    /// Postgres runs a string of several statements as one implicit
+    /// transaction. So each such file holds exactly one statement.
+    #[test]
+    fn no_transaction_migrations_hold_exactly_one_statement() {
+        for dir in ["migrations/sqlite", "migrations/postgres"] {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+            for entry in std::fs::read_dir(&dir).expect("migrations dir") {
+                let path = entry.expect("dir entry").path();
+                if path.extension().is_none_or(|e| e != "sql") {
+                    continue;
+                }
+                let sql = std::fs::read_to_string(&path).expect("read migration");
+                if !sql.starts_with("-- no-transaction") {
+                    continue;
+                }
+                let code: String = sql
+                    .lines()
+                    .map(|line| line.split("--").next().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let statements = code.split(';').filter(|s| !s.trim().is_empty()).count();
+                assert_eq!(
+                    statements,
+                    1,
+                    "{} must hold exactly one statement",
+                    path.display()
+                );
+            }
+        }
+    }
 
     #[test]
     fn sqlite_migrations_declare_no_unmappable_column_types() {

@@ -2586,4 +2586,74 @@ mod tests {
             assert!(err.to_string().contains("score"), "{err}");
         }
     }
+
+    /// The default listing (no custom sort) reads
+    /// `idx_records_collection_created_at_uri` in order, on both backends.
+    #[tokio::test]
+    async fn the_default_records_listing_walks_the_collection_created_at_index() {
+        let spec = RecordsQuery {
+            collection: "app.test.post".into(),
+            did: None,
+            filter: None,
+            sort: None,
+            limit: Some(50),
+            cursor: Some(crate::db::encode_cursor(
+                "2026-01-01T00:00:00+00:00",
+                "at://did:plc:a/app.test.post/1",
+            )),
+        };
+        let (sql, binds) = records_query_sql(&spec, Sqlite).unwrap();
+        assert_eq!(binds.len(), 4, "the collection and three cursor values");
+        let sql = crate::test_support::inline_binds(
+            &sql,
+            &[
+                "'app.test.post'",
+                "'2026-01-01T00:00:00+00:00'",
+                "'2026-01-01T00:00:00+00:00'",
+                "'at://did:plc:a/app.test.post/1'",
+                "50",
+            ],
+        );
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
+            crate::test_support::assert_index_without_sort(
+                &plan,
+                "idx_records_collection_created_at_uri",
+                backend,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_superseded_record_indexes_are_gone() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let sql = match backend {
+                Sqlite => {
+                    "SELECT name FROM sqlite_master WHERE type = 'index' \
+                     AND name IN ('idx_records_collection', 'idx_records_created_at_uri')"
+                }
+                Postgres => {
+                    "SELECT indexname FROM pg_indexes \
+                     WHERE indexname IN ('idx_records_collection', 'idx_records_created_at_uri')"
+                }
+            };
+            let left: Vec<(String,)> = crate::db::query_as(sql)
+                .fetch_all(&pool)
+                .await
+                .expect("list indexes");
+            assert!(left.is_empty(), "{backend:?} still has {left:?}");
+
+            if backend == Postgres {
+                // A failed CONCURRENTLY build leaves an index behind marked invalid.
+                let (valid,): (bool,) = crate::db::query_as(
+                    "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                     WHERE c.relname = 'idx_records_collection_created_at_uri'",
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("new index exists");
+                assert!(valid);
+            }
+        }
+    }
 }

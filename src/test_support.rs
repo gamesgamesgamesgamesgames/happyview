@@ -239,3 +239,95 @@ pub fn test_state_with_pool_on(
         script_limits: Arc::new(crate::lua::limits::ScriptLimits::default()),
     }
 }
+
+/// A migrated SQLite pool, plus the `TEST_DATABASE_URL` Postgres database
+/// when one is set, for assertions that must hold on both backends.
+pub async fn test_pools() -> Vec<(sqlx::AnyPool, crate::db::DatabaseBackend)> {
+    use crate::db::DatabaseBackend;
+    let mut pools = vec![(migrated_memory_pool().await, DatabaseBackend::Sqlite)];
+    if let Ok(url) = std::env::var("TEST_DATABASE_URL")
+        && DatabaseBackend::from_url(&url) == DatabaseBackend::Postgres
+    {
+        pools.push((
+            crate::db::connect(&url, DatabaseBackend::Postgres).await,
+            DatabaseBackend::Postgres,
+        ));
+    }
+    pools
+}
+
+/// `sql` with each `?` replaced, in order, by the matching literal, for
+/// handing a test's query to `EXPLAIN` as plain SQL on either backend.
+pub fn inline_binds(sql: &str, literals: &[&str]) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut values = literals.iter();
+    for ch in sql.chars() {
+        if ch == '?' {
+            out.push_str(values.next().expect("a literal for every placeholder"));
+        } else {
+            out.push(ch);
+        }
+    }
+    assert!(values.next().is_none(), "more literals than placeholders");
+    out
+}
+
+/// The planner's plan for `sql`, written in SQLite's dialect, one line per
+/// step.
+///
+/// On Postgres, sequential scans and sorts are disabled for the statement.
+/// On a near-empty test table both are cheapest, so leaving them on would
+/// say nothing; with them off, the plan shows whether an index *can* serve
+/// the query in order.
+pub async fn query_plan(
+    pool: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    sql: &str,
+) -> Vec<String> {
+    let explain = |prefix: &str| crate::db::adapt_sql(&format!("{prefix} {sql}"), backend);
+    match backend {
+        crate::db::DatabaseBackend::Sqlite => {
+            crate::db::query_as::<(i64, i64, i64, String)>(&explain("EXPLAIN QUERY PLAN"))
+                .fetch_all(pool)
+                .await
+                .expect("explain query plan")
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect()
+        }
+        crate::db::DatabaseBackend::Postgres => {
+            let mut tx = pool.begin().await.expect("begin");
+            crate::db::query("SET LOCAL enable_seqscan = off")
+                .execute(&mut *tx)
+                .await
+                .expect("disable seqscan");
+            crate::db::query("SET LOCAL enable_sort = off")
+                .execute(&mut *tx)
+                .await
+                .expect("disable sort");
+            let rows: Vec<(String,)> = crate::db::query_as(&explain("EXPLAIN"))
+                .fetch_all(&mut *tx)
+                .await
+                .expect("explain");
+            tx.rollback().await.expect("rollback");
+            rows.into_iter().map(|(line,)| line).collect()
+        }
+    }
+}
+
+/// Assert `plan` reads `index` and never sorts.
+pub fn assert_index_without_sort(
+    plan: &[String],
+    index: &str,
+    backend: crate::db::DatabaseBackend,
+) {
+    assert!(
+        plan.iter().any(|line| line.contains(index)),
+        "{backend:?} plan does not use {index}: {plan:#?}"
+    );
+    let sorts = match backend {
+        crate::db::DatabaseBackend::Sqlite => plan.iter().any(|line| line.contains("TEMP B-TREE")),
+        crate::db::DatabaseBackend::Postgres => plan.iter().any(|line| line.contains("Sort  (")),
+    };
+    assert!(!sorts, "{backend:?} plan sorts: {plan:#?}");
+}

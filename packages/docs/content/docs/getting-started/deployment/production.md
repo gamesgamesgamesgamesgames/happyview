@@ -90,7 +90,7 @@ SQLite is fine for small to medium instances and is the default. Switch to Postg
 - Larger-than-memory working sets
 - External tools that need direct read access to the records table
 
-See the [database setup guide](../../guides/database/database-setup.md) for configuration details and [Postgres → SQLite migration](../../guides/database/postgres-to-sqlite-migration.md) if you're moving the other direction. Migrations run automatically on startup regardless of backend.
+See the [database setup guide](../../guides/database/database-setup.md) for configuration details and [Postgres → SQLite migration](../../guides/database/postgres-to-sqlite-migration.md) if you're moving the other direction. Migrations run automatically on startup regardless of backend. Upgrades that build an index over a large records table make that boot slow on either backend. With several replicas, upgrade one first. See [migrations at startup](../../guides/database/database-setup.md#migrations-at-startup).
 
 ## Rate limits
 
