@@ -9,6 +9,9 @@
 //! A failed event is retried in place, so the worker's later events (and so
 //! that DID's) wait behind it. Once the retries run out it is handed to
 //! `on_give_up` and its ticket completes, so the watermark never stalls.
+//! An event that failed only because the infrastructure is unavailable is
+//! retried until it applies: its ticket stays open, the watermark holds, and
+//! the full queue backpressures the reader until the outage ends.
 
 use std::any::Any;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -20,6 +23,7 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use super::event::Event;
 use super::watermark::WatermarkHandle;
@@ -28,27 +32,52 @@ use super::watermark::WatermarkHandle;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
     Applied,
-    /// Worth retrying; the string says why it failed.
+    /// Worth a few retries; the string says why it failed.
     Failed(String),
+    /// A transient infrastructure failure (the database is unreachable, say),
+    /// retried until it applies and never given up.
+    Unavailable(String),
 }
 
 /// What a worker does with each event.
 pub type ApplyFn = Arc<dyn Fn(Event) -> BoxFuture<'static, ApplyOutcome> + Send + Sync>;
 
 /// Called once for an event that still failed after every retry, with the
-/// last error.
+/// last error. It runs inline before the event's ticket completes, so it
+/// must not hang: a hang stops that worker and the watermark for good.
 pub type GiveUpFn = Arc<dyn Fn(Event, String) -> BoxFuture<'static, ()> + Send + Sync>;
 
-/// The waits before each retry of a failed event; one retry per delay.
+/// The longest wait between retries of an `Unavailable` event.
+pub const MAX_UNAVAILABLE_DELAY: Duration = Duration::from_secs(30);
+
+/// How a worker retries an event.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetryPolicy {
+    /// The waits before each retry of a `Failed` event; one retry per delay.
+    /// `Unavailable` retries walk the same delays, then repeat the last.
     pub delays: Vec<Duration>,
+    /// The cap on an `Unavailable` retry's wait.
+    pub max_unavailable_delay: Duration,
+}
+
+impl RetryPolicy {
+    /// The wait before the `retry`th (from 0) retry of an `Unavailable` event.
+    fn unavailable_delay(&self, retry: usize) -> Duration {
+        let delay = self
+            .delays
+            .get(retry)
+            .or(self.delays.last())
+            .copied()
+            .unwrap_or(self.max_unavailable_delay);
+        delay.min(self.max_unavailable_delay)
+    }
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             delays: [1, 2, 4, 8, 16].map(Duration::from_secs).to_vec(),
+            max_unavailable_delay: MAX_UNAVAILABLE_DELAY,
         }
     }
 }
@@ -62,6 +91,17 @@ pub struct WorkerPool {
     senders: Vec<mpsc::Sender<Job>>,
     depths: Arc<Vec<AtomicUsize>>,
     watermark: Arc<WatermarkHandle>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+/// Dropping the pool stops its workers, so a stopped consumer leaves nothing
+/// writing in the background. An apply cut off mid-transaction rolls back.
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 /// The worker that owns `did`'s events.
@@ -83,10 +123,10 @@ impl WorkerPool {
         let workers = workers.max(1);
         let depths: Arc<Vec<AtomicUsize>> =
             Arc::new((0..workers).map(|_| AtomicUsize::new(0)).collect());
-        let senders = (0..workers)
+        let (senders, tasks) = (0..workers)
             .map(|index| {
                 let (tx, rx) = mpsc::channel(capacity.max(1));
-                tokio::spawn(run_worker(Worker {
+                let task = tokio::spawn(run_worker(Worker {
                     index,
                     rx,
                     apply: Arc::clone(&apply),
@@ -95,13 +135,14 @@ impl WorkerPool {
                     retry: retry.clone(),
                     on_give_up: Arc::clone(&on_give_up),
                 }));
-                tx
+                (tx, task)
             })
-            .collect();
+            .unzip();
         Self {
             senders,
             depths,
             watermark,
+            tasks,
         }
     }
 
@@ -153,17 +194,46 @@ async fn run_worker(mut worker: Worker) {
     }
 }
 
-/// Apply `event`, retrying after each delay, and give it up once they run
-/// out. A panic counts as a failure: it must not kill the worker, or its
-/// tickets would never complete and the saved cursor would stop for good.
+/// Apply `event`, retrying after each delay, and give it up once a `Failed`
+/// event runs out of them. `Unavailable` attempts never count toward that and
+/// are retried until the event applies. A panic counts as a failure: it must
+/// not kill the worker, or its tickets would never complete and the saved
+/// cursor would stop for good.
 async fn apply_with_retries(worker: &Worker, event: Event) {
     let mut delays = worker.retry.delays.iter();
+    let mut unavailable_retries = 0;
     let error = loop {
         let error = match AssertUnwindSafe((worker.apply)(event.clone()))
             .catch_unwind()
             .await
         {
-            Ok(ApplyOutcome::Applied) => return,
+            Ok(ApplyOutcome::Applied) => {
+                if unavailable_retries > 0 {
+                    tracing::info!(
+                        worker = worker.index,
+                        did = %event.did,
+                        unavailable_retries,
+                        "applied a jetstream event once it became available"
+                    );
+                }
+                return;
+            }
+            Ok(ApplyOutcome::Unavailable(error)) => {
+                let delay = worker.retry.unavailable_delay(unavailable_retries);
+                if unavailable_retries % 10 == 0 {
+                    tracing::warn!(
+                        worker = worker.index,
+                        did = %event.did,
+                        %error,
+                        unavailable_retries,
+                        retry_in_ms = delay.as_millis() as u64,
+                        "a jetstream event cannot be applied while unavailable; retrying until it can"
+                    );
+                }
+                unavailable_retries += 1;
+                tokio::time::sleep(delay).await;
+                continue;
+            }
             Ok(ApplyOutcome::Failed(error)) => error,
             Err(panic) => format!("panicked: {}", panic_message(&*panic)),
         };
@@ -212,6 +282,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use crate::jetstream::event::{CursorPoint, EventKind};
@@ -235,6 +306,7 @@ mod tests {
     fn fast_retry(attempts_after_the_first: usize) -> RetryPolicy {
         RetryPolicy {
             delays: vec![Duration::from_millis(1); attempts_after_the_first],
+            max_unavailable_delay: Duration::from_millis(2),
         }
     }
 
@@ -269,10 +341,199 @@ mod tests {
 
     #[test]
     fn the_default_retry_backs_off_from_one_to_sixteen_seconds() {
+        let policy = RetryPolicy::default();
         assert_eq!(
-            RetryPolicy::default().delays,
+            policy.delays,
             [1, 2, 4, 8, 16].map(Duration::from_secs).to_vec()
         );
+        assert_eq!(policy.max_unavailable_delay, MAX_UNAVAILABLE_DELAY);
+    }
+
+    #[test]
+    fn unavailable_retries_repeat_the_last_delay_up_to_the_cap() {
+        let policy = RetryPolicy {
+            delays: [1, 2, 40].map(Duration::from_secs).to_vec(),
+            max_unavailable_delay: MAX_UNAVAILABLE_DELAY,
+        };
+        let delays: Vec<u64> = (0..5)
+            .map(|retry| policy.unavailable_delay(retry).as_secs())
+            .collect();
+        assert_eq!(delays, vec![1, 2, 30, 30, 30]);
+        let walked: Vec<u64> = (0..7)
+            .map(|retry| RetryPolicy::default().unavailable_delay(retry).as_secs())
+            .collect();
+        assert_eq!(walked, vec![1, 2, 4, 8, 16, 16, 16]);
+    }
+
+    async fn wait_for(what: &str, condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_event_holds_the_watermark_until_it_applies() {
+        let healthy = Arc::new(AtomicBool::new(false));
+        let attempts: Arc<Mutex<Vec<i64>>> = Arc::default();
+        let apply: ApplyFn = {
+            let healthy = Arc::clone(&healthy);
+            let attempts = Arc::clone(&attempts);
+            Arc::new(move |event: Event| {
+                let healthy = Arc::clone(&healthy);
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts
+                        .lock()
+                        .unwrap()
+                        .push(event.cursor.seq().expect("seq"));
+                    if healthy.load(Ordering::SeqCst) {
+                        ApplyOutcome::Applied
+                    } else {
+                        ApplyOutcome::Unavailable("the database is unreachable".into())
+                    }
+                }
+                .boxed()
+            })
+        };
+        let (on_give_up, gave_up) = recording_give_up();
+        let watermark = Arc::new(WatermarkHandle::new());
+        let pool = WorkerPool::spawn(
+            1,
+            8,
+            apply,
+            Arc::clone(&watermark),
+            fast_retry(2),
+            on_give_up,
+        );
+        send(&pool, &watermark, event("did:plc:same", 1)).await;
+        send(&pool, &watermark, event("did:plc:same", 2)).await;
+
+        wait_for("ten unavailable attempts", || {
+            attempts.lock().unwrap().len() >= 10
+        })
+        .await;
+        assert!(
+            attempts.lock().unwrap().iter().all(|seq| *seq == 1),
+            "seq 2 waits behind seq 1"
+        );
+        assert_eq!(watermark.applied(), None, "the watermark holds");
+        assert_eq!(watermark.in_flight(), 2);
+
+        healthy.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), watermark.wait_idle())
+            .await
+            .expect("drained");
+        assert!(gave_up.lock().unwrap().is_empty());
+        assert_eq!(
+            watermark.applied(),
+            Some(CursorPoint::V2 {
+                seq: 2,
+                witnessed_us: 2
+            })
+        );
+    }
+
+    /// Plays `script` out for seq 1, one outcome per attempt, then applies.
+    fn scripted(script: Vec<ApplyOutcome>) -> (ApplyFn, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let script = Arc::new(script);
+        let apply: ApplyFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_event: Event| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let outcome = script.get(call).cloned().unwrap_or(ApplyOutcome::Applied);
+                async move { outcome }.boxed()
+            })
+        };
+        (apply, calls)
+    }
+
+    #[tokio::test]
+    async fn a_long_outage_never_gives_up() {
+        let (apply, calls) = scripted(vec![ApplyOutcome::Unavailable("down".into()); 50]);
+        let (on_give_up, gave_up) = recording_give_up();
+        let watermark = Arc::new(WatermarkHandle::new());
+        let pool = WorkerPool::spawn(
+            1,
+            8,
+            apply,
+            Arc::clone(&watermark),
+            fast_retry(2),
+            on_give_up,
+        );
+        send(&pool, &watermark, event("did:plc:same", 1)).await;
+        tokio::time::timeout(Duration::from_secs(10), watermark.wait_idle())
+            .await
+            .expect("drained");
+        assert_eq!(calls.load(Ordering::SeqCst), 51);
+        assert!(gave_up.lock().unwrap().is_empty());
+        assert_eq!(
+            watermark.applied(),
+            Some(CursorPoint::V2 {
+                seq: 1,
+                witnessed_us: 1
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn only_failed_attempts_count_toward_giving_up() {
+        let u = || ApplyOutcome::Unavailable("down".into());
+        let f = |n: u32| ApplyOutcome::Failed(format!("failure {n}"));
+        // Two retries allow three failed attempts; the unavailable ones
+        // between them do not count.
+        let (apply, calls) = scripted(vec![u(), f(1), u(), u(), f(2), u(), f(3)]);
+        let (on_give_up, gave_up) = recording_give_up();
+        let watermark = Arc::new(WatermarkHandle::new());
+        let pool = WorkerPool::spawn(
+            1,
+            8,
+            apply,
+            Arc::clone(&watermark),
+            fast_retry(2),
+            on_give_up,
+        );
+        send(&pool, &watermark, event("did:plc:same", 1)).await;
+        tokio::time::timeout(Duration::from_secs(5), watermark.wait_idle())
+            .await
+            .expect("drained");
+        assert_eq!(calls.load(Ordering::SeqCst), 7);
+        assert_eq!(*gave_up.lock().unwrap(), vec![(1, "failure 3".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_pool_stops_a_retrying_worker() {
+        let (apply, calls) = scripted(vec![ApplyOutcome::Unavailable("down".into()); 100_000]);
+        let (on_give_up, _gave_up) = recording_give_up();
+        let watermark = Arc::new(WatermarkHandle::new());
+        let pool = WorkerPool::spawn(
+            1,
+            8,
+            apply,
+            Arc::clone(&watermark),
+            fast_retry(1),
+            on_give_up,
+        );
+        send(&pool, &watermark, event("did:plc:same", 1)).await;
+        wait_for("the worker to start retrying", || {
+            calls.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+
+        drop(pool);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after_drop = calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_drop,
+            "the worker kept applying after the pool was dropped"
+        );
+        assert_eq!(watermark.applied(), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -501,6 +762,7 @@ mod tests {
             senders: vec![tx],
             depths: Arc::new(vec![AtomicUsize::new(0)]),
             watermark: Arc::clone(&watermark),
+            tasks: Vec::new(),
         };
         send(&pool, &watermark, event("did:plc:same", 1)).await;
         assert_eq!(watermark.in_flight(), 0);
