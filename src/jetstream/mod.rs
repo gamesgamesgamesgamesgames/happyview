@@ -16,6 +16,7 @@ pub mod status;
 pub mod watermark;
 pub mod workers;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -76,18 +77,33 @@ struct Session {
     /// seq numbering it no longer has (`FutureCursor`). While it is still the
     /// saved one, resumes go by the saved witnessed time instead.
     stale_seq: Option<i64>,
-    /// Connect without a cursor: neither the saved seq nor a witnessed time
-    /// will do. Cleared by the first event.
+    /// Connect without a cursor: the saved seq was refused as too old and no
+    /// witnessed time will do. Cleared by the first event, and before a long
+    /// `invalid_request` wait.
     from_tip: bool,
     /// A resume from the tip that lost events, reported once the first event
     /// shows where the stream picked up again.
     pending_gap: Option<Gap>,
     /// 400s in a row with no error name to go by (`handle_rejection`).
     unexplained_400s: u32,
+    /// After `FutureCursor`, the first ticket of the new seq numbering:
+    /// nothing is saved until it is applied, so an old-numbering seq still
+    /// applying cannot become the saved cursor.
+    save_barrier: Option<u64>,
+    /// Gaps logged by this `run()`, by reason and the cursor sent, so a
+    /// retry that hits the same one does not log it again.
+    logged_gaps: HashSet<(&'static str, Option<i64>)>,
 }
 
+/// `reason` in a `jetstream.gap` event's detail.
+const GAP_CURSOR_TOO_OLD: &str = "cursor_too_old";
+const GAP_OUTDATED_CURSOR: &str = "outdated_cursor";
+const GAP_FUTURE_CURSOR: &str = "future_cursor";
+
 struct Gap {
-    reason: String,
+    /// The cursor that was refused.
+    sent: Option<i64>,
+    /// The saved seq, the last one known applied.
     after_seq: Option<i64>,
     message: String,
 }
@@ -107,6 +123,8 @@ impl Session {
             from_tip: false,
             pending_gap: None,
             unexplained_400s: 0,
+            save_barrier: None,
+            logged_gaps: HashSet::new(),
         }
     }
 }
@@ -190,7 +208,7 @@ async fn handle_rejection(
             Some(Duration::ZERO)
         }
         Rejection::CursorTooOld(message) => {
-            resume_without_seq(state, session, last_dispatched, "CursorTooOld", message).await;
+            resume_without_seq(state, session, last_dispatched, message, true).await;
             Some(Duration::ZERO)
         }
         Rejection::UnknownDictionary(message) => {
@@ -220,27 +238,38 @@ async fn handle_rejection(
             }
             Some(Duration::ZERO)
         }
-        Rejection::InvalidRequest(message) => Some(invalid_request(state, settings, message).await),
+        Rejection::InvalidRequest(message) => {
+            Some(invalid_request(state, settings, session, message).await)
+        }
         // tungstenite hands over only the body bytes that came with the
         // headers, so a 400 may arrive with nothing to classify. Step down
         // through what could be wrong with the request, and only then wait.
+        // The cursor is only dropped for a seq that a witnessed time can
+        // replace: never for the tip, which would skip everything since.
         Rejection::Other {
             status: 400,
             message,
         } => {
             session.unexplained_400s += 1;
-            match session.unexplained_400s {
-                1 => {
-                    tracing::warn!(%message, "jetstream refused the subscription; retrying uncompressed");
-                    session.compression = false;
-                    session.dictionary = None;
-                }
-                2 => {
-                    resume_without_seq(state, session, last_dispatched, "HTTP 400", message).await;
-                }
-                _ => return Some(invalid_request(state, settings, message).await),
+            let sent_seq = session
+                .sent_cursor
+                .is_some_and(|c| c < cursor::TIMESTAMP_CURSOR_MIN);
+            let step = session.unexplained_400s;
+            if step == 1 {
+                tracing::warn!(%message, "jetstream refused the subscription; retrying uncompressed");
+                session.compression = false;
+                session.dictionary = None;
+                return Some(Duration::ZERO);
             }
-            Some(Duration::ZERO)
+            if step == 2
+                && sent_seq
+                && resume_without_seq(state, session, last_dispatched, message.clone(), false).await
+            {
+                return Some(Duration::ZERO);
+            }
+            // Straight on from step 2 when the cursor stays.
+            session.unexplained_400s = step.max(3);
+            Some(invalid_request(state, settings, session, message).await)
         }
         Rejection::NotFound => {
             tracing::warn!("jetstream answered 404 for the subscription");
@@ -258,54 +287,68 @@ async fn handle_rejection(
 }
 
 /// Stop resuming by seq: the refused one, the saved one and the last one
-/// dispatched all go. The next connection resumes by the saved witnessed
-/// time, or from the live tip when there is none or it was just refused.
+/// dispatched all go, and the next connection resumes by the saved
+/// witnessed time. When there is none, or it was the cursor refused, only
+/// `to_tip` (a `CursorTooOld`) goes on to the live tip; otherwise nothing
+/// changes. Returns whether the next connection resumes differently.
 async fn resume_without_seq(
     state: &AppState,
     session: &mut Session,
     last_dispatched: &mut Option<i64>,
-    reason: &str,
     message: String,
-) {
-    *last_dispatched = None;
+    to_tip: bool,
+) -> bool {
     let stored = match cursor::load(&state.db, state.db_backend).await {
         Ok(stored) => stored,
         Err(e) => {
             // The next attempt tries again, and is likely refused again.
             tracing::warn!(error = %e, "failed to load the jetstream cursor");
-            return;
+            return false;
         }
     };
-    session.stale_seq = stored.seq;
     let sent_time = session
         .sent_cursor
         .is_some_and(|c| c >= cursor::TIMESTAMP_CURSOR_MIN);
-    if stored.time_us.is_some() && !sent_time {
+    let by_time = stored.time_us.is_some() && !sent_time;
+    if !by_time && !to_tip {
+        return false;
+    }
+    *last_dispatched = None;
+    session.stale_seq = stored.seq;
+    if by_time {
         tracing::warn!(
             %message,
-            reason,
             "jetstream refused the seq cursor; resuming by witnessed time"
         );
-        return;
+        return true;
     }
     tracing::warn!(
         %message,
-        reason,
         "jetstream refused the cursor and no witnessed time is left; resuming from the live tip"
     );
     session.from_tip = true;
     if session.sent_cursor.is_some() {
         session.pending_gap = Some(Gap {
-            reason: reason.to_string(),
+            sent: session.sent_cursor,
             after_seq: stored.seq,
             message,
         });
     }
+    true
 }
 
 /// Log a refusal that will not fix itself on a quick retry; returns how long
-/// to wait before trying again.
-async fn invalid_request(state: &AppState, settings: &Settings, message: String) -> Duration {
+/// to wait before trying again. The retry keeps its cursor rather than
+/// starting at the tip: a tip resume waiting on it would skip everything
+/// from the saved cursor to whenever the refusals stop.
+async fn invalid_request(
+    state: &AppState,
+    settings: &Settings,
+    session: &mut Session,
+    message: String,
+) -> Duration {
+    session.from_tip = false;
+    session.pending_gap = None;
     let retry = settings.invalid_request_retry;
     tracing::error!(
         %message,
@@ -330,7 +373,19 @@ async fn invalid_request(state: &AppState, settings: &Settings, message: String)
     retry
 }
 
-async fn log_gap(state: &AppState, detail: serde_json::Value) {
+/// Log a `jetstream.gap` with `reason` and `detail`, once per `run()` for
+/// each reason and cursor sent.
+async fn log_gap(
+    state: &AppState,
+    session: &mut Session,
+    reason: &'static str,
+    sent: Option<i64>,
+    mut detail: serde_json::Value,
+) {
+    if !session.logged_gaps.insert((reason, sent)) {
+        return;
+    }
+    detail["reason"] = reason.into();
     log_event(
         &state.db,
         EventLog {
@@ -596,8 +651,7 @@ async fn run_session(
                         }
                         session.from_tip = false;
                         if let Some(gap) = session.pending_gap.take() {
-                            log_gap(state, serde_json::json!({
-                                "reason": gap.reason,
+                            log_gap(state, session, GAP_CURSOR_TOO_OLD, gap.sent, serde_json::json!({
                                 "message": gap.message,
                                 "after_seq": gap.after_seq,
                                 "resumed_at_seq": event.cursor.seq(),
@@ -613,7 +667,7 @@ async fn run_session(
                         pool.dispatch(Job { ticket, event }).await;
                         since_flush += 1;
                         if since_flush >= FLUSH_EVERY_EVENTS {
-                            flush(state, host, watermark, &mut last_saved).await;
+                            flush(state, host, watermark, &mut session.save_barrier, &mut last_saved).await;
                             since_flush = 0;
                         }
                     }
@@ -623,8 +677,10 @@ async fn run_session(
                             // A timestamp cursor older than the server keeps
                             // was moved up: the events in between are gone.
                             "OutdatedCursor" => {
-                                log_gap(state, serde_json::json!({ "reason": name, "message": message }))
-                                    .await;
+                                log_gap(state, session, GAP_OUTDATED_CURSOR, resume, serde_json::json!({
+                                    "message": message,
+                                }))
+                                .await;
                             }
                             // The seq resumed from is past the server's next
                             // one: its seqs started over or went back. The
@@ -636,8 +692,8 @@ async fn run_session(
                                 if stored.seq.is_some() {
                                     session.stale_seq = stored.seq;
                                 }
-                                log_gap(state, serde_json::json!({
-                                    "reason": "future_cursor",
+                                session.save_barrier = Some(watermark.next_ticket());
+                                log_gap(state, session, GAP_FUTURE_CURSOR, resume, serde_json::json!({
                                     "from_seq": resume,
                                 }))
                                 .await;
@@ -653,7 +709,7 @@ async fn run_session(
                 }
             }
             _ = ticker.tick() => {
-                flush(state, host, watermark, &mut last_saved).await;
+                flush(state, host, watermark, &mut session.save_barrier, &mut last_saved).await;
                 since_flush = 0;
             }
             _ = &mut collections_changed => break Ended::CollectionsChanged,
@@ -669,7 +725,14 @@ async fn run_session(
             "jetstream events still applying; the saved cursor stops before them"
         );
     }
-    flush(state, host, watermark, &mut last_saved).await;
+    flush(
+        state,
+        host,
+        watermark,
+        &mut session.save_barrier,
+        &mut last_saved,
+    )
+    .await;
 
     match ended {
         Ended::CollectionsChanged => {
@@ -708,17 +771,25 @@ fn v2_resume(saved: Option<i64>, last_dispatched: Option<i64>) -> Option<i64> {
     }
 }
 
-/// Save the applied watermark when it moved.
+/// Save the applied watermark when it moved, unless it is still short of
+/// `barrier` (`Session::save_barrier`), which is cleared once passed.
 async fn flush(
     state: &AppState,
     host: &str,
     watermark: &WatermarkHandle,
+    barrier: &mut Option<u64>,
     last_saved: &mut Option<CursorPoint>,
 ) {
     let Some(point) = watermark.applied() else {
         return;
     };
     status::applied(&point);
+    if let Some(ticket) = *barrier {
+        if !watermark.has_retired(ticket) {
+            return;
+        }
+        *barrier = None;
+    }
     if *last_saved == Some(point) {
         return;
     }

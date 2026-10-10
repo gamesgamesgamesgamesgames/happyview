@@ -571,9 +571,10 @@ impl Blocker {
 }
 
 /// Watches `jetstream_seq` until dropped and records whether it ever went
-/// backwards.
+/// backwards, and every value it held.
 struct SeqWatch {
     went_back: Arc<AtomicBool>,
+    seen: Arc<std::sync::Mutex<Vec<i64>>>,
     task: JoinHandle<()>,
 }
 
@@ -582,6 +583,8 @@ impl SeqWatch {
         let went_back = Arc::new(AtomicBool::new(false));
         let (db, backend) = (app.state.db.clone(), app.state.db_backend);
         let flag = Arc::clone(&went_back);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let values = Arc::clone(&seen);
         let task = tokio::spawn(async move {
             let sql = adapt_sql(
                 "SELECT value FROM happyview_instance_settings WHERE key = 'jetstream_seq'",
@@ -596,6 +599,11 @@ impl SeqWatch {
                     .flatten()
                     .and_then(|(v,)| v.parse::<i64>().ok());
                 if let Some(seq) = seq {
+                    let mut values = values.lock().expect("seen");
+                    if values.last() != Some(&seq) {
+                        values.push(seq);
+                    }
+                    drop(values);
                     if seq < highest {
                         flag.store(true, Ordering::SeqCst);
                     }
@@ -604,11 +612,19 @@ impl SeqWatch {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
-        Self { went_back, task }
+        Self {
+            went_back,
+            seen,
+            task,
+        }
     }
 
     fn went_back(&self) -> bool {
         self.went_back.load(Ordering::SeqCst)
+    }
+
+    fn seen(&self) -> Vec<i64> {
+        self.seen.lock().expect("seen").clone()
     }
 }
 
@@ -776,7 +792,7 @@ async fn a_cursor_past_retention_resumes_by_witnessed_time() {
     assert_eq!(connections.len(), 2, "{connections:?}");
     assert_eq!(
         events(&app, "jetstream.gap").await,
-        vec![json!({"reason": "OutdatedCursor", "message": "cursor clamped to seq 90"})]
+        vec![json!({"reason": "outdated_cursor", "message": "cursor clamped to seq 90"})]
     );
     assert_eq!(
         rkeys(&app, "did:plc:gap").await,
@@ -808,7 +824,7 @@ async fn a_cursor_past_retention_without_a_time_resumes_from_the_tip() {
     assert_eq!(
         events(&app, "jetstream.gap").await,
         vec![json!({
-            "reason": "CursorTooOld",
+            "reason": "cursor_too_old",
             "message": "cursor 5 below lookback floor 90",
             "after_seq": 5,
             "resumed_at_seq": 100,
@@ -902,7 +918,7 @@ async fn a_clamped_time_cursor_logs_the_gap() {
     wait_until!("seq 2 applied", applied_through(&app, 2).await);
     assert_eq!(
         events(&app, "jetstream.gap").await,
-        vec![json!({"reason": "OutdatedCursor", "message": "cursor clamped to seq 90"})]
+        vec![json!({"reason": "outdated_cursor", "message": "cursor clamped to seq 90"})]
     );
 }
 
@@ -1049,4 +1065,204 @@ async fn an_unexplained_400_steps_down_then_waits() {
         vec![json!({"message": "HTTP 400", "retry_in_secs": 0})]
     );
     assert_eq!(rkeys(&app, "did:plc:bare").await, vec!["r6", "r7", "r8"]);
+}
+
+/// An unexplained 400 on a time cursor (v1, or a pre-upgrade instance's
+/// first v2 connect) never drops the cursor: dropping it would resume at
+/// the tip and skip everything since the saved time. It goes straight to
+/// the long wait instead, and keeps the cursor across those retries.
+#[tokio::test]
+#[serial]
+async fn an_unexplained_400_keeps_a_time_cursor() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    let time = js::witnessed_us(5).to_string();
+    set_setting(&app, "jetstream_cursor", &time).await;
+    for _ in 0..3 {
+        mock.reject_next_bare(400);
+    }
+    mock.push((6..=8).map(|s| js::create(s, "did:plc:keep", GAME, &format!("r{s}"), game("x"))));
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 8 applied", applied_through(&app, 8).await);
+    let connections = mock.connections();
+    assert_eq!(connections.len(), 4, "{connections:?}");
+    assert!(
+        connections
+            .iter()
+            .all(|c| c.param("cursor") == Some(time.clone())),
+        "a connection dropped the cursor: {connections:?}"
+    );
+    assert_eq!(connections[1].param("zstdDictionary"), None);
+    assert_eq!(
+        events(&app, "jetstream.invalid_request").await.len(),
+        2,
+        "the second and third 400s both wait"
+    );
+    assert!(events(&app, "jetstream.gap").await.is_empty());
+    assert_eq!(rkeys(&app, "did:plc:keep").await, vec!["r6", "r7", "r8"]);
+}
+
+/// A 503 between two unexplained 400s does not restart the ladder: the
+/// second 400 is step 2. (Pins the current behaviour.)
+#[tokio::test]
+#[serial]
+async fn a_503_between_unexplained_400s_does_not_reset_the_ladder() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    set_setting(&app, "jetstream_seq", "5").await;
+    set_setting(&app, "jetstream_cursor", &js::witnessed_us(5).to_string()).await;
+    set_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next_bare(400);
+    mock.reject_next(503, "ServiceUnavailable", "warming up");
+    mock.reject_next_bare(400);
+    mock.push((6..=8).map(|s| js::create(s, "did:plc:503", GAME, &format!("r{s}"), game("x"))));
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 8 applied", applied_through(&app, 8).await);
+    let shape: Vec<(Option<String>, Option<String>)> = mock
+        .connections()
+        .iter()
+        .map(|c| (c.param("cursor"), c.param("zstdDictionary")))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (Some("5".into()), Some(js::DICTIONARY_A.to_string())),
+            (Some("5".into()), None),
+            (Some("5".into()), None),
+            (Some(js::witnessed_us(5).to_string()), None),
+        ]
+    );
+    assert!(events(&app, "jetstream.invalid_request").await.is_empty());
+}
+
+/// The dictionary is refused and refetching it fails: the consumer goes on
+/// uncompressed.
+#[tokio::test]
+#[serial]
+async fn compression_falls_back_when_the_dictionary_cannot_be_refetched() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    mock.push((1..=3).map(|s| js::create(s, "did:plc:nodict", GAME, &format!("r{s}"), game("x"))));
+    let _consumer = start(&app, settings(&mock));
+    wait_until!("seq 3 applied", applied_through(&app, 3).await);
+
+    mock.serve_dictionary(None);
+    mock.accept_dictionaries(&[]);
+    mock.push((4..=6).map(|s| js::create(s, "did:plc:nodict", GAME, &format!("r{s}"), game("x"))));
+    mock.kick();
+
+    wait_until!("seq 6 applied", applied_through(&app, 6).await);
+    let connections = mock.connections();
+    assert_eq!(
+        connections[1].param("zstdDictionary"),
+        Some(js::DICTIONARY_A.to_string())
+    );
+    assert_eq!(
+        connections
+            .last()
+            .expect("connections")
+            .param("zstdDictionary"),
+        None
+    );
+    assert_eq!(rkeys(&app, "did:plc:nodict").await.len(), 6);
+}
+
+/// The same gap met again on a retry with the same cursor is logged once.
+#[tokio::test]
+#[serial]
+async fn a_repeated_gap_is_logged_once() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    let time = js::witnessed_us(1).to_string();
+    set_setting(&app, "jetstream_cursor", &time).await;
+    mock.notice_next("OutdatedCursor", "cursor clamped to seq 90");
+    mock.notice_next("OutdatedCursor", "cursor clamped to seq 90");
+    let _consumer = start(&app, settings(&mock));
+    wait_until!("a connection", !mock.connections().is_empty());
+
+    mock.push([js::create(2, "did:plc:once", GAME, "a", game("a"))]);
+    mock.kick();
+    wait_until!("seq 2 applied", applied_through(&app, 2).await);
+    assert_eq!(mock.connections()[1].param("cursor"), Some(time));
+    assert_eq!(
+        events(&app, "jetstream.gap").await,
+        vec![json!({"reason": "outdated_cursor", "message": "cursor clamped to seq 90"})]
+    );
+}
+
+/// `FutureCursor` arrives while an event of the old seq numbering is still
+/// applying. When it finishes, its seq (ahead of the new numbering's) must
+/// not be saved: after a crash the consumer would resume past every new
+/// event up to it. Nothing is saved until a new-numbering event applies,
+/// and a restart then resumes in the new numbering.
+///
+/// Postgres only: it holds two events back independently, and the SQLite
+/// blocker holds back every write.
+#[tokio::test]
+#[serial]
+async fn an_old_numbering_seq_is_not_saved_after_a_future_cursor() {
+    let Some(app) = app().await else { return };
+    if app.state.db_backend == DatabaseBackend::Sqlite {
+        eprintln!("skipped (needs Postgres)");
+        return;
+    }
+    let mock = MockJetstream::start().await;
+    let (old_did, new_did) = ("did:plc:oldnumbering", "did:plc:newnumbering");
+    let old = |s: i64| js::create(s, old_did, GAME, &format!("r{s}"), game("x"));
+    let new = |s: i64| js::create(s, new_did, GAME, &format!("r{s}"), game("x"));
+    let fast_drain = || Settings {
+        drain_timeout: Duration::from_millis(200),
+        ..settings(&mock)
+    };
+    mock.push((10..=11).map(old));
+    let base = received(&app);
+    let consumer = start(&app, fast_drain());
+    wait_until!("seq 11 applied", applied_through(&app, 11).await);
+
+    let old_blocker = Blocker::hold(&app, &format!("at://{old_did}/{GAME}/r12")).await;
+    mock.push([old(12)]);
+    mock.kick();
+    wait_until!("seq 12 dispatched", received(&app) == base + 3);
+
+    let seqs = SeqWatch::start(&app);
+    let new_blocker = Blocker::hold(&app, &format!("at://{new_did}/{GAME}/r1")).await;
+    mock.reset_events();
+    mock.push((1..=3).map(new));
+    mock.notice_next("FutureCursor", "cursor 12 is past the next seq 4");
+    mock.kick();
+    wait_until!("the new seqs dispatched", received(&app) == base + 6);
+
+    old_blocker.release().await;
+    wait_until!(
+        "old seq 12 applied",
+        rkeys(&app, old_did).await.contains(&"r12".to_string())
+    );
+    let connections = mock.connections().len();
+    mock.kick();
+    wait_until!(
+        "a session end, which saves the cursor",
+        mock.connections().len() > connections
+    );
+    assert_eq!(setting(&app, "jetstream_seq").await.as_deref(), Some("11"));
+    assert!(
+        !seqs.seen().contains(&12),
+        "an old-numbering seq was saved: {:?}",
+        seqs.seen()
+    );
+
+    // A crash before any new event applied: the restart resumes at the
+    // saved 11, the server answers `FutureCursor` again, and nothing of the
+    // new numbering is skipped.
+    drop(consumer);
+    new_blocker.release().await;
+    mock.notice_next("FutureCursor", "cursor 11 is past the next seq 4");
+    let _consumer = start(&app, fast_drain());
+    wait_until!(
+        "the new seq 3 saved",
+        setting(&app, "jetstream_seq").await.as_deref() == Some("3")
+    );
+    assert_eq!(rkeys(&app, new_did).await, vec!["r1", "r2", "r3"]);
+    assert!(!seqs.seen().contains(&12), "{:?}", seqs.seen());
 }

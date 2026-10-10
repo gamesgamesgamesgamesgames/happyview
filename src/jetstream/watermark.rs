@@ -56,6 +56,16 @@ impl Watermark {
     pub fn in_flight(&self) -> usize {
         self.pending.len()
     }
+
+    /// The ticket the next `begin` hands out.
+    pub fn next_ticket(&self) -> u64 {
+        self.front + self.pending.len() as u64
+    }
+
+    /// Whether `applied` is at or past `ticket`.
+    pub fn has_retired(&self, ticket: u64) -> bool {
+        self.front > ticket
+    }
 }
 
 /// A `Watermark` shared between the reader and the workers.
@@ -97,6 +107,14 @@ impl WatermarkHandle {
         self.lock().in_flight()
     }
 
+    pub fn next_ticket(&self) -> u64 {
+        self.lock().next_ticket()
+    }
+
+    pub fn has_retired(&self, ticket: u64) -> bool {
+        self.lock().has_retired(ticket)
+    }
+
     /// Wait until every dispatched event has been applied.
     pub async fn wait_idle(&self) {
         loop {
@@ -124,6 +142,21 @@ mod tests {
             seq,
             witnessed_us: seq,
         }
+    }
+
+    #[test]
+    fn a_ticket_retires_once_everything_up_to_it_is_applied() {
+        let mut w = Watermark::default();
+        let old = w.begin(p(12));
+        let barrier = w.next_ticket();
+        let new = w.begin(p(1));
+        assert_eq!(new, barrier);
+        w.complete(old);
+        assert_eq!(w.applied(), Some(p(12)));
+        assert!(!w.has_retired(barrier), "only the old ticket is applied");
+        w.complete(new);
+        assert!(w.has_retired(barrier));
+        assert_eq!(w.next_ticket(), new + 1);
     }
 
     #[test]

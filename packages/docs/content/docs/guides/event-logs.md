@@ -104,12 +104,22 @@ See [Backfill](./backfill.md) for background on backfill jobs.
 
 ### Jetstream events
 
-| Event Type               | Severity | Subject | Detail   |
-| ------------------------ | -------- | ------- | -------- |
-| `jetstream.connected`    | info     | —       | `url`    |
-| `jetstream.disconnected` | warn     | —       | `reason` |
+| Event Type                  | Severity | Subject | Detail                                            |
+| --------------------------- | -------- | ------- | ------------------------------------------------- |
+| `jetstream.connected`       | info     | —       | `url`, `protocol`, `compression`, `dictionary_id` |
+| `jetstream.disconnected`    | warn     | —       | `reason`                                          |
+| `jetstream.gap`             | warn     | —       | `reason`, and more by reason (below)              |
+| `jetstream.invalid_request` | error    | —       | `message`, `retry_in_secs`                        |
 
-Logged when the WebSocket connection to [Jetstream](https://github.com/bluesky-social/jetstream) is established or lost.
+`jetstream.connected` and `jetstream.disconnected` are logged when the WebSocket connection to [Jetstream](https://github.com/bluesky-social/jetstream) is established or lost.
+
+`jetstream.gap` means events may have been missed. Each gap is logged once per process for the same reason and cursor. Its `reason` is one of:
+
+- `cursor_too_old`: the saved cursor was past Jetstream's retention and no saved time could replace it, so HappyView resumed from the live tip. `after_seq` is the saved seq (the last one known applied), `resumed_at_seq` the first seq received after it, and `message` Jetstream's explanation.
+- `outdated_cursor`: Jetstream moved a time cursor older than its retention up to the oldest event it has. `message` names where it resumed.
+- `future_cursor`: the saved seq was past Jetstream's newest, because its seq numbering restarted. HappyView follows the new numbering from the live tip. `from_seq` is the cursor it asked for.
+
+`jetstream.invalid_request` means Jetstream refused the subscription as invalid, or kept refusing it without saying why after HappyView dropped what it could from the request. HappyView retries after `retry_in_secs` (an hour by default).
 
 ## Querying events
 
