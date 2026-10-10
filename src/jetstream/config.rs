@@ -60,17 +60,34 @@ pub fn parse_protocol(raw: Option<&str>) -> ProtocolChoice {
 }
 
 pub fn parse_compression(raw: Option<&str>) -> bool {
-    !matches!(
-        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("false" | "0" | "no" | "off")
-    )
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("true" | "1" | "yes" | "on") => true,
+        Some("false" | "0" | "no" | "off") => false,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "JETSTREAM_COMPRESSION must be true or false; using true"
+            );
+            true
+        }
+    }
 }
 
 pub fn parse_workers(raw: Option<&str>) -> usize {
-    raw.and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|n| *n >= 1)
-        .map(|n| n.min(MAX_WORKERS))
-        .unwrap_or(DEFAULT_WORKERS)
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_WORKERS;
+    };
+    match raw.parse::<usize>() {
+        Ok(n) if n >= 1 => n.min(MAX_WORKERS),
+        _ => {
+            tracing::warn!(
+                value = raw,
+                default = DEFAULT_WORKERS,
+                "JETSTREAM_WORKERS must be a positive integer; using the default"
+            );
+            DEFAULT_WORKERS
+        }
+    }
 }
 
 /// A Jetstream host, reachable as a websocket and over HTTP.
@@ -106,10 +123,11 @@ pub fn parse_endpoint(url: &str) -> Endpoint {
         "ws" | "http" => ("ws", "http"),
         _ => ("wss", "https"),
     };
+    let host = rest.to_ascii_lowercase();
     Endpoint {
-        ws_base: format!("{ws}://{rest}"),
-        http_base: format!("{http}://{rest}"),
-        host: rest.to_string(),
+        ws_base: format!("{ws}://{host}"),
+        http_base: format!("{http}://{host}"),
+        host,
     }
 }
 
@@ -288,6 +306,14 @@ mod tests {
         assert_eq!(
             parse_endpoint("wss://js.example.com/subscribe?wantedCollections=app.x").host,
             "js.example.com"
+        );
+    }
+
+    #[test]
+    fn endpoint_hosts_are_case_insensitive() {
+        assert_eq!(
+            parse_endpoint("WSS://JS.Example.com"),
+            parse_endpoint("js.example.com")
         );
     }
 
