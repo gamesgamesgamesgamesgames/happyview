@@ -32,16 +32,16 @@ use crate::wire::{
     CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, JobGet, JobListAny, JobProgressRequest,
     JobView, Label, LabelsGet, LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoInfo,
     LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut, PluginError, RecordRef,
-    RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, ScriptLogRequest, SpaceDelete,
-    SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo,
+    RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, ResolvedIdentity, ScriptLogRequest,
+    SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo,
     SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage,
     SpaceUpdate, SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers,
     SpacesQuery, StrongRef, TableQuery,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::wire::{
-    AtprotoResolveService, BlobLookup, BlobPut, BlobStored, JobShouldStopRequest, JobWaitRequest,
-    LexiconGet,
+    AtprotoResolveIdentity, AtprotoResolveService, BlobLookup, BlobPut, BlobStored,
+    JobShouldStopRequest, JobWaitRequest, LexiconGet,
 };
 
 /// The wire types these wrappers send and receive. Defined in [`crate::wire`],
@@ -89,6 +89,7 @@ extern "C" {
     fn host_blob_get(req_ptr: i32, req_len: i32) -> i64;
     fn host_blob_stat(req_ptr: i32, req_len: i32) -> i64;
     fn host_atproto_resolve_service(req_ptr: i32, req_len: i32) -> i64;
+    fn host_atproto_resolve_identity(req_ptr: i32, req_len: i32) -> i64;
     fn host_atproto_blob_download(req_ptr: i32, req_len: i32) -> i64;
     fn host_labels_get(req_ptr: i32, req_len: i32) -> i64;
     fn host_attest_sign(req_ptr: i32, req_len: i32) -> i64;
@@ -599,6 +600,28 @@ pub fn atproto_resolve_service(did: &str) -> Result<Option<String>, PluginError>
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = did;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Resolve a handle or a DID to both. Needs `atproto:read`.
+///
+/// The returned `handle` is present only when it was confirmed in both
+/// directions, so it is safe to display; a DID always comes back when the
+/// identifier resolves at all.
+pub fn atproto_resolve_identity(identifier: &str) -> Result<ResolvedIdentity, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(
+            host_atproto_resolve_identity,
+            &AtprotoResolveIdentity {
+                identifier: identifier.into(),
+            },
+        )
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = identifier;
         Err(HostError::NotWasm.into())
     }
 }
