@@ -159,24 +159,28 @@ From there, follow the [Quickstart](../quickstart.md) from step 3 to add your fi
 
 Beyond the required secrets, both Compose files expose these with production defaults. Override them in `.env`.
 
-| Variable                         | Default                                    | Notes                                                           |
-| -------------------------------- | ------------------------------------------ | --------------------------------------------------------------- |
-| `HAPPYVIEW_VERSION`              | `latest`                                   | Image tag to deploy                                             |
-| `HTTP_BIND`                      | `127.0.0.1:3000`                           | Host address the container publishes on                         |
-| `BASE_PATH`                      | _(none)_                                   | Subpath prefix, e.g. `/hv`. `PUBLIC_URL` must not include it    |
-| `RUST_LOG`                       | `happyview=info,tower_http=info,sqlx=warn` | The dev default is very noisy in production                     |
-| `JETSTREAM_URL`                  | `wss://jetstream1.us-east.bsky.network`    | Real-time record stream                                         |
-| `RELAY_URL`                      | `https://bsky.network`                     | Used for [backfill](../../guides/backfill.md) repo discovery    |
-| `PLC_URL`                        | `https://plc.directory`                    | DID resolution                                                  |
-| `EVENT_LOG_RETENTION_DAYS`       | `30`                                       | `0` keeps [event logs](../../guides/event-logs.md) indefinitely |
-| `DEFAULT_RATE_LIMIT_CAPACITY`    | `100`                                      | Per-client token bucket capacity                                |
-| `DEFAULT_RATE_LIMIT_REFILL_RATE` | `2.0`                                      | Tokens per second                                               |
+| Variable                         | Default                                    | Notes                                                                       |
+| -------------------------------- | ------------------------------------------ | --------------------------------------------------------------------------- |
+| `HAPPYVIEW_VERSION`              | `latest`                                   | Image tag to deploy                                                         |
+| `HTTP_BIND`                      | `127.0.0.1:3000`                           | Host address the container publishes on                                     |
+| `BASE_PATH`                      | _(none)_                                   | Subpath prefix, e.g. `/hv`. `PUBLIC_URL` must not include it                |
+| `RUST_LOG`                       | `happyview=info,tower_http=info,sqlx=warn` | The dev default is very noisy in production                                 |
+| `JETSTREAM_URL`                  | `wss://jetstream1.us-east.bsky.network`    | Real-time record stream                                                     |
+| `RELAY_URL`                      | `https://bsky.network`                     | Used for [backfill](../../guides/backfill.md) repo discovery                |
+| `PLC_URL`                        | `https://plc.directory`                    | DID resolution                                                              |
+| `EVENT_LOG_RETENTION_DAYS`       | `30`                                       | `0` keeps [event logs](../../guides/event-logs.md) indefinitely             |
+| `DEAD_LETTER_RETENTION_DAYS`     | `30`                                       | Days to keep script dead letters once resolved. `0` keeps them              |
+| `BACKFILL_DISCOVERY_WINDOW`      | `50000`                                    | Most work units a [backfill](../../guides/backfill.md) keeps queued at once |
+| `DEFAULT_RATE_LIMIT_CAPACITY`    | `100`                                      | Per-client token bucket capacity                                            |
+| `DEFAULT_RATE_LIMIT_REFILL_RATE` | `2.0`                                      | Tokens per second                                                           |
 
 SQLite stack only:
 
-| Variable                    | Default             | Notes                                                                                                                                          |
-| --------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SQLITE_JOURNAL_SIZE_LIMIT` | `67108864` (64 MiB) | Caps the `-wal` file after a checkpoint. Deleting rows grows the WAL for the duration of the delete, so this bounds a delete's peak disk usage |
+| Variable                          | Default             | Notes                                                                                                                                                         |
+| --------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SQLITE_JOURNAL_SIZE_LIMIT`       | `67108864` (64 MiB) | Caps the `-wal` file after a checkpoint. Deleting rows grows the WAL for the duration of the delete, so this bounds a delete's peak disk usage                |
+| `SQLITE_SYNCHRONOUS`              | `NORMAL`            | `NORMAL` or `FULL`. `NORMAL` cannot corrupt the database in WAL mode, but a crash or power loss can lose the last few transactions; `FULL` syncs every commit |
+| `SQLITE_CHECKPOINT_INTERVAL_SECS` | `60`                | Seconds between `wal_checkpoint(TRUNCATE)` runs, which empty the write-ahead log. `0` disables them                                                           |
 
 Postgres stack only:
 
