@@ -29,6 +29,8 @@ struct JetstreamEvent {
 
 #[derive(Deserialize)]
 struct CommitEvent {
+    #[serde(default)]
+    rev: Option<String>,
     operation: String,
     collection: String,
     rkey: String,
@@ -287,6 +289,7 @@ async fn run(
                                 action: commit.operation,
                                 record: commit.record,
                                 cid: commit.cid,
+                                rev: commit.rev,
                             };
 
                             let sem = semaphore.clone();

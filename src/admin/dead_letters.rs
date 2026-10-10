@@ -979,6 +979,7 @@ async fn reindex_single(state: &AppState, id: &str) -> Result<(), AppError> {
         action: dl.action.clone(),
         record,
         cid,
+        rev: None,
     };
 
     let _ = crate::record_handler::handle_record_event(state, &event).await;
