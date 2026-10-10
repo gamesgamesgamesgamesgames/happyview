@@ -4446,7 +4446,6 @@ pub(super) async fn backfill_pds_summary(
     auth.require(Permission::BackfillRead).await?;
 
     let bounded = job_queue_version(&state, &job_id).await? == Some(QueueVersion::Bounded);
-    // The bounded counters are 64-bit; the response's are not.
     let sql = if bounded {
         "SELECT pds_endpoint, repos, completed_repos, records FROM happyview_backfill_pds_stats \
          WHERE job_id = ? ORDER BY repos DESC, pds_endpoint ASC"
@@ -4460,16 +4459,15 @@ pub(super) async fn backfill_pds_summary(
         .await
         .map_err(|e| AppError::Internal(format!("failed to query PDS summary: {e}")))?;
 
-    let saturate = |n: i64| i32::try_from(n).unwrap_or(i32::MAX);
     let pds_endpoints = rows
         .into_iter()
         .map(
             |(pds_endpoint, total_repos, completed_repos, total_records)| {
                 super::types::PdsSummaryEntry {
                     pds_endpoint,
-                    total_repos: saturate(total_repos),
-                    completed_repos: saturate(completed_repos),
-                    total_records: saturate(total_records),
+                    total_repos,
+                    completed_repos,
+                    total_records,
                 }
             },
         )
@@ -4774,20 +4772,51 @@ const FINISHED_STATUSES: [&str; 3] = ["completed", "cancelled", "failed"];
 const FINISHED_JOBS: &str =
     "SELECT id FROM happyview_backfill_jobs WHERE status IN ('completed', 'cancelled', 'failed')";
 
-/// Run one detail delete, retrying while the database is busy. Returns the
+/// Rows each flush or retention DELETE removes at a time. A legacy network
+/// job can hold millions of repo rows, and one statement over all of them
+/// would hold the write lock (and on SQLite grow the WAL) for its whole run.
+const BACKFILL_DELETE_BATCH: i64 = 10_000;
+
+/// Delete the rows of `table` matching `filter`, `batch` at a time, each
+/// batch its own statement retried while the database is busy. Returns the
 /// rows deleted.
-async fn delete_detail_rows(state: &AppState, sql: &str, binds: &[&str]) -> Result<u64, AppError> {
-    let sql = adapt_sql(sql, state.db_backend);
-    crate::db::retry_on_busy(|| {
-        let mut q = crate::db::query(&sql);
-        for value in binds {
-            q = q.bind(*value);
+async fn delete_detail_rows(
+    state: &AppState,
+    table: &str,
+    filter: &str,
+    binds: &[&str],
+    batch: i64,
+) -> Result<u64, AppError> {
+    // Neither backend has DELETE … LIMIT, so each batch picks its rows by
+    // physical row id.
+    let row_id = match state.db_backend {
+        crate::db::DatabaseBackend::Sqlite => "rowid",
+        crate::db::DatabaseBackend::Postgres => "ctid",
+    };
+    let sql = adapt_sql(
+        &format!(
+            "DELETE FROM {table} WHERE {row_id} IN \
+             (SELECT {row_id} FROM {table} WHERE {filter} LIMIT ?)"
+        ),
+        state.db_backend,
+    );
+    let mut deleted = 0;
+    loop {
+        let rows = crate::db::retry_on_busy(|| {
+            let mut q = crate::db::query(&sql);
+            for value in binds {
+                q = q.bind(*value);
+            }
+            q.bind(batch).execute(&state.backfill_db)
+        })
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|e| AppError::Internal(format!("failed to flush backfill details: {e}")))?;
+        deleted += rows;
+        if rows < batch as u64 {
+            return Ok(deleted);
         }
-        q.execute(&state.backfill_db)
-    })
-    .await
-    .map(|result| result.rows_affected())
-    .map_err(|e| AppError::Internal(format!("failed to flush backfill details: {e}")))
+    }
 }
 
 /// `DELETE /admin/backfill/{id}/details`.
@@ -4820,24 +4849,20 @@ pub(super) async fn flush_backfill_details(
         )));
     }
 
-    for table in BACKFILL_DETAIL_TABLES {
-        delete_detail_rows(
-            &state,
-            &format!("DELETE FROM {table} WHERE job_id = ?"),
-            &[job_id.as_str()],
-        )
-        .await?;
-    }
-    for table in BACKFILL_WORK_TABLES {
-        delete_detail_rows(
-            &state,
-            &format!("DELETE FROM {table} WHERE job_id = ? AND job_id IN ({FINISHED_JOBS})"),
-            &[job_id.as_str()],
-        )
-        .await?;
-    }
-
+    flush_job_details(&state, &job_id, BACKFILL_DELETE_BATCH).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete one job's detail rows, and its queue if it has finished.
+async fn flush_job_details(state: &AppState, job_id: &str, batch: i64) -> Result<(), AppError> {
+    for table in BACKFILL_DETAIL_TABLES {
+        delete_detail_rows(state, table, "job_id = ?", &[job_id], batch).await?;
+    }
+    let finished = format!("job_id = ? AND job_id IN ({FINISHED_JOBS})");
+    for table in BACKFILL_WORK_TABLES {
+        delete_detail_rows(state, table, &finished, &[job_id], batch).await?;
+    }
+    Ok(())
 }
 
 /// `DELETE /admin/backfill/details`: every detail and leftover queue row of
@@ -4848,16 +4873,16 @@ pub(super) async fn flush_all_backfill_details(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::BackfillCreate).await?;
 
-    for table in BACKFILL_DETAIL_TABLES.iter().chain(&BACKFILL_WORK_TABLES) {
-        delete_detail_rows(
-            &state,
-            &format!("DELETE FROM {table} WHERE job_id IN ({FINISHED_JOBS})"),
-            &[],
-        )
-        .await?;
-    }
-
+    flush_finished_details(&state, BACKFILL_DELETE_BATCH).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn flush_finished_details(state: &AppState, batch: i64) -> Result<(), AppError> {
+    let filter = format!("job_id IN ({FINISHED_JOBS})");
+    for table in BACKFILL_DETAIL_TABLES.iter().chain(&BACKFILL_WORK_TABLES) {
+        delete_detail_rows(state, table, &filter, &[], batch).await?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4870,17 +4895,19 @@ pub(crate) async fn sweep_backfill_details(
     state: &AppState,
     cutoff: &str,
 ) -> Result<u64, AppError> {
+    sweep_backfill_details_in_batches(state, cutoff, BACKFILL_DELETE_BATCH).await
+}
+
+async fn sweep_backfill_details_in_batches(
+    state: &AppState,
+    cutoff: &str,
+    batch: i64,
+) -> Result<u64, AppError> {
+    let filter =
+        format!("job_id IN ({FINISHED_JOBS} AND completed_at IS NOT NULL AND completed_at < ?)");
     let mut deleted = 0;
     for table in BACKFILL_DETAIL_TABLES.iter().chain(&BACKFILL_WORK_TABLES) {
-        deleted += delete_detail_rows(
-            state,
-            &format!(
-                "DELETE FROM {table} WHERE job_id IN ({FINISHED_JOBS} \
-                 AND completed_at IS NOT NULL AND completed_at < ?)"
-            ),
-            &[cutoff],
-        )
-        .await?;
+        deleted += delete_detail_rows(state, table, &filter, &[cutoff], batch).await?;
     }
     Ok(deleted)
 }
@@ -7059,7 +7086,7 @@ mod tests {
         )
         .await
         .expect("summary");
-        let rows: Vec<(&str, i32, i32, i32)> = summary
+        let rows: Vec<(&str, i64, i64, i64)> = summary
             .pds_endpoints
             .iter()
             .map(|p| {
@@ -7133,7 +7160,7 @@ mod tests {
         )
         .await
         .expect("summary");
-        let rows: Vec<(&str, i32, i32, i32)> = summary
+        let rows: Vec<(&str, i64, i64, i64)> = summary
             .pds_endpoints
             .iter()
             .map(|p| {
@@ -7150,7 +7177,7 @@ mod tests {
             [
                 ("https://b.test", 9, 9, 90),
                 ("https://a.test", 5, 3, 40),
-                ("https://c.test", 1, 1, i32::MAX),
+                ("https://c.test", 1, 1, 5_000_000_000),
             ]
         );
     }
@@ -7336,6 +7363,94 @@ mod tests {
         }
         assert_detail_rows(&state, "new-done", 1).await;
         assert_detail_rows(&state, "paused", 1).await;
+    }
+
+    /// `n` rows in every per-job table, so a batch of fewer than `n` takes
+    /// several rounds to clear each one.
+    async fn seed_many_details(state: &AppState, job_id: &str, n: usize) {
+        for i in 0..n {
+            let did = format!("did:plc:many{i}");
+            seed_unit(state, job_id, POST, &did, None).await;
+            seed_completion(state, job_id, &did, 1).await;
+            seed_pds_stats(state, job_id, &format!("https://pds{i}.test"), 1).await;
+            seed_legacy_repo(state, job_id, &did, None, "completed").await;
+            let sql = adapt_sql(
+                "INSERT INTO happyview_backfill_cursors (job_id, collection, done) VALUES (?, ?, 1)",
+                state.db_backend,
+            );
+            crate::db::query(&sql)
+                .bind(job_id)
+                .bind(format!("app.test.c{i}"))
+                .execute(&state.db)
+                .await
+                .expect("seed cursor");
+        }
+    }
+
+    /// Flush and sweep a job holding more rows than one delete batch; `tag`
+    /// keeps the jobs apart from other tests sharing a Postgres database.
+    async fn assert_deletes_run_in_batches(state: &AppState, tag: &str) -> Vec<String> {
+        let flushed = format!("batched-flush-{tag}");
+        seed_job(state, &flushed, Some(POST), "network", "completed", 2, true).await;
+        finish_job(state, &flushed, "completed", "2026-01-01T00:00:00+00:00").await;
+        seed_many_details(state, &flushed, 5).await;
+
+        flush_job_details(state, &flushed, 2).await.expect("flush");
+        assert_detail_rows(state, &flushed, 0).await;
+
+        // Finished before any other test's job, so the sweep touches only it.
+        let swept = format!("batched-sweep-{tag}");
+        seed_job(state, &swept, Some(POST), "network", "completed", 2, true).await;
+        finish_job(state, &swept, "cancelled", "1999-01-01T00:00:00+00:00").await;
+        seed_many_details(state, &swept, 5).await;
+
+        let deleted = sweep_backfill_details_in_batches(state, "2000-01-01T00:00:00+00:00", 2)
+            .await
+            .expect("sweep");
+        assert!(deleted >= 25, "deleted {deleted}");
+        assert_detail_rows(state, &swept, 0).await;
+        vec![flushed, swept]
+    }
+
+    #[tokio::test]
+    async fn flush_and_retention_delete_in_batches() {
+        let state = migrated_state().await;
+        assert_deletes_run_in_batches(&state, "sqlite").await;
+
+        seed_job(
+            &state,
+            "batched-all",
+            Some(POST),
+            "network",
+            "completed",
+            2,
+            true,
+        )
+        .await;
+        finish_job(&state, "batched-all", "failed", "2026-01-01T00:00:00+00:00").await;
+        seed_many_details(&state, "batched-all", 5).await;
+        flush_finished_details(&state, 2).await.expect("flush all");
+        assert_detail_rows(&state, "batched-all", 0).await;
+    }
+
+    #[tokio::test]
+    async fn flush_and_retention_delete_in_batches_on_postgres() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        let tag = Uuid::new_v4().simple().to_string();
+        for job_id in assert_deletes_run_in_batches(&state, &tag).await {
+            let sql = adapt_sql(
+                "DELETE FROM happyview_backfill_jobs WHERE id = ?",
+                state.db_backend,
+            );
+            crate::db::query(&sql)
+                .bind(&job_id)
+                .execute(&state.db)
+                .await
+                .expect("delete job");
+        }
     }
 
     #[tokio::test]

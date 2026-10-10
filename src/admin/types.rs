@@ -167,9 +167,9 @@ pub(crate) struct BackfillReposResponse {
 #[derive(Serialize)]
 pub(crate) struct PdsSummaryEntry {
     pub(crate) pds_endpoint: String,
-    pub(crate) total_repos: i32,
-    pub(crate) completed_repos: i32,
-    pub(crate) total_records: i32,
+    pub(crate) total_repos: i64,
+    pub(crate) completed_repos: i64,
+    pub(crate) total_records: i64,
 }
 
 #[derive(Serialize)]
