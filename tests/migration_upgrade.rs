@@ -315,7 +315,9 @@ async fn postgres_boot_rebuilds_an_index_a_failed_concurrent_build_left_invalid(
         // Rewind to before the index's migration, then fail a concurrent
         // build of that name: two rows share a collection, so a unique build
         // on it fails and leaves the index invalid.
-        db::query("DELETE FROM _sqlx_migrations WHERE version >= 20261009000001")
+        db::query(
+            "DELETE FROM _sqlx_migrations WHERE version BETWEEN 20261009000001 AND 20261009000003",
+        )
             .execute(&pool)
             .await
             .expect("rewind migrations");
@@ -352,7 +354,9 @@ async fn postgres_boot_rebuilds_an_index_a_failed_concurrent_build_left_invalid(
         assert!(valid, "the index is valid after the retry");
         assert!(!unique, "the retry built the migration's index");
         let (applied,): (i64,) =
-            db::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version >= 20261009000001")
+            db::query_as(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version BETWEEN 20261009000001 AND 20261009000003",
+            )
                 .fetch_one(&pool)
                 .await
                 .expect("count migrations");

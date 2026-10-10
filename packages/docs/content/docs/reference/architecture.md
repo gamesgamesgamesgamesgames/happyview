@@ -198,6 +198,11 @@ sequenceDiagram
 | `record`     | jsonb       | Record value                        |
 | `cid`        | text        | Content identifier                  |
 | `indexed_at` | timestamptz | When HappyView indexed this version of the record. Redelivering an identical record (same CID and body) keeps the original value. A local write that Jetstream will echo back (an XRPC procedure, a `happyview.record` mirror, a linked-repo write) stores `NULL`, on insert and on update, until the echo stamps it. A plugin's direct local-index write gets no echo, so an update through it keeps the existing value |
+| `rev`        | text        | TID of the repo commit that wrote this version, from Jetstream. `NULL` for local writes, `listRecords` backfill rows and rows written before revs were stored. A delivery with an older rev than the stored one is ignored |
+
+### `record_tombstones` and `did_tombstones`
+
+Recently deleted records (`uri`, `rev`, `deleted_at`) and deleted accounts (`did`, `rev`, `seq`, `deleted_at`). A create or update at or before a tombstone's rev, or one without a rev, is not written, so a late or replayed copy cannot bring a deleted record back. Tombstones are kept for `RECORD_TOMBSTONE_RETENTION_HOURS` (72 by default).
 
 ### `lexicons`
 

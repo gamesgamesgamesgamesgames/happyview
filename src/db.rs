@@ -144,6 +144,53 @@ pub fn record_changed_clause(backend: DatabaseBackend) -> &'static str {
     }
 }
 
+/// `lhs op rhs` over two rev (TID) expressions. TIDs sort by time in byte
+/// order; Postgres would otherwise compare text in the database's collation,
+/// so it gets `COLLATE "C"` on both sides.
+pub fn rev_compare(backend: DatabaseBackend, lhs: &str, op: &str, rhs: &str) -> String {
+    match backend {
+        DatabaseBackend::Sqlite => format!("{lhs} {op} {rhs}"),
+        DatabaseBackend::Postgres => format!("{lhs} COLLATE \"C\" {op} {rhs} COLLATE \"C\""),
+    }
+}
+
+/// The `WHERE` of a network record upsert's `ON CONFLICT (uri) DO UPDATE`:
+/// the row changed (see `record_changed_clause`), and the incoming rev is not
+/// older than the stored one. A missing rev on either side (a local write, a
+/// `listRecords` row, a row from before revs were stored) does not block the
+/// update, which is how every write behaved before.
+pub fn record_upsert_where(backend: DatabaseBackend) -> String {
+    format!(
+        "({}) AND (happyview_records.rev IS NULL OR excluded.rev IS NULL OR {})",
+        record_changed_clause(backend),
+        rev_compare(backend, "excluded.rev", ">=", "happyview_records.rev")
+    )
+}
+
+/// Begin a transaction that reads and then writes on what it read, holding
+/// the write lock from the start.
+///
+/// SQLite's default `BEGIN` is deferred: it takes the write lock only at the
+/// first write, and if another writer committed since this transaction's
+/// first read, that upgrade fails with `SQLITE_BUSY` at once instead of
+/// waiting out the busy timeout. `BEGIN IMMEDIATE` takes the write lock up
+/// front, so a check (a tombstone lookup, a stored rev) cannot go stale
+/// before the write it guards. Postgres gets a plain `BEGIN`; serialize its
+/// writers on the rows concerned with `tombstones::lock_uris` and
+/// `tombstones::lock_did`.
+///
+/// Run the whole transaction inside `retry_on_busy`, so a write lock held
+/// past the busy timeout retries the transaction rather than failing it.
+pub async fn begin_write(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+) -> Result<sqlx::Transaction<'static, Any>, sqlx::Error> {
+    match backend {
+        DatabaseBackend::Sqlite => pool.begin_with("BEGIN IMMEDIATE").await,
+        DatabaseBackend::Postgres => pool.begin().await,
+    }
+}
+
 /// Database backend type, auto-detected from DATABASE_URL or set via DATABASE_BACKEND.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1154,6 +1201,141 @@ mod tests {
             .await
             .expect_err("missing table");
         assert!(!is_retryable_write_error(&err), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // begin_write and the rev-guarded upsert
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_sqlite_write_transaction_takes_the_write_lock_when_it_begins() {
+        sqlx::any::install_default_drivers();
+        let path = std::env::temp_dir().join(format!("hv-begin-write-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        // Never wait on a lock, so a held write lock surfaces as SQLITE_BUSY.
+        let pool = || {
+            PoolOptions::<sqlx::Any>::new()
+                .max_connections(1)
+                .after_connect(|conn, _| {
+                    Box::pin(async move {
+                        crate::db::query("PRAGMA busy_timeout = 0")
+                            .execute(&mut *conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&url)
+        };
+        let first = pool().await.expect("connect first");
+        crate::db::query("PRAGMA journal_mode = WAL")
+            .execute(&first)
+            .await
+            .expect("enable WAL");
+        let second = pool().await.expect("connect second");
+
+        let held = begin_write(&first, DatabaseBackend::Sqlite)
+            .await
+            .expect("begin the first write transaction");
+
+        let deferred = second
+            .begin()
+            .await
+            .expect("a deferred BEGIN takes no lock");
+        deferred.rollback().await.expect("roll back");
+        let err = begin_write(&second, DatabaseBackend::Sqlite)
+            .await
+            .expect_err("the write lock is already held");
+        assert!(is_retryable_write_error(&err), "{err}");
+
+        held.commit().await.expect("release the write lock");
+        begin_write(&second, DatabaseBackend::Sqlite)
+            .await
+            .expect("the lock is free again")
+            .commit()
+            .await
+            .expect("commit");
+
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[tokio::test]
+    async fn a_write_transaction_begins_and_commits_on_either_backend() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let mut tx = begin_write(&pool, backend).await.expect("begin");
+            crate::db::query("SELECT 1")
+                .execute(&mut *tx)
+                .await
+                .expect("query inside the transaction");
+            tx.commit().await.expect("commit");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_record_upsert_never_replaces_a_newer_rev() {
+        let tid = |n: i64| crate::tid::tid_from_unix_microseconds(1_700_000_000_000_000 + n);
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let uri = format!(
+                "at://did:plc:rev{}/app.test.post/r",
+                uuid::Uuid::new_v4().simple()
+            );
+            let upsert = adapt_sql(
+                &format!(
+                    "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at, rev) \
+                     VALUES (?, 'did:plc:rev', 'app.test.post', 'r', '{{}}', ?, ?, ?, ?) \
+                     ON CONFLICT (uri) DO UPDATE SET cid = excluded.cid, rev = excluded.rev \
+                     WHERE {}",
+                    record_upsert_where(backend)
+                ),
+                backend,
+            );
+            let stored = || async {
+                crate::db::query_as::<(String, Option<String>)>(&adapt_sql(
+                    "SELECT cid, rev FROM happyview_records WHERE uri = ?",
+                    backend,
+                ))
+                .bind(&uri)
+                .fetch_one(&pool)
+                .await
+                .expect("read the record")
+            };
+
+            for (cid, rev, expected) in [
+                ("c50", Some(tid(50)), ("c50", Some(tid(50)))),
+                ("c40", Some(tid(40)), ("c50", Some(tid(50)))),
+                ("c60", Some(tid(60)), ("c60", Some(tid(60)))),
+                ("c-none", None, ("c-none", None)),
+                ("c10", Some(tid(10)), ("c10", Some(tid(10)))),
+            ] {
+                crate::db::query(&upsert)
+                    .bind(&uri)
+                    .bind(cid)
+                    .bind(now_rfc3339())
+                    .bind(now_rfc3339())
+                    .bind(rev.clone())
+                    .execute(&pool)
+                    .await
+                    .expect("upsert");
+                let (got_cid, got_rev) = stored().await;
+                assert_eq!(
+                    (got_cid.as_str(), got_rev),
+                    (expected.0, expected.1),
+                    "after writing {cid} ({backend:?})"
+                );
+            }
+
+            crate::db::query(&adapt_sql(
+                "DELETE FROM happyview_records WHERE uri = ?",
+                backend,
+            ))
+            .bind(&uri)
+            .execute(&pool)
+            .await
+            .expect("clean up");
+        }
     }
 
     // -----------------------------------------------------------------------

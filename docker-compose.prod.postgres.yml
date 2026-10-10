@@ -169,6 +169,8 @@ services:
       EVENT_LOG_RETENTION_DAYS: ${EVENT_LOG_RETENTION_DAYS:-30}
       # Days to keep script dead letters once resolved. 0 keeps them.
       DEAD_LETTER_RETENTION_DAYS: ${DEAD_LETTER_RETENTION_DAYS:-30}
+      # Hours to remember deleted records and accounts. 0 keeps them.
+      RECORD_TOMBSTONE_RETENTION_HOURS: ${RECORD_TOMBSTONE_RETENTION_HOURS:-72}
       # Most work units a backfill keeps queued at once. Lower it on a small
       # disk.
       BACKFILL_DISCOVERY_WINDOW: ${BACKFILL_DISCOVERY_WINDOW:-50000}

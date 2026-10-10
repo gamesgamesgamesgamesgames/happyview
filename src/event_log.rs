@@ -273,7 +273,8 @@ pub async fn sweep_resolved_dead_letters(
     deleted
 }
 
-/// Hourly retention sweep for event logs and resolved dead letters.
+/// Hourly retention sweep for event logs, resolved dead letters and expired
+/// record and account tombstones.
 ///
 /// The event log retention value is re-read every iteration rather than
 /// captured at spawn, so an operator can change it without a restart. A value
@@ -284,6 +285,7 @@ pub async fn spawn_retention_cleanup(
     db: AnyPool,
     backend: DatabaseBackend,
     dead_letter_retention_days: u32,
+    tombstone_retention_hours: u32,
 ) {
     let interval = tokio::time::Duration::from_secs(3600);
 
@@ -294,6 +296,11 @@ pub async fn spawn_retention_cleanup(
             sweep_resolved_dead_letters(&db, dead_letter_retention_days, backend).await;
         if dead_letters > 0 {
             tracing::info!(count = dead_letters, "cleaned up resolved dead letters");
+        }
+
+        let tombstones = crate::tombstones::sweep(&db, backend, tombstone_retention_hours).await;
+        if tombstones > 0 {
+            tracing::info!(count = tombstones, "cleaned up expired tombstones");
         }
 
         let retention_days = match crate::admin::settings::get_setting(
@@ -324,15 +331,16 @@ pub async fn spawn_retention_cleanup(
         }
 
         // The event log sweep reclaims pages only when it deleted something;
-        // dead letters need the same when they were the only deletion.
-        if dead_letters > 0
+        // dead letters and tombstones need the same when they were the only
+        // deletions.
+        if dead_letters + tombstones > 0
             && !outcome.vacuumed
             && backend == DatabaseBackend::Sqlite
             && let Err(e) = crate::db::query("PRAGMA incremental_vacuum")
                 .execute(&db)
                 .await
         {
-            tracing::warn!(error = %e, "incremental_vacuum after dead letter cleanup failed");
+            tracing::warn!(error = %e, "incremental_vacuum after dead letter and tombstone cleanup failed");
         }
     }
 }

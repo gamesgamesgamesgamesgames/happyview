@@ -26,6 +26,7 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `SCRIPT_WALL_CLOCK_SECONDS` | no | `10` | Seconds a query, procedure, record or label script may spend running, before it fails with `timeout`. Time spent awaiting the host — an HTTP request, a database read — is not charged against it. An integer from `1` to `300`. Job scripts are not clocked. The **Request wall clock** setting in Settings → General takes precedence when set |
 | `EVENT_LOG_RETENTION_DAYS` | no | `30` | Number of days to keep event logs before automatic cleanup. Set to `0` to disable cleanup |
 | `DEAD_LETTER_RETENTION_DAYS` | no | `30` | Days to keep script dead letters after they are resolved; the hourly cleanup deletes older ones. Unresolved dead letters are never deleted. `0` keeps resolved ones indefinitely |
+| `RECORD_TOMBSTONE_RETENTION_HOURS` | no | `72` | Hours to remember a deleted record or account, so that a late or replayed copy of it cannot bring it back. The hourly cleanup deletes older tombstones. `0` keeps them indefinitely |
 | `JOB_WORKER_CONCURRENCY` | no | `1` | Number of background jobs that run at once. Values below 1 fall back to 1; values above 32 are capped at 32. Each running job uses database connections, so keep this below `DATABASE_MAX_CONNECTIONS`. |
 | `PLATFORM_API_KEY_HASH` | no | — | Hex SHA-256 of a key that a managed-hosting provider uses to administer this instance. Leave unset when self-hosting. See [Platform API](../api-reference/admin/platform.md) |
 | `TOKEN_ENCRYPTION_KEY` | no | --- | Base64-encoded 32-byte key for encrypting stored OAuth tokens. **Strongly recommended in production** |
@@ -75,6 +76,7 @@ SESSION_SECRET=change-me-in-production
 # STATIC_DIR=./web/out
 # EVENT_LOG_RETENTION_DAYS=30
 # DEAD_LETTER_RETENTION_DAYS=30
+# RECORD_TOMBSTONE_RETENTION_HOURS=72
 # TOKEN_ENCRYPTION_KEY=base64-encoded-32-byte-key
 # DEFAULT_RATE_LIMIT_CAPACITY=100
 # DEFAULT_RATE_LIMIT_REFILL_RATE=2.0
