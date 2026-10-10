@@ -99,6 +99,8 @@ struct ReleaseRecord {
     #[serde(default)]
     version: Option<String>,
     #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
     artifacts: Artifacts,
 }
 
@@ -255,10 +257,10 @@ pub async fn fetch_catalogue(
                         version: r.record.version.clone()?,
                         name: format!("{slug}-v{}", r.record.version.as_deref()?),
                         published_at: r.indexed_at.clone().unwrap_or_default(),
-                        // A release record carries no notes, so there is no
-                        // changelog to show. The GitHub walk had the release
-                        // body; the registry has no field for it.
-                        body: String::new(),
+                        // Markdown, rendered for an operator deciding whether
+                        // to upgrade. Absent is normal: `notes` is optional and
+                        // a release published before the field existed has none.
+                        body: r.record.notes.clone().unwrap_or_default(),
                     })
                 })
                 .collect(),
@@ -315,11 +317,17 @@ mod tests {
             "uri": "at://did:plc:abc/at.happyproto.plugin.release/demo:1.0.0",
             "record": {
                 "version": "1.0.0",
+                "notes": "## 1.0.0\n\n- first release",
                 "artifacts": { "package": { "url": "https://example.com/d/m.wasm" } }
             },
             "indexedAt": "2026-01-01T00:00:00.000000+00:00"
         }))
         .expect("the release should parse");
+        assert_eq!(
+            with_url.record.notes.as_deref(),
+            Some("## 1.0.0\n\n- first release"),
+            "notes are markdown and are read verbatim"
+        );
         assert_eq!(
             with_url.record.artifacts.package.and_then(|a| a.url),
             Some("https://example.com/d/m.wasm".into())

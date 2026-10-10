@@ -323,6 +323,7 @@ async fn the_registry_is_preferred_over_the_github_walk() {
                     "uri": "at://did:plc:pub/at.happyproto.plugin.release/happyview-http:1.0.0",
                     "record": {
                         "version": "1.0.0",
+                        "notes": "- faster\n- fewer bugs",
                         "artifacts": {
                             "package": { "url": "https://example.com/d/happyview-http.wasm" }
                         }
@@ -405,6 +406,16 @@ async fn the_registry_is_preferred_over_the_github_walk() {
         .map(|r| r.version.as_str())
         .collect();
     assert_eq!(versions, vec!["1.0.0", "0.9.0"]);
+    // The release's own notes are what the update dialog renders, so they have
+    // to survive the catalogue rather than being dropped on the way through.
+    assert_eq!(
+        cached.plugins["happyview-http"].releases[0].body,
+        "- faster\n- fewer bugs"
+    );
+    assert_eq!(
+        cached.plugins["happyview-http"].releases[1].body, "",
+        "a release that published no notes carries none"
+    );
 }
 
 /// An empty registry must not empty the catalogue. Replacing a working plugin
