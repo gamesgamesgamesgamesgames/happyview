@@ -1,6 +1,9 @@
 pub mod compression;
 pub mod config;
+pub mod cursor;
 pub mod event;
+pub mod watermark;
+pub mod workers;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
