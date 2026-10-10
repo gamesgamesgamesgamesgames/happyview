@@ -61,6 +61,15 @@ extern "C" {
         args_ptr: i32,
         args_len: i32,
     ) -> i64;
+    fn host_call_library_start(
+        lib_ptr: i32,
+        lib_len: i32,
+        fn_ptr: i32,
+        fn_len: i32,
+        args_ptr: i32,
+        args_len: i32,
+    ) -> i32;
+    fn host_call_library_wait_any(req_ptr: i32, req_len: i32) -> i64;
     fn host_get_api_surface(lib_ptr: i32, lib_len: i32) -> i64;
     fn host_script_log(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_progress(req_ptr: i32, req_len: i32) -> i64;
@@ -168,6 +177,27 @@ mod imports {
             )
         })
     }
+
+    /// The raw handle, 0 included: a host test asserts on what came back.
+    pub fn call_library_start(lib: &str, function: &str, args: &str) -> i32 {
+        unsafe {
+            host_call_library_start(
+                lib.as_ptr() as i32,
+                lib.len() as i32,
+                function.as_ptr() as i32,
+                function.len() as i32,
+                args.as_ptr() as i32,
+                args.len() as i32,
+            )
+        }
+    }
+
+    /// `request` is sent as written, so a test can send one that is malformed.
+    pub fn call_library_wait_any(request: &str) -> Value {
+        read_packed(unsafe {
+            host_call_library_wait_any(request.as_ptr() as i32, request.len() as i32)
+        })
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -196,6 +226,76 @@ mod imports {
     pub fn call_library(_lib: &str, _function: &str, _args: &Value) -> Value {
         unavailable()
     }
+    pub fn call_library_start(_lib: &str, _function: &str, _args: &str) -> i32 {
+        0
+    }
+    pub fn call_library_wait_any(_request: &str) -> Value {
+        unavailable()
+    }
+}
+
+/// `host:calls`: run `steps` in order against the two concurrent-call imports
+/// and return what each answered, so a host test reads the whole `(handle,
+/// result)` sequence. A step is one of:
+///
+/// - `{"start": {"library", "function", "args"}}` — start a call; answers
+///   `{"handle": n}`. `"args_raw": "<text>"` sends that text as the args
+///   instead, for a request that is not an array.
+/// - `{"wait": [handles]}` — one `wait_any` over those handles.
+/// - `{"wait_raw": "<text>"}` — one `wait_any` with that text as the request.
+/// - `{"wait_all": true}` — `wait_any` over every started, uncollected
+///   handle until none is left; answers the list of what each wait returned.
+/// - `{"trap": true}` — trap, ending the run with whatever is still in flight.
+fn run_calls(steps: &Value) -> Value {
+    let mut outstanding: alloc::vec::Vec<i64> = alloc::vec::Vec::new();
+    let mut answers: alloc::vec::Vec<Value> = alloc::vec::Vec::new();
+    for step in steps.as_array().map(|s| s.as_slice()).unwrap_or(&[]) {
+        if let Some(start) = step.get("start") {
+            let args = match start.get("args_raw").and_then(Value::as_str) {
+                Some(raw) => raw.to_string(),
+                None => start.get("args").cloned().unwrap_or_else(|| json!([])).to_string(),
+            };
+            let handle = imports::call_library_start(
+                start["library"].as_str().unwrap_or(""),
+                start["function"].as_str().unwrap_or(""),
+                &args,
+            );
+            outstanding.push(handle as i64);
+            answers.push(json!({"handle": handle}));
+        } else if let Some(handles) = step.get("wait") {
+            let answer = imports::call_library_wait_any(&handles.to_string());
+            if let Some(done) = answer.get("handle").and_then(Value::as_i64) {
+                outstanding.retain(|h| *h != done);
+            }
+            answers.push(answer);
+        } else if let Some(raw) = step.get("wait_raw").and_then(Value::as_str) {
+            answers.push(imports::call_library_wait_any(raw));
+        } else if step.get("wait_all").is_some() {
+            let mut settled = alloc::vec::Vec::new();
+            while !outstanding.is_empty() {
+                let answer = imports::call_library_wait_any(&json!(outstanding).to_string());
+                let Some(done) = answer.get("handle").and_then(Value::as_i64) else {
+                    settled.push(answer);
+                    break;
+                };
+                outstanding.retain(|h| *h != done);
+                settled.push(answer);
+            }
+            answers.push(Value::Array(settled));
+        } else if step.get("trap").is_some() {
+            trap()
+        }
+    }
+    Value::Array(answers)
+}
+
+fn trap() -> ! {
+    #[cfg(target_arch = "wasm32")]
+    {
+        core::arch::wasm32::unreachable()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    panic!("not wasm")
 }
 
 /// A loop no optimiser may drop, for the host's execution-deadline tests.
@@ -364,6 +464,7 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
                     "object",
                 )
             }
+            "host:calls" => returned(run_calls(&payload["steps"]), "other"),
             // The `require` contract a language gives a library call: the
             // value on success and a raise on an error envelope. A host test
             // driving a library through a real request reads the library's own
