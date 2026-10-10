@@ -453,7 +453,9 @@ const ALL_COLLECTIONS: &str = "";
 /// The largest relay page discovery asks for.
 const RELAY_PAGE_LIMIT: i64 = 1000;
 
-/// Discovered DIDs per INSERT: three bound parameters each, under SQLite's 999.
+/// Discovered DIDs per INSERT: three bound parameters each, 900 a statement.
+/// That is well within the bundled SQLite's limit of 32766, and within the
+/// 999 of SQLite builds before 3.32 too.
 const DISCOVERY_INSERT_CHUNK: usize = 300;
 
 /// Rows per DELETE when a pre-upgrade job's partial repo list is discarded,
@@ -957,6 +959,9 @@ async fn drop_unresolvable(
 /// will not pick it up again, and holding its slot for good could stall
 /// discovery behind it. The window undercounts by one until the job restarts
 /// and recounts; the job is paused rather than completed with the unit left.
+/// Completions that keep failing fail the run instead, after
+/// `MAX_CONSECUTIVE_COMPLETION_FAILURES` in a row, so freed slots cannot let
+/// discovery grow the queue without bound.
 fn release_slot(queue: &JobQueue, removed: Option<bool>) {
     if removed != Some(false) {
         queue.window.release(1);

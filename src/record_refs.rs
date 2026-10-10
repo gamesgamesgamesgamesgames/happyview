@@ -104,7 +104,9 @@ fn collect_at_uris(value: &Value, uris: &mut HashSet<String>) {
     }
 }
 
-/// Refs per multi-row INSERT: three bound parameters each, under SQLite's 999.
+/// Refs per multi-row INSERT: three bound parameters each, 900 a statement.
+/// That is well within the bundled SQLite's limit of 32766, and within the
+/// 999 of SQLite builds before 3.32 too.
 pub const REFS_PER_INSERT: usize = 300;
 
 /// Replace `source_uri`'s refs with those in `record`, on a connection the

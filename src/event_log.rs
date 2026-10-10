@@ -238,6 +238,12 @@ pub async fn sweep_resolved_dead_letters(
     if retention_days == 0 {
         return 0;
     }
+    // `resolved_at` is text on both backends, so `resolved_at < ?` compares
+    // strings against this RFC 3339 cutoff. That orders RFC 3339 values
+    // correctly. Postgres rows resolved before `resolved_at` became text
+    // (20260527000001) hold `YYYY-MM-DD HH:MM:SS+00` instead, whose space
+    // sorts before the cutoff's `T`, so such a row resolved on the cutoff's
+    // date goes in that day's sweep: up to a day early, never late.
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64)).to_rfc3339();
     let sql = adapt_sql(
         "DELETE FROM happyview_dead_letter_scripts WHERE id IN \
