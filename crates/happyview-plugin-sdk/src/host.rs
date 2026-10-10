@@ -24,8 +24,6 @@ use serde_json::{Map, Value};
 
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::abi::read_packed;
-#[cfg(any(target_arch = "wasm32", test))]
-use crate::wire::Response;
 use crate::wire::{
     ApiSurface, AtprotoBlobDownload, AttestSign, AttestVerify, BacklinksQuery, BlobData, BlobInfo,
     CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
@@ -43,6 +41,8 @@ use crate::wire::{
     AtprotoResolveIdentity, AtprotoResolveService, BlobLookup, BlobPut, BlobStored,
     JobShouldStopRequest, JobWaitRequest, LexiconGet,
 };
+#[cfg(any(target_arch = "wasm32", test))]
+use crate::wire::{LibraryCallSettled, Response};
 
 /// The wire types these wrappers send and receive. Defined in [`crate::wire`],
 /// which the host imports too; re-exported here as the import path plugins use.
@@ -67,6 +67,15 @@ extern "C" {
         args_ptr: i32,
         args_len: i32,
     ) -> i64;
+    fn host_call_library_start(
+        lib_ptr: i32,
+        lib_len: i32,
+        fn_ptr: i32,
+        fn_len: i32,
+        args_ptr: i32,
+        args_len: i32,
+    ) -> i32;
+    fn host_call_library_wait_any(req_ptr: i32, req_len: i32) -> i64;
     fn host_get_api_surface(lib_ptr: i32, lib_len: i32) -> i64;
     fn host_db_query(sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32) -> i64;
     fn host_db_execute(sql_ptr: i32, sql_len: i32, params_ptr: i32, params_len: i32) -> i64;
@@ -1103,6 +1112,82 @@ pub fn call_library(library: &str, function: &str, args: &[Value]) -> Result<Val
     }
 }
 
+/// Start a library call without waiting for it, and return its handle. The
+/// call runs alongside the plugin, up to eight at once; [`call_library_wait_any`]
+/// collects it. Anything that goes wrong with the call itself — bad arguments,
+/// a missing capability, an unknown library, the callee's own error — comes
+/// back through the handle, so an `Err` here means only that the host could
+/// not read the request. Needs `library:call`.
+pub fn call_library_start(
+    library: &str,
+    function: &str,
+    args: &[Value],
+) -> Result<u32, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let args = serde_json::to_vec(args).map_err(PluginError::from)?;
+        // SAFETY: every slice is live for the duration of the call.
+        let handle = unsafe {
+            host_call_library_start(
+                library.as_ptr() as i32,
+                library.len() as i32,
+                function.as_ptr() as i32,
+                function.len() as i32,
+                args.as_ptr() as i32,
+                args.len() as i32,
+            )
+        };
+        if handle <= 0 {
+            return Err(HostError::NoResponse.into());
+        }
+        Ok(handle as u32)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (library, function, args);
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Wait until any of `handles` has settled and return which one, with the
+/// call's own outcome decoded as [`call_library`] would have decoded it. The
+/// handle is spent: waiting on it again is refused. The outer `Err` is the
+/// wait itself failing — an empty list, or a handle never issued or already
+/// collected — and names no call. Needs `library:call`.
+pub fn call_library_wait_any(
+    handles: &[u32],
+) -> Result<(u32, Result<Value, PluginError>), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let request = serde_json::to_vec(handles).map_err(PluginError::from)?;
+        // SAFETY: `request` is live for the duration of the call.
+        let packed =
+            unsafe { host_call_library_wait_any(request.as_ptr() as i32, request.len() as i32) };
+        let answer: Value = read_packed(packed).ok_or(HostError::NoResponse)?;
+        decode_settled(answer)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = handles;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Split a wait's answer into the call it names and that call's outcome, or
+/// the wait's own refusal when it names none.
+#[cfg(any(target_arch = "wasm32", test))]
+fn decode_settled(answer: Value) -> Result<(u32, Result<Value, PluginError>), PluginError> {
+    if answer.get("handle").is_some() {
+        let settled: LibraryCallSettled = serde_json::from_value(answer)
+            .map_err(|e| PluginError::host(alloc::format!("unreadable wait answer: {e}")))?;
+        return Ok((settled.handle, settled.outcome.into_result()));
+    }
+    match serde_json::from_value::<Response<Value>>(answer) {
+        Ok(Response::Err { error }) => Err(error),
+        _ => Err(PluginError::host("the wait answered without naming a call")),
+    }
+}
+
 /// Read another library's API surface, to discover what it exports before
 /// calling it. Needs `library:call`.
 pub fn library_surface(library: &str) -> Result<ApiSurface, PluginError> {
@@ -1306,6 +1391,44 @@ mod tests {
         );
         assert_eq!(job_should_stop(), Err(not_wasm.clone()));
         assert_eq!(job_wait(1.5), Err(not_wasm));
+    }
+
+    #[test]
+    fn the_concurrent_library_wrappers_report_not_wasm_off_target() {
+        let not_wasm: PluginError = HostError::NotWasm.into();
+        assert_eq!(
+            call_library_start("http", "get", &[]),
+            Err(not_wasm.clone())
+        );
+        assert_eq!(call_library_wait_any(&[1]), Err(not_wasm));
+    }
+
+    #[test]
+    fn a_settled_call_carries_its_handle_and_its_own_outcome() {
+        let (handle, outcome) =
+            decode_settled(serde_json::json!({"handle": 2, "ok": {"status": 200}})).unwrap();
+        assert_eq!(handle, 2);
+        assert_eq!(outcome, Ok(serde_json::json!({"status": 200})));
+
+        let (handle, outcome) = decode_settled(serde_json::json!({
+            "handle": 5,
+            "error": {"code": "DEPTH_EXCEEDED", "message": "too deep", "retryable": false},
+        }))
+        .unwrap();
+        assert_eq!(handle, 5);
+        assert_eq!(outcome.unwrap_err().code, "DEPTH_EXCEEDED");
+    }
+
+    #[test]
+    fn a_refused_wait_is_the_outer_error() {
+        let err = decode_settled(serde_json::json!({
+            "error": {"code": "BAD_INPUT", "message": "handle 9 was never issued", "retryable": false},
+        }))
+        .unwrap_err();
+        assert_eq!(err.code, "BAD_INPUT");
+
+        let err = decode_settled(serde_json::json!({"ok": 1})).unwrap_err();
+        assert_eq!(err.code, "HOST_ERROR");
     }
 
     #[test]

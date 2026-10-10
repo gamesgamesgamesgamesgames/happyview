@@ -50,6 +50,9 @@ pub struct PluginState {
     pub deadline: crate::plugin::runtime::GuestDeadline,
     /// The store's linear-memory ceiling, installed as its resource limiter.
     pub limiter: crate::plugin::runtime::MemoryLimiter,
+    /// Library calls started through `host_call_library_start` and not yet
+    /// waited on. Dropped with the store, which aborts whatever is left.
+    pub pending_calls: super::PendingCalls,
 }
 
 /// Check that a memory access is within bounds
@@ -912,6 +915,25 @@ pub(crate) fn define_host_functions(
                 host_call_library_impl(caller, lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len)
                     .await
             })
+        },
+    )?;
+
+    imports.define(
+        "host_call_library_start",
+        |caller,
+         (lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len): (i32, i32, i32, i32, i32, i32)| {
+            Box::pin(async move {
+                host_call_library_start_impl(
+                    caller, lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len,
+                )
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_call_library_wait_any",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move { host_call_library_wait_any_impl(caller, req_ptr, req_len).await })
         },
     )?;
 
@@ -1944,38 +1966,152 @@ async fn host_call_library_impl(
     ) else {
         return 0;
     };
-    let args: Vec<serde_json::Value> = match serde_json::from_slice(&args_bytes) {
+    let outcome = match library_call(
+        caller.data(),
+        "host_call_library",
+        lib,
+        function,
+        &args_bytes,
+    ) {
+        Ok(call) => call.await,
+        Err(refused) => refused,
+    };
+    write_guest_response(caller, &serde_json::to_vec(&outcome).unwrap_or_default()).await
+}
+
+/// One library call, checked and ready to run: everything it needs is owned,
+/// so `host_call_library` can await it in place and
+/// `host_call_library_start` can hand it to a task of its own. It runs one
+/// hop deeper than `state`, as `state`'s caller, under `state`'s context.
+/// Anything wrong with the request is the `Err`, already an envelope.
+fn library_call(
+    state: &PluginState,
+    import: &str,
+    lib: String,
+    function: String,
+    args_bytes: &[u8],
+) -> Result<
+    impl Future<Output = super::pending_calls::CallOutcome> + Send + 'static,
+    super::pending_calls::CallOutcome,
+> {
+    let refused = |envelope: Vec<u8>| {
+        serde_json::from_slice(&envelope)
+            .unwrap_or_else(|_| call_error("HOST_ERROR", "unreadable refusal"))
+    };
+    let args: Vec<serde_json::Value> = match serde_json::from_slice(args_bytes) {
         Ok(serde_json::Value::Array(a)) => a,
-        Ok(_) => {
+        Ok(_) => return Err(call_error("BAD_INPUT", "args must be a JSON array")),
+        Err(e) => return Err(call_error("BAD_INPUT", e)),
+    };
+    let executor = library_access(state, import).map_err(refused)?;
+    let ctx = state.call_ctx.clone();
+    let depth = state.depth + 1;
+    // A library reached through another library acts as the same user, so the
+    // session travels the whole chain rather than stopping at the first hop.
+    let session = state.caller.clone();
+    Ok(async move {
+        match executor
+            .call_library_as(&lib, &function, &args, &ctx, session, depth)
+            .await
+        {
+            Ok(ok) => super::pending_calls::CallOutcome::Ok { ok },
+            Err(crate::plugin::ExecutionError::PluginError {
+                code,
+                message,
+                retryable,
+            }) => super::pending_calls::CallOutcome::Err {
+                error: crate::plugin::PluginEnvelopeError {
+                    code,
+                    message,
+                    retryable,
+                },
+            },
+            Err(e) => call_error("LIBRARY_ERROR", e),
+        }
+    })
+}
+
+/// [`error_envelope`], as the typed outcome a started call settles with.
+fn call_error(code: &str, message: impl std::fmt::Display) -> super::pending_calls::CallOutcome {
+    super::pending_calls::CallOutcome::Err {
+        error: crate::plugin::PluginEnvelopeError::new(code, message.to_string()),
+    }
+}
+
+/// Start a library call and hand back its handle without waiting for it. The
+/// guest is never suspended on the call's work, and the only failure answered
+/// here is guest memory that cannot be read (`0`, as `host_call_library`
+/// answers it); every other one settles through the handle, so an interpreter
+/// reads every failure of a call from one place.
+fn host_call_library_start_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    lib_ptr: i32,
+    lib_len: i32,
+    fn_ptr: i32,
+    fn_len: i32,
+    args_ptr: i32,
+    args_len: i32,
+) -> i32 {
+    let (Some(lib), Some(function), Some(args_bytes)) = (
+        read_guest_string(caller, lib_ptr, lib_len),
+        read_guest_string(caller, fn_ptr, fn_len),
+        read_guest_bytes(caller, args_ptr, args_len),
+    ) else {
+        return 0;
+    };
+    let call = library_call(
+        caller.data(),
+        "host_call_library_start",
+        lib,
+        function,
+        &args_bytes,
+    );
+    let pending = &mut caller.data_mut().pending_calls;
+    let handle = match call {
+        Ok(call) => pending.start(call),
+        Err(refused) => pending.settled(refused),
+    };
+    handle.map_or(0, |h| h as i32)
+}
+
+/// Suspend the guest until one of the listed calls settles and answer its
+/// envelope with its handle beside it. A request that could never be answered
+/// — malformed, empty, or naming a handle that is not outstanding — is refused
+/// at once with no `handle`, rather than left to hang.
+async fn host_call_library_wait_any_impl(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    req_ptr: i32,
+    req_len: i32,
+) -> i64 {
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    if let Err(envelope) = require_capability(
+        caller.data(),
+        requirement_for_import("host_call_library_wait_any").unwrap(),
+    ) {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let handles: Vec<u32> = match serde_json::from_slice(&bytes) {
+        Ok(handles) => handles,
+        Err(e) => {
             return write_guest_response(
                 caller,
-                &error_envelope("BAD_INPUT", "args must be a JSON array"),
+                &error_envelope("BAD_INPUT", format!("expected an array of handles: {e}")),
             )
             .await;
         }
-        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
     };
-    let executor = match library_access(caller.data(), "host_call_library") {
-        Ok(e) => e,
-        Err(envelope) => return write_guest_response(caller, &envelope).await,
-    };
-    let ctx = caller.data().call_ctx.clone();
-    let depth = caller.data().depth + 1;
-    // A library reached through another library acts as the same user, so the
-    // session travels the whole chain rather than stopping at the first hop.
-    let session = caller.data().caller.clone();
-    let response = match executor
-        .call_library_as(&lib, &function, &args, &ctx, session, depth)
-        .await
-    {
-        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
-        Err(crate::plugin::ExecutionError::PluginError { code, message, retryable }) => {
-            serde_json::to_vec(&serde_json::json!({"error": {"code": code, "message": message, "retryable": retryable}}))
-                .unwrap_or_default()
+    let mut waiting = match caller.data_mut().pending_calls.take(&handles) {
+        Ok(waiting) => waiting,
+        Err(message) => {
+            return write_guest_response(caller, &error_envelope("BAD_INPUT", message)).await;
         }
-        Err(e) => error_envelope("LIBRARY_ERROR", e),
     };
-    write_guest_response(caller, &response).await
+    let (handle, outcome) = waiting.first().await;
+    caller.data_mut().pending_calls.restore(waiting);
+    let settled = happyview_plugin_sdk::wire::LibraryCallSettled { handle, outcome };
+    write_guest_response(caller, &serde_json::to_vec(&settled).unwrap_or_default()).await
 }
 
 async fn host_get_api_surface_impl(
@@ -2604,6 +2740,7 @@ mod tests {
             limiter: crate::plugin::runtime::MemoryLimiter::new(
                 crate::plugin::runtime::LIBRARY_MEMORY_CEILING,
             ),
+            pending_calls: Default::default(),
         }
     }
 

@@ -276,6 +276,8 @@ Beyond the [host functions](#host-functions) above, a plugin declaring `library:
 | Import | Signature | Description |
 | ------------------------ | ------------------------------------------------------------------------ | --------------------------------------------------------------------- |
 | `host_call_library`      | `(lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len) -> i64`           | Call another installed library's `function` with a JSON `args` array, acting as the caller's `context` |
+| `host_call_library_start` | `(lib_ptr, lib_len, fn_ptr, fn_len, args_ptr, args_len) -> i32`          | Start the same call without waiting for it, and return its handle — see [Concurrent library calls](#concurrent-library-calls) |
+| `host_call_library_wait_any` | `(req_ptr, req_len) -> i64`                                           | Wait until any of a JSON array of handles has settled, and return its result |
 | `host_get_api_surface`   | `(lib_ptr, lib_len) -> i64`                                               | Fetch another library's API surface (cached after the first call per registration) |
 
 A plugin declaring `database:read` or `database:write` can import:
@@ -301,6 +303,18 @@ A plugin declaring the listed capability can import the matching function below.
 An envelope is the record shape every library read answers, described in [Libraries](../api-reference/lua/libraries.md#conventions-every-library-follows).
 
 `filter`, on `host_records_query`, `host_records_count`, and `host_table_query`, is `{field, op, value}` or `{combine: "and"|"or", conditions: [...]}`, nesting capped at 5.
+
+#### Concurrent library calls
+
+`host_call_library` holds the plugin until the call returns, so two calls made with it run one after the other. To run several at once, start each with `host_call_library_start`, which takes the same arguments and returns a handle (a positive integer) immediately, then collect them with `host_call_library_wait_any`.
+
+`host_call_library_wait_any` takes a JSON array of handles, such as `[3, 1, 7]`, and holds the plugin until any one of them has settled. It returns that call's result in the same envelope `host_call_library` returns, with the handle beside it: `{"handle": 3, "ok": ...}` or `{"handle": 3, "error": {"code", "message", "retryable"}}`. If more than one has already settled, the lowest-numbered handle comes back first. A handle can be collected once.
+
+Everything that can go wrong with a call comes back through its handle, including arguments that are not a JSON array (`BAD_INPUT`), a missing `library:call` capability (`FORBIDDEN`), an unknown library, the depth limit, and the library's own errors. `host_call_library_start` only returns `0` when the host cannot read the request from the plugin's memory. A wait the host can never answer — an empty list, or a handle that was never issued or has already been collected — returns `{"error": {"code": "BAD_INPUT", ...}}` with no `handle`, immediately.
+
+At most **8** started calls run at once for each run or library call. A call started beyond that still gets its handle immediately and waits for a free slot before it begins. When a run returns, calls it started and never collected are allowed to finish (for up to the script wall clock) and their results are discarded; a failure among them is written to the plugin's log. When a run fails or times out, its outstanding calls are stopped.
+
+With the SDK, these are `host::call_library_start` and `host::call_library_wait_any`.
 
 #### Database access
 
@@ -475,7 +489,7 @@ An empty Lua table argument (`{}`) is encoded as a JSON object, the same convent
 Everything above — the allocator, the packed-`i64` calling convention, the JSON envelope, and the `env` host imports — is what a plugin would otherwise have to hand-roll behind `extern "C"`. The `happyview-plugin-sdk` crate (`crates/happyview-plugin-sdk` in the HappyView repo) owns all of it, so a plugin crate needs only this one dependency.
 
 - `library_plugin! { info: ..., surface: ..., call: ... }` generates the five ABI exports (`alloc`, `dealloc`, `plugin_info`, `get_api_surface`, `call`) from a `PluginInfo`, an `ApiSurface`-returning function, and a dispatch function — the `export_abi!` macro it builds on is also available directly for lower-level cases.
-- `host::*` gives typed, `Result`-returning wrappers over every host import — `host::http_request`, `host::allowed_hosts`, `host::kv_get`/`kv_set`/`kv_delete`, `host::get_secret`, `host::call_library`, `host::library_surface`, `host::db_query`/`db_execute`, `host::lookup_record`, and `host::log`/`debug`/`info`/`warn`/`error`. A native (non-wasm32) build compiles the whole SDK, so a plugin's own logic is testable with `cargo test`; the host wrappers just report `host::HostError::NotWasm` there instead of calling anything.
+- `host::*` gives typed, `Result`-returning wrappers over every host import — `host::http_request`, `host::allowed_hosts`, `host::kv_get`/`kv_set`/`kv_delete`, `host::get_secret`, `host::call_library`, `host::call_library_start`/`call_library_wait_any`, `host::library_surface`, `host::db_query`/`db_execute`, `host::lookup_record`, and `host::log`/`debug`/`info`/`warn`/`error`. A native (non-wasm32) build compiles the whole SDK, so a plugin's own logic is testable with `cargo test`; the host wrappers just report `host::HostError::NotWasm` there instead of calling anything.
 - Only the imports a plugin actually calls end up in its compiled module; an unused `host::*` wrapper is dropped at link time, so the loader's import check sees exactly what the plugin uses.
 - `happyview_plugin_sdk::wire` holds every type that crosses the WASM boundary (`PluginInfo`, `ApiSurface`, `CallInput`, `HttpRequest`/`HttpResponse`, `TokenSet` and the rest). The host re-exports these rather than redefining them, so the two sides cannot drift. Plugins import them from `happyview_plugin_sdk::{PluginInfo, ...}` or `host::HttpRequest`.
 

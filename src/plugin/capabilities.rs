@@ -304,6 +304,14 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
         any_of: &[PluginCapability::LibraryCall],
     },
     Requirement {
+        import: "host_call_library_start",
+        any_of: &[PluginCapability::LibraryCall],
+    },
+    Requirement {
+        import: "host_call_library_wait_any",
+        any_of: &[PluginCapability::LibraryCall],
+    },
+    Requirement {
         import: "host_get_api_surface",
         any_of: &[PluginCapability::LibraryCall],
     },
@@ -772,6 +780,8 @@ mod tests {
             "host_kv_delete",
             "host_lookup_record",
             "host_call_library",
+            "host_call_library_start",
+            "host_call_library_wait_any",
             "host_get_api_surface",
             "host_db_query",
             "host_db_execute",

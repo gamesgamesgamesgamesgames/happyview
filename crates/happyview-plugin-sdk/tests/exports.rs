@@ -182,9 +182,11 @@ const EXPECTED_INTERPRETER_EXPORTS: &[&str] = &[
 ];
 
 /// The `interpreter_echo` fixture reaches every import an interpreter may use:
-/// the two library imports and the four the `script:host` capability covers.
+/// the four library imports and the four the `script:host` capability covers.
 const EXPECTED_INTERPRETER_IMPORTS: &[&str] = &[
     "env::host_call_library",
+    "env::host_call_library_start",
+    "env::host_call_library_wait_any",
     "env::host_get_api_surface",
     "env::host_job_progress",
     "env::host_job_should_stop",

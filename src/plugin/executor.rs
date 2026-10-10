@@ -139,6 +139,51 @@ impl PluginInstance {
             MemoryLimiter::new(script_memory_ceiling(script_memory_bytes));
     }
 
+    /// Let the library calls this instance started and never waited on finish,
+    /// for up to `bound`, then abort what is left. A run that returned asked
+    /// for those calls and should not lose them because it did not read the
+    /// answer — a fire-and-forget write still lands — but the run is over, so
+    /// nothing is read either: each failure, and each call still running at
+    /// the bound, is a line in the plugin's log rather than an error.
+    pub async fn settle_pending_calls(&mut self, bound: std::time::Duration) {
+        let calls = self.store.data_mut().pending_calls.drain();
+        if calls.is_empty() {
+            return;
+        }
+        let state = self.store.data();
+        let (plugin_id, db, db_backend) =
+            (state.plugin_id.clone(), state.db.clone(), state.db_backend);
+        let warn = |message: String| {
+            crate::plugin::host::log(
+                &plugin_id,
+                crate::plugin::host::LogLevel::Warn,
+                &message,
+                db.clone(),
+                db_backend,
+            )
+        };
+        let deadline = tokio::time::Instant::now() + bound;
+        for (handle, call) in calls {
+            match tokio::time::timeout_at(deadline, call).await {
+                Ok(joined) => {
+                    if let PluginResponse::Err { error } =
+                        crate::plugin::host::pending_call_outcome(joined)
+                    {
+                        warn(format!(
+                            "library call {handle} started by this run failed after it returned: {} - {}",
+                            error.code, error.message
+                        ));
+                    }
+                }
+                // Dropping the timed-out call is what aborts it.
+                Err(_) => warn(format!(
+                    "library call {handle} started by this run was still running {}s after it returned and was stopped",
+                    bound.as_secs()
+                )),
+            }
+        }
+    }
+
     /// Call plugin_info() - no input required
     pub async fn call_plugin_info(&mut self) -> Result<PluginInfo, ExecutionError> {
         self.call_no_input_function("plugin_info").await
@@ -483,7 +528,9 @@ impl PluginExecutor {
             return Err(ExecutionError::DepthExceeded);
         }
         let mut inst = self.instantiate_library(lib_id, ctx, caller, depth).await?;
-        inst.call_library_function(function, args, ctx).await
+        let value = inst.call_library_function(function, args, ctx).await?;
+        inst.settle_pending_calls(self.script_wall_clock()).await;
+        Ok(value)
     }
 
     /// Run a script through interpreter `plugin_id`.
@@ -525,7 +572,11 @@ impl PluginExecutor {
             ScriptKind::Job => inst.lift_guest_deadline(),
             _ => inst.arm_guest_deadline(self.script_wall_clock()),
         }
-        inst.call_execute(input).await
+        // A run that failed takes its outstanding calls down with it when
+        // `inst` drops; only one that answered waits for them.
+        let output = inst.call_execute(input).await?;
+        inst.settle_pending_calls(self.script_wall_clock()).await;
+        Ok(output)
     }
 
     /// Ask interpreter `plugin_id` whether `source` is a script it can run.
@@ -761,6 +812,7 @@ impl PluginExecutor {
             ),
             deadline: GuestDeadline::unbounded(self.runtime.epoch()),
             limiter: MemoryLimiter::new(memory_ceiling(plugin.plugin_type())),
+            pending_calls: Default::default(),
         })
     }
 
@@ -1751,6 +1803,7 @@ mod deadline {
             wasi: crate::plugin::host::build_wasi_context("p", None, DatabaseBackend::Sqlite),
             deadline: GuestDeadline::unbounded(runtime.epoch()),
             limiter: MemoryLimiter::new(memory_ceiling(PluginType::Library)),
+            pending_calls: Default::default(),
         }
     }
 }
