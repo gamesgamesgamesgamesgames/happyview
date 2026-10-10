@@ -28,6 +28,9 @@ pub struct JetstreamStatus {
     /// Per worker, when the job it is applying (or retrying) started, in unix
     /// milliseconds; `None` when idle. Queue depths do not count that job.
     pub worker_busy_since_ms: Vec<Option<i64>>,
+    /// Server time at this snapshot, in unix milliseconds, so a client can age
+    /// `worker_busy_since_ms` without trusting its own clock.
+    pub now_ms: i64,
 }
 
 #[derive(Default)]
@@ -68,6 +71,13 @@ pub fn set_workers(depths: Arc<Vec<AtomicUsize>>, busy_since: Arc<Vec<AtomicI64>
     live.busy_since = Some(busy_since);
 }
 
+/// Forget the worker counters, once the pool they belong to is gone.
+pub fn clear_workers() {
+    let mut live = live();
+    live.depths = None;
+    live.busy_since = None;
+}
+
 pub fn snapshot() -> JetstreamStatus {
     snapshot_at(chrono::Utc::now().timestamp_micros())
 }
@@ -75,6 +85,7 @@ pub fn snapshot() -> JetstreamStatus {
 fn snapshot_at(now_us: i64) -> JetstreamStatus {
     let live = live();
     let mut status = live.status.clone();
+    status.now_ms = now_us / 1000;
     status.lag_ms = status.applied_time_us.map(|t| ((now_us - t) / 1000).max(0));
     status.worker_queue_depths = live
         .depths
@@ -122,7 +133,14 @@ mod tests {
             vec![Some(1_700_000_000_000), None]
         );
 
+        assert_eq!(status.now_ms, 3_500);
+
         disconnected();
         assert!(!snapshot_at(3_500_000).connected);
+
+        clear_workers();
+        let status = snapshot_at(3_500_000);
+        assert!(status.worker_queue_depths.is_empty());
+        assert!(status.worker_busy_since_ms.is_empty());
     }
 }

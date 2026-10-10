@@ -192,7 +192,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 
 ### Jetstream status
 
-`GET /admin/jetstream/status` reports the live [Jetstream](https://github.com/bluesky-social/jetstream) consumer since the process started. A platform API key can read it. Unknown values are an explicit `null`.
+`GET /admin/jetstream/status` reports the live [Jetstream](https://github.com/bluesky-social/jetstream) consumer since the process started. A platform API key can read it. Unknown values are an explicit `null`: `protocol`, `host`, `dictionary_id`, `applied_seq`, `applied_time_us` and `lag_ms` are all `null` before the first connection or event, and the two worker arrays are empty until the worker pool starts.
 
 | Field | Meaning |
 | --- | --- |
@@ -205,6 +205,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `applied_time_us` | When Jetstream witnessed that event, in microseconds since the Unix epoch |
 | `lag_ms` | Milliseconds from `applied_time_us` to now |
 | `worker_queue_depths` | Events waiting in each worker's queue, one entry per `JETSTREAM_WORKERS`. The event a worker is applying or retrying is not counted |
+| `now_ms` | Server time when the snapshot was taken, in milliseconds since the Unix epoch. Subtract `worker_busy_since_ms` from it rather than using your own clock |
 | `worker_busy_since_ms` | One entry per worker: when its current event started, in milliseconds since the Unix epoch, or `null` when idle. An old value with an empty queue means the worker is stuck retrying |
 
 ### Database disk usage and vacuum

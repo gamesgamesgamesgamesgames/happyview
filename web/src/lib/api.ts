@@ -756,6 +756,8 @@ export interface JetstreamStatus {
   worker_queue_depths: number[];
   /** Per worker, when its current job started (unix ms); null when idle. */
   worker_busy_since_ms: (number | null)[];
+  /** Server time at the snapshot (unix ms); age busy workers against this. */
+  now_ms: number;
 }
 
 export function getJetstreamStatus() {

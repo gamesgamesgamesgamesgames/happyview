@@ -411,6 +411,15 @@ enum Ended {
     Renumbered,
 }
 
+/// Clears the status's worker counters when `run` exits by any path.
+struct ClearWorkersOnDrop;
+
+impl Drop for ClearWorkersOnDrop {
+    fn drop(&mut self) {
+        status::clear_workers();
+    }
+}
+
 async fn run(
     state: AppState,
     mut collections_rx: watch::Receiver<Vec<String>>,
@@ -429,6 +438,9 @@ async fn run(
         apply::give_up_fn(state.clone()),
     );
     status::set_workers(pool.depth_counters(), pool.busy_since_counters());
+    // Declared after the pool, so it drops first only in name: the pool's own
+    // drop resets its counters, and this stops the status holding them.
+    let _clear_workers = ClearWorkersOnDrop;
 
     let mut session = Session::new(&settings);
     // The seq of the last v2 event handed to the pool. The pool outlives the

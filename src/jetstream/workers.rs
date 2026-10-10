@@ -102,6 +102,14 @@ impl Drop for WorkerPool {
         for task in &self.tasks {
             task.abort();
         }
+        // An aborted worker never clears its own slot; leave nothing reading
+        // as busy or queued through the shared status counters.
+        for busy in self.busy_since.iter() {
+            busy.store(IDLE, Ordering::Relaxed);
+        }
+        for depth in self.depths.iter() {
+            depth.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -863,5 +871,33 @@ mod tests {
             pool.busy_since() == vec![None, None]
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pool_mid_retry_leaves_no_worker_busy() {
+        let (apply, _calls) = scripted(vec![ApplyOutcome::Unavailable("down".into()); 100_000]);
+        let (on_give_up, _gave_up) = recording_give_up();
+        let watermark = Arc::new(WatermarkHandle::new());
+        let pool = WorkerPool::spawn(
+            1,
+            8,
+            apply,
+            Arc::clone(&watermark),
+            fast_retry(2),
+            on_give_up,
+        );
+        let busy = pool.busy_since_counters();
+        let depths = pool.depth_counters();
+        send(&pool, &watermark, event("did:plc:same", 1)).await;
+        send(&pool, &watermark, event("did:plc:same", 2)).await;
+        wait_for("the worker to take the job", || {
+            pool.busy_since()[0].is_some()
+        })
+        .await;
+        assert_eq!(pool.depths(), vec![1]);
+
+        drop(pool);
+        assert_eq!(busy_since_values(&busy), vec![None]);
+        assert_eq!(depths[0].load(Ordering::Relaxed), 0);
     }
 }

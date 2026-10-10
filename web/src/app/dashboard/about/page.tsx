@@ -10,7 +10,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { getJetstreamStatus, type JetstreamStatus } from "@/lib/api"
+import { ApiError, getJetstreamStatus, type JetstreamStatus } from "@/lib/api"
 
 interface ConfigInfo {
   version: string
@@ -35,12 +35,12 @@ function formatLag(ms: number | null): string | undefined {
   return `${(ms / 3_600_000).toFixed(1)} h`
 }
 
-function formatWorkers(status: JetstreamStatus, now: number): string | undefined {
+function formatWorkers(status: JetstreamStatus): string | undefined {
   if (status.worker_queue_depths.length === 0) return undefined
   return status.worker_queue_depths
     .map((depth, i) => {
       const since = status.worker_busy_since_ms[i] ?? null
-      return since !== null && now - since > RETRYING_AFTER_MS
+      return since !== null && status.now_ms - since > RETRYING_AFTER_MS
         ? `${depth} (retrying)`
         : String(depth)
     })
@@ -59,13 +59,11 @@ function Rows({ rows }: { rows: Row[] }) {
     </dl>
   )
 }
+
 export default function AboutPage() {
   const [config, setConfig] = useState<ConfigInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [jetstream, setJetstream] = useState<{
-    status: JetstreamStatus
-    fetchedAt: number
-  } | null>(null)
+  const [jetstream, setJetstream] = useState<JetstreamStatus | null>(null)
 
   useEffect(() => {
     fetch(`${process.env.NEXT_PUBLIC_BASE_PATH || ""}/config`, { credentials: "same-origin" })
@@ -86,10 +84,18 @@ export default function AboutPage() {
     const poll = () => {
       getJetstreamStatus()
         .then((status) => {
-          if (!cancelled) setJetstream({ status, fetchedAt: Date.now() })
+          if (!cancelled) setJetstream(status)
         })
-        .catch(() => {
-          if (!cancelled) setJetstream(null)
+        .catch((e) => {
+          // Keep the last good status through a transient failure; hide the
+          // card only when the user cannot read it at all.
+          if (
+            !cancelled &&
+            e instanceof ApiError &&
+            (e.status === 403 || e.status === 404)
+          ) {
+            setJetstream(null)
+          }
         })
     }
     const start = () => {
@@ -126,26 +132,26 @@ export default function AboutPage() {
 
   const jetstreamRows: Row[] = jetstream
     ? [
-        { label: "Protocol", value: jetstream.status.protocol ?? undefined },
-        { label: "Host", value: jetstream.status.host ?? undefined },
+        { label: "Protocol", value: jetstream.protocol ?? undefined },
+        { label: "Host", value: jetstream.host ?? undefined },
         {
           label: "Connected",
-          value: jetstream.status.connected ? "Yes" : "No",
+          value: jetstream.connected ? "Yes" : "No",
         },
         {
           label: "Compression",
-          value: jetstream.status.compression
-            ? `zstd, dictionary ${jetstream.status.dictionary_id}`
+          value: jetstream.compression
+            ? `zstd, dictionary ${jetstream.dictionary_id}`
             : "Off",
         },
         {
           label: "Applied seq",
-          value: jetstream.status.applied_seq?.toString(),
+          value: jetstream.applied_seq?.toString(),
         },
-        { label: "Lag", value: formatLag(jetstream.status.lag_ms) },
+        { label: "Lag", value: formatLag(jetstream.lag_ms) },
         {
           label: "Worker queues",
-          value: formatWorkers(jetstream.status, jetstream.fetchedAt),
+          value: formatWorkers(jetstream),
         },
       ]
     : []
