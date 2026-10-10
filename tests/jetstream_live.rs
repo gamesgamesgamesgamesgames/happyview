@@ -1311,6 +1311,7 @@ async fn an_old_numbering_seq_is_not_saved_after_a_future_cursor() {
     // new numbering is skipped.
     drop(consumer);
     new_blocker.release().await;
+    mock.set_tip(4);
     mock.notice_next("FutureCursor", "cursor 11 is past the next seq 4");
     let _consumer = start(&app, fast_drain());
     wait_until!(
@@ -1318,6 +1319,14 @@ async fn an_old_numbering_seq_is_not_saved_after_a_future_cursor() {
         setting(&app, "jetstream_seq").await.as_deref() == Some("3")
     );
     assert_eq!(rkeys(&app, new_did).await, vec!["r1", "r2", "r3"]);
+    assert_eq!(
+        mock.connections()
+            .last()
+            .expect("connections")
+            .param("cursor"),
+        Some(js::witnessed_us(11).to_string()),
+        "the restart resumed by witnessed time, not from the tip"
+    );
     assert!(!seqs.seen().contains(&12), "{:?}", seqs.seen());
 }
 
@@ -1361,5 +1370,35 @@ async fn a_cursor_too_old_gap_outlasts_the_refusals_after_it() {
             "after_seq": 5,
             "resumed_at_seq": 100,
         })]
+    );
+}
+
+/// `FutureCursor` in answer to a time cursor (which should not happen):
+/// reconnecting by that time would only meet it again, so the consumer
+/// goes on from the tip instead of looping.
+#[tokio::test]
+#[serial]
+async fn a_future_cursor_on_a_time_cursor_does_not_loop() {
+    let Some(app) = app().await else { return };
+    let mock = MockJetstream::start().await;
+    let time = js::witnessed_us(5);
+    set_setting(&app, "jetstream_cursor", &time.to_string()).await;
+    for _ in 0..5 {
+        mock.notice_next("FutureCursor", "cursor is past the next seq");
+    }
+    mock.push((6..=7).map(|s| js::create(s, "did:plc:noloop", GAME, &format!("r{s}"), game("x"))));
+    let _consumer = start(&app, settings(&mock));
+
+    wait_until!("seq 7 applied", applied_through(&app, 7).await);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let connections = mock.connections();
+    assert!(
+        connections.len() <= 2,
+        "reconnected in a loop: {connections:?}"
+    );
+    assert_eq!(rkeys(&app, "did:plc:noloop").await, vec!["r6", "r7"]);
+    assert_eq!(
+        events(&app, "jetstream.gap").await,
+        vec![json!({"reason": "future_cursor", "from_seq": time})]
     );
 }

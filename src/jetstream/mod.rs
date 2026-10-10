@@ -466,7 +466,10 @@ async fn run(
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
-            SessionEnd::Renumbered => backoff = MIN_BACKOFF,
+            SessionEnd::Renumbered => {
+                backoff = MIN_BACKOFF;
+                tokio::time::sleep(backoff).await;
+            }
             SessionEnd::Rejected(rejection) => {
                 match handle_rejection(
                     &state,
@@ -710,7 +713,11 @@ async fn run_session(
                                     "from_seq": resume,
                                 }))
                                 .await;
-                                if stored.time_us.is_some() {
+                                // Only from a seq: a time refused this way
+                                // would be refused again, so the tip it is.
+                                let sent_seq = resume
+                                    .is_some_and(|c| c < cursor::TIMESTAMP_CURSOR_MIN);
+                                if stored.time_us.is_some() && sent_seq {
                                     break Ended::Renumbered;
                                 }
                             }
