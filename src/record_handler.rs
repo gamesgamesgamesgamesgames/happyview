@@ -391,7 +391,9 @@ async fn upsert_record_and_refs(
 /// whose rev is unknown or not newer, and, unless a newer row survives it,
 /// leaves a tombstone in the same transaction, so a reordered or replayed
 /// create cannot bring the record back. A delete that overtakes its create
-/// (no row yet) tombstones too.
+/// (no row yet) tombstones too. A delete without a rev (a dead-letter retry)
+/// deletes the row whatever its rev and tombstones it at the rev it was
+/// stored at, if any, so a replay of that create cannot bring it back.
 async fn delete_record(
     db: &sqlx::AnyPool,
     backend: crate::db::DatabaseBackend,
@@ -432,8 +434,18 @@ async fn delete_record(
             }
         }
         None => {
-            let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-            crate::db::query(&sql).bind(uri).execute(&mut *tx).await?;
+            let sql = adapt_sql(
+                "DELETE FROM happyview_records WHERE uri = ? RETURNING rev",
+                backend,
+            );
+            let deleted: Option<(Option<String>,)> = crate::db::query_as(&sql)
+                .bind(uri)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if let Some((Some(stored_rev),)) = deleted {
+                crate::tombstones::write_record_tombstone(&mut tx, backend, uri, &stored_rev, now)
+                    .await?;
+            }
         }
     }
     tx.commit().await
@@ -1460,6 +1472,80 @@ mod tests {
         let rkey = format!("early{}", uuid::Uuid::new_v4().simple());
         assert_a_delete_with_no_row_tombstones(&state, &rkey).await;
         clean_up_rkey(&state, &rkey).await;
+    }
+
+    /// A delete without a rev (a dead-letter retry) tombstones the deleted
+    /// row at the rev it was stored at, so a replay of that create, or of an
+    /// older one, cannot bring it back; a newer create still applies. A row
+    /// stored without a rev leaves no tombstone.
+    async fn assert_unversioned_deletes_tombstone_the_stored_rev(state: &AppState, rkey: &str) {
+        let uri = format!("at://did:plc:abc/{NSID}/{rkey}");
+        let create = |r: Option<String>| {
+            event_with(rkey, "create", Some(serde_json::json!({"text": "hi"})), r)
+        };
+        let delete = event_with(rkey, "delete", None, None);
+
+        let _ = handle_record_event(state, &create(Some(rev(20)))).await;
+        assert_eq!(
+            handle_record_event(state, &delete).await,
+            RecordOutcome::Matched
+        );
+        assert!(body_of(state, &uri).await.is_none());
+        assert_eq!(tombstone_rev(state, &uri).await, Some(rev(20)));
+        for (r, why) in [
+            (rev(20), "a replay of the deleted create"),
+            (rev(10), "an older create"),
+        ] {
+            let _ = handle_record_event(state, &create(Some(r))).await;
+            assert!(
+                body_of(state, &uri).await.is_none(),
+                "{why} must not resurrect the record"
+            );
+        }
+        let _ = handle_record_event(state, &create(Some(rev(30)))).await;
+        assert!(
+            body_of(state, &uri).await.is_some(),
+            "a newer create still applies"
+        );
+
+        let unversioned = format!("{rkey}u");
+        let uri = format!("at://did:plc:abc/{NSID}/{unversioned}");
+        let _ = handle_record_event(
+            state,
+            &event_with(
+                &unversioned,
+                "create",
+                Some(serde_json::json!({"text": "hi"})),
+                None,
+            ),
+        )
+        .await;
+        let _ = handle_record_event(state, &event_with(&unversioned, "delete", None, None)).await;
+        assert!(body_of(state, &uri).await.is_none());
+        assert_eq!(
+            tombstone_rev(state, &uri).await,
+            None,
+            "a row without a rev leaves no tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unversioned_delete_tombstones_the_stored_rev() {
+        let state = migrated_tracked_state().await;
+        assert_unversioned_deletes_tombstone_the_stored_rev(&state, "unv").await;
+    }
+
+    #[tokio::test]
+    async fn an_unversioned_delete_tombstones_the_stored_rev_on_postgres() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        register_tracked_lexicon(&state).await;
+        let rkey = format!("unv{}", uuid::Uuid::new_v4().simple());
+        assert_unversioned_deletes_tombstone_the_stored_rev(&state, &rkey).await;
+        clean_up_rkey(&state, &rkey).await;
+        clean_up_rkey(&state, &format!("{rkey}u")).await;
     }
 
     /// The hand-written schema `tracked_state` builds still takes a
