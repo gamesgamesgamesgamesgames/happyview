@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use std::time::Duration;
 
 use axum::Json;
@@ -107,6 +107,36 @@ async fn update_job_counter(state: &AppState, job_id: &str, column: &str, value:
             .execute(&state.backfill_db)
     })
     .await;
+}
+
+/// `column + increment` for a job counter, held at `i32::MAX`: the counter
+/// columns are `INT`, which Postgres refuses to overflow and which every
+/// reader decodes as `i32`. Postgres widens the sum first so that it cannot
+/// overflow before it is clamped.
+fn saturating_counter(
+    column: &str,
+    increment: &str,
+    backend: crate::db::DatabaseBackend,
+) -> String {
+    match backend {
+        crate::db::DatabaseBackend::Sqlite => {
+            format!("{column} = MIN(COALESCE({column}, 0) + {increment}, 2147483647)")
+        }
+        crate::db::DatabaseBackend::Postgres => format!(
+            "{column} = LEAST(CAST(COALESCE({column}, 0) AS BIGINT) + {increment}, 2147483647)"
+        ),
+    }
+}
+
+/// Add `n` to an in-memory job counter, holding it at `i32::MAX` like its
+/// column. Returns the new value.
+fn saturating_fetch_add(counter: &AtomicI32, n: i32) -> i32 {
+    let previous = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_add(n))
+        })
+        .unwrap_or_else(|v| v);
+    previous.saturating_add(n)
 }
 
 fn publish_event(state: &AppState, event: super::types::BackfillEvent) {
@@ -441,6 +471,12 @@ const COMPLETIONS_TRIM_EVERY: i32 = 100;
 /// (6.86M on one tenant) and a read snapshot open for the whole scan.
 const RESOLVE_PAGE_SIZE: i64 = 1000;
 
+/// Unit completions in a row that may fail before the job is failed. A unit
+/// whose completion fails still frees its window slot (see `release_slot`), so
+/// a completion that fails every time would otherwise let discovery fill the
+/// queue without bound.
+const MAX_CONSECUTIVE_COMPLETION_FAILURES: u32 = 20;
+
 /// Parse `BACKFILL_DISCOVERY_WINDOW`. Anything unparseable or below 1 falls
 /// back to the default rather than failing a job over a tuning knob.
 pub fn parse_discovery_window(raw: Option<&str>) -> i64 {
@@ -557,6 +593,8 @@ struct JobQueue {
     /// Set once discovery can enqueue nothing more. Until then the resolver
     /// keeps looking for new units instead of finishing.
     discovery_done: Arc<AtomicBool>,
+    /// Unit completions that have failed in a row, across every worker.
+    completion_failures: Arc<AtomicU32>,
 }
 
 impl JobQueue {
@@ -568,7 +606,24 @@ impl JobQueue {
             version: QueueVersion::Legacy,
             window: Arc::new(QueueWindow::new(i64::MAX, 0)),
             discovery_done: Arc::new(AtomicBool::new(true)),
+            completion_failures: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Count whether a unit's completion committed. Returns true once
+    /// `MAX_CONSECUTIVE_COMPLETION_FAILURES` have failed in a row.
+    fn record_completion(&self, committed: bool) -> bool {
+        if committed {
+            self.completion_failures.store(0, Ordering::Relaxed);
+            return false;
+        }
+        self.completion_failures.fetch_add(1, Ordering::Relaxed) + 1
+            >= MAX_CONSECUTIVE_COMPLETION_FAILURES
+    }
+
+    /// Whether this run gave up because unit completions kept failing.
+    fn completions_failing(&self) -> bool {
+        self.completion_failures.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_COMPLETION_FAILURES
     }
 }
 
@@ -736,7 +791,10 @@ async fn mark_resolved(
         }
     }
     let counter = adapt_sql(
-        "UPDATE happyview_backfill_jobs SET resolved_repos = COALESCE(resolved_repos, 0) + 1 WHERE id = ?",
+        &format!(
+            "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
+            saturating_counter("resolved_repos", "1", backend)
+        ),
         backend,
     );
     crate::db::query(&counter)
@@ -820,8 +878,11 @@ async fn complete_unit(
         }
     };
     let counters = adapt_sql(
-        "UPDATE happyview_backfill_jobs SET processed_repos = COALESCE(processed_repos, 0) + 1, \
-         total_records = COALESCE(total_records, 0) + ? WHERE id = ?",
+        &format!(
+            "UPDATE happyview_backfill_jobs SET {}, {} WHERE id = ?",
+            saturating_counter("processed_repos", "1", backend),
+            saturating_counter("total_records", "?", backend)
+        ),
         backend,
     );
     crate::db::query(&counters)
@@ -928,7 +989,10 @@ async fn add_late_records(
     let job_id = queue.job_id.as_str();
     let mut tx = state.backfill_db.begin().await?;
     let counter = adapt_sql(
-        "UPDATE happyview_backfill_jobs SET total_records = COALESCE(total_records, 0) + ? WHERE id = ?",
+        &format!(
+            "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
+            saturating_counter("total_records", "?", backend)
+        ),
         backend,
     );
     crate::db::query(&counter)
@@ -1226,7 +1290,10 @@ async fn enqueue_discovered_page(
         .execute(&mut *tx)
         .await?;
     let total_sql = adapt_sql(
-        "UPDATE happyview_backfill_jobs SET total_repos = COALESCE(total_repos, 0) + ? WHERE id = ?",
+        &format!(
+            "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
+            saturating_counter("total_repos", "?", backend)
+        ),
         backend,
     );
     crate::db::query(&total_sql)
@@ -1324,7 +1391,7 @@ async fn discover_collection(
         queue.window.settle(page_limit, added);
 
         let added = i32::try_from(added).unwrap_or(i32::MAX);
-        let running = total.fetch_add(added, Ordering::Relaxed) + added;
+        let running = saturating_fetch_add(total, added);
         publish_event(
             state,
             super::types::BackfillEvent::JobCounters {
@@ -1925,7 +1992,7 @@ async fn on_resolved(ctx: &ResolverContext, unit: WorkUnit, pds: String) -> bool
             pds_endpoint: pds.clone(),
         },
     );
-    let count = ctx.resolved.fetch_add(1, Ordering::Relaxed) + 1;
+    let count = saturating_fetch_add(&ctx.resolved, 1);
     publish_event(
         &ctx.state,
         super::types::BackfillEvent::JobCounters {
@@ -2398,7 +2465,7 @@ async fn finish_unit(
     result: UnitFetchResult,
 ) -> Option<(i32, i32)> {
     let (unit, records, any_success, mut failures) = result;
-    let records_now = scope.total_records.fetch_add(records, Ordering::Relaxed) + records;
+    let records_now = saturating_fetch_add(scope.total_records, records);
     if scope.cancelled.load(Ordering::Relaxed) {
         return None;
     }
@@ -2437,6 +2504,10 @@ async fn finish_unit(
     })
     .await;
     release_slot(scope.queue, removed);
+    if scope.queue.record_completion(removed.is_some()) {
+        // Stop the whole run: see `MAX_CONSECUTIVE_COMPLETION_FAILURES`.
+        scope.cancelled.store(true, Ordering::Relaxed);
+    }
     publish_event(
         scope.state,
         super::types::BackfillEvent::RepoFetched {
@@ -2446,7 +2517,7 @@ async fn finish_unit(
             records_fetched: records,
         },
     );
-    let repos = scope.processed_repos.fetch_add(1, Ordering::Relaxed) + 1;
+    let repos = saturating_fetch_add(scope.processed_repos, 1);
     trim_completions_on_schedule(scope.state, scope.queue, repos).await;
     Some((repos, records_now))
 }
@@ -2456,7 +2527,7 @@ async fn record_late_records(scope: &WorkerScope<'_>, records: i32) {
     if records == 0 {
         return;
     }
-    scope.total_records.fetch_add(records, Ordering::Relaxed);
+    saturating_fetch_add(scope.total_records, records);
     job_write(scope.state, &scope.queue.job_id, "late_records", || {
         add_late_records(scope.state, scope.queue, scope.pds_endpoint, records)
     })
@@ -2503,11 +2574,11 @@ async fn fetch_unit(
         .await
         {
             FetchOutcome::Complete { count: c } => {
-                count += c as i32;
+                count = count.saturating_add(i32::try_from(c).unwrap_or(i32::MAX));
                 any_success = true;
             }
             outcome @ FetchOutcome::Failed { count: c, .. } => {
-                count += c as i32;
+                count = count.saturating_add(i32::try_from(c).unwrap_or(i32::MAX));
                 failures.push((collection.clone(), outcome));
             }
         }
@@ -2879,7 +2950,7 @@ async fn run_fetching_phase(
                         // the defer/give-up decision is made synchronously
                         // here, before the async block, which only awaits
                         // the give-ups' recorder I/O.
-                        total_records.fetch_add(did_records, Ordering::Relaxed);
+                        saturating_fetch_add(&total_records, did_records);
                         if any_success {
                             cooldowns.record_success(&pds_host);
                         }
@@ -2966,12 +3037,12 @@ async fn run_fetching_phase(
                             })
                             .await;
 
-                            let repos = processed_repos.fetch_add(1, Ordering::Relaxed) + 1;
+                            let repos = saturating_fetch_add(&processed_repos, 1);
                             let records = total_records.load(Ordering::Relaxed);
 
                             let threshold = next_flush.load(Ordering::Relaxed);
                             if repos >= threshold
-                                && next_flush.compare_exchange(threshold, repos + random_batch_threshold(10), Ordering::Relaxed, Ordering::Relaxed).is_ok()
+                                && next_flush.compare_exchange(threshold, repos.saturating_add(random_batch_threshold(10)), Ordering::Relaxed, Ordering::Relaxed).is_ok()
                             {
                                 let backend = state.db_backend;
                                 let sql = adapt_sql(
@@ -3034,10 +3105,10 @@ async fn run_fetching_phase(
                             {
                                 FetchOutcome::Complete { count } => {
                                     cooldowns.record_success(&pds_host);
-                                    total_records.fetch_add(count as i32, Ordering::Relaxed);
+                                    saturating_fetch_add(&total_records, i32::try_from(count).unwrap_or(i32::MAX));
                                 }
                                 FetchOutcome::Failed { count, cursor, failure } => {
-                                    total_records.fetch_add(count as i32, Ordering::Relaxed);
+                                    saturating_fetch_add(&total_records, i32::try_from(count).unwrap_or(i32::MAX));
                                     let last_failure = failure.clone();
                                     defer_or_give_up_fetch(
                                         &state,
@@ -3627,6 +3698,7 @@ async fn run_queue(
         discovery_done: Arc::new(AtomicBool::new(
             version == QueueVersion::Legacy || discovery_complete,
         )),
+        completion_failures: Arc::new(AtomicU32::new(0)),
     };
     let cancelled = Arc::new(AtomicBool::new(false));
     let discovery = (!queue.discovery_done.load(Ordering::Acquire)).then(|| {
@@ -3645,6 +3717,12 @@ async fn run_queue(
         handle
             .await
             .map_err(|e| format!("backfill discovery task panicked: {e}"))??;
+    }
+    if queue.completions_failing() {
+        return Err(format!(
+            "stopped after {MAX_CONSECUTIVE_COMPLETION_FAILURES} unit completions in a row failed to commit; \
+             see the backfill.write_failed events for the cause"
+        ));
     }
     counts
 }
@@ -5294,6 +5372,7 @@ mod tests {
             version: QueueVersion::Bounded,
             window: Arc::new(QueueWindow::new(DEFAULT_DISCOVERY_WINDOW, 0)),
             discovery_done: Arc::new(AtomicBool::new(true)),
+            completion_failures: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -6256,6 +6335,166 @@ mod tests {
     async fn the_completion_log_keeps_only_the_most_recent_units() {
         let state = migrated_state().await;
         assert_the_completion_log_is_trimmed(&state, "log-job").await;
+    }
+
+    /// Every SQL increment of a job counter holds at `i32::MAX` rather than
+    /// failing (Postgres) or leaving a value no reader can decode (SQLite).
+    async fn assert_job_counters_saturate(state: &AppState, job_id: &str) {
+        seed_job(
+            state,
+            job_id,
+            Some(POST),
+            "network",
+            "resolving_and_fetching",
+            2,
+            true,
+        )
+        .await;
+        let sql = adapt_sql(
+            "UPDATE happyview_backfill_jobs SET total_repos = ?, resolved_repos = ?, processed_repos = ?, total_records = ? WHERE id = ?",
+            state.db_backend,
+        );
+        crate::db::query(&sql)
+            .bind(i32::MAX - 1)
+            .bind(i32::MAX)
+            .bind(i32::MAX - 1)
+            .bind(i32::MAX - 3)
+            .bind(job_id)
+            .execute(&state.db)
+            .await
+            .expect("seed counters");
+        let queue = bounded_queue(job_id);
+        let unit = WorkUnit {
+            did: format!("did:plc:sat{job_id}"),
+            collection: POST.to_string(),
+        };
+        seed_unit(state, job_id, POST, &unit.did, None).await;
+
+        enqueue_discovered_page(
+            state,
+            job_id,
+            POST,
+            &[format!("did:plc:more{job_id}")],
+            None,
+        )
+        .await
+        .expect("enqueue");
+        mark_resolved(state, &queue, &unit, "https://pds.test")
+            .await
+            .expect("mark resolved");
+        complete_unit(state, &queue, &unit, "https://pds.test", 10)
+            .await
+            .expect("complete unit");
+        add_late_records(state, &queue, "https://pds.test", 10)
+            .await
+            .expect("late records");
+
+        let job = job_row(state, job_id).await;
+        assert_eq!(
+            (
+                job.total_repos,
+                job.resolved_repos,
+                job.processed_repos,
+                job.total_records
+            ),
+            (i32::MAX, i32::MAX, i32::MAX, i32::MAX)
+        );
+    }
+
+    #[tokio::test]
+    async fn job_counters_saturate_instead_of_overflowing() {
+        let state = migrated_state().await;
+        assert_job_counters_saturate(&state, "sat-job").await;
+    }
+
+    #[tokio::test]
+    async fn job_counters_saturate_instead_of_overflowing_on_postgres() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        let job_id = format!("sat-{}", Uuid::new_v4().simple());
+        assert_job_counters_saturate(&state, &job_id).await;
+        delete_postgres_job(&state, &job_id, &[]).await;
+    }
+
+    #[test]
+    fn in_memory_counters_saturate() {
+        let counter = AtomicI32::new(i32::MAX - 1);
+        assert_eq!(saturating_fetch_add(&counter, 5), i32::MAX);
+        assert_eq!(saturating_fetch_add(&counter, 1), i32::MAX);
+        assert_eq!(counter.load(Ordering::Relaxed), i32::MAX);
+    }
+
+    #[test]
+    fn completion_failures_trip_only_when_consecutive() {
+        let queue = bounded_queue("trip");
+        for _ in 1..MAX_CONSECUTIVE_COMPLETION_FAILURES {
+            assert!(!queue.record_completion(false));
+        }
+        assert!(!queue.record_completion(true), "a success resets the run");
+        for _ in 1..MAX_CONSECUTIVE_COMPLETION_FAILURES {
+            assert!(!queue.record_completion(false));
+        }
+        assert!(!queue.completions_failing());
+        assert!(queue.record_completion(false));
+        assert!(queue.completions_failing());
+    }
+
+    /// When every unit completion fails, the job fails after
+    /// `MAX_CONSECUTIVE_COMPLETION_FAILURES` of them instead of releasing
+    /// slots for the whole queue.
+    #[tokio::test]
+    async fn a_job_whose_completions_keep_failing_fails() {
+        let mock = MockServer::start().await;
+        let state = pipeline_state(&mock, &[POST]).await;
+        crate::db::query(
+            "CREATE TRIGGER refuse_unit_deletes BEFORE DELETE ON happyview_backfill_queue \
+             BEGIN SELECT RAISE(ABORT, 'unit deletes refused'); END",
+        )
+        .execute(&state.db)
+        .await
+        .expect("create trigger");
+        mount_plc(&mock).await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.repo.listRecords"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"records": []})),
+            )
+            .mount(&mock)
+            .await;
+
+        let dids: Vec<String> = (0..200).map(|i| format!("did:plc:stuck{i:03}")).collect();
+        let job_id = create_backfill_job(&state, Some(POST), &dids)
+            .await
+            .expect("create job");
+        run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+        let (status, error): (String, Option<String>) =
+            crate::db::query_as("SELECT status, error FROM happyview_backfill_jobs WHERE id = ?")
+                .bind(&job_id)
+                .fetch_one(&state.db)
+                .await
+                .expect("job row");
+        assert_eq!(status, "failed");
+        assert_eq!(
+            error.as_deref(),
+            Some(
+                "stopped after 20 unit completions in a row failed to commit; \
+                 see the backfill.write_failed events for the cause"
+            )
+        );
+        let (attempts,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'backfill.write_failed' \
+             AND json_extract(detail, '$.write') = 'complete_unit'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .expect("count failures");
+        assert!(
+            (i64::from(MAX_CONSECUTIVE_COMPLETION_FAILURES)..100).contains(&attempts),
+            "the run stops soon after the limit, not at the end of the queue: {attempts}"
+        );
     }
 
     // -----------------------------------------------------------------------
