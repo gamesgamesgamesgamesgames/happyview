@@ -1,3 +1,4 @@
+pub mod apply;
 pub mod compression;
 pub mod config;
 pub mod cursor;
@@ -320,7 +321,9 @@ async fn run(
                                             .jetstream_skipped
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     }
-                                    RecordOutcome::SchemaEvent | RecordOutcome::Errored => {}
+                                    RecordOutcome::SchemaEvent
+                                    | RecordOutcome::Errored
+                                    | RecordOutcome::Unavailable => {}
                                 }
                             });
                         }

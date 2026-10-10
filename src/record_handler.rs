@@ -36,6 +36,10 @@ pub enum RecordOutcome {
     Skipped,
     SchemaEvent,
     Errored,
+    /// The write failed because the database could not be reached (see
+    /// `db::is_unavailable`); the same event should apply once it is back.
+    /// A caller that does not retry treats it like `Errored`.
+    Unavailable,
 }
 
 /// Process a record event: upsert/delete the record in the database, run index
@@ -231,7 +235,7 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
                         backend,
                     )
                     .await;
-                    RecordOutcome::Errored
+                    failed_write_outcome(&e)
                 }
             }
         }
@@ -323,11 +327,21 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
                         backend,
                     )
                     .await;
-                    RecordOutcome::Errored
+                    failed_write_outcome(&e)
                 }
             }
         }
         _ => RecordOutcome::Errored,
+    }
+}
+
+/// `Unavailable` when `e` means the database could not be reached, otherwise
+/// `Errored`.
+fn failed_write_outcome(e: &sqlx::Error) -> RecordOutcome {
+    if crate::db::is_unavailable(e) {
+        RecordOutcome::Unavailable
+    } else {
+        RecordOutcome::Errored
     }
 }
 

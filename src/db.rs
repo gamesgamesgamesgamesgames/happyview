@@ -108,6 +108,31 @@ pub fn is_retryable_write_error(e: &sqlx::Error) -> bool {
     matches!(code.as_ref(), "40001" | "40P01")
 }
 
+/// Whether a query failed because the database could not be reached or used
+/// at all, rather than because of anything in the query: the pool timed out
+/// or closed, the connection broke (an I/O error), Postgres reported a
+/// connection error (SQLSTATE class `08`) or a shutdown (`57P`), or a lock
+/// stayed held past `retry_on_busy` (see `is_retryable_write_error`). The
+/// same query is expected to succeed once the database is back, so a caller
+/// waits and retries it instead of giving it up. Everything else is a failure
+/// of that query.
+pub fn is_unavailable(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) => true,
+        sqlx::Error::Database(db) => {
+            if is_retryable_write_error(e) {
+                return true;
+            }
+            if db.try_downcast_ref::<sqlx::sqlite::SqliteError>().is_some() {
+                return false;
+            }
+            db.code()
+                .is_some_and(|code| code.starts_with("08") || code.starts_with("57P"))
+        }
+        _ => false,
+    }
+}
+
 /// Run a write, retrying up to `BUSY_RETRY_ATTEMPTS` times with backoff while
 /// it fails retryably. The final error is returned for the caller to log;
 /// nothing is swallowed here.
@@ -1147,6 +1172,10 @@ mod tests {
             .await
             .expect_err("the write lock is held");
         assert!(is_retryable_write_error(&err), "{err}");
+        assert!(
+            is_unavailable(&err),
+            "a lock still held is unavailable: {err}"
+        );
 
         let release = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
@@ -1169,6 +1198,7 @@ mod tests {
             !is_retryable_write_error(&dup),
             "a constraint failure is final: {dup}"
         );
+        assert!(!is_unavailable(&dup), "{dup}");
 
         drop(writer);
         drop(holder_pool);
@@ -1201,6 +1231,80 @@ mod tests {
             .await
             .expect_err("missing table");
         assert!(!is_retryable_write_error(&err), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_unavailable
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pool_and_io_errors_are_unavailable() {
+        use std::io::{Error as IoError, ErrorKind};
+        for err in [
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::Io(IoError::from(ErrorKind::ConnectionRefused)),
+            sqlx::Error::Io(IoError::from(ErrorKind::ConnectionReset)),
+            sqlx::Error::Io(IoError::from(ErrorKind::UnexpectedEof)),
+        ] {
+            assert!(is_unavailable(&err), "{err}");
+        }
+        for err in [
+            sqlx::Error::RowNotFound,
+            sqlx::Error::Protocol("bad frame".into()),
+            sqlx::Error::ColumnNotFound("rev".into()),
+            sqlx::Error::Decode("not a number".into()),
+        ] {
+            assert!(!is_unavailable(&err), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_sqlite_statement_is_not_unavailable() {
+        let pool = crate::test_support::memory_pool().await;
+        let err = query("SELECT * FROM happyview_no_such_table")
+            .execute(&pool)
+            .await
+            .expect_err("missing table");
+        assert!(!is_unavailable(&err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn postgres_connection_and_shutdown_codes_are_unavailable() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
+            return;
+        }
+        let pool = connect(&url, DatabaseBackend::Postgres).await;
+        let raise = |code: &str| {
+            format!("DO $$ BEGIN RAISE EXCEPTION 'forced' USING ERRCODE = '{code}'; END $$")
+        };
+        for code in ["08000", "08006", "57P01", "57P03", "40001", "40P01"] {
+            let err = query(&raise(code))
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert!(is_unavailable(&err), "{code}: {err}");
+        }
+        for code in ["23505", "22P02", "42P01", "57014"] {
+            let err = query(&raise(code))
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert!(!is_unavailable(&err), "{code}: {err}");
+        }
+
+        // A backend terminated under a live connection, as a restart does.
+        let mut conn = pool.acquire().await.expect("acquire");
+        let err = query("SELECT pg_terminate_backend(pg_backend_pid())")
+            .execute(&mut *conn)
+            .await
+            .expect_err("the backend is terminated");
+        assert!(is_unavailable(&err), "{err:?}");
+        conn.detach();
     }
 
     // -----------------------------------------------------------------------
