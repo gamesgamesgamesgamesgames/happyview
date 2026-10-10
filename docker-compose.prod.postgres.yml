@@ -149,6 +149,10 @@ services:
 
       # --- Upstream services --------------------------------------------
       JETSTREAM_URL: ${JETSTREAM_URL:-wss://jetstream1.us-east.bsky.network}
+      # auto tries v2 and falls back to v1; v2 or v1 forces one.
+      JETSTREAM_PROTOCOL: ${JETSTREAM_PROTOCOL:-auto}
+      JETSTREAM_COMPRESSION: ${JETSTREAM_COMPRESSION:-true}
+      JETSTREAM_WORKERS: ${JETSTREAM_WORKERS:-8}
       RELAY_URL: ${RELAY_URL:-https://bsky.network}
       PLC_URL: ${PLC_URL:-https://plc.directory}
 

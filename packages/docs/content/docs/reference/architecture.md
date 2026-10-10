@@ -35,7 +35,7 @@ graph LR
   Labeler["Labeler<br/><small>WebSocket (out-of-band)</small>"] -->|label events| DB
 ```
 
-Queries go through the query handler to the database (SQLite by default, or Postgres). Writes go through the procedure handler to the user's PDS, then HappyView indexes the record locally. Real-time record events stream in via [Jetstream](https://github.com/bluesky-social/jetstream); historical records are backfilled in-process by discovering repos via the relay's `listReposByCollection` and fetching records directly from each PDS. [Labelers](../guides/labelers.md) are external services that emit content labels over a direct WebSocket connection — they operate out-of-band, outside the relay/repo system. [Spaces](../experimental/spaces/index.md) provide permissioned data containers with membership-gated access, per-user repo state tracking (LtHash + signed commits), and cross-service credential-based authentication.
+Queries go through the query handler to the database (SQLite by default, or Postgres). Writes go through the procedure handler to the user's PDS, then HappyView indexes the record locally. Real-time record events stream in via [Jetstream](https://github.com/bluesky-social/jetstream) (its v2 `subscribeEvents` stream when the host offers it, otherwise v1), applied in order for each repo, with the stream position saved only once every earlier event has been applied; historical records are backfilled in-process by discovering repos via the relay's `listReposByCollection` and fetching records directly from each PDS. [Labelers](../guides/labelers.md) are external services that emit content labels over a direct WebSocket connection — they operate out-of-band, outside the relay/repo system. [Spaces](../experimental/spaces/index.md) provide permissioned data containers with membership-gated access, per-user repo state tracking (LtHash + signed commits), and cross-service credential-based authentication.
 
 ## Request flow
 
@@ -139,9 +139,41 @@ sequenceDiagram
     J->>H: Lexicon schema event (com.atproto.lexicon.schema)
     H->>D: Update tracked network lexicons
     H->>R: Update in-memory registry
-    Note over H,D: Cursor persisted to instance_settings for resume on reconnect
+    Note over H,D: Applied watermark persisted to instance_settings for resume on reconnect
     Note over H,J: Reconnects on collection filter changes (lexicon add/remove)
 ```
+
+**Ordering.** Events are split across `JETSTREAM_WORKERS` workers by account DID, so each repo's events apply in the order they arrived while different repos apply in parallel. The saved cursor is the applied watermark: the position below which every event has been applied. After a restart or reconnect HappyView resumes from it, so delivery is at-least-once, and writes are idempotent (a replayed record carries the same `rev` and is ignored).
+
+**Accounts.** An account event with `active=false` is handled by its status:
+
+- `deleted`, `takendown` and `suspended` purge the account's records and leave an account tombstone (`jetstream.account_deleted`, `jetstream.account_takendown`).
+- `deactivated`, `desynchronized` and `throttled` keep the records (`jetstream.account_inactive`).
+- `active=true` lifts the account's tombstone. Records that were purged come back only through a new [backfill](../guides/backfill.md).
+- A `#sync` removes the repo's records in registered collections, and the current ones that follow replace them. `identity` events change nothing, because HappyView caches no identities.
+
+**Failures.**
+
+- A database outage is retried indefinitely, up to 30 seconds apart, so ingest pauses rather than skipping events. While paused, the consumer cannot notice a collection change or a shutdown until the queue drains.
+- Any other failure is retried for about 31 seconds, then logged as `jetstream.apply_failed` and skipped.
+- Invalid input (no record body, an unknown operation, data the database rejects) is skipped at once with one `jetstream.record_invalid` warning.
+
+**Recovering a cursor.**
+
+- A cursor older than Jetstream keeps resumes from the stored witnessed time, or from the live tip when there is none, and logs `jetstream.gap`. A [backfill](../guides/backfill.md) recovers what was missed.
+- If the server renumbers its seqs (`FutureCursor`), HappyView resumes by witnessed time too.
+- An unexplained 400 first drops compression, then the seq cursor (only if the cursor was a seq), then retries hourly and logs `jetstream.invalid_request`.
+- Under `auto`, a 404 falls back to v1 until the process restarts.
+
+**Edge cases of revs and tombstones.**
+
+- The Lua [record script](../guides/record-scripts.md) can run for a write that a tombstone then refuses.
+- An account tombstone's `rev` is a TID of the time Jetstream witnessed the event. A PDS whose clock differs from Jetstream's can therefore let an older replay through, or block a newer write until the tombstone is swept (`RECORD_TOMBSTONE_RETENTION_HOURS`, 72 by default).
+- A stale record tombstone left after a newer recreate blocks writes without a rev (crawl writes) to that record until the sweep.
+- A crawl row fetched before a live update but written after it can overwrite the newer body while keeping the stored `rev`. A later replay at that `rev` heals it.
+- A delete with a `rev` removes a crawled row that has none.
+
+Admins can watch the consumer with `GET /admin/jetstream/status` and the About page's Jetstream card. See [Jetstream status](../api-reference/admin/admin-api.md#jetstream-status).
 
 ### Backfill
 

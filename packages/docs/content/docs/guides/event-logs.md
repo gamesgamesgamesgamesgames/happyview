@@ -104,12 +104,18 @@ See [Backfill](./backfill.md) for background on backfill jobs.
 
 ### Jetstream events
 
-| Event Type                  | Severity | Subject | Detail                                            |
-| --------------------------- | -------- | ------- | ------------------------------------------------- |
-| `jetstream.connected`       | info     | —       | `url`, `protocol`, `compression`, `dictionary_id` |
-| `jetstream.disconnected`    | warn     | —       | `reason`                                          |
-| `jetstream.gap`             | warn     | —       | `reason`, and more by reason (below)              |
-| `jetstream.invalid_request` | error    | —       | `message`, `retry_in_secs`                        |
+| Event Type                    | Severity | Subject     | Detail                                                                |
+| ----------------------------- | -------- | ----------- | --------------------------------------------------------------------- |
+| `jetstream.connected`         | info     | —           | `url`, `protocol`, `compression`, `dictionary_id`                     |
+| `jetstream.disconnected`      | warn     | —           | `reason`                                                              |
+| `jetstream.gap`               | warn     | —           | `reason`, and more by reason (below)                                  |
+| `jetstream.invalid_request`   | error    | —           | `message`, `retry_in_secs`                                            |
+| `jetstream.account_deleted`   | info     | Account DID | `purged`, `seq`                                                       |
+| `jetstream.account_takendown` | info     | Account DID | `purged`, `seq`, `status` (`takendown` or `suspended`)                |
+| `jetstream.account_inactive`  | info     | Account DID | `status` (`deactivated`, `desynchronized` or `throttled`)             |
+| `jetstream.sync_purged`       | info     | Account DID | `purged`, `rev`                                                       |
+| `jetstream.record_invalid`    | warn     | Account DID | `uri`, `seq`, `error`                                                 |
+| `jetstream.apply_failed`      | error    | Account DID | `uri` (or `kind` and, for an account event, `status`), `seq`, `error` |
 
 `jetstream.connected` and `jetstream.disconnected` are logged when the WebSocket connection to [Jetstream](https://github.com/bluesky-social/jetstream) is established or lost.
 
@@ -120,6 +126,12 @@ See [Backfill](./backfill.md) for background on backfill jobs.
 - `future_cursor`: the saved seq was past Jetstream's newest, because its seq numbering restarted. HappyView reconnects by the saved witnessed time, which Jetstream translates to the new numbering, or, with none saved, follows the new numbering from the live tip. `from_seq` is the cursor it asked for.
 
 `jetstream.invalid_request` means Jetstream refused the subscription as invalid, or kept refusing it without saying why after HappyView dropped what it could from the request. HappyView retries after `retry_in_secs` (an hour by default).
+
+`jetstream.account_deleted` is logged when an account this instance holds records for is deleted: its records (other than local writes not yet echoed back) are removed. `jetstream.account_takendown` is logged the same way for an account that is taken down or suspended. Both leave a tombstone for the account, so a late or replayed copy of its records is refused. `jetstream.account_inactive` is logged when such an account is deactivated, desynchronized or throttled; its records are kept. When an account becomes active again, its tombstone is lifted, but removed records come back only through a new [backfill](./backfill.md). `jetstream.sync_purged` is logged when a repo is resynced: its records in registered collections are removed, and the current ones that follow in the stream replace them. Events for accounts this instance holds nothing for are not logged.
+
+`jetstream.record_invalid` is logged once for an event HappyView skips immediately because retrying cannot help: a create or update with no record body, an unknown operation, or data the database rejects.
+
+`jetstream.apply_failed` is logged when an event keeps failing for a reason that is not a database outage. HappyView retries it for about 31 seconds, logs this event and skips it, so one bad event does not stall the stream. Database outages are never skipped: see [Real-time indexing](../reference/architecture.md#real-time-indexing).
 
 ## Querying events
 
