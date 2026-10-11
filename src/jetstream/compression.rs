@@ -77,11 +77,27 @@ pub async fn fetch_dictionary(http: &reqwest::Client, url: &str) -> Result<Dicti
     if !response.status().is_success() {
         return Err(format!("dictionary fetch answered {}", response.status()));
     }
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_DICTIONARY_BYTES {
-        return Err(format!("dictionary is {} bytes", bytes.len()));
-    }
+    let bytes = read_capped(response, MAX_DICTIONARY_BYTES).await?;
     Dictionary::from_bytes(&bytes)
+}
+
+/// `response`'s body, refused as soon as it is known to exceed `cap` bytes:
+/// up front from its `Content-Length`, or as its chunks arrive.
+async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    let too_large = |len: u64| format!("dictionary is over {cap} bytes ({len} or more)");
+    if let Some(len) = response.content_length()
+        && len > cap as u64
+    {
+        return Err(too_large(len));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if bytes.len() + chunk.len() > cap {
+            return Err(too_large((bytes.len() + chunk.len()) as u64));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -166,6 +182,56 @@ mod tests {
         encoder.write_all(b"{}").expect("write");
         let frame = encoder.finish().expect("finish");
         assert!(dictionary.decode(&frame).is_err());
+    }
+
+    /// Ruling FR6: an oversized dictionary is refused while it is read, not
+    /// after the whole body has arrived. Each server here then stalls; a
+    /// fetch that waits for the end of the body hangs until its timeout.
+    #[tokio::test]
+    async fn an_oversized_dictionary_is_refused_while_it_is_read() {
+        use tokio::io::AsyncWriteExt;
+
+        async fn stalling_server(head: String, body: Vec<u8>) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request).await;
+                stream.write_all(head.as_bytes()).await.expect("head");
+                stream.write_all(&body).await.expect("body");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+            format!("http://{addr}/dictionary")
+        }
+
+        let declared = stalling_server(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_DICTIONARY_BYTES + 1
+            ),
+            Vec::new(),
+        )
+        .await;
+        let mut chunk = format!("{:x}\r\n", MAX_DICTIONARY_BYTES + 1).into_bytes();
+        chunk.extend(vec![0u8; MAX_DICTIONARY_BYTES + 1]);
+        chunk.extend_from_slice(b"\r\n");
+        let chunked = stalling_server(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_string(),
+            chunk,
+        )
+        .await;
+
+        let http = reqwest::Client::new();
+        for url in [declared, chunked] {
+            let err = tokio::time::timeout(Duration::from_secs(5), fetch_dictionary(&http, &url))
+                .await
+                .unwrap_or_else(|_| panic!("{url}: the fetch waited for the whole body"))
+                .unwrap_err();
+            assert!(err.contains("over"), "{url}: {err}");
+        }
     }
 
     #[tokio::test]

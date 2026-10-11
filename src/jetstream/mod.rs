@@ -95,6 +95,15 @@ struct Session {
     logged_gaps: HashSet<(&'static str, Option<i64>)>,
 }
 
+/// Limits for the Jetstream socket: no frame or message larger than the
+/// biggest frame a v2 server sends decoded (the Go client's read limit),
+/// in place of tungstenite's 16 MiB frames and 64 MiB messages.
+fn socket_config() -> tungstenite::protocol::WebSocketConfig {
+    tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(compression::MAX_DECODED_FRAME))
+        .max_frame_size(Some(compression::MAX_DECODED_FRAME))
+}
+
 /// `reason` in a `jetstream.gap` event's detail.
 const GAP_CURSOR_TOO_OLD: &str = "cursor_too_old";
 const GAP_OUTDATED_CURSOR: &str = "outdated_cursor";
@@ -574,7 +583,7 @@ async fn run_session(
     tracing::info!(%url, protocol = protocol.as_str(), "connecting to jetstream");
     let ws = match tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async(url.as_str()),
+        tokio_tungstenite::connect_async_with_config(url.as_str(), Some(socket_config()), false),
     )
     .await
     {
@@ -845,6 +854,68 @@ async fn flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ruling FR6: a frame up to the decoded-frame cap is read (tungstenite's
+    /// default frame limit is 16 MiB); a message over it is refused, however
+    /// it is fragmented (the default message limit is 64 MiB).
+    #[tokio::test]
+    async fn the_socket_reads_frames_up_to_the_cap_and_no_larger_messages() {
+        use futures_util::SinkExt;
+        use tungstenite::protocol::WebSocketConfig;
+        use tungstenite::protocol::frame::Frame;
+        use tungstenite::protocol::frame::coding::{Data, OpCode};
+
+        const MIB: usize = 1 << 20;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async_with_config(
+                stream,
+                Some(WebSocketConfig::default()),
+            )
+            .await
+            .expect("handshake");
+            ws.send(Message::Binary(vec![b'a'; 20 * MIB].into()))
+                .await
+                .expect("send one large frame");
+            let fragments = 33;
+            for i in 0..fragments {
+                let opcode = if i == 0 {
+                    OpCode::Data(Data::Binary)
+                } else {
+                    OpCode::Data(Data::Continue)
+                };
+                let frame = Frame::message(vec![b'b'; MIB], opcode, i == fragments - 1);
+                if ws.send(Message::Frame(frame)).await.is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async_with_config(
+            format!("ws://{addr}"),
+            Some(socket_config()),
+            false,
+        )
+        .await
+        .expect("connect");
+        let first = ws
+            .next()
+            .await
+            .expect("a message")
+            .expect("a 20 MiB frame is under the cap");
+        assert_eq!(first.len(), 20 * MIB);
+        let second = ws.next().await.expect("an outcome");
+        assert!(
+            matches!(second, Err(tungstenite::Error::Capacity(_))),
+            "a 33 MiB message must be refused: {second:?}"
+        );
+        server.abort();
+    }
 
     #[test]
     fn a_reconnect_resumes_past_what_was_dispatched() {
