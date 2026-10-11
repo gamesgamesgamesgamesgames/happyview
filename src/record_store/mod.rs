@@ -7,6 +7,7 @@
 //! which shares its statement. The storage format can then change in one
 //! place, and the two ingest paths cannot drift apart.
 
+pub mod codec;
 pub mod query;
 
 use std::collections::{HashMap, HashSet};
