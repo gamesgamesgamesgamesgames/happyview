@@ -28,6 +28,8 @@ use crate::record_handler::{self, LEXICON_SCHEMA_COLLECTION, RecordEvent, Record
 /// How long asking an account's PDS for its status may take before a purge
 /// goes ahead on the relay's word.
 const ACCOUNT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// The largest `getRepoStatus` answer read; a real one is under 200 bytes.
+const REPO_STATUS_MAX_BYTES: usize = 64 << 10;
 
 /// The worker's `ApplyFn`. `collections` is the registered record
 /// collections; only a `#sync` reads them, so only a `#sync` clones them.
@@ -233,12 +235,14 @@ async fn log(
 /// repo rev, so the tombstone's rev is a TID of when Jetstream witnessed the
 /// event.
 ///
-/// Account status is what the emitting host says, and a relay can still be
-/// relaying a host the account has migrated away from. So when this instance
-/// holds the account's records, its current PDS is asked first (ruling FR2):
-/// if that says the account is active, nothing is purged or tombstoned, and
+/// A deletion is what the emitting host says, and a relay can still be
+/// relaying a host the account has migrated away from. So for a deletion
+/// (`status` `None`) of an account this instance holds records for, its
+/// current PDS is asked first (rulings FR2 and E1): if that says the account
+/// is active, nothing is purged or tombstoned, and
 /// `jetstream.account_status_mismatch` is logged. If the PDS cannot be asked,
-/// the relay is trusted.
+/// the relay is trusted. A takedown or suspension is purged on the relay's
+/// word: the relay may have imposed it, and the account's PDS cannot see it.
 ///
 /// The tombstone's transaction holds the DID's lock, and `purge_did_records`
 /// takes it again per batch, so that transaction commits before the purge
@@ -251,15 +255,17 @@ async fn account_purged(
     status: Option<&str>,
 ) -> ApplyOutcome {
     let backend = state.db_backend;
-    let held = match holds_records(state, did).await {
-        Ok(held) => held,
-        Err(e) => {
-            tracing::warn!(did, error = %e, "failed to check an account's records");
-            return failed(&e);
-        }
-    };
+    let deleted = status.is_none();
+    let held = deleted
+        && match holds_records(state, did).await {
+            Ok(held) => held,
+            Err(e) => {
+                tracing::warn!(did, error = %e, "failed to check an account's records");
+                return failed(&e);
+            }
+        };
     if held && let Some(pds) = active_at_pds(state, did).await {
-        let status = status.unwrap_or("deleted");
+        let status = "deleted";
         tracing::warn!(
             did,
             status,
@@ -350,7 +356,8 @@ async fn active_at_pds(state: &AppState, did: &str) -> Option<String> {
         if !response.status().is_success() {
             return Err(format!("getRepoStatus answered {}", response.status()));
         }
-        let status: RepoStatus = response.json().await.map_err(|e| e.to_string())?;
+        let body = super::compression::read_capped(response, REPO_STATUS_MAX_BYTES).await?;
+        let status: RepoStatus = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
         Ok((pds, status.active))
     };
     match tokio::time::timeout(ACCOUNT_STATUS_TIMEOUT, check).await {
@@ -806,13 +813,14 @@ mod tests {
             .await;
     }
 
-    /// Ruling FR2: before purging an account it holds records for, the
-    /// instance asks the account's current PDS. Active there means the relay
-    /// is relaying a stale host: nothing is purged or tombstoned. Any other
-    /// answer, or none, and the purge goes ahead. Nothing is asked for an
-    /// account it holds nothing for.
+    /// Rulings FR2 and E1: before purging a deleted account it holds records
+    /// for, the instance asks the account's current PDS. Active there means
+    /// the relay is relaying a stale host: nothing is purged or tombstoned.
+    /// Any other answer, an oversized one, or none, and the purge goes ahead.
+    /// Nothing is asked for an account it holds nothing for, nor for a
+    /// takedown or suspension, which the account's PDS cannot see.
     #[tokio::test]
-    async fn a_purge_is_skipped_when_the_accounts_pds_says_it_is_active() {
+    async fn a_deletion_is_skipped_when_the_accounts_pds_says_it_is_active() {
         for mut state in states().await {
             let mock = wiremock::MockServer::start().await;
             state.config.plc_url = mock.uri();
@@ -826,15 +834,15 @@ mod tests {
             )
             .await;
             apply(&state, commit(&migrated, 1, "a", "create")).await;
-            apply(&state, account(&migrated, 10, false, Some("takendown"))).await;
+            apply(&state, account(&migrated, 10, false, Some("deleted"))).await;
             assert_eq!(rkeys(&state, &migrated).await, vec!["a"]);
             assert_eq!(did_tombstones(&state, &migrated).await, 0);
             assert_eq!(
                 logged(&state, "jetstream.account_status_mismatch", &migrated).await,
-                vec![serde_json::json!({"status": "takendown", "pds": mock.uri(), "seq": 10})]
+                vec![serde_json::json!({"status": "deleted", "pds": mock.uri(), "seq": 10})]
             );
             assert!(
-                logged(&state, "jetstream.account_takendown", &migrated)
+                logged(&state, "jetstream.account_deleted", &migrated)
                     .await
                     .is_empty()
             );
@@ -849,15 +857,47 @@ mod tests {
             .await;
             let unreachable = unique_did();
             mock_pds(&mock, &unreachable, None, 1).await;
-            for did in [&gone, &unreachable] {
+            let oversized = unique_did();
+            mock_pds(
+                &mock,
+                &oversized,
+                Some(serde_json::json!({
+                    "did": oversized,
+                    "active": true,
+                    "padding": "x".repeat(REPO_STATUS_MAX_BYTES),
+                })),
+                1,
+            )
+            .await;
+            for did in [&gone, &unreachable, &oversized] {
                 apply(&state, commit(did, 1, "a", "create")).await;
                 apply(&state, account(did, 10, false, Some("deleted"))).await;
-                assert!(rkeys(&state, did).await.is_empty());
+                assert!(rkeys(&state, did).await.is_empty(), "{did}");
                 assert_eq!(did_tombstones(&state, did).await, 1);
                 assert_eq!(
                     logged(&state, "jetstream.account_deleted", did).await,
                     vec![serde_json::json!({"purged": 1, "seq": 10})]
                 );
+            }
+
+            let mut unasked = Vec::new();
+            for status in ["takendown", "suspended"] {
+                let did = unique_did();
+                mock_pds(
+                    &mock,
+                    &did,
+                    Some(serde_json::json!({"did": did, "active": true})),
+                    0,
+                )
+                .await;
+                apply(&state, commit(&did, 1, "a", "create")).await;
+                apply(&state, account(&did, 10, false, Some(status))).await;
+                assert!(
+                    rkeys(&state, &did).await.is_empty(),
+                    "a {status} account is purged on the relay's word"
+                );
+                assert_eq!(did_tombstones(&state, &did).await, 1);
+                unasked.push(did);
             }
 
             let stranger = unique_did();
@@ -870,9 +910,13 @@ mod tests {
             .await;
             apply(&state, account(&stranger, 10, false, Some("deleted"))).await;
             assert_eq!(did_tombstones(&state, &stranger).await, 1);
+            unasked.push(stranger);
 
             mock.verify().await;
-            for did in [&migrated, &gone, &unreachable, &stranger] {
+            for did in [migrated, gone, unreachable, oversized]
+                .iter()
+                .chain(&unasked)
+            {
                 clean_up(&state, did).await;
             }
         }

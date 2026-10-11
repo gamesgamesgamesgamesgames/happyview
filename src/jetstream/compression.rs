@@ -83,8 +83,11 @@ pub async fn fetch_dictionary(http: &reqwest::Client, url: &str) -> Result<Dicti
 
 /// `response`'s body, refused as soon as it is known to exceed `cap` bytes:
 /// up front from its `Content-Length`, or as its chunks arrive.
-async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
-    let too_large = |len: u64| format!("dictionary is over {cap} bytes ({len} or more)");
+pub(super) async fn read_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
+    let too_large = |len: u64| format!("the response is over {cap} bytes ({len} or more)");
     if let Some(len) = response.content_length()
         && len > cap as u64
     {
