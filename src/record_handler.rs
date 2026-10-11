@@ -421,7 +421,8 @@ async fn upsert_record_and_refs(
 /// leaves a tombstone in the same transaction, so a reordered or replayed
 /// create cannot bring the record back. A delete that finds no row
 /// tombstones only when a create could still be on its way: the account
-/// holds network records in the collection, or a running backfill covers it.
+/// holds network records in the collection, or a backfill still writing
+/// covers it.
 /// Otherwise it is a delete for a record this instance never held, and the
 /// network sends millions of those. A delete without a rev (a dead-letter
 /// retry) deletes the row whatever its rev and tombstones it at the rev it
@@ -488,8 +489,9 @@ async fn delete_record(
 
 /// Whether a create for a record `did` holds no row for could still arrive
 /// out of order: the account holds network records in `collection` (live
-/// ingest or a past backfill reached it), or a running or pausing backfill
-/// covers the collection and may yet crawl it.
+/// ingest or a past backfill reached it), or a backfill covering the
+/// collection may still write: running, or pausing or cancelling (both stop
+/// once in-flight pages are written).
 async fn create_may_follow(
     conn: &mut sqlx::AnyConnection,
     backend: crate::db::DatabaseBackend,
@@ -512,7 +514,8 @@ async fn create_may_follow(
     }
     let sql = adapt_sql(
         "SELECT 1 FROM happyview_backfill_jobs \
-         WHERE status IN ('running', 'pausing') AND (collection IS NULL OR collection = ?) LIMIT 1",
+         WHERE status IN ('running', 'pausing', 'cancelling') \
+         AND (collection IS NULL OR collection = ?) LIMIT 1",
         backend,
     );
     Ok(crate::db::query(&sql)
@@ -1573,7 +1576,8 @@ mod tests {
 
     /// Ruling FR1: a delete for a record this instance never held, from an
     /// account it holds nothing for in the collection, leaves no tombstone
-    /// unless a running or pausing backfill covers the collection.
+    /// unless a backfill still writing (running, pausing or cancelling)
+    /// covers the collection.
     #[tokio::test]
     async fn a_delete_with_no_row_tombstones_only_when_a_create_may_follow() {
         let state = migrated_tracked_state().await;
@@ -1600,7 +1604,11 @@ mod tests {
         let _ = handle_record_event(&state, &delete("never")).await;
         assert!(!tombstoned("never").await, "nothing could resurrect it");
 
-        for (status, collection) in [("running", None), ("pausing", Some(NSID))] {
+        for (status, collection) in [
+            ("running", None),
+            ("pausing", Some(NSID)),
+            ("cancelling", Some(NSID)),
+        ] {
             let job = add_backfill_job(&state, status, collection).await;
             let rkey = format!("job{status}");
             let _ = handle_record_event(&state, &delete(&rkey)).await;
