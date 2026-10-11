@@ -7,6 +7,8 @@
 //! which shares its statement. The storage format can then change in one
 //! place, and the two ingest paths cannot drift apart.
 
+pub mod query;
+
 use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
@@ -78,6 +80,57 @@ pub enum LocalWriteError {
     #[error("row written but its refs not synced: {0}")]
     Refs(sqlx::Error),
 }
+
+/// A stored record with its identity, as the read paths return it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredRecord {
+    pub uri: String,
+    pub did: String,
+    pub collection: String,
+    pub rkey: String,
+    /// The JSON text exactly as it was stored.
+    pub record: String,
+    pub cid: Option<String>,
+    pub indexed_at: Option<String>,
+    pub created_at: String,
+}
+
+type StoredRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+impl From<StoredRow> for StoredRecord {
+    fn from(row: StoredRow) -> Self {
+        let (uri, did, collection, rkey, record, cid, indexed_at, created_at) = row;
+        Self {
+            uri,
+            did,
+            collection,
+            rkey,
+            record,
+            cid,
+            indexed_at,
+            created_at,
+        }
+    }
+}
+
+const STORED_COLUMNS: &str = "uri, did, collection, rkey, record, cid, indexed_at, created_at";
+
+/// The no-`did` collection listing, newest arrival first, served from
+/// `idx_records_collection_indexed_at` in order (pinned by a test).
+pub(crate) const LIST_RECENT_SQL: &str = "SELECT uri, did, collection, rkey, record, cid, indexed_at, created_at \
+     FROM happyview_records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?";
+
+const LIST_RECENT_BY_DID_SQL: &str = "SELECT uri, did, collection, rkey, record, cid, indexed_at, created_at \
+     FROM happyview_records WHERE collection = ? AND did = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?";
 
 /// A handle on the record tables. Cheap to clone.
 #[derive(Clone)]
@@ -246,10 +299,32 @@ impl RecordStore {
         records: &[&PreparedRecord],
         written: &[String],
     ) -> Result<(), sqlx::Error> {
-        if written.is_empty() {
+        let written: HashSet<&str> = written.iter().map(String::as_str).collect();
+        let sources: Vec<(String, &str, &str)> = records
+            .iter()
+            .filter_map(|rec| {
+                let uri = rec.uri();
+                written.contains(uri.as_str()).then_some((
+                    uri,
+                    rec.collection.as_str(),
+                    rec.record_json.as_str(),
+                ))
+            })
+            .collect();
+        self.replace_refs(conn, &sources).await
+    }
+
+    /// Replace the refs of each `(uri, collection, body)` source with those
+    /// its body carries. The one writer of `happyview_record_refs` rows.
+    async fn replace_refs(
+        &self,
+        conn: &mut AnyConnection,
+        sources: &[(String, &str, &str)],
+    ) -> Result<(), sqlx::Error> {
+        if sources.is_empty() {
             return Ok(());
         }
-        for chunk in written.chunks(DELETE_CHUNK) {
+        for chunk in sources.chunks(DELETE_CHUNK) {
             let sql = adapt_sql(
                 &format!(
                     "DELETE FROM happyview_record_refs WHERE source_uri IN ({})",
@@ -258,22 +333,17 @@ impl RecordStore {
                 self.backend,
             );
             let mut delete = crate::db::query(&sql);
-            for uri in chunk {
+            for (uri, _, _) in chunk {
                 delete = delete.bind(uri.as_str());
             }
             delete.execute(&mut *conn).await?;
         }
 
-        let written: HashSet<&str> = written.iter().map(String::as_str).collect();
-        let mut refs: Vec<(String, String, &str)> = Vec::new();
-        for rec in records {
-            let uri = rec.uri();
-            if !written.contains(uri.as_str()) {
-                continue;
-            }
-            let value: Value = serde_json::from_str(&rec.record_json).unwrap_or(Value::Null);
+        let mut refs: Vec<(&str, String, &str)> = Vec::new();
+        for (uri, collection, body) in sources {
+            let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             for target in crate::record_refs::extract_at_uris(&value) {
-                refs.push((uri.clone(), target, rec.collection.as_str()));
+                refs.push((uri.as_str(), target, collection));
             }
         }
         for chunk in refs.chunks(crate::record_refs::REFS_PER_INSERT) {
@@ -286,10 +356,7 @@ impl RecordStore {
             );
             let mut insert = crate::db::query(&sql);
             for (source, target, collection) in chunk {
-                insert = insert
-                    .bind(source.as_str())
-                    .bind(target.as_str())
-                    .bind(*collection);
+                insert = insert.bind(*source).bind(target.as_str()).bind(*collection);
             }
             insert.execute(&mut *conn).await?;
         }
@@ -619,6 +686,145 @@ impl RecordStore {
         .bind(collection)
         .fetch_one(&self.db)
         .await
+    }
+
+    pub async fn get(&self, uri: &str) -> Result<Option<StoredRecord>, sqlx::Error> {
+        let sql = adapt_sql(
+            &format!("SELECT {STORED_COLUMNS} FROM happyview_records WHERE uri = ?"),
+            self.backend,
+        );
+        Ok(crate::db::query_as::<StoredRow>(&sql)
+            .bind(uri)
+            .fetch_optional(&self.db)
+            .await?
+            .map(StoredRecord::from))
+    }
+
+    pub async fn stored_cid(&self, uri: &str) -> Result<Option<String>, sqlx::Error> {
+        let sql = adapt_sql(
+            "SELECT cid FROM happyview_records WHERE uri = ?",
+            self.backend,
+        );
+        Ok(crate::db::query_as::<(Option<String>,)>(&sql)
+            .bind(uri)
+            .fetch_optional(&self.db)
+            .await?
+            .and_then(|(cid,)| cid))
+    }
+
+    /// A collection's records, most recently arrived first, optionally only
+    /// `did`'s, by offset.
+    pub async fn list_recent(
+        &self,
+        collection: &str,
+        did: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StoredRecord>, sqlx::Error> {
+        let rows = match did {
+            Some(did) => {
+                crate::db::query_as::<StoredRow>(&adapt_sql(LIST_RECENT_BY_DID_SQL, self.backend))
+                    .bind(collection)
+                    .bind(did)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(&self.db)
+                    .await?
+            }
+            None => {
+                crate::db::query_as::<StoredRow>(&adapt_sql(LIST_RECENT_SQL, self.backend))
+                    .bind(collection)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(&self.db)
+                    .await?
+            }
+        };
+        Ok(rows.into_iter().map(StoredRecord::from).collect())
+    }
+
+    pub async fn count_all(&self) -> Result<i64, sqlx::Error> {
+        crate::db::query_scalar::<i64>("SELECT COUNT(*) FROM happyview_records")
+            .fetch_one(&self.db)
+            .await
+    }
+
+    /// Records per collection, largest first.
+    pub async fn count_by_collection(&self) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        crate::db::query_as::<(String, i64)>(
+            "SELECT collection, COUNT(*) AS cnt FROM happyview_records GROUP BY collection ORDER BY cnt DESC, collection",
+        )
+        .fetch_all(&self.db)
+        .await
+    }
+
+    /// The first record of `collection` whose `field_sql` (a validated
+    /// expression from `query::record_text_field_sql`) equals `value`, as
+    /// `(uri, cid)`.
+    pub async fn lookup_by_text_field(
+        &self,
+        collection: &str,
+        field_sql: &str,
+        value: &str,
+    ) -> Result<Option<(String, String)>, sqlx::Error> {
+        let sql = adapt_sql(
+            &format!(
+                "SELECT uri, cid FROM happyview_records WHERE collection = ? AND {field_sql} = ? LIMIT 1"
+            ),
+            self.backend,
+        );
+        crate::db::query_as::<(String, String)>(&sql)
+            .bind(collection)
+            .bind(value)
+            .fetch_optional(&self.db)
+            .await
+    }
+
+    /// Delete every record label whose subject this instance no longer holds
+    /// (moved from `labeler::delete_orphaned_labels`; its rationale stays
+    /// there).
+    pub async fn delete_orphaned_labels(&self) -> Result<u64, sqlx::Error> {
+        crate::db::query(
+            "DELETE FROM happyview_labels WHERE uri LIKE 'at://%' AND NOT EXISTS \
+             (SELECT 1 FROM happyview_records WHERE happyview_records.uri = happyview_labels.uri)",
+        )
+        .execute(&self.db)
+        .await
+        .map(|r| r.rows_affected())
+    }
+
+    /// One page of the one-time refs rebuild on the caller's transaction:
+    /// re-sync the refs of up to `limit` records after the opaque cursor
+    /// `after` (`""` starts at the beginning). Returns the records walked and
+    /// the cursor of the last one, or `None` when there were none.
+    ///
+    /// The page is read on the caller's transaction and then written, so on
+    /// SQLite it must be a `db::begin_write` one: a deferred transaction that
+    /// reads first cannot upgrade to a writer while another holds the lock.
+    pub async fn rebuild_refs_page(
+        &self,
+        conn: &mut AnyConnection,
+        after: &str,
+        limit: i64,
+    ) -> Result<(u64, Option<String>), sqlx::Error> {
+        let sql = adapt_sql(
+            "SELECT uri, collection, record FROM happyview_records WHERE uri > ? ORDER BY uri LIMIT ?",
+            self.backend,
+        );
+        let page: Vec<(String, String, String)> = crate::db::query_as(&sql)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&mut *conn)
+            .await?;
+        let sources: Vec<(String, &str, &str)> = page
+            .iter()
+            .map(|(uri, collection, body)| (uri.clone(), collection.as_str(), body.as_str()))
+            .collect();
+        self.replace_refs(conn, &sources).await?;
+        Ok((
+            page.len() as u64,
+            page.last().map(|(uri, _, _)| uri.clone()),
+        ))
     }
 
     /// A record reached its PDS but not this index. The write the caller made
@@ -1195,5 +1401,182 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, LocalWriteError::Row(_)), "{err}");
         assert!(row(&store, &rec.uri()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_and_list_recent_read_what_was_written() {
+        for (pool, backend) in test_pools().await {
+            let store = RecordStore::new(pool.clone(), backend);
+            let did = unique_did();
+            let collection = format!("app.test.read{}", uuid::Uuid::new_v4().simple());
+            let mut first = prepared(&did, "a", r#"{"via":"witchsky","n":1}"#, "c1", None);
+            first.collection = collection.clone();
+            let mut second = prepared(&did, "b", r#"{"n":2}"#, "c2", None);
+            second.collection = collection.clone();
+            store
+                .write_network(&pool, std::slice::from_ref(&first))
+                .await
+                .expect("first");
+            store
+                .write_network(&pool, std::slice::from_ref(&second))
+                .await
+                .expect("second");
+
+            let got = store
+                .get(&first.uri())
+                .await
+                .expect("get")
+                .expect("present");
+            assert_eq!(
+                (
+                    got.did.as_str(),
+                    got.collection.as_str(),
+                    got.rkey.as_str(),
+                    got.record.as_str(),
+                    got.cid.as_deref()
+                ),
+                (
+                    did.as_str(),
+                    collection.as_str(),
+                    "a",
+                    r#"{"via":"witchsky","n":1}"#,
+                    Some("c1")
+                ),
+                "{backend:?}"
+            );
+            assert_eq!(
+                store
+                    .stored_cid(&second.uri())
+                    .await
+                    .expect("cid")
+                    .as_deref(),
+                Some("c2")
+            );
+            assert!(
+                store
+                    .get(&format!("at://{did}/{collection}/missing"))
+                    .await
+                    .expect("get")
+                    .is_none()
+            );
+
+            let listed = store
+                .list_recent(&collection, None, 10, 0)
+                .await
+                .expect("list");
+            assert_eq!(listed.len(), 2, "{backend:?}");
+            let by_did = store
+                .list_recent(&collection, Some(&did), 1, 1)
+                .await
+                .expect("list by did");
+            assert_eq!(by_did.len(), 1);
+
+            let counts = store.count_by_collection().await.expect("counts");
+            assert!(
+                counts.contains(&(collection.clone(), 2)),
+                "{backend:?}: {counts:?}"
+            );
+            assert!(store.count_all().await.expect("count") >= 2);
+            store.delete(&first.uri()).await.expect("clean up");
+            store.delete(&second.uri()).await.expect("clean up");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_orphaned_label_sweep_keeps_account_labels_and_labels_of_held_records() {
+        for (pool, backend) in test_pools().await {
+            let store = RecordStore::new(pool.clone(), backend);
+            let did = unique_did();
+            let held = prepared(&did, "held", "{}", "c", None);
+            store
+                .write_network(&pool, std::slice::from_ref(&held))
+                .await
+                .expect("write");
+            let gone = format!("at://{did}/app.test.store/gone");
+            let insert = adapt_sql(
+                "INSERT INTO happyview_labels (src, uri, val, cts) VALUES ('did:plc:labeler', ?, 'spam', '2026-01-01T00:00:00Z')",
+                backend,
+            );
+            for subject in [held.uri(), gone.clone(), did.clone()] {
+                crate::db::query(&insert)
+                    .bind(subject)
+                    .execute(&pool)
+                    .await
+                    .expect("label");
+            }
+            store.delete_orphaned_labels().await.expect("sweep");
+            let left: Vec<(String,)> = crate::db::query_as(&adapt_sql(
+                "SELECT uri FROM happyview_labels WHERE uri IN (?, ?, ?) ORDER BY uri",
+                backend,
+            ))
+            .bind(held.uri())
+            .bind(&gone)
+            .bind(&did)
+            .fetch_all(&pool)
+            .await
+            .expect("labels left");
+            let mut expected = vec![held.uri(), did.clone()];
+            expected.sort();
+            assert_eq!(
+                left.into_iter().map(|(u,)| u).collect::<Vec<_>>(),
+                expected,
+                "{backend:?}"
+            );
+            crate::db::query(&adapt_sql(
+                "DELETE FROM happyview_labels WHERE uri IN (?, ?)",
+                backend,
+            ))
+            .bind(held.uri())
+            .bind(&did)
+            .execute(&pool)
+            .await
+            .expect("clean up labels");
+            store.delete(&held.uri()).await.expect("clean up");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_xrpc_listing_walks_the_collection_indexed_at_index() {
+        let sql =
+            crate::test_support::inline_binds(LIST_RECENT_SQL, &["'app.test.post'", "50", "0"]);
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
+            crate::test_support::assert_index_without_sort(
+                &plan,
+                "idx_records_collection_indexed_at",
+                backend,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_replaces_refs_across_insert_chunks() {
+        for (pool, backend) in test_pools().await {
+            let store = RecordStore::new(pool.clone(), backend);
+            let did = unique_did();
+            let targets: Vec<String> = (0..(crate::record_refs::REFS_PER_INSERT + 5))
+                .map(|i| format!("at://did:plc:t/app.test.post/{i}"))
+                .collect();
+            let body = serde_json::json!({ "refs": targets }).to_string();
+            let mut rec = prepared(&did, "many", &body, "c1", None);
+            store
+                .write_network(&pool, std::slice::from_ref(&rec))
+                .await
+                .expect("write");
+            assert_eq!(
+                ref_count(&store, &rec.uri()).await as usize,
+                crate::record_refs::REFS_PER_INSERT + 5,
+                "{backend:?}: every ref lands across insert chunks"
+            );
+
+            rec.record_json = "{}".to_string();
+            rec.cid = "c2".to_string();
+            store
+                .write_network(&pool, std::slice::from_ref(&rec))
+                .await
+                .expect("rewrite");
+            assert_eq!(ref_count(&store, &rec.uri()).await, 0, "{backend:?}");
+            store.delete(&rec.uri()).await.expect("clean up");
+        }
     }
 }

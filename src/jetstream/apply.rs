@@ -317,15 +317,7 @@ async fn account_purged(
 
 /// Whether this instance holds any network records for `did`.
 async fn holds_records(state: &AppState, did: &str) -> Result<bool, sqlx::Error> {
-    let sql = adapt_sql(
-        "SELECT uri FROM happyview_records WHERE did = ? AND indexed_at IS NOT NULL LIMIT 1",
-        state.db_backend,
-    );
-    let held: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await?;
-    Ok(held.is_some())
+    state.records.holds_network_records(did, None).await
 }
 
 #[derive(serde::Deserialize)]

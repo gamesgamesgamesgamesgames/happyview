@@ -1,5 +1,4 @@
 use super::HostContext;
-use crate::db::adapt_sql;
 use crate::plugin::StrongRef;
 
 /// Which record a plugin asked for. The SDK's type, as the guest built it.
@@ -33,20 +32,8 @@ pub async fn lookup_record(
     let field = super::records::record_text_field_sql(external_id_field)
         .map_err(|_| LookupError::InvalidFieldPath)?;
 
-    let sql = adapt_sql(
-        &format!(
-            "SELECT uri, cid FROM happyview_records
-         WHERE collection = ?
-         AND {field} = ?
-         LIMIT 1"
-        ),
-        ctx.db_backend,
-    );
-
-    let result: Option<(String, String)> = crate::db::query_as(&sql)
-        .bind(collection)
-        .bind(external_id_value)
-        .fetch_optional(&ctx.db)
+    let result = crate::record_store::RecordStore::new(ctx.db.clone(), ctx.db_backend)
+        .lookup_by_text_field(collection, &field, external_id_value)
         .await?;
 
     Ok(result.map(|(uri, cid)| StrongRef { uri, cid }))
@@ -68,6 +55,7 @@ pub async fn lookup_record_by_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::adapt_sql;
 
     #[test]
     fn test_invalid_field_path_empty() {

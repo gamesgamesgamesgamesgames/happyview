@@ -665,13 +665,13 @@ pub async fn delete_expired_labels(
 /// URI and so read as orphaned on its first pass — every account-level label an
 /// instance held was deleted within the hour. Account labels are retained until
 /// they expire or are negated.
-pub async fn delete_orphaned_labels(db: &sqlx::AnyPool) -> Result<u64, sqlx::Error> {
-    crate::db::query(
-        "DELETE FROM happyview_labels WHERE uri LIKE 'at://%' AND NOT EXISTS (SELECT 1 FROM happyview_records WHERE happyview_records.uri = happyview_labels.uri)",
-    )
-    .execute(db)
-    .await
-    .map(|r| r.rows_affected())
+pub async fn delete_orphaned_labels(
+    db: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+) -> Result<u64, sqlx::Error> {
+    crate::record_store::RecordStore::new(db.clone(), backend)
+        .delete_orphaned_labels()
+        .await
 }
 
 /// Hourly task to clean up expired and orphaned labels.
@@ -693,7 +693,7 @@ pub async fn spawn_label_gc(db: sqlx::AnyPool, backend: DatabaseBackend) {
             }
         };
 
-        let orphaned_count = match delete_orphaned_labels(&db).await {
+        let orphaned_count = match delete_orphaned_labels(&db, backend).await {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!("failed to clean up orphaned labels: {e}");

@@ -280,19 +280,13 @@ pub async fn labels_get(
         }
     }
 
-    let record_sql = adapt_sql(
-        "SELECT did, record FROM happyview_records WHERE uri = ?",
-        backend,
-    );
+    let store = crate::record_store::RecordStore::new(db.clone(), backend);
     for uri in uris {
-        let record: Option<(String, String)> = crate::db::query_as(&record_sql)
-            .bind(uri)
-            .fetch_optional(db)
-            .await?;
-        let Some((did, record_str)) = record else {
+        let Some(stored) = store.get(uri).await? else {
             continue;
         };
-        let record_val: Value = serde_json::from_str(&record_str).unwrap_or(Value::Null);
+        let did = stored.did;
+        let record_val: Value = serde_json::from_str(&stored.record).unwrap_or(Value::Null);
         let Some(arr) = record_val
             .get("labels")
             .and_then(|l| l.get("values"))

@@ -9,7 +9,7 @@ mod linked_repos;
 mod logging;
 mod lookup;
 mod pending_calls;
-mod records;
+pub(crate) mod records;
 pub mod script;
 mod secrets;
 mod spaces;
