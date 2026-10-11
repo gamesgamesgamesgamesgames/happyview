@@ -54,6 +54,22 @@ HappyView applies any pending migrations every time it starts, before it serves 
 
 The `happyview_records` index on `(collection, created_at DESC, uri DESC)` is one of these. It replaces the `idx_records_created_at_uri` and `idx_records_collection` indexes, which the same upgrade drops.
 
+## Rolling back the record tombstones
+
+The release with the Jetstream v2 consumer adds two migrations: `20261010000000_records_rev` (a `rev` column on `happyview_records`) and `20261010000001_record_tombstones` (the `happyview_record_tombstones` and `happyview_did_tombstones` tables). An older release refuses to start on a database with migrations it doesn't know. To roll back, stop HappyView and delete their rows:
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version IN (20261010000000, 20261010000001);
+```
+
+The column and the two tables stay. The older release ignores them, and the next upgrade reuses the tables and what they hold. On Postgres, nothing else is needed to upgrade again. On SQLite, which cannot add a column only when it is missing, drop the `rev` column before upgrading again:
+
+```sql
+ALTER TABLE happyview_records DROP COLUMN rev;
+```
+
+The upgraded release resumes from the time cursor the older one saved, not from its own older seq.
+
 ## Environment variables
 
 | Variable | Description |

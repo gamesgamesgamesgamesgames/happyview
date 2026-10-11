@@ -143,11 +143,11 @@ sequenceDiagram
     Note over H,J: Reconnects on collection filter changes (lexicon add/remove)
 ```
 
-**Ordering.** Events are split across `JETSTREAM_WORKERS` workers by account DID, so each repo's events apply in the order they arrived while different repos apply in parallel. The saved cursor is the applied watermark: the position below which every event has been applied. After a restart or reconnect HappyView resumes from it, so delivery is at-least-once, and writes are idempotent (a replayed record carries the same `rev` and is ignored).
+**Ordering.** Events are split across `JETSTREAM_WORKERS` workers by account DID, so each repo's events apply in the order they arrived while different repos apply in parallel. Each worker runs one event at a time, record script included, so script latency bounds throughput: with slow scripts on Postgres, raise `JETSTREAM_WORKERS`. The saved cursor is the applied watermark: the position below which every event has been applied. After a restart or reconnect HappyView resumes from it, so delivery is at-least-once, and writes are idempotent (a replayed record carries the same `rev` and is ignored).
 
 **Accounts.** An account event with `active=false` is handled by its status:
 
-- `deleted`, `takendown` and `suspended` purge the account's records and leave an account tombstone (`jetstream.account_deleted`, `jetstream.account_takendown`).
+- `deleted`, `takendown` and `suspended` purge the account's records and leave an account tombstone (`jetstream.account_deleted`, `jetstream.account_takendown`). An account's status is what its hosting PDS reports, and a relay can still be relaying a PDS the account has left. So when HappyView holds records for the account, it first asks the account's current PDS (`com.atproto.sync.getRepoStatus`, 5 second timeout). If that PDS says the account is active, nothing is purged or tombstoned and `jetstream.account_status_mismatch` is logged. If the PDS cannot be asked, the purge goes ahead.
 - `deactivated`, `desynchronized` and `throttled` keep the records (`jetstream.account_inactive`).
 - `active=true` lifts the account's tombstone. Records that were purged come back only through a new [backfill](../guides/backfill.md).
 - A `#sync` removes the repo's records in registered collections, and the current ones that follow replace them. `identity` events change nothing, because HappyView caches no identities.
@@ -172,6 +172,7 @@ sequenceDiagram
 - A stale record tombstone left after a newer recreate blocks writes without a rev (crawl writes) to that record until the sweep.
 - A crawl row fetched before a live update but written after it can overwrite the newer body while keeping the stored `rev`. A later replay at that `rev` heals it.
 - A delete with a `rev` removes a crawled row that has none.
+- A delete for a record HappyView does not hold leaves a tombstone only when the account holds records in that collection, or a running or pausing backfill covers it. Those are the cases where a create could still arrive. The network sends many deletes for records an instance never held, and tombstoning each would fill the table.
 
 Admins can watch the consumer with `GET /admin/jetstream/status` and the About page's Jetstream card. See [Jetstream status](../api-reference/admin/admin-api.md#jetstream-status).
 
