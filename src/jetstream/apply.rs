@@ -293,7 +293,7 @@ async fn account_purged(
     })
     .await;
     let purged = match tombstoned {
-        Ok(()) => crate::tombstones::purge_did_records(&state.db, backend, did, None).await,
+        Ok(()) => crate::tombstones::purge_did_records(&state.records, did, None).await,
         Err(e) => Err(e),
     };
     match purged {
@@ -461,13 +461,8 @@ async fn repo_resynced(
         .filter(|c| c.as_str() != LEXICON_SCHEMA_COLLECTION)
         .cloned()
         .collect();
-    match crate::tombstones::purge_did_records(
-        &state.db,
-        state.db_backend,
-        did,
-        Some(collections.as_slice()),
-    )
-    .await
+    match crate::tombstones::purge_did_records(&state.records, did, Some(collections.as_slice()))
+        .await
     {
         Ok(0) => ApplyOutcome::Applied,
         Ok(purged) => {

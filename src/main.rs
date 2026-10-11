@@ -880,6 +880,7 @@ async fn main() {
     let state = AppState {
         config: config.clone(),
         http,
+        records: happyview::record_store::RecordStore::new(db_pool.clone(), db_backend),
         db: db_pool,
         backfill_db: backfill_db_pool,
         db_backend,

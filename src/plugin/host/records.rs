@@ -896,30 +896,26 @@ pub async fn index_put(
         cid,
     } = spec;
     let did = did.ok_or_else(|| invalid("index_put needs a did: pass the record's author"))?;
-    let uri = format!("at://{did}/{collection}/{rkey}");
-    let record_str = serde_json::to_string(&record).unwrap_or_default();
-    let now = crate::db::now_rfc3339();
-
-    let upsert_sql = adapt_sql(
-        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (uri) DO UPDATE
-               SET record = EXCLUDED.record"#,
-        backend,
-    );
-    crate::db::query(&upsert_sql)
-        .bind(&uri)
-        .bind(&did)
-        .bind(&collection)
-        .bind(&rkey)
-        .bind(&record_str)
-        .bind(cid.unwrap_or_default())
-        .bind(crate::db::NO_INDEXED_AT)
-        .bind(&now)
-        .execute(db)
-        .await?;
-
-    let _ = crate::record_refs::sync_refs(db, &uri, &collection, &record, backend).await;
+    let store = crate::record_store::RecordStore::new(db.clone(), backend);
+    let prepared = crate::record_store::PreparedRecord {
+        did,
+        collection,
+        rkey,
+        record_json: serde_json::to_string(&record).unwrap_or_default(),
+        cid: cid.unwrap_or_default(),
+        rev: None,
+    };
+    let uri = prepared.uri();
+    match store
+        .write_local(crate::record_store::WriteKind::IndexOnly, &prepared)
+        .await
+    {
+        Ok(()) => {}
+        Err(crate::record_store::LocalWriteError::Row(e)) => return Err(e.into()),
+        Err(e @ crate::record_store::LocalWriteError::Refs(_)) => {
+            tracing::warn!(uri = %uri, "index_put: {e}");
+        }
+    }
 
     // Read the CID back rather than assume one: an update leaves whatever the
     // network last stored, which is the value a caller building a strongRef
@@ -945,17 +941,8 @@ pub struct NetworkWrite<'a> {
     pub cid: &'a str,
 }
 
-/// Which step of a mirror failed. The row and its refs are separate
-/// statements, so the index can hold a correct row whose backlinks are empty
-/// until Jetstream re-syncs them; an operator reading the log needs to know
-/// whether the record is missing or merely unlinked.
-#[derive(Debug, thiserror::Error)]
-pub enum MirrorError {
-    #[error("row not written: {0}")]
-    Row(sqlx::Error),
-    #[error("row written but its refs not synced: {0}")]
-    Refs(sqlx::Error),
-}
+/// Which step of a mirror failed; see [`crate::record_store::LocalWriteError`].
+pub type MirrorError = crate::record_store::LocalWriteError;
 
 /// Reflect a write the caller just made to their PDS into the local index, so
 /// a script that writes and then reads its own record sees it before Jetstream
@@ -972,30 +959,19 @@ pub async fn mirror_network_write(
     backend: DatabaseBackend,
     write: NetworkWrite<'_>,
 ) -> Result<(), MirrorError> {
-    let record_str = serde_json::to_string(write.record).unwrap_or_default();
-    let upsert_sql = adapt_sql(
-        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (uri) DO UPDATE
-               SET record = EXCLUDED.record,
-                   cid = EXCLUDED.cid, indexed_at = NULL"#,
-        backend,
-    );
-    crate::db::query(&upsert_sql)
-        .bind(write.uri)
-        .bind(write.did)
-        .bind(write.collection)
-        .bind(write.rkey)
-        .bind(&record_str)
-        .bind(write.cid)
-        .bind(crate::db::NO_INDEXED_AT)
-        .bind(crate::db::now_rfc3339())
-        .execute(db)
+    crate::record_store::RecordStore::new(db.clone(), backend)
+        .write_local(
+            crate::record_store::WriteKind::Echoed,
+            &crate::record_store::PreparedRecord {
+                did: write.did.to_string(),
+                collection: write.collection.to_string(),
+                rkey: write.rkey.to_string(),
+                record_json: serde_json::to_string(write.record).unwrap_or_default(),
+                cid: write.cid.to_string(),
+                rev: None,
+            },
+        )
         .await
-        .map_err(MirrorError::Row)?;
-    crate::record_refs::sync_refs(db, write.uri, write.collection, write.record, backend)
-        .await
-        .map_err(MirrorError::Refs)
 }
 
 /// Drop a record the caller just deleted from their PDS, and the references
@@ -1005,12 +981,9 @@ pub async fn mirror_network_delete(
     backend: DatabaseBackend,
     uri: &str,
 ) -> Result<(), RecordsError> {
-    let refs_sql = adapt_sql(
-        "DELETE FROM happyview_record_refs WHERE source_uri = ?",
-        backend,
-    );
-    crate::db::query(&refs_sql).bind(uri).execute(db).await?;
-    index_delete(db, backend, uri).await?;
+    crate::record_store::RecordStore::new(db.clone(), backend)
+        .delete(uri)
+        .await?;
     Ok(())
 }
 
@@ -1021,9 +994,9 @@ pub async fn index_delete(
     backend: DatabaseBackend,
     uri: &str,
 ) -> Result<bool, RecordsError> {
-    let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-    let result = crate::db::query(&sql).bind(uri).execute(db).await?;
-    Ok(result.rows_affected() > 0)
+    Ok(crate::record_store::RecordStore::new(db.clone(), backend)
+        .delete(uri)
+        .await?)
 }
 
 /// The raw JSON of an uploaded lexicon, or `None` when this instance holds no

@@ -7,7 +7,7 @@
 //! checkpoint between batches.
 
 use crate::AppState;
-use crate::db::{DatabaseBackend, adapt_sql};
+use crate::db::DatabaseBackend;
 
 use super::super::{Job, db};
 use super::NativeOutcome;
@@ -22,24 +22,10 @@ pub async fn run(state: &AppState, job: &Job) -> NativeOutcome {
     };
     let backend = state.db_backend;
 
-    let count_sql = adapt_sql(
-        "SELECT COUNT(*) FROM happyview_records WHERE collection = ?",
-        backend,
-    );
-    let total: i64 = match crate::db::query_as::<(i64,)>(&count_sql)
-        .bind(&collection)
-        .fetch_one(&state.db)
-        .await
-    {
-        Ok((n,)) => n,
+    let total: i64 = match state.records.count_collection(&collection).await {
+        Ok(n) => n,
         Err(e) => return NativeOutcome::Failed(format!("failed to count records: {e}")),
     };
-
-    let delete_sql = adapt_sql(
-        "DELETE FROM happyview_records WHERE uri IN \
-         (SELECT uri FROM happyview_records WHERE collection = ? LIMIT ?)",
-        backend,
-    );
 
     let mut deleted: i64 = 0;
     let mut stopped: Option<&'static str> = None;
@@ -51,13 +37,12 @@ pub async fn run(state: &AppState, job: &Job) -> NativeOutcome {
             break;
         }
 
-        let affected = match crate::db::query(&delete_sql)
-            .bind(&collection)
-            .bind(BATCH_SIZE)
-            .execute(&state.db)
+        let affected = match state
+            .records
+            .delete_collection_batch(&collection, BATCH_SIZE)
             .await
         {
-            Ok(r) => r.rows_affected(),
+            Ok(n) => n,
             Err(e) => return NativeOutcome::Failed(format!("failed to delete batch: {e}")),
         };
         deleted += affected as i64;

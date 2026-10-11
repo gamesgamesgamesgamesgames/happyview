@@ -228,6 +228,7 @@ pub fn test_state_with_pool_on(
         db: pool.clone(),
         backfill_db: pool.clone(),
         db_backend: backend,
+        records: crate::record_store::RecordStore::new(pool.clone(), backend),
         domain_cache: crate::domain::DomainCache::new(),
         lexicons: LexiconRegistry::new(),
         collections_tx: tx,

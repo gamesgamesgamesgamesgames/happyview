@@ -219,18 +219,14 @@ pub(super) async fn delete_record(
     Query(params): Query<DeleteRecordParams>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::RecordsDelete).await?;
-    let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-    let result = crate::db::query(&sql)
-        .bind(&params.uri)
-        .execute(&state.db)
+    let deleted = state
+        .records
+        .delete(&params.uri)
         .await
         .map_err(|e| AppError::Internal(format!("failed to delete record: {e}")))?;
-
-    if result.rows_affected() == 0 {
+    if !deleted {
         return Err(AppError::NotFound("record not found".into()));
     }
-
     Ok(StatusCode::NO_CONTENT)
 }
 

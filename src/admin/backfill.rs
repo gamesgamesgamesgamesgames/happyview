@@ -21,6 +21,7 @@ use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::http_retry::parse_retry_after;
 use crate::profile;
+use crate::record_store::PreparedRecord;
 
 use super::auth::UserAuth;
 use super::backfill_errors::{BackfillErrorKind, ERROR_DETAIL_CAP, ErrorCounts};
@@ -3178,171 +3179,21 @@ async fn run_fetching_phase(
     (final_repos, final_records)
 }
 
-struct PreparedRecord {
-    uri: String,
-    did: String,
-    collection: String,
-    rkey: String,
-    record_json: String,
-    cid: String,
-    /// The commit rev, when the source carries one. `listRecords` does not,
-    /// so crawled rows are `None` and are written as before revs existed,
-    /// except that any tombstone blocks them.
-    rev: Option<String>,
-}
-
-/// Rows per multi-row upsert of a records page: 9 bound parameters each.
-/// `listRecords` is asked for 100 records, but nothing stops a PDS sending
-/// more, and the page must not grow one statement past the backend's
-/// parameter limit.
-const RECORDS_PER_UPSERT: usize = 100;
-
-/// Write one `listRecords` page in one transaction: multi-row upserts of at
-/// most `RECORDS_PER_UPSERT` rows, each followed by refs for exactly the rows
-/// it inserted or changed. The upsert's `WHERE` skips unchanged rows, which
-/// keep their refs and `indexed_at`. Returns the URIs written.
-///
-/// A URI repeated within the page is written once, with its last copy:
-/// Postgres refuses to upsert one row twice in a statement (`21000`).
-///
-/// A row a record or DID tombstone supersedes is skipped, so a crawl cannot
-/// bring back a record deleted live (see `crate::tombstones`). The
-/// transaction comes from `db::begin_write`; on Postgres it locks every DID
-/// and then every URI of the page before the first check. Callers run it
-/// inside `db::retry_on_busy`.
+/// Write one `listRecords` page through `record_store` on the backfill pool:
+/// one transaction, tombstoned rows skipped, a repeated URI written once with
+/// its last copy, refs for exactly the rows inserted or changed. Returns the
+/// URIs written. Callers run it inside `db::retry_on_busy`.
 async fn write_records_page(
     state: &AppState,
     batch: &[PreparedRecord],
 ) -> Result<Vec<String>, sqlx::Error> {
-    if batch.is_empty() {
-        return Ok(Vec::new());
-    }
-    let last: HashMap<&str, usize> = batch
-        .iter()
-        .enumerate()
-        .map(|(i, rec)| (rec.uri.as_str(), i))
-        .collect();
-    let records: Vec<&PreparedRecord> = batch
-        .iter()
-        .enumerate()
-        .filter(|(i, rec)| last[rec.uri.as_str()] == *i)
-        .map(|(_, rec)| rec)
-        .collect();
-    let now = now_rfc3339();
-
-    let mut tx = crate::db::begin_write(&state.backfill_db, state.db_backend).await?;
-    let dids: Vec<&str> = records.iter().map(|rec| rec.did.as_str()).collect();
-    let uris: Vec<&str> = records.iter().map(|rec| rec.uri.as_str()).collect();
-    crate::tombstones::lock_dids(&mut tx, state.db_backend, &dids).await?;
-    crate::tombstones::lock_uris(&mut tx, state.db_backend, &uris).await?;
-    let mut written = Vec::new();
-    for chunk in records.chunks(RECORDS_PER_UPSERT) {
-        written.extend(write_records_chunk(&mut tx, state.db_backend, &now, chunk).await?);
-    }
-    tx.commit().await?;
-    Ok(written)
-}
-
-/// One upsert of `write_records_page`, and the refs of the rows it wrote.
-/// Rows a tombstone supersedes are left out. An unversioned row keeps the
-/// stored rev.
-async fn write_records_chunk(
-    conn: &mut sqlx::AnyConnection,
-    backend: crate::db::DatabaseBackend,
-    now: &str,
-    chunk: &[&PreparedRecord],
-) -> Result<Vec<String>, sqlx::Error> {
-    let candidates: Vec<crate::tombstones::WriteCandidate<'_>> = chunk
-        .iter()
-        .map(|rec| crate::tombstones::WriteCandidate {
-            uri: &rec.uri,
-            did: &rec.did,
-            rev: rec.rev.as_deref(),
-        })
-        .collect();
-    let blocked = crate::tombstones::blocked_writes(&mut *conn, backend, &candidates).await?;
-    let chunk: Vec<&PreparedRecord> = chunk
-        .iter()
-        .copied()
-        .filter(|rec| !blocked.contains(&rec.uri))
-        .collect();
-    if chunk.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let placeholders = vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
-    let upsert_sql = adapt_sql(
-        &format!(
-            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at, rev) VALUES {placeholders} \
-             ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at, \
-             rev = COALESCE(EXCLUDED.rev, happyview_records.rev) \
-             WHERE {} RETURNING uri",
-            crate::db::record_upsert_where(backend)
-        ),
-        backend,
-    );
-    let mut upsert = crate::db::query_as::<(String,)>(&upsert_sql);
-    for rec in &chunk {
-        upsert = upsert
-            .bind(&rec.uri)
-            .bind(&rec.did)
-            .bind(&rec.collection)
-            .bind(&rec.rkey)
-            .bind(&rec.record_json)
-            .bind(&rec.cid)
-            .bind(now)
-            .bind(now)
-            .bind(rec.rev.as_deref());
-    }
-    let written: Vec<String> = upsert
-        .fetch_all(&mut *conn)
+    Ok(state
+        .records
+        .write_network(&state.backfill_db, batch)
         .await?
         .into_iter()
-        .map(|(uri,)| uri)
-        .collect();
-    if written.is_empty() {
-        return Ok(written);
-    }
-
-    let delete_sql = adapt_sql(
-        &format!(
-            "DELETE FROM happyview_record_refs WHERE source_uri IN ({})",
-            vec!["?"; written.len()].join(", ")
-        ),
-        backend,
-    );
-    let mut delete = crate::db::query(&delete_sql);
-    for uri in &written {
-        delete = delete.bind(uri.as_str());
-    }
-    delete.execute(&mut *conn).await?;
-
-    let written_uris: HashSet<&str> = written.iter().map(String::as_str).collect();
-    let mut refs: Vec<(&str, String, &str)> = Vec::new();
-    for rec in chunk
-        .iter()
-        .filter(|rec| written_uris.contains(rec.uri.as_str()))
-    {
-        let value: Value = serde_json::from_str(&rec.record_json).unwrap_or_default();
-        for target in crate::record_refs::extract_at_uris(&value) {
-            refs.push((&rec.uri, target, &rec.collection));
-        }
-    }
-    for refs_chunk in refs.chunks(crate::record_refs::REFS_PER_INSERT) {
-        let ref_sql = adapt_sql(
-            &format!(
-                "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES {} ON CONFLICT DO NOTHING",
-                vec!["(?, ?, ?)"; refs_chunk.len()].join(", ")
-            ),
-            backend,
-        );
-        let mut insert = crate::db::query(&ref_sql);
-        for (source, target, collection) in refs_chunk {
-            insert = insert.bind(*source).bind(target.as_str()).bind(*collection);
-        }
-        insert.execute(&mut *conn).await?;
-    }
-    Ok(written)
+        .map(|changed| changed.uri)
+        .collect())
 }
 
 /// Fetch labels for freshly written records, when any labeler is subscribed.
@@ -3490,7 +3341,6 @@ async fn fetch_records_page_loop(
             };
 
             batch.push(PreparedRecord {
-                uri,
                 did: did.to_string(),
                 collection: collection.to_string(),
                 rkey,
@@ -8305,7 +8155,6 @@ mod tests {
 
     fn prepared(rkey: &str, body: serde_json::Value) -> PreparedRecord {
         PreparedRecord {
-            uri: format!("at://did:plc:page/{POST}/{rkey}"),
             did: "did:plc:page".to_string(),
             collection: POST.to_string(),
             rkey: rkey.to_string(),
@@ -8340,7 +8189,7 @@ mod tests {
             ),
             prepared(&format!("{prefix}b"), serde_json::json!({"text": "plain"})),
         ];
-        let linked = page[0].uri.clone();
+        let linked = page[0].uri();
 
         let written = write_records_page(state, &page).await.expect("first write");
         assert_eq!(written.len(), 2);
@@ -8415,7 +8264,7 @@ mod tests {
         let mut page: Vec<PreparedRecord> = (0..9000)
             .map(|i| prepared(&format!("{prefix}n{i:05}"), serde_json::json!({"n": i})))
             .collect();
-        let repeated = page[150].uri.clone();
+        let repeated = page[150].uri();
         let mut last = prepared(
             &format!("{prefix}n00150"),
             serde_json::json!({"subject": "at://did:plc:t/app.test.post/1"}),
@@ -8534,7 +8383,7 @@ mod tests {
             crate::tombstones::write_record_tombstone(
                 &mut conn,
                 state.db_backend,
-                &dead.uri,
+                &dead.uri(),
                 &page_rev(50),
                 &now_rfc3339(),
             )
@@ -8545,7 +8394,7 @@ mod tests {
             &format!("{prefix}fresh"),
             serde_json::json!({"text": "fresh"}),
         );
-        let fresh_uri = fresh.uri.clone();
+        let fresh_uri = fresh.uri();
         let written = write_records_page(state, &[dead, fresh])
             .await
             .expect("write");
@@ -8556,7 +8405,7 @@ mod tests {
             serde_json::json!({"text": "newer"}),
         );
         newer.rev = Some(page_rev(20));
-        let uri = newer.uri.clone();
+        let uri = newer.uri();
         write_records_page(state, &[newer]).await.expect("newer");
         let mut older = prepared(
             &format!("{prefix}rev"),
@@ -8607,7 +8456,7 @@ mod tests {
     async fn assert_crawl_row_keeps_the_stored_rev(state: &AppState, prefix: &str) {
         let mut versioned = prepared(&format!("{prefix}kept"), serde_json::json!({"text": "v20"}));
         versioned.rev = Some(page_rev(20));
-        let uri = versioned.uri.clone();
+        let uri = versioned.uri();
         write_records_page(state, &[versioned])
             .await
             .expect("versioned");
@@ -8675,7 +8524,7 @@ mod tests {
             &format!("{prefix}fresh"),
             serde_json::json!({"text": "fresh"}),
         );
-        let (dead_uri, fresh_uri) = (dead.uri.clone(), fresh.uri.clone());
+        let (dead_uri, fresh_uri) = (dead.uri(), fresh.uri());
 
         let mut tx = crate::db::begin_write(&state.db, state.db_backend)
             .await
