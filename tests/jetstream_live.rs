@@ -115,6 +115,9 @@ async fn setting(app: &TestApp, key: &str) -> Option<String> {
         .map(|(v,)| v)
 }
 
+/// Seed a setting. Every seeded row shares one `updated_at`, as `cursor::save`
+/// writes the seq and the time together; a time saved later than the seq
+/// would read as an older binary's save and drop the seq.
 async fn set_setting(app: &TestApp, key: &str, value: &str) {
     let sql = adapt_sql(
         "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?)",
@@ -123,7 +126,7 @@ async fn set_setting(app: &TestApp, key: &str, value: &str) {
     happyview::db::query(&sql)
         .bind(key)
         .bind(value)
-        .bind(happyview::db::now_rfc3339())
+        .bind("2026-01-01T00:00:00+00:00")
         .execute(&app.state.db)
         .await
         .expect("seed setting");

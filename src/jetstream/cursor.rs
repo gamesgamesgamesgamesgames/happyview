@@ -8,6 +8,13 @@
 //!   kept current on v2 too, so v1, another host, or an older HappyView can
 //!   still resume from it.
 //! - `jetstream_host`: the host the seq belongs to.
+//!
+//! A HappyView from before v2 knows only `jetstream_cursor`. Run after an
+//! upgrade (a rollback), it moves the time on and leaves the seq where it
+//! was; upgraded again, resuming from that seq would replay everything since.
+//! Each row's `updated_at` shows it: `save` writes the seq and the time with
+//! one timestamp, so a time saved later than the seq means another binary
+//! saved it, and `load` drops the seq.
 
 use sqlx::AnyPool;
 
@@ -35,30 +42,51 @@ pub struct StoredCursor {
 
 pub async fn load(db: &AnyPool, backend: DatabaseBackend) -> Result<StoredCursor, sqlx::Error> {
     let sql = adapt_sql(
-        "SELECT key, value FROM happyview_instance_settings WHERE key IN (?, ?, ?)",
+        "SELECT key, value, updated_at FROM happyview_instance_settings WHERE key IN (?, ?, ?)",
         backend,
     );
-    let rows: Vec<(String, String)> = crate::db::query_as(&sql)
+    let rows: Vec<(String, String, String)> = crate::db::query_as(&sql)
         .bind(SEQ_KEY)
         .bind(TIME_KEY)
         .bind(HOST_KEY)
         .fetch_all(db)
         .await?;
     let mut stored = StoredCursor::default();
-    for (key, value) in rows {
+    let (mut seq_saved, mut time_saved) = (None, None);
+    for (key, value, updated_at) in rows {
         match key.as_str() {
-            SEQ_KEY => stored.seq = value.parse().ok(),
+            SEQ_KEY => {
+                stored.seq = value.parse().ok();
+                seq_saved = saved_at(&updated_at);
+            }
             TIME_KEY => {
                 stored.time_us = value
                     .parse()
                     .ok()
-                    .filter(|t: &i64| *t >= TIMESTAMP_CURSOR_MIN)
+                    .filter(|t: &i64| *t >= TIMESTAMP_CURSOR_MIN);
+                time_saved = saved_at(&updated_at);
             }
             HOST_KEY => stored.host = Some(value).filter(|h| !h.is_empty()),
             _ => {}
         }
     }
+    if let (Some(seq), Some(seq_saved), Some(time_saved)) = (stored.seq, seq_saved, time_saved)
+        && time_saved > seq_saved
+    {
+        tracing::info!(
+            seq,
+            "the jetstream time cursor was saved after the seq, by an older HappyView; \
+             resuming by time"
+        );
+        stored.seq = None;
+    }
     Ok(stored)
+}
+
+/// A row's `updated_at`, or `None` if it isn't RFC 3339 (a row written by
+/// hand, say), which leaves the seq alone.
+fn saved_at(updated_at: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(updated_at).ok()
 }
 
 /// Save `point` as the applied watermark on `host`, in one transaction.
@@ -220,6 +248,57 @@ mod tests {
                 load(&pool, backend).await.unwrap(),
                 stored(None, Some(T + 100), Some("js.example.com")),
                 "a v1 save drops the seq, which would otherwise shadow the newer time"
+            );
+            clear(&pool, backend).await;
+        }
+    }
+
+    /// Ruling FR4: upgrade, roll back to a HappyView that only knows the
+    /// time cursor, upgrade again. The seq the first upgrade saved is older
+    /// than the time the old binary saved since, so it is dropped and the
+    /// resume goes by time.
+    #[tokio::test]
+    #[serial]
+    async fn a_seq_older_than_the_time_cursor_is_dropped() {
+        for (pool, backend) in test_pools().await {
+            clear(&pool, backend).await;
+            save(
+                &pool,
+                backend,
+                "js.example.com",
+                &CursorPoint::V2 {
+                    seq: 42,
+                    witnessed_us: T + 42,
+                },
+            )
+            .await
+            .unwrap();
+
+            // The pre-v2 binary's save: the time row only, as it writes it.
+            let later = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT (key) DO UPDATE SET value = ?, updated_at = ?",
+                backend,
+            ))
+            .bind(TIME_KEY)
+            .bind((T + 9_000).to_string())
+            .bind(&later)
+            .bind((T + 9_000).to_string())
+            .bind(&later)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let loaded = load(&pool, backend).await.unwrap();
+            assert_eq!(
+                loaded,
+                stored(None, Some(T + 9_000), Some("js.example.com")),
+                "{backend:?}"
+            );
+            assert_eq!(
+                resume_cursor(&loaded, "js.example.com", Protocol::V2),
+                Some(T + 9_000)
             );
             clear(&pool, backend).await;
         }
