@@ -224,9 +224,9 @@ pub async fn blocked_writes(
 }
 
 /// Record that `uri` was deleted at `rev`. A repeated delete keeps the newest
-/// rev. Takes the URI's lock (`lock_uris`), so call it inside a
-/// `begin_write` transaction, after locking every URI that transaction
-/// touches.
+/// rev. Call it inside a `begin_write` transaction that already holds the
+/// URI's lock (`lock_uris`), as the delete it records must: it takes no lock
+/// of its own.
 pub async fn write_record_tombstone(
     conn: &mut AnyConnection,
     backend: DatabaseBackend,
@@ -234,7 +234,6 @@ pub async fn write_record_tombstone(
     rev: &str,
     now: &str,
 ) -> Result<(), sqlx::Error> {
-    lock_uris(conn, backend, &[uri]).await?;
     let sql = adapt_sql(
         &format!(
             "INSERT INTO happyview_record_tombstones (uri, rev, deleted_at) VALUES (?, ?, ?) \
@@ -296,6 +295,10 @@ pub async fn write_did_tombstone(
 /// their echo are left alone. Each batch is its own `begin_write`
 /// transaction holding the DID's lock. Returns the records deleted.
 ///
+/// Account and sync events arrive for every repo on the network, and this
+/// instance holds records for few of them, so an unlocked look comes first:
+/// when there is nothing to purge, no write transaction or lock is taken.
+///
 /// The caller must commit any transaction of its own that holds the DID's
 /// lock (the one that wrote the DID tombstone, say) before calling this.
 /// Otherwise the purge waits forever on a lock its caller holds, and Postgres
@@ -309,6 +312,12 @@ pub async fn purge_did_records(
     if collections.is_some_and(<[String]>::is_empty) {
         return Ok(0);
     }
+    if held_uris(db, backend, did, collections, 1)
+        .await?
+        .is_empty()
+    {
+        return Ok(0);
+    }
     let mut purged = 0;
     loop {
         let deleted =
@@ -320,12 +329,18 @@ pub async fn purge_did_records(
     }
 }
 
-async fn purge_batch(
-    db: &AnyPool,
+/// Up to `limit` of the network records `did` holds, optionally only in
+/// `collections`.
+async fn held_uris<'e, E>(
+    executor: E,
     backend: DatabaseBackend,
     did: &str,
     collections: Option<&[String]>,
-) -> Result<u64, sqlx::Error> {
+    limit: i64,
+) -> Result<Vec<String>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
     let mut select =
         "SELECT uri FROM happyview_records WHERE did = ? AND indexed_at IS NOT NULL".to_string();
     if let Some(collections) = collections {
@@ -337,19 +352,28 @@ async fn purge_batch(
     select.push_str(" LIMIT ?");
     let select = adapt_sql(&select, backend);
 
-    let mut tx = begin_write(db, backend).await?;
-    lock_did(&mut tx, backend, did).await?;
     let mut query = crate::db::query_as::<(String,)>(&select).bind(did);
     for collection in collections.unwrap_or_default() {
         query = query.bind(collection.as_str());
     }
-    let uris: Vec<String> = query
-        .bind(PURGE_BATCH)
-        .fetch_all(&mut *tx)
+    Ok(query
+        .bind(limit)
+        .fetch_all(executor)
         .await?
         .into_iter()
         .map(|(uri,)| uri)
-        .collect();
+        .collect())
+}
+
+async fn purge_batch(
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    did: &str,
+    collections: Option<&[String]>,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = begin_write(db, backend).await?;
+    lock_did(&mut tx, backend, did).await?;
+    let uris = held_uris(&mut *tx, backend, did, collections, PURGE_BATCH).await?;
     if uris.is_empty() {
         tx.commit().await?;
         return Ok(0);
@@ -892,7 +916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tombstone_writes_lock_their_key_on_postgres() {
+    async fn only_a_did_tombstone_takes_its_own_lock_on_postgres() {
         for (pool, backend) in test_pools().await {
             if backend != DatabaseBackend::Postgres {
                 continue;
@@ -901,15 +925,51 @@ mod tests {
             let uri = format!("at://{did}/{POST}/1");
 
             let mut tx = begin_write(&pool, backend).await.expect("begin");
-            write_record_tombstone(&mut tx, backend, &uri, &tid(1), &now_rfc3339())
-                .await
-                .expect("record tombstone");
             write_did_tombstone(&mut tx, backend, &did, &tid(1), None, &now_rfc3339())
                 .await
                 .expect("did tombstone");
-            assert!(!lock_is_free(&pool, URI_LOCK_CLASS, &uri).await);
             assert!(!lock_is_free(&pool, DID_LOCK_CLASS, &did).await);
+            write_record_tombstone(&mut tx, backend, &uri, &tid(1), &now_rfc3339())
+                .await
+                .expect("record tombstone");
+            assert!(
+                lock_is_free(&pool, URI_LOCK_CLASS, &uri).await,
+                "a record tombstone relies on its caller's URI lock"
+            );
             tx.commit().await.expect("commit");
+
+            clean_up(&pool, backend, &format!("at://{did}%")).await;
+        }
+    }
+
+    /// Ruling FR7: a purge of an account this instance holds nothing for
+    /// takes no write transaction or lock, so it does not queue behind one.
+    #[tokio::test]
+    async fn a_purge_with_nothing_held_takes_no_lock_on_postgres() {
+        for (pool, backend) in test_pools().await {
+            if backend != DatabaseBackend::Postgres {
+                continue;
+            }
+            let did = unique("did:plc:nolock");
+            let empty = unique("did:plc:empty");
+            seed_record(&pool, backend, &did, LIKE, "a", Some(&now_rfc3339())).await;
+
+            let mut held = begin_write(&pool, backend).await.expect("begin");
+            lock_dids(&mut held, backend, &[&did, &empty])
+                .await
+                .expect("lock dids");
+            let purged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let posts = [POST.to_string()];
+                (
+                    purge_did_records(&pool, backend, &empty, None).await,
+                    purge_did_records(&pool, backend, &did, Some(&posts)).await,
+                )
+            })
+            .await
+            .expect("a purge with nothing to delete must not wait for the DID's lock");
+            assert_eq!(purged.0.expect("purge"), 0);
+            assert_eq!(purged.1.expect("purge"), 0);
+            held.commit().await.expect("release");
 
             clean_up(&pool, backend, &format!("at://{did}%")).await;
         }

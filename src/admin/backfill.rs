@@ -8680,6 +8680,9 @@ mod tests {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend)
             .await
             .expect("begin");
+        crate::tombstones::lock_uris(&mut tx, state.db_backend, &[&dead_uri])
+            .await
+            .expect("lock uri");
         crate::tombstones::write_record_tombstone(
             &mut tx,
             state.db_backend,

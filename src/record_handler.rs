@@ -288,7 +288,15 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
 
             let now = now_rfc3339();
             match crate::db::retry_on_busy(|| {
-                delete_record(db, backend, &uri, &record.did, record.rev.as_deref(), &now)
+                delete_record(
+                    db,
+                    backend,
+                    &uri,
+                    &record.did,
+                    &record.collection,
+                    record.rev.as_deref(),
+                    &now,
+                )
             })
             .await
             {
@@ -411,15 +419,19 @@ async fn upsert_record_and_refs(
 /// Delete one record. A delete that carries a rev deletes only a stored row
 /// whose rev is unknown or not newer, and, unless a newer row survives it,
 /// leaves a tombstone in the same transaction, so a reordered or replayed
-/// create cannot bring the record back. A delete that overtakes its create
-/// (no row yet) tombstones too. A delete without a rev (a dead-letter retry)
-/// deletes the row whatever its rev and tombstones it at the rev it was
-/// stored at, if any, so a replay of that create cannot bring it back.
+/// create cannot bring the record back. A delete that finds no row
+/// tombstones only when a create could still be on its way: the account
+/// holds network records in the collection, or a running backfill covers it.
+/// Otherwise it is a delete for a record this instance never held, and the
+/// network sends millions of those. A delete without a rev (a dead-letter
+/// retry) deletes the row whatever its rev and tombstones it at the rev it
+/// was stored at, if any, so a replay of that create cannot bring it back.
 async fn delete_record(
     db: &sqlx::AnyPool,
     backend: crate::db::DatabaseBackend,
     uri: &str,
     did: &str,
+    collection: &str,
     rev: Option<&str>,
     now: &str,
 ) -> Result<(), sqlx::Error> {
@@ -450,7 +462,9 @@ async fn delete_record(
                     .await?
                     .is_some()
             };
-            if !survived {
+            let tombstone = deleted
+                || (!survived && create_may_follow(&mut tx, backend, did, collection).await?);
+            if tombstone {
                 crate::tombstones::write_record_tombstone(&mut tx, backend, uri, rev, now).await?;
             }
         }
@@ -470,6 +484,42 @@ async fn delete_record(
         }
     }
     tx.commit().await
+}
+
+/// Whether a create for a record `did` holds no row for could still arrive
+/// out of order: the account holds network records in `collection` (live
+/// ingest or a past backfill reached it), or a running or pausing backfill
+/// covers the collection and may yet crawl it.
+async fn create_may_follow(
+    conn: &mut sqlx::AnyConnection,
+    backend: crate::db::DatabaseBackend,
+    did: &str,
+    collection: &str,
+) -> Result<bool, sqlx::Error> {
+    let sql = adapt_sql(
+        "SELECT 1 FROM happyview_records \
+         WHERE did = ? AND collection = ? AND indexed_at IS NOT NULL LIMIT 1",
+        backend,
+    );
+    let held = crate::db::query(&sql)
+        .bind(did)
+        .bind(collection)
+        .fetch_optional(&mut *conn)
+        .await?
+        .is_some();
+    if held {
+        return Ok(true);
+    }
+    let sql = adapt_sql(
+        "SELECT 1 FROM happyview_backfill_jobs \
+         WHERE status IN ('running', 'pausing') AND (collection IS NULL OR collection = ?) LIMIT 1",
+        backend,
+    );
+    Ok(crate::db::query(&sql)
+        .bind(collection)
+        .fetch_optional(&mut *conn)
+        .await?
+        .is_some())
 }
 
 /// Handle a `com.atproto.lexicon.schema` record event for tracked network
@@ -1440,9 +1490,20 @@ mod tests {
         );
     }
 
-    /// A delete that arrives before its record's create still tombstones it.
+    /// A delete that arrives before its record's create still tombstones it,
+    /// for an account that holds records in the collection.
     async fn assert_a_delete_with_no_row_tombstones(state: &AppState, rkey: &str) {
         let uri = format!("at://did:plc:abc/{NSID}/{rkey}");
+        let held = event_with(
+            &format!("{rkey}held"),
+            "create",
+            Some(serde_json::json!({"text": "held"})),
+            Some(rev(10)),
+        );
+        assert_eq!(
+            handle_record_event(state, &held).await,
+            RecordOutcome::Matched
+        );
         let _ = handle_record_event(state, &event_with(rkey, "delete", None, Some(rev(30)))).await;
         assert_eq!(tombstone_rev(state, &uri).await, Some(rev(30)));
         let create = event_with(
@@ -1494,6 +1555,83 @@ mod tests {
         clean_up_rkey(&state, &rkey).await;
     }
 
+    async fn add_backfill_job(state: &AppState, status: &str, collection: Option<&str>) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        crate::db::query(&adapt_sql(
+            "INSERT INTO happyview_backfill_jobs (id, collection, status, created_at) VALUES (?, ?, ?, ?)",
+            state.db_backend,
+        ))
+        .bind(&id)
+        .bind(collection)
+        .bind(status)
+        .bind(now_rfc3339())
+        .execute(&state.db)
+        .await
+        .expect("seed backfill job");
+        id
+    }
+
+    /// Ruling FR1: a delete for a record this instance never held, from an
+    /// account it holds nothing for in the collection, leaves no tombstone
+    /// unless a running or pausing backfill covers the collection.
+    #[tokio::test]
+    async fn a_delete_with_no_row_tombstones_only_when_a_create_may_follow() {
+        let state = migrated_tracked_state().await;
+        let did = "did:plc:stranger";
+        let delete = |rkey: &str| RecordEvent {
+            did: did.to_string(),
+            collection: NSID.to_string(),
+            rkey: rkey.to_string(),
+            action: "delete".to_string(),
+            record: None,
+            cid: None,
+            rev: Some(rev(30)),
+        };
+        let tombstoned = |rkey: &str| {
+            let uri = format!("at://{did}/{NSID}/{rkey}");
+            let state = state.clone();
+            async move { tombstone_rev(&state, &uri).await.is_some() }
+        };
+
+        // Another account's records and other collections' jobs don't count.
+        insert_record(&state).await;
+        add_backfill_job(&state, "running", Some("com.example.other")).await;
+        add_backfill_job(&state, "completed", None).await;
+        let _ = handle_record_event(&state, &delete("never")).await;
+        assert!(!tombstoned("never").await, "nothing could resurrect it");
+
+        for (status, collection) in [("running", None), ("pausing", Some(NSID))] {
+            let job = add_backfill_job(&state, status, collection).await;
+            let rkey = format!("job{status}");
+            let _ = handle_record_event(&state, &delete(&rkey)).await;
+            assert!(
+                tombstoned(&rkey).await,
+                "a {status} backfill covering the collection may crawl it"
+            );
+            crate::db::query("DELETE FROM happyview_backfill_jobs WHERE id = ?")
+                .bind(job)
+                .execute(&state.db)
+                .await
+                .expect("drop job");
+        }
+
+        let held = RecordEvent {
+            action: "create".to_string(),
+            record: Some(serde_json::json!({"text": "held"})),
+            rev: Some(rev(10)),
+            ..delete("held")
+        };
+        assert_eq!(
+            handle_record_event(&state, &held).await,
+            RecordOutcome::Matched
+        );
+        let _ = handle_record_event(&state, &delete("later")).await;
+        assert!(
+            tombstoned("later").await,
+            "the account holds records in the collection"
+        );
+    }
+
     #[tokio::test]
     async fn a_delete_with_no_row_still_tombstones() {
         let state = migrated_tracked_state().await;
@@ -1510,6 +1648,7 @@ mod tests {
         let rkey = format!("early{}", uuid::Uuid::new_v4().simple());
         assert_a_delete_with_no_row_tombstones(&state, &rkey).await;
         clean_up_rkey(&state, &rkey).await;
+        clean_up_rkey(&state, &format!("{rkey}held")).await;
     }
 
     /// A delete without a rev (a dead-letter retry) tombstones the deleted
@@ -1618,6 +1757,9 @@ mod tests {
         let mut tx = crate::db::begin_write(&state.db, state.db_backend)
             .await
             .expect("begin");
+        crate::tombstones::lock_uris(&mut tx, state.db_backend, &[&uri])
+            .await
+            .expect("lock uri");
         crate::tombstones::write_record_tombstone(
             &mut tx,
             state.db_backend,
