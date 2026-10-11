@@ -50,6 +50,12 @@ impl Respond for PlcPostResponder {
         let did = path.trim_start_matches('/').to_string();
 
         if let Ok(body) = serde_json::from_slice::<Value>(&request.body) {
+            if let Some(key) = invalid_verification_method(&body) {
+                return ResponseTemplate::new(400).set_body_json(json!({
+                    "message": format!("Invalid verificationMethod key: {key}"),
+                }));
+            }
+
             let store = self.store.clone();
             futures::executor::block_on(async {
                 store.write().await.insert(did, body);
@@ -58,6 +64,14 @@ impl Respond for PlcPostResponder {
 
         ResponseTemplate::new(200)
     }
+}
+
+fn invalid_verification_method(op: &Value) -> Option<String> {
+    op["verificationMethods"]
+        .as_object()?
+        .values()
+        .find(|v| !v.as_str().is_some_and(|s| s.starts_with("did:key:")))
+        .map(|v| v.to_string())
 }
 
 pub async fn setup_mock_plc(server: &MockServer) -> PlcStore {
