@@ -366,3 +366,83 @@ async fn postgres_boot_rebuilds_an_index_a_failed_concurrent_build_left_invalid(
         eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
     }
 }
+
+/// The last migration before Phase 2a's tombstones.
+const PRE_TOMBSTONES_CUTOFF: &str = "20261009000003";
+
+/// The documented rollback from the tombstone release, then an upgrade again:
+/// delete the two migrations' rows so the older binary boots; on SQLite, drop
+/// `rev` before upgrading again. The tables the rollback left must not stop
+/// the second upgrade, and what they hold survives it.
+async fn assert_rollback_then_upgrade(pool: &AnyPool, migrations_dir: &str, sqlite: bool) {
+    let current = Migrator::new(Path::new(migrations_dir))
+        .await
+        .expect("load current migrations");
+    current.run(pool).await.expect("upgrade");
+    sqlx::query(
+        "INSERT INTO happyview_record_tombstones (uri, rev, deleted_at) \
+         VALUES ('at://did:plc:rb/app.test.post/1', '3l', '2026-10-10T00:00:00+00:00')",
+    )
+    .execute(pool)
+    .await
+    .expect("seed a tombstone");
+
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (20261010000000, 20261010000001)")
+        .execute(pool)
+        .await
+        .expect("roll back");
+    let previous_dir =
+        std::env::temp_dir().join(format!("hv-pre-tombstones-{}", uuid::Uuid::new_v4()));
+    stage_baseline_migrations(migrations_dir, &previous_dir, PRE_TOMBSTONES_CUTOFF);
+    Migrator::new(previous_dir.as_path())
+        .await
+        .expect("load the previous release's migrations")
+        .run(pool)
+        .await
+        .expect("the previous release boots after the rollback");
+
+    if sqlite {
+        sqlx::query("ALTER TABLE happyview_records DROP COLUMN rev")
+            .execute(pool)
+            .await
+            .expect("drop rev before upgrading again");
+    }
+    current.run(pool).await.expect("upgrade again");
+    let (tombstones,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM happyview_record_tombstones")
+        .fetch_one(pool)
+        .await
+        .expect("count tombstones");
+    assert_eq!(tombstones, 1);
+    sqlx::query("SELECT rev FROM happyview_records LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .expect("rev is back");
+
+    let _ = std::fs::remove_dir_all(&previous_dir);
+}
+
+#[tokio::test]
+async fn sqlite_rollback_from_the_tombstones_then_upgrade_again() {
+    sqlx::any::install_default_drivers();
+    let tmp_db = std::env::temp_dir().join(format!("hv-rollback-{}.db", uuid::Uuid::new_v4()));
+    let pool = AnyPool::connect(&format!("sqlite://{}?mode=rwc", tmp_db.display()))
+        .await
+        .expect("connect to fresh sqlite database");
+    assert_rollback_then_upgrade(&pool, "migrations/sqlite", true).await;
+    pool.close().await;
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn postgres_rollback_from_the_tombstones_then_upgrade_again() {
+    let ran = with_scratch_postgres("hv_rollback", |url| async move {
+        let pool = AnyPool::connect(&url).await.expect("connect");
+        assert_rollback_then_upgrade(&pool, "migrations/postgres", false).await;
+        pool.close().await;
+    })
+    .await;
+    if ran.is_none() {
+        eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
+}
