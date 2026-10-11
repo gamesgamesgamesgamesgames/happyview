@@ -2706,7 +2706,7 @@ mod tests {
     /// or two fields (here, `allowed_hosts`) use this rather than each
     /// re-deriving the rest.
     fn test_plugin_state(allowed_hosts: Vec<String>) -> PluginState {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         PluginState {
             plugin_id: "test-plugin".into(),
             scope: "did:example:test".into(),

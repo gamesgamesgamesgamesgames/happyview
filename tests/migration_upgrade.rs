@@ -110,7 +110,7 @@ async fn assert_upgrade_preserves_data(pool: &AnyPool, migrations_dir: &str) {
 
 #[tokio::test]
 async fn sqlite_upgrade_from_v2_0_0_applies_and_preserves_data() {
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
 
     let tmp_db = std::env::temp_dir().join(format!("hv-upgrade-{}.db", uuid::Uuid::new_v4()));
     let url = format!("sqlite://{}?mode=rwc", tmp_db.display());
@@ -128,7 +128,7 @@ async fn sqlite_upgrade_from_v2_0_0_applies_and_preserves_data() {
 #[serial_test::serial]
 async fn postgres_upgrade_from_v2_0_0_applies_and_preserves_data() {
     common::require_db!();
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
     if common::db::test_backend() != happyview::db::DatabaseBackend::Postgres {
         eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
         return;
@@ -182,7 +182,7 @@ const PRE_SCOPE_CUTOFF: &str = "20260913000001";
 
 #[tokio::test]
 async fn sqlite_backfill_scope_marks_existing_single_did_jobs() {
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
 
     let tmp_db = std::env::temp_dir().join(format!("hv-scope-{}.db", uuid::Uuid::new_v4()));
     let url = format!("sqlite://{}?mode=rwc", tmp_db.display());
@@ -242,7 +242,7 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     let base_url = std::env::var("TEST_DATABASE_URL").ok()?;
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
     if happyview::db::DatabaseBackend::from_url(&base_url)
         != happyview::db::DatabaseBackend::Postgres
     {
@@ -370,15 +370,27 @@ async fn postgres_boot_rebuilds_an_index_a_failed_concurrent_build_left_invalid(
 /// The last migration before Phase 2a's tombstones.
 const PRE_TOMBSTONES_CUTOFF: &str = "20261009000003";
 
+/// The last migration of the tombstone release, the one the rollback leaves.
+const TOMBSTONES_CUTOFF: &str = "20261010000001";
+
 /// The documented rollback from the tombstone release, then an upgrade again:
 /// delete the two migrations' rows so the older binary boots; on SQLite, drop
 /// `rev` before upgrading again. The tables the rollback left must not stop
 /// the second upgrade, and what they hold survives it.
 async fn assert_rollback_then_upgrade(pool: &AnyPool, migrations_dir: &str, sqlite: bool) {
+    let tombstones_dir =
+        std::env::temp_dir().join(format!("hv-tombstones-{}", uuid::Uuid::new_v4()));
+    stage_baseline_migrations(migrations_dir, &tombstones_dir, TOMBSTONES_CUTOFF);
+    Migrator::new(tombstones_dir.as_path())
+        .await
+        .expect("load the tombstone release's migrations")
+        .run(pool)
+        .await
+        .expect("upgrade");
+    let _ = std::fs::remove_dir_all(&tombstones_dir);
     let current = Migrator::new(Path::new(migrations_dir))
         .await
         .expect("load current migrations");
-    current.run(pool).await.expect("upgrade");
     sqlx::query(
         "INSERT INTO happyview_record_tombstones (uri, rev, deleted_at) \
          VALUES ('at://did:plc:rb/app.test.post/1', '3l', '2026-10-10T00:00:00+00:00')",
@@ -423,7 +435,7 @@ async fn assert_rollback_then_upgrade(pool: &AnyPool, migrations_dir: &str, sqli
 
 #[tokio::test]
 async fn sqlite_rollback_from_the_tombstones_then_upgrade_again() {
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
     let tmp_db = std::env::temp_dir().join(format!("hv-rollback-{}.db", uuid::Uuid::new_v4()));
     let pool = AnyPool::connect(&format!("sqlite://{}?mode=rwc", tmp_db.display()))
         .await

@@ -69,6 +69,7 @@ cid = "0.11"
 ciborium = "0.2"
 ipld-core = { version = "0.4", features = ["serde"] }
 k256 = { version = "0.14", features = ["ecdsa"] }
+libsqlite3-sys = { version = "0.30", default-features = false }
 multibase = "0.9"
 p256 = { version = "0.14", features = ["pkcs8", "ecdsa"] }
 uuid = { version = "1", features = ["v4"] }

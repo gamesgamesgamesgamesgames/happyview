@@ -101,7 +101,7 @@ mod tests {
     use crate::db::DatabaseBackend;
 
     async fn test_pool() -> sqlx::AnyPool {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
             .max_connections(1)
             .connect("sqlite::memory:")

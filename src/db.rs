@@ -661,9 +661,18 @@ fn with_sqlite_pragmas(
     })
 }
 
+/// Install sqlx's `Any` drivers and register the record store's SQLite
+/// functions (`record_store::sqlite_functions`), which must happen before
+/// the first SQLite connection opens. Call this, not
+/// `sqlx::any::install_default_drivers`, before building any pool.
+pub fn install_drivers() {
+    sqlx::any::install_default_drivers();
+    crate::record_store::sqlite_functions::register();
+}
+
 /// Connect to the configured database and run migrations.
 pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
-    sqlx::any::install_default_drivers();
+    install_drivers();
 
     // For SQLite, ensure the parent directory exists
     if backend == DatabaseBackend::Sqlite
@@ -893,6 +902,8 @@ pub fn compute_backfill_pool_size(
 }
 
 pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPool {
+    install_drivers();
+
     let pds: u32 = std::env::var("BACKFILL_CONCURRENT_PDS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1186,7 +1197,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_busy_write_is_retried_until_the_lock_clears() {
-        sqlx::any::install_default_drivers();
+        install_drivers();
         let path = std::env::temp_dir().join(format!("hv-busy-{}.db", uuid::Uuid::new_v4()));
         let url = format!("sqlite://{}?mode=rwc", path.display());
         let holder_pool = PoolOptions::<sqlx::Any>::new()
@@ -1412,7 +1423,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_only_sqlite_database_is_unavailable() {
-        sqlx::any::install_default_drivers();
+        install_drivers();
         let path = std::env::temp_dir().join(format!("hv-readonly-{}.db", uuid::Uuid::new_v4()));
         let rw = PoolOptions::<sqlx::Any>::new()
             .max_connections(1)
@@ -1502,7 +1513,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_sqlite_write_transaction_takes_the_write_lock_when_it_begins() {
-        sqlx::any::install_default_drivers();
+        install_drivers();
         let path = std::env::temp_dir().join(format!("hv-begin-write-{}.db", uuid::Uuid::new_v4()));
         let url = format!("sqlite://{}?mode=rwc", path.display());
         // Never wait on a lock, so a held write lock surfaces as SQLITE_BUSY.

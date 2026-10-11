@@ -16,7 +16,7 @@ use crate::lexicon::LexiconRegistry;
 /// connection to `sqlite::memory:` gets its own private database, so a larger
 /// pool would hand later queries an empty schema.
 pub async fn memory_pool() -> sqlx::AnyPool {
-    sqlx::any::install_default_drivers();
+    crate::db::install_drivers();
     sqlx::pool::PoolOptions::<sqlx::Any>::new()
         .max_connections(1)
         .connect("sqlite::memory:")

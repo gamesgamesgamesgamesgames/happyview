@@ -344,7 +344,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_checkpoint_returns_its_connection_with_the_normal_busy_timeout() {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         let path = std::env::temp_dir().join(format!("hv-ckpt-{}.db", uuid::Uuid::new_v4()));
         let url = format!("sqlite://{}?mode=rwc", path.display());
         // One connection, so the one the checkpoint borrowed is the one read back.
@@ -479,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_busy_checkpoint_still_restores_the_normal_busy_timeout() {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         let path = std::env::temp_dir().join(format!("hv-busy-{}.db", uuid::Uuid::new_v4()));
         let url = format!("sqlite://{}?mode=rwc", path.display());
         let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()

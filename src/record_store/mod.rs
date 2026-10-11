@@ -9,6 +9,7 @@
 
 pub mod codec;
 pub mod query;
+pub mod sqlite_functions;
 
 use std::collections::{HashMap, HashSet};
 

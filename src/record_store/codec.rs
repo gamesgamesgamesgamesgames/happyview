@@ -13,7 +13,7 @@
 //! implement the same rules in SQL for the views and triggers; tests hold
 //! the three to agreement.
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
@@ -91,40 +91,104 @@ pub fn decode_cid(bytes: &[u8]) -> String {
     }
 }
 
+/// The first instant a timestamp can hold, `0000-01-01T00:00:00Z`.
+pub const MIN_MICROS: i64 = -62_167_219_200_000_000;
+
+/// The last instant a timestamp can hold, `9999-12-31T23:59:59.999999Z`.
+pub const MAX_MICROS: i64 = 253_402_300_799_999_999;
+
 /// A stored timestamp in any form HappyView has written: RFC 3339 at any
 /// precision and offset, SQLite's `datetime('now')` (UTC), or Postgres's
-/// `timestamptz::text` (`+00` offsets). Rounded to the nearest microsecond,
-/// as Postgres rounds its own input.
+/// `timestamptz::text` (`+00` offsets).
+///
+/// The grammar is explicit, because `hv_ts_micros` on Postgres repeats it
+/// and the two must agree on every input:
+///
+/// * `YYYY-MM-DD`, then `T`, `t` or a space, then `HH:MM:SS`, every field
+///   ASCII digits of exactly that width. `SS` may be `60`, a leap second,
+///   read as the next second, as Postgres reads it.
+/// * Optionally `.` and one or more digits. Digits past the ninth are
+///   ignored; the rest rounds half up to the microsecond.
+/// * Optionally `Z`, `z`, or `+`/`-` with `HH`, `HHMM` or `HH:MM` (up to
+///   23:59). No offset means UTC.
+/// * The instant must fall in years 0000 to 9999 ([`MIN_MICROS`] to
+///   [`MAX_MICROS`]), the span the rendered form can spell.
 pub fn parse_micros(text: &str) -> Option<i64> {
-    let dt: DateTime<Utc> = if let Ok(dt) = DateTime::parse_from_rfc3339(text) {
-        dt.with_timezone(&Utc)
-    } else if let Some(dt) = ["%Y-%m-%d %H:%M:%S%.f%#z", "%Y-%m-%d %H:%M:%S%#z"]
-        .iter()
-        .find_map(|f| DateTime::parse_from_str(text, f).ok())
+    fn digits(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() {
+            return None;
+        }
+        bytes.iter().try_fold(0i64, |n, &b| {
+            b.is_ascii_digit().then(|| n * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    let b = text.as_bytes();
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't' | b' ')
+        || b[13] != b':'
+        || b[16] != b':'
     {
-        dt.with_timezone(&Utc)
-    } else if let Some(naive) = [
-        "%Y-%m-%d %H:%M:%S%.f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-    ]
-    .iter()
-    .find_map(|f| NaiveDateTime::parse_from_str(text, f).ok())
-    {
-        naive.and_utc()
-    } else {
         return None;
+    }
+    let field = |at: usize, len: usize| digits(&b[at..at + len]);
+    let (year, month, day) = (field(0, 4)?, field(5, 2)?, field(8, 2)?);
+    let (hour, minute, second) = (field(11, 2)?, field(14, 2)?, field(17, 2)?);
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let date = NaiveDate::from_ymd_opt(year as i32, month as u32, day as u32)?;
+    let days = (date - DateTime::UNIX_EPOCH.date_naive()).num_days();
+
+    let mut rest = &b[19..];
+    let mut nanos = 0;
+    if let Some(fraction) = rest.strip_prefix(b".") {
+        let len = fraction.iter().take_while(|c| c.is_ascii_digit()).count();
+        let kept = &fraction[..len.min(9)];
+        nanos = digits(kept)? * 10i64.pow(9 - kept.len() as u32);
+        rest = &fraction[len..];
+    }
+    let offset = match rest {
+        [] | [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), zone @ ..] => {
+            let (h, m) = match zone {
+                [_, _] => (digits(zone)?, 0),
+                [h1, h2, m1, m2] | [h1, h2, b':', m1, m2] => {
+                    (digits(&[*h1, *h2])?, digits(&[*m1, *m2])?)
+                }
+                _ => return None,
+            };
+            if h > 23 || m > 59 {
+                return None;
+            }
+            if *sign == b'-' {
+                -(h * 3_600 + m * 60)
+            } else {
+                h * 3_600 + m * 60
+            }
+        }
+        _ => return None,
     };
-    let nanos = i64::from(dt.timestamp_subsec_nanos());
-    Some(dt.timestamp() * 1_000_000 + (nanos + 500) / 1_000)
+
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second - offset;
+    let us = seconds * 1_000_000 + (nanos + 500) / 1_000;
+    (MIN_MICROS..=MAX_MICROS).contains(&us).then_some(us)
 }
 
+/// RFC 3339 in UTC with six fractional digits, which [`parse_micros`] reads
+/// back exactly. Nothing HappyView writes falls outside years 0000 to 9999,
+/// so a value that does is corrupt: it renders as `invalid timestamp {us}`,
+/// visibly wrong and still showing the stored number, rather than as a
+/// plausible date. `hv_ts_text` renders the same on both backends.
 pub fn render_micros(us: i64) -> String {
-    DateTime::from_timestamp_micros(us)
-        .unwrap_or(DateTime::UNIX_EPOCH)
-        .format("%Y-%m-%dT%H:%M:%S%.6f+00:00")
-        .to_string()
+    match DateTime::from_timestamp_micros(us) {
+        Some(dt) if (MIN_MICROS..=MAX_MICROS).contains(&us) => {
+            dt.format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string()
+        }
+        _ => format!("invalid timestamp {us}"),
+    }
 }
 
 pub fn now_micros() -> i64 {
@@ -342,6 +406,70 @@ mod tests {
         }
         assert_eq!(parse_micros("yesterday"), None);
         assert_eq!(parse_micros(""), None);
+    }
+
+    /// The grammar `hv_ts_micros` on Postgres repeats, so its edges are
+    /// pinned here; `sqlite_functions` checks the SQL against these.
+    #[test]
+    fn the_timestamp_grammar_is_exact() {
+        const T: i64 = 1_791_722_096_000_000; // 2026-10-11T12:34:56Z
+        for (input, micros) in [
+            ("2026-10-11T12:34:56", T),
+            ("2026-10-11t12:34:56z", T),
+            ("2026-10-11 12:34:56Z", T),
+            ("2026-10-11T18:04:56+0530", T),
+            ("2026-10-11T18:04:56+05:30", T),
+            ("2026-10-11T08:34:56-04", T),
+            ("2026-10-11T12:34:56-00:00", T),
+            ("2026-10-11T12:34:56.0000005Z", T + 1),
+            ("2026-10-11T12:34:56.0000004999Z", T),
+            ("2026-10-11T12:34:55.9999995Z", T),
+            ("1969-12-31T23:59:59.0000005Z", -999_999),
+            ("1969-12-31T23:59:59.9999995Z", 0),
+            ("2016-12-31T23:59:60Z", 1_483_228_800_000_000),
+            ("0000-01-01T00:00:00Z", MIN_MICROS),
+            ("9999-12-31T23:59:59.999999Z", MAX_MICROS),
+        ] {
+            assert_eq!(parse_micros(input), Some(micros), "{input}");
+        }
+        for bad in [
+            " 2026-10-11 12:34:56",
+            "2026-10-11 12:34:56 ",
+            "2026-1-11 12:34:56",
+            "+2026-10-11 12:34:56",
+            "2026-02-29 00:00:00",
+            "2026-10-11T24:00:00Z",
+            "2026-10-11T12:34:56 +00:00",
+            "2026-10-11T12:34:56+24:00",
+            "2026-10-11T12:34:56+05:30:00",
+            "2026-10-11T12:34:56.Z",
+            "9999-12-31T23:59:59.9999995Z",
+            "0000-01-01T00:00:00+00:01",
+            "now",
+        ] {
+            assert_eq!(parse_micros(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_timestamp_outside_years_0000_to_9999_renders_as_invalid() {
+        assert_eq!(
+            render_micros(MIN_MICROS),
+            "0000-01-01T00:00:00.000000+00:00"
+        );
+        assert_eq!(
+            render_micros(MAX_MICROS),
+            "9999-12-31T23:59:59.999999+00:00"
+        );
+        assert_eq!(
+            render_micros(i64::MAX),
+            "invalid timestamp 9223372036854775807"
+        );
+        assert_eq!(
+            render_micros(MIN_MICROS - 1),
+            "invalid timestamp -62167219200000001"
+        );
+        assert_eq!(parse_micros(&render_micros(i64::MIN)), None);
     }
 
     #[test]
