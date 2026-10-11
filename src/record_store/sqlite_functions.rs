@@ -103,11 +103,36 @@ enum Out {
     Int(i64),
 }
 
+/// Why a function failed.
+enum Fail {
+    Error(String),
+    /// SQLite ran out of memory converting an argument.
+    NoMem,
+}
+
+impl From<String> for Fail {
+    fn from(msg: String) -> Self {
+        Self::Error(msg)
+    }
+}
+
+/// Characters of an argument an error message quotes. A message must not
+/// copy (and Debug-escape) the whole of a large argument.
+const EXCERPT_CHARS: usize = 200;
+
+/// `text` quoted for an error message, cut at [`EXCERPT_CHARS`].
+fn excerpt(text: &str) -> String {
+    match text.char_indices().nth(EXCERPT_CHARS) {
+        Some((end, _)) => format!("{:?}…", &text[..end]),
+        None => format!("{text:?}"),
+    }
+}
+
 /// Run `f` and hand its result, or its error, to SQLite. A panic must not
 /// unwind into C, so it becomes an SQL error too.
-unsafe fn finish(ctx: *mut ffi::sqlite3_context, f: impl FnOnce() -> Result<Out, String>) {
-    let out =
-        catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err("hv function panicked".into()));
+unsafe fn finish(ctx: *mut ffi::sqlite3_context, f: impl FnOnce() -> Result<Out, Fail>) {
+    let out = catch_unwind(AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(Fail::Error("hv function panicked".into())));
     // SAFETY: `ctx` is the live context SQLite passed to the function; every
     // buffer is copied by SQLite (`SQLITE_TRANSIENT`) before it is dropped.
     unsafe {
@@ -128,7 +153,14 @@ unsafe fn finish(ctx: *mut ffi::sqlite3_context, f: impl FnOnce() -> Result<Out,
                 ffi::SQLITE_TRANSIENT(),
             ),
             Ok(Out::Int(i)) => ffi::sqlite3_result_int64(ctx, i),
-            Err(msg) => ffi::sqlite3_result_error(ctx, msg.as_ptr().cast(), msg.len() as c_int),
+            Err(Fail::NoMem) => ffi::sqlite3_result_error_nomem(ctx),
+            // The length is clamped, never wrapped: a negative length would
+            // have SQLite read on to a NUL the `String` does not have.
+            Err(Fail::Error(msg)) => ffi::sqlite3_result_error(
+                ctx,
+                msg.as_ptr().cast(),
+                c_int::try_from(msg.len()).unwrap_or(c_int::MAX),
+            ),
         }
     }
 }
@@ -140,37 +172,51 @@ unsafe fn arg(argv: *mut *mut ffi::sqlite3_value, i: usize) -> Option<*mut ffi::
     (unsafe { ffi::sqlite3_value_type(value) } != ffi::SQLITE_NULL).then_some(value)
 }
 
-/// The value's bytes, borrowed until the function returns.
-unsafe fn blob<'a>(value: *mut ffi::sqlite3_value) -> &'a [u8] {
-    // SAFETY: the pointer is valid until the function returns, and `bytes`
-    // is read after `blob`, as SQLite requires.
-    unsafe {
-        let ptr = ffi::sqlite3_value_blob(value) as *const u8;
-        let len = ffi::sqlite3_value_bytes(value) as usize;
-        if ptr.is_null() || len == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(ptr, len)
-        }
+/// The `len` bytes at `ptr`, borrowed until the function returns. SQLite
+/// hands back no pointer for an empty text or blob, and otherwise only when
+/// it ran out of memory converting the value.
+unsafe fn borrowed<'a>(
+    value: *mut ffi::sqlite3_value,
+    ptr: *const u8,
+    len: usize,
+) -> Result<&'a [u8], Fail> {
+    if !ptr.is_null() {
+        // SAFETY: SQLite keeps the buffer valid until the function returns.
+        return Ok(unsafe { std::slice::from_raw_parts(ptr, len) });
+    }
+    // SAFETY: `value` is a live argument.
+    let kind = unsafe { ffi::sqlite3_value_type(value) };
+    if len == 0 && matches!(kind, ffi::SQLITE_TEXT | ffi::SQLITE_BLOB) {
+        Ok(&[])
+    } else {
+        Err(Fail::NoMem)
     }
 }
 
-unsafe fn text<'a>(value: *mut ffi::sqlite3_value) -> Result<&'a str, String> {
+/// The value's bytes.
+unsafe fn blob<'a>(value: *mut ffi::sqlite3_value) -> Result<&'a [u8], Fail> {
+    // SAFETY: `bytes` is read after `blob`, as SQLite requires.
+    unsafe {
+        let ptr = ffi::sqlite3_value_blob(value) as *const u8;
+        let len = ffi::sqlite3_value_bytes(value) as usize;
+        borrowed(value, ptr, len)
+    }
+}
+
+/// The value as UTF-8 text.
+unsafe fn text<'a>(value: *mut ffi::sqlite3_value) -> Result<&'a str, Fail> {
     // SAFETY: as for `blob`, with `text` read before `bytes`.
     let bytes = unsafe {
         let ptr = ffi::sqlite3_value_text(value);
         let len = ffi::sqlite3_value_bytes(value) as usize;
-        if ptr.is_null() || len == 0 {
-            &[][..]
-        } else {
-            std::slice::from_raw_parts(ptr, len)
-        }
+        borrowed(value, ptr, len)?
     };
-    std::str::from_utf8(bytes).map_err(|e| e.to_string())
+    std::str::from_utf8(bytes).map_err(|e| Fail::Error(e.to_string()))
 }
 
 /// `hv_record(body, body_dict)`: the stored body as JSON text. A NULL or `0`
-/// dictionary means the body is stored raw; Task 8 adds dictionaries.
+/// dictionary means the body is stored raw; Task 8 adds dictionaries. A
+/// negative id is no dictionary at all, so it is an error.
 unsafe extern "C" fn hv_record(
     ctx: *mut ffi::sqlite3_context,
     _argc: c_int,
@@ -185,14 +231,14 @@ unsafe extern "C" fn hv_record(
             .map(|v| ffi::sqlite3_value_int64(v))
             .unwrap_or(0);
         finish(ctx, || {
-            if dict <= 0 {
-                return std::str::from_utf8(body)
+            let body = body?;
+            match dict {
+                0 => std::str::from_utf8(body)
                     .map(|s| Out::Text(s.to_string()))
-                    .map_err(|e| format!("hv_record: stored body is not UTF-8: {e}"));
+                    .map_err(|e| format!("hv_record: stored body is not UTF-8: {e}").into()),
+                ..0 => Err(format!("hv_record: {dict} is not a dictionary id").into()),
+                _ => Err(format!("hv_record: zstd dictionary {dict} is not available").into()),
             }
-            Err(format!(
-                "hv_record: zstd dictionary {dict} is not available"
-            ))
         })
     }
 }
@@ -204,8 +250,9 @@ unsafe extern "C" fn hv_cid_text(
 ) {
     unsafe {
         let value = arg(argv, 0).map(|v| blob(v));
-        finish(ctx, || {
-            Ok(value.map_or(Out::Null, |b| Out::Text(codec::decode_cid(b))))
+        finish(ctx, || match value {
+            None => Ok(Out::Null),
+            Some(b) => Ok(Out::Text(codec::decode_cid(b?))),
         })
     }
 }
@@ -248,9 +295,9 @@ unsafe extern "C" fn hv_ts_micros(
             None => Ok(Out::Null),
             Some(t) => {
                 let t = t?;
-                codec::parse_micros(t)
-                    .map(Out::Int)
-                    .ok_or_else(|| format!("hv_ts_micros: cannot read {t:?} as a timestamp"))
+                codec::parse_micros(t).map(Out::Int).ok_or_else(|| {
+                    format!("hv_ts_micros: cannot read {} as a timestamp", excerpt(t)).into()
+                })
             }
         })
     }
@@ -650,56 +697,19 @@ mod tests {
         }
     }
 
-    /// The Postgres view exposes `indexed_at` and `created_at` as
-    /// `timestamptz`, so raw SQL can compare them with `now()`; these two
-    /// functions convert between that and the stored microseconds exactly.
+    /// An error quotes at most a slice of its argument, however large.
     #[tokio::test]
-    async fn postgres_converts_microseconds_to_timestamptz_exactly() {
-        let mut values = vec![
-            0,
-            -1,
-            -500_000,
-            codec::MIN_MICROS,
-            codec::MAX_MICROS,
-            codec::now_micros(),
-        ];
-        let mut rng = Xorshift(0x7a5e_5eed_0000_0005);
-        let span = (codec::MAX_MICROS - codec::MIN_MICROS) as u64;
-        for _ in 0..200 {
-            values.push(codec::MIN_MICROS + (rng.next() % span) as i64);
-        }
+    async fn an_error_quotes_only_an_excerpt_of_a_huge_argument() {
+        let huge = "\u{1}".repeat(1_000_000);
         for (mut conn, backend) in connections().await {
-            if backend != DatabaseBackend::Postgres {
-                continue;
-            }
-            for us in &values {
-                let (back, utc): (i64, String) = crate::db::query_as(
-                    "SELECT hv_tz_micros(hv_ts_tz($1)), \
-                     to_char(hv_ts_tz($1) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US')",
-                )
-                .bind(*us)
-                .fetch_one(&mut *conn)
+            let err = crate::db::query(&adapt_sql("SELECT hv_ts_micros(?)", backend))
+                .bind(&huge)
+                .execute(&mut *conn)
                 .await
-                .unwrap_or_else(|e| panic!("{us}: {e}"));
-                assert_eq!(back, *us);
-                if *us >= -62_135_596_800_000_000 {
-                    // to_char spells year 0 as 0001 BC; from year 1 it is RFC 3339.
-                    assert_eq!(format!("{utc}+00:00"), codec::render_micros(*us), "{us}");
-                }
-            }
-            let (now_is_now,): (bool,) = crate::db::query_as(
-                "SELECT hv_ts_tz(hv_now_micros()) BETWEEN now() - INTERVAL '1 minute' AND now() + INTERVAL '1 minute'",
-            )
-            .fetch_one(&mut *conn)
-            .await
-            .expect("compare with now()");
-            assert!(now_is_now);
-            let (null_ts, null_us): (Option<String>, Option<i64>) =
-                crate::db::query_as("SELECT hv_ts_tz(NULL)::text, hv_tz_micros(NULL)")
-                    .fetch_one(&mut *conn)
-                    .await
-                    .expect("null in, null out");
-            assert_eq!((null_ts, null_us), (None, None));
+                .expect_err("not a timestamp");
+            let msg = err.to_string();
+            assert!(msg.contains("hv_ts_micros"), "{backend:?}: {msg}");
+            assert!(msg.len() < 2_000, "{backend:?}: {} bytes", msg.len());
         }
     }
 
@@ -787,6 +797,28 @@ mod tests {
         }
     }
 
+    /// SQLite hands back no pointer for an empty blob; that is an empty
+    /// argument, not an out-of-memory error.
+    #[tokio::test]
+    async fn empty_arguments_are_empty_not_errors() {
+        let pool = crate::test_support::memory_pool().await;
+        let (text, bytes, record): (String, Vec<u8>, String) =
+            crate::db::query_as("SELECT hv_cid_text(x''), hv_cid_bytes(x''), hv_record(x'', NULL)")
+                .fetch_one(&pool)
+                .await
+                .expect("empty blobs");
+        assert_eq!(
+            (text.as_str(), bytes.as_slice(), record.as_str()),
+            ("", &[][..], "")
+        );
+        let (text, bytes): (String, Vec<u8>) =
+            crate::db::query_as("SELECT hv_cid_text(''), hv_cid_bytes('')")
+                .fetch_one(&pool)
+                .await
+                .expect("empty text");
+        assert_eq!((text.as_str(), bytes.as_slice()), ("", &[][..]));
+    }
+
     #[tokio::test]
     async fn sqlite_reads_raw_bodies_and_refuses_an_unknown_dictionary() {
         let pool = crate::test_support::memory_pool().await;
@@ -811,6 +843,13 @@ mod tests {
                 .execute(&pool)
                 .await
                 .is_err()
+        );
+        assert!(
+            crate::db::query("SELECT hv_record(CAST('{}' AS BLOB), -1)")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "a negative dictionary id is an error, not a raw body"
         );
         assert!(
             crate::db::query("SELECT hv_record(x'ff', NULL)")
@@ -849,8 +888,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Calling `register` again changes nothing: SQLite would run a second
-    /// copy of the entry point, but the `Once` never hands it one.
+    /// Calling `register` again changes nothing.
     #[tokio::test]
     async fn register_is_idempotent() {
         super::register();

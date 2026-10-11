@@ -1,5 +1,6 @@
 -- SQL-side codecs for the compact record format (Phase 3). The compatibility
--- views render cid and timestamps back to their old forms with these, and
+-- views render cid and timestamps back to their old text forms with these
+-- (indexed_at and created_at are TEXT on both backends), and
 -- their INSTEAD OF triggers encode raw-SQL writes. Same rules as
 -- src/record_store/codec.rs and the SQLite functions in
 -- src/record_store/sqlite_functions.rs; tests there hold the three to
@@ -202,39 +203,25 @@ BEGIN
                ELSE 31
                END)
        OR h > 23 OR mi > 59 OR s > 60 OR oh > 23 OR om > 59 THEN
-        RAISE EXCEPTION 'hv_ts_micros: cannot read % as a timestamp', quote_literal(t)
+        RAISE EXCEPTION 'hv_ts_micros: cannot read % as a timestamp', quote_literal(left(t, 200))
             USING ERRCODE = 'invalid_datetime_format';
     END IF;
     us := (hv_days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s - off) * 1000000
         + (nanos + 500) / 1000;
     IF us < -62167219200000000 OR us > 253402300799999999 THEN
-        RAISE EXCEPTION 'hv_ts_micros: % is outside years 0000 to 9999', quote_literal(t)
+        RAISE EXCEPTION 'hv_ts_micros: % is outside years 0000 to 9999', quote_literal(left(t, 200))
             USING ERRCODE = 'datetime_field_overflow';
     END IF;
     RETURN us;
 END $$;
 
--- The Postgres compatibility view exposes indexed_at and created_at as
--- timestamptz, as the legacy columns were, so raw SQL can keep comparing
--- them with now() and intervals. These two convert between that and the
--- stored microseconds exactly: every step is integer arithmetic or adds a
--- whole interval, and the zone is fixed to UTC.
-CREATE OR REPLACE FUNCTION hv_ts_tz(us bigint) RETURNS timestamptz
-LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-    SELECT (TIMESTAMP 'epoch'
-            + (us / 86400000000) * INTERVAL '1 day'
-            + (us % 86400000000) * INTERVAL '1 microsecond') AT TIME ZONE 'UTC'
-$$;
-
-CREATE OR REPLACE FUNCTION hv_tz_micros(ts timestamptz) RETURNS bigint
-LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-    SELECT (EXTRACT(EPOCH FROM date_trunc('second', ts AT TIME ZONE 'UTC')))::bigint * 1000000
-         + (EXTRACT(MICROSECONDS FROM ts AT TIME ZONE 'UTC'))::bigint % 1000000
-$$;
-
+-- The wall clock now in unix microseconds, exactly. clock_timestamp(), not
+-- now(): it advances within a transaction, as Rust's clock does.
 CREATE OR REPLACE FUNCTION hv_now_micros() RETURNS bigint
 LANGUAGE sql VOLATILE PARALLEL SAFE AS $$
-    SELECT hv_tz_micros(clock_timestamp())
+    SELECT (EXTRACT(EPOCH FROM date_trunc('second', ts)))::bigint * 1000000
+         + (EXTRACT(MICROSECONDS FROM ts))::bigint % 1000000
+    FROM (SELECT clock_timestamp() AT TIME ZONE 'UTC' AS ts) clock
 $$;
 
 -- 0: the interned text; 1: the collection (NULL unless a record URI);
