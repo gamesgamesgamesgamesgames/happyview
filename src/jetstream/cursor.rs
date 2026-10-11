@@ -14,7 +14,8 @@
 //! was; upgraded again, resuming from that seq would replay everything since.
 //! Each row's `updated_at` shows it: `save` writes the seq and the time with
 //! one timestamp, so a time saved later than the seq means another binary
-//! saved it, and `load` drops the seq.
+//! saved it, and `load` drops the seq, as long as that time is one to
+//! resume from.
 
 use sqlx::AnyPool;
 
@@ -70,7 +71,8 @@ pub async fn load(db: &AnyPool, backend: DatabaseBackend) -> Result<StoredCursor
             _ => {}
         }
     }
-    if let (Some(seq), Some(seq_saved), Some(time_saved)) = (stored.seq, seq_saved, time_saved)
+    if let (Some(seq), Some(_), Some(seq_saved), Some(time_saved)) =
+        (stored.seq, stored.time_us, seq_saved, time_saved)
         && time_saved > seq_saved
     {
         tracing::info!(
@@ -299,6 +301,44 @@ mod tests {
             assert_eq!(
                 resume_cursor(&loaded, "js.example.com", Protocol::V2),
                 Some(T + 9_000)
+            );
+            clear(&pool, backend).await;
+        }
+    }
+
+    /// Review N1: a later time row that is not a usable time cursor drops
+    /// nothing, since there would be no time to resume from.
+    #[tokio::test]
+    #[serial]
+    async fn a_seq_is_kept_when_the_later_time_row_is_unusable() {
+        for (pool, backend) in test_pools().await {
+            clear(&pool, backend).await;
+            save(
+                &pool,
+                backend,
+                "js.example.com",
+                &CursorPoint::V2 {
+                    seq: 42,
+                    witnessed_us: T + 42,
+                },
+            )
+            .await
+            .unwrap();
+            let later = (chrono::Utc::now() + chrono::Duration::seconds(5)).to_rfc3339();
+            crate::db::query(&adapt_sql(
+                "UPDATE happyview_instance_settings SET value = ?, updated_at = ? WHERE key = ?",
+                backend,
+            ))
+            .bind("12345")
+            .bind(&later)
+            .bind(TIME_KEY)
+            .execute(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                load(&pool, backend).await.unwrap(),
+                stored(Some(42), None, Some("js.example.com")),
+                "{backend:?}"
             );
             clear(&pool, backend).await;
         }
