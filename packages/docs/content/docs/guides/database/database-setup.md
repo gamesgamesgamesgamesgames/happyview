@@ -68,6 +68,8 @@ The column and the two tables stay. The older release ignores them, and the next
 ALTER TABLE happyview_records DROP COLUMN rev;
 ```
 
+Dropping the column rewrites `happyview_records`, so on a large database it takes a while and needs free disk about the size of the table. It also discards the stored revs: records written before the drop have none until a new commit to them arrives, so until then they behave as records from before the upgrade.
+
 The upgraded release resumes from the time cursor the older one saved, not from its own older seq.
 
 ## Environment variables
