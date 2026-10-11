@@ -1037,11 +1037,12 @@ async fn seed_record(app: &TestApp, uri: &str, collection: &str) {
         app.state.db_backend,
     );
     let now = happyview::db::now_rfc3339();
+    let rkey = uri.rsplit('/').next().expect("a uri has an rkey");
     happyview::db::query(&sql)
         .bind(uri)
         .bind("did:plc:seed")
         .bind(collection)
-        .bind("rkey1")
+        .bind(rkey)
         .bind(r#"{"text":"hi"}"#)
         .bind("bafyseed")
         .bind(&now)

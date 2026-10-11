@@ -42,6 +42,43 @@ pub async fn migrated_memory_pool() -> sqlx::AnyPool {
     pool
 }
 
+/// Insert one record the way raw SQL would, with a URI that agrees with its
+/// identity (`at://{did}/{collection}/{rkey}`), and return the URI. Before the
+/// record store's cutover this writes the legacy table; afterwards the same
+/// statement goes through the compatibility view's trigger, which refuses a
+/// URI that does not match.
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_record(
+    pool: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    record: &str,
+    cid: &str,
+    indexed_at: Option<&str>,
+) -> String {
+    let uri = format!("at://{did}/{collection}/{rkey}");
+    let sql = crate::db::adapt_sql(
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(&uri)
+        .bind(did)
+        .bind(collection)
+        .bind(rkey)
+        .bind(record)
+        .bind(cid)
+        .bind(indexed_at)
+        .bind(crate::db::now_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("seed {uri}: {e}"));
+    uri
+}
+
 /// The encryption key every test uses.
 ///
 /// One value across the whole suite: DB-backed tests share a database, and a
@@ -330,4 +367,67 @@ pub fn assert_index_without_sort(
         crate::db::DatabaseBackend::Postgres => plan.iter().any(|line| line.contains("Sort  (")),
     };
     assert!(!sorts, "{backend:?} plan sorts: {plan:#?}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A test's hand-written record tables drift from the real schema and,
+    /// after the record store's cutover, from what the store writes at all.
+    /// Tests use `migrated_memory_pool` instead.
+    #[test]
+    fn no_unit_test_hand_writes_the_record_tables() {
+        // Built from parts so this file does not match its own needles.
+        let needles = [
+            format!("CREATE {} happyview_records", "TABLE"),
+            format!("CREATE {} happyview_record_refs", "TABLE"),
+        ];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read file");
+                    for needle in &needles {
+                        if text.contains(needle.as_str()) {
+                            offenders.push(format!("{}: {needle}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "hand-written record tables:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_record_writes_a_canonical_uri() {
+        let pool = migrated_memory_pool().await;
+        let uri = seed_record(
+            &pool,
+            crate::db::DatabaseBackend::Sqlite,
+            "did:plc:a",
+            "c",
+            "1",
+            "{}",
+            "cid",
+            None,
+        )
+        .await;
+        assert_eq!(uri, "at://did:plc:a/c/1");
+        let row: (String,) = crate::db::query_as("SELECT did FROM happyview_records WHERE uri = ?")
+            .bind(&uri)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, "did:plc:a");
+    }
 }

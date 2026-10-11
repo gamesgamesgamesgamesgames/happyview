@@ -1353,14 +1353,12 @@ mod tests {
     }
 
     async fn seeded_pool() -> sqlx::AnyPool {
-        let pool = crate::test_support::memory_pool().await;
+        let pool = crate::test_support::migrated_memory_pool().await;
         for sql in [
-            "CREATE TABLE happyview_records (uri TEXT PRIMARY KEY, did TEXT NOT NULL, collection TEXT NOT NULL, rkey TEXT, record TEXT NOT NULL, cid TEXT, indexed_at TEXT, created_at TEXT)",
-            "CREATE TABLE happyview_record_refs (source_uri TEXT NOT NULL, target_uri TEXT NOT NULL, collection TEXT NOT NULL)",
-            "INSERT INTO happyview_records VALUES ('at://a/c/1', 'did:plc:a', 'c', '1', '{\"n\":\"one\",\"score\":1}', 'cid1', NULL, '2026-01-01T00:00:01Z')",
-            "INSERT INTO happyview_records VALUES ('at://a/c/2', 'did:plc:a', 'c', '2', '{\"n\":\"two\",\"score\":2}', 'cid2', NULL, '2026-01-01T00:00:02Z')",
-            "INSERT INTO happyview_records VALUES ('at://b/c/3', 'did:plc:b', 'c', '3', '{\"n\":\"three\",\"score\":3}', 'cid3', NULL, '2026-01-01T00:00:03Z')",
-            "INSERT INTO happyview_record_refs VALUES ('at://a/c/2', 'at://a/c/1', 'c')",
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES ('at://did:plc:a/c/1', 'did:plc:a', 'c', '1', '{\"n\":\"one\",\"score\":1}', 'cid1', NULL, '2026-01-01T00:00:01Z')",
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES ('at://did:plc:a/c/2', 'did:plc:a', 'c', '2', '{\"n\":\"two\",\"score\":2}', 'cid2', NULL, '2026-01-01T00:00:02Z')",
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES ('at://did:plc:b/c/3', 'did:plc:b', 'c', '3', '{\"n\":\"three\",\"score\":3}', 'cid3', NULL, '2026-01-01T00:00:03Z')",
+            "INSERT INTO happyview_record_refs VALUES ('at://did:plc:a/c/2', 'at://did:plc:a/c/1', 'c')",
             "CREATE TABLE leaderboard (name TEXT, score INTEGER)",
             "INSERT INTO leaderboard VALUES ('x', 50), ('y', 150)",
             "CREATE TABLE flags (name TEXT, active INTEGER)",
@@ -1389,7 +1387,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(page.records.len(), 2);
-        assert_eq!(page.records[0]["uri"], "at://b/c/3");
+        assert_eq!(page.records[0]["uri"], "at://did:plc:b/c/3");
         let cursor = page.cursor.expect("more pages");
         let next = records_query(
             &pool,
@@ -1406,7 +1404,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(next.records.len(), 1);
-        assert_eq!(next.records[0]["uri"], "at://a/c/1");
+        assert_eq!(next.records[0]["uri"], "at://did:plc:a/c/1");
         assert!(next.cursor.is_none());
     }
 
@@ -1440,13 +1438,13 @@ mod tests {
     async fn every_read_returns_an_envelope_around_the_stored_body() {
         let pool = seeded_pool().await;
         for sql in [
-            "INSERT INTO happyview_records VALUES ('at://a/c/4', 'did:plc:a', 'c', '4', '{\"uri\":\"at://spoof\",\"n\":\"four\"}', '', '2026-02-02T00:00:00Z', '2026-01-01T00:00:04Z')",
-            "INSERT INTO happyview_record_refs VALUES ('at://a/c/4', 'at://b/c/3', 'c')",
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES ('at://did:plc:a/c/4', 'did:plc:a', 'c', '4', '{\"uri\":\"at://spoof\",\"n\":\"four\"}', '', '2026-02-02T00:00:00Z', '2026-01-01T00:00:04Z')",
+            "INSERT INTO happyview_record_refs VALUES ('at://did:plc:a/c/4', 'at://did:plc:b/c/3', 'c')",
         ] {
             crate::db::query(sql).execute(&pool).await.unwrap();
         }
         let expected = json!({
-            "uri": "at://a/c/4",
+            "uri": "at://did:plc:a/c/4",
             "did": "did:plc:a",
             "collection": "c",
             "rkey": "4",
@@ -1455,7 +1453,7 @@ mod tests {
             "record": {"uri": "at://spoof", "n": "four"},
         });
 
-        let got = records_get(&pool, Sqlite, "at://a/c/4")
+        let got = records_get(&pool, Sqlite, "at://did:plc:a/c/4")
             .await
             .unwrap()
             .unwrap();
@@ -1495,7 +1493,7 @@ mod tests {
             &pool,
             Sqlite,
             BacklinksQuery {
-                uri: "at://b/c/3".into(),
+                uri: "at://did:plc:b/c/3".into(),
                 collection: "c".into(),
                 did: None,
                 limit: None,
@@ -1512,7 +1510,7 @@ mod tests {
     #[tokio::test]
     async fn envelope_reports_a_cid_and_a_null_indexed_at() {
         let pool = seeded_pool().await;
-        let got = records_get(&pool, Sqlite, "at://a/c/1")
+        let got = records_get(&pool, Sqlite, "at://did:plc:a/c/1")
             .await
             .unwrap()
             .unwrap();
@@ -1536,12 +1534,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 2);
-        let got = records_get(&pool, Sqlite, "at://a/c/1")
+        let got = records_get(&pool, Sqlite, "at://did:plc:a/c/1")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(got["record"]["n"], "one");
-        assert_eq!(got["uri"], "at://a/c/1");
+        assert_eq!(got["uri"], "at://did:plc:a/c/1");
         assert!(
             records_get(&pool, Sqlite, "at://nope")
                 .await
@@ -1565,7 +1563,7 @@ mod tests {
             &pool,
             Sqlite,
             BacklinksQuery {
-                uri: "at://a/c/1".into(),
+                uri: "at://did:plc:a/c/1".into(),
                 collection: "c".into(),
                 did: None,
                 limit: None,
@@ -1575,7 +1573,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(back.records.len(), 1);
-        assert_eq!(back.records[0]["uri"], "at://a/c/2");
+        assert_eq!(back.records[0]["uri"], "at://did:plc:a/c/2");
     }
 
     #[tokio::test]
@@ -1733,7 +1731,7 @@ mod tests {
             IndexPut {
                 collection: "c".into(),
                 rkey: "1".into(),
-                did: Some("a".into()),
+                did: Some("did:plc:a".into()),
                 record: json!({"n": "edited"}),
                 cid: Some("bafysomethingelse".into()),
             },
@@ -1744,7 +1742,7 @@ mod tests {
 
         let row: (Option<String>,) =
             crate::db::query_as("SELECT cid FROM happyview_records WHERE uri = ?")
-                .bind("at://a/c/1")
+                .bind("at://did:plc:a/c/1")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -1757,7 +1755,7 @@ mod tests {
     async fn index_put_leaves_network_provenance_alone() {
         let pool = seeded_pool().await;
         crate::db::query(
-            "UPDATE happyview_records SET indexed_at = ?, cid = ? WHERE uri = 'at://a/c/1'",
+            "UPDATE happyview_records SET indexed_at = ?, cid = ? WHERE uri = 'at://did:plc:a/c/1'",
         )
         .bind("2026-01-01T00:00:00Z")
         .bind("bafyoriginal")
@@ -1771,7 +1769,7 @@ mod tests {
             IndexPut {
                 collection: "c".into(),
                 rkey: "1".into(),
-                did: Some("a".into()),
+                did: Some("did:plc:a".into()),
                 record: json!({"n": "edited"}),
                 cid: None,
             },
@@ -1782,7 +1780,7 @@ mod tests {
 
         let row: (Option<String>, Option<String>) =
             crate::db::query_as("SELECT indexed_at, cid FROM happyview_records WHERE uri = ?")
-                .bind("at://a/c/1")
+                .bind("at://did:plc:a/c/1")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -1832,7 +1830,7 @@ mod tests {
     #[tokio::test]
     async fn mirrored_create_lands_with_the_pds_cid_and_no_indexed_at() {
         let pool = seeded_pool().await;
-        let record = json!({"n": "mine", "subject": "at://a/c/1"});
+        let record = json!({"n": "mine", "subject": "at://did:plc:a/c/1"});
         mirror_network_write(
             &pool,
             Sqlite,
@@ -1858,24 +1856,26 @@ mod tests {
         assert_eq!(got["record"], record);
         assert_eq!(
             ref_targets(&pool, "at://did:plc:a/c/fresh").await,
-            vec!["at://a/c/1"]
+            vec!["at://did:plc:a/c/1"]
         );
     }
 
     #[tokio::test]
     async fn mirrored_put_replaces_the_cid_and_clears_indexed_at() {
         let pool = seeded_pool().await;
-        crate::db::query("UPDATE happyview_records SET indexed_at = ? WHERE uri = 'at://a/c/2'")
-            .bind("2026-01-01T00:00:00Z")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let record = json!({"n": "edited", "subject": "at://b/c/3"});
+        crate::db::query(
+            "UPDATE happyview_records SET indexed_at = ? WHERE uri = 'at://did:plc:a/c/2'",
+        )
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let record = json!({"n": "edited", "subject": "at://did:plc:b/c/3"});
         mirror_network_write(
             &pool,
             Sqlite,
             NetworkWrite {
-                uri: "at://a/c/2",
+                uri: "at://did:plc:a/c/2",
                 did: "did:plc:a",
                 collection: "c",
                 rkey: "2",
@@ -1886,32 +1886,38 @@ mod tests {
         .await
         .unwrap();
 
-        let (cid, indexed_at) = provenance(&pool, "at://a/c/2").await;
+        let (cid, indexed_at) = provenance(&pool, "at://did:plc:a/c/2").await;
         assert_eq!(cid.as_deref(), Some("bafyv2"));
         assert_eq!(indexed_at, None, "the identical echo must re-stamp the row");
-        let got = records_get(&pool, Sqlite, "at://a/c/2")
+        let got = records_get(&pool, Sqlite, "at://did:plc:a/c/2")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(got["record"], record);
-        assert_eq!(ref_targets(&pool, "at://a/c/2").await, vec!["at://b/c/3"]);
+        assert_eq!(
+            ref_targets(&pool, "at://did:plc:a/c/2").await,
+            vec!["at://did:plc:b/c/3"]
+        );
     }
 
     #[tokio::test]
     async fn mirrored_delete_removes_the_row_and_its_refs() {
         let pool = seeded_pool().await;
-        assert_eq!(ref_targets(&pool, "at://a/c/2").await, vec!["at://a/c/1"]);
-        mirror_network_delete(&pool, Sqlite, "at://a/c/2")
+        assert_eq!(
+            ref_targets(&pool, "at://did:plc:a/c/2").await,
+            vec!["at://did:plc:a/c/1"]
+        );
+        mirror_network_delete(&pool, Sqlite, "at://did:plc:a/c/2")
             .await
             .unwrap();
         assert!(
-            records_get(&pool, Sqlite, "at://a/c/2")
+            records_get(&pool, Sqlite, "at://did:plc:a/c/2")
                 .await
                 .unwrap()
                 .is_none()
         );
-        assert!(ref_targets(&pool, "at://a/c/2").await.is_empty());
-        mirror_network_delete(&pool, Sqlite, "at://a/c/2")
+        assert!(ref_targets(&pool, "at://did:plc:a/c/2").await.is_empty());
+        mirror_network_delete(&pool, Sqlite, "at://did:plc:a/c/2")
             .await
             .expect("a second delete is a no-op");
     }
@@ -1920,10 +1926,14 @@ mod tests {
     /// has to surface it, and say which step failed, rather than swallow it.
     #[tokio::test]
     async fn a_mirror_that_cannot_write_names_the_failed_step() {
-        let pool = crate::test_support::memory_pool().await;
-        let record = json!({"subject": "at://a/c/1"});
+        let pool = crate::test_support::migrated_memory_pool().await;
+        crate::db::query("DROP TABLE happyview_records")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let record = json!({"subject": "at://did:plc:a/c/1"});
         let write = NetworkWrite {
-            uri: "at://a/c/1",
+            uri: "at://did:plc:a/c/1",
             did: "did:plc:a",
             collection: "c",
             rkey: "1",
@@ -1936,19 +1946,18 @@ mod tests {
         assert!(matches!(err, MirrorError::Row(_)), "{err}");
         assert!(err.to_string().starts_with("row not written"), "{err}");
 
-        crate::db::query(
-            "CREATE TABLE happyview_records (uri TEXT PRIMARY KEY, did TEXT NOT NULL, collection TEXT NOT NULL, rkey TEXT, record TEXT NOT NULL, cid TEXT, indexed_at TEXT, created_at TEXT)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let pool = crate::test_support::migrated_memory_pool().await;
+        crate::db::query("DROP TABLE happyview_record_refs")
+            .execute(&pool)
+            .await
+            .unwrap();
         let err = mirror_network_write(&pool, Sqlite, write)
             .await
             .unwrap_err();
         assert!(matches!(err, MirrorError::Refs(_)), "{err}");
         assert!(err.to_string().starts_with("row written"), "{err}");
         assert!(
-            records_get(&pool, Sqlite, "at://a/c/1")
+            records_get(&pool, Sqlite, "at://did:plc:a/c/1")
                 .await
                 .unwrap()
                 .is_some(),
@@ -1959,7 +1968,7 @@ mod tests {
     #[tokio::test]
     async fn a_mirror_delete_that_cannot_write_reports_it() {
         let pool = crate::test_support::memory_pool().await;
-        let err = mirror_network_delete(&pool, Sqlite, "at://a/c/1")
+        let err = mirror_network_delete(&pool, Sqlite, "at://did:plc:a/c/1")
             .await
             .unwrap_err();
         assert!(matches!(err, RecordsError::Database(_)), "{err}");
@@ -1968,10 +1977,18 @@ mod tests {
     #[tokio::test]
     async fn index_delete_reports_whether_a_row_went() {
         let pool = seeded_pool().await;
-        assert!(index_delete(&pool, Sqlite, "at://a/c/1").await.unwrap());
-        assert!(!index_delete(&pool, Sqlite, "at://a/c/1").await.unwrap());
         assert!(
-            records_get(&pool, Sqlite, "at://a/c/1")
+            index_delete(&pool, Sqlite, "at://did:plc:a/c/1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !index_delete(&pool, Sqlite, "at://did:plc:a/c/1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            records_get(&pool, Sqlite, "at://did:plc:a/c/1")
                 .await
                 .unwrap()
                 .is_none()

@@ -132,23 +132,7 @@ mod tests {
     use crate::test_support::memory_pool;
 
     async fn pool_with_records() -> sqlx::AnyPool {
-        let pool = memory_pool().await;
-        crate::db::query(
-            "CREATE TABLE happyview_records (
-                uri TEXT PRIMARY KEY,
-                did TEXT NOT NULL,
-                collection TEXT NOT NULL,
-                rkey TEXT NOT NULL,
-                record TEXT NOT NULL,
-                cid TEXT NOT NULL,
-                indexed_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create records");
-        pool
+        crate::test_support::migrated_memory_pool().await
     }
 
     async fn insert_record(pool: &sqlx::AnyPool, uri: &str, collection: &str) {
