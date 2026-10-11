@@ -278,7 +278,10 @@ async fn handle_create_record(
                 .write_local(crate::record_store::WriteKind::Echoed, &prepared)
                 .await
             {
-                state.records.report_index_failure(uri, &e).await;
+                state
+                    .records
+                    .report_index_failure(&prepared.uri(), &e)
+                    .await;
             }
         }
 

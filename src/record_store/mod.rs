@@ -173,10 +173,7 @@ impl RecordStore {
             let blocked =
                 crate::tombstones::blocked_writes(&mut *conn, self.backend, &candidates).await?;
             if !blocked.is_empty() {
-                tracing::debug!(
-                    skipped = blocked.len(),
-                    "skipping records a tombstone supersedes"
-                );
+                tracing::debug!(?blocked, "skipping records a tombstone supersedes");
                 records.retain(|rec| !blocked.contains(&rec.uri()));
             }
         }
@@ -318,33 +315,31 @@ impl RecordStore {
         Ok(written)
     }
 
-    /// One local write (`Echoed` or `IndexOnly`): the row, then its refs, as
-    /// two steps whose failures are told apart.
+    /// One local write (`Echoed` or `IndexOnly`): the row, then its refs in
+    /// a transaction of their own, as two steps whose failures are told
+    /// apart. A `Network` kind is refused: it needs the locks and tombstone
+    /// checks of [`Self::upsert_batch`].
     pub async fn write_local(
         &self,
         kind: WriteKind,
         record: &PreparedRecord,
     ) -> Result<(), LocalWriteError> {
-        debug_assert!(
-            kind != WriteKind::Network,
-            "network writes go through upsert_batch"
-        );
-        {
+        if kind == WriteKind::Network {
+            return Err(LocalWriteError::Row(sqlx::Error::InvalidArgument(
+                "a network write goes through upsert_batch, not write_local".to_string(),
+            )));
+        }
+        let written = {
             let mut conn = self.db.acquire().await.map_err(LocalWriteError::Row)?;
             self.upsert_rows(&mut conn, kind, &[record])
                 .await
-                .map_err(LocalWriteError::Row)?;
-        }
-        let value: Value = serde_json::from_str(&record.record_json).unwrap_or(Value::Null);
-        crate::record_refs::sync_refs(
-            &self.db,
-            &record.uri(),
-            &record.collection,
-            &value,
-            self.backend,
-        )
-        .await
-        .map_err(LocalWriteError::Refs)
+                .map_err(LocalWriteError::Row)?
+        };
+        let mut tx = self.db.begin().await.map_err(LocalWriteError::Refs)?;
+        self.sync_refs_for(&mut tx, &[record], &written)
+            .await
+            .map_err(LocalWriteError::Refs)?;
+        tx.commit().await.map_err(LocalWriteError::Refs)
     }
 
     /// Delete one record and its refs. Idempotent; says whether a row was
@@ -574,7 +569,10 @@ impl RecordStore {
 
     /// Delete up to `limit` of `did`'s network records and their refs on the
     /// caller's transaction, which must hold the DID's lock. Returns how many
-    /// went.
+    /// were selected, not how many rows the delete found: a delete that does
+    /// not take the DID's lock (admin, XRPC, plugin) can remove one in
+    /// between on Postgres, and a short count would end the caller's batch
+    /// loop while the account still holds records.
     pub async fn purge_network_batch(
         &self,
         conn: &mut AnyConnection,
@@ -585,7 +583,8 @@ impl RecordStore {
         let uris = self
             .held_network_uris(&mut *conn, did, collections, limit)
             .await?;
-        self.delete_uris(conn, &uris).await
+        self.delete_uris(conn, &uris).await?;
+        Ok(uris.len() as u64)
     }
 
     /// Delete up to `limit` records of `collection`, and their refs, in one
@@ -1126,5 +1125,75 @@ mod tests {
             .await
             .expect("clean up");
         }
+    }
+    /// A row an unlocked delete removes between the purge's select and its
+    /// delete still counts as purged: the batch was full, so the caller's
+    /// loop must go on. Postgres only; SQLite's `BEGIN IMMEDIATE` serialises
+    /// the two.
+    #[tokio::test]
+    async fn a_purge_batch_counts_a_row_a_concurrent_delete_took() {
+        for (pool, backend) in test_pools().await {
+            if backend != DatabaseBackend::Postgres {
+                continue;
+            }
+            let store = RecordStore::new(pool.clone(), backend);
+            let did = unique_did();
+            let taken = prepared(&did, "taken", r#"{"n":1}"#, "c1", None);
+            let kept = prepared(&did, "kept", r#"{"n":2}"#, "c2", None);
+            store
+                .write_network(&pool, &[taken.clone(), kept.clone()])
+                .await
+                .expect("write");
+
+            // An uncommitted delete holds `taken`'s row lock: the purge's
+            // select still sees the row, and its delete waits on the lock.
+            let mut other = pool.begin().await.expect("begin");
+            crate::db::query(&adapt_sql(
+                "DELETE FROM happyview_records WHERE uri = ?",
+                backend,
+            ))
+            .bind(taken.uri())
+            .execute(&mut *other)
+            .await
+            .expect("concurrent delete");
+
+            let purge = tokio::spawn({
+                let (store, did) = (store.clone(), did.clone());
+                async move {
+                    let mut tx = crate::db::begin_write(store.db(), store.backend()).await?;
+                    let purged = store.purge_network_batch(&mut tx, &did, None, 2).await?;
+                    tx.commit().await?;
+                    Ok::<_, sqlx::Error>(purged)
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert!(
+                !purge.is_finished(),
+                "the purge's delete waits on the row lock"
+            );
+            other.commit().await.expect("commit the concurrent delete");
+
+            let purged = purge.await.expect("join").expect("purge");
+            assert_eq!(purged, 2, "both selected rows count, though one was gone");
+            assert!(
+                !store
+                    .holds_network_records(&did, None)
+                    .await
+                    .expect("holds")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_network_write_is_refused_by_write_local() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let store = RecordStore::new(pool, DatabaseBackend::Sqlite);
+        let rec = prepared(&unique_did(), "a", "{}", "c", None);
+        let err = store
+            .write_local(WriteKind::Network, &rec)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LocalWriteError::Row(_)), "{err}");
+        assert!(row(&store, &rec.uri()).await.is_none());
     }
 }

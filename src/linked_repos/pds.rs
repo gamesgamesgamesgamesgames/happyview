@@ -157,19 +157,32 @@ pub async fn index_write(
     cid: &str,
     record: &Value,
 ) -> Result<(), crate::record_store::LocalWriteError> {
-    let rkey = uri.split('/').next_back().unwrap_or_default();
-    let prepared = crate::record_store::PreparedRecord {
+    state
+        .records
+        .write_local(
+            crate::record_store::WriteKind::Echoed,
+            &prepared_write(did, collection, uri, cid, record),
+        )
+        .await
+}
+
+/// The row `index_write` stores: keyed by `did`, `collection` and the record
+/// key at the end of the PDS's `uri`.
+fn prepared_write(
+    did: &str,
+    collection: &str,
+    uri: &str,
+    cid: &str,
+    record: &Value,
+) -> crate::record_store::PreparedRecord {
+    crate::record_store::PreparedRecord {
         did: did.to_string(),
         collection: collection.to_string(),
-        rkey: rkey.to_string(),
+        rkey: uri.split('/').next_back().unwrap_or_default().to_string(),
         record_json: serde_json::to_string(record).unwrap_or_default(),
         cid: cid.to_string(),
         rev: None,
-    };
-    state
-        .records
-        .write_local(crate::record_store::WriteKind::Echoed, &prepared)
-        .await
+    }
 }
 
 /// Remove a record and its refs from the local index after a successful
@@ -218,7 +231,8 @@ pub async fn create_record(
     let out = post_json(&session, "com.atproto.repo.createRecord", &body).await?;
     let (uri, cid) = extract_uri_cid(&out, "createRecord")?;
     if let Err(e) = index_write(state, did, collection, &uri, &cid, &body["record"]).await {
-        state.records.report_index_failure(&uri, &e).await;
+        let indexed = prepared_write(did, collection, &uri, &cid, &body["record"]).uri();
+        state.records.report_index_failure(&indexed, &e).await;
     }
     Ok((uri, cid))
 }
@@ -248,7 +262,8 @@ pub async fn put_record(
     let out = post_json(&session, "com.atproto.repo.putRecord", &body).await?;
     let (uri, cid) = extract_uri_cid(&out, "putRecord")?;
     if let Err(e) = index_write(state, did, collection, &uri, &cid, &body["record"]).await {
-        state.records.report_index_failure(&uri, &e).await;
+        let indexed = prepared_write(did, collection, &uri, &cid, &body["record"]).uri();
+        state.records.report_index_failure(&indexed, &e).await;
     }
     Ok((uri, cid))
 }
