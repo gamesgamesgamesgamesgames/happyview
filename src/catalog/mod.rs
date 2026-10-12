@@ -14,7 +14,9 @@ use crate::error::AppError;
 pub mod lexicon_rows;
 pub mod lexicons;
 
-pub use lexicons::{LexiconCatalog, NetworkLexicon};
+pub use lexicons::{
+    LexiconCatalog, LexiconListing, LexiconWrite, NetworkLexicon, NetworkWriteError,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
