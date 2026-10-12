@@ -1448,17 +1448,27 @@ async fn swap(
             "record store upgrade: returning the legacy tables' pages to the filesystem"
         );
         // In checkpointed steps: one `incremental_vacuum` over every legacy
-        // page would grow the WAL to about the legacy tables' size.
-        let reclaimed = crate::maintenance::sqlite::reclaim_free_pages_on(
+        // page would grow the WAL to about the legacy tables' size. The swap
+        // has committed, so a failure here costs only disk: the pages stay
+        // free in the file for SQLite to reuse, and the next
+        // `incremental_vacuum` (the hourly cleanup's, or a compression
+        // pass's) returns them.
+        match crate::maintenance::sqlite::reclaim_free_pages_on(
             conn,
             crate::maintenance::sqlite::RECLAIM_CHUNK_BYTES,
         )
-        .await?;
-        tracing::info!(
-            pages = reclaimed.pages,
-            steps = reclaimed.chunks,
-            "record store upgrade: returned the legacy tables' pages"
-        );
+        .await
+        {
+            Ok(reclaimed) => tracing::info!(
+                pages = reclaimed.pages,
+                steps = reclaimed.chunks,
+                "record store upgrade: returned the legacy tables' pages"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "record store upgrade: could not return the legacy tables' pages; they stay free in the database file"
+            ),
+        }
     }
     Ok(summary)
 }
