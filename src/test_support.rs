@@ -31,6 +31,12 @@ pub async fn memory_pool() -> sqlx::AnyPool {
 /// database. The path is anchored to the crate manifest so the helper works
 /// from any working directory.
 pub async fn migrated_memory_pool() -> sqlx::AnyPool {
+    pre_upgrade_memory_pool().await
+}
+
+/// Every SQLite migration applied, the record store upgrade not run: the
+/// legacy record tables are still tables and the v2 tables are empty.
+pub async fn pre_upgrade_memory_pool() -> sqlx::AnyPool {
     let pool = memory_pool().await;
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite");
     sqlx::migrate::Migrator::new(dir)
@@ -40,6 +46,71 @@ pub async fn migrated_memory_pool() -> sqlx::AnyPool {
         .await
         .expect("run migrations");
     pool
+}
+
+/// A pre-upgrade database (see [`pre_upgrade_memory_pool`]). The Postgres
+/// one is a scratch database on the `TEST_DATABASE_URL` server, so tests
+/// that copy or swap tables never touch the shared test schema.
+pub struct PreUpgradePool {
+    pub pool: sqlx::AnyPool,
+    pub backend: crate::db::DatabaseBackend,
+    scratch: Option<(sqlx::AnyPool, String)>,
+}
+
+impl PreUpgradePool {
+    /// Close the pool and drop the scratch database, if any.
+    pub async fn finish(self) {
+        self.pool.close().await;
+        if let Some((admin, name)) = self.scratch {
+            let _ = crate::db::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
+                .execute(&admin)
+                .await;
+            admin.close().await;
+        }
+    }
+}
+
+/// A pre-upgrade SQLite database, plus a Postgres one when
+/// `TEST_DATABASE_URL` names a Postgres server.
+pub async fn pre_upgrade_pools() -> Vec<PreUpgradePool> {
+    use crate::db::DatabaseBackend;
+    let mut out = vec![PreUpgradePool {
+        pool: pre_upgrade_memory_pool().await,
+        backend: DatabaseBackend::Sqlite,
+        scratch: None,
+    }];
+    if let Ok(url) = std::env::var("TEST_DATABASE_URL")
+        && DatabaseBackend::from_url(&url) == DatabaseBackend::Postgres
+    {
+        crate::db::install_drivers();
+        let admin = sqlx::AnyPool::connect(&url)
+            .await
+            .expect("connect to the test server");
+        let name = format!("hv_pre_{}", uuid::Uuid::new_v4().simple());
+        crate::db::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .expect("create a scratch database");
+        let (server, _) = url
+            .rsplit_once('/')
+            .expect("TEST_DATABASE_URL names a database");
+        let pool = sqlx::AnyPool::connect(&format!("{server}/{name}"))
+            .await
+            .expect("connect to the scratch database");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        sqlx::migrate::Migrator::new(dir)
+            .await
+            .expect("load postgres migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        out.push(PreUpgradePool {
+            pool,
+            backend: DatabaseBackend::Postgres,
+            scratch: Some((admin, name)),
+        });
+    }
+    out
 }
 
 /// Insert one record the way raw SQL would, with a URI that agrees with its

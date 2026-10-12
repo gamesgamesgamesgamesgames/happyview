@@ -8,6 +8,7 @@
 //! place, and the two ingest paths cannot drift apart.
 
 pub mod codec;
+pub mod compat;
 pub mod compression;
 pub mod intern;
 pub mod query;
