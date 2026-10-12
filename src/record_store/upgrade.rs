@@ -84,9 +84,10 @@ pub enum UpgradeError {
     #[error("record store upgrade verification failed, nothing was dropped: {0}")]
     Mismatch(String),
     #[error(
-        "record store upgrade: {} depend on happyview_records or happyview_record_refs, \
-         which the upgrade replaces with views of the same names; drop them, restart to \
-         upgrade, then recreate them (they will read the views); nothing was copied or dropped",
+        "record store upgrade: these objects depend on happyview_records or \
+         happyview_record_refs, which the upgrade replaces with views of the same names: {}; \
+         drop them, restart to upgrade, then recreate the views and rules (foreign keys \
+         cannot point at a view); nothing was copied or dropped",
         .0.join(", ")
     )]
     DependentObjects(Vec<String>),

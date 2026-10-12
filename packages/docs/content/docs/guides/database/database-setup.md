@@ -80,15 +80,17 @@ Make sure there is enough free disk:
 
 **Your own indexes, triggers and views on the old tables.** The upgrade drops `happyview_records` and `happyview_record_refs` and puts views of the same names in their place, so what you built on the old tables goes with them:
 
-- **Indexes and triggers** you created on either table are dropped with it, on both backends. The upgrade logs each one first, at warn level, with its full definition (`record store upgrade: dropping an object on the old record tables that HappyView did not create`, with `kind`, `name` and `definition` fields), and then carries on. Recreate an index on the table behind the view, where queries on the view use it; see [JSON indexes on Postgres](#after-the-upgrade):
+- **Indexes and triggers** you created on either table are dropped with it, on both backends. The upgrade logs each one first, at warn level, with its full definition (`record store upgrade: dropping an object on the old record tables that HappyView did not create`, with `kind`, `name` and `definition` fields), and then carries on. On Postgres, recreate an index on the table behind the view, where queries on the view use it; see [JSON indexes on Postgres](#after-the-upgrade):
 
   ```sql
   CREATE INDEX ON happyview_records_v2 ((record::jsonb->>'via'));
   ```
 
+  On SQLite a JSON index such as `json_extract(record, '$.via')` has no replacement: the body behind the view is compressed, so there is no column to index. Queries on JSON fields still work through the view, as a scan of the collection.
+
   A trigger cannot be recreated on the view as it was: write through the view and react in your own code, or put the trigger on `happyview_records_v2`, whose columns are the compact ones.
 - **Views on SQLite** keep working. They name `happyview_records`, which is the new view after the upgrade.
-- **Views, materialized views, rules and foreign keys on Postgres** that depend on either table would stop the old table from being dropped. The upgrade checks for them before it copies anything and stops with an error that names each one, such as `record store upgrade: view my_witchsky depend on happyview_records or happyview_record_refs, …`. Nothing is copied or dropped. Save their definitions, drop them, start HappyView again so the upgrade runs, then recreate them: they read the views the same way they read the tables.
+- **Views, materialized views, rules and foreign keys on Postgres** that depend on either table would stop the old table from being dropped. The upgrade checks for them before it copies anything and stops with an error that names each one, such as `record store upgrade: these objects depend on happyview_records or happyview_record_refs, which the upgrade replaces with views of the same names: view my_witchsky; …`. Nothing is copied or dropped. Save their definitions, drop them and start HappyView again so the upgrade runs. Then recreate the views and rules: they read the new views the same way they read the tables. A foreign key cannot point at a view, so a foreign key to either table cannot come back; check the reference in your own code instead.
 
 **On SQLite, start one instance.** A second process started on the same file while the first is upgrading can exit with `database is locked`. Start it again once the first is serving: it finds the upgrade done.
 
