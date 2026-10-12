@@ -141,6 +141,14 @@ pub fn parse_superadmin_did(raw: Option<&str>) -> Result<Option<String>, String>
         .map_err(|e| format!("SUPERADMIN_DID is not a valid DID ('{trimmed}'): {e}"))
 }
 
+/// Environment entries whose name and value are both UTF-8; the rest cannot
+/// name a configuration variable and must not abort boot.
+pub fn utf8_env(
+    entries: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> impl Iterator<Item = (String, String)> {
+    entries.filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub host: String,
@@ -235,11 +243,16 @@ impl Config {
             .map(|p| p.env_layer(mode))
             .unwrap_or_default();
         let mut view: BTreeMap<String, String> = layer.clone();
-        view.extend(env::vars());
+        view.extend(utf8_env(env::vars_os()));
         for (name, value) in defaults(&view) {
             layer.entry(name).or_insert(value);
         }
         vars::set_project_layer(layer);
+        // An unusable superadmin must not read as "none configured": that
+        // would hand the first login the admin role.
+        if let Err(message) = parse_superadmin_did(var("SUPERADMIN_DID").as_deref()) {
+            return Err(project::ProjectConfigError::InvalidSetting { message });
+        }
         if let Some(message) = project
             .as_ref()
             .and_then(|p| p.version_mismatch(crate::version::version()))
@@ -1291,14 +1304,68 @@ mod tests {
 
     #[test]
     #[serial]
-    fn an_invalid_superadmin_env_seeds_nobody() {
+    fn an_invalid_superadmin_env_refuses_boot() {
         unsafe {
             clear_env();
             set_required_env();
             env::set_var("SUPERADMIN_DID", "alice.bsky.social");
         }
-        let config = from_project(SUPERADMIN_TOML, project::ConfigMode::Serve);
+        let _reset = vars::LayerReset;
+        let err = Config::load_from(None, ConfigMode::Serve).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("SUPERADMIN_DID"), "{message}");
+        assert!(message.contains("alice.bsky.social"), "{message}");
+    }
+
+    #[test]
+    #[serial]
+    fn an_invalid_superadmin_in_the_file_refuses_boot() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let root = env::temp_dir().join(format!("hv-sa-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(project::PROJECT_FILE),
+            "[instance]\nsuperadmin = \"not-a-did\"\n",
+        )
+        .unwrap();
+        let result = Config::load_from(Some(&root), ConfigMode::Serve);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn a_blank_superadmin_env_is_unset() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("SUPERADMIN_DID", "  ");
+        }
+        let _reset = vars::LayerReset;
+        let config = Config::load_from(None, ConfigMode::Serve).unwrap();
         assert_eq!(config.superadmin_did, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_environment_entries_are_skipped() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![0x66, 0xff, 0x6f]);
+        let kept: Vec<_> = utf8_env(
+            vec![
+                ("GOOD".into(), "yes".into()),
+                (bad.clone(), "v".into()),
+                ("BADVAL".into(), bad),
+            ]
+            .into_iter(),
+        )
+        .collect();
+        assert_eq!(kept, vec![("GOOD".to_string(), "yes".to_string())]);
     }
 
     #[test]

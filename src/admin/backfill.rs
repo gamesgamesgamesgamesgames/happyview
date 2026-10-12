@@ -3535,7 +3535,8 @@ async fn fetch_records_page_loop(
 // ---------------------------------------------------------------------------
 
 async fn run_backfill_job(state: AppState, job_id: String) {
-    let window = parse_discovery_window(std::env::var("BACKFILL_DISCOVERY_WINDOW").ok().as_deref());
+    let window =
+        parse_discovery_window(crate::config::vars::var("BACKFILL_DISCOVERY_WINDOW").as_deref());
     run_backfill_job_with(state, job_id, window).await;
 }
 

@@ -186,6 +186,13 @@ pub(super) async fn delete_lexicon(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::LexiconsDelete).await?;
     let backend = state.db_backend;
+    // The same message as the network-lexicon route: the file is the source of
+    // truth, so a delete here would be undone at the next boot.
+    if state.config.declares_network_lexicon(&id) {
+        return Err(AppError::Conflict(format!(
+            "'{id}' is declared in happyview.toml; remove it from the file instead"
+        )));
+    }
     if !state.lexicons.remove(&state.db, backend, &id).await? {
         return Err(AppError::NotFound(format!("lexicon '{id}' not found")));
     }

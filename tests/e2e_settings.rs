@@ -920,6 +920,7 @@ impl Drop for ProjectLayerGuard {
 #[tokio::test]
 #[serial]
 async fn the_listing_reports_a_project_file_value_with_its_source() {
+    common::require_db!();
     let app = TestApp::new().await;
     let _guard = ProjectLayerGuard;
     unsafe { std::env::remove_var("APP_NAME") };

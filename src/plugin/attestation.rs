@@ -377,16 +377,16 @@ fn legacy_json_to_cbor(value: &Value) -> ciborium::Value {
 pub type SharedAttestationSigner = Arc<AttestationSigner>;
 
 pub fn load_from_env() -> Result<Option<AttestationSigner>, AttestationError> {
-    let private_key = match std::env::var("ATTESTATION_PRIVATE_KEY") {
-        Ok(k) => k,
-        Err(_) => return Ok(None),
+    let private_key = match crate::config::vars::var("ATTESTATION_PRIVATE_KEY") {
+        Some(k) => k,
+        None => return Ok(None),
     };
 
-    let key_id = std::env::var("ATTESTATION_KEY_ID")
-        .unwrap_or_else(|_| "did:web:localhost#attestation".to_string());
+    let key_id = crate::config::vars::var("ATTESTATION_KEY_ID")
+        .unwrap_or_else(|| "did:web:localhost#attestation".to_string());
 
-    let sig_type = std::env::var("ATTESTATION_SIG_TYPE")
-        .unwrap_or_else(|_| "games.gamesgamesgamesgames.attestation".to_string());
+    let sig_type = crate::config::vars::var("ATTESTATION_SIG_TYPE")
+        .unwrap_or_else(|| "games.gamesgamesgamesgames.attestation".to_string());
 
     Ok(Some(AttestationSigner::from_hex(
         &private_key,

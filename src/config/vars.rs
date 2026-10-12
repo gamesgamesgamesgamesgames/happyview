@@ -28,6 +28,7 @@ impl VarSource {
 }
 
 /// Replace the project layer. Called once at boot, before `Config` is built.
+/// The layer is process-wide, so a test that installs one must be `#[serial]`.
 pub fn set_project_layer(layer: BTreeMap<String, String>) {
     *PROJECT_LAYER.write().unwrap_or_else(|e| e.into_inner()) = layer;
 }
@@ -50,7 +51,7 @@ pub fn var(name: &str) -> Option<String> {
 }
 
 /// Clears the layer when dropped, so a test that installs one cannot leak
-/// it into the next.
+/// it into the next. Tests holding one must be `#[serial]`.
 #[cfg(test)]
 pub(crate) struct LayerReset;
 

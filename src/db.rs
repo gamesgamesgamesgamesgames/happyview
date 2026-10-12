@@ -576,7 +576,7 @@ pub fn parse_journal_size_limit(raw: Option<&str>) -> u64 {
 
 /// Resolve the configured journal size limit from the environment.
 pub fn journal_size_limit_bytes() -> u64 {
-    parse_journal_size_limit(std::env::var("SQLITE_JOURNAL_SIZE_LIMIT").ok().as_deref())
+    parse_journal_size_limit(crate::config::vars::var("SQLITE_JOURNAL_SIZE_LIMIT").as_deref())
 }
 
 /// Parse `SQLITE_SYNCHRONOUS`. `NORMAL` is the default: in WAL mode a crash
@@ -601,7 +601,7 @@ pub fn parse_sqlite_synchronous(raw: Option<&str>) -> &'static str {
 
 /// Resolve the configured `synchronous` level from the environment.
 pub fn sqlite_synchronous() -> &'static str {
-    parse_sqlite_synchronous(std::env::var("SQLITE_SYNCHRONOUS").ok().as_deref())
+    parse_sqlite_synchronous(crate::config::vars::var("SQLITE_SYNCHRONOUS").as_deref())
 }
 
 /// Rows `ANALYZE` samples per index when `PRAGMA optimize` decides to run it.
@@ -679,8 +679,7 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
         }
     }
 
-    let max_connections = std::env::var("DATABASE_MAX_CONNECTIONS")
-        .ok()
+    let max_connections = crate::config::vars::var("DATABASE_MAX_CONNECTIONS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(match backend {
             DatabaseBackend::Sqlite => 16,
@@ -882,8 +881,7 @@ pub fn compute_backfill_pool_size(
     dids_per_pds: u32,
     resolution: u32,
 ) -> u32 {
-    std::env::var("BACKFILL_DATABASE_MAX_CONNECTIONS")
-        .ok()
+    crate::config::vars::var("BACKFILL_DATABASE_MAX_CONNECTIONS")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or_else(|| {
             needed_backfill_connections(pds, dids_per_pds, resolution)
@@ -893,16 +891,13 @@ pub fn compute_backfill_pool_size(
 }
 
 pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPool {
-    let pds: u32 = std::env::var("BACKFILL_CONCURRENT_PDS")
-        .ok()
+    let pds: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_PDS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
-    let dids: u32 = std::env::var("BACKFILL_CONCURRENT_DIDS_PER_PDS")
-        .ok()
+    let dids: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_DIDS_PER_PDS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let resolution: u32 = std::env::var("BACKFILL_CONCURRENT_RESOLUTION")
-        .ok()
+    let resolution: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_RESOLUTION")
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
     let max_connections = compute_backfill_pool_size(backend, pds, dids, resolution);

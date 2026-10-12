@@ -252,7 +252,7 @@ async fn main() {
     // regardless of which of these two sources it came from.
     let mut boot_plugins: Vec<happyview::plugin::LoadedPlugin> = Vec::new();
 
-    if let Ok(urls) = std::env::var("PLUGIN_URLS") {
+    if let Some(urls) = happyview::config::vars::var("PLUGIN_URLS") {
         for (id, url, sha256) in happyview::plugin::loader::parse_plugin_urls(&urls) {
             match happyview::plugin::loader::fetch_manifest(&http, &url).await {
                 Ok(preview) => {
@@ -932,7 +932,7 @@ async fn main() {
         state.db.clone(),
         state.db_backend,
         happyview::event_log::parse_dead_letter_retention_days(
-            std::env::var("DEAD_LETTER_RETENTION_DAYS").ok().as_deref(),
+            happyview::config::vars::var("DEAD_LETTER_RETENTION_DAYS").as_deref(),
         ),
         happyview::tombstones::retention_hours(),
     ));

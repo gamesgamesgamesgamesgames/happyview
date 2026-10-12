@@ -405,6 +405,10 @@ pub enum ProjectConfigError {
         column: Option<usize>,
         message: String,
     },
+    /// A configured value that must refuse boot rather than degrade.
+    InvalidSetting {
+        message: String,
+    },
 }
 
 impl fmt::Display for ProjectConfigError {
@@ -415,6 +419,7 @@ impl fmt::Display for ProjectConfigError {
                 "project root {} does not exist or is not a directory",
                 root.display()
             ),
+            Self::InvalidSetting { message } => f.write_str(message),
             Self::Read { path, source } => write!(f, "could not read {}: {source}", path.display()),
             // `path:line:column: message` is the shape terminals and editors
             // turn into a link to the offending line.

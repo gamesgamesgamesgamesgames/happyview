@@ -126,7 +126,7 @@ impl RegistryConfig {
     /// what an offline stack should show rather than whatever the internet
     /// happened to answer.
     pub fn with_github_base_from_env(mut self) -> Self {
-        let Ok(configured) = std::env::var("PLUGIN_GITHUB_API_BASE") else {
+        let Some(configured) = crate::config::vars::var("PLUGIN_GITHUB_API_BASE") else {
             return self;
         };
         let configured = configured.trim();
@@ -137,7 +137,7 @@ impl RegistryConfig {
     }
 
     pub fn with_registry_from_env(mut self) -> Self {
-        let Ok(configured) = std::env::var("PLUGIN_REGISTRY_URL") else {
+        let Some(configured) = crate::config::vars::var("PLUGIN_REGISTRY_URL") else {
             return self;
         };
         let configured = configured.trim();

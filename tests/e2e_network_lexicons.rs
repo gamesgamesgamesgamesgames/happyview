@@ -242,3 +242,42 @@ async fn a_declared_network_lexicon_is_flagged_and_cannot_be_removed() {
     assert_eq!(list[0]["nsid"], nsid);
     assert_eq!(list[0]["declared"], true);
 }
+
+#[tokio::test]
+#[serial]
+async fn a_declared_network_lexicon_cannot_be_deleted_through_the_lexicon_route() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let nsid = "games.gamesgamesgamesgames.game";
+    seed_network_lexicon(&app, nsid, "did:plc:authority").await;
+    app.state.config.project = Some(declaring(&format!(
+        "[network_lexicons]\ninclude = [\"{nsid}\"]\n"
+    )));
+    app.rebuild_router();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_delete(
+            &format!("/admin/lexicons/{nsid}"),
+            app.admin_cookie(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = json_body(resp).await;
+    assert!(
+        body["error"].as_str().unwrap().contains("happyview.toml"),
+        "{body}"
+    );
+
+    let list = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get("/admin/network-lexicons", app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list[0]["nsid"], nsid);
+}

@@ -47,7 +47,7 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `VERBOSE_EVENT_LOGGING` | no | `false` | Log every record index, hook execution, and hook skip to the event log. High write volume — recommended only for debugging. Overridden by database setting if set via admin API |
 | `RUST_LOG` | no | `happyview=debug,tower_http=debug,sqlx=warn` | Log filter (uses `tracing_subscriber::EnvFilter`) |
 | `APP_NAME` | no | --- | Application name shown on OAuth authorization screens. Overridden by database setting if set via admin API |
-| `SUPERADMIN_DID` | no | --- | DID seeded as a super user at every boot, before the server accepts requests, so the first person to sign in is not made an admin automatically. Additive: other super users keep their role, and removing it later demotes nobody |
+| `SUPERADMIN_DID` | no | --- | DID seeded as a super user at every boot, before the server accepts requests. Setting it turns off the first-sign-in admin bootstrap, even if seeding fails (restart to retry). A value that is not a valid DID refuses boot. Additive: other super users keep their role, and removing it later demotes nobody. A platform super-user transfer demotes the other super users, and the configured superadmin is promoted again at the next boot |
 | `HAPPYVIEW_PROJECT` | no | --- | Path to a project directory. Its `happyview.toml` is read at boot; see [Project file](#project-file-happyviewtoml). A path that does not exist stops boot |
 | `LOGO_URI` | no | --- | URL to application logo for OAuth screens. Overridden by database setting or logo upload |
 | `TOS_URI` | no | --- | URL to terms of service. Overridden by database setting if set via admin API |

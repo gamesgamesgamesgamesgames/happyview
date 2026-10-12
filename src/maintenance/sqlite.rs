@@ -71,9 +71,7 @@ pub fn parse_checkpoint_interval_secs(raw: Option<&str>) -> u64 {
 
 pub fn checkpoint_interval_secs() -> u64 {
     parse_checkpoint_interval_secs(
-        std::env::var("SQLITE_CHECKPOINT_INTERVAL_SECS")
-            .ok()
-            .as_deref(),
+        crate::config::vars::var("SQLITE_CHECKPOINT_INTERVAL_SECS").as_deref(),
     )
 }
 

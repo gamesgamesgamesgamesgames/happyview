@@ -27,23 +27,20 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 
-const SETTING_KEYS = [
-  "app_name",
-  "backfill_concurrent_dids_per_pds",
-  "backfill_concurrent_pds",
-  "backfill_concurrent_resolution",
-  "backfill_retention_days",
-  "client_uri",
-  "event_log_retention_days",
-  "logo_uri",
-  "tos_uri",
-  "policy_uri",
-  "script_instruction_limit",
-  "script_wall_clock_seconds",
-  "verbose_event_logging",
-] as const;
-
-type FieldKey = (typeof SETTING_KEYS)[number];
+type FieldKey =
+  | "app_name"
+  | "backfill_concurrent_dids_per_pds"
+  | "backfill_concurrent_pds"
+  | "backfill_concurrent_resolution"
+  | "backfill_retention_days"
+  | "client_uri"
+  | "event_log_retention_days"
+  | "logo_uri"
+  | "tos_uri"
+  | "policy_uri"
+  | "script_instruction_limit"
+  | "script_wall_clock_seconds"
+  | "verbose_event_logging";
 
 type FieldConfig = {
   key: FieldKey;
