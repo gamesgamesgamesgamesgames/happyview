@@ -646,6 +646,23 @@ pub enum MigrateFailure {
 /// tables into the compact format if they are not yet
 /// (`record_store::upgrade::run`).
 pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
+    let max_connections = std::env::var("DATABASE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(match backend {
+            DatabaseBackend::Sqlite => 16,
+            DatabaseBackend::Postgres => 32,
+        });
+    connect_with(url, backend, max_connections).await
+}
+
+/// [`connect`] with the pool size given rather than read from
+/// `DATABASE_MAX_CONNECTIONS`.
+pub(crate) async fn connect_with(
+    url: &str,
+    backend: DatabaseBackend,
+    max_connections: u32,
+) -> AnyPool {
     install_drivers();
 
     // For SQLite, ensure the parent directory exists
@@ -661,14 +678,6 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
             });
         }
     }
-
-    let max_connections = std::env::var("DATABASE_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(match backend {
-            DatabaseBackend::Sqlite => 16,
-            DatabaseBackend::Postgres => 32,
-        });
 
     let pool = with_sqlite_pragmas(
         PoolOptions::<sqlx::Any>::new()
@@ -819,7 +828,9 @@ async fn migrate_postgres(pool: &AnyPool, migrator: &Migrator) -> Result<(), Mig
         // the compiler to prove `connect`'s future `Send`. `run_direct` is
         // what `run` calls once it has the connection.
         migrator.run_direct(None, &mut *conn, false).await?;
-        crate::record_store::upgrade::run(pool, DatabaseBackend::Postgres).await?;
+        // On the lock's own connection: it stays busy (no idle session the
+        // server could drop mid-copy), and a one-connection pool suffices.
+        crate::record_store::upgrade::run_on(&mut conn, DatabaseBackend::Postgres).await?;
         Ok::<(), MigrateFailure>(())
     }
     .await;
@@ -1536,6 +1547,69 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// `DATABASE_MAX_CONNECTIONS=1` on Postgres: the record store upgrade
+    /// runs on the connection holding the migration lock, so a boot that
+    /// has to copy records needs no second one.
+    #[tokio::test]
+    async fn a_one_connection_postgres_boot_upgrades_the_record_store() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            return;
+        };
+        if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
+            return;
+        }
+        install_drivers();
+        let admin = AnyPool::connect(&url)
+            .await
+            .expect("connect to the test server");
+        let name = format!("hv_onecon_{}", uuid::Uuid::new_v4().simple());
+        crate::db::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .expect("create a scratch database");
+        let (server, _) = url.rsplit_once('/').expect("a database path");
+        let scratch = format!("{server}/{name}");
+
+        let pool = AnyPool::connect(&scratch).await.expect("connect");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        Migrator::new(dir)
+            .await
+            .expect("load")
+            .run(&pool)
+            .await
+            .expect("migrate to before the upgrade");
+        let uri = crate::test_support::seed_record(
+            &pool,
+            DatabaseBackend::Postgres,
+            "did:plc:onecon",
+            "app.test.post",
+            "r1",
+            r#"{"n":1}"#,
+            "c1",
+            None,
+        )
+        .await;
+        pool.close().await;
+
+        let booted = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            connect_with(&scratch, DatabaseBackend::Postgres, 1),
+        )
+        .await
+        .expect("the boot finishes");
+        let got = crate::record_store::RecordStore::new(booted.clone(), DatabaseBackend::Postgres)
+            .get(&uri)
+            .await
+            .expect("get")
+            .expect("the record survived the upgrade");
+        assert_eq!(got.record, r#"{"n":1}"#);
+        booted.close().await;
+        let _ = crate::db::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .execute(&admin)
+            .await;
+        admin.close().await;
     }
 
     #[tokio::test]
