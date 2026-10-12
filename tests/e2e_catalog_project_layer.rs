@@ -6,10 +6,14 @@ mod common;
 
 use std::sync::Arc;
 
+use axum::body::Body;
+use axum::http::{Method, Request};
 use happyview::db::adapt_sql;
 use happyview::project::ProjectSnapshot;
+use http_body_util::BodyExt;
 use serde_json::json;
 use serial_test::serial;
+use tower::ServiceExt;
 
 use common::app::TestApp;
 use common::fixtures;
@@ -178,5 +182,147 @@ async fn collection_listings_include_project_record_lexicons() {
             .unwrap()
             .contains(&json!(GAME)),
         "{listed}"
+    );
+}
+
+const SCRIPT: &str = "xrpc.query:games.gamesgamesgamesgames.listGames";
+const SCRIPT_PATH: &str = "src/lexicons/games/gamesgamesgamesgames/listGames.lua";
+
+fn owning_script() -> ProjectSnapshot {
+    let mut snap = project::snapshot();
+    project::add_script(
+        &mut snap,
+        SCRIPT,
+        "function handle() return {} end",
+        SCRIPT_PATH,
+    );
+    snap
+}
+
+fn encoded(id: &str) -> String {
+    id.replace(':', "%3A")
+}
+
+async fn patch_status(app: &TestApp, path: &str, body: serde_json::Value) -> u16 {
+    let cookie = app.admin_cookie();
+    let req = Request::builder()
+        .method(Method::PATCH)
+        .uri(path)
+        .header(cookie.0, cookie.1)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let _ = resp.into_body().collect().await;
+    status
+}
+
+#[tokio::test]
+#[serial]
+async fn creating_a_script_a_project_file_owns_is_a_409_naming_the_file() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state.project.store(Arc::new(owning_script()));
+
+    let (status, body) = app
+        .post_json_status(
+            "/admin/scripts",
+            json!({ "id": SCRIPT, "body": "function handle() end" }),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains(SCRIPT_PATH),
+        "{body}"
+    );
+
+    let listed = app.get_json("/admin/scripts").await;
+    let script = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == SCRIPT)
+        .unwrap();
+    assert_eq!(script["layer"], "project");
+    assert_eq!(script["path"], SCRIPT_PATH);
+    assert_eq!(script["shadows_stored"], false);
+    assert!(script["updated_at"].is_null());
+}
+
+#[tokio::test]
+#[serial]
+async fn every_write_to_a_shadowed_script_is_a_409_and_the_row_survives() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .scripts
+        .put_manual(
+            &app.state.db,
+            app.state.db_backend,
+            happyview::catalog::ScriptWrite {
+                id: SCRIPT.into(),
+                script_type: "lua".into(),
+                body: "row".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+    app.state.project.store(Arc::new(owning_script()));
+    let path = format!("/admin/scripts/{}", encoded(SCRIPT));
+
+    assert_eq!(app.delete_json(&path).await.0, 409);
+    assert_eq!(
+        patch_status(&app, &path, json!({ "description": "x" })).await,
+        409
+    );
+    assert_eq!(
+        app.post_json_status(&format!("{path}/codemod"), json!({ "apply": true }))
+            .await
+            .0,
+        409
+    );
+
+    let got = app.get_json(&path).await;
+    assert_eq!(got["layer"], "project");
+    assert_eq!(got["shadows_stored"], true);
+
+    app.state.project.store(Arc::new(ProjectSnapshot::empty()));
+    let got = app.get_json(&path).await;
+    assert_eq!(got["layer"], "manual");
+    assert_eq!(got["body"], "row");
+    assert!(got["description"].is_null(), "the patch never landed");
+}
+
+/// Each of these would be refused for some other reason, or not at all, if
+/// the handler's own ownership check were missing: a patch carrying a body
+/// reaches interpreter validation (400 here, no interpreter claims `lua`)
+/// before it reaches the catalog's write, and a codemod that rewrites
+/// nothing never reaches the catalog's write at all.
+#[tokio::test]
+#[serial]
+async fn the_handlers_refuse_before_validating_or_rewriting() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let mut snap = project::snapshot();
+    project::add_script(
+        &mut snap,
+        SCRIPT,
+        "function handle(input, ctx)\n  return {}\nend\n",
+        SCRIPT_PATH,
+    );
+    app.state.project.store(Arc::new(snap));
+    let path = format!("/admin/scripts/{}", encoded(SCRIPT));
+
+    assert_eq!(
+        patch_status(&app, &path, json!({ "body": "function handle() end" })).await,
+        409
+    );
+    assert_eq!(
+        app.post_json_status(&format!("{path}/codemod"), json!({ "apply": true }))
+            .await
+            .0,
+        409
     );
 }

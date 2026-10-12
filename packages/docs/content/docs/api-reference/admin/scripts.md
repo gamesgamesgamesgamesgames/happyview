@@ -39,8 +39,17 @@ interface Script {
   script_type: string;
   body: string;
   description: string | null;
-  created_at: string;
-  updated_at: string;
+  // "project" when a file in the instance's project defines this script,
+  // otherwise "manual".
+  layer: "project" | "manual";
+  // Project-relative path of the file, for a project script only.
+  path: string | null;
+  // A dashboard script sits under this project file. It is kept and runs
+  // again if the file is removed.
+  shadows_stored: boolean;
+  // null for a project script, which has no stored row.
+  created_at: string | null;
+  updated_at: string | null;
   // v2 globals (`db`, `Record`, `now`, `params`, …) this script still
   // references as free names; empty once migrated onto
   // require("happyview.*") / require("internal.*"). Always empty for a
@@ -420,6 +429,10 @@ curl -X DELETE "http://127.0.0.1:3000/admin/scripts/record.index%3Axyz.statusphe
 ```
 
 **Response**: `204 No Content`
+
+## Scripts a project file defines
+
+When the instance runs a project, a script defined by a file under `src/` answers its trigger ahead of any dashboard script with the same id. Creating, patching, deleting or applying the codemod to it is refused with `409 Conflict`, naming the file. A dashboard script the file shadows is kept as it is and runs again when the file is removed.
 
 ## Preview or apply the v3 codemod
 
