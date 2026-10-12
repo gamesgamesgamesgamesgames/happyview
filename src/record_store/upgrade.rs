@@ -108,6 +108,9 @@ pub struct VerifySummary {
     /// Legacy timestamps that could not be read, which the copy must hold
     /// at their fallback values.
     pub unreadable_timestamps: u64,
+    /// Refs whose collection, kept as the legacy row held it, disagrees with
+    /// their source record's collection.
+    pub ref_collection_mismatches: u64,
 }
 
 /// The legacy record columns, read as text whatever a SQLite row holds.
@@ -470,6 +473,7 @@ async fn write_refs(
     dids.extend(targets.iter().map(RefTarget::did_text));
     let mut collections: Vec<&str> = sources.iter().map(|(_, c, _)| *c).collect();
     collections.extend(targets.iter().filter_map(RefTarget::collection));
+    collections.extend(rows.iter().map(|(_, _, collection)| collection.as_str()));
     interner
         .intern(&mut tx, backend, &mut scope, &dids, &collections)
         .await?;
@@ -488,11 +492,15 @@ async fn write_refs(
             ids.get(&(scope.dids[d], collection_id, r.to_string()))
                 .map(|id| (*id, collection_id))
         });
-        let Some((source_id, collection_id)) = found else {
+        let Some((source_id, source_collection_id)) = found else {
             written.skipped += 1;
             continue;
         };
-        if codec::parse_record_uri(source).map(|(_, c, _)| c) != Some(legacy_collection.as_str()) {
+        // The legacy column is kept as it was, even where it disagrees with
+        // the source record (only raw SQL could write that): a reader that
+        // filters refs by collection sees what it saw before.
+        let collection_id = scope.collections[legacy_collection.as_str()];
+        if collection_id != source_collection_id {
             written.collection_mismatches += 1;
             tracing::warn!(
                 source_uri = source,
@@ -640,6 +648,12 @@ async fn verify_in_batches(
         tracing::warn!(
             unreadable_timestamps = summary.unreadable_timestamps,
             "record store upgrade: legacy timestamps that could not be read were copied with their fallbacks"
+        );
+    }
+    if summary.ref_collection_mismatches > 0 {
+        tracing::warn!(
+            ref_collection_mismatches = summary.ref_collection_mismatches,
+            "record store upgrade: refs whose collection disagrees with their source record were kept as they were"
         );
     }
     tracing::info!(
@@ -910,6 +924,7 @@ async fn compare_refs(
         did_names.extend(targets.iter().map(RefTarget::did_text));
         let mut collection_names: BTreeSet<&str> = sources.iter().map(|(_, c, _)| *c).collect();
         collection_names.extend(targets.iter().filter_map(RefTarget::collection));
+        collection_names.extend(rows.iter().map(|(_, _, collection)| collection.as_str()));
         let dids = interned_ids(conn, backend, "happyview_dids", "did", &did_names).await?;
         let collections = interned_ids(
             conn,
@@ -980,19 +995,25 @@ async fn compare_refs(
             }
         }
 
-        for ((source, target, _), expected) in rows.iter().copied().zip(&expected) {
+        for ((source, target, collection), expected) in rows.iter().copied().zip(&expected) {
             summary.refs += 1;
-            let found = expected.and_then(|(collection_id, (s, d, c, r))| {
+            // The copy keeps the legacy column, not the source's collection.
+            let legacy_collection = collections.get(collection.as_str()).copied();
+            let found = expected.and_then(|(source_collection, (s, d, c, r))| {
                 copies
                     .get(&(s, d, c, r.to_string()))
-                    .map(|copied| (collection_id, *copied))
+                    .map(|copied| (source_collection, *copied))
             });
             match found {
                 None => mismatches.push(format!("{source} -> {target}: ref missing from the copy")),
-                Some((collection_id, copied)) if collection_id != copied => {
+                Some((_, copied)) if Some(copied) != legacy_collection => {
                     mismatches.push(format!("{source} -> {target}: ref collection differs"))
                 }
-                Some(_) => {}
+                Some((source_collection, copied)) => {
+                    if copied != source_collection {
+                        summary.ref_collection_mismatches += 1;
+                    }
+                }
             }
         }
         mismatches.truncate(MISMATCHES_NAMED);
@@ -1265,7 +1286,8 @@ mod tests {
                 VerifySummary {
                     records: 25,
                     refs: 25,
-                    unreadable_timestamps: 0
+                    unreadable_timestamps: 0,
+                    ref_collection_mismatches: 0,
                 },
                 "{backend:?}"
             );
@@ -1960,6 +1982,70 @@ mod tests {
                 .await
                 .expect("verification passes");
             assert_eq!(summary.refs, (legacy - orphans) as u64);
+            db.finish().await;
+        }
+    }
+
+    /// I1: a legacy ref whose collection disagrees with its source (raw SQL
+    /// could write one) keeps that collection through the copy, the
+    /// verification and the refs view, and is counted.
+    #[tokio::test]
+    async fn a_divergent_ref_collection_survives_the_copy_exactly() {
+        for db in pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            seed_legacy(pool, backend, 3).await;
+            let source = format!("at://did:plc:u1/{NSID}/r001");
+            let target = "at://did:plc:t/app.other.thing/odd";
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES (?, ?, 'app.other')",
+                backend,
+            ))
+            .bind(&source)
+            .bind(target)
+            .execute(pool)
+            .await
+            .expect("seed a divergent ref");
+            let (_, refs) = copy_all(pool, backend, 100).await;
+            assert_eq!(refs.ref_collection_mismatches, 1, "{backend:?}");
+            let summary = verify_batched(pool, backend, 2)
+                .await
+                .expect("verification passes");
+            assert_eq!(summary.ref_collection_mismatches, 1, "{backend:?}");
+
+            let (_, view) = staged(pool, backend).await;
+            let rows: Vec<(String, String, String)> = crate::db::query_as(&format!(
+                "SELECT source_uri, target_uri, collection FROM {view} ORDER BY source_uri, target_uri"
+            ))
+            .fetch_all(pool)
+            .await
+            .expect("read the view");
+            let legacy: Vec<(String, String, String)> = crate::db::query_as(
+                "SELECT f.source_uri, f.target_uri, f.collection FROM happyview_record_refs f \
+                 WHERE EXISTS (SELECT 1 FROM happyview_records r WHERE r.uri = f.source_uri) \
+                 ORDER BY f.source_uri, f.target_uri",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("read the legacy refs");
+            assert_eq!(rows, legacy, "{backend:?}: byte for byte through the view");
+            assert!(rows.contains(&(source.clone(), target.to_string(), "app.other".to_string())));
+
+            // Normalising it on the way would be a mismatch.
+            exec(
+                pool,
+                "UPDATE happyview_record_refs_v2 SET collection_id = \
+                 (SELECT collection_id FROM happyview_records_v2 WHERE rkey = 'r001') \
+                 WHERE target_rkey = 'odd'",
+            )
+            .await;
+            let err = verify_batched(pool, backend, 2)
+                .await
+                .expect_err("a normalised collection");
+            assert!(
+                err.to_string()
+                    .contains(&format!("{source} -> {target}: ref collection differs")),
+                "{backend:?}: {err}"
+            );
             db.finish().await;
         }
     }

@@ -75,10 +75,14 @@ fn records_view(records: &str, record_expr: &str) -> String {
     )
 }
 
+/// `source_uri` comes from the source row's own collection and `collection`
+/// from the ref's `collection_id`. The triggers keep the two equal for new
+/// writes, but a legacy ref copied by the upgrade keeps the collection its
+/// row held, even one that disagreed with its source.
 fn refs_view(refs: &str) -> String {
     format!(
         "CREATE VIEW {refs} AS \
-         SELECT 'at://' || sd.did || '/' || sc.nsid || '/' || s.rkey AS source_uri, \
+         SELECT 'at://' || sd.did || '/' || ssc.nsid || '/' || s.rkey AS source_uri, \
                 CASE f.target_collection_id \
                     WHEN -1 THEN td.did \
                     WHEN 0 THEN 'at://' || td.did \
@@ -88,6 +92,7 @@ fn refs_view(refs: &str) -> String {
            FROM happyview_record_refs_v2 f \
            JOIN happyview_records_v2 s ON s.id = f.source_id \
            JOIN happyview_dids sd ON sd.id = s.did_id \
+           JOIN happyview_collections ssc ON ssc.id = s.collection_id \
            JOIN happyview_collections sc ON sc.id = f.collection_id \
            JOIN happyview_dids td ON td.id = f.target_did_id \
            LEFT JOIN happyview_collections tc ON tc.id = f.target_collection_id"
