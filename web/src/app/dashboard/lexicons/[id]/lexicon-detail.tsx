@@ -196,6 +196,12 @@ export default function LexiconDetailPage() {
                 </p>
               </div>
             )}
+            {projectPath && lexicon.shadows_stored && (
+              <p className="text-muted-foreground text-xs">
+                A stored version of this lexicon is kept and answers again if
+                the file is removed.
+              </p>
+            )}
             {lexicon.created_at && (
               <div>
                 <Label className="text-muted-foreground">Created</Label>
