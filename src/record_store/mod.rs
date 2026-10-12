@@ -1,11 +1,20 @@
-//! The one owner of `happyview_records` and `happyview_record_refs`.
+//! The one owner of the record tables: `happyview_records_v2` and
+//! `happyview_record_refs_v2`, with identity interned in `happyview_dids`
+//! and `happyview_collections` ([`intern`]) and bodies encoded per backend
+//! ([`compression`]). `happyview_records` and `happyview_record_refs` are
+//! compatibility views over them for raw SQL ([`compat`]); HappyView itself
+//! never reads or writes through those.
 //!
 //! Every write of a record, and of the refs it carries, goes through here:
-//! Jetstream (a batch of one) and backfill pages through
-//! [`RecordStore::upsert_batch`], and `index_put`, `mirror_network_write`,
+//! Jetstream and backfill pages through [`RecordStore::write_network`] (one
+//! [`RecordStore::upsert_batch`]), and `index_put`, `mirror_network_write`,
 //! XRPC procedures and linked repos through [`RecordStore::write_local`],
-//! which shares its statement. The storage format can then change in one
-//! place, and the two ingest paths cannot drift apart.
+//! which shares its statement. Every read does too: the store's own lookups
+//! and [`query`]'s plugin and Lua queries read [`records_relation`]. A
+//! lookup by URI parses it and seeks the identity index by interned id; the
+//! derived `uri` columns are for output only, since filtering on them scans.
+//! The storage format can then change in one place, and the ingest paths
+//! cannot drift apart.
 
 pub mod codec;
 pub mod compat;
@@ -15,22 +24,71 @@ pub mod query;
 pub mod sqlite_functions;
 pub mod upgrade;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
 use sqlx::{AnyConnection, AnyPool};
 
-use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
+use crate::db::{DatabaseBackend, adapt_sql};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::tombstones::WriteCandidate;
+use codec::RefTarget;
+use intern::{DID_CACHE_CAPACITY, InternScope, Interner};
 
 /// Rows per multi-row upsert: nine bound parameters each, well within either
 /// backend's parameter limit, whatever size a PDS makes a page.
 pub const RECORDS_PER_UPSERT: usize = 100;
 
-/// URIs per `IN (…)` list when deleting by URI.
+/// Ids per `IN (…)` list when deleting.
 const DELETE_CHUNK: usize = 500;
+
+/// The id of a DID, bound by text; NULL when the DID was never interned.
+pub(crate) const DID_ID: &str = "(SELECT id FROM happyview_dids WHERE did = ?)";
+/// The id of a collection, bound by NSID; NULL when never interned.
+pub(crate) const COLLECTION_ID: &str = "(SELECT id FROM happyview_collections WHERE nsid = ?)";
+
+/// The records as every read sees them: the legacy columns under their
+/// legacy names, plus `id`, the interned ids and the raw microsecond
+/// timestamps for seeking and ordering. Readers filter on `did_id` and
+/// `collection_id`, never on the derived `uri`, so the planner uses the v2
+/// indexes. JSON filters keep reading `record`, unchanged on both backends.
+///
+/// SQLite joins with `CROSS JOIN`, which its planner never reorders: `r`
+/// stays the outer loop, and its index supplies the order a listing asks
+/// for instead of a sort.
+pub(crate) fn records_relation(backend: DatabaseBackend) -> String {
+    let (record, join) = match backend {
+        DatabaseBackend::Sqlite => ("hv_record(r.body, r.body_dict)", "CROSS JOIN"),
+        DatabaseBackend::Postgres => ("r.record", "JOIN"),
+    };
+    format!(
+        "(SELECT r.id AS id, r.did_id AS did_id, r.collection_id AS collection_id, \
+                 'at://' || d.did || '/' || c.nsid || '/' || r.rkey AS uri, \
+                 d.did AS did, c.nsid AS collection, r.rkey AS rkey, {record} AS record, \
+                 hv_cid_text(r.cid) AS cid, hv_ts_text(r.indexed_at) AS indexed_at, \
+                 hv_ts_text(r.created_at) AS created_at, \
+                 r.indexed_at AS indexed_at_us, r.created_at AS created_at_us \
+            FROM happyview_records_v2 r \
+            {join} happyview_dids d ON d.id = r.did_id \
+            {join} happyview_collections c ON c.id = r.collection_id) rec"
+    )
+}
+
+/// The collection listing, newest arrival first, by offset; pinned to
+/// `idx_records_v2_collection_indexed_at` by a test.
+pub(crate) fn list_recent_sql(backend: DatabaseBackend, by_did: bool) -> String {
+    let did = if by_did {
+        format!(" AND rec.did_id = {DID_ID}")
+    } else {
+        String::new()
+    };
+    format!(
+        "SELECT {STORED_COLUMNS} FROM {} WHERE rec.collection_id = {COLLECTION_ID}{did} \
+         ORDER BY rec.indexed_at_us DESC LIMIT ? OFFSET ?",
+        records_relation(backend)
+    )
+}
 
 /// A record ready to store: its identity, the JSON text exactly as it will be
 /// read back, its CID and, for a network record, its commit rev.
@@ -59,7 +117,7 @@ impl PreparedRecord {
 pub enum WriteKind {
     /// From the network (Jetstream, backfill). Skips rows a tombstone
     /// supersedes, stamps `indexed_at`, never replaces a newer rev, and leaves
-    /// an unchanged, already stamped row alone (see `db::record_upsert_where`).
+    /// an unchanged, already stamped row alone (see `RecordStore::upsert_sql`).
     Network,
     /// A write this instance just made to a PDS and Jetstream will echo:
     /// replaces the body and CID and clears `indexed_at`, so the echo
@@ -129,22 +187,26 @@ impl From<StoredRow> for StoredRecord {
     }
 }
 
-const STORED_COLUMNS: &str = "uri, did, collection, rkey, record, cid, indexed_at, created_at";
+/// [`records_relation`]'s columns a [`StoredRow`] decodes.
+const STORED_COLUMNS: &str = "rec.uri, rec.did, rec.collection, rec.rkey, rec.record, rec.cid, \
+     rec.indexed_at, rec.created_at";
 
-/// The no-`did` collection listing, newest arrival first, served from
-/// `idx_records_collection_indexed_at` in order (pinned by a test).
-pub(crate) const LIST_RECENT_SQL: &str = "SELECT uri, did, collection, rkey, record, cid, indexed_at, created_at \
-     FROM happyview_records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?";
-
-const LIST_RECENT_BY_DID_SQL: &str = "SELECT uri, did, collection, rkey, record, cid, indexed_at, created_at \
-     FROM happyview_records WHERE collection = ? AND did = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?";
-
-/// A handle on the record tables. Cheap to clone.
+/// A handle on the record tables. Cheap to clone; clones share the interned
+/// id cache and the body codec.
 #[derive(Clone)]
 pub struct RecordStore {
     db: AnyPool,
     backend: DatabaseBackend,
+    interner: Arc<Interner>,
     bodies: Arc<compression::BodyCodec>,
+}
+
+/// A row an upsert inserted or changed: its id, its collection's id, and
+/// its index in the records the upsert was given.
+struct WrittenRow {
+    id: i64,
+    collection_id: i64,
+    index: usize,
 }
 
 /// The last copy of each URI in `records`, in first-seen order: Postgres
@@ -166,21 +228,18 @@ fn placeholders(n: usize) -> String {
     vec!["?"; n].join(", ")
 }
 
-fn conflict_clause(backend: DatabaseBackend, kind: WriteKind) -> String {
-    match kind {
-        WriteKind::Network => format!(
-            "ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, \
-             indexed_at = EXCLUDED.indexed_at, rev = COALESCE(EXCLUDED.rev, happyview_records.rev) \
-             WHERE {}",
-            crate::db::record_upsert_where(backend)
-        ),
-        WriteKind::Echoed => "ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, \
-                              cid = EXCLUDED.cid, indexed_at = NULL"
-            .to_string(),
-        WriteKind::IndexOnly => {
-            "ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record".to_string()
-        }
-    }
+/// The `at://` strings each body carries, sorted.
+fn ref_targets<'a>(bodies: impl Iterator<Item = &'a str>) -> Vec<Vec<String>> {
+    bodies
+        .map(|body| {
+            let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let mut targets: Vec<String> = crate::record_refs::extract_at_uris(&value)
+                .into_iter()
+                .collect();
+            targets.sort();
+            targets
+        })
+        .collect()
 }
 
 impl RecordStore {
@@ -196,12 +255,14 @@ impl RecordStore {
         Self {
             db,
             backend,
+            interner: Arc::new(Interner::new(DID_CACHE_CAPACITY)),
             bodies: Arc::new(bodies),
         }
     }
 
     /// The store the server shares: on SQLite its codec holds each
-    /// collection's newest dictionary under `RECORD_COMPRESSION`.
+    /// collection's newest dictionary under `RECORD_COMPRESSION`. Postgres
+    /// stores bodies as text and never reads `happyview_zstd_dicts`.
     pub async fn shared(db: AnyPool, backend: DatabaseBackend) -> Result<Self, sqlx::Error> {
         let bodies = match backend {
             DatabaseBackend::Sqlite => {
@@ -216,6 +277,10 @@ impl RecordStore {
         &self.bodies
     }
 
+    pub fn interner(&self) -> &Arc<Interner> {
+        &self.interner
+    }
+
     pub fn db(&self) -> &AnyPool {
         &self.db
     }
@@ -224,9 +289,214 @@ impl RecordStore {
         self.backend
     }
 
+    /// The multi-row upsert of `rows` records for `kind`.
+    fn upsert_sql(&self, kind: WriteKind, rows: usize) -> String {
+        let t = "happyview_records_v2";
+        let (columns, values, set_body) = match self.backend {
+            DatabaseBackend::Sqlite => (
+                "did_id, collection_id, rkey, cid, body, body_dict, rev, indexed_at, created_at",
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "body = excluded.body, body_dict = excluded.body_dict",
+            ),
+            DatabaseBackend::Postgres => (
+                "did_id, collection_id, rkey, cid, record, rev, indexed_at, created_at",
+                "(?, ?, ?, ?, ?, ?, ?, ?)",
+                "record = excluded.record",
+            ),
+        };
+        let conflict = match kind {
+            WriteKind::Network => {
+                // The row changed (CID, decoded body, or a local write awaiting
+                // its echo) and the incoming rev is not older. The decoded
+                // body, not the CID alone: a Lua record hook can replace a
+                // body under an unchanged CID, and a recompressed row's bytes
+                // differ from an identical incoming body's. A missing rev on
+                // either side (a local write, a `listRecords` row, a row from
+                // before revs were stored) does not block the update.
+                let (body_changed, cid_changed) = match self.backend {
+                    DatabaseBackend::Sqlite => (
+                        format!(
+                            "hv_record({t}.body, {t}.body_dict) IS NOT hv_record(excluded.body, excluded.body_dict)"
+                        ),
+                        format!("{t}.cid IS NOT excluded.cid"),
+                    ),
+                    DatabaseBackend::Postgres => (
+                        format!("{t}.record IS DISTINCT FROM excluded.record"),
+                        format!("{t}.cid IS DISTINCT FROM excluded.cid"),
+                    ),
+                };
+                format!(
+                    "DO UPDATE SET {set_body}, cid = excluded.cid, indexed_at = excluded.indexed_at, \
+                     rev = COALESCE(excluded.rev, {t}.rev) \
+                     WHERE ({cid_changed} OR {body_changed} OR {t}.indexed_at IS NULL) \
+                       AND ({t}.rev IS NULL OR excluded.rev IS NULL OR {})",
+                    crate::db::rev_compare(self.backend, "excluded.rev", ">=", &format!("{t}.rev"))
+                )
+            }
+            WriteKind::Echoed => {
+                format!("DO UPDATE SET {set_body}, cid = excluded.cid, indexed_at = NULL")
+            }
+            WriteKind::IndexOnly => format!("DO UPDATE SET {set_body}"),
+        };
+        adapt_sql(
+            &format!(
+                "INSERT INTO {t} ({columns}) VALUES {} \
+                 ON CONFLICT (did_id, collection_id, rkey) {conflict} \
+                 RETURNING id, did_id, collection_id, rkey",
+                vec![values; rows].join(", ")
+            ),
+            self.backend,
+        )
+    }
+
+    /// Intern every DID and collection `records` and their ref `targets`
+    /// name, in one call (two transactions interning overlapping names in
+    /// several calls can deadlock on Postgres), then upsert the rows and
+    /// return the ones inserted or changed: the `Network` clause's `WHERE`
+    /// leaves unchanged rows out, and they keep their refs and `indexed_at`.
+    /// Ids land in `scope`; the caller remembers them once it has committed.
+    async fn upsert_rows(
+        &self,
+        conn: &mut AnyConnection,
+        kind: WriteKind,
+        records: &[&PreparedRecord],
+        targets: &[Vec<String>],
+        scope: &mut InternScope,
+    ) -> Result<Vec<WrittenRow>, sqlx::Error> {
+        let parsed: Vec<RefTarget<'_>> = targets
+            .iter()
+            .flatten()
+            .map(|t| RefTarget::parse(t))
+            .collect();
+        let mut dids: Vec<&str> = records.iter().map(|r| r.did.as_str()).collect();
+        let mut collections: Vec<&str> = records.iter().map(|r| r.collection.as_str()).collect();
+        dids.extend(parsed.iter().map(RefTarget::did_text));
+        collections.extend(parsed.iter().filter_map(RefTarget::collection));
+        self.interner
+            .intern(conn, self.backend, scope, &dids, &collections)
+            .await?;
+
+        let now = codec::now_micros();
+        let indexed_at = (kind == WriteKind::Network).then_some(now);
+        let mut by_identity: HashMap<(i64, i64, &str), usize> = HashMap::new();
+        for (index, rec) in records.iter().enumerate() {
+            by_identity.insert(
+                (
+                    scope.dids[&rec.did],
+                    scope.collections[&rec.collection],
+                    rec.rkey.as_str(),
+                ),
+                index,
+            );
+        }
+        let mut written = Vec::new();
+        for chunk in records.chunks(RECORDS_PER_UPSERT) {
+            let sql = self.upsert_sql(kind, chunk.len());
+            let mut upsert = crate::db::query_as::<(i64, i64, i64, String)>(&sql);
+            for rec in chunk {
+                let collection_id = scope.collections[&rec.collection];
+                let rev = match kind {
+                    WriteKind::Network => rec.rev.as_deref(),
+                    WriteKind::Echoed | WriteKind::IndexOnly => None,
+                };
+                upsert = upsert
+                    .bind(scope.dids[&rec.did])
+                    .bind(collection_id)
+                    .bind(rec.rkey.as_str())
+                    .bind(codec::encode_cid(&rec.cid));
+                upsert = match self.backend {
+                    DatabaseBackend::Sqlite => {
+                        let (body, body_dict) = self.bodies.encode(collection_id, &rec.record_json);
+                        upsert.bind(body).bind(body_dict)
+                    }
+                    DatabaseBackend::Postgres => upsert.bind(rec.record_json.as_str()),
+                };
+                upsert = upsert.bind(rev).bind(indexed_at).bind(now);
+            }
+            for (id, did_id, collection_id, rkey) in upsert.fetch_all(&mut *conn).await? {
+                if let Some(index) = by_identity.get(&(did_id, collection_id, rkey.as_str())) {
+                    written.push(WrittenRow {
+                        id,
+                        collection_id,
+                        index: *index,
+                    });
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// Replace the refs of the `written` rows with their bodies' `targets`
+    /// (already interned into `scope`). The one writer of
+    /// `happyview_record_refs_v2` rows.
+    async fn sync_refs(
+        &self,
+        conn: &mut AnyConnection,
+        scope: &InternScope,
+        written: &[WrittenRow],
+        targets: &[Vec<String>],
+    ) -> Result<(), sqlx::Error> {
+        let ids: Vec<i64> = written.iter().map(|w| w.id).collect();
+        for chunk in ids.chunks(DELETE_CHUNK) {
+            let sql = adapt_sql(
+                &format!(
+                    "DELETE FROM happyview_record_refs_v2 WHERE source_id IN ({})",
+                    placeholders(chunk.len())
+                ),
+                self.backend,
+            );
+            let mut delete = crate::db::query(&sql);
+            for id in chunk {
+                delete = delete.bind(*id);
+            }
+            delete.execute(&mut *conn).await?;
+        }
+        let mut rows: Vec<(i64, i64, i64, &str, i64)> = Vec::new();
+        for w in written {
+            for target in &targets[w.index] {
+                let parsed = RefTarget::parse(target);
+                let target_collection = match parsed.collection() {
+                    Some(nsid) => scope.collections[nsid],
+                    None => parsed.kind(),
+                };
+                rows.push((
+                    w.id,
+                    scope.dids[parsed.did_text()],
+                    target_collection,
+                    parsed.rkey(),
+                    w.collection_id,
+                ));
+            }
+        }
+        for chunk in rows.chunks(crate::record_refs::REFS_PER_INSERT) {
+            let sql = adapt_sql(
+                &format!(
+                    "INSERT INTO happyview_record_refs_v2 \
+                     (source_id, target_did_id, target_collection_id, target_rkey, collection_id) VALUES {} \
+                     ON CONFLICT DO NOTHING",
+                    vec!["(?, ?, ?, ?, ?)"; chunk.len()].join(", ")
+                ),
+                self.backend,
+            );
+            let mut insert = crate::db::query(&sql);
+            for (source, did_id, collection_id, rkey, source_collection) in chunk {
+                insert = insert
+                    .bind(*source)
+                    .bind(*did_id)
+                    .bind(*collection_id)
+                    .bind(*rkey)
+                    .bind(*source_collection);
+            }
+            insert.execute(&mut *conn).await?;
+        }
+        Ok(())
+    }
+
     /// Upsert `records` on the caller's connection, then replace the refs of
     /// exactly the rows inserted or changed. A URI repeated in `records` is
-    /// written once, with its last copy. Returns the rows written.
+    /// written once, with its last copy. Returns the rows written. The ids
+    /// interned are not cached: the caller owns the transaction, and an id
+    /// a rolled-back transaction created can be handed to another name.
     ///
     /// A `Network` batch must run on a `db::begin_write` transaction: on
     /// Postgres it locks every DID and then every URI of the batch, in one
@@ -239,6 +509,17 @@ impl RecordStore {
         conn: &mut AnyConnection,
         kind: WriteKind,
         records: &[PreparedRecord],
+    ) -> Result<Vec<Changed>, sqlx::Error> {
+        let mut scope = InternScope::default();
+        self.upsert_batch_in(conn, kind, records, &mut scope).await
+    }
+
+    async fn upsert_batch_in(
+        &self,
+        conn: &mut AnyConnection,
+        kind: WriteKind,
+        records: &[PreparedRecord],
+        scope: &mut InternScope,
     ) -> Result<Vec<Changed>, sqlx::Error> {
         if records.is_empty() {
             return Ok(Vec::new());
@@ -266,142 +547,23 @@ impl RecordStore {
                 records.retain(|rec| !blocked.contains(&rec.uri()));
             }
         }
-        let mut written = Vec::new();
-        for chunk in records.chunks(RECORDS_PER_UPSERT) {
-            let rows = self.upsert_rows(conn, kind, chunk).await?;
-            self.sync_refs_for(conn, chunk, &rows).await?;
-            written.extend(rows.into_iter().map(|uri| Changed { uri }));
-        }
-        Ok(written)
-    }
-
-    /// One multi-row upsert per `RECORDS_PER_UPSERT` rows. Returns the URIs
-    /// inserted or changed: the `Network` clause's `WHERE` leaves unchanged
-    /// rows out, and they keep their refs and `indexed_at`.
-    async fn upsert_rows(
-        &self,
-        conn: &mut AnyConnection,
-        kind: WriteKind,
-        records: &[&PreparedRecord],
-    ) -> Result<Vec<String>, sqlx::Error> {
-        let now = now_rfc3339();
-        let indexed_at = match kind {
-            WriteKind::Network => Some(now.as_str()),
-            WriteKind::Echoed | WriteKind::IndexOnly => crate::db::NO_INDEXED_AT,
-        };
-        let mut written = Vec::new();
-        for chunk in records.chunks(RECORDS_PER_UPSERT) {
-            let values = vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
-            let sql = adapt_sql(
-                &format!(
-                    "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at, rev) \
-                     VALUES {values} {} RETURNING uri",
-                    conflict_clause(self.backend, kind)
-                ),
-                self.backend,
-            );
-            let mut upsert = crate::db::query_as::<(String,)>(&sql);
-            for rec in chunk {
-                let rev = match kind {
-                    WriteKind::Network => rec.rev.as_deref(),
-                    WriteKind::Echoed | WriteKind::IndexOnly => None,
-                };
-                upsert = upsert
-                    .bind(rec.uri())
-                    .bind(rec.did.as_str())
-                    .bind(rec.collection.as_str())
-                    .bind(rec.rkey.as_str())
-                    .bind(rec.record_json.as_str())
-                    .bind(rec.cid.as_str())
-                    .bind(indexed_at)
-                    .bind(now.as_str())
-                    .bind(rev);
-            }
-            written.extend(
-                upsert
-                    .fetch_all(&mut *conn)
-                    .await?
-                    .into_iter()
-                    .map(|(uri,)| uri),
-            );
-        }
-        Ok(written)
-    }
-
-    /// Replace the refs of the `written` rows with those their bodies carry.
-    async fn sync_refs_for(
-        &self,
-        conn: &mut AnyConnection,
-        records: &[&PreparedRecord],
-        written: &[String],
-    ) -> Result<(), sqlx::Error> {
-        let written: HashSet<&str> = written.iter().map(String::as_str).collect();
-        let sources: Vec<(String, &str, &str)> = records
+        let targets = ref_targets(records.iter().map(|rec| rec.record_json.as_str()));
+        let written = self
+            .upsert_rows(conn, kind, &records, &targets, scope)
+            .await?;
+        self.sync_refs(conn, scope, &written, &targets).await?;
+        Ok(written
             .iter()
-            .filter_map(|rec| {
-                let uri = rec.uri();
-                written.contains(uri.as_str()).then_some((
-                    uri,
-                    rec.collection.as_str(),
-                    rec.record_json.as_str(),
-                ))
+            .map(|w| Changed {
+                uri: records[w.index].uri(),
             })
-            .collect();
-        self.replace_refs(conn, &sources).await
-    }
-
-    /// Replace the refs of each `(uri, collection, body)` source with those
-    /// its body carries. The one writer of `happyview_record_refs` rows.
-    async fn replace_refs(
-        &self,
-        conn: &mut AnyConnection,
-        sources: &[(String, &str, &str)],
-    ) -> Result<(), sqlx::Error> {
-        if sources.is_empty() {
-            return Ok(());
-        }
-        for chunk in sources.chunks(DELETE_CHUNK) {
-            let sql = adapt_sql(
-                &format!(
-                    "DELETE FROM happyview_record_refs WHERE source_uri IN ({})",
-                    placeholders(chunk.len())
-                ),
-                self.backend,
-            );
-            let mut delete = crate::db::query(&sql);
-            for (uri, _, _) in chunk {
-                delete = delete.bind(uri.as_str());
-            }
-            delete.execute(&mut *conn).await?;
-        }
-
-        let mut refs: Vec<(&str, String, &str)> = Vec::new();
-        for (uri, collection, body) in sources {
-            let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-            for target in crate::record_refs::extract_at_uris(&value) {
-                refs.push((uri.as_str(), target, collection));
-            }
-        }
-        for chunk in refs.chunks(crate::record_refs::REFS_PER_INSERT) {
-            let sql = adapt_sql(
-                &format!(
-                    "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES {} ON CONFLICT DO NOTHING",
-                    vec!["(?, ?, ?)"; chunk.len()].join(", ")
-                ),
-                self.backend,
-            );
-            let mut insert = crate::db::query(&sql);
-            for (source, target, collection) in chunk {
-                insert = insert.bind(*source).bind(target.as_str()).bind(*collection);
-            }
-            insert.execute(&mut *conn).await?;
-        }
-        Ok(())
+            .collect())
     }
 
     /// [`Self::upsert_batch`] of network `records` in its own
     /// `db::begin_write` transaction on `pool` (backfill passes its own
-    /// pool). Callers run it inside `db::retry_on_busy`.
+    /// pool), caching the ids it interned once it commits. Callers run it
+    /// inside `db::retry_on_busy`.
     pub async fn write_network(
         &self,
         pool: &AnyPool,
@@ -410,11 +572,13 @@ impl RecordStore {
         if records.is_empty() {
             return Ok(Vec::new());
         }
+        let mut scope = InternScope::default();
         let mut tx = crate::db::begin_write(pool, self.backend).await?;
         let written = self
-            .upsert_batch(&mut tx, WriteKind::Network, records)
+            .upsert_batch_in(&mut tx, WriteKind::Network, records, &mut scope)
             .await?;
         tx.commit().await?;
+        self.interner.remember(scope);
         Ok(written)
     }
 
@@ -432,40 +596,63 @@ impl RecordStore {
                 "a network write goes through upsert_batch, not write_local".to_string(),
             )));
         }
-        let written = {
-            let mut conn = self.db.acquire().await.map_err(LocalWriteError::Row)?;
-            self.upsert_rows(&mut conn, kind, &[record])
-                .await
-                .map_err(LocalWriteError::Row)?
-        };
-        let mut tx = self.db.begin().await.map_err(LocalWriteError::Refs)?;
-        self.sync_refs_for(&mut tx, &[record], &written)
-            .await
-            .map_err(LocalWriteError::Refs)?;
-        tx.commit().await.map_err(LocalWriteError::Refs)
+        let records = [record];
+        let targets = ref_targets(std::iter::once(record.record_json.as_str()));
+        let mut scope = InternScope::default();
+        let written = async {
+            let mut tx = crate::db::begin_write(&self.db, self.backend).await?;
+            let written = self
+                .upsert_rows(&mut tx, kind, &records, &targets, &mut scope)
+                .await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(written)
+        }
+        .await
+        .map_err(LocalWriteError::Row)?;
+        // Every id in `scope` was committed with the row.
+        let refs = async {
+            let mut tx = crate::db::begin_write(&self.db, self.backend).await?;
+            self.sync_refs(&mut tx, &scope, &written, &targets).await?;
+            tx.commit().await
+        }
+        .await
+        .map_err(LocalWriteError::Refs);
+        self.interner.remember(scope);
+        refs
     }
 
-    /// Delete one record and its refs. Idempotent; says whether a row was
-    /// there.
-    pub async fn delete(&self, uri: &str) -> Result<bool, sqlx::Error> {
-        let mut tx = crate::db::begin_write(&self.db, self.backend).await?;
-        let deleted = self.delete_uris(&mut tx, &[uri.to_string()]).await? > 0;
-        tx.commit().await?;
-        Ok(deleted)
-    }
-
-    /// Delete `uris` and their refs on the caller's connection. Returns the
-    /// records deleted.
-    async fn delete_uris(
+    /// `(id, rev)` of the stored record with this identity, through the
+    /// identity index.
+    async fn find(
         &self,
         conn: &mut AnyConnection,
-        uris: &[String],
-    ) -> Result<u64, sqlx::Error> {
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<Option<(i64, Option<String>)>, sqlx::Error> {
+        let sql = adapt_sql(
+            &format!(
+                "SELECT id, rev FROM happyview_records_v2 \
+                 WHERE did_id = {DID_ID} AND collection_id = {COLLECTION_ID} AND rkey = ?"
+            ),
+            self.backend,
+        );
+        crate::db::query_as(&sql)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
+            .fetch_optional(&mut *conn)
+            .await
+    }
+
+    /// Delete the records `ids` and their refs on the caller's connection.
+    /// Returns the records deleted.
+    async fn delete_ids(&self, conn: &mut AnyConnection, ids: &[i64]) -> Result<u64, sqlx::Error> {
         let mut deleted = 0;
-        for chunk in uris.chunks(DELETE_CHUNK) {
+        for chunk in ids.chunks(DELETE_CHUNK) {
             for (table, column) in [
-                ("happyview_record_refs", "source_uri"),
-                ("happyview_records", "uri"),
+                ("happyview_record_refs_v2", "source_id"),
+                ("happyview_records_v2", "id"),
             ] {
                 let sql = adapt_sql(
                     &format!(
@@ -475,15 +662,30 @@ impl RecordStore {
                     self.backend,
                 );
                 let mut delete = crate::db::query(&sql);
-                for uri in chunk {
-                    delete = delete.bind(uri.as_str());
+                for id in chunk {
+                    delete = delete.bind(*id);
                 }
                 let affected = delete.execute(&mut *conn).await?.rows_affected();
-                if table == "happyview_records" {
+                if table == "happyview_records_v2" {
                     deleted += affected;
                 }
             }
         }
+        Ok(deleted)
+    }
+
+    /// Delete one record and its refs. Idempotent; says whether a row was
+    /// there.
+    pub async fn delete(&self, uri: &str) -> Result<bool, sqlx::Error> {
+        let Some((did, collection, rkey)) = codec::parse_record_uri(uri) else {
+            return Ok(false);
+        };
+        let mut tx = crate::db::begin_write(&self.db, self.backend).await?;
+        let deleted = match self.find(&mut tx, did, collection, rkey).await? {
+            Some((id, _)) => self.delete_ids(&mut tx, &[id]).await? > 0,
+            None => false,
+        };
+        tx.commit().await?;
         Ok(deleted)
     }
 
@@ -512,33 +714,22 @@ impl RecordStore {
         let mut tx = crate::db::begin_write(pool, backend).await?;
         crate::tombstones::lock_dids(&mut tx, backend, &[did]).await?;
         crate::tombstones::lock_uris(&mut tx, backend, &[uri]).await?;
+        let rkey = codec::parse_record_uri(uri)
+            .map(|(_, _, rkey)| rkey)
+            .unwrap_or_default();
+        let found = self.find(&mut tx, did, collection, rkey).await?;
         match rev {
             Some(rev) => {
-                let sql = adapt_sql(
-                    &format!(
-                        "DELETE FROM happyview_records WHERE uri = ? AND (rev IS NULL OR {})",
-                        crate::db::rev_compare(backend, "rev", "<=", "CAST(? AS TEXT)")
-                    ),
-                    backend,
-                );
-                let deleted = crate::db::query(&sql)
-                    .bind(uri)
-                    .bind(rev)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected()
-                    > 0;
-                let survived = !deleted && {
-                    let sql = adapt_sql("SELECT 1 FROM happyview_records WHERE uri = ?", backend);
-                    crate::db::query(&sql)
-                        .bind(uri)
-                        .fetch_optional(&mut *tx)
-                        .await?
-                        .is_some()
+                // TIDs order by bytes, which is how Rust compares strings
+                // (and what `COLLATE "C"` gave the SQL comparison).
+                let deletable = found
+                    .as_ref()
+                    .filter(|(_, stored)| stored.as_deref().is_none_or(|stored| stored <= rev));
+                let deleted = match deletable {
+                    Some((id, _)) => self.delete_ids(&mut tx, &[*id]).await? > 0,
+                    None => false,
                 };
-                if !survived {
-                    self.delete_refs(&mut tx, uri).await?;
-                }
+                let survived = !deleted && found.is_some();
                 let tombstone = deleted
                     || (!survived && self.create_may_follow(&mut tx, did, collection).await?);
                 if tombstone {
@@ -547,39 +738,22 @@ impl RecordStore {
                 }
             }
             None => {
-                let sql = adapt_sql(
-                    "DELETE FROM happyview_records WHERE uri = ? RETURNING rev",
-                    backend,
-                );
-                let deleted: Option<(Option<String>,)> = crate::db::query_as(&sql)
-                    .bind(uri)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                self.delete_refs(&mut tx, uri).await?;
-                if let Some((Some(stored_rev),)) = deleted {
-                    crate::tombstones::write_record_tombstone(
-                        &mut tx,
-                        backend,
-                        uri,
-                        &stored_rev,
-                        now,
-                    )
-                    .await?;
+                if let Some((id, stored_rev)) = found {
+                    self.delete_ids(&mut tx, &[id]).await?;
+                    if let Some(stored_rev) = stored_rev {
+                        crate::tombstones::write_record_tombstone(
+                            &mut tx,
+                            backend,
+                            uri,
+                            &stored_rev,
+                            now,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
         tx.commit().await
-    }
-
-    async fn delete_refs(&self, conn: &mut AnyConnection, uri: &str) -> Result<(), sqlx::Error> {
-        crate::db::query(&adapt_sql(
-            "DELETE FROM happyview_record_refs WHERE source_uri = ?",
-            self.backend,
-        ))
-        .bind(uri)
-        .execute(&mut *conn)
-        .await?;
-        Ok(())
     }
 
     /// Whether a create for a record `did` holds no row for could still arrive
@@ -594,8 +768,11 @@ impl RecordStore {
         collection: &str,
     ) -> Result<bool, sqlx::Error> {
         let sql = adapt_sql(
-            "SELECT 1 FROM happyview_records \
-             WHERE did = ? AND collection = ? AND indexed_at IS NOT NULL LIMIT 1",
+            &format!(
+                "SELECT 1 FROM happyview_records_v2 \
+                 WHERE did_id = {DID_ID} AND collection_id = {COLLECTION_ID} \
+                 AND indexed_at IS NOT NULL LIMIT 1"
+            ),
             self.backend,
         );
         let held = crate::db::query(&sql)
@@ -620,31 +797,31 @@ impl RecordStore {
             .is_some())
     }
 
-    /// Up to `limit` of the network records `did` holds, optionally only in
-    /// `collections`.
-    async fn held_network_uris<'e, E>(
+    /// The ids of up to `limit` of the network records `did` holds,
+    /// optionally only in `collections`.
+    async fn held_network_ids<'e, E>(
         &self,
         executor: E,
         did: &str,
         collections: Option<&[String]>,
         limit: i64,
-    ) -> Result<Vec<String>, sqlx::Error>
+    ) -> Result<Vec<i64>, sqlx::Error>
     where
         E: sqlx::Executor<'e, Database = sqlx::Any>,
     {
-        let mut select =
-            "SELECT uri FROM happyview_records WHERE did = ? AND indexed_at IS NOT NULL"
-                .to_string();
+        let mut select = format!(
+            "SELECT id FROM happyview_records_v2 WHERE did_id = {DID_ID} AND indexed_at IS NOT NULL"
+        );
         if let Some(collections) = collections {
             select.push_str(&format!(
-                " AND collection IN ({})",
+                " AND collection_id IN (SELECT id FROM happyview_collections WHERE nsid IN ({}))",
                 placeholders(collections.len())
             ));
         }
         select.push_str(" LIMIT ?");
         let select = adapt_sql(&select, self.backend);
 
-        let mut query = crate::db::query_as::<(String,)>(&select).bind(did);
+        let mut query = crate::db::query_as::<(i64,)>(&select).bind(did);
         for collection in collections.unwrap_or_default() {
             query = query.bind(collection.as_str());
         }
@@ -653,7 +830,7 @@ impl RecordStore {
             .fetch_all(executor)
             .await?
             .into_iter()
-            .map(|(uri,)| uri)
+            .map(|(id,)| id)
             .collect())
     }
 
@@ -665,7 +842,7 @@ impl RecordStore {
         collections: Option<&[String]>,
     ) -> Result<bool, sqlx::Error> {
         Ok(!self
-            .held_network_uris(&self.db, did, collections, 1)
+            .held_network_ids(&self.db, did, collections, 1)
             .await?
             .is_empty())
     }
@@ -683,11 +860,11 @@ impl RecordStore {
         collections: Option<&[String]>,
         limit: i64,
     ) -> Result<u64, sqlx::Error> {
-        let uris = self
-            .held_network_uris(&mut *conn, did, collections, limit)
+        let ids = self
+            .held_network_ids(&mut *conn, did, collections, limit)
             .await?;
-        self.delete_uris(conn, &uris).await?;
-        Ok(uris.len() as u64)
+        self.delete_ids(conn, &ids).await?;
+        Ok(ids.len() as u64)
     }
 
     /// Delete up to `limit` records of `collection`, and their refs, in one
@@ -698,8 +875,10 @@ impl RecordStore {
         limit: i64,
     ) -> Result<u64, sqlx::Error> {
         let mut tx = crate::db::begin_write(&self.db, self.backend).await?;
-        let uris: Vec<String> = crate::db::query_as::<(String,)>(&adapt_sql(
-            "SELECT uri FROM happyview_records WHERE collection = ? LIMIT ?",
+        let ids: Vec<i64> = crate::db::query_as::<(i64,)>(&adapt_sql(
+            &format!(
+                "SELECT id FROM happyview_records_v2 WHERE collection_id = {COLLECTION_ID} LIMIT ?"
+            ),
             self.backend,
         ))
         .bind(collection)
@@ -707,16 +886,18 @@ impl RecordStore {
         .fetch_all(&mut *tx)
         .await?
         .into_iter()
-        .map(|(uri,)| uri)
+        .map(|(id,)| id)
         .collect();
-        let deleted = self.delete_uris(&mut tx, &uris).await?;
+        let deleted = self.delete_ids(&mut tx, &ids).await?;
         tx.commit().await?;
         Ok(deleted)
     }
 
     pub async fn count_collection(&self, collection: &str) -> Result<i64, sqlx::Error> {
         crate::db::query_scalar::<i64>(&adapt_sql(
-            "SELECT COUNT(*) FROM happyview_records WHERE collection = ?",
+            &format!(
+                "SELECT COUNT(*) FROM happyview_records_v2 WHERE collection_id = {COLLECTION_ID}"
+            ),
             self.backend,
         ))
         .bind(collection)
@@ -724,25 +905,45 @@ impl RecordStore {
         .await
     }
 
+    /// The SQL of [`Self::get`]: one row by identity, through the identity
+    /// index (pinned by a test).
+    pub(crate) fn get_sql(backend: DatabaseBackend) -> String {
+        format!(
+            "SELECT {STORED_COLUMNS} FROM {} \
+             WHERE rec.did_id = {DID_ID} AND rec.collection_id = {COLLECTION_ID} AND rec.rkey = ?",
+            records_relation(backend)
+        )
+    }
+
     pub async fn get(&self, uri: &str) -> Result<Option<StoredRecord>, sqlx::Error> {
-        let sql = adapt_sql(
-            &format!("SELECT {STORED_COLUMNS} FROM happyview_records WHERE uri = ?"),
-            self.backend,
-        );
+        let Some((did, collection, rkey)) = codec::parse_record_uri(uri) else {
+            return Ok(None);
+        };
+        let sql = adapt_sql(&Self::get_sql(self.backend), self.backend);
         Ok(crate::db::query_as::<StoredRow>(&sql)
-            .bind(uri)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
             .fetch_optional(&self.db)
             .await?
             .map(StoredRecord::from))
     }
 
     pub async fn stored_cid(&self, uri: &str) -> Result<Option<String>, sqlx::Error> {
+        let Some((did, collection, rkey)) = codec::parse_record_uri(uri) else {
+            return Ok(None);
+        };
         let sql = adapt_sql(
-            "SELECT cid FROM happyview_records WHERE uri = ?",
+            &format!(
+                "SELECT hv_cid_text(cid) FROM happyview_records_v2 \
+                 WHERE did_id = {DID_ID} AND collection_id = {COLLECTION_ID} AND rkey = ?"
+            ),
             self.backend,
         );
         Ok(crate::db::query_as::<(Option<String>,)>(&sql)
-            .bind(uri)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
             .fetch_optional(&self.db)
             .await?
             .and_then(|(cid,)| cid))
@@ -757,30 +958,23 @@ impl RecordStore {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredRecord>, sqlx::Error> {
-        let rows = match did {
-            Some(did) => {
-                crate::db::query_as::<StoredRow>(&adapt_sql(LIST_RECENT_BY_DID_SQL, self.backend))
-                    .bind(collection)
-                    .bind(did)
-                    .bind(limit)
-                    .bind(offset)
-                    .fetch_all(&self.db)
-                    .await?
-            }
-            None => {
-                crate::db::query_as::<StoredRow>(&adapt_sql(LIST_RECENT_SQL, self.backend))
-                    .bind(collection)
-                    .bind(limit)
-                    .bind(offset)
-                    .fetch_all(&self.db)
-                    .await?
-            }
-        };
-        Ok(rows.into_iter().map(StoredRecord::from).collect())
+        let sql = adapt_sql(&list_recent_sql(self.backend, did.is_some()), self.backend);
+        let mut query = crate::db::query_as::<StoredRow>(&sql).bind(collection);
+        if let Some(did) = did {
+            query = query.bind(did);
+        }
+        Ok(query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?
+            .into_iter()
+            .map(StoredRecord::from)
+            .collect())
     }
 
     pub async fn count_all(&self) -> Result<i64, sqlx::Error> {
-        crate::db::query_scalar::<i64>("SELECT COUNT(*) FROM happyview_records")
+        crate::db::query_scalar::<i64>("SELECT COUNT(*) FROM happyview_records_v2")
             .fetch_one(&self.db)
             .await
     }
@@ -788,7 +982,10 @@ impl RecordStore {
     /// Records per collection, largest first.
     pub async fn count_by_collection(&self) -> Result<Vec<(String, i64)>, sqlx::Error> {
         crate::db::query_as::<(String, i64)>(
-            "SELECT collection, COUNT(*) AS cnt FROM happyview_records GROUP BY collection ORDER BY cnt DESC, collection",
+            "SELECT c.nsid, n.cnt FROM \
+             (SELECT collection_id, COUNT(*) AS cnt FROM happyview_records_v2 GROUP BY collection_id) n \
+             JOIN happyview_collections c ON c.id = n.collection_id \
+             ORDER BY n.cnt DESC, c.nsid",
         )
         .fetch_all(&self.db)
         .await
@@ -805,7 +1002,9 @@ impl RecordStore {
     ) -> Result<Option<(String, String)>, sqlx::Error> {
         let sql = adapt_sql(
             &format!(
-                "SELECT uri, cid FROM happyview_records WHERE collection = ? AND {field_sql} = ? LIMIT 1"
+                "SELECT rec.uri, rec.cid FROM {} \
+                 WHERE rec.collection_id = {COLLECTION_ID} AND {field_sql} = ? LIMIT 1",
+                records_relation(self.backend)
             ),
             self.backend,
         );
@@ -818,15 +1017,29 @@ impl RecordStore {
 
     /// Delete every record label whose subject this instance no longer holds
     /// (moved from `labeler::delete_orphaned_labels`; its rationale stays
-    /// there).
+    /// there). The subject is looked up by identity, not by derived URI.
     pub async fn delete_orphaned_labels(&self) -> Result<u64, sqlx::Error> {
         crate::db::query(
-            "DELETE FROM happyview_labels WHERE uri LIKE 'at://%' AND NOT EXISTS \
-             (SELECT 1 FROM happyview_records WHERE happyview_records.uri = happyview_labels.uri)",
+            "DELETE FROM happyview_labels WHERE uri LIKE 'at://%' AND NOT EXISTS ( \
+               SELECT 1 FROM happyview_records_v2 r \
+                WHERE r.did_id = (SELECT id FROM happyview_dids WHERE did = hv_ref_part(happyview_labels.uri, 0)) \
+                  AND r.collection_id = (SELECT id FROM happyview_collections WHERE nsid = hv_ref_part(happyview_labels.uri, 1)) \
+                  AND r.rkey = hv_ref_part(happyview_labels.uri, 2))",
         )
         .execute(&self.db)
         .await
         .map(|r| r.rows_affected())
+    }
+
+    /// Whether any record holds a ref: the probe that tells the one-time
+    /// refs rebuild whether refs are already maintained live.
+    pub async fn has_refs(&self) -> Result<bool, sqlx::Error> {
+        let (n,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM happyview_record_refs_v2 LIMIT 1) AS any_ref",
+        )
+        .fetch_one(&self.db)
+        .await?;
+        Ok(n > 0)
     }
 
     /// One page of the one-time refs rebuild on the caller's transaction:
@@ -834,33 +1047,87 @@ impl RecordStore {
     /// `after` (`""` starts at the beginning). Returns the records walked and
     /// the cursor of the last one, or `None` when there were none.
     ///
-    /// The page is read on the caller's transaction and then written, so on
-    /// SQLite it must be a `db::begin_write` one: a deferred transaction that
-    /// reads first cannot upgrade to a writer while another holds the lock.
+    /// The page's URIs are locked (on Postgres) before its bodies are read,
+    /// so a network write to one of them cannot land between the read and
+    /// the refs rewrite and be left with the older body's refs. The caller's
+    /// transaction must be a `db::begin_write` one: on SQLite a deferred
+    /// transaction that reads first cannot upgrade to a writer while another
+    /// holds the lock.
     pub async fn rebuild_refs_page(
         &self,
         conn: &mut AnyConnection,
         after: &str,
         limit: i64,
     ) -> Result<(u64, Option<String>), sqlx::Error> {
-        let sql = adapt_sql(
-            "SELECT uri, collection, record FROM happyview_records WHERE uri > ? ORDER BY uri LIMIT ?",
+        // An empty or pre-upgrade (uri) cursor restarts the walk; refs are
+        // replaced, not added, so walking a record twice is harmless.
+        let after: i64 = after.parse().unwrap_or(0);
+        let page: Vec<(i64, String, String, String)> = crate::db::query_as(&adapt_sql(
+            "SELECT r.id, d.did, c.nsid, r.rkey FROM happyview_records_v2 r \
+             JOIN happyview_dids d ON d.id = r.did_id \
+             JOIN happyview_collections c ON c.id = r.collection_id \
+             WHERE r.id > ? ORDER BY r.id LIMIT ?",
             self.backend,
-        );
-        let page: Vec<(String, String, String)> = crate::db::query_as(&sql)
-            .bind(after)
-            .bind(limit)
-            .fetch_all(&mut *conn)
-            .await?;
-        let sources: Vec<(String, &str, &str)> = page
-            .iter()
-            .map(|(uri, collection, body)| (uri.clone(), collection.as_str(), body.as_str()))
-            .collect();
-        self.replace_refs(conn, &sources).await?;
-        Ok((
-            page.len() as u64,
-            page.last().map(|(uri, _, _)| uri.clone()),
         ))
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
+        let Some(last) = page.last().map(|(id, ..)| id.to_string()) else {
+            return Ok((0, None));
+        };
+        let uris: Vec<String> = page
+            .iter()
+            .map(|(_, did, nsid, rkey)| format!("at://{did}/{nsid}/{rkey}"))
+            .collect();
+        let uri_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+        crate::tombstones::lock_uris(&mut *conn, self.backend, &uri_refs).await?;
+
+        let record = match self.backend {
+            DatabaseBackend::Sqlite => "hv_record(body, body_dict)",
+            DatabaseBackend::Postgres => "record",
+        };
+        let ids: Vec<i64> = page.iter().map(|(id, ..)| *id).collect();
+        let mut bodies: Vec<(i64, i64, String)> = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(DELETE_CHUNK) {
+            let sql = adapt_sql(
+                &format!(
+                    "SELECT id, collection_id, {record} FROM happyview_records_v2 WHERE id IN ({})",
+                    placeholders(chunk.len())
+                ),
+                self.backend,
+            );
+            let mut query = crate::db::query_as::<(i64, i64, String)>(&sql);
+            for id in chunk {
+                query = query.bind(*id);
+            }
+            // A record deleted since the page was read is simply missing.
+            bodies.extend(query.fetch_all(&mut *conn).await?);
+        }
+        let targets = ref_targets(bodies.iter().map(|(_, _, body)| body.as_str()));
+        let parsed: Vec<RefTarget<'_>> = targets
+            .iter()
+            .flatten()
+            .map(|t| RefTarget::parse(t))
+            .collect();
+        let dids: Vec<&str> = parsed.iter().map(RefTarget::did_text).collect();
+        let collections: Vec<&str> = parsed.iter().filter_map(RefTarget::collection).collect();
+        // The caller commits, so these ids are not cached.
+        let mut scope = InternScope::default();
+        self.interner
+            .intern(conn, self.backend, &mut scope, &dids, &collections)
+            .await?;
+        let written: Vec<WrittenRow> = bodies
+            .iter()
+            .enumerate()
+            .map(|(index, (id, collection_id, _))| WrittenRow {
+                id: *id,
+                collection_id: *collection_id,
+                index,
+            })
+            .collect();
+        self.sync_refs(conn, &scope, &written, &targets).await?;
+        Ok((page.len() as u64, Some(last)))
     }
 
     /// A record reached its PDS but not this index. The write the caller made
@@ -1573,15 +1840,65 @@ mod tests {
 
     #[tokio::test]
     async fn the_xrpc_listing_walks_the_collection_indexed_at_index() {
-        let sql =
-            crate::test_support::inline_binds(LIST_RECENT_SQL, &["'app.test.post'", "50", "0"]);
         for (pool, backend) in crate::test_support::test_pools().await {
-            let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
-            crate::test_support::assert_index_without_sort(
-                &plan,
-                "idx_records_collection_indexed_at",
-                backend,
+            for by_did in [false, true] {
+                let literals: &[&str] = if by_did {
+                    &["'app.test.post'", "'did:plc:a'", "50", "0"]
+                } else {
+                    &["'app.test.post'", "50", "0"]
+                };
+                let sql =
+                    crate::test_support::inline_binds(&list_recent_sql(backend, by_did), literals);
+                let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
+                crate::test_support::assert_index_without_sort(
+                    &plan,
+                    "idx_records_v2_collection_indexed_at",
+                    backend,
+                );
+            }
+        }
+    }
+
+    /// A lookup by URI seeks the identity index by interned id; it never
+    /// filters the derived `uri`, which would scan every record. Seeded with
+    /// many accounts and analyzed, so the planner weighs a real choice.
+    #[tokio::test]
+    async fn a_get_by_uri_seeks_the_identity_index() {
+        for db in crate::test_support::pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            upgrade::run(pool, backend).await.expect("upgrade");
+            let store = RecordStore::new(pool.clone(), backend);
+            let records: Vec<PreparedRecord> = (0..2000)
+                .map(|i| PreparedRecord {
+                    did: format!("did:plc:plan{}", i % 400),
+                    collection: format!("app.test.plan{}", i % 2),
+                    rkey: format!("r{i}"),
+                    record_json: "{}".to_string(),
+                    cid: "c".to_string(),
+                    rev: None,
+                })
+                .collect();
+            store.write_network(pool, &records).await.expect("seed");
+            crate::db::query("ANALYZE")
+                .execute(pool)
+                .await
+                .expect("analyze");
+            let sql = crate::test_support::inline_binds(
+                &RecordStore::get_sql(backend),
+                &["'did:plc:plan7'", "'app.test.plan1'", "'r7'"],
             );
+            let plan = crate::test_support::query_plan(pool, backend, &sql).await;
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("idx_records_v2_identity")),
+                "{backend:?}: {plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.contains("SCAN r")
+                    || line.contains("Seq Scan on happyview_records_v2")),
+                "{backend:?}: {plan:#?}"
+            );
+            db.finish().await;
         }
     }
 
@@ -1613,6 +1930,310 @@ mod tests {
                 .expect("rewrite");
             assert_eq!(ref_count(&store, &rec.uri()).await, 0, "{backend:?}");
             store.delete(&rec.uri()).await.expect("clean up");
+        }
+    }
+
+    async fn stored(
+        store: &RecordStore,
+        did: &str,
+        rkey: &str,
+    ) -> (String, String, Option<String>, Option<String>) {
+        crate::db::query_as(&adapt_sql(
+            "SELECT record, cid, rev, indexed_at FROM happyview_records WHERE did = ? AND collection = ? AND rkey = ?",
+            store.backend(),
+        ))
+        .bind(did)
+        .bind(NSID)
+        .bind(rkey)
+        .fetch_one(store.db())
+        .await
+        .expect("read through the view")
+    }
+
+    /// Moved from `db.rs`: an older delivery never replaces a newer rev, and
+    /// a write without a rev applies but keeps the stored one.
+    #[tokio::test]
+    async fn the_upsert_never_replaces_a_newer_rev() {
+        for (pool, backend) in test_pools().await {
+            let store = RecordStore::new(pool.clone(), backend);
+            let did = unique_did();
+            for (cid, rev, expected) in [
+                ("c50", Some(tid(50)), ("c50", Some(tid(50)))),
+                ("c40", Some(tid(40)), ("c50", Some(tid(50)))),
+                ("c60", Some(tid(60)), ("c60", Some(tid(60)))),
+                // A write without a rev applies but keeps the stored rev, so
+                // an older delivery after it is still refused.
+                ("c-none", None, ("c-none", Some(tid(60)))),
+                ("c10", Some(tid(10)), ("c-none", Some(tid(60)))),
+                ("c70", Some(tid(70)), ("c70", Some(tid(70)))),
+            ] {
+                let rec = prepared(&did, "r", "{}", cid, rev.as_deref());
+                store.write_network(&pool, &[rec]).await.expect("upsert");
+                let (_, got_cid, got_rev, _) = stored(&store, &did, "r").await;
+                assert_eq!(
+                    (got_cid.as_str(), got_rev),
+                    (expected.0, expected.1),
+                    "after {cid} ({backend:?})"
+                );
+            }
+            store
+                .delete(&format!("at://{did}/{NSID}/r"))
+                .await
+                .expect("clean up");
+        }
+    }
+
+    /// A body a hook changed under the same CID is written; an identical
+    /// redelivery of a row since recompressed (different stored bytes, same
+    /// decoded body) is not.
+    #[tokio::test]
+    async fn a_changed_body_under_the_same_cid_updates_and_a_recompressed_redelivery_does_not() {
+        for (pool, backend) in test_pools().await {
+            let store = RecordStore::with_bodies(
+                pool.clone(),
+                backend,
+                compression::BodyCodec::new(compression::Compression::Zstd),
+            );
+            let did = unique_did();
+            let collection = format!("app.test.hook{}", uuid::Uuid::new_v4().simple());
+            let bulk: Vec<PreparedRecord> = compression::sample_posts(1000)
+                .into_iter()
+                .enumerate()
+                .map(|(i, body)| PreparedRecord {
+                    did: did.clone(),
+                    collection: collection.clone(),
+                    rkey: format!("bulk{i}"),
+                    record_json: body,
+                    cid: format!("cb{i}"),
+                    rev: None,
+                })
+                .collect();
+            store.write_network(&pool, &bulk).await.expect("bulk write");
+
+            let mut rec = bulk[0].clone();
+            rec.record_json = r#"{"text":"replaced by a hook","via":"witchsky"}"#.to_string();
+            assert_eq!(
+                store
+                    .write_network(&pool, std::slice::from_ref(&rec))
+                    .await
+                    .expect("changed body")
+                    .len(),
+                1,
+                "{backend:?}"
+            );
+
+            if backend == DatabaseBackend::Sqlite {
+                let (collection_id,): (i64,) =
+                    crate::db::query_as("SELECT id FROM happyview_collections WHERE nsid = ?")
+                        .bind(&collection)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("collection id");
+                compression::train(&pool, store.bodies(), collection_id, 4096)
+                    .await
+                    .expect("train");
+                while compression::recompress_batch(
+                    &pool,
+                    store.bodies(),
+                    collection_id,
+                    500,
+                    compression::RECOMPRESS_BUDGET_BYTES,
+                )
+                .await
+                .expect("recompress")
+                .more
+                {}
+                let (dict,): (Option<i64>,) = crate::db::query_as(&format!(
+                    "SELECT body_dict FROM happyview_records_v2 WHERE collection_id = {collection_id} AND rkey = 'bulk1'"
+                ))
+                .fetch_one(&pool)
+                .await
+                .expect("body_dict");
+                assert!(
+                    dict.is_some_and(|d| d > 0),
+                    "the row was recompressed: {dict:?}"
+                );
+            }
+            for again in [&rec, &bulk[1]] {
+                let before = store
+                    .get(&again.uri())
+                    .await
+                    .expect("get")
+                    .expect("present");
+                assert!(
+                    store
+                        .write_network(&pool, std::slice::from_ref(again))
+                        .await
+                        .expect("identical redelivery")
+                        .is_empty(),
+                    "{backend:?} {}",
+                    again.rkey
+                );
+                let after = store
+                    .get(&again.uri())
+                    .await
+                    .expect("get")
+                    .expect("present");
+                assert_eq!(
+                    (after.record, after.indexed_at),
+                    (before.record, before.indexed_at),
+                    "{backend:?}"
+                );
+            }
+            while store
+                .delete_collection_batch(&collection, 500)
+                .await
+                .expect("clean up")
+                > 0
+            {}
+        }
+    }
+
+    /// Record targets and odd targets (a bare DID, a handle URI with a path,
+    /// a trailing slash) are kept exactly, and backlinks find the record one.
+    #[tokio::test]
+    async fn backlinks_find_record_targets_and_keep_odd_targets() {
+        use happyview_plugin_sdk::wire::BacklinksQuery;
+        for (pool, backend) in test_pools().await {
+            let store = RecordStore::new(pool.clone(), backend);
+            let did = unique_did();
+            let target = format!("at://{}/app.test.target/t", unique_did());
+            let body = format!(
+                r#"{{"subject":"{target}","mentions":["at://did:plc:odd","at://alice.example.com/a/b/c","at://did:plc:x/"]}}"#
+            );
+            let rec = prepared(&did, "src", &body, "c", None);
+            store
+                .write_network(&pool, std::slice::from_ref(&rec))
+                .await
+                .expect("write");
+
+            let page = query::backlinks_query(
+                &pool,
+                backend,
+                BacklinksQuery {
+                    uri: target.clone(),
+                    collection: NSID.to_string(),
+                    did: None,
+                    limit: Some(10),
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("backlinks");
+            assert_eq!(page.records.len(), 1, "{backend:?}");
+            let odd = query::backlinks_query(
+                &pool,
+                backend,
+                BacklinksQuery {
+                    uri: "at://did:plc:odd".to_string(),
+                    collection: NSID.to_string(),
+                    did: Some(did.clone()),
+                    limit: Some(10),
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("backlinks to an odd target");
+            assert_eq!(odd.records.len(), 1, "{backend:?}");
+
+            let mut targets: Vec<String> = crate::db::query_as::<(String,)>(&adapt_sql(
+                "SELECT target_uri FROM happyview_record_refs WHERE source_uri = ?",
+                backend,
+            ))
+            .bind(rec.uri())
+            .fetch_all(&pool)
+            .await
+            .expect("refs")
+            .into_iter()
+            .map(|(t,)| t)
+            .collect();
+            targets.sort();
+            let mut expected = vec![
+                target.clone(),
+                "at://did:plc:odd".to_string(),
+                "at://alice.example.com/a/b/c".to_string(),
+                "at://did:plc:x/".to_string(),
+            ];
+            expected.sort();
+            assert_eq!(targets, expected, "{backend:?}");
+            store.delete(&rec.uri()).await.expect("clean up");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_live_views_keep_the_raw_sql_contract() {
+        for (pool, backend) in test_pools().await {
+            let store = RecordStore::new(pool.clone(), backend);
+            let did = unique_did();
+            let rec = prepared(&did, "via", r#"{"text":"hi","via":"witchsky"}"#, "c", None);
+            store
+                .write_network(&pool, std::slice::from_ref(&rec))
+                .await
+                .expect("write");
+            let (filter, placeholder) = match backend {
+                DatabaseBackend::Sqlite => ("json_extract(record, '$.via')", "?"),
+                DatabaseBackend::Postgres => ("record::jsonb->>'via'", "$1"),
+            };
+            let rows = crate::plugin::host::run_query(
+                &pool,
+                &format!(
+                    "SELECT uri, record FROM happyview_records WHERE did = {placeholder} AND {filter} = 'witchsky'"
+                ),
+                &[serde_json::json!(did)],
+            )
+            .await
+            .expect("raw SQL through the guard");
+            assert_eq!(rows.len(), 1, "{backend:?}");
+            assert_eq!(rows[0]["record"], serde_json::json!(rec.record_json));
+            store.delete(&rec.uri()).await.expect("clean up");
+        }
+    }
+
+    /// An id interned in a transaction that rolled back is never cached:
+    /// SQLite hands a freed id to the next name inserted, and a cached stale
+    /// id would file one account's records under another.
+    #[tokio::test]
+    async fn a_rolled_back_intern_never_reaches_the_cache() {
+        for (pool, backend) in test_pools().await {
+            let store = RecordStore::new(pool.clone(), backend);
+            let (rolled_back, other) = (unique_did(), unique_did());
+            let mut tx = crate::db::begin_write(&pool, backend).await.expect("begin");
+            store
+                .upsert_batch(
+                    &mut tx,
+                    WriteKind::Network,
+                    &[prepared(&rolled_back, "a", "{}", "c", None)],
+                )
+                .await
+                .expect("upsert");
+            tx.rollback().await.expect("rollback");
+            assert_eq!(
+                store.interner().cached_did(&rolled_back),
+                None,
+                "{backend:?}"
+            );
+
+            // On SQLite this takes the id the rollback freed.
+            let theirs = prepared(&other, "b", r#"{"who":"other"}"#, "c", None);
+            store
+                .write_network(&pool, std::slice::from_ref(&theirs))
+                .await
+                .expect("other write");
+            assert!(store.interner().cached_did(&other).is_some(), "{backend:?}");
+            let mine = prepared(&rolled_back, "a", r#"{"who":"mine"}"#, "c", None);
+            store
+                .write_network(&pool, std::slice::from_ref(&mine))
+                .await
+                .expect("retried write");
+            for rec in [&theirs, &mine] {
+                let got = store.get(&rec.uri()).await.expect("get").expect("present");
+                assert_eq!(
+                    (got.did, got.record),
+                    (rec.did.clone(), rec.record_json.clone()),
+                    "{backend:?}"
+                );
+                store.delete(&rec.uri()).await.expect("clean up");
+            }
         }
     }
 }

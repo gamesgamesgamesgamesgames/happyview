@@ -176,7 +176,7 @@ pub(crate) async fn get_setting(
 /// The old check rebuilt whenever the table happened to be empty, which on a
 /// collection whose records reference nothing meant a full OFFSET scan and
 /// rewrite on every boot. An instance setting now records that the rebuild
-/// ran, and the walk is keyset-paged on `uri`. Each page commits together with
+/// ran, and the walk is keyset-paged on the record id. Each page commits together with
 /// a resume cursor, and the done marker is written only after the last page,
 /// so an interrupted rebuild picks up where it stopped.
 pub async fn rebuild_once(
@@ -202,18 +202,12 @@ async fn rebuild_pages(
         return Ok(Some(RebuildOutcome::AlreadyDone));
     }
 
+    let store = crate::record_store::RecordStore::new(db.clone(), backend);
     let cursor = get_setting(db, backend, REFS_REBUILD_CURSOR_SETTING).await?;
-    if cursor.is_none() {
-        let (has_refs,): (i64,) = crate::db::query_as(
-            "SELECT COUNT(*) FROM (SELECT 1 FROM happyview_record_refs LIMIT 1) AS any_ref",
-        )
-        .fetch_one(db)
-        .await?;
-        if has_refs > 0 {
-            let mut conn = db.acquire().await?;
-            put_setting(&mut conn, backend, REFS_REBUILT_SETTING, "true").await?;
-            return Ok(Some(RebuildOutcome::NotNeeded));
-        }
+    if cursor.is_none() && store.has_refs().await? {
+        let mut conn = db.acquire().await?;
+        put_setting(&mut conn, backend, REFS_REBUILT_SETTING, "true").await?;
+        return Ok(Some(RebuildOutcome::NotNeeded));
     }
 
     // Record that a rebuild has started before any page commits, so a crash
@@ -227,7 +221,6 @@ async fn rebuild_pages(
         .await?;
     }
 
-    let store = crate::record_store::RecordStore::new(db.clone(), backend);
     let mut after = cursor.unwrap_or_default();
     let mut records: u64 = 0;
     let mut pages = 0usize;

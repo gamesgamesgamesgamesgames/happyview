@@ -210,22 +210,6 @@ where
     }
 }
 
-/// The `WHERE` of `ON CONFLICT (uri) DO UPDATE`, so an upsert leaves a row
-/// alone when neither its CID nor its body changed. That avoids rewriting the
-/// row and its indexes, and keeps its original `indexed_at`. A stored row with
-/// no `indexed_at` (one written locally, before the network echoed it) always
-/// updates, so the echo stamps it.
-pub fn record_changed_clause(backend: DatabaseBackend) -> &'static str {
-    match backend {
-        DatabaseBackend::Sqlite => {
-            "happyview_records.cid IS NOT excluded.cid OR happyview_records.record IS NOT excluded.record OR happyview_records.indexed_at IS NULL"
-        }
-        DatabaseBackend::Postgres => {
-            "happyview_records.cid IS DISTINCT FROM excluded.cid OR happyview_records.record IS DISTINCT FROM excluded.record OR happyview_records.indexed_at IS NULL"
-        }
-    }
-}
-
 /// `lhs op rhs` over two rev (TID) expressions. TIDs sort by time in byte
 /// order; Postgres would otherwise compare text in the database's collation,
 /// so it gets `COLLATE "C"` on both sides.
@@ -234,19 +218,6 @@ pub fn rev_compare(backend: DatabaseBackend, lhs: &str, op: &str, rhs: &str) -> 
         DatabaseBackend::Sqlite => format!("{lhs} {op} {rhs}"),
         DatabaseBackend::Postgres => format!("{lhs} COLLATE \"C\" {op} {rhs} COLLATE \"C\""),
     }
-}
-
-/// The `WHERE` of a network record upsert's `ON CONFLICT (uri) DO UPDATE`:
-/// the row changed (see `record_changed_clause`), and the incoming rev is not
-/// older than the stored one. A missing rev on either side (a local write, a
-/// `listRecords` row, a row from before revs were stored) does not block the
-/// update, which is how every write behaved before.
-pub fn record_upsert_where(backend: DatabaseBackend) -> String {
-    format!(
-        "({}) AND (happyview_records.rev IS NULL OR excluded.rev IS NULL OR {})",
-        record_changed_clause(backend),
-        rev_compare(backend, "excluded.rev", ">=", "happyview_records.rev")
-    )
 }
 
 /// Begin a transaction that reads and then writes on what it read, holding
@@ -676,7 +647,20 @@ pub fn install_drivers() {
     crate::record_store::sqlite_functions::register();
 }
 
-/// Connect to the configured database and run migrations.
+/// Why startup could not bring the schema up to date.
+#[derive(Debug, thiserror::Error)]
+pub enum MigrateFailure {
+    #[error(transparent)]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error(transparent)]
+    Upgrade(#[from] crate::record_store::upgrade::UpgradeError),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// Connect to the configured database, run migrations, and move the record
+/// tables into the compact format if they are not yet
+/// (`record_store::upgrade::run`).
 pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
     install_drivers();
 
@@ -745,11 +729,18 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
         .await
         .unwrap_or_else(|e| panic!("Failed to load migrations from {migration_dir}: {e}"));
 
-    match backend {
-        DatabaseBackend::Sqlite => migrator.run(&pool).await,
+    let migrated: Result<(), MigrateFailure> = match backend {
+        DatabaseBackend::Sqlite => {
+            async {
+                migrator.run(&pool).await?;
+                crate::record_store::upgrade::run(&pool, backend).await?;
+                Ok(())
+            }
+            .await
+        }
         DatabaseBackend::Postgres => migrate_postgres(&pool, &migrator).await,
-    }
-    .expect("Failed to run migrations");
+    };
+    migrated.unwrap_or_else(|e| panic!("Failed to run migrations: {e}"));
 
     if backend == DatabaseBackend::Sqlite
         && let Err(e) = sqlite_optimize(&pool).await
@@ -790,11 +781,10 @@ const PG_MIGRATION_LOCK_REPORT: std::time::Duration = std::time::Duration::from_
 const CONCURRENTLY_BUILT_INDEXES: &[&str] = &["idx_records_collection_created_at_uri"];
 
 /// Run `migrator` against Postgres under [`PG_MIGRATION_LOCK_KEY`], after
-/// dropping any invalid leftover of [`CONCURRENTLY_BUILT_INDEXES`].
-async fn migrate_postgres(
-    pool: &AnyPool,
-    migrator: &Migrator,
-) -> Result<(), sqlx::migrate::MigrateError> {
+/// dropping any invalid leftover of [`CONCURRENTLY_BUILT_INDEXES`], then the
+/// record store upgrade under the same lock: a second instance booting waits
+/// for the copy as it waits for a migration.
+async fn migrate_postgres(pool: &AnyPool, migrator: &Migrator) -> Result<(), MigrateFailure> {
     let mut conn = pool.acquire().await?;
 
     let started = std::time::Instant::now();
@@ -844,7 +834,9 @@ async fn migrate_postgres(
         // `run` would do, but its `Acquire` bound is not general enough for
         // the compiler to prove `connect`'s future `Send`. `run_direct` is
         // what `run` calls once it has the connection.
-        migrator.run_direct(None, &mut *conn, false).await
+        migrator.run_direct(None, &mut *conn, false).await?;
+        crate::record_store::upgrade::run(pool, DatabaseBackend::Postgres).await?;
+        Ok::<(), MigrateFailure>(())
     }
     .await;
 
@@ -1574,73 +1566,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn the_record_upsert_never_replaces_a_newer_rev() {
-        let tid = |n: i64| crate::tid::tid_from_unix_microseconds(1_700_000_000_000_000 + n);
-        for (pool, backend) in crate::test_support::test_pools().await {
-            let uri = format!(
-                "at://did:plc:rev{}/app.test.post/r",
-                uuid::Uuid::new_v4().simple()
-            );
-            let upsert = adapt_sql(
-                &format!(
-                    "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at, rev) \
-                     VALUES (?, 'did:plc:rev', 'app.test.post', 'r', '{{}}', ?, ?, ?, ?) \
-                     ON CONFLICT (uri) DO UPDATE SET cid = excluded.cid, rev = COALESCE(excluded.rev, happyview_records.rev) \
-                     WHERE {}",
-                    record_upsert_where(backend)
-                ),
-                backend,
-            );
-            let stored = || async {
-                crate::db::query_as::<(String, Option<String>)>(&adapt_sql(
-                    "SELECT cid, rev FROM happyview_records WHERE uri = ?",
-                    backend,
-                ))
-                .bind(&uri)
-                .fetch_one(&pool)
-                .await
-                .expect("read the record")
-            };
-
-            for (cid, rev, expected) in [
-                ("c50", Some(tid(50)), ("c50", Some(tid(50)))),
-                ("c40", Some(tid(40)), ("c50", Some(tid(50)))),
-                ("c60", Some(tid(60)), ("c60", Some(tid(60)))),
-                // A write without a rev applies but keeps the stored rev, so
-                // an older delivery after it is still refused.
-                ("c-none", None, ("c-none", Some(tid(60)))),
-                ("c10", Some(tid(10)), ("c-none", Some(tid(60)))),
-                ("c70", Some(tid(70)), ("c70", Some(tid(70)))),
-            ] {
-                crate::db::query(&upsert)
-                    .bind(&uri)
-                    .bind(cid)
-                    .bind(now_rfc3339())
-                    .bind(now_rfc3339())
-                    .bind(rev.clone())
-                    .execute(&pool)
-                    .await
-                    .expect("upsert");
-                let (got_cid, got_rev) = stored().await;
-                assert_eq!(
-                    (got_cid.as_str(), got_rev),
-                    (expected.0, expected.1),
-                    "after writing {cid} ({backend:?})"
-                );
-            }
-
-            crate::db::query(&adapt_sql(
-                "DELETE FROM happyview_records WHERE uri = ?",
-                backend,
-            ))
-            .bind(&uri)
-            .execute(&pool)
-            .await
-            .expect("clean up");
-        }
-    }
-
     // -----------------------------------------------------------------------
     // DatabaseBackend detection
     // -----------------------------------------------------------------------
@@ -2211,12 +2136,12 @@ mod tests {
         sqlite_optimize(&pool).await.expect("optimize");
 
         let (rows,): (i64,) = crate::db::query_as(
-            "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'happyview_records'",
+            "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'happyview_records_v2'",
         )
         .fetch_one(&pool)
         .await
         .expect("sqlite_stat1 should exist after optimize");
-        assert!(rows > 0, "optimize did not analyze happyview_records");
+        assert!(rows > 0, "optimize did not analyze happyview_records_v2");
 
         drop(pool);
         let _ = std::fs::remove_file(&path);

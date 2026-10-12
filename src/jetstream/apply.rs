@@ -1120,8 +1120,9 @@ mod tests {
         let (create, drop): (Vec<String>, Vec<String>) = match state.db_backend {
             crate::db::DatabaseBackend::Sqlite => (
                 vec![format!(
-                    "CREATE TRIGGER {name} BEFORE DELETE ON happyview_records \
-                     WHEN OLD.did = '{did}' BEGIN SELECT RAISE(ABORT, 'refused'); END"
+                    "CREATE TRIGGER {name} BEFORE DELETE ON happyview_records_v2 \
+                     WHEN OLD.did_id = (SELECT id FROM happyview_dids WHERE did = '{did}') \
+                     BEGIN SELECT RAISE(ABORT, 'refused'); END"
                 )],
                 vec![format!("DROP TRIGGER {name}")],
             ),
@@ -1129,16 +1130,17 @@ mod tests {
                 vec![
                     format!(
                         "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
-                         BEGIN IF OLD.did = '{did}' THEN RAISE EXCEPTION 'refused'; END IF; \
+                         BEGIN IF OLD.did_id = (SELECT id FROM happyview_dids WHERE did = '{did}') \
+                         THEN RAISE EXCEPTION 'refused'; END IF; \
                          RETURN OLD; END $$"
                     ),
                     format!(
-                        "CREATE TRIGGER {name} BEFORE DELETE ON happyview_records \
+                        "CREATE TRIGGER {name} BEFORE DELETE ON happyview_records_v2 \
                          FOR EACH ROW EXECUTE FUNCTION {name}()"
                     ),
                 ],
                 vec![
-                    format!("DROP TRIGGER {name} ON happyview_records"),
+                    format!("DROP TRIGGER {name} ON happyview_records_v2"),
                     format!("DROP FUNCTION {name}()"),
                 ],
             ),

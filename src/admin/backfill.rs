@@ -8568,7 +8568,7 @@ mod tests {
     async fn a_page_that_cannot_be_written_is_a_fetch_failure() {
         let mock = MockServer::start().await;
         let state = migrated_state().await;
-        crate::db::query("DROP TABLE happyview_record_refs")
+        crate::db::query("DROP TABLE happyview_record_refs_v2")
             .execute(&state.db)
             .await
             .expect("drop refs table");

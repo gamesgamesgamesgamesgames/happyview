@@ -829,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_refs_write_rolls_back_the_record() {
         let state = tracked_state().await;
-        crate::db::query("DROP TABLE happyview_record_refs")
+        crate::db::query("DROP TABLE happyview_record_refs_v2")
             .execute(&state.db)
             .await
             .expect("drop refs table");

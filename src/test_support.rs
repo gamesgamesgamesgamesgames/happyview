@@ -24,14 +24,19 @@ pub async fn memory_pool() -> sqlx::AnyPool {
         .expect("connect to in-memory sqlite")
 }
 
-/// A [`memory_pool`] with every SQLite migration applied. A hand-written
+/// A [`memory_pool`] with every SQLite migration applied and the record
+/// store upgraded, as `db::connect` leaves a database. A hand-written
 /// `CREATE TABLE` in a test drifts silently from the real schema — a
 /// migration can add a column the copy never gets, and a test against the
 /// stale copy keeps passing while the code it exercises breaks against a real
 /// database. The path is anchored to the crate manifest so the helper works
 /// from any working directory.
 pub async fn migrated_memory_pool() -> sqlx::AnyPool {
-    pre_upgrade_memory_pool().await
+    let pool = pre_upgrade_memory_pool().await;
+    crate::record_store::upgrade::run(&pool, crate::db::DatabaseBackend::Sqlite)
+        .await
+        .expect("upgrade the record store");
+    pool
 }
 
 /// Every SQLite migration applied, the record store upgrade not run: the
@@ -379,6 +384,28 @@ pub fn inline_binds(sql: &str, literals: &[&str]) -> String {
     }
     assert!(values.next().is_none(), "more literals than placeholders");
     out
+}
+
+/// [`inline_binds`] for SQL already adapted to `backend`: on Postgres the
+/// literals replace `$1`, `$2`, … by number.
+pub fn inline_binds_on(
+    sql: &str,
+    backend: crate::db::DatabaseBackend,
+    literals: &[&str],
+) -> String {
+    match backend {
+        crate::db::DatabaseBackend::Sqlite => inline_binds(sql, literals),
+        crate::db::DatabaseBackend::Postgres => {
+            let mut out = sql.to_string();
+            // Highest first, so `$1` never eats the front of `$12`.
+            for (i, literal) in literals.iter().enumerate().rev() {
+                let placeholder = format!("${}", i + 1);
+                assert!(out.contains(&placeholder), "no {placeholder} in {sql}");
+                out = out.replace(&placeholder, literal);
+            }
+            out
+        }
+    }
 }
 
 /// The planner's plan for `sql`, written in SQLite's dialect, one line per

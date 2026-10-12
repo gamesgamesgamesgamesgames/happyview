@@ -14,6 +14,7 @@ use crate::plugin::host::records::{
     MAX_LIMIT, RecordsError, bind_as_text, bind_value_as, clamp_limit, column_sql, direction_sql,
     filter_sql, invalid, invalid_field, is_text_op, normalize_op, order_by,
 };
+use crate::record_store::{COLLECTION_ID, DID_ID, RecordStore, StoredRecord, records_relation};
 
 /// Columns `records_query`'s sort accepts bare, as opposed to a JSON path
 /// evaluated inside `record`.
@@ -126,9 +127,10 @@ fn record_sort_sql(path: &str, backend: DatabaseBackend) -> Result<String, Recor
     }
 }
 
-/// The columns every record read selects, in the order [`RecordRow`] decodes
-/// them. `created_at` is there for the keyset cursor, not the envelope.
-fn record_columns(qualifier: &str) -> String {
+/// The columns every record read selects from [`records_relation`], in the
+/// order [`RecordRow`] decodes them. `created_at_us` and `id` are there for
+/// the keyset cursor, not the envelope.
+fn record_columns() -> String {
     [
         "uri",
         "did",
@@ -137,9 +139,10 @@ fn record_columns(qualifier: &str) -> String {
         "record",
         "cid",
         "indexed_at",
-        "created_at",
+        "created_at_us",
+        "id",
     ]
-    .map(|column| format!("{qualifier}{column}"))
+    .map(|column| format!("rec.{column}"))
     .join(", ")
 }
 
@@ -151,17 +154,53 @@ type RecordRow = (
     String,
     Option<String>,
     Option<String>,
-    String,
+    i64,
+    i64,
 );
 
-fn created_at(row: &RecordRow) -> &str {
-    &row.7
+/// A keyset cursor: `(created_at_us, id)`. Anything else, including a cursor
+/// from before the compact format (`created_at|uri`), is refused rather than
+/// read as the first page.
+fn keyset_cursor(cursor: &str) -> Result<(i64, i64), RecordsError> {
+    decode_cursor(cursor)
+        .and_then(|(ts, id)| Some((ts.parse().ok()?, id.parse().ok()?)))
+        .ok_or_else(|| invalid("invalid cursor: request the first page again"))
 }
+
+/// The keyset seek after `cursor`, newest first.
+const KEYSET_AFTER: &str = " AND (rec.created_at_us < ? OR (rec.created_at_us = ? AND rec.id < ?))";
+const KEYSET_ORDER: &str = "ORDER BY rec.created_at_us DESC, rec.id DESC";
 
 /// The one place a read turns a row into the shape a guest sees. The
 /// rationale for the shape lives on [`RecordEnvelope`].
 fn envelope(row: RecordRow) -> Value {
-    let (uri, did, collection, rkey, record, cid, indexed_at, _created_at) = row;
+    let (uri, did, collection, rkey, record, cid, indexed_at, _, _) = row;
+    stored_envelope(uri, did, collection, rkey, record, cid, indexed_at)
+}
+
+impl From<StoredRecord> for Value {
+    fn from(rec: StoredRecord) -> Self {
+        stored_envelope(
+            rec.uri,
+            rec.did,
+            rec.collection,
+            rec.rkey,
+            rec.record,
+            rec.cid,
+            rec.indexed_at,
+        )
+    }
+}
+
+fn stored_envelope(
+    uri: String,
+    did: String,
+    collection: String,
+    rkey: String,
+    record: String,
+    cid: Option<String>,
+    indexed_at: Option<String>,
+) -> Value {
     serde_json::to_value(RecordEnvelope {
         uri,
         did,
@@ -176,28 +215,31 @@ fn envelope(row: RecordRow) -> Value {
 
 /// Builds the two SQL shapes `records_query` needs: a custom sort uses
 /// `OFFSET`/`LIMIT`; the default (no sort) uses a keyset cursor on
-/// `(created_at, uri)`. Bind values are returned in placeholder order; the
+/// `(created_at, id)`. Bind values are returned in placeholder order; the
 /// `LIMIT`/`OFFSET` integers themselves are appended by `records_query`.
 pub fn records_query_sql(
     spec: &RecordsQuery,
     backend: DatabaseBackend,
 ) -> Result<(String, Vec<Value>), RecordsError> {
     let mut binds = vec![Value::String(spec.collection.clone())];
-    let mut where_clause = String::from("WHERE collection = ?");
+    let mut where_clause = format!("WHERE rec.collection_id = {COLLECTION_ID}");
     if let Some(did) = &spec.did {
-        where_clause.push_str(" AND did = ?");
+        where_clause.push_str(&format!(" AND rec.did_id = {DID_ID}"));
         binds.push(Value::String(did.clone()));
     }
+    let relation = records_relation(backend);
 
     let sql = if let Some(Sort { field, direction }) = &spec.sort {
         // A JSON path is null wherever the field is absent, which no row of a
         // schemaless body guarantees; a bare column is null only where the
         // schema lets it be.
         let (column, nullable) = if TOP_LEVEL_COLUMNS.contains(&field.as_str()) {
-            (
-                column_sql(field)?,
-                NULLABLE_TOP_LEVEL_COLUMNS.contains(&field.as_str()),
-            )
+            let column = match column_sql(field)?.as_str() {
+                // The stored microseconds order as the rendered text does.
+                "indexed_at" => "rec.indexed_at_us".to_string(),
+                other => format!("rec.{other}"),
+            };
+            (column, NULLABLE_TOP_LEVEL_COLUMNS.contains(&field.as_str()))
         } else {
             (record_sort_sql(field, backend)?, true)
         };
@@ -208,16 +250,14 @@ pub fn records_query_sql(
             where_clause.push_str(&clause);
         }
         format!(
-            "SELECT {} FROM happyview_records {where_clause} ORDER BY {order} LIMIT ? OFFSET ?",
-            record_columns("")
+            "SELECT {} FROM {relation} {where_clause} ORDER BY {order} LIMIT ? OFFSET ?",
+            record_columns()
         )
     } else {
-        let cursor_parts = spec.cursor.as_ref().and_then(|c| decode_cursor(c));
-        if let Some((cursor_ts, cursor_uri)) = &cursor_parts {
-            where_clause.push_str(" AND (created_at < ? OR (created_at = ? AND uri < ?))");
-            binds.push(Value::String(cursor_ts.clone()));
-            binds.push(Value::String(cursor_ts.clone()));
-            binds.push(Value::String(cursor_uri.clone()));
+        if let Some(cursor) = &spec.cursor {
+            let (ts, id) = keyset_cursor(cursor)?;
+            where_clause.push_str(KEYSET_AFTER);
+            binds.extend([json!(ts), json!(ts), json!(id)]);
         }
         if let Some(filter) = &spec.filter {
             let clause = filter_sql(filter, backend, &record_bind_on(backend), 0, &mut binds)?;
@@ -225,8 +265,8 @@ pub fn records_query_sql(
             where_clause.push_str(&clause);
         }
         format!(
-            "SELECT {} FROM happyview_records {where_clause} ORDER BY created_at DESC, uri DESC LIMIT ?",
-            record_columns("")
+            "SELECT {} FROM {relation} {where_clause} {KEYSET_ORDER} LIMIT ?",
+            record_columns()
         )
     };
 
@@ -235,7 +275,7 @@ pub fn records_query_sql(
 
 /// Paginated record listing: a custom sort walks pages with a base64-encoded
 /// decimal offset; the default sort walks a keyset cursor on
-/// `(created_at, uri)` so pages stay stable under concurrent inserts.
+/// `(created_at, id)` so pages stay stable under concurrent inserts.
 pub async fn records_query(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
@@ -269,14 +309,14 @@ pub async fn records_query(
     }
 }
 
-/// A page walked by the `(created_at, uri)` keyset: the cursor is the last
+/// A page walked by the `(created_at, id)` keyset: the cursor is the last
 /// row's position, present only when the page came back full.
 fn keyset_page(rows: Vec<RecordRow>, limit: i64) -> RecordsPage {
     let has_next = rows.len() as i64 == limit;
     let cursor = has_next
         .then(|| rows.last())
         .flatten()
-        .map(|row| encode_cursor(created_at(row), &row.0));
+        .map(|row| encode_cursor(&row.7.to_string(), &row.8.to_string()));
     let records = rows.into_iter().map(envelope).collect();
     RecordsPage { records, cursor }
 }
@@ -287,9 +327,12 @@ pub async fn records_count(
     spec: RecordsCount,
 ) -> Result<i64, RecordsError> {
     let mut binds = vec![Value::String(spec.collection.clone())];
-    let mut sql = String::from("SELECT COUNT(*) FROM happyview_records WHERE collection = ?");
+    let mut sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE rec.collection_id = {COLLECTION_ID}",
+        records_relation(backend)
+    );
     if let Some(did) = &spec.did {
-        sql.push_str(" AND did = ?");
+        sql.push_str(&format!(" AND rec.did_id = {DID_ID}"));
         binds.push(Value::String(did.clone()));
     }
     if let Some(filter) = &spec.filter {
@@ -311,18 +354,10 @@ pub async fn records_get(
     backend: DatabaseBackend,
     uri: &str,
 ) -> Result<Option<Value>, RecordsError> {
-    let sql = adapt_sql(
-        &format!(
-            "SELECT {} FROM happyview_records WHERE uri = ?",
-            record_columns("")
-        ),
-        backend,
-    );
-    let row: Option<RecordRow> = crate::db::query_as(&sql)
-        .bind(uri)
-        .fetch_optional(db)
-        .await?;
-    Ok(row.map(envelope))
+    Ok(RecordStore::new(db.clone(), backend)
+        .get(uri)
+        .await?
+        .map(Value::from))
 }
 
 pub async fn records_search(
@@ -337,7 +372,7 @@ pub async fn records_search(
     }
     let limit = i64::from(spec.limit.unwrap_or(10).clamp(1, MAX_LIMIT));
     let like_pattern = format!("%{}%", spec.query);
-    let columns = record_columns("");
+    let columns = record_columns();
 
     // The field goes through `record_field_sql` so `adapt_sql` can rewrite it:
     // a hand-written `record::jsonb->>'author.handle'` reads a top-level key
@@ -348,8 +383,8 @@ pub async fn records_search(
     let ilike = normalize_op("ilike", backend)?;
     let sql = adapt_sql(
         &format!(
-            "SELECT {columns} FROM happyview_records \
-             WHERE collection = ? \
+            "SELECT {columns} FROM {} \
+             WHERE rec.collection_id = {COLLECTION_ID} \
                AND {field} {ilike} ? \
              ORDER BY \
                CASE \
@@ -358,7 +393,8 @@ pub async fn records_search(
                  ELSE 2 \
                END, \
                {field} \
-             LIMIT ?"
+             LIMIT ?",
+            records_relation(backend)
         ),
         backend,
     );
@@ -374,41 +410,56 @@ pub async fn records_search(
     Ok(rows.into_iter().map(envelope).collect())
 }
 
-/// Records in `spec.collection` that reference `spec.uri` via
-/// `happyview_record_refs`, keyset-paginated the same way as `records_query`.
+/// Records in `spec.collection` that reference `spec.uri`, keyset-paginated
+/// the same way as `records_query`. The target is parsed and matched by
+/// interned id on the refs target index, never by the derived `target_uri`.
+pub(crate) fn backlinks_query_sql(
+    spec: &BacklinksQuery,
+    backend: DatabaseBackend,
+) -> Result<(String, Vec<Value>), RecordsError> {
+    let target = crate::record_store::codec::RefTarget::parse(&spec.uri);
+    let mut binds: Vec<Value> = vec![json!(target.did_text())];
+    let target_collection = match target.collection() {
+        Some(nsid) => {
+            binds.push(json!(nsid));
+            COLLECTION_ID.to_string()
+        }
+        None => target.kind().to_string(),
+    };
+    binds.push(json!(target.rkey()));
+    binds.push(json!(spec.collection));
+    let mut where_clause = format!(
+        "WHERE f.target_did_id = {DID_ID} AND f.target_collection_id = {target_collection} \
+         AND f.target_rkey = ? AND f.collection_id = {COLLECTION_ID}"
+    );
+    if let Some(did) = &spec.did {
+        where_clause.push_str(&format!(" AND rec.did_id = {DID_ID}"));
+        binds.push(json!(did));
+    }
+    if let Some(cursor) = &spec.cursor {
+        let (ts, id) = keyset_cursor(cursor)?;
+        where_clause.push_str(KEYSET_AFTER);
+        binds.extend([json!(ts), json!(ts), json!(id)]);
+    }
+    let sql = format!(
+        "SELECT {} FROM {} JOIN happyview_record_refs_v2 f ON f.source_id = rec.id \
+         {where_clause} {KEYSET_ORDER} LIMIT ?",
+        record_columns(),
+        records_relation(backend)
+    );
+    Ok((adapt_sql(&sql, backend), binds))
+}
+
 pub async fn backlinks_query(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
     spec: BacklinksQuery,
 ) -> Result<RecordsPage, RecordsError> {
     let limit = clamp_limit(spec.limit);
-    let mut binds = vec![spec.uri.clone(), spec.collection.clone()];
-    let mut where_clause = String::from("WHERE ref.target_uri = ? AND ref.collection = ?");
-    if let Some(did) = &spec.did {
-        where_clause.push_str(" AND r.did = ?");
-        binds.push(did.clone());
-    }
-    if let Some((cursor_ts, cursor_uri)) = spec.cursor.as_ref().and_then(|c| decode_cursor(c)) {
-        where_clause.push_str(" AND (r.created_at < ? OR (r.created_at = ? AND r.uri < ?))");
-        binds.push(cursor_ts.clone());
-        binds.push(cursor_ts);
-        binds.push(cursor_uri);
-    }
-    let sql = adapt_sql(
-        &format!(
-            "SELECT {} FROM happyview_records r \
-             INNER JOIN happyview_record_refs ref ON ref.source_uri = r.uri \
-             {where_clause} \
-             ORDER BY r.created_at DESC, r.uri DESC \
-             LIMIT ?",
-            record_columns("r.")
-        ),
-        backend,
-    );
-
+    let (sql, binds) = backlinks_query_sql(&spec, backend)?;
     let mut q = crate::db::query_as::<RecordRow>(&sql);
     for bind in &binds {
-        q = q.bind(bind);
+        q = bind_value_as(q, bind);
     }
     let rows = q.bind(limit).fetch_all(db).await?;
     Ok(keyset_page(rows, limit))
@@ -417,43 +468,96 @@ pub async fn backlinks_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::DatabaseBackend::Sqlite;
     use happyview_plugin_sdk::wire::RecordsQuery;
 
     /// The default listing (no custom sort) reads
-    /// `idx_records_collection_created_at_uri` in order, on both backends.
+    /// `idx_records_v2_collection_created_at_id` in order, on both backends.
     #[tokio::test]
     async fn the_default_records_listing_walks_the_collection_created_at_index() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            for did in [None, Some("did:plc:a".to_string())] {
+                let spec = RecordsQuery {
+                    collection: "app.test.post".into(),
+                    did: did.clone(),
+                    filter: None,
+                    sort: None,
+                    limit: Some(50),
+                    cursor: Some(encode_cursor("1767225600000000", "42")),
+                };
+                let (sql, binds) = records_query_sql(&spec, backend).unwrap();
+                let mut literals = vec!["'app.test.post'"];
+                if did.is_some() {
+                    literals.push("'did:plc:a'");
+                }
+                literals.extend(["1767225600000000", "1767225600000000", "42", "50"]);
+                assert_eq!(binds.len() + 1, literals.len(), "{backend:?}");
+                let sql = crate::test_support::inline_binds_on(&sql, backend, &literals);
+                let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
+                crate::test_support::assert_index_without_sort(
+                    &plan,
+                    "idx_records_v2_collection_created_at_id",
+                    backend,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cursor_from_before_the_compact_format_is_refused() {
         let spec = RecordsQuery {
             collection: "app.test.post".into(),
             did: None,
             filter: None,
             sort: None,
             limit: Some(50),
-            cursor: Some(crate::db::encode_cursor(
+            cursor: Some(encode_cursor(
                 "2026-01-01T00:00:00+00:00",
                 "at://did:plc:a/app.test.post/1",
             )),
         };
-        let (sql, binds) = records_query_sql(&spec, Sqlite).unwrap();
-        assert_eq!(binds.len(), 4, "the collection and three cursor values");
-        let sql = crate::test_support::inline_binds(
-            &sql,
-            &[
-                "'app.test.post'",
-                "'2026-01-01T00:00:00+00:00'",
-                "'2026-01-01T00:00:00+00:00'",
-                "'at://did:plc:a/app.test.post/1'",
-                "50",
-            ],
-        );
+        assert!(matches!(
+            records_query_sql(&spec, DatabaseBackend::Sqlite),
+            Err(RecordsError::InvalidSpec(_))
+        ));
+    }
+
+    /// Backlinks seek the refs target index by interned id; they never
+    /// filter the derived `target_uri`.
+    #[tokio::test]
+    async fn backlinks_seek_the_refs_target_index() {
         for (pool, backend) in crate::test_support::test_pools().await {
-            let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
-            crate::test_support::assert_index_without_sort(
-                &plan,
-                "idx_records_collection_created_at_uri",
-                backend,
-            );
+            for (target, literals) in [
+                (
+                    "at://did:plc:t/app.test.post/r1",
+                    vec![
+                        "'did:plc:t'",
+                        "'app.test.post'",
+                        "'r1'",
+                        "'app.test.like'",
+                        "50",
+                    ],
+                ),
+                (
+                    "at://did:plc:t",
+                    vec!["'did:plc:t'", "''", "'app.test.like'", "50"],
+                ),
+            ] {
+                let spec = BacklinksQuery {
+                    uri: target.to_string(),
+                    collection: "app.test.like".into(),
+                    did: None,
+                    limit: Some(50),
+                    cursor: None,
+                };
+                let (sql, _) = backlinks_query_sql(&spec, backend).unwrap();
+                let sql = crate::test_support::inline_binds_on(&sql, backend, &literals);
+                let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
+                assert!(
+                    plan.iter()
+                        .any(|line| line.contains("idx_record_refs_v2_target")),
+                    "{backend:?} {target}: {plan:#?}"
+                );
+            }
         }
     }
 }
