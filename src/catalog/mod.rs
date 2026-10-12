@@ -15,6 +15,8 @@ pub mod lexicon_rows;
 pub mod lexicons;
 pub mod script_rows;
 pub mod scripts;
+#[cfg(test)]
+pub(crate) mod testing;
 
 pub use lexicons::{
     LexiconCatalog, LexiconListing, LexiconWrite, NetworkLexicon, NetworkWriteError,
@@ -159,5 +161,46 @@ mod tests {
     #[test]
     fn layers_serialise_lowercase() {
         assert_eq!(serde_json::to_value(Layer::Project).unwrap(), "project");
+    }
+
+    /// The catalogs keep a row and its in-memory copy from drifting only if
+    /// nothing else can write the row. Integration tests under `tests/` may
+    /// still seed rows directly; this covers what ships.
+    #[test]
+    fn only_the_catalog_names_the_lexicon_and_script_tables() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let catalog = src.join("catalog");
+        let mut offenders = Vec::new();
+        let mut dirs = vec![src.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.starts_with(&catalog) {
+                    continue;
+                }
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (n, line) in text.lines().enumerate() {
+                    if line.contains(lexicon_rows::TABLE) || line.contains(script_rows::TABLE) {
+                        offenders.push(format!(
+                            "{}:{}",
+                            path.strip_prefix(&src).unwrap().display(),
+                            n + 1
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "only src/catalog/ may name the lexicon or script tables; found:\n{}",
+            offenders.join("\n")
+        );
     }
 }

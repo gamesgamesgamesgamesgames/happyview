@@ -606,7 +606,7 @@ mod tests {
     use crate::lexicon::ParsedLexicon;
     use crate::lexicon::ProcedureAction;
     use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
-    use crate::test_support::{memory_pool, test_state_with_pool};
+    use crate::test_support::test_state_with_pool;
 
     const NSID: &str = "com.example.thing";
     const URI: &str = "at://did:plc:abc/com.example.thing/rkey1";
@@ -653,60 +653,10 @@ mod tests {
         echo_interpreter(&state).await.then_some(state)
     }
 
-    /// A state with the record/script/event-log tables and `NSID` registered as
-    /// a record-type lexicon, so `handle_record_event` treats it as tracked.
+    /// A migrated state with `NSID` registered as a record-type lexicon, so
+    /// `handle_record_event` treats it as tracked.
     async fn tracked_state() -> AppState {
-        let pool = memory_pool().await;
-        for ddl in [
-            "CREATE TABLE happyview_records (
-                uri TEXT PRIMARY KEY,
-                did TEXT NOT NULL,
-                collection TEXT NOT NULL,
-                rkey TEXT NOT NULL,
-                record TEXT NOT NULL,
-                cid TEXT,
-                indexed_at TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                rev TEXT
-            )",
-            "CREATE TABLE happyview_scripts (
-                id TEXT PRIMARY KEY,
-                body TEXT NOT NULL,
-                script_type TEXT NOT NULL DEFAULT 'lua'
-            )",
-            "CREATE TABLE happyview_event_logs (
-                id TEXT PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                severity TEXT NOT NULL,
-                actor_did TEXT,
-                subject TEXT,
-                detail TEXT,
-                created_at TEXT NOT NULL
-            )",
-            "CREATE TABLE happyview_record_refs (
-                source_uri TEXT NOT NULL,
-                target_uri TEXT NOT NULL,
-                field TEXT NOT NULL
-            )",
-            "CREATE TABLE happyview_record_tombstones (
-                uri TEXT PRIMARY KEY,
-                rev TEXT NOT NULL,
-                deleted_at TEXT NOT NULL
-            )",
-            "CREATE TABLE happyview_did_tombstones (
-                did TEXT PRIMARY KEY,
-                rev TEXT NOT NULL,
-                seq INTEGER,
-                deleted_at TEXT NOT NULL
-            )",
-        ] {
-            crate::db::query(ddl)
-                .execute(&pool)
-                .await
-                .unwrap_or_else(|e| panic!("create table: {e}"));
-        }
-
-        let state = test_state_with_pool(pool);
+        let state = test_state_with_pool(crate::test_support::migrated_memory_pool().await);
         register_tracked_lexicon(&state).await;
         state
     }
@@ -761,15 +711,6 @@ mod tests {
             cid: None,
             rev: None,
         }
-    }
-
-    /// `tracked_state` on the real migrated schema, which the refs tests need:
-    /// `tracked_state`'s hand-written `happyview_record_refs` has no
-    /// `collection` column.
-    async fn migrated_tracked_state() -> AppState {
-        let state = test_state_with_pool(crate::test_support::migrated_memory_pool().await);
-        register_tracked_lexicon(&state).await;
-        state
     }
 
     async fn register_tracked_lexicon(state: &AppState) {
@@ -925,7 +866,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_identical_redelivery_is_a_no_op() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         assert_redelivery_semantics(&state, "noop").await;
     }
 
@@ -980,7 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_local_edit_is_restamped_by_the_identical_echo() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         assert_local_edit_is_restamped_by_echo(&state, "local").await;
     }
 
@@ -1008,7 +949,7 @@ mod tests {
     /// the record with it, and the failure is logged rather than dropped.
     #[tokio::test]
     async fn a_failed_refs_write_rolls_back_the_record() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         crate::db::query("DROP TABLE happyview_record_refs")
             .execute(&state.db)
             .await
@@ -1058,14 +999,20 @@ mod tests {
     }
 
     async fn install_script(state: &AppState, trigger: &str, body: &str) {
-        crate::db::query(
-            "INSERT INTO happyview_scripts (id, body, script_type) VALUES (?, ?, 'lua')",
-        )
-        .bind(trigger)
-        .bind(body)
-        .execute(&state.db)
-        .await
-        .expect("install script");
+        state
+            .scripts
+            .put_manual(
+                &state.db,
+                state.db_backend,
+                crate::catalog::ScriptWrite {
+                    id: trigger.to_string(),
+                    script_type: "lua".to_string(),
+                    body: body.to_string(),
+                    description: None,
+                },
+            )
+            .await
+            .expect("install script");
     }
 
     /// Regression test for #80: a Jetstream delete for a tracked collection with
@@ -1470,7 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_older_rev_never_overwrites_a_newer_one() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         assert_revs_order_updates(&state, "revs").await;
     }
 
@@ -1488,7 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_delete_leaves_a_tombstone_that_blocks_resurrection() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         assert_deletes_leave_tombstones(&state, "tomb").await;
     }
 
@@ -1526,7 +1473,7 @@ mod tests {
     /// covers the collection.
     #[tokio::test]
     async fn a_delete_with_no_row_tombstones_only_when_a_create_may_follow() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         let did = "did:plc:stranger";
         let delete = |rkey: &str| RecordEvent {
             did: did.to_string(),
@@ -1588,7 +1535,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_delete_with_no_row_still_tombstones() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         assert_a_delete_with_no_row_tombstones(&state, "early").await;
     }
 
@@ -1662,7 +1609,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unversioned_delete_tombstones_the_stored_rev() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         assert_unversioned_deletes_tombstone_the_stored_rev(&state, "unv").await;
     }
 
@@ -1946,7 +1893,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_schema_event_during_an_outage_is_unavailable() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         track_schema_nsid(&state).await;
         state.db.close().await;
         for action in ["create", "update", "delete"] {
@@ -1960,7 +1907,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_schema_event_whose_query_fails_is_errored() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         track_schema_nsid(&state).await;
         crate::db::query(&format!(
             "DROP TABLE {}",
@@ -1977,7 +1924,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_schema_event_for_an_untracked_lexicon_changes_nothing() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         assert_eq!(
             handle_record_event(&state, &schema_event("create")).await,
             RecordOutcome::SchemaEvent
@@ -1986,7 +1933,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_with_no_body_or_an_unknown_operation_is_invalid() {
-        let state = migrated_tracked_state().await;
+        let state = tracked_state().await;
         let mut no_body = create_event();
         no_body.record = None;
         assert_eq!(

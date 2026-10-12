@@ -3,7 +3,7 @@
 //! rather than only from the admin endpoint. Single-file mode is for
 //! previewing the rewrite on a script that isn't stored yet (or checking one
 //! in isolation); database mode is for migrating an instance's whole
-//! `happyview_scripts` table in one pass, since the admin endpoint only ever
+//! scripts table in one pass, since the admin endpoint only ever
 //! touches one row at a time.
 
 use std::io::Read;
@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use happyview::codemod::{self, ScriptKind};
-use happyview::db::{self, DatabaseBackend, adapt_sql, now_rfc3339};
+use happyview::db::DatabaseBackend;
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -207,22 +207,15 @@ async fn run_database_mode(args: &Args) -> ExitCode {
         }
     };
 
-    let select_sql = if args.script.is_some() {
-        adapt_sql(
-            "SELECT id, script_type, body FROM happyview_scripts WHERE id = ?",
-            backend,
-        )
-    } else {
-        adapt_sql(
-            "SELECT id, script_type, body FROM happyview_scripts ORDER BY id",
-            backend,
-        )
+    let catalog = happyview::catalog::ScriptCatalog::detached(pool.clone(), backend);
+    let rows = match &args.script {
+        Some(id) => catalog
+            .get_manual(id)
+            .await
+            .map(|row| row.into_iter().collect::<Vec<_>>()),
+        None => catalog.list_manual(None).await,
     };
-    let mut select = db::query_as::<(String, String, String)>(&select_sql);
-    if let Some(id) = &args.script {
-        select = select.bind(id);
-    }
-    let rows = match select.fetch_all(&pool).await {
+    let rows = match rows {
         Ok(rows) => rows,
         Err(e) => {
             eprintln!("error: could not read scripts: {e}");
@@ -240,7 +233,8 @@ async fn run_database_mode(args: &Args) -> ExitCode {
     let mut had_error = false;
     let mut had_markers = false;
 
-    for (id, script_type, body) in rows {
+    for row in rows {
+        let (id, script_type, body) = (row.id.clone(), row.script_type.clone(), row.body.clone());
         if script_type != "lua" {
             continue;
         }
@@ -263,7 +257,9 @@ async fn run_database_mode(args: &Args) -> ExitCode {
                         println!(
                             "{id}: not applying — {marker_count} marker(s) remain (use --allow-markers to override)"
                         );
-                    } else if let Err(e) = write_back(&pool, backend, &id, &result.source).await {
+                    } else if let Err(e) =
+                        write_back(&catalog, &pool, backend, &row, &result.source).await
+                    {
                         had_error = true;
                         eprintln!("{id}: failed to write back: {e}");
                     }
@@ -285,33 +281,26 @@ async fn run_database_mode(args: &Args) -> ExitCode {
     }
 }
 
-/// Stores a rewritten body, recomputing `outbound_xrpcs` the same way
-/// `/admin/scripts` upsert does — the rewrite keeps `xrpc.query`/`xrpc.procedure`
-/// call syntax unchanged, but re-deriving rather than assuming that keeps this
-/// in lockstep with upsert if that ever stops being true.
+/// Stores a rewritten body through the catalog, which re-derives
+/// `outbound_xrpcs` from it exactly as `/admin/scripts` does.
 async fn write_back(
+    catalog: &happyview::catalog::ScriptCatalog,
     pool: &sqlx::AnyPool,
     backend: DatabaseBackend,
-    id: &str,
+    row: &happyview::catalog::ManualScript,
     new_body: &str,
-) -> Result<(), sqlx::Error> {
-    let outbound_xrpcs = happyview::lua_analysis::extract_outbound_xrpcs(new_body);
-    let outbound_json = if outbound_xrpcs.is_empty() {
-        None
-    } else {
-        serde_json::to_string(&outbound_xrpcs).ok()
-    };
-
-    let sql = adapt_sql(
-        "UPDATE happyview_scripts SET body = ?, outbound_xrpcs = ?, updated_at = ? WHERE id = ?",
-        backend,
-    );
-    db::query(&sql)
-        .bind(new_body)
-        .bind(&outbound_json)
-        .bind(now_rfc3339())
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(())
+) -> Result<(), happyview::catalog::CatalogError> {
+    catalog
+        .put_manual(
+            pool,
+            backend,
+            happyview::catalog::ScriptWrite {
+                id: row.id.clone(),
+                script_type: row.script_type.clone(),
+                body: new_body.to_string(),
+                description: row.description.clone(),
+            },
+        )
+        .await
+        .map(|_| ())
 }

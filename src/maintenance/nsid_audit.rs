@@ -20,7 +20,7 @@ use crate::db::{DatabaseBackend, adapt_sql};
 use crate::lua::scripts::ParsedTrigger;
 use crate::proxy_config::ProxyConfig;
 
-/// A `happyview_scripts.id` that would be rejected if re-saved today.
+/// A stored script trigger id that would be rejected if re-saved today.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegacyTriggerFinding {
     pub trigger_id: String,
@@ -68,14 +68,13 @@ pub fn classify_proxy_pattern(pattern: &str) -> Option<LegacyProxyPatternFinding
     }
 }
 
-/// Scan `happyview_scripts.id` for trigger ids the current NSID grammar
+/// Scan stored script trigger ids for ones the current NSID grammar
 /// would reject, and warn about each one found.
 async fn audit_scripts(pool: &AnyPool, backend: DatabaseBackend) -> Result<usize, sqlx::Error> {
-    let sql = adapt_sql("SELECT id FROM happyview_scripts", backend);
-    let rows: Vec<(String,)> = crate::db::query_as(&sql).fetch_all(pool).await?;
+    let ids = crate::catalog::script_rows::ids(pool, backend).await?;
 
     let mut found = 0;
-    for (id,) in rows {
+    for id in ids {
         if let Some(finding) = classify_trigger_id(&id) {
             warn!(
                 trigger_id = %finding.trigger_id,
@@ -145,7 +144,7 @@ pub async fn run(pool: &AnyPool, backend: DatabaseBackend) {
     let scripts_found = match audit_scripts(pool, backend).await {
         Ok(n) => n,
         Err(e) => {
-            warn!(error = %e, "NSID audit: failed to scan happyview_scripts; skipping");
+            warn!(error = %e, "NSID audit: failed to scan stored scripts; skipping");
             0
         }
     };

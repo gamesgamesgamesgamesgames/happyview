@@ -17,7 +17,7 @@ const COUNTED_TABLES: &[(&str, &str)] = &[
     ("backfill_pds_stats", "happyview_backfill_pds_stats"),
     ("backfill_cursors", "happyview_backfill_cursors"),
     ("jobs", "happyview_jobs"),
-    ("lexicons", "happyview_lexicons"),
+    ("lexicons", crate::catalog::lexicon_rows::TABLE),
     ("spaces", "happyview_spaces"),
     ("space_members", "happyview_space_members"),
     ("linked_repos", "happyview_linked_repos"),
