@@ -143,6 +143,40 @@ impl From<OverrideAction> for crate::lexicon::ProcedureAction {
     }
 }
 
+impl ProjectConfig {
+    /// The file's settings as the environment variables they stand in for.
+    /// Expressing them this way is what lets an environment variable win
+    /// without each reader knowing the file exists.
+    pub fn env_layer(&self, mode: ConfigMode) -> BTreeMap<String, String> {
+        let mut layer = BTreeMap::new();
+        if let Some(name) = &self.instance.app_name {
+            layer.insert("APP_NAME".to_string(), name.clone());
+        }
+        if let Some(did) = &self.instance.superadmin {
+            layer.insert("SUPERADMIN_DID".to_string(), did.clone());
+        }
+        if let Some(protocol) = self.jetstream.protocol {
+            layer.insert(
+                "JETSTREAM_PROTOCOL".to_string(),
+                protocol.as_str().to_string(),
+            );
+        }
+        if let Some(compression) = self.jetstream.compression {
+            layer.insert("JETSTREAM_COMPRESSION".to_string(), compression.to_string());
+        }
+        if mode == ConfigMode::Dev {
+            if let Some(port) = self.dev.port {
+                layer.insert("PORT".to_string(), port.to_string());
+            }
+            layer.insert(
+                "HAPPYVIEW_DEV_BACKFILL".to_string(),
+                self.dev.backfill.to_string(),
+            );
+        }
+        layer
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScriptOverride {
@@ -822,5 +856,45 @@ capabilities = ["library:call"]
     #[test]
     fn the_full_example_still_parses_under_validation() {
         parse(FULL).unwrap();
+    }
+
+    #[test]
+    fn the_env_layer_names_the_variables_the_file_stands_in_for() {
+        let config = parse(FULL).unwrap();
+        let serve = config.env_layer(ConfigMode::Serve);
+        assert_eq!(
+            serve.get("APP_NAME").map(String::as_str),
+            Some("HappyProto Registry")
+        );
+        assert_eq!(
+            serve.get("SUPERADMIN_DID").map(String::as_str),
+            Some("did:plc:ar7c4by46qjdydhdevvrndac")
+        );
+        assert_eq!(
+            serve.get("PORT"),
+            None,
+            "[dev] never reaches a production deploy"
+        );
+        assert_eq!(
+            serve.get("JETSTREAM_PROTOCOL").map(String::as_str),
+            Some("v1")
+        );
+        assert_eq!(
+            serve.get("JETSTREAM_COMPRESSION").map(String::as_str),
+            Some("false")
+        );
+
+        let dev = config.env_layer(ConfigMode::Dev);
+        assert_eq!(dev.get("PORT").map(String::as_str), Some("3000"));
+        assert_eq!(
+            dev.get("HAPPYVIEW_DEV_BACKFILL").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(serve.get("HAPPYVIEW_DEV_BACKFILL"), None);
+    }
+
+    #[test]
+    fn an_empty_file_contributes_no_serve_variables() {
+        assert!(parse("").unwrap().env_layer(ConfigMode::Serve).is_empty());
     }
 }

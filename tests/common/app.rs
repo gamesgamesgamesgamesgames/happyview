@@ -84,6 +84,9 @@ impl TestApp {
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
+            superadmin_did: None,
+            project_root: None,
+            project: None,
         };
 
         let sql = adapt_sql(

@@ -149,6 +149,9 @@ pub fn test_state_with_pool_on(
         plugin_cache_dir: None,
         platform_api_key_hash: None,
         job_worker_concurrency: 1,
+        superadmin_did: None,
+        project_root: None,
+        project: None,
     };
     let (tx, _) = watch::channel(vec![]);
     let (labeler_tx, _) = watch::channel(());
