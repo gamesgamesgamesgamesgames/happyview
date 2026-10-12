@@ -415,6 +415,9 @@ jobs:
       - name: Check that a default build links no Lua interpreter
         run: bash scripts/check-no-native-lua.sh
 
+      - name: Check that nothing links OpenSSL
+        run: bash scripts/check-no-openssl.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
