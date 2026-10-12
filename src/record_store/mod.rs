@@ -2327,6 +2327,7 @@ mod tests {
                 .collect();
             let cids = [
                 "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm",
+                "",
                 "c50",
                 "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",
             ];
@@ -2407,34 +2408,51 @@ mod tests {
                 assert_eq!(cid, rec.cid, "{backend:?} {} view cid", rec.rkey);
             }
             if backend == DatabaseBackend::Sqlite {
-                let count = |range: &'static str| {
-                    let pool = pool.clone();
-                    let collection = collection.clone();
-                    async move {
-                        let (n,): (i64,) = crate::db::query_as(&format!(
-                            "SELECT COUNT(*) FROM happyview_records_v2 r \
-                             JOIN happyview_collections c ON c.id = r.collection_id \
-                             WHERE c.nsid = ? AND {range}"
-                        ))
-                        .bind(collection)
-                        .fetch_one(&pool)
-                        .await
-                        .expect("count");
-                        n
+                // Every compressible row is compressed: a row under
+                // MIN_COMPRESS_BYTES, or one zstd could not shrink, is
+                // `RAW_CONSIDERED` (0) with its stored bytes unchanged, and
+                // any other row has a dictionary and a smaller body. Only the
+                // codec-less segment is NULL.
+                let rows: Vec<(String, Option<i64>, i64)> = crate::db::query_as(
+                    "SELECT r.rkey, r.body_dict, length(r.body) FROM happyview_records_v2 r \
+                     JOIN happyview_collections c ON c.id = r.collection_id WHERE c.nsid = ?",
+                )
+                .bind(&collection)
+                .fetch_all(&pool)
+                .await
+                .expect("stored bodies");
+                assert_eq!(rows.len(), records.len());
+                let mut positive = [0usize; 2];
+                for (rkey, dict, stored_len) in rows {
+                    let i: usize = rkey[1..].parse().unwrap();
+                    let raw_len = records[i].record_json.len() as i64;
+                    if i >= 270 {
+                        assert_eq!(dict, None, "{rkey} stays raw");
+                        assert_eq!(stored_len, raw_len, "{rkey}");
+                        continue;
                     }
-                };
-                assert!(
-                    count("r.rkey < 'r0130' AND r.body_dict > 0").await > 0,
-                    "recompressed rows"
-                );
-                assert!(
-                    count("r.rkey >= 'r0130' AND r.rkey < 'r0270' AND r.body_dict > 0").await > 0,
-                    "rows compressed on write"
-                );
-                assert!(
-                    count("r.rkey >= 'r0270' AND r.body_dict IS NULL").await > 0,
-                    "raw rows"
-                );
+                    match dict {
+                        None => panic!("{rkey} was never considered for compression"),
+                        Some(0) => {
+                            assert_eq!(stored_len, raw_len, "{rkey} raw bytes");
+                            if raw_len >= compression::MIN_COMPRESS_BYTES as i64 {
+                                // zstd could not shrink it; the generated
+                                // bodies are too varied to expect that of
+                                // the structured posts.
+                                assert!(
+                                    !i.is_multiple_of(3) || i < 3,
+                                    "{rkey} is a compressible post"
+                                );
+                            }
+                        }
+                        Some(id) => {
+                            assert!(id > 0);
+                            assert!(stored_len < raw_len, "{rkey} is smaller compressed");
+                            positive[usize::from(i >= 130)] += 1;
+                        }
+                    }
+                }
+                assert!(positive.iter().all(|n| *n >= 40), "{positive:?}");
                 // The view and `hv_record` agree for every row, compressed or not.
                 let rows: Vec<(String, String)> = crate::db::query_as(
                     "SELECT hv_record(r.body, r.body_dict), v.record FROM happyview_records_v2 r \
