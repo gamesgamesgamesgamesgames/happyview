@@ -22,9 +22,8 @@ pub(crate) use execute::{execute_procedure_script, execute_query_script};
 pub use sandbox::validate_script;
 pub use scripts::{
     LabelAppliedEvent, LabelHookOutcome, NATIVE_LANGUAGE, ParsedTrigger, RecordEventPayload,
-    RecordHookOutcome, ResolvedScript, ScriptRow, TriggerKind, resolve, resolve_record_event,
-    run_label_applied_script, run_record_event_once, run_record_event_script,
-    trigger_for_label_uri,
+    RecordHookOutcome, ResolvedScript, TriggerKind, run_label_applied_script,
+    run_record_event_once, run_record_event_script, trigger_for_label_uri,
 };
 
 /// Test-only seams for integration tests that need a runner-shaped VM

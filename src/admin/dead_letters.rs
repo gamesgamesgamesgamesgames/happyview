@@ -29,7 +29,7 @@ use super::permissions::Permission;
 use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339, parse_dt};
 use crate::error::AppError;
-use crate::lua::{RecordEventPayload, resolve_record_event, run_record_event_once};
+use crate::lua::{RecordEventPayload, run_record_event_once};
 use crate::record_handler::RecordEvent;
 
 // ---------------------------------------------------------------------------
@@ -884,7 +884,10 @@ async fn retry_single(state: &AppState, id: &str) -> Result<(), AppError> {
         ));
     }
 
-    let resolved = resolve_record_event(state, &dl.collection, &dl.action)
+    let project = state.project.load_full();
+    let resolved = state
+        .scripts
+        .resolve_record_event_in(&project, &dl.collection, &dl.action)
         .await
         .ok_or_else(|| {
             AppError::NotFound(format!(

@@ -96,7 +96,8 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     }
 
     let lookup = scripts::ParsedTrigger::new(scripts::TriggerKind::JobRun, &job.job_type);
-    let script = match scripts::resolve(state, &lookup).await {
+    let project = state.project.load_full();
+    let script = match state.scripts.resolve_in(&project, &lookup).await {
         Some(s) => s,
         None => {
             let error = format!("no script found for trigger: {}", lookup.id());

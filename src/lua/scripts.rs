@@ -28,7 +28,7 @@
 //!   label). The firehose has no caller to surface errors to.
 //! - **XRPC procedures / queries**: fail-CLOSED, single-shot — a script
 //!   error becomes a 5xx response. The XRPC dispatchers in
-//!   [`crate::xrpc`] resolve the script via [`resolve`] and call
+//!   [`crate::xrpc`] resolve the script via [`crate::catalog::ScriptCatalog::resolve_in`] and call
 //!   [`super::execute::execute_procedure_script`] /
 //!   [`super::execute::execute_query_script`] directly.
 
@@ -162,17 +162,6 @@ impl ParsedTrigger {
 /// installed interpreters, so only this one is a constant.
 pub const NATIVE_LANGUAGE: &str = "lua";
 
-/// A row from the `scripts` table — the wire shape the admin API returns.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ScriptRow {
-    pub id: String,
-    pub body: String,
-    pub description: Option<String>,
-    pub script_type: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
 /// A script ready to execute.
 #[derive(Clone, Debug)]
 pub struct ResolvedScript {
@@ -199,64 +188,6 @@ pub struct ResolvedScript {
     /// The run carries it so everything it resolves later, such as a local
     /// module, comes from the same build.
     pub snapshot: Arc<ProjectSnapshot>,
-}
-
-/// Look up a single trigger. Returns `None` when no row matches.
-///
-/// Which language the row names is not a filter here. A trigger an operator
-/// bound to a script must resolve to that script whether or not its
-/// interpreter is installed, so that the answer is the dispatcher's refusal
-/// rather than a different script's output or silence.
-pub async fn resolve(state: &AppState, trigger: &ParsedTrigger) -> Option<ResolvedScript> {
-    let trigger_id = trigger.id();
-    let sql = adapt_sql(
-        "SELECT id, body, script_type FROM happyview_scripts WHERE id = ?",
-        state.db_backend,
-    );
-    let row: Option<(String, String, String)> = match crate::db::query_as(&sql)
-        .bind(&trigger_id)
-        .fetch_optional(&state.db)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(trigger_id, "scripts lookup failed: {e}");
-            return None;
-        }
-    };
-    let (id, body, script_type) = row?;
-    Some(ResolvedScript {
-        id,
-        trigger: trigger.kind,
-        script_type,
-        body,
-        layer: Layer::Manual,
-        path: None,
-        chunk_name: crate::catalog::DASHBOARD_CHUNK_NAME.to_string(),
-        outbound_xrpcs: Vec::new(),
-        snapshot: state.project.load_full(),
-    })
-}
-
-/// Resolve a record-event trigger with the cascade rule:
-/// `record.<action>:<nsid>` first, then `record.index:<nsid>`.
-pub async fn resolve_record_event(
-    state: &AppState,
-    nsid: &str,
-    action: &str,
-) -> Option<ResolvedScript> {
-    let action_kind = match action {
-        "create" => Some(TriggerKind::RecordCreate),
-        "update" => Some(TriggerKind::RecordUpdate),
-        "delete" => Some(TriggerKind::RecordDelete),
-        _ => None,
-    };
-    if let Some(kind) = action_kind
-        && let Some(s) = resolve(state, &ParsedTrigger::new(kind, nsid)).await
-    {
-        return Some(s);
-    }
-    resolve(state, &ParsedTrigger::new(TriggerKind::RecordIndex, nsid)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +235,12 @@ pub async fn run_record_event_script(
     state: &AppState,
     payload: RecordEventPayload<'_>,
 ) -> RecordHookOutcome {
-    let resolved = match resolve_record_event(state, payload.nsid, payload.action).await {
+    let project = state.project.load_full();
+    let resolved = match state
+        .scripts
+        .resolve_record_event_in(&project, payload.nsid, payload.action)
+        .await
+    {
         Some(s) => s,
         // No script for this trigger → index the event unchanged.
         None => return RecordHookOutcome::Proceed,
@@ -503,7 +439,8 @@ pub async fn run_label_applied_script(
     event: LabelAppliedEvent,
 ) -> LabelHookOutcome {
     let trigger = trigger_for_label_uri(&event.uri);
-    let resolved = match resolve(state, &trigger).await {
+    let project = state.project.load_full();
+    let resolved = match state.scripts.resolve_in(&project, &trigger).await {
         Some(s) => s,
         None => return LabelHookOutcome::Continue(event),
     };
@@ -766,50 +703,6 @@ async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The cascade reads trigger ids and nothing else. Skipping a row whose
-    /// language has no interpreter would answer an event with a different
-    /// script than the one its operator bound to that action, which is a
-    /// quieter wrong answer than the failure the runner records instead.
-    #[tokio::test]
-    async fn the_cascade_prefers_the_action_trigger_whatever_language_it_names() {
-        let state = crate::test_support::test_state_with_pool(
-            crate::test_support::migrated_memory_pool().await,
-        );
-        let seed = |id: &'static str, script_type: &'static str| {
-            let state = state.clone();
-            async move {
-                let now = now_rfc3339();
-                let sql = adapt_sql(
-                    "INSERT INTO happyview_scripts (id, script_type, body, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?)",
-                    state.db_backend,
-                );
-                crate::db::query(&sql)
-                    .bind(id)
-                    .bind(script_type)
-                    .bind("function handle() end")
-                    .bind(&now)
-                    .bind(&now)
-                    .execute(&state.db)
-                    .await
-                    .expect("seed a script row");
-            }
-        };
-        seed("record.create:com.example.thing", "typescript").await;
-        seed("record.index:com.example.thing", NATIVE_LANGUAGE).await;
-
-        let cascaded = resolve_record_event(&state, "com.example.thing", "create")
-            .await
-            .expect("the cascade resolves the action trigger");
-        assert_eq!(cascaded.id, "record.create:com.example.thing");
-        assert_eq!(cascaded.script_type, "typescript");
-
-        let cascaded = resolve_record_event(&state, "com.example.thing", "update")
-            .await
-            .expect("no update trigger, so the wildcard answers");
-        assert_eq!(cascaded.id, "record.index:com.example.thing");
-    }
 
     #[test]
     fn parse_record_index_trigger() {

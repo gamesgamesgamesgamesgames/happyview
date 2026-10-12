@@ -47,6 +47,10 @@ pub(crate) async fn handle_procedure(
     // overrides the default PDS-write flow.
     let trigger =
         crate::lua::ParsedTrigger::new(crate::lua::TriggerKind::XrpcProcedure, &lexicon.id);
+    // One lookup for the whole call: the scope check below and the run after
+    // it must describe the same script, whatever the snapshot does meanwhile.
+    let project = state.project.load_full();
+    let resolved = state.scripts.resolve_in(&project, &trigger).await;
 
     // Service auth access and scope checks
     if let Some(sa) = &service_auth {
@@ -82,18 +86,10 @@ pub(crate) async fn handle_procedure(
         }
 
         // Check token scope against outbound XRPCs declared by the script
-        let outbound_sql = adapt_sql(
-            "SELECT outbound_xrpcs FROM happyview_scripts WHERE id = ?",
-            state.db_backend,
-        );
-        if let Ok(Some((Some(json_str),))) = crate::db::query_as::<(Option<String>,)>(&outbound_sql)
-            .bind(trigger.id())
-            .fetch_optional(&state.db)
-            .await
-            && let Ok(outbound_list) = serde_json::from_str::<Vec<String>>(&json_str)
-        {
+        if let Some(script) = &resolved {
             let token_scope: Vec<&str> = vec![&method];
-            let missing: Vec<&String> = outbound_list
+            let missing: Vec<&String> = script
+                .outbound_xrpcs
                 .iter()
                 .filter(|x| !token_scope.contains(&x.as_str()))
                 .collect();
@@ -107,7 +103,7 @@ pub(crate) async fn handle_procedure(
             }
         }
     }
-    if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
+    if let Some(resolved) = resolved {
         // Delegation guard preserved from origin/dev: scripts that run
         // under a `delegateDid` must come from a caller who is an
         // active write-capable delegate of that account, scoped to the

@@ -133,6 +133,7 @@ mod tests {
                 id          TEXT PRIMARY KEY,
                 body        TEXT NOT NULL,
                 description TEXT,
+                outbound_xrpcs TEXT,
                 script_type TEXT NOT NULL DEFAULT 'lua',
                 created_at  TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
