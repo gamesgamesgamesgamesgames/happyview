@@ -83,6 +83,13 @@ pub enum UpgradeError {
     RecordsPending { next_uri: String },
     #[error("record store upgrade verification failed, nothing was dropped: {0}")]
     Mismatch(String),
+    #[error(
+        "record store upgrade: {} depend on happyview_records or happyview_record_refs, \
+         which the upgrade replaces with views of the same names; drop them, restart to \
+         upgrade, then recreate them (they will read the views); nothing was copied or dropped",
+        .0.join(", ")
+    )]
+    DependentObjects(Vec<String>),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1262,6 +1269,109 @@ where
         > 0)
 }
 
+/// The indexes HappyView's migrations built on the legacy tables, under
+/// every name a release has used (`ALTER TABLE … RENAME` keeps an index's
+/// name, so the primary keys are still named for `records`/`record_refs`).
+/// Anything else on those tables is a user's own.
+const OWN_LEGACY_INDEXES: &[&str] = &[
+    "records_pkey",
+    "record_refs_pkey",
+    "happyview_records_pkey",
+    "happyview_record_refs_pkey",
+    "idx_records_collection",
+    "idx_records_created_at_uri",
+    "idx_records_did_collection",
+    "idx_records_collection_indexed_at",
+    "idx_records_collection_created_at_uri",
+    "idx_record_refs_target",
+];
+
+/// A user's own index, trigger or rule on a legacy table: the swap's
+/// `DROP TABLE` takes it, so its definition is logged first.
+struct UserObject {
+    kind: String,
+    name: String,
+    definition: String,
+}
+
+/// The user-made indexes, triggers and (Postgres) rules on the two legacy
+/// tables. HappyView made none of its own triggers or rules there.
+async fn user_objects(
+    conn: &mut AnyConnection,
+    backend: DatabaseBackend,
+) -> Result<Vec<UserObject>, sqlx::Error> {
+    let sql = match backend {
+        // Automatic (primary key) indexes have no `sql`.
+        DatabaseBackend::Sqlite => {
+            "SELECT type, name, sql FROM sqlite_master \
+             WHERE type IN ('index', 'trigger') \
+               AND tbl_name IN ('happyview_records', 'happyview_record_refs') \
+               AND sql IS NOT NULL ORDER BY type, name"
+        }
+        DatabaseBackend::Postgres => {
+            "SELECT 'index', CAST(c.relname AS TEXT), pg_get_indexdef(i.indexrelid) \
+               FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+              WHERE i.indrelid IN (to_regclass('happyview_records'), to_regclass('happyview_record_refs')) \
+             UNION ALL \
+             SELECT 'trigger', CAST(t.tgname AS TEXT), pg_get_triggerdef(t.oid) FROM pg_trigger t \
+              WHERE t.tgrelid IN (to_regclass('happyview_records'), to_regclass('happyview_record_refs')) \
+                AND NOT t.tgisinternal \
+             UNION ALL \
+             SELECT 'rule', CAST(r.rulename AS TEXT), pg_get_ruledef(r.oid) FROM pg_rewrite r \
+              WHERE r.ev_class IN (to_regclass('happyview_records'), to_regclass('happyview_record_refs')) \
+             ORDER BY 1, 2"
+        }
+    };
+    Ok(crate::db::query_as::<(String, String, String)>(sql)
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .filter(|(_, name, _)| !OWN_LEGACY_INDEXES.contains(&name.as_str()))
+        .map(|(kind, name, definition)| UserObject {
+            kind,
+            name,
+            definition,
+        })
+        .collect())
+}
+
+/// On Postgres, the objects elsewhere that depend on a legacy table and so
+/// would stop its `DROP TABLE`: views, materialized views and rules on other
+/// tables, and foreign keys from other tables. Named, so the user can drop
+/// them before the upgrade. SQLite has no such dependency: a view there
+/// names the table and reads the compatibility view after the swap.
+async fn dependent_objects(
+    conn: &mut AnyConnection,
+    backend: DatabaseBackend,
+) -> Result<Vec<String>, sqlx::Error> {
+    if backend != DatabaseBackend::Postgres {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(String,)> = crate::db::query_as(
+        "WITH legacy AS ( \
+           SELECT to_regclass('happyview_records') AS oid \
+           UNION ALL SELECT to_regclass('happyview_record_refs')) \
+         SELECT DISTINCT CASE c.relkind WHEN 'v' THEN 'view ' WHEN 'm' THEN 'materialized view ' \
+                ELSE 'rule ' || r.rulename || ' on ' END || CAST(CAST(c.oid AS regclass) AS TEXT) \
+           FROM pg_depend d \
+           JOIN pg_rewrite r ON r.oid = d.objid \
+           JOIN pg_class c ON c.oid = r.ev_class \
+          WHERE d.classid = CAST('pg_rewrite' AS regclass) \
+            AND d.refobjid IN (SELECT oid FROM legacy) \
+            AND r.ev_class NOT IN (SELECT oid FROM legacy) \
+         UNION \
+         SELECT 'foreign key ' || con.conname || ' on ' || CAST(CAST(con.conrelid AS regclass) AS TEXT) \
+           FROM pg_constraint con \
+          WHERE con.contype = 'f' \
+            AND con.confrelid IN (SELECT oid FROM legacy) \
+            AND con.conrelid NOT IN (SELECT oid FROM legacy) \
+         ORDER BY 1",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows.into_iter().map(|(name,)| name).collect())
+}
+
 /// Copy passes `run` makes when the refs copy finds records written behind
 /// the records copy (an instance still on the old release writing during a
 /// rolling deploy) before it gives up.
@@ -1307,6 +1417,13 @@ pub async fn run_on(
         if !legacy_tables_present(&mut *tx, backend).await? {
             tx.rollback().await?;
             return Ok(UpgradeOutcome::AlreadyDone);
+        }
+        // Before anything is copied: a full copy that the swap's DROP TABLE
+        // then refuses would repeat on every boot.
+        let dependent = dependent_objects(&mut tx, backend).await?;
+        if !dependent.is_empty() {
+            tx.rollback().await?;
+            return Err(UpgradeError::DependentObjects(dependent));
         }
         let resuming = get_setting(&mut *tx, backend, RECORDS_CURSOR)
             .await?
@@ -1514,6 +1631,15 @@ async fn swap_in_transaction(
         let summary = verify(&mut tx, backend, STAGING).await?;
         for sql in compat::drop_statements(backend, STAGING) {
             crate::db::query(&sql).execute(&mut *tx).await?;
+        }
+        for object in user_objects(&mut tx, backend).await? {
+            tracing::warn!(
+                kind = object.kind,
+                name = object.name,
+                definition = object.definition,
+                "record store upgrade: dropping an object on the old record tables that HappyView did not \
+                 create; recreate an index on happyview_records_v2 (see the upgrade notes)"
+            );
         }
         crate::db::query("DROP TABLE happyview_record_refs")
             .execute(&mut *tx)
@@ -2625,6 +2751,212 @@ mod tests {
             );
             db.finish().await;
         }
+    }
+
+    /// Everything logged at warn or above while the guard lives, as text.
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    impl Logs {
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(self.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("logs")).into_owned()
+        }
+    }
+
+    /// A Postgres view on a legacy table would make the swap's `DROP TABLE`
+    /// fail after a full copy, on every boot. It is refused up front, by
+    /// name, before anything is copied.
+    #[tokio::test]
+    async fn a_dependent_postgres_view_refuses_the_upgrade_by_name() {
+        for db in pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            if backend != DatabaseBackend::Postgres {
+                db.finish().await;
+                continue;
+            }
+            seed_legacy(pool, backend, 12).await;
+            exec(
+                pool,
+                "CREATE VIEW my_witchsky AS SELECT uri, record FROM happyview_records \
+                 WHERE record::jsonb->>'via' = 'witchsky'",
+            )
+            .await;
+            let err = run(pool, backend).await.expect_err("refused");
+            let message = err.to_string();
+            assert!(
+                matches!(err, UpgradeError::DependentObjects(_))
+                    && message.contains("view my_witchsky")
+                    && message.contains("drop"),
+                "{message}"
+            );
+            assert!(legacy_tables_present(pool, backend).await.expect("check"));
+            assert_eq!(
+                count(pool, "happyview_records_v2").await,
+                0,
+                "nothing copied"
+            );
+            assert_eq!(
+                get_setting(pool, backend, RECORDS_CURSOR)
+                    .await
+                    .expect("cursor"),
+                None
+            );
+
+            exec(pool, "DROP VIEW my_witchsky").await;
+            assert!(matches!(
+                run(pool, backend).await.expect("upgrade"),
+                UpgradeOutcome::Upgraded { records: 12, .. }
+            ));
+            exec(
+                pool,
+                "CREATE VIEW my_witchsky AS SELECT uri, record FROM happyview_records \
+                 WHERE record::jsonb->>'via' = 'witchsky'",
+            )
+            .await;
+            assert_eq!(count(pool, "my_witchsky").await, 12);
+            db.finish().await;
+        }
+    }
+
+    /// A user's own index or trigger on a legacy table goes with it, so the
+    /// swap logs each one's definition first, and the upgrade goes on.
+    #[tokio::test]
+    async fn a_custom_index_and_trigger_are_logged_and_dropped() {
+        for db in pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            seed_legacy(pool, backend, 12).await;
+            // Every index the migrations built is on HappyView's own list.
+            let mut conn = pool.acquire().await.expect("acquire");
+            let own: Vec<String> = user_objects(&mut conn, backend)
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|o| o.name)
+                .collect();
+            assert!(own.is_empty(), "{backend:?}: not on the own list: {own:?}");
+            assert!(
+                dependent_objects(&mut conn, backend)
+                    .await
+                    .expect("list")
+                    .is_empty()
+            );
+            drop(conn);
+            let statements: &[&str] = match backend {
+                DatabaseBackend::Sqlite => &[
+                    "CREATE INDEX my_via ON happyview_records (json_extract(record, '$.via'))",
+                    "CREATE TRIGGER my_trigger AFTER INSERT ON happyview_records BEGIN SELECT 1; END",
+                ],
+                DatabaseBackend::Postgres => &[
+                    "CREATE INDEX my_via ON happyview_records ((record::jsonb->>'via'))",
+                    "CREATE FUNCTION my_noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+                    "CREATE TRIGGER my_trigger AFTER INSERT ON happyview_records FOR EACH ROW EXECUTE FUNCTION my_noop()",
+                ],
+            };
+            for sql in statements {
+                exec(pool, sql).await;
+            }
+            let logs = Logs::default();
+            let outcome = {
+                let _capture = logs.capture();
+                run(pool, backend).await.expect("upgrade")
+            };
+            assert!(matches!(
+                outcome,
+                UpgradeOutcome::Upgraded { records: 12, .. }
+            ));
+            let text = logs.text();
+            for expected in ["my_via", "my_trigger", "happyview_records"] {
+                assert!(
+                    text.contains(expected),
+                    "{backend:?}: {expected} not in {text}"
+                );
+            }
+            assert!(
+                text.contains("via"),
+                "{backend:?}: the index definition: {text}"
+            );
+            for own in [
+                "idx_records_collection_created_at_uri",
+                "idx_record_refs_target",
+            ] {
+                assert!(
+                    !text.contains(own),
+                    "{backend:?}: HappyView's own {own} logged: {text}"
+                );
+            }
+            let left: i64 = match backend {
+                DatabaseBackend::Sqlite => crate::db::query_scalar(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('my_via', 'my_trigger')",
+                ),
+                DatabaseBackend::Postgres => crate::db::query_scalar(
+                    "SELECT (SELECT COUNT(*) FROM pg_class WHERE relname = 'my_via') \
+                          + (SELECT COUNT(*) FROM pg_trigger WHERE tgname = 'my_trigger')",
+                ),
+            }
+            .fetch_one(pool)
+            .await
+            .expect("count");
+            assert_eq!(left, 0, "{backend:?}");
+            db.finish().await;
+        }
+    }
+
+    /// A SQLite view names `happyview_records`, which after the swap is the
+    /// compatibility view, so it keeps answering.
+    #[tokio::test]
+    async fn a_sqlite_user_view_keeps_working_after_the_swap() {
+        let pool = crate::test_support::pre_upgrade_memory_pool().await;
+        let backend = DatabaseBackend::Sqlite;
+        seed_legacy(&pool, backend, 12).await;
+        exec(
+            &pool,
+            "CREATE VIEW my_witchsky AS SELECT uri, record FROM happyview_records \
+             WHERE json_extract(record, '$.via') = 'witchsky'",
+        )
+        .await;
+        let before: Vec<(String, String)> =
+            crate::db::query_as("SELECT uri, record FROM my_witchsky ORDER BY uri")
+                .fetch_all(&pool)
+                .await
+                .expect("before");
+        assert!(matches!(
+            run(&pool, backend).await.expect("upgrade"),
+            UpgradeOutcome::Upgraded { .. }
+        ));
+        let after: Vec<(String, String)> =
+            crate::db::query_as("SELECT uri, record FROM my_witchsky ORDER BY uri")
+                .fetch_all(&pool)
+                .await
+                .expect("the view still reads");
+        assert_eq!(after, before);
+        assert_eq!(after.len(), 12);
     }
 
     #[tokio::test]

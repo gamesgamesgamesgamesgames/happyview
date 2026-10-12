@@ -78,6 +78,18 @@ Make sure there is enough free disk:
 
 **On Postgres, stop every HappyView instance before you start the new release.** An instance still running the old release can write to the old tables while the new one copies them. The copy picks up those writes, and the final check locks the old tables so that it sees every one, but if writes keep arriving, the upgrade stops with an error rather than drop them. Stop the old instances and start the new release again.
 
+**Your own indexes, triggers and views on the old tables.** The upgrade drops `happyview_records` and `happyview_record_refs` and puts views of the same names in their place, so what you built on the old tables goes with them:
+
+- **Indexes and triggers** you created on either table are dropped with it, on both backends. The upgrade logs each one first, at warn level, with its full definition (`record store upgrade: dropping an object on the old record tables that HappyView did not create`, with `kind`, `name` and `definition` fields), and then carries on. Recreate an index on the table behind the view, where queries on the view use it; see [JSON indexes on Postgres](#after-the-upgrade):
+
+  ```sql
+  CREATE INDEX ON happyview_records_v2 ((record::jsonb->>'via'));
+  ```
+
+  A trigger cannot be recreated on the view as it was: write through the view and react in your own code, or put the trigger on `happyview_records_v2`, whose columns are the compact ones.
+- **Views on SQLite** keep working. They name `happyview_records`, which is the new view after the upgrade.
+- **Views, materialized views, rules and foreign keys on Postgres** that depend on either table would stop the old table from being dropped. The upgrade checks for them before it copies anything and stops with an error that names each one, such as `record store upgrade: view my_witchsky depend on happyview_records or happyview_record_refs, …`. Nothing is copied or dropped. Save their definitions, drop them, start HappyView again so the upgrade runs, then recreate them: they read the views the same way they read the tables.
+
 **On SQLite, start one instance.** A second process started on the same file while the first is upgrading can exit with `database is locked`. Start it again once the first is serving: it finds the upgrade done.
 
 ### What happens at the first start
@@ -144,6 +156,7 @@ Some queries are slower through the views, because `uri`, `source_uri` and `targ
 
 - Filtering on `uri`, `source_uri` or `target_uri` reads every row. Filter `happyview_records` by `did`, `collection` and `rkey` instead, which use an index. For the records that link to a URI, use the [`happyview.backlinks`](../../api-reference/lua/libraries.md) library, or `host_backlinks_query` from a plugin.
 - `ORDER BY` or a range on `created_at`, `indexed_at` or `uri` sorts or scans the whole collection.
+- On Postgres, `cid`, `indexed_at` and `created_at` are converted back to text as they are read, about 6.6 µs per row for the three (about 7 seconds per million rows). A query that reads every row, such as an export, is faster when it selects only the columns it needs.
 
 HappyView's own queries read the tables directly and are not affected.
 
