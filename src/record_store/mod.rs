@@ -2236,4 +2236,222 @@ mod tests {
             }
         }
     }
+
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items[(self.next() % items.len() as u64) as usize]
+        }
+    }
+
+    /// JSON text as a PDS or a Lua hook might hand it over: arbitrary key
+    /// order, repeated keys, whitespace, escapes, non-ASCII, big numbers.
+    fn random_json(rng: &mut Xorshift, depth: u32) -> String {
+        let ws = |rng: &mut Xorshift| rng.pick(&["", " ", "\n  ", "\t"]).to_string();
+        match rng.next() % 6 {
+            0 | 1 if depth > 0 => {
+                let n = rng.next() % 5;
+                let fields: Vec<String> = (0..n)
+                    .map(|_| {
+                        let key =
+                            rng.pick(&["text", "via", "a", "z", "é", "$type", "createdAt", "text"]);
+                        format!(
+                            "{}\"{key}\"{}:{}{}",
+                            ws(rng),
+                            ws(rng),
+                            ws(rng),
+                            random_json(rng, depth - 1)
+                        )
+                    })
+                    .collect();
+                format!("{{{}}}", fields.join(","))
+            }
+            2 if depth > 0 => {
+                let n = rng.next() % 4;
+                let items: Vec<String> = (0..n).map(|_| random_json(rng, depth - 1)).collect();
+                format!("[{}{}]", items.join(","), ws(rng))
+            }
+            3 => rng
+                .pick(&["0", "-0.5", "1e3", "12345678901234567890", "3.14159"])
+                .to_string(),
+            4 => rng.pick(&["true", "false", "null"]).to_string(),
+            _ => format!(
+                "\"{}\"",
+                rng.pick(&[
+                    "hi",
+                    "\\\"quoted\\\"",
+                    "line\\nbreak",
+                    "\\u00e9 é 日本 🦋",
+                    "tab\\t",
+                    "at://did:plc:x/app.test.store/y",
+                    ""
+                ])
+            ),
+        }
+    }
+
+    /// Arbitrary bodies come back byte-identical through the store and the
+    /// `happyview_records` view, with their CIDs, whether SQLite holds them
+    /// raw, compressed by the recompression pass, or compressed on write.
+    #[tokio::test]
+    async fn arbitrary_bodies_round_trip_byte_for_byte_compressed_and_raw() {
+        for (pool, backend) in test_pools().await {
+            let codec = compression::BodyCodec::new(compression::Compression::Zstd);
+            let store = RecordStore::with_bodies(pool.clone(), backend, codec);
+            let did = unique_did();
+            let collection = format!("app.test.rt{}", uuid::Uuid::new_v4().simple());
+            let mut rng = Xorshift(0xfeed_beef_1234_5678);
+            let fixed = [
+                "{}",
+                r#"{"text":"é 日本 🦋 \u00e9 \"q\" \\ \n","z":1,"a":2}"#,
+                r#"{ "b" : 1 , "a" : [ ] , "b" : 2 }"#,
+            ];
+            let bodies: Vec<String> = (0..400)
+                .map(|i| match i {
+                    0..=2 => fixed[i].to_string(),
+                    _ if i % 3 == 0 => {
+                        compression::sample_posts(1)[0].replace("post 0", &format!("post {i}"))
+                    }
+                    _ => format!("{{\"n\":{i},\"body\":{}}}", random_json(&mut rng, 4)),
+                })
+                .collect();
+            let cids = [
+                "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm",
+                "c50",
+                "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",
+            ];
+            let records: Vec<PreparedRecord> = bodies
+                .iter()
+                .enumerate()
+                .map(|(i, body)| PreparedRecord {
+                    did: did.clone(),
+                    collection: collection.clone(),
+                    rkey: format!("r{i:04}"),
+                    record_json: body.clone(),
+                    cid: cids[i % cids.len()].to_string(),
+                    rev: None,
+                })
+                .collect();
+            // 0..130 are written before a dictionary exists, then compressed
+            // by the recompression pass; 130..270 are compressed on write;
+            // 270.. go through a store without a codec and stay raw.
+            store
+                .write_network(&pool, &records[..130])
+                .await
+                .expect("first segment");
+            if backend == DatabaseBackend::Sqlite {
+                let (collection_id,): (i64,) =
+                    crate::db::query_as("SELECT id FROM happyview_collections WHERE nsid = ?")
+                        .bind(&collection)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("collection id");
+                compression::train(&pool, store.bodies(), collection_id, 4096)
+                    .await
+                    .expect("train");
+                while compression::recompress_batch(
+                    &pool,
+                    store.bodies(),
+                    collection_id,
+                    500,
+                    compression::RECOMPRESS_BUDGET_BYTES,
+                )
+                .await
+                .expect("recompress")
+                .more
+                {}
+            }
+            for rec in &records[130..270] {
+                store
+                    .write_local(WriteKind::Echoed, rec)
+                    .await
+                    .expect("compressed on write");
+            }
+            let plain = RecordStore::new(pool.clone(), backend);
+            for rec in &records[270..] {
+                plain
+                    .write_local(WriteKind::Echoed, rec)
+                    .await
+                    .expect("raw write");
+            }
+            for rec in &records {
+                let got = store.get(&rec.uri()).await.expect("get").expect("present");
+                assert_eq!(got.record, rec.record_json, "{backend:?} {}", rec.rkey);
+                assert_eq!(
+                    got.cid.as_deref(),
+                    Some(rec.cid.as_str()),
+                    "{backend:?} {}",
+                    rec.rkey
+                );
+                let (raw, cid): (String, String) = crate::db::query_as(&adapt_sql(
+                    "SELECT record, cid FROM happyview_records WHERE did = ? AND collection = ? AND rkey = ?",
+                    backend,
+                ))
+                .bind(&did)
+                .bind(&collection)
+                .bind(&rec.rkey)
+                .fetch_one(&pool)
+                .await
+                .expect("view read");
+                assert_eq!(raw, rec.record_json, "{backend:?} {} view", rec.rkey);
+                assert_eq!(cid, rec.cid, "{backend:?} {} view cid", rec.rkey);
+            }
+            if backend == DatabaseBackend::Sqlite {
+                let count = |range: &'static str| {
+                    let pool = pool.clone();
+                    let collection = collection.clone();
+                    async move {
+                        let (n,): (i64,) = crate::db::query_as(&format!(
+                            "SELECT COUNT(*) FROM happyview_records_v2 r \
+                             JOIN happyview_collections c ON c.id = r.collection_id \
+                             WHERE c.nsid = ? AND {range}"
+                        ))
+                        .bind(collection)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("count");
+                        n
+                    }
+                };
+                assert!(
+                    count("r.rkey < 'r0130' AND r.body_dict > 0").await > 0,
+                    "recompressed rows"
+                );
+                assert!(
+                    count("r.rkey >= 'r0130' AND r.rkey < 'r0270' AND r.body_dict > 0").await > 0,
+                    "rows compressed on write"
+                );
+                assert!(
+                    count("r.rkey >= 'r0270' AND r.body_dict IS NULL").await > 0,
+                    "raw rows"
+                );
+                // The view and `hv_record` agree for every row, compressed or not.
+                let rows: Vec<(String, String)> = crate::db::query_as(
+                    "SELECT hv_record(r.body, r.body_dict), v.record FROM happyview_records_v2 r \
+                     JOIN happyview_collections c ON c.id = r.collection_id \
+                     JOIN happyview_records v ON v.collection = c.nsid AND v.rkey = r.rkey \
+                     WHERE c.nsid = ?",
+                )
+                .bind(&collection)
+                .fetch_all(&pool)
+                .await
+                .expect("hv_record");
+                assert_eq!(rows.len(), records.len());
+                assert!(rows.iter().all(|(a, b)| a == b));
+            }
+            for rec in &records {
+                store.delete(&rec.uri()).await.expect("clean up");
+            }
+        }
+    }
 }

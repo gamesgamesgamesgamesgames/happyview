@@ -421,7 +421,7 @@ pub async fn records_search(
 /// Records in `spec.collection` that reference `spec.uri`, keyset-paginated
 /// the same way as `records_query`. The target is parsed and matched by
 /// interned id on the refs target index, never by the derived `target_uri`.
-pub(crate) fn backlinks_query_sql(
+pub fn backlinks_query_sql(
     spec: &BacklinksQuery,
     backend: DatabaseBackend,
 ) -> Result<(String, Vec<Value>), RecordsError> {
@@ -568,9 +568,12 @@ mod tests {
                 .execute(pool)
                 .await
                 .expect("analyze");
-            for (target, literals) in [
+            let cursor = Some(encode_cursor("1767225600000000", "42"));
+            for (target, did, cursor, literals) in [
                 (
                     "at://did:plc:t7/app.test.post/r0",
+                    None,
+                    None,
                     vec![
                         "'did:plc:t7'",
                         "'app.test.post'",
@@ -581,17 +584,35 @@ mod tests {
                 ),
                 (
                     "at://did:plc:t7",
+                    None,
+                    None,
                     vec!["'did:plc:t7'", "''", "'app.test.like'", "50"],
+                ),
+                (
+                    "at://did:plc:t7/app.test.post/r0",
+                    Some("did:plc:src7".to_string()),
+                    cursor,
+                    vec![
+                        "'did:plc:t7'",
+                        "'app.test.post'",
+                        "'r0'",
+                        "'app.test.like'",
+                        "'did:plc:src7'",
+                        "1767225600000000",
+                        "42",
+                        "50",
+                    ],
                 ),
             ] {
                 let spec = BacklinksQuery {
                     uri: target.to_string(),
                     collection: "app.test.like".into(),
-                    did: None,
+                    did,
                     limit: Some(50),
-                    cursor: None,
+                    cursor,
                 };
-                let (sql, _) = backlinks_query_sql(&spec, backend).unwrap();
+                let (sql, binds) = backlinks_query_sql(&spec, backend).unwrap();
+                assert_eq!(binds.len() + 1, literals.len(), "{backend:?} {target}");
                 let sql = crate::test_support::inline_binds_on(&sql, backend, &literals);
                 let plan = crate::test_support::query_plan(pool, backend, &sql).await;
                 assert!(
