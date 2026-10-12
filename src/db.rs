@@ -12,22 +12,6 @@ use sqlx::{query as sqlx_query, query_as as sqlx_query_as, query_scalar as sqlx_
 use std::path::Path;
 use std::sync::LazyLock;
 
-/// Bind value for `happyview_records.indexed_at` on **local** write paths.
-///
-/// `indexed_at` records when a record arrived *from the network*, so only the
-/// Jetstream consumer (`record_handler`) and backfill may write it. Everything
-/// else — `Record:save()`, `save_local()`, the built-in XRPC procedure
-/// handlers, linked-repo writes — binds this on insert. Writes that Jetstream
-/// will echo back also set `indexed_at = NULL` in their `ON CONFLICT` branch,
-/// so the echo re-stamps the row; `index_put`, which is index-only and never
-/// echoed, omits the column there and keeps its existing value.
-///
-/// It has to be an explicit NULL rather than an omitted column: SQLite still
-/// declares `indexed_at TEXT DEFAULT (datetime('now'))` while Postgres dropped
-/// its default in `20260213000000_add_created_at.sql`, so leaving the column out
-/// would fabricate an arrival time on one backend and not the other.
-pub const NO_INDEXED_AT: Option<&str> = None;
-
 // ---------------------------------------------------------------------------
 // SQL query helpers (sqlx 0.9 `SqlSafeStr`)
 // ---------------------------------------------------------------------------

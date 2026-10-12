@@ -148,7 +148,7 @@ async fn post_json(
 ///
 /// `indexed_at` is cleared (NULL on insert and on update): it is
 /// network-arrival provenance, and this write has not come back over the
-/// firehose yet, so the echo re-stamps it. See [`crate::db::NO_INDEXED_AT`].
+/// firehose yet, so the echo re-stamps it. See [`crate::record_store::WriteKind::Echoed`].
 pub async fn index_write(
     state: &AppState,
     did: &str,
