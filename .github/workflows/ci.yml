@@ -395,7 +395,17 @@ jobs:
 
       - name: Build frontend
         working-directory: web
+        env:
+          NEXT_PUBLIC_BASE_PATH: /__HAPPYVIEW_BP__
         run: npm ci && npm run build
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: frontend
+
+      - name: Test the embedded dashboard
+        run: cargo test --release --features embedded-dashboard --lib dashboard::
 
   lint:
     needs: changes

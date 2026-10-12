@@ -110,6 +110,8 @@ hkdf = "0.13"
 hmac = "0.13"
 sqlparser = "0.62.0"
 subtle = "2"
+mime_guess = "2"
+rust-embed = { version = "8", optional = true }
 sfv = "0.15"
 
 [features]
@@ -118,8 +120,12 @@ sfv = "0.15"
 # that a release build carries no Lua interpreter of its own and the plugin is
 # the only path a script run can take.
 lua-reference = ["dep:mlua"]
-# Serve the dashboard compiled into the binary when `STATIC_DIR` is unset.
-embedded-dashboard = []
+# The dashboard compiled into the binary, served when STATIC_DIR is unset.
+# Needs `web/out` (npm run build in web/, with
+# NEXT_PUBLIC_BASE_PATH=/__HAPPYVIEW_BP__) and refuses to compile without it,
+# which is why it is off by default: the release build turns it on after
+# building the frontend, and nothing else has to.
+embedded-dashboard = ["dep:rust-embed"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

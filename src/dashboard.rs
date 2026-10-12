@@ -74,6 +74,132 @@ fn dir_fallback<S: Clone + Send + Sync + 'static>(
     router.fallback_service(ServeDir::new(&static_dir).not_found_service(spa_fallback))
 }
 
+/// What the release build exports `NEXT_PUBLIC_BASE_PATH` as. The served copy
+/// has it replaced by the configured base path, or removed.
+pub const BASE_PATH_SENTINEL: &str = "/__HAPPYVIEW_BP__";
+
+/// The extensions `entrypoint.sh` rewrites on disk; every other asset is
+/// served byte for byte.
+const REWRITTEN_EXTENSIONS: &[&str] = &["html", "js", "css", "txt"];
+
+pub trait Assets: Send + Sync + 'static {
+    fn get(&self, path: &str) -> Option<std::borrow::Cow<'static, [u8]>>;
+}
+
+pub struct EmbeddedDashboard<A: Assets> {
+    assets: A,
+    base_path: String,
+    /// Rewritten text assets, so the sentinel is replaced once per file
+    /// rather than on every request.
+    rewritten: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+}
+
+impl<A: Assets> EmbeddedDashboard<A> {
+    pub fn new(assets: A, base_path: Option<&str>) -> Self {
+        Self {
+            assets,
+            base_path: base_path.unwrap_or("").to_string(),
+            rewritten: Default::default(),
+        }
+    }
+
+    /// Mirrors `ServeDir` plus the directory source's SPA fallback: a
+    /// directory path serves its `index.html`, a directory without its
+    /// trailing slash redirects to it, and anything else unknown gets the
+    /// dynamic-route shell or the root.
+    pub fn respond(&self, path: &str) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        let rel = path.trim_start_matches('/');
+        if rel.is_empty() || rel.ends_with('/') {
+            let index = format!("{rel}index.html");
+            if let Some(res) = self.file(&index) {
+                return res;
+            }
+        } else if let Some(res) = self.file(rel) {
+            return res;
+        } else if self.assets.get(&format!("{rel}/index.html")).is_some() {
+            return (
+                axum::http::StatusCode::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, format!("{path}/"))],
+            )
+                .into_response();
+        }
+
+        let segments: Vec<&str> = rel.trim_end_matches('/').split('/').collect();
+        if segments.len() >= 2 {
+            let shell = format!("{}/_/index.html", segments[..segments.len() - 1].join("/"));
+            if let Some(res) = self.file(&shell) {
+                return res;
+            }
+        }
+        self.file("index.html")
+            .unwrap_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response())
+    }
+
+    fn file(&self, rel: &str) -> Option<axum::response::Response> {
+        let raw = self.assets.get(rel)?;
+        let mime = mime_guess::from_path(rel).first_or_octet_stream();
+        let rewrite = std::path::Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| REWRITTEN_EXTENSIONS.contains(&e));
+        let bytes = if rewrite {
+            let mut cache = self.rewritten.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .entry(rel.to_string())
+                .or_insert_with(|| {
+                    Bytes::from(
+                        String::from_utf8_lossy(&raw)
+                            .replace(BASE_PATH_SENTINEL, &self.base_path)
+                            .into_bytes(),
+                    )
+                })
+                .clone()
+        } else {
+            Bytes::from(raw.into_owned())
+        };
+        Some(
+            axum::http::Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
+                .body(axum::body::Body::from(bytes))
+                .unwrap(),
+        )
+    }
+}
+
+#[cfg(feature = "embedded-dashboard")]
+mod embedded {
+    use std::sync::Arc;
+
+    use axum::Router;
+
+    use super::{Assets, EmbeddedDashboard};
+
+    #[derive(rust_embed::Embed)]
+    #[folder = "web/out/"]
+    struct Export;
+
+    pub(super) struct RustEmbedAssets;
+
+    impl Assets for RustEmbedAssets {
+        fn get(&self, path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+            Export::get(path).map(|f| f.data)
+        }
+    }
+
+    pub(super) fn attach<S: Clone + Send + Sync + 'static>(
+        router: Router<S>,
+        base_path: Option<&str>,
+    ) -> Router<S> {
+        let dashboard = Arc::new(EmbeddedDashboard::new(RustEmbedAssets, base_path));
+        router.fallback(move |uri: axum::http::Uri| {
+            let dashboard = dashboard.clone();
+            async move { dashboard.respond(uri.path()) }
+        })
+    }
+}
+
 #[cfg(not(feature = "embedded-dashboard"))]
 mod embedded {
     use axum::Router;
@@ -83,18 +209,6 @@ mod embedded {
         _base_path: Option<&str>,
     ) -> Router<S> {
         unreachable!("`source` answers Embedded only when the feature is on")
-    }
-}
-
-#[cfg(feature = "embedded-dashboard")]
-mod embedded {
-    use axum::Router;
-
-    pub(super) fn attach<S: Clone + Send + Sync + 'static>(
-        _router: Router<S>,
-        _base_path: Option<&str>,
-    ) -> Router<S> {
-        unimplemented!("the embedded dashboard source is not built yet")
     }
 }
 
@@ -158,5 +272,107 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), "root");
+    }
+
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+
+    struct MapAssets(HashMap<&'static str, &'static [u8]>);
+
+    impl Assets for MapAssets {
+        fn get(&self, path: &str) -> Option<Cow<'static, [u8]>> {
+            self.0.get(path).map(|b| Cow::Borrowed(*b))
+        }
+    }
+
+    fn export() -> MapAssets {
+        MapAssets(HashMap::from([
+            (
+                "index.html",
+                b"<a href=\"/__HAPPYVIEW_BP__/dashboard/\">root</a>".as_slice(),
+            ),
+            ("dashboard/index.html", b"dash".as_slice()),
+            ("dashboard/records/_/index.html", b"shell".as_slice()),
+            (
+                "_next/static/app.js",
+                b"fetch(\"/__HAPPYVIEW_BP__/admin\")".as_slice(),
+            ),
+            ("logo.png", b"\x89PNG/__HAPPYVIEW_BP__".as_slice()),
+        ]))
+    }
+
+    async fn body(res: axum::response::Response) -> String {
+        use http_body_util::BodyExt;
+        String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn serves_a_directory_index_for_a_trailing_slash() {
+        let d = EmbeddedDashboard::new(export(), None);
+        let res = d.respond("/dashboard/");
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "text/html");
+        assert_eq!(body(res).await, "dash");
+    }
+
+    #[tokio::test]
+    async fn redirects_a_directory_without_its_trailing_slash() {
+        let res = EmbeddedDashboard::new(export(), None).respond("/dashboard");
+        assert_eq!(res.status(), 307);
+        assert_eq!(res.headers()["location"], "/dashboard/");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_dynamic_shell_then_the_root() {
+        let d = EmbeddedDashboard::new(export(), None);
+        assert_eq!(body(d.respond("/dashboard/records/abc")).await, "shell");
+        assert_eq!(
+            body(d.respond("/nowhere/at/all")).await,
+            "<a href=\"/dashboard/\">root</a>"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrites_the_base_path_sentinel_in_text_assets() {
+        let d = EmbeddedDashboard::new(export(), Some("/hv"));
+        assert_eq!(
+            body(d.respond("/_next/static/app.js")).await,
+            "fetch(\"/hv/admin\")"
+        );
+        assert_eq!(
+            body(d.respond("/")).await,
+            "<a href=\"/hv/dashboard/\">root</a>"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_the_sentinel_when_there_is_no_base_path() {
+        let d = EmbeddedDashboard::new(export(), None);
+        assert_eq!(
+            body(d.respond("/_next/static/app.js")).await,
+            "fetch(\"/admin\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_binary_assets_untouched() {
+        use http_body_util::BodyExt;
+        let res = EmbeddedDashboard::new(export(), Some("/hv")).respond("/logo.png");
+        assert_eq!(res.headers()["content-type"], "image/png");
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"\x89PNG/__HAPPYVIEW_BP__");
+    }
+
+    /// Only meaningful in a build that embedded a real export: an empty
+    /// `web/out` compiles, and this is what notices.
+    #[cfg(feature = "embedded-dashboard")]
+    #[test]
+    fn the_embedded_copy_holds_the_dashboard() {
+        assert!(embedded::RustEmbedAssets.get("index.html").is_some());
+        assert!(
+            embedded::RustEmbedAssets
+                .get("dashboard/index.html")
+                .is_some()
+        );
     }
 }
