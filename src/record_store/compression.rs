@@ -10,8 +10,12 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use sqlx::AnyPool;
+
+use crate::db::DatabaseBackend;
+use crate::record_store::RecordStore;
 
 pub const ZSTD_LEVEL: i32 = 3;
 
@@ -172,6 +176,236 @@ pub fn decompress(body: &[u8], dict: &zstd::dict::DecoderDictionary<'_>) -> Resu
     String::from_utf8(out).map_err(|e| e.to_string())
 }
 
+/// Records a collection needs before it gets a dictionary.
+pub const DEFAULT_TRAIN_AT: i64 = 5_000;
+/// Newest bodies a dictionary is trained from.
+pub const TRAIN_SAMPLES: i64 = 20_000;
+/// Dictionary size.
+pub const DICT_BYTES: usize = 64 * 1024;
+/// Rows per recompression transaction, so ingest interleaves.
+pub const RECOMPRESS_BATCH: i64 = 1_000;
+/// Seconds between maintenance passes.
+pub const DEFAULT_INTERVAL_SECS: u64 = 600;
+
+/// `ZSTD_DICT_TRAIN_AT`; a missing, unparseable or non-positive value is the
+/// default.
+pub fn parse_train_at(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_TRAIN_AT)
+}
+
+pub fn train_at_from_env() -> i64 {
+    parse_train_at(std::env::var("ZSTD_DICT_TRAIN_AT").ok().as_deref())
+}
+
+/// `RECORD_COMPRESSION_INTERVAL_SECS`, the seconds between passes.
+pub fn parse_interval_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_INTERVAL_SECS)
+}
+
+pub fn interval_from_env() -> Duration {
+    Duration::from_secs(parse_interval_secs(
+        std::env::var("RECORD_COMPRESSION_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+    ))
+}
+
+/// The magic number that opens a zstd dictionary, little-endian.
+pub const ZSTD_DICT_MAGIC: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
+
+/// Whether `dict` is a zstd-format dictionary rather than raw content.
+pub fn is_zstd_dictionary(dict: &[u8]) -> bool {
+    dict.starts_with(&ZSTD_DICT_MAGIC)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TrainError {
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+    #[error("the collection has no records to train on")]
+    NoSamples,
+    #[error("zstd could not train a dictionary: {0}")]
+    Zstd(String),
+}
+
+/// Collections that hold at least `train_at` records and have no
+/// dictionary. Each count stops at `train_at`, so a large collection costs
+/// no more than a small one.
+pub async fn due_for_training(pool: &AnyPool, train_at: i64) -> Result<Vec<i64>, sqlx::Error> {
+    let candidates: Vec<(i64,)> = crate::db::query_as(
+        "SELECT c.id FROM happyview_collections c \
+         WHERE NOT EXISTS (SELECT 1 FROM happyview_zstd_dicts z WHERE z.collection_id = c.id) ORDER BY c.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut due = Vec::new();
+    for (collection_id,) in candidates {
+        let (held,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM happyview_records_v2 WHERE collection_id = ? LIMIT ?) AS sample",
+        )
+        .bind(collection_id)
+        .bind(train_at)
+        .fetch_one(pool)
+        .await?;
+        if held >= train_at {
+            due.push(collection_id);
+        }
+    }
+    Ok(due)
+}
+
+/// Train a dictionary for `collection_id` from up to `TRAIN_SAMPLES` of its
+/// newest bodies, store it, and make new writes through `codec` use it.
+/// The dictionary is committed on its own before anything references it, so
+/// its id never names different bytes.
+pub async fn train(
+    pool: &AnyPool,
+    codec: &BodyCodec,
+    collection_id: i64,
+    dict_bytes: usize,
+) -> Result<i64, TrainError> {
+    let samples: Vec<String> = crate::db::query_as::<(String,)>(
+        "SELECT hv_record(body, body_dict) FROM happyview_records_v2 \
+         WHERE collection_id = ? ORDER BY id DESC LIMIT ?",
+    )
+    .bind(collection_id)
+    .bind(TRAIN_SAMPLES)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(body,)| body)
+    .collect();
+    if samples.is_empty() {
+        return Err(TrainError::NoSamples);
+    }
+    let dict = tokio::task::spawn_blocking(move || zstd::dict::from_samples(&samples, dict_bytes))
+        .await
+        .map_err(|e| TrainError::Zstd(e.to_string()))?
+        .map_err(|e| TrainError::Zstd(e.to_string()))?;
+    // A raw-content dictionary (no magic) carries no id of its own, so a
+    // frame read with the wrong one would decode to wrong text, silently.
+    if !is_zstd_dictionary(&dict) {
+        return Err(TrainError::Zstd(
+            "training produced a raw-content dictionary, not a zstd one".into(),
+        ));
+    }
+    let (dict_id,): (i64,) = crate::db::retry_on_busy(|| {
+        crate::db::query_as(
+            "INSERT INTO happyview_zstd_dicts (collection_id, created_at, dict) VALUES (?, ?, ?) RETURNING id",
+        )
+        .bind(collection_id)
+        .bind(crate::record_store::codec::now_micros())
+        .bind(dict.clone())
+        .fetch_one(pool)
+    })
+    .await?;
+    codec.install(collection_id, dict_id, &dict);
+    Ok(dict_id)
+}
+
+/// Compress up to `limit` of `collection_id`'s never-considered rows with
+/// its current dictionary, in one write transaction. Returns the rows
+/// considered; fewer than `limit` means none are left.
+pub async fn recompress_batch(
+    pool: &AnyPool,
+    codec: &BodyCodec,
+    collection_id: i64,
+    limit: i64,
+) -> Result<u64, sqlx::Error> {
+    if codec.current_dict(collection_id).is_none() {
+        return Ok(0);
+    }
+    crate::db::retry_on_busy(|| async {
+        let mut tx = crate::db::begin_write(pool, DatabaseBackend::Sqlite).await?;
+        let rows: Vec<(i64, Vec<u8>)> = crate::db::query_as(
+            "SELECT id, body FROM happyview_records_v2 \
+             WHERE collection_id = ? AND body_dict IS NULL ORDER BY id LIMIT ?",
+        )
+        .bind(collection_id)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (id, body) in &rows {
+            let (stored, dict) = match std::str::from_utf8(body) {
+                Ok(json) => codec.encode(collection_id, json),
+                Err(_) => (body.clone(), Some(RAW_CONSIDERED)),
+            };
+            crate::db::query(
+                "UPDATE happyview_records_v2 SET body = ?, body_dict = ? WHERE id = ?",
+            )
+            .bind(stored)
+            .bind(dict.unwrap_or(RAW_CONSIDERED))
+            .bind(*id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(rows.len() as u64)
+    })
+    .await
+}
+
+/// One maintenance pass: train the collections that are due, recompress
+/// every raw row of a collection with a dictionary, and hand freed pages
+/// back to the filesystem. Returns the rows considered.
+pub async fn pass(store: &RecordStore, train_at: i64) -> Result<u64, TrainError> {
+    let (pool, codec) = (store.db(), store.bodies());
+    for collection_id in due_for_training(pool, train_at).await? {
+        match train(pool, codec, collection_id, DICT_BYTES).await {
+            Ok(dict_id) => tracing::info!(collection_id, dict_id, "trained a zstd dictionary"),
+            Err(e) => {
+                tracing::warn!(collection_id, error = %e, "could not train a zstd dictionary")
+            }
+        }
+    }
+    let collections: Vec<(i64,)> = crate::db::query_as(
+        "SELECT DISTINCT collection_id FROM happyview_zstd_dicts ORDER BY collection_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut considered = 0;
+    for (collection_id,) in collections {
+        loop {
+            let n = recompress_batch(pool, codec, collection_id, RECOMPRESS_BATCH).await?;
+            considered += n;
+            if (n as i64) < RECOMPRESS_BATCH {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    if considered > 0 {
+        tracing::info!(considered, "recompressed record bodies");
+        if let Err(e) = crate::db::query("PRAGMA incremental_vacuum")
+            .execute(pool)
+            .await
+        {
+            tracing::warn!(error = %e, "incremental vacuum after recompression failed");
+        }
+    }
+    Ok(considered)
+}
+
+/// The maintenance loop: a pass shortly after boot, then every `every`.
+/// Returns at once on Postgres or with `RECORD_COMPRESSION=none`.
+pub async fn run(store: RecordStore, train_at: i64, every: Duration) {
+    if store.backend() != DatabaseBackend::Sqlite || store.bodies().mode() != Compression::Zstd {
+        return;
+    }
+    let first = tokio::time::Instant::now() + every.min(Duration::from_secs(30));
+    let mut tick = tokio::time::interval_at(first, every);
+    loop {
+        tick.tick().await;
+        if let Err(e) = pass(&store, train_at).await {
+            tracing::warn!(error = %e, "record compression pass failed; retrying next interval");
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn sample_posts(n: usize) -> Vec<String> {
     let topics = [
@@ -197,8 +431,9 @@ pub(crate) fn sample_posts(n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DatabaseBackend;
 
-    fn train(samples: &[String], size: usize) -> Vec<u8> {
+    fn train_dict(samples: &[String], size: usize) -> Vec<u8> {
         zstd::dict::from_samples(samples, size).expect("train a test dictionary")
     }
 
@@ -240,7 +475,7 @@ mod tests {
     #[test]
     fn the_codec_compresses_only_what_it_should() {
         let posts = sample_posts(1000);
-        let dict = train(&posts, 4096);
+        let dict = train_dict(&posts, 4096);
         let codec = BodyCodec::new(Compression::Zstd);
         assert_eq!(
             codec.encode(1, &posts[0]),
@@ -277,7 +512,7 @@ mod tests {
     async fn raw_sql_reads_compressed_and_raw_bodies_byte_for_byte() {
         let pool = crate::test_support::migrated_memory_pool().await;
         let posts = sample_posts(1000);
-        let dict = train(&posts, 4096);
+        let dict = train_dict(&posts, 4096);
         let (collection_id, did_id, dict_id) = seed(&pool, &dict).await;
         let codec = BodyCodec::new(Compression::Zstd);
         codec.install(collection_id, dict_id, &dict);
@@ -327,7 +562,7 @@ mod tests {
         let other: Vec<String> = posts.iter().map(|p| p.replace("post", "skeet")).collect();
         for samples in [&posts, &other] {
             let pool = crate::test_support::migrated_memory_pool().await;
-            let dict = train(samples, 4096);
+            let dict = train_dict(samples, 4096);
             let (collection_id, did_id, dict_id) = seed(&pool, &dict).await;
             let codec = BodyCodec::new(Compression::Zstd);
             codec.install(collection_id, dict_id, &dict);
@@ -358,7 +593,7 @@ mod tests {
     async fn a_body_past_the_decode_limit_stays_raw() {
         let pool = crate::test_support::migrated_memory_pool().await;
         let posts = sample_posts(1000);
-        let dict = train(&posts, 4096);
+        let dict = train_dict(&posts, 4096);
         let (collection_id, did_id, dict_id) = seed(&pool, &dict).await;
         let codec = BodyCodec::new(Compression::Zstd);
         codec.install(collection_id, dict_id, &dict);
@@ -398,7 +633,7 @@ mod tests {
             "{err}"
         );
         let posts = sample_posts(1000);
-        let (_, _, dict_id) = seed(&pool, &train(&posts, 4096)).await;
+        let (_, _, dict_id) = seed(&pool, &train_dict(&posts, 4096)).await;
         let err = crate::db::query("SELECT hv_record(x'28b52ffd00', ?)")
             .bind(dict_id)
             .execute(&pool)
@@ -415,7 +650,7 @@ mod tests {
     async fn the_codec_loads_each_collections_newest_dictionary() {
         let pool = crate::test_support::migrated_memory_pool().await;
         let posts = sample_posts(1000);
-        let dict = train(&posts, 4096);
+        let dict = train_dict(&posts, 4096);
         let (collection_id, _, first) = seed(&pool, &dict).await;
         let (second,): (i64,) = crate::db::query_as(
             "INSERT INTO happyview_zstd_dicts (collection_id, created_at, dict) VALUES (?, 1, ?) RETURNING id",
@@ -434,5 +669,151 @@ mod tests {
             .await
             .expect("load");
         assert_eq!(off.current_dict(collection_id), None);
+    }
+
+    /// Seed `bodies` as raw, never-considered rows of a fresh collection.
+    async fn seed_raw(pool: &sqlx::AnyPool, bodies: &[String]) -> i64 {
+        let (collection_id,): (i64,) =
+            crate::db::query_as("INSERT INTO happyview_collections (nsid) VALUES (?) RETURNING id")
+                .bind(format!("app.test.train{}", uuid::Uuid::new_v4().simple()))
+                .fetch_one(pool)
+                .await
+                .expect("collection");
+        let (did_id,): (i64,) =
+            crate::db::query_as("INSERT INTO happyview_dids (did) VALUES (?) RETURNING id")
+                .bind(format!("did:plc:t{}", uuid::Uuid::new_v4().simple()))
+                .fetch_one(pool)
+                .await
+                .expect("did");
+        for (i, body) in bodies.iter().enumerate() {
+            crate::db::query(
+                "INSERT INTO happyview_records_v2 (did_id, collection_id, rkey, cid, body, created_at) \
+                 VALUES (?, ?, ?, x'', CAST(? AS BLOB), 0)",
+            )
+            .bind(did_id)
+            .bind(collection_id)
+            .bind(format!("r{i}"))
+            .bind(body.as_str())
+            .execute(pool)
+            .await
+            .expect("seed row");
+        }
+        collection_id
+    }
+
+    #[test]
+    fn training_and_interval_settings_parse_with_defaults() {
+        assert_eq!(parse_train_at(None), DEFAULT_TRAIN_AT);
+        assert_eq!(parse_train_at(Some("200")), 200);
+        assert_eq!(parse_train_at(Some("0")), DEFAULT_TRAIN_AT);
+        assert_eq!(parse_train_at(Some("lots")), DEFAULT_TRAIN_AT);
+        assert_eq!(parse_interval_secs(None), DEFAULT_INTERVAL_SECS);
+        assert_eq!(parse_interval_secs(Some("5")), 5);
+        assert_eq!(parse_interval_secs(Some("0")), DEFAULT_INTERVAL_SECS);
+    }
+
+    #[tokio::test]
+    async fn a_collection_past_the_threshold_trains_and_its_raw_rows_recompress() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let mut bodies = sample_posts(1200);
+        bodies.push("{}".to_string());
+        let collection_id = seed_raw(&pool, &bodies).await;
+        let small = seed_raw(&pool, &sample_posts(10)).await;
+
+        let due = due_for_training(&pool, 1000).await.expect("due");
+        assert!(
+            due.contains(&collection_id) && !due.contains(&small),
+            "{due:?}"
+        );
+
+        let codec = BodyCodec::new(Compression::Zstd);
+        let dict_id = train(&pool, &codec, collection_id, 4096)
+            .await
+            .expect("train");
+        assert_eq!(codec.current_dict(collection_id), Some(dict_id));
+        assert!(
+            due_for_training(&pool, 1000).await.expect("due").is_empty(),
+            "a trained collection is no longer due"
+        );
+
+        let mut considered = 0;
+        loop {
+            let n = recompress_batch(&pool, &codec, collection_id, 500)
+                .await
+                .expect("recompress");
+            considered += n;
+            if n < 500 {
+                break;
+            }
+        }
+        assert_eq!(considered as usize, bodies.len());
+        let (left,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_records_v2 WHERE collection_id = ? AND body_dict IS NULL",
+        )
+        .bind(collection_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(left, 0);
+        let (stored, raw): (i64, i64) = crate::db::query_as(
+            "SELECT SUM(length(body)), SUM(length(hv_record(body, body_dict))) FROM happyview_records_v2 WHERE collection_id = ?",
+        )
+        .bind(collection_id)
+        .fetch_one(&pool)
+        .await
+        .expect("sizes");
+        assert!(stored * 2 < raw, "compressed {stored} of {raw} bytes");
+        let read: Vec<(String,)> = crate::db::query_as(
+            "SELECT hv_record(body, body_dict) FROM happyview_records_v2 WHERE collection_id = ? ORDER BY id",
+        )
+        .bind(collection_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read back");
+        assert_eq!(read.into_iter().map(|(s,)| s).collect::<Vec<_>>(), bodies);
+        let (tiny,): (i64,) = crate::db::query_as(
+            "SELECT body_dict FROM happyview_records_v2 WHERE collection_id = ? AND body = CAST('{}' AS BLOB)",
+        )
+        .bind(collection_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the tiny row");
+        assert_eq!(tiny, RAW_CONSIDERED);
+    }
+
+    #[tokio::test]
+    async fn the_loop_does_nothing_when_compression_is_off_or_on_postgres() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let off = crate::record_store::RecordStore::with_bodies(
+            pool.clone(),
+            DatabaseBackend::Sqlite,
+            BodyCodec::disabled(),
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run(off, 1, std::time::Duration::from_secs(3600)),
+        )
+        .await
+        .expect("returns at once when compression is off");
+        let pg = crate::record_store::RecordStore::with_bodies(
+            pool,
+            DatabaseBackend::Postgres,
+            BodyCodec::new(Compression::Zstd),
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run(pg, 1, std::time::Duration::from_secs(3600)),
+        )
+        .await
+        .expect("returns at once on Postgres");
+    }
+
+    #[test]
+    fn only_a_zstd_dictionary_passes_the_magic_check() {
+        let trained = train_dict(&sample_posts(1000), 4096);
+        assert!(is_zstd_dictionary(&trained));
+        assert!(!is_zstd_dictionary(b"{\"text\":\"raw content\"}"));
+        assert!(!is_zstd_dictionary(&[0x37, 0xA4, 0x30]));
+        assert!(!is_zstd_dictionary(&[]));
     }
 }

@@ -161,7 +161,9 @@ impl TestApp {
             http: reqwest::Client::new(),
             db: pool.clone(),
             db_backend: backend,
-            records: happyview::record_store::RecordStore::new(pool.clone(), backend),
+            records: happyview::record_store::RecordStore::shared(pool.clone(), backend)
+                .await
+                .expect("load record dictionaries"),
             domain_cache,
             lexicons,
             collections_tx,

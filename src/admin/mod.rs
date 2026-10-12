@@ -29,6 +29,7 @@ pub mod settings;
 mod spaces;
 pub mod spaces_migration;
 mod stats;
+mod storage;
 mod telemetry;
 pub(crate) mod types;
 mod users;
@@ -147,6 +148,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/database/vacuum/schedule",
             post(database::schedule_vacuum).delete(database::cancel_vacuum),
         )
+        .route("/storage/retrain", post(storage::retrain))
         .route("/jetstream/status", get(jetstream::status))
         .route(
             "/network-lexicons",

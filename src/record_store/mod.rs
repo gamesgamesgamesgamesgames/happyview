@@ -14,6 +14,7 @@ pub mod query;
 pub mod sqlite_functions;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde_json::Value;
 use sqlx::{AnyConnection, AnyPool};
@@ -141,6 +142,7 @@ const LIST_RECENT_BY_DID_SQL: &str = "SELECT uri, did, collection, rkey, record,
 pub struct RecordStore {
     db: AnyPool,
     backend: DatabaseBackend,
+    bodies: Arc<compression::BodyCodec>,
 }
 
 /// The last copy of each URI in `records`, in first-seen order: Postgres
@@ -181,7 +183,35 @@ fn conflict_clause(backend: DatabaseBackend, kind: WriteKind) -> String {
 
 impl RecordStore {
     pub fn new(db: AnyPool, backend: DatabaseBackend) -> Self {
-        Self { db, backend }
+        Self::with_bodies(db, backend, compression::BodyCodec::disabled())
+    }
+
+    pub fn with_bodies(
+        db: AnyPool,
+        backend: DatabaseBackend,
+        bodies: compression::BodyCodec,
+    ) -> Self {
+        Self {
+            db,
+            backend,
+            bodies: Arc::new(bodies),
+        }
+    }
+
+    /// The store the server shares: on SQLite its codec holds each
+    /// collection's newest dictionary under `RECORD_COMPRESSION`.
+    pub async fn shared(db: AnyPool, backend: DatabaseBackend) -> Result<Self, sqlx::Error> {
+        let bodies = match backend {
+            DatabaseBackend::Sqlite => {
+                compression::BodyCodec::load(&db, compression::compression_from_env()).await?
+            }
+            DatabaseBackend::Postgres => compression::BodyCodec::disabled(),
+        };
+        Ok(Self::with_bodies(db, backend, bodies))
+    }
+
+    pub fn bodies(&self) -> &Arc<compression::BodyCodec> {
+        &self.bodies
     }
 
     pub fn db(&self) -> &AnyPool {

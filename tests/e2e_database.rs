@@ -221,3 +221,29 @@ async fn status_requires_auth() {
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+#[serial]
+async fn retrain_refuses_postgres_and_collections_without_records() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/storage/retrain")
+                .header(app.admin_cookie().0, app.admin_cookie().1)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"collection":"app.test.nothing"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let expected = match app.state.db_backend {
+        DatabaseBackend::Postgres => StatusCode::BAD_REQUEST,
+        DatabaseBackend::Sqlite => StatusCode::NOT_FOUND,
+    };
+    assert_eq!(resp.status(), expected);
+}
