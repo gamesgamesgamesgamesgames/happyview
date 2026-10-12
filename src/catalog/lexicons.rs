@@ -382,9 +382,9 @@ impl LexiconCatalog {
     ) -> Result<i32, CatalogError> {
         let id = lexicon.id()?;
         self.check_writable(&id)?;
-        lexicon.parse(1)?;
+        let mut parsed = lexicon.parse(1)?;
         let revision = lexicon_rows::upsert_manual(db, backend, &id, &lexicon).await?;
-        let parsed = lexicon.parse(revision)?;
+        parsed.revision = revision;
         self.stored_mut().insert(
             id,
             StoredLexicon {
@@ -407,10 +407,10 @@ impl LexiconCatalog {
         let authority_did = lexicon.authority_did.clone().ok_or_else(|| {
             CatalogError::Invalid("a network lexicon needs the DID its NSID resolved to".into())
         })?;
-        lexicon.parse(1)?;
+        let mut parsed = lexicon.parse(1)?;
         let revision =
             lexicon_rows::upsert_network(db, backend, &id, &lexicon, &authority_did).await?;
-        let parsed = lexicon.parse(revision)?;
+        parsed.revision = revision;
         self.stored_mut().insert(
             id,
             StoredLexicon {
@@ -434,17 +434,14 @@ impl LexiconCatalog {
         let Some(current) = self.get_network(id).await else {
             return Ok(None);
         };
-        let reparse = |revision| {
-            ParsedLexicon::parse(
-                lexicon_json.clone(),
-                revision,
-                current.parsed.target_collection.clone(),
-                current.parsed.action.clone(),
-                current.parsed.token_cost,
-            )
-            .map_err(|e| NetworkWriteError::Invalid(format!("failed to parse lexicon: {e}")))
-        };
-        reparse(1)?;
+        let mut parsed = ParsedLexicon::parse(
+            lexicon_json.clone(),
+            1,
+            current.parsed.target_collection.clone(),
+            current.parsed.action.clone(),
+            current.parsed.token_cost,
+        )
+        .map_err(|e| NetworkWriteError::Invalid(format!("failed to parse lexicon: {e}")))?;
         let Some(revision) = crate::db::retry_on_busy(|| {
             lexicon_rows::refresh_network(db, backend, id, &lexicon_json)
         })
@@ -452,7 +449,7 @@ impl LexiconCatalog {
         else {
             return Ok(None);
         };
-        let parsed = reparse(revision)?;
+        parsed.revision = revision;
         self.stored_mut().insert(
             id.to_string(),
             StoredLexicon {
@@ -1194,6 +1191,41 @@ mod tests {
             for id in [&man_id, &net_id, &broken_id] {
                 catalog.remove(&db, backend, id).await.unwrap();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_manual_write_over_a_network_row_clears_its_authority() {
+        for (db, backend) in backends().await {
+            let catalog = LexiconCatalog::default();
+            let id = unique("convert");
+            catalog
+                .put_network(&db, backend, network(record_json(&id), "did:plc:authority"))
+                .await
+                .unwrap();
+            catalog
+                .put_manual(&db, backend, manual(record_json(&id)))
+                .await
+                .unwrap();
+
+            let fresh = LexiconCatalog::default();
+            fresh.load_from_db(&db).await.unwrap();
+            assert_eq!(fresh.get_entry(&id).await.unwrap().layer, Layer::Manual);
+            assert!(fresh.get_network(&id).await.is_none());
+            for listing in [
+                catalog
+                    .get_listing(&db, backend, &id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                fresh.get_listing(&db, backend, &id).await.unwrap().unwrap(),
+            ] {
+                assert_eq!(listing.layer, Layer::Manual);
+                assert!(listing.authority_did.is_none(), "{listing:?}");
+                assert!(listing.last_fetched_at.is_none(), "{listing:?}");
+            }
+
+            catalog.remove(&db, backend, &id).await.unwrap();
         }
     }
 }

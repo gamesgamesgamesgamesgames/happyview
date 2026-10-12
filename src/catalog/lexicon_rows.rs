@@ -164,6 +164,8 @@ pub(crate) async fn upsert_manual(
             action = EXCLUDED.action,
             token_cost = EXCLUDED.token_cost,
             source = 'manual',
+            authority_did = NULL,
+            last_fetched_at = NULL,
             revision = happyview_lexicons.revision + 1,
             updated_at = ?
         RETURNING revision
