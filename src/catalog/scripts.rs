@@ -40,12 +40,21 @@ pub struct ManualScript {
 impl ManualScript {
     fn from_columns(c: script_rows::ScriptColumns) -> Self {
         let (id, script_type, body, description, outbound_json, created_at, updated_at) = c;
+        // A corrupt list reads as "calls nothing", which is what the scope
+        // check trusts, so the corruption must at least be visible.
+        let outbound_xrpcs = outbound_json.and_then(|j| match serde_json::from_str(&j) {
+            Ok(list) => Some(list),
+            Err(e) => {
+                tracing::warn!(script_id = %id, "stored outbound_xrpcs is not a JSON list: {e}");
+                None
+            }
+        });
         Self {
             id,
             script_type,
             body,
             description,
-            outbound_xrpcs: outbound_json.and_then(|j| serde_json::from_str(&j).ok()),
+            outbound_xrpcs,
             created_at,
             updated_at,
         }
@@ -403,16 +412,18 @@ mod tests {
                 "file"
             );
 
-            let resolved = catalog
-                .resolve_in(&Arc::new(ProjectSnapshot::empty()), &trigger)
-                .await
-                .unwrap();
+            let empty = Arc::new(ProjectSnapshot::empty());
+            let resolved = catalog.resolve_in(&empty, &trigger).await.unwrap();
             assert_eq!(
                 (resolved.body.as_str(), resolved.layer),
                 ("row", Layer::Manual)
             );
             assert_eq!(resolved.chunk_name, DASHBOARD_CHUNK_NAME);
             assert!(resolved.path.is_none());
+            assert!(
+                Arc::ptr_eq(&resolved.snapshot, &empty),
+                "a row hit carries the pinned snapshot too"
+            );
 
             catalog.remove(&db, backend, &trigger_id).await.unwrap();
         }
@@ -613,6 +624,39 @@ mod tests {
                 .remove(&db, backend, &format!("record.index:{decoy}"))
                 .await
                 .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_outbound_column_reads_as_none_rather_than_failing() {
+        for (db, backend) in backends().await {
+            let catalog = ScriptCatalog::detached(db.clone(), backend);
+            let id = format!("xrpc.procedure:{}", unique_nsid());
+            catalog
+                .put_manual(&db, backend, write(&id, "return {}"))
+                .await
+                .unwrap();
+            let sql = crate::db::adapt_sql(
+                "UPDATE happyview_scripts SET outbound_xrpcs = ? WHERE id = ?",
+                backend,
+            );
+            crate::db::query(&sql)
+                .bind("not json")
+                .bind(&id)
+                .execute(&db)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                catalog
+                    .get_manual(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .outbound_xrpcs,
+                None
+            );
+            catalog.remove(&db, backend, &id).await.unwrap();
         }
     }
 }

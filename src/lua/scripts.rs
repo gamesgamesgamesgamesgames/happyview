@@ -32,19 +32,18 @@
 //!   [`super::execute::execute_procedure_script`] /
 //!   [`super::execute::execute_query_script`] directly.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use crate::catalog::Layer;
-use crate::project::ProjectSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::AppState;
+use crate::catalog::Layer;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::plugin::{ScriptExecuteOutput, ScriptValueKind};
+use crate::project::ProjectSnapshot;
 use crate::script::{Invocation, Trigger, dispatch};
 
 /// Number of attempts (1 initial + 3 retries) before dead-lettering.
