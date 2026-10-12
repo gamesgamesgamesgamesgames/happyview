@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::db::DatabaseBackend;
 
+pub mod project;
+
 /// Placeholder session secrets that have shipped in this repo's docs/examples.
 /// Booting with any of them is refused — the cookie signing key is derived from
 /// `SESSION_SECRET`, so a known value lets anyone forge a validly-signed admin
