@@ -111,11 +111,14 @@ test.describe("Project-owned entries", () => {
     await expect(footer.getByRole("button", { name: /delete lexicon/i })).toHaveCount(0)
     await expect(page.locator("#token-cost")).toBeDisabled()
     await expect(page.getByText(/stored version of this lexicon is kept/i)).toBeVisible()
-    // The JSON editor is read-only: typing must not change it.
+    // The JSON editor is read-only: typing into it must not change it.
     const editor = page.locator(".monaco-editor").first()
     await expect(editor).toBeVisible({ timeout: 10000 })
-    await expect(editor.locator("textarea[readonly]")).toHaveCount(1)
-    await expect(editor.locator("textarea.inputarea")).toHaveCount(0)
+    const lines = editor.locator(".view-lines")
+    await expect(lines).toContainText("application/json")
+    await lines.click()
+    await page.keyboard.type("zzz")
+    await expect(lines).not.toContainText("zzz")
   })
 
   test("the lexicons list offers no delete for a project lexicon", async ({ page }) => {
