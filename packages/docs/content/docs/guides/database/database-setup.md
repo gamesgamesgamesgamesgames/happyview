@@ -73,7 +73,7 @@ A synthetic set of a million records built from the same posts gave the same pro
 
 Make sure there is enough free disk:
 
-- **SQLite**: about one and a half times the size of the database file. The copy sits beside the old tables, at about a third of their size. Once the old tables are dropped, HappyView returns their pages to the filesystem in one step, which grows the write-ahead log to about the size of the old tables until the next checkpoint truncates it. On a database that has never had incremental vacuum (`PRAGMA auto_vacuum` reports `0`), that step does nothing, so about half the database file's size is enough. The file then keeps its size, and SQLite reuses the freed pages for new records.
+- **SQLite**: about half the size of the database file. The copy sits beside the old tables, at about a third of their size, and once the old tables are dropped HappyView returns their pages to the filesystem in steps of 32 MB, emptying the write-ahead log after each. In the measurements above the most extra disk in use was 0.40 times the database file. On a database that has never had incremental vacuum (`PRAGMA auto_vacuum` reports `0`), the pages are not returned: the file keeps its size, and SQLite reuses the freed pages for new records.
 - **Postgres**: about the current size of `happyview_records` and `happyview_record_refs` together. The copy takes about half of that inside the database. It also generates about the tables' size in write-ahead log, of which Postgres keeps up to `max_wal_size` (1 GB by default), or more when WAL archiving or a replication slot holds it back.
 
 **On Postgres, stop every HappyView instance before you start the new release.** An instance still running the old release can write to the old tables while the new one copies them. The copy picks up those writes, and the final check locks the old tables so that it sees every one, but if writes keep arriving, the upgrade stops with an error rather than drop them. Stop the old instances and start the new release again.
@@ -88,7 +88,7 @@ The upgrade runs once, after the migrations and before HappyView serves requests
 2. It compares every record and every ref with the copy: the body byte for byte, the CID, the rev and the timestamps, and the number of records in each collection. If anything differs, it drops nothing, discards the copy and stops with an error naming up to five differences. Fix those rows or restore the backup, then start again; the copy starts over.
 3. It replaces the old tables with the views and drops them, in the same transaction as the comparison. On SQLite it then returns the freed pages to the filesystem. The log reports `record store upgrade complete` with the number of records and refs.
 
-On an Apple M4 Max laptop, the 67,437-post set took 2 seconds on SQLite and 43 seconds on Postgres 17. The million-record set took 100 seconds on SQLite, 65 of them returning the freed pages, and 224 seconds on Postgres. Expect a slower disk to take longer.
+On an Apple M4 Max laptop, the 67,437-post set took 3 seconds on SQLite and 43 seconds on Postgres 17. The million-record set took 102 seconds on SQLite, 65 of them returning the freed pages, and 224 seconds on Postgres. Expect a slower disk to take longer.
 
 A record whose `uri` is not `at://{did}/{collection}/{rkey}` stops the upgrade with an error naming it. Nothing is dropped. Fix or delete that row, then start again.
 
