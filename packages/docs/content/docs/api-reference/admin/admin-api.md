@@ -215,7 +215,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 
 ### Record compression
 
-`POST /admin/storage/retrain` trains a new zstd dictionary for one collection from up to 20,000 of its most recently stored records, as the background task does when a collection first reaches `ZSTD_DICT_TRAIN_AT` records (see [the compact record format](../../guides/database/database-setup.md#after-the-upgrade)). Records written from then on are compressed with it. Records already compressed keep the dictionary they were compressed with, and records the background task has not reached yet get the new one. SQLite only.
+`POST /admin/storage/retrain` trains a new zstd dictionary for one collection from up to 20,000 of its most recently stored records, as the background task does when a collection first reaches `ZSTD_DICT_TRAIN_AT` records (see [the compact record format](../../guides/database/database-setup.md#after-the-upgrade)). Records written from then on are compressed with it. Records already compressed keep the dictionary they were compressed with, and records the background task has not reached yet get the new one. One retrain runs at a time. SQLite only.
 
 ```sh
 curl -X POST "http://127.0.0.1:3000/admin/storage/retrain" -H "$AUTH" \
@@ -231,4 +231,5 @@ curl -X POST "http://127.0.0.1:3000/admin/storage/retrain" -H "$AUTH" \
 | `200 OK` | The dictionary was trained and is in use |
 | `400 Bad Request` | The instance runs on Postgres, or `RECORD_COMPRESSION=none` |
 | `404 Not Found` | The instance holds no records in that collection |
+| `409 Conflict` | Another retrain is still running on this instance; try again when it finishes |
 | `422 Unprocessable Entity` | zstd could not train a dictionary from the records (`TrainingFailed`) |

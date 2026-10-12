@@ -14,6 +14,20 @@ use crate::record_store::compression::{self, Compression, TrainError};
 use super::auth::UserAuth;
 use super::permissions::Permission;
 
+/// Held while a retrain runs: one at a time per process. Each training reads
+/// up to 32 MiB of samples and every success keeps another dictionary for
+/// good, so a double-clicked button or a retry loop must not start several.
+static RETRAIN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The retrain lock, or `409 Conflict` while another retrain holds it.
+fn begin_retrain() -> Result<tokio::sync::MutexGuard<'static, ()>, AppError> {
+    RETRAIN.try_lock().map_err(|_| {
+        AppError::Conflict(
+            "a dictionary is already being trained; try again when it finishes".into(),
+        )
+    })
+}
+
 #[derive(Deserialize)]
 pub(super) struct RetrainBody {
     collection: String,
@@ -54,6 +68,7 @@ pub(super) async fn retrain(
             body.collection
         )));
     };
+    let _training = begin_retrain()?;
     let dict_id = compression::train(
         &state.db,
         state.records.bodies(),
@@ -76,4 +91,23 @@ pub(super) async fn retrain(
     Ok(Json(
         json!({ "collection": body.collection, "dict_id": dict_id }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_retrain_while_another_runs_is_a_conflict() {
+        let first = begin_retrain().expect("the first retrain starts");
+        match begin_retrain() {
+            Err(AppError::Conflict(message)) => {
+                assert!(message.contains("already being trained"), "{message}")
+            }
+            Err(other) => panic!("expected a conflict, got {other:?}"),
+            Ok(_) => panic!("expected a conflict, got the lock"),
+        }
+        drop(first);
+        drop(begin_retrain().expect("free again once the first finishes"));
+    }
 }
