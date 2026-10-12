@@ -108,6 +108,88 @@ pub fn is_retryable_write_error(e: &sqlx::Error) -> bool {
     matches!(code.as_ref(), "40001" | "40P01")
 }
 
+/// A database error's code, split by backend: SQLite's numeric result code,
+/// or Postgres's SQLSTATE.
+enum DbCode<'a> {
+    Sqlite(i32),
+    Postgres(std::borrow::Cow<'a, str>),
+}
+
+fn db_code(e: &sqlx::Error) -> Option<DbCode<'_>> {
+    let db = e.as_database_error()?;
+    let code = db.code()?;
+    if db.try_downcast_ref::<sqlx::sqlite::SqliteError>().is_some() {
+        return code.parse().ok().map(DbCode::Sqlite);
+    }
+    Some(DbCode::Postgres(code))
+}
+
+/// Whether a query failed because the database could not be reached or used
+/// at all, rather than because of anything in the query. The same query is
+/// expected to succeed once the database is back, so a caller waits and
+/// retries it instead of giving it up. Everything else is a failure of that
+/// query.
+///
+/// That is: the pool timed out or closed, the connection or its TLS broke,
+/// the SQLite worker died, a transaction could not begin; a Postgres
+/// connection failure (`08000`, `08001`, `08003`, `08004`, `08006`, but not
+/// the per-message `08P01`), shutdown (`57P`), resource exhaustion (`53`), a
+/// read-only transaction (`25006`, a standby), a system error (`58`), an
+/// authorization failure (`28`) or a missing database (`3D000`); a SQLite
+/// file that cannot be written, read or opened (`sqlite_code_is_unavailable`);
+/// or a lock still held after `retry_on_busy` (`is_retryable_write_error`).
+pub fn is_unavailable(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::BeginFailed => true,
+        sqlx::Error::Database(_) => match db_code(e) {
+            Some(DbCode::Sqlite(code)) => sqlite_code_is_unavailable(code),
+            Some(DbCode::Postgres(code)) => postgres_code_is_unavailable(&code),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// SQLite `BUSY`, `LOCKED`, `NOMEM`, `READONLY`, `IOERR`, `FULL` and
+/// `CANTOPEN`, under any extended code (the primary code is the low byte).
+fn sqlite_code_is_unavailable(code: i32) -> bool {
+    matches!(code & 0xff, 5 | 6 | 7 | 8 | 10 | 13 | 14)
+}
+
+fn postgres_code_is_unavailable(code: &str) -> bool {
+    matches!(
+        code,
+        "08000" | "08001" | "08003" | "08004" | "08006" | "25006" | "3D000" | "40001" | "40P01"
+    ) || ["57P", "53", "58", "28"]
+        .iter()
+        .any(|class| code.starts_with(class))
+}
+
+/// Whether a write failed because of the data it carried, so retrying the
+/// same data can never succeed: a value the driver could not encode, a
+/// Postgres data exception (class `22`, e.g. `22021`, a NUL byte in text) or
+/// a statement too complex (`54000`), or SQLite `TOOBIG`.
+pub fn is_invalid_data(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Encode(_) => true,
+        sqlx::Error::Database(_) => match db_code(e) {
+            Some(DbCode::Sqlite(code)) => sqlite_code_is_invalid_data(code),
+            Some(DbCode::Postgres(code)) => code.starts_with("22") || code == "54000",
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+fn sqlite_code_is_invalid_data(code: i32) -> bool {
+    code & 0xff == 18
+}
+
 /// Run a write, retrying up to `BUSY_RETRY_ATTEMPTS` times with backoff while
 /// it fails retryably. The final error is returned for the caller to log;
 /// nothing is swallowed here.
@@ -141,6 +223,53 @@ pub fn record_changed_clause(backend: DatabaseBackend) -> &'static str {
         DatabaseBackend::Postgres => {
             "happyview_records.cid IS DISTINCT FROM excluded.cid OR happyview_records.record IS DISTINCT FROM excluded.record OR happyview_records.indexed_at IS NULL"
         }
+    }
+}
+
+/// `lhs op rhs` over two rev (TID) expressions. TIDs sort by time in byte
+/// order; Postgres would otherwise compare text in the database's collation,
+/// so it gets `COLLATE "C"` on both sides.
+pub fn rev_compare(backend: DatabaseBackend, lhs: &str, op: &str, rhs: &str) -> String {
+    match backend {
+        DatabaseBackend::Sqlite => format!("{lhs} {op} {rhs}"),
+        DatabaseBackend::Postgres => format!("{lhs} COLLATE \"C\" {op} {rhs} COLLATE \"C\""),
+    }
+}
+
+/// The `WHERE` of a network record upsert's `ON CONFLICT (uri) DO UPDATE`:
+/// the row changed (see `record_changed_clause`), and the incoming rev is not
+/// older than the stored one. A missing rev on either side (a local write, a
+/// `listRecords` row, a row from before revs were stored) does not block the
+/// update, which is how every write behaved before.
+pub fn record_upsert_where(backend: DatabaseBackend) -> String {
+    format!(
+        "({}) AND (happyview_records.rev IS NULL OR excluded.rev IS NULL OR {})",
+        record_changed_clause(backend),
+        rev_compare(backend, "excluded.rev", ">=", "happyview_records.rev")
+    )
+}
+
+/// Begin a transaction that reads and then writes on what it read, holding
+/// the write lock from the start.
+///
+/// SQLite's default `BEGIN` is deferred: it takes the write lock only at the
+/// first write, and if another writer committed since this transaction's
+/// first read, that upgrade fails with `SQLITE_BUSY` at once instead of
+/// waiting out the busy timeout. `BEGIN IMMEDIATE` takes the write lock up
+/// front, so a check (a tombstone lookup, a stored rev) cannot go stale
+/// before the write it guards. Postgres gets a plain `BEGIN`; serialize its
+/// writers on the rows concerned with `tombstones::lock_uris` and
+/// `tombstones::lock_did`.
+///
+/// Run the whole transaction inside `retry_on_busy`, so a write lock held
+/// past the busy timeout retries the transaction rather than failing it.
+pub async fn begin_write(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+) -> Result<sqlx::Transaction<'static, Any>, sqlx::Error> {
+    match backend {
+        DatabaseBackend::Sqlite => pool.begin_with("BEGIN IMMEDIATE").await,
+        DatabaseBackend::Postgres => pool.begin().await,
     }
 }
 
@@ -1100,6 +1229,10 @@ mod tests {
             .await
             .expect_err("the write lock is held");
         assert!(is_retryable_write_error(&err), "{err}");
+        assert!(
+            is_unavailable(&err),
+            "a lock still held is unavailable: {err}"
+        );
 
         let release = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
@@ -1122,6 +1255,7 @@ mod tests {
             !is_retryable_write_error(&dup),
             "a constraint failure is final: {dup}"
         );
+        assert!(!is_unavailable(&dup), "{dup}");
 
         drop(writer);
         drop(holder_pool);
@@ -1154,6 +1288,350 @@ mod tests {
             .await
             .expect_err("missing table");
         assert!(!is_retryable_write_error(&err), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_unavailable
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pool_and_io_errors_are_unavailable() {
+        use std::io::{Error as IoError, ErrorKind};
+        for err in [
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::WorkerCrashed,
+            sqlx::Error::BeginFailed,
+            sqlx::Error::Tls("handshake failed".into()),
+            sqlx::Error::Io(IoError::from(ErrorKind::ConnectionRefused)),
+            sqlx::Error::Io(IoError::from(ErrorKind::ConnectionReset)),
+            sqlx::Error::Io(IoError::from(ErrorKind::UnexpectedEof)),
+        ] {
+            assert!(is_unavailable(&err), "{err}");
+        }
+        for err in [
+            sqlx::Error::RowNotFound,
+            sqlx::Error::Protocol("bad frame".into()),
+            sqlx::Error::ColumnNotFound("rev".into()),
+            sqlx::Error::Decode("not a number".into()),
+        ] {
+            assert!(!is_unavailable(&err), "{err}");
+        }
+    }
+
+    /// A database error with a chosen code, standing in for a Postgres one
+    /// that is impractical to provoke.
+    #[derive(Debug)]
+    struct CodedError(&'static str);
+
+    impl std::fmt::Display for CodedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "error {}", self.0)
+        }
+    }
+
+    impl std::error::Error for CodedError {}
+
+    impl sqlx::error::DatabaseError for CodedError {
+        fn message(&self) -> &str {
+            "coded"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn coded(code: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(CodedError(code)))
+    }
+
+    #[test]
+    fn postgres_codes_for_an_unusable_database_are_unavailable() {
+        for code in [
+            "08000", "08001", "08003", "08004", "08006", "57P01", "57P02", "57P03", "57P04",
+            "53000", "53100", "53200", "53300", "25006", "58000", "58030", "28000", "28P01",
+            "3D000", "40001", "40P01",
+        ] {
+            assert!(is_unavailable(&coded(code)), "{code}");
+        }
+        for code in [
+            "08P01", "08007", "22021", "22001", "22P02", "23505", "42P01", "57014", "54000",
+        ] {
+            assert!(!is_unavailable(&coded(code)), "{code}");
+        }
+    }
+
+    #[test]
+    fn sqlite_codes_for_an_unusable_database_are_unavailable() {
+        // Primary codes, then extended ones: BUSY_SNAPSHOT, IOERR_READ,
+        // READONLY_ROLLBACK, CANTOPEN_ISDIR.
+        for code in [5, 6, 7, 8, 10, 13, 14, 517, 266, 776, 526] {
+            assert!(sqlite_code_is_unavailable(code), "{code}");
+        }
+        // ERROR, TOOBIG, CONSTRAINT, CONSTRAINT_UNIQUE, MISMATCH.
+        for code in [1, 18, 19, 2067, 20] {
+            assert!(!sqlite_code_is_unavailable(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn errors_in_the_data_itself_are_invalid() {
+        for err in [
+            coded("22021"),
+            coded("22001"),
+            coded("22P02"),
+            coded("54000"),
+            sqlx::Error::Encode("not encodable".into()),
+        ] {
+            assert!(is_invalid_data(&err), "{err}");
+        }
+        for err in [
+            coded("23505"),
+            coded("08006"),
+            coded("54001"),
+            sqlx::Error::PoolClosed,
+            sqlx::Error::RowNotFound,
+        ] {
+            assert!(!is_invalid_data(&err), "{err}");
+        }
+        assert!(sqlite_code_is_invalid_data(18), "TOOBIG");
+        assert!(!sqlite_code_is_invalid_data(19), "CONSTRAINT");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_sqlite_database_is_unavailable() {
+        sqlx::any::install_default_drivers();
+        let path = std::env::temp_dir().join(format!("hv-readonly-{}.db", uuid::Uuid::new_v4()));
+        let rw = PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("create");
+        query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            .execute(&rw)
+            .await
+            .expect("create table");
+        rw.close().await;
+        let ro = PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect(&format!("sqlite://{}?mode=ro", path.display()))
+            .await
+            .expect("open read-only");
+        let err = query("INSERT INTO t (id) VALUES (1)")
+            .execute(&ro)
+            .await
+            .expect_err("the database is read-only");
+        assert!(is_unavailable(&err), "{err}");
+        ro.close().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn a_failing_sqlite_statement_is_not_unavailable() {
+        let pool = crate::test_support::memory_pool().await;
+        let err = query("SELECT * FROM happyview_no_such_table")
+            .execute(&pool)
+            .await
+            .expect_err("missing table");
+        assert!(!is_unavailable(&err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn postgres_connection_and_shutdown_codes_are_unavailable() {
+        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        if DatabaseBackend::from_url(&url) != DatabaseBackend::Postgres {
+            return;
+        }
+        let pool = connect(&url, DatabaseBackend::Postgres).await;
+        let raise = |code: &str| {
+            format!("DO $$ BEGIN RAISE EXCEPTION 'forced' USING ERRCODE = '{code}'; END $$")
+        };
+        for code in [
+            "08000", "08001", "08003", "08004", "08006", "57P01", "57P03", "53300", "25006",
+            "58030", "28P01", "3D000", "40001", "40P01",
+        ] {
+            let err = query(&raise(code))
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert!(is_unavailable(&err), "{code}: {err}");
+        }
+        for code in ["23505", "22P02", "42P01", "57014", "08P01", "22021"] {
+            let err = query(&raise(code))
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert!(!is_unavailable(&err), "{code}: {err}");
+        }
+        for (code, invalid) in [("22021", true), ("54000", true), ("23505", false)] {
+            let err = query(&raise(code))
+                .execute(&pool)
+                .await
+                .expect_err("the block raises");
+            assert_eq!(is_invalid_data(&err), invalid, "{code}: {err}");
+        }
+
+        // A backend terminated under a live connection, as a restart does.
+        let mut conn = pool.acquire().await.expect("acquire");
+        let err = query("SELECT pg_terminate_backend(pg_backend_pid())")
+            .execute(&mut *conn)
+            .await
+            .expect_err("the backend is terminated");
+        assert!(is_unavailable(&err), "{err:?}");
+        conn.detach();
+    }
+
+    // -----------------------------------------------------------------------
+    // begin_write and the rev-guarded upsert
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_sqlite_write_transaction_takes_the_write_lock_when_it_begins() {
+        sqlx::any::install_default_drivers();
+        let path = std::env::temp_dir().join(format!("hv-begin-write-{}.db", uuid::Uuid::new_v4()));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        // Never wait on a lock, so a held write lock surfaces as SQLITE_BUSY.
+        let pool = || {
+            PoolOptions::<sqlx::Any>::new()
+                .max_connections(1)
+                .after_connect(|conn, _| {
+                    Box::pin(async move {
+                        crate::db::query("PRAGMA busy_timeout = 0")
+                            .execute(&mut *conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&url)
+        };
+        let first = pool().await.expect("connect first");
+        crate::db::query("PRAGMA journal_mode = WAL")
+            .execute(&first)
+            .await
+            .expect("enable WAL");
+        let second = pool().await.expect("connect second");
+
+        let held = begin_write(&first, DatabaseBackend::Sqlite)
+            .await
+            .expect("begin the first write transaction");
+
+        let deferred = second
+            .begin()
+            .await
+            .expect("a deferred BEGIN takes no lock");
+        deferred.rollback().await.expect("roll back");
+        let err = begin_write(&second, DatabaseBackend::Sqlite)
+            .await
+            .expect_err("the write lock is already held");
+        assert!(is_retryable_write_error(&err), "{err}");
+
+        held.commit().await.expect("release the write lock");
+        begin_write(&second, DatabaseBackend::Sqlite)
+            .await
+            .expect("the lock is free again")
+            .commit()
+            .await
+            .expect("commit");
+
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[tokio::test]
+    async fn a_write_transaction_begins_and_commits_on_either_backend() {
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let mut tx = begin_write(&pool, backend).await.expect("begin");
+            crate::db::query("SELECT 1")
+                .execute(&mut *tx)
+                .await
+                .expect("query inside the transaction");
+            tx.commit().await.expect("commit");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_record_upsert_never_replaces_a_newer_rev() {
+        let tid = |n: i64| crate::tid::tid_from_unix_microseconds(1_700_000_000_000_000 + n);
+        for (pool, backend) in crate::test_support::test_pools().await {
+            let uri = format!(
+                "at://did:plc:rev{}/app.test.post/r",
+                uuid::Uuid::new_v4().simple()
+            );
+            let upsert = adapt_sql(
+                &format!(
+                    "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at, rev) \
+                     VALUES (?, 'did:plc:rev', 'app.test.post', 'r', '{{}}', ?, ?, ?, ?) \
+                     ON CONFLICT (uri) DO UPDATE SET cid = excluded.cid, rev = COALESCE(excluded.rev, happyview_records.rev) \
+                     WHERE {}",
+                    record_upsert_where(backend)
+                ),
+                backend,
+            );
+            let stored = || async {
+                crate::db::query_as::<(String, Option<String>)>(&adapt_sql(
+                    "SELECT cid, rev FROM happyview_records WHERE uri = ?",
+                    backend,
+                ))
+                .bind(&uri)
+                .fetch_one(&pool)
+                .await
+                .expect("read the record")
+            };
+
+            for (cid, rev, expected) in [
+                ("c50", Some(tid(50)), ("c50", Some(tid(50)))),
+                ("c40", Some(tid(40)), ("c50", Some(tid(50)))),
+                ("c60", Some(tid(60)), ("c60", Some(tid(60)))),
+                // A write without a rev applies but keeps the stored rev, so
+                // an older delivery after it is still refused.
+                ("c-none", None, ("c-none", Some(tid(60)))),
+                ("c10", Some(tid(10)), ("c-none", Some(tid(60)))),
+                ("c70", Some(tid(70)), ("c70", Some(tid(70)))),
+            ] {
+                crate::db::query(&upsert)
+                    .bind(&uri)
+                    .bind(cid)
+                    .bind(now_rfc3339())
+                    .bind(now_rfc3339())
+                    .bind(rev.clone())
+                    .execute(&pool)
+                    .await
+                    .expect("upsert");
+                let (got_cid, got_rev) = stored().await;
+                assert_eq!(
+                    (got_cid.as_str(), got_rev),
+                    (expected.0, expected.1),
+                    "after writing {cid} ({backend:?})"
+                );
+            }
+
+            crate::db::query(&adapt_sql(
+                "DELETE FROM happyview_records WHERE uri = ?",
+                backend,
+            ))
+            .bind(&uri)
+            .execute(&pool)
+            .await
+            .expect("clean up");
+        }
     }
 
     // -----------------------------------------------------------------------

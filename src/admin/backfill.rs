@@ -3185,9 +3185,13 @@ struct PreparedRecord {
     rkey: String,
     record_json: String,
     cid: String,
+    /// The commit rev, when the source carries one. `listRecords` does not,
+    /// so crawled rows are `None` and are written as before revs existed,
+    /// except that any tombstone blocks them.
+    rev: Option<String>,
 }
 
-/// Rows per multi-row upsert of a records page: 8 bound parameters each.
+/// Rows per multi-row upsert of a records page: 9 bound parameters each.
 /// `listRecords` is asked for 100 records, but nothing stops a PDS sending
 /// more, and the page must not grow one statement past the backend's
 /// parameter limit.
@@ -3200,6 +3204,12 @@ const RECORDS_PER_UPSERT: usize = 100;
 ///
 /// A URI repeated within the page is written once, with its last copy:
 /// Postgres refuses to upsert one row twice in a statement (`21000`).
+///
+/// A row a record or DID tombstone supersedes is skipped, so a crawl cannot
+/// bring back a record deleted live (see `crate::tombstones`). The
+/// transaction comes from `db::begin_write`; on Postgres it locks every DID
+/// and then every URI of the page before the first check. Callers run it
+/// inside `db::retry_on_busy`.
 async fn write_records_page(
     state: &AppState,
     batch: &[PreparedRecord],
@@ -3220,7 +3230,11 @@ async fn write_records_page(
         .collect();
     let now = now_rfc3339();
 
-    let mut tx = state.backfill_db.begin().await?;
+    let mut tx = crate::db::begin_write(&state.backfill_db, state.db_backend).await?;
+    let dids: Vec<&str> = records.iter().map(|rec| rec.did.as_str()).collect();
+    let uris: Vec<&str> = records.iter().map(|rec| rec.uri.as_str()).collect();
+    crate::tombstones::lock_dids(&mut tx, state.db_backend, &dids).await?;
+    crate::tombstones::lock_uris(&mut tx, state.db_backend, &uris).await?;
     let mut written = Vec::new();
     for chunk in records.chunks(RECORDS_PER_UPSERT) {
         written.extend(write_records_chunk(&mut tx, state.db_backend, &now, chunk).await?);
@@ -3230,24 +3244,45 @@ async fn write_records_page(
 }
 
 /// One upsert of `write_records_page`, and the refs of the rows it wrote.
+/// Rows a tombstone supersedes are left out. An unversioned row keeps the
+/// stored rev.
 async fn write_records_chunk(
     conn: &mut sqlx::AnyConnection,
     backend: crate::db::DatabaseBackend,
     now: &str,
     chunk: &[&PreparedRecord],
 ) -> Result<Vec<String>, sqlx::Error> {
-    let placeholders = vec!["(?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
+    let candidates: Vec<crate::tombstones::WriteCandidate<'_>> = chunk
+        .iter()
+        .map(|rec| crate::tombstones::WriteCandidate {
+            uri: &rec.uri,
+            did: &rec.did,
+            rev: rec.rev.as_deref(),
+        })
+        .collect();
+    let blocked = crate::tombstones::blocked_writes(&mut *conn, backend, &candidates).await?;
+    let chunk: Vec<&PreparedRecord> = chunk
+        .iter()
+        .copied()
+        .filter(|rec| !blocked.contains(&rec.uri))
+        .collect();
+    if chunk.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
     let upsert_sql = adapt_sql(
         &format!(
-            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES {placeholders} \
-             ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at \
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at, rev) VALUES {placeholders} \
+             ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at, \
+             rev = COALESCE(EXCLUDED.rev, happyview_records.rev) \
              WHERE {} RETURNING uri",
-            crate::db::record_changed_clause(backend)
+            crate::db::record_upsert_where(backend)
         ),
         backend,
     );
     let mut upsert = crate::db::query_as::<(String,)>(&upsert_sql);
-    for rec in chunk {
+    for rec in &chunk {
         upsert = upsert
             .bind(&rec.uri)
             .bind(&rec.did)
@@ -3256,7 +3291,8 @@ async fn write_records_chunk(
             .bind(&rec.record_json)
             .bind(&rec.cid)
             .bind(now)
-            .bind(now);
+            .bind(now)
+            .bind(rec.rev.as_deref());
     }
     let written: Vec<String> = upsert
         .fetch_all(&mut *conn)
@@ -3460,6 +3496,7 @@ async fn fetch_records_page_loop(
                 rkey,
                 record_json: serde_json::to_string(&rec_to_store).unwrap_or_default(),
                 cid: entry.cid.clone(),
+                rev: None,
             });
         }
 
@@ -8274,6 +8311,7 @@ mod tests {
             rkey: rkey.to_string(),
             record_json: body.to_string(),
             cid: format!("bafy{rkey}"),
+            rev: None,
         }
     }
 
@@ -8444,6 +8482,235 @@ mod tests {
                 .await
                 .expect("clean up");
         }
+    }
+
+    fn page_rev(n: i64) -> String {
+        crate::tid::tid_from_unix_microseconds(1_700_000_000_000_000 + n)
+    }
+
+    async fn stored_record(
+        state: &AppState,
+        uri: &str,
+    ) -> Option<(serde_json::Value, Option<String>)> {
+        let sql = adapt_sql(
+            "SELECT record, rev FROM happyview_records WHERE uri = ?",
+            state.db_backend,
+        );
+        crate::db::query_as::<(String, Option<String>)>(&sql)
+            .bind(uri)
+            .fetch_optional(&state.db)
+            .await
+            .expect("row")
+            .map(|(body, rev)| (serde_json::from_str(&body).expect("json"), rev))
+    }
+
+    async fn clean_up_page_prefix(state: &AppState, prefix: &str) {
+        for (table, column) in [
+            ("happyview_record_refs", "source_uri"),
+            ("happyview_records", "uri"),
+            ("happyview_record_tombstones", "uri"),
+        ] {
+            let sql = adapt_sql(
+                &format!("DELETE FROM {table} WHERE {column} LIKE ?"),
+                state.db_backend,
+            );
+            crate::db::query(&sql)
+                .bind(format!("at://did:plc:page/{POST}/{prefix}%"))
+                .execute(&state.db)
+                .await
+                .expect("clean up");
+        }
+    }
+
+    /// A crawl row cannot resurrect a record deleted live, and a row with an
+    /// older rev than the stored one is not written.
+    async fn assert_page_respects_tombstones_and_revs(state: &AppState, prefix: &str) {
+        let dead = prepared(
+            &format!("{prefix}dead"),
+            serde_json::json!({"text": "deleted live"}),
+        );
+        {
+            let mut conn = state.db.acquire().await.expect("connection");
+            crate::tombstones::write_record_tombstone(
+                &mut conn,
+                state.db_backend,
+                &dead.uri,
+                &page_rev(50),
+                &now_rfc3339(),
+            )
+            .await
+            .expect("tombstone");
+        }
+        let fresh = prepared(
+            &format!("{prefix}fresh"),
+            serde_json::json!({"text": "fresh"}),
+        );
+        let fresh_uri = fresh.uri.clone();
+        let written = write_records_page(state, &[dead, fresh])
+            .await
+            .expect("write");
+        assert_eq!(written, vec![fresh_uri], "the tombstoned row is skipped");
+
+        let mut newer = prepared(
+            &format!("{prefix}rev"),
+            serde_json::json!({"text": "newer"}),
+        );
+        newer.rev = Some(page_rev(20));
+        let uri = newer.uri.clone();
+        write_records_page(state, &[newer]).await.expect("newer");
+        let mut older = prepared(
+            &format!("{prefix}rev"),
+            serde_json::json!({"text": "older"}),
+        );
+        older.rev = Some(page_rev(10));
+        assert!(
+            write_records_page(state, &[older])
+                .await
+                .expect("older")
+                .is_empty(),
+            "an older rev is not written"
+        );
+        let sql = adapt_sql(
+            "SELECT record FROM happyview_records WHERE uri = ?",
+            state.db_backend,
+        );
+        let (body,): (String,) = crate::db::query_as(&sql)
+            .bind(&uri)
+            .fetch_one(&state.db)
+            .await
+            .expect("row");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({"text": "newer"})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backfill_page_respects_tombstones_and_revs() {
+        let state = migrated_state().await;
+        assert_page_respects_tombstones_and_revs(&state, "t").await;
+    }
+
+    #[tokio::test]
+    async fn a_backfill_page_respects_tombstones_and_revs_on_postgres() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        let prefix = format!("t{}", Uuid::new_v4().simple());
+        assert_page_respects_tombstones_and_revs(&state, &prefix).await;
+        clean_up_page_prefix(&state, &prefix).await;
+    }
+
+    /// An unversioned crawl row that changes a record keeps the stored rev,
+    /// so an older versioned write is still refused afterwards.
+    async fn assert_crawl_row_keeps_the_stored_rev(state: &AppState, prefix: &str) {
+        let mut versioned = prepared(&format!("{prefix}kept"), serde_json::json!({"text": "v20"}));
+        versioned.rev = Some(page_rev(20));
+        let uri = versioned.uri.clone();
+        write_records_page(state, &[versioned])
+            .await
+            .expect("versioned");
+
+        let crawled = prepared(
+            &format!("{prefix}kept"),
+            serde_json::json!({"text": "crawled"}),
+        );
+        assert_eq!(
+            write_records_page(state, &[crawled])
+                .await
+                .expect("crawled"),
+            vec![uri.clone()],
+            "an unversioned row with no tombstone is written"
+        );
+        assert_eq!(
+            stored_record(state, &uri).await,
+            Some((serde_json::json!({"text": "crawled"}), Some(page_rev(20)))),
+            "the crawl row keeps the stored rev"
+        );
+
+        let mut older = prepared(&format!("{prefix}kept"), serde_json::json!({"text": "v10"}));
+        older.rev = Some(page_rev(10));
+        assert!(
+            write_records_page(state, &[older])
+                .await
+                .expect("older")
+                .is_empty(),
+            "an older rev is still refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crawl_row_keeps_the_stored_rev() {
+        let state = migrated_state().await;
+        assert_crawl_row_keeps_the_stored_rev(&state, "k").await;
+    }
+
+    #[tokio::test]
+    async fn a_crawl_row_keeps_the_stored_rev_on_postgres() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        let prefix = format!("k{}", Uuid::new_v4().simple());
+        assert_crawl_row_keeps_the_stored_rev(&state, &prefix).await;
+        clean_up_page_prefix(&state, &prefix).await;
+    }
+
+    /// A tombstone being written for a URI in a page, uncommitted, holds the
+    /// page back until it commits; the page then sees it, rather than
+    /// checking before it lands and writing after.
+    #[tokio::test]
+    async fn a_backfill_page_waits_for_a_concurrent_tombstone_on_postgres() {
+        let Some(state) = crate::test_support::test_state_from_env().await else {
+            eprintln!("skipped (TEST_DATABASE_URL not set)");
+            return;
+        };
+        let prefix = format!("r{}", Uuid::new_v4().simple());
+        let dead = prepared(
+            &format!("{prefix}dead"),
+            serde_json::json!({"text": "deleted live"}),
+        );
+        let fresh = prepared(
+            &format!("{prefix}fresh"),
+            serde_json::json!({"text": "fresh"}),
+        );
+        let (dead_uri, fresh_uri) = (dead.uri.clone(), fresh.uri.clone());
+
+        let mut tx = crate::db::begin_write(&state.db, state.db_backend)
+            .await
+            .expect("begin");
+        crate::tombstones::lock_uris(&mut tx, state.db_backend, &[&dead_uri])
+            .await
+            .expect("lock uri");
+        crate::tombstones::write_record_tombstone(
+            &mut tx,
+            state.db_backend,
+            &dead_uri,
+            &page_rev(50),
+            &now_rfc3339(),
+        )
+        .await
+        .expect("write tombstone");
+
+        let racer = {
+            let state = state.clone();
+            tokio::spawn(async move { write_records_page(&state, &[fresh, dead]).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !racer.is_finished(),
+            "the page must wait for the uncommitted tombstone"
+        );
+        tx.commit().await.expect("commit tombstone");
+
+        let written = racer.await.expect("join").expect("write");
+        assert_eq!(written, vec![fresh_uri]);
+        assert!(
+            stored_record(&state, &dead_uri).await.is_none(),
+            "the page must see the tombstone it waited for"
+        );
+        clean_up_page_prefix(&state, &prefix).await;
     }
 
     /// A page that cannot be written rolls back whole and becomes a fetch

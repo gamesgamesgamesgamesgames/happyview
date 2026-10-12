@@ -486,3 +486,61 @@ async fn super_user_requires_platform_principal() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(supers(&app).await, vec!["did:plc:testadmin".to_string()]);
 }
+
+#[tokio::test]
+#[serial]
+async fn platform_key_can_read_the_jetstream_status() {
+    common::require_db!();
+    let app = app_with_platform_key().await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(
+            Method::GET,
+            "/admin/jetstream/status",
+            PLATFORM_KEY,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert!(body["worker_queue_depths"].is_array());
+    assert!(body["worker_busy_since_ms"].is_array());
+}
+
+#[tokio::test]
+#[serial]
+async fn the_jetstream_status_needs_stats_read() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let (name, value) = app.admin_cookie();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/api-keys")
+                .header(name, value)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "name": "no-stats", "permissions": ["spaces:read"] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let key = json_body(resp).await["key"].as_str().unwrap().to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(bearer(Method::GET, "/admin/jetstream/status", &key, None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

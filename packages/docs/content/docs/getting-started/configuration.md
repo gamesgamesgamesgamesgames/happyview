@@ -18,7 +18,10 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `SESSION_SECRET` | no | dev default | Secret key for signing session cookies (at least 64 characters). **Must be set in production** |
 | `HOST` | no | `0.0.0.0` | Bind host |
 | `PORT` | no | `3000` | Bind port |
-| `JETSTREAM_URL` | no | `wss://jetstream1.us-east.bsky.network` | Jetstream WebSocket URL for real-time record streaming |
+| `JETSTREAM_URL` | no | `wss://jetstream1.us-east.bsky.network` | Jetstream host for real-time record streaming. The scheme can be `ws`, `wss`, `http` or `https`, and a v1 or v2 subscribe path, a trailing slash and a query string are ignored, so all of them name the same host |
+| `JETSTREAM_PROTOCOL` | no | `auto` | `auto` subscribes to the v2 stream (`/xrpc/network.bsky.jetstream.subscribeEvents`) and falls back to v1 (`/subscribe`) when the host answers 404. A fallback lasts until HappyView restarts. `v2` or `v1` uses only that one. Set `v1` for a v1-only host behind a proxy that answers the v2 path with something other than 404 (a 400, 403 or 502, say): `auto` does not fall back on those |
+| `JETSTREAM_COMPRESSION` | no | `true` | Receive v2 events zstd-compressed with the host's dictionary. When the dictionary cannot be fetched, or the host keeps refusing it, HappyView subscribes uncompressed instead. `false` always subscribes uncompressed. v1 is always uncompressed |
+| `JETSTREAM_WORKERS` | no | `8` | Workers applying events in parallel, 1 to 64. Larger values are capped at 64, and 0 or an invalid value uses 8 with a warning. A repo's events always go to the same worker, in order. A worker waits for each event's [record script](../guides/record-scripts.md), so slow scripts limit throughput; on Postgres, raise this to apply more repos at once. On SQLite writes take turns, so more workers help less. See [Real-time indexing](../reference/architecture.md#real-time-indexing) |
 | `RELAY_URL` | no | `https://bsky.network` | Relay URL for [backfill](../guides/backfill.md) repo discovery |
 | `PLC_URL` | no | `https://plc.directory` | [PLC directory](https://github.com/did-method-plc/did-method-plc) URL for DID resolution |
 | `STATIC_DIR` | no | `./web/out` | Directory containing the built dashboard static assets |
@@ -26,6 +29,7 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `SCRIPT_WALL_CLOCK_SECONDS` | no | `10` | Seconds a query, procedure, record or label script may spend running, before it fails with `timeout`. Time spent awaiting the host — an HTTP request, a database read — is not charged against it. An integer from `1` to `300`. Job scripts are not clocked. The **Request wall clock** setting in Settings → General takes precedence when set |
 | `EVENT_LOG_RETENTION_DAYS` | no | `30` | Number of days to keep event logs before automatic cleanup. Set to `0` to disable cleanup |
 | `DEAD_LETTER_RETENTION_DAYS` | no | `30` | Days to keep script dead letters after they are resolved; the hourly cleanup deletes older ones. Unresolved dead letters are never deleted. `0` keeps resolved ones indefinitely |
+| `RECORD_TOMBSTONE_RETENTION_HOURS` | no | `72` | Hours to remember a deleted record or account, so that a late or replayed copy of it cannot bring it back. The hourly cleanup deletes older tombstones. `0` keeps them indefinitely |
 | `JOB_WORKER_CONCURRENCY` | no | `1` | Number of background jobs that run at once. Values below 1 fall back to 1; values above 32 are capped at 32. Each running job uses database connections, so keep this below `DATABASE_MAX_CONNECTIONS`. |
 | `PLATFORM_API_KEY_HASH` | no | — | Hex SHA-256 of a key that a managed-hosting provider uses to administer this instance. Leave unset when self-hosting. See [Platform API](../api-reference/admin/platform.md) |
 | `TOKEN_ENCRYPTION_KEY` | no | --- | Base64-encoded 32-byte key for encrypting stored OAuth tokens. **Strongly recommended in production** |
@@ -70,11 +74,15 @@ SESSION_SECRET=change-me-in-production
 # SQLITE_SYNCHRONOUS=NORMAL
 # SQLITE_CHECKPOINT_INTERVAL_SECS=60
 # JETSTREAM_URL=wss://jetstream1.us-east.bsky.network
+# JETSTREAM_PROTOCOL=auto
+# JETSTREAM_COMPRESSION=true
+# JETSTREAM_WORKERS=8
 # RELAY_URL=https://bsky.network
 # PLC_URL=https://plc.directory
 # STATIC_DIR=./web/out
 # EVENT_LOG_RETENTION_DAYS=30
 # DEAD_LETTER_RETENTION_DAYS=30
+# RECORD_TOMBSTONE_RETENTION_HOURS=72
 # TOKEN_ENCRYPTION_KEY=base64-encoded-32-byte-key
 # DEFAULT_RATE_LIMIT_CAPACITY=100
 # DEFAULT_RATE_LIMIT_REFILL_RATE=2.0

@@ -233,6 +233,7 @@ fn game_event(rkey: &str, action: &str, record: Value) -> RecordEvent {
         action: action.into(),
         record: Some(record),
         cid,
+        rev: None,
     }
 }
 

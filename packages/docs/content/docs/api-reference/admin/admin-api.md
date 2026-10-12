@@ -81,6 +81,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/network-lexicons`            | `lexicons:read`            |
 | `DELETE /admin/network-lexicons/{id}`    | `lexicons:delete`          |
 | `GET /admin/stats`                       | `stats:read`               |
+| `GET /admin/jetstream/status`            | `stats:read`               |
 | `POST /admin/backfill`                   | `backfill:create`          |
 | `GET /admin/backfill/status`             | `backfill:read`            |
 | `POST /admin/backfill/{id}/cancel`       | `backfill:create`          |
@@ -188,6 +189,24 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/permissions`                 | `users:read`               |
 | `GET /admin/settings/xrpc-proxy`         | `settings:manage`          |
 | `PUT /admin/settings/xrpc-proxy`         | `settings:manage`          |
+
+### Jetstream status
+
+`GET /admin/jetstream/status` reports the live [Jetstream](https://github.com/bluesky-social/jetstream) consumer since the process started. A platform API key can read it. Unknown values are an explicit `null`: `protocol`, `host`, `dictionary_id`, `applied_seq`, `applied_time_us` and `lag_ms` are all `null` before the first connection or event, and the two worker arrays are empty until the worker pool starts.
+
+| Field | Meaning |
+| --- | --- |
+| `protocol` | `v2` (`subscribeEvents`) or `v1` (`/subscribe`); `null` before the first connection |
+| `host` | The Jetstream host from `JETSTREAM_URL` |
+| `connected` | Whether a subscription is open now |
+| `compression` | Whether frames arrive zstd-compressed |
+| `dictionary_id` | The zstd dictionary in use, or `null` |
+| `applied_seq` | The newest event that it and every event before it have been applied: the position saved for a restart. `null` on v1, which has no seq |
+| `applied_time_us` | When Jetstream witnessed that event, in microseconds since the Unix epoch |
+| `lag_ms` | Milliseconds from `applied_time_us` to now |
+| `worker_queue_depths` | Events waiting in each worker's queue, one entry per `JETSTREAM_WORKERS`. The event a worker is applying or retrying is not counted |
+| `now_ms` | Server time when the snapshot was taken, in milliseconds since the Unix epoch. Subtract `worker_busy_since_ms` from it rather than using your own clock |
+| `worker_busy_since_ms` | One entry per worker: when its current event started, in milliseconds since the Unix epoch, or `null` when idle. An old value with an empty queue means the worker is stuck retrying |
 
 ### Database disk usage and vacuum
 

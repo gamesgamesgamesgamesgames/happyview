@@ -939,6 +939,7 @@ async fn main() {
         happyview::event_log::parse_dead_letter_retention_days(
             std::env::var("DEAD_LETTER_RETENTION_DAYS").ok().as_deref(),
         ),
+        happyview::tombstones::retention_hours(),
     ));
 
     {

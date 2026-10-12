@@ -10,6 +10,7 @@ mod domains;
 mod events;
 mod feature_flags;
 mod identity;
+mod jetstream;
 mod jobs;
 mod labelers;
 mod lexicons;
@@ -146,6 +147,7 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/database/vacuum/schedule",
             post(database::schedule_vacuum).delete(database::cancel_vacuum),
         )
+        .route("/jetstream/status", get(jetstream::status))
         .route(
             "/network-lexicons",
             post(network_lexicons::add).get(network_lexicons::list),
