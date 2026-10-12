@@ -1138,7 +1138,7 @@ async fn seed_records_bulk(app: &TestApp, collection: &str, count: usize) {
         for j in 0..n {
             let idx = i + j;
             q = q
-                .bind(format!("at://did:plc:bulk/{collection}/{idx}"))
+                .bind(format!("at://did:plc:bulk/{collection}/rkey{idx}"))
                 .bind("did:plc:bulk".to_string())
                 .bind(collection.to_string())
                 .bind(format!("rkey{idx}"))

@@ -570,12 +570,29 @@ async fn mount_pds_write(
 /// probe behind.
 async fn refuse_collection(app: &TestApp, collection: &str) {
     let sql = match app.state.db_backend {
-        happyview::db::DatabaseBackend::Postgres => format!(
-            "ALTER TABLE happyview_records ADD CONSTRAINT mirror_probe CHECK (collection <> '{collection}')"
-        ),
+        happyview::db::DatabaseBackend::Postgres => {
+            // A CHECK cannot hold a subquery: intern the collection here and
+            // name its id.
+            happyview::db::query(
+                "INSERT INTO happyview_collections (nsid) VALUES ($1) ON CONFLICT (nsid) DO NOTHING",
+            )
+            .bind(collection)
+            .execute(&app.state.db)
+            .await
+            .unwrap();
+            let (id,): (i64,) =
+                happyview::db::query_as("SELECT id FROM happyview_collections WHERE nsid = $1")
+                    .bind(collection)
+                    .fetch_one(&app.state.db)
+                    .await
+                    .unwrap();
+            format!(
+                "ALTER TABLE happyview_records_v2 ADD CONSTRAINT mirror_probe CHECK (collection_id <> {id})"
+            )
+        }
         happyview::db::DatabaseBackend::Sqlite => format!(
-            "CREATE TRIGGER mirror_probe BEFORE INSERT ON happyview_records \
-             WHEN NEW.collection = '{collection}' \
+            "CREATE TRIGGER mirror_probe BEFORE INSERT ON happyview_records_v2 \
+             WHEN NEW.collection_id = (SELECT id FROM happyview_collections WHERE nsid = '{collection}') \
              BEGIN SELECT RAISE(ABORT, 'mirror probe'); END"
         ),
     };
@@ -588,7 +605,7 @@ async fn refuse_collection(app: &TestApp, collection: &str) {
 async fn allow_collection(app: &TestApp) {
     let sql = match app.state.db_backend {
         happyview::db::DatabaseBackend::Postgres => {
-            "ALTER TABLE happyview_records DROP CONSTRAINT IF EXISTS mirror_probe"
+            "ALTER TABLE happyview_records_v2 DROP CONSTRAINT IF EXISTS mirror_probe"
         }
         happyview::db::DatabaseBackend::Sqlite => "DROP TRIGGER IF EXISTS mirror_probe",
     };

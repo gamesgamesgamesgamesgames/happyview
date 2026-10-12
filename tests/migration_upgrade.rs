@@ -59,8 +59,13 @@ fn stage_baseline_migrations(src: &str, dest: &Path, cutoff: &str) {
 }
 
 /// Reproduce a v2.0.0 install on `pool`, seed a row, then run the current
-/// migrations on top and assert the row survived.
-async fn assert_upgrade_preserves_data(pool: &AnyPool, migrations_dir: &str) {
+/// migrations and the record store upgrade on top and assert the row
+/// survived.
+async fn assert_upgrade_preserves_data(
+    pool: &AnyPool,
+    migrations_dir: &str,
+    backend: happyview::db::DatabaseBackend,
+) {
     let baseline_dir = std::env::temp_dir().join(format!("hv-baseline-{}", uuid::Uuid::new_v4()));
     stage_baseline_migrations(migrations_dir, &baseline_dir, V2_0_0_CUTOFF);
 
@@ -105,6 +110,35 @@ async fn assert_upgrade_preserves_data(pool: &AnyPool, migrations_dir: &str) {
         .expect("seeded backfill job should survive the upgrade");
     assert_eq!((queue_version, discovery_complete), (1, 1));
 
+    // 6. The record store upgrade moves it into the compact tables, and the
+    //    view reads back the same row and the same text.
+    const SEED_RECORD: &str = "SELECT CAST(record AS TEXT) FROM happyview_records \
+         WHERE uri = 'at://did:plc:legacy/app.test.post/rk1'";
+    let (before,): (String,) = sqlx::query_as(SEED_RECORD)
+        .fetch_one(pool)
+        .await
+        .expect("read the record before the upgrade");
+    let outcome = happyview::record_store::upgrade::run(pool, backend)
+        .await
+        .expect("the record store upgrade");
+    assert!(
+        matches!(
+            outcome,
+            happyview::record_store::upgrade::UpgradeOutcome::Upgraded { records: 1, .. }
+        ),
+        "{outcome:?}"
+    );
+    let (did,): (String,) = sqlx::query_as(SEED_ASSERT)
+        .fetch_one(pool)
+        .await
+        .expect("the record reads through the view");
+    assert_eq!(did, "did:plc:legacy");
+    let (after,): (String,) = sqlx::query_as(SEED_RECORD)
+        .fetch_one(pool)
+        .await
+        .expect("read the record after the upgrade");
+    assert_eq!(after, before);
+
     let _ = std::fs::remove_dir_all(&baseline_dir);
 }
 
@@ -118,7 +152,12 @@ async fn sqlite_upgrade_from_v2_0_0_applies_and_preserves_data() {
         .await
         .expect("connect to fresh sqlite database");
 
-    assert_upgrade_preserves_data(&pool, "migrations/sqlite").await;
+    assert_upgrade_preserves_data(
+        &pool,
+        "migrations/sqlite",
+        happyview::db::DatabaseBackend::Sqlite,
+    )
+    .await;
 
     pool.close().await;
     let _ = std::fs::remove_file(&tmp_db);
@@ -158,10 +197,13 @@ async fn postgres_upgrade_from_v2_0_0_applies_and_preserves_data() {
     // Run the upgrade, but catch a panic so the scratch database is always
     // dropped even when an assertion fails — then re-raise so the test still fails.
     use futures::FutureExt;
-    let outcome =
-        std::panic::AssertUnwindSafe(assert_upgrade_preserves_data(&pool, "migrations/postgres"))
-            .catch_unwind()
-            .await;
+    let outcome = std::panic::AssertUnwindSafe(assert_upgrade_preserves_data(
+        &pool,
+        "migrations/postgres",
+        happyview::db::DatabaseBackend::Postgres,
+    ))
+    .catch_unwind()
+    .await;
 
     pool.close().await;
     // FORCE terminates any lingering backend connections so the drop can't hang.
@@ -301,33 +343,35 @@ async fn postgres_instances_migrating_at_once_all_boot() {
     }
 }
 
+/// The last migration before the concurrently built records index.
+const PRE_INDEX_CUTOFF: &str = "20261009000000";
+
 /// A `CREATE INDEX CONCURRENTLY` that fails partway leaves an invalid index of
 /// its name, and sqlx records nothing, so the migration runs again at the next
 /// boot. That run must build the index rather than let `IF NOT EXISTS` keep
-/// the invalid one.
+/// the invalid one, and the boot then goes on to the record store upgrade.
 #[tokio::test]
 #[serial_test::serial]
 async fn postgres_boot_rebuilds_an_index_a_failed_concurrent_build_left_invalid() {
     let ran = with_scratch_postgres("hv_invalid_index", |url| async move {
         use happyview::db::{self, DatabaseBackend};
-        let pool = db::connect(&url, DatabaseBackend::Postgres).await;
+        let staged = std::env::temp_dir().join(format!("hv-pre-index-{}", uuid::Uuid::new_v4()));
+        stage_baseline_migrations("migrations/postgres", &staged, PRE_INDEX_CUTOFF);
+        let pool = AnyPool::connect(&url).await.expect("connect");
+        Migrator::new(staged.as_path())
+            .await
+            .expect("load the migrations before the index")
+            .run(&pool)
+            .await
+            .expect("migrate to before the index");
+        let _ = std::fs::remove_dir_all(&staged);
 
-        // Rewind to before the index's migration, then fail a concurrent
-        // build of that name: two rows share a collection, so a unique build
-        // on it fails and leaves the index invalid.
-        const INDEX_MIGRATIONS: &str = "version BETWEEN 20261009000001 AND 20261009000003";
-        db::query(&format!("DELETE FROM _sqlx_migrations WHERE {INDEX_MIGRATIONS}"))
-            .execute(&pool)
-            .await
-            .expect("rewind migrations");
-        db::query("DROP INDEX idx_records_collection_created_at_uri")
-            .execute(&pool)
-            .await
-            .expect("drop the built index");
+        // Fail a concurrent build of the index's name: two rows share a
+        // collection, so a unique build on it fails and leaves it invalid.
         db::query(
             "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) VALUES \
-             ('at://did:plc:a/app.test.post/1', 'did:plc:a', 'app.test.post', '1', '{}', 'c1', NOW()), \
-             ('at://did:plc:a/app.test.post/2', 'did:plc:a', 'app.test.post', '2', '{}', 'c2', NOW())",
+             ('at://did:plc:a/app.test.post/1', 'did:plc:a', 'app.test.post', '1', '{\"n\":1}', 'c1', NOW()), \
+             ('at://did:plc:a/app.test.post/2', 'did:plc:a', 'app.test.post', '2', '{\"n\":2}', 'c2', NOW())",
         )
         .execute(&pool)
         .await
@@ -339,31 +383,245 @@ async fn postgres_boot_rebuilds_an_index_a_failed_concurrent_build_left_invalid(
         .execute(&pool)
         .await
         .expect_err("a unique build over duplicates fails");
-        pool.close().await;
-
-        let pool = db::connect(&url, DatabaseBackend::Postgres).await;
-        let (valid, unique): (bool, bool) = db::query_as(
-            "SELECT i.indisvalid, i.indisunique FROM pg_index i \
-             JOIN pg_class c ON c.oid = i.indexrelid \
-             WHERE c.relname = 'idx_records_collection_created_at_uri'",
+        let (invalid,): (i64,) = db::query_as(
+            "SELECT COUNT(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+             WHERE c.relname = 'idx_records_collection_created_at_uri' AND NOT i.indisvalid",
         )
         .fetch_one(&pool)
         .await
-        .expect("the index exists");
-        assert!(valid, "the index is valid after the retry");
-        assert!(!unique, "the retry built the migration's index");
-        let (applied,): (i64,) = db::query_as(&format!(
-            "SELECT COUNT(*) FROM _sqlx_migrations WHERE {INDEX_MIGRATIONS}"
-        ))
+        .expect("find the invalid index");
+        assert_eq!(invalid, 1, "the failed build left an invalid index");
+        pool.close().await;
+
+        let pool = db::connect(&url, DatabaseBackend::Postgres).await;
+        let (applied,): (i64,) = db::query_as(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version BETWEEN 20261009000001 AND 20261009000003",
+        )
         .fetch_one(&pool)
         .await
         .expect("count migrations");
         assert_eq!(applied, 3);
+        assert!(
+            !happyview::record_store::upgrade::legacy_tables_present(&pool, DatabaseBackend::Postgres)
+                .await
+                .expect("check"),
+            "the boot went on to the record store upgrade"
+        );
+        let store = happyview::record_store::RecordStore::new(pool.clone(), DatabaseBackend::Postgres);
+        for (rkey, body) in [("1", r#"{"n":1}"#), ("2", r#"{"n":2}"#)] {
+            let got = store
+                .get(&format!("at://did:plc:a/app.test.post/{rkey}"))
+                .await
+                .expect("get")
+                .expect("the record survived");
+            assert_eq!(got.record, body);
+        }
         pool.close().await;
     })
     .await;
     if ran.is_none() {
         eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+    }
+}
+
+/// Seed the legacy tables of a migrated (not yet upgraded) database, then
+/// upgrade, and read every record back through the view and the store.
+async fn assert_records_survive_the_compact_upgrade(
+    pool: &AnyPool,
+    backend: happyview::db::DatabaseBackend,
+) {
+    use happyview::db::adapt_sql;
+    use happyview::record_store::{RecordStore, upgrade};
+    const CID: &str = "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm";
+    let insert = adapt_sql(
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+         VALUES (?, ?, 'app.test.post', ?, ?, ?, ?, ?)",
+        backend,
+    );
+    let mut expected = Vec::new();
+    for i in 0..30 {
+        let uri = format!("at://did:plc:mu{}/app.test.post/r{i:02}", i % 4);
+        let record = format!(r#"{{"z":{i},"a":"é\n","via":"witchsky"}}"#);
+        happyview::db::query(&insert)
+            .bind(&uri)
+            .bind(format!("did:plc:mu{}", i % 4))
+            .bind(format!("r{i:02}"))
+            .bind(&record)
+            .bind(CID)
+            .bind((i % 3 != 0).then_some("2026-01-01T00:00:00+00:00"))
+            .bind("2026-01-01T00:00:00+00:00")
+            .execute(pool)
+            .await
+            .expect("seed");
+        expected.push((uri, record));
+    }
+
+    // An interrupted copy: one batch, then the boot-time upgrade resumes it.
+    let interner = happyview::record_store::intern::Interner::new(64);
+    upgrade::copy_records(pool, backend, &interner, 10, Some(1))
+        .await
+        .expect("one batch");
+    let outcome = upgrade::run(pool, backend).await.expect("upgrade");
+    assert!(
+        matches!(
+            outcome,
+            upgrade::UpgradeOutcome::Upgraded { records: 30, .. }
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        !upgrade::legacy_tables_present(pool, backend)
+            .await
+            .expect("check")
+    );
+    assert_eq!(
+        upgrade::run(pool, backend).await.expect("again"),
+        upgrade::UpgradeOutcome::AlreadyDone
+    );
+
+    let store = RecordStore::new(pool.clone(), backend);
+    for (uri, record) in &expected {
+        let got = store.get(uri).await.expect("get").expect("present");
+        assert_eq!(&got.record, record, "{uri}");
+        assert_eq!(got.cid.as_deref(), Some(CID));
+    }
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM happyview_records")
+        .fetch_one(pool)
+        .await
+        .expect("count through the view");
+    assert_eq!(n, expected.len() as i64);
+}
+
+/// A forced mismatch: a row written behind the copy stops the swap, drops
+/// nothing, and returns promptly (the reset must not wait on the refused
+/// swap's locks).
+async fn assert_a_row_added_behind_the_copy_stops_the_swap(
+    pool: &AnyPool,
+    backend: happyview::db::DatabaseBackend,
+) {
+    use happyview::db::adapt_sql;
+    use happyview::record_store::upgrade;
+    let insert = adapt_sql(
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) \
+         VALUES (?, ?, 'app.test.post', ?, '{}', 'c', '2026-01-01T00:00:00Z')",
+        backend,
+    );
+    for did in ["did:plc:m", "did:plc:n"] {
+        happyview::db::query(&insert)
+            .bind(format!("at://{did}/app.test.post/r"))
+            .bind(did)
+            .bind("r")
+            .execute(pool)
+            .await
+            .expect("seed");
+    }
+    let interner = happyview::record_store::intern::Interner::new(8);
+    upgrade::copy_records(pool, backend, &interner, 100, None)
+        .await
+        .expect("copy");
+    // An old instance writes a row that sorts before the copy's cursor.
+    happyview::db::query(&insert)
+        .bind("at://did:plc:a/app.test.post/r")
+        .bind("did:plc:a")
+        .bind("r")
+        .execute(pool)
+        .await
+        .expect("late write");
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        upgrade::run(pool, backend),
+    )
+    .await
+    .expect("the refused swap returns")
+    .expect_err("the swap is refused");
+    assert!(
+        err.to_string()
+            .contains("app.test.post: 3 legacy rows, 2 copied"),
+        "{err}"
+    );
+    assert!(
+        upgrade::legacy_tables_present(pool, backend)
+            .await
+            .expect("check"),
+        "nothing dropped"
+    );
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM happyview_records")
+        .fetch_one(pool)
+        .await
+        .expect("count the legacy rows");
+    assert_eq!(n, 3);
+}
+
+#[tokio::test]
+async fn sqlite_records_survive_the_compact_upgrade() {
+    happyview::db::install_drivers();
+    for check in [0, 1] {
+        let tmp_db = std::env::temp_dir().join(format!("hv-compact-{}.db", uuid::Uuid::new_v4()));
+        let pool = AnyPool::connect(&format!("sqlite://{}?mode=rwc", tmp_db.display()))
+            .await
+            .expect("connect");
+        Migrator::new(Path::new("migrations/sqlite"))
+            .await
+            .expect("load")
+            .run(&pool)
+            .await
+            .expect("migrate");
+        match check {
+            0 => {
+                assert_records_survive_the_compact_upgrade(
+                    &pool,
+                    happyview::db::DatabaseBackend::Sqlite,
+                )
+                .await
+            }
+            _ => {
+                assert_a_row_added_behind_the_copy_stops_the_swap(
+                    &pool,
+                    happyview::db::DatabaseBackend::Sqlite,
+                )
+                .await
+            }
+        }
+        pool.close().await;
+        let _ = std::fs::remove_file(&tmp_db);
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn postgres_records_survive_the_compact_upgrade() {
+    for check in [0, 1] {
+        let ran = with_scratch_postgres("hv_compact", |url| async move {
+            let pool = AnyPool::connect(&url).await.expect("connect");
+            Migrator::new(Path::new("migrations/postgres"))
+                .await
+                .expect("load")
+                .run(&pool)
+                .await
+                .expect("migrate");
+            match check {
+                0 => {
+                    assert_records_survive_the_compact_upgrade(
+                        &pool,
+                        happyview::db::DatabaseBackend::Postgres,
+                    )
+                    .await
+                }
+                _ => {
+                    assert_a_row_added_behind_the_copy_stops_the_swap(
+                        &pool,
+                        happyview::db::DatabaseBackend::Postgres,
+                    )
+                    .await
+                }
+            }
+            pool.close().await;
+        })
+        .await;
+        if ran.is_none() {
+            eprintln!("skipped (TEST_DATABASE_URL is not Postgres)");
+            return;
+        }
     }
 }
 
