@@ -706,22 +706,27 @@ async fn stats_with_seeded_records() {
     let app = TestApp::new().await;
     let backend = app.state.db_backend;
 
-    // Seed a lexicon so the stats query can join against it
+    // Seed a lexicon so the stats list has a collection to count
     let lexicon_json_val = serde_json::json!({
         "lexicon": 1,
         "id": "test.collection",
         "defs": { "main": { "type": "record", "key": "tid", "record": { "type": "object", "properties": {} } } }
     });
     let now = now_rfc3339();
-    let sql = adapt_sql(
-        "INSERT INTO happyview_lexicons (id, lexicon_json, created_at) VALUES (?, ?, ?)",
-        backend,
-    );
-    happyview::db::query(&sql)
-        .bind("test.collection")
-        .bind(serde_json::to_string(&lexicon_json_val).unwrap_or_default())
-        .bind(&now)
-        .execute(&app.state.db)
+    app.state
+        .lexicons
+        .put_manual(
+            &app.state.db,
+            backend,
+            happyview::catalog::LexiconWrite {
+                lexicon_json: lexicon_json_val,
+                backfill: false,
+                target_collection: None,
+                action: happyview::lexicon::ProcedureAction::Upsert,
+                token_cost: None,
+                authority_did: None,
+            },
+        )
         .await
         .unwrap();
 

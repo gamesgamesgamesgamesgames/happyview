@@ -144,3 +144,39 @@ async fn adding_or_removing_a_network_lexicon_a_project_file_owns_is_a_409() {
         .await;
     assert_eq!(status, 409, "{body}");
 }
+
+/// The stats page lists collections from the catalog, so a record lexicon
+/// only a file defines is a collection like any other.
+#[tokio::test]
+#[serial]
+async fn stats_include_project_record_lexicons() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state.project.store(Arc::new(owning_game()));
+
+    let stats = app.get_json("/admin/stats").await;
+    let game = stats["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["collection"] == GAME);
+    assert_eq!(game.map(|c| c["count"].clone()), Some(json!(0)), "{stats}");
+}
+
+/// The records page lists collections from the catalog too.
+#[tokio::test]
+#[serial]
+async fn collection_listings_include_project_record_lexicons() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state.project.store(Arc::new(owning_game()));
+
+    let listed = app.get_json("/admin/records/collections").await;
+    assert!(
+        listed["collections"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(GAME)),
+        "{listed}"
+    );
+}

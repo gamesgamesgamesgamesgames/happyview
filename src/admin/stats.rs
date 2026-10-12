@@ -2,7 +2,6 @@ use axum::Json;
 use axum::extract::State;
 
 use crate::AppState;
-use crate::db::adapt_sql;
 use crate::error::AppError;
 
 use super::auth::AllowPlatform;
@@ -20,31 +19,28 @@ pub(super) async fn stats(
         .await
         .map_err(|e| AppError::Internal(format!("failed to count records: {e}")))?;
 
-    let collection_sql = adapt_sql(
-        r#"
-        SELECT c.collection, COALESCE(r.cnt, 0) AS count
-        FROM (
-            SELECT id AS collection FROM happyview_lexicons
-            WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record'
-        ) c
-        LEFT JOIN (
-            SELECT collection, COUNT(*) AS cnt FROM happyview_records GROUP BY collection
-        ) r ON r.collection = c.collection
-        ORDER BY c.collection
-        "#,
-        state.db_backend,
-    );
-
-    let collections: Vec<(String, i64)> = crate::db::query_as(&collection_sql)
-        .fetch_all(&state.db)
+    // Counted per collection and merged here rather than joined in SQL, so
+    // the collection list is the catalog's: every layer, not only stored rows.
+    let counted: Vec<(String, i64)> = crate::db::query_as(
+        "SELECT collection, COUNT(*) FROM happyview_records GROUP BY collection",
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to count by collection: {e}")))?;
+    let counts: std::collections::HashMap<String, i64> = counted.into_iter().collect();
+    let collections: Vec<CollectionStat> = state
+        .lexicons
+        .get_record_collections()
         .await
-        .map_err(|e| AppError::Internal(format!("failed to count by collection: {e}")))?;
+        .into_iter()
+        .map(|collection| CollectionStat {
+            count: counts.get(&collection).copied().unwrap_or(0),
+            collection,
+        })
+        .collect();
 
     Ok(Json(StatsResponse {
         total_records: total.0,
-        collections: collections
-            .into_iter()
-            .map(|(collection, count)| CollectionStat { collection, count })
-            .collect(),
+        collections,
     }))
 }

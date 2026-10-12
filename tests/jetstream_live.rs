@@ -12,7 +12,7 @@ use happyview::db::DatabaseBackend;
 use happyview::db::adapt_sql;
 use happyview::jetstream::config::{DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint};
 use happyview::jetstream::workers::RetryPolicy;
-use happyview::lexicon::{ParsedLexicon, ProcedureAction};
+use happyview::lexicon::ProcedureAction;
 use serde_json::{Value, json};
 use serial_test::serial;
 use tokio::sync::watch;
@@ -57,15 +57,22 @@ async fn app() -> Option<TestApp> {
         return None;
     }
     let app = TestApp::new().await;
-    let parsed = ParsedLexicon::parse(
-        common::fixtures::game_record_lexicon(),
-        1,
-        Some(GAME.to_string()),
-        ProcedureAction::Upsert,
-        None,
-    )
-    .expect("parse the game lexicon");
-    app.state.lexicons.upsert(parsed).await;
+    app.state
+        .lexicons
+        .put_manual(
+            &app.state.db,
+            app.state.db_backend,
+            happyview::catalog::LexiconWrite {
+                lexicon_json: common::fixtures::game_record_lexicon(),
+                backfill: false,
+                target_collection: Some(GAME.to_string()),
+                action: ProcedureAction::Upsert,
+                token_cost: None,
+                authority_did: None,
+            },
+        )
+        .await
+        .expect("store the game lexicon");
     Some(app)
 }
 

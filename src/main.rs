@@ -5,7 +5,6 @@ use happyview::catalog::LexiconCatalog;
 use happyview::config::Config;
 use happyview::db;
 use happyview::dns::NativeDnsResolver;
-use happyview::lexicon::{ParsedLexicon, ProcedureAction};
 use happyview::rate_limit::{RateLimitDefaults, RateLimiter};
 use happyview::resolve::{fetch_lexicon_from_pds, resolve_nsid_authority};
 use happyview::{AppState, jetstream, labeler, server};
@@ -161,49 +160,19 @@ async fn main() {
 
     // Re-fetch all network lexicons from their respective PDSes.
     let http = happyview::http_retry::init_shared_client(&config.user_agent);
-    let network_rows: Vec<(String, Option<String>, Option<String>)> = crate::db::query_as(
-        "SELECT id, authority_did, target_collection FROM happyview_lexicons WHERE source = 'network'",
-    )
-    .fetch_all(&db_pool)
-    .await
-    .unwrap_or_default();
-
-    for (nsid, _authority_did, target_collection) in &network_rows {
+    let network = lexicons.network_lexicons().await;
+    for lexicon in &network {
+        let nsid = lexicon.parsed.id.as_str();
         match resolve_nsid_authority(&http, &config.plc_url, nsid).await {
             Ok((did, pds_endpoint)) => {
                 match fetch_lexicon_from_pds(&http, &pds_endpoint, &did, nsid).await {
                     Ok(lexicon_json) => {
-                        match ParsedLexicon::parse(
-                            lexicon_json.clone(),
-                            1,
-                            target_collection.clone(),
-                            ProcedureAction::Upsert,
-                            None,
-                        ) {
-                            Ok(parsed) => {
-                                let now = db::now_rfc3339();
-                                let update_sql = db::adapt_sql(
-                                    "UPDATE happyview_lexicons SET lexicon_json = ?, last_fetched_at = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND source = 'network'",
-                                    db_backend,
-                                );
-                                let lexicon_json_str =
-                                    serde_json::to_string(&lexicon_json).unwrap_or_default();
-                                if let Err(e) = crate::db::query(&update_sql)
-                                    .bind(&lexicon_json_str)
-                                    .bind(&now)
-                                    .bind(&now)
-                                    .bind(nsid)
-                                    .execute(&db_pool)
-                                    .await
-                                {
-                                    warn!(nsid, "failed to update network lexicon in DB: {e}");
-                                    continue;
-                                }
-
-                                lexicons.upsert(parsed).await;
-                                info!(nsid, "refreshed network lexicon");
-                            }
-                            Err(e) => warn!(nsid, "failed to parse network lexicon: {e}"),
+                        match lexicons
+                            .refresh_network(&db_pool, db_backend, nsid, lexicon_json)
+                            .await
+                        {
+                            Ok(_) => info!(nsid, "refreshed network lexicon"),
+                            Err(e) => warn!(nsid, "failed to refresh network lexicon: {e}"),
                         }
                     }
                     Err(e) => warn!(nsid, "failed to fetch network lexicon from PDS: {e}"),
@@ -213,9 +182,9 @@ async fn main() {
         }
     }
 
-    if !network_rows.is_empty() {
+    if !network.is_empty() {
         info!(
-            count = network_rows.len(),
+            count = network.len(),
             "processed network lexicons on startup"
         );
     }

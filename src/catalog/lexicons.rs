@@ -542,27 +542,18 @@ impl LexiconCatalog {
         })
     }
 
-    /// Puts a lexicon in memory without a row, keeping the layer an existing
-    /// entry has.
-    pub async fn upsert(&self, parsed: ParsedLexicon) {
-        let mut stored = self.stored_mut();
-        let (layer, authority_did) = stored
-            .get(&parsed.id)
-            .map(|s| (s.layer, s.authority_did.clone()))
-            .unwrap_or((Layer::Manual, None));
-        stored.insert(
+    /// Puts a lexicon in memory as a manual entry with no row, for tests that
+    /// exercise readers rather than storage.
+    #[cfg(test)]
+    pub(crate) async fn upsert(&self, parsed: ParsedLexicon) {
+        self.stored_mut().insert(
             parsed.id.clone(),
             StoredLexicon {
                 parsed,
-                layer,
-                authority_did,
+                layer: Layer::Manual,
+                authority_did: None,
             },
         );
-    }
-
-    /// Drops a lexicon from memory without touching its row.
-    pub async fn forget(&self, id: &str) -> bool {
-        self.stored_mut().remove(id).is_some()
     }
 }
 
