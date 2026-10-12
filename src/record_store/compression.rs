@@ -126,7 +126,8 @@ impl BodyCodec {
     }
 
     /// `(body, body_dict)` for `json`: compressed with the collection's
-    /// newest dictionary when that helps, raw otherwise.
+    /// newest dictionary when that helps and the body is one `decompress`
+    /// will read back, raw otherwise.
     pub fn encode(&self, collection_id: i64, json: &str) -> (Vec<u8>, Option<i64>) {
         let raw = json.as_bytes().to_vec();
         if self.mode == Compression::None {
@@ -141,7 +142,9 @@ impl BodyCodec {
         else {
             return (raw, None);
         };
-        if raw.len() < MIN_COMPRESS_BYTES {
+        // Past MAX_RECORD_BYTES `decompress` would refuse the frame, and
+        // every read of the row would fail.
+        if raw.len() < MIN_COMPRESS_BYTES || raw.len() > MAX_RECORD_BYTES {
             return (raw, Some(RAW_CONSIDERED));
         }
         match zstd::bulk::Compressor::with_prepared_dictionary(&dict.encoder)
@@ -347,6 +350,40 @@ mod tests {
                     .expect("decode");
             assert_eq!(text, samples[5]);
         }
+    }
+
+    /// A body `decompress` would refuse is never compressed, or no read of
+    /// it (or of its collection) could succeed.
+    #[tokio::test]
+    async fn a_body_past_the_decode_limit_stays_raw() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let posts = sample_posts(1000);
+        let dict = train(&posts, 4096);
+        let (collection_id, did_id, dict_id) = seed(&pool, &dict).await;
+        let codec = BodyCodec::new(Compression::Zstd);
+        codec.install(collection_id, dict_id, &dict);
+        let json = format!(r#"{{"text":"{}"}}"#, "a".repeat(MAX_RECORD_BYTES));
+        assert!(json.len() > MAX_RECORD_BYTES);
+        let (body, body_dict) = codec.encode(collection_id, &json);
+        assert_eq!(body_dict, Some(RAW_CONSIDERED));
+        assert!(body == json.as_bytes(), "an oversized body is stored raw");
+        crate::db::query(
+            "INSERT INTO happyview_records_v2 (did_id, collection_id, rkey, cid, body, body_dict, created_at) \
+             VALUES (?, ?, 'r', x'', ?, ?, 0)",
+        )
+        .bind(did_id)
+        .bind(collection_id)
+        .bind(body)
+        .bind(body_dict)
+        .execute(&pool)
+        .await
+        .expect("insert");
+        let (text,): (String,) =
+            crate::db::query_as("SELECT hv_record(body, body_dict) FROM happyview_records_v2")
+                .fetch_one(&pool)
+                .await
+                .expect("read an oversized body");
+        assert!(text == json, "hv_record returns the oversized body intact");
     }
 
     #[tokio::test]
