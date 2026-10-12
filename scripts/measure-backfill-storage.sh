@@ -17,7 +17,10 @@
 #   MEASURE_PORT      port for the throwaway server (default 3917)
 #   MEASURE_PROFILE   cargo profile to build and run (default release)
 #
-# The WAL is sampled every 0.2s, so its peak is a lower bound.
+# The WAL is sampled every 0.2s, so its peak is a lower bound. On a version
+# with the compact record format, the summary waits (up to ten minutes) for
+# the background compression to catch up, which the server is told to run
+# every 5 seconds; seconds covers the backfill only.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -70,6 +73,7 @@ start_server() {
     PUBLIC_URL="$base" HOST=127.0.0.1 PORT="$port" \
     SESSION_SECRET="measure-$(printf 'x%.0s' {1..64})" \
     JETSTREAM_URL="ws://127.0.0.1:9" \
+    RECORD_COMPRESSION_INTERVAL_SECS=5 \
     RUST_LOG="happyview=info" \
     "$bin" >>"$log" 2>&1 &
   pid=$!
@@ -143,7 +147,23 @@ if [[ -r "/proc/$pid/io" ]]; then
   write_bytes=$(( $(proc_write_bytes) - write_bytes_before ))
 fi
 wal_at_end=$(size_of "$db-wal")
-records=$(sqlite3 "$db" "SELECT COUNT(*) FROM happyview_records WHERE collection = '$collection';")
+# The sqlite3 CLI cannot read the happyview_records view of the compact
+# format (its record column needs a function only HappyView registers), so
+# count from the table behind it when there is one.
+if [[ "$(sqlite3 "$db" "SELECT COUNT(*) FROM sqlite_master WHERE name = 'happyview_records_v2' AND type = 'table'")" == 1 ]]; then
+  records=$(sqlite3 "$db" "SELECT COUNT(*) FROM happyview_records_v2 r JOIN happyview_collections c ON c.id = r.collection_id WHERE c.nsid = '$collection';")
+  # Compression runs in the background once a collection reaches the
+  # training threshold; measure after it has caught up.
+  if [[ "${RECORD_COMPRESSION:-zstd}" != none ]] && (( records >= ${ZSTD_DICT_TRAIN_AT:-5000} )); then
+    for _ in $(seq 1 600); do
+      pending=$(sqlite3 "$db" "SELECT (SELECT COUNT(*) FROM happyview_zstd_dicts) = 0 OR EXISTS (SELECT 1 FROM happyview_records_v2 WHERE body_dict IS NULL AND collection_id IN (SELECT collection_id FROM happyview_zstd_dicts));")
+      [[ "$pending" == 0 ]] && break
+      sleep 1
+    done
+  fi
+else
+  records=$(sqlite3 "$db" "SELECT COUNT(*) FROM happyview_records WHERE collection = '$collection';")
+fi
 stop_server
 
 cat <<REPORT
