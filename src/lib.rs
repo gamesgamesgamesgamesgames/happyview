@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod auth;
 pub mod blobs;
+pub mod catalog;
 pub mod cid_verify;
 pub mod codemod;
 pub mod config;
@@ -30,6 +31,7 @@ pub mod oauth;
 pub mod plc;
 pub mod plugin;
 pub mod profile;
+pub mod project;
 pub mod proxy_config;
 pub mod rate_limit;
 pub mod raw_sql_guard;
