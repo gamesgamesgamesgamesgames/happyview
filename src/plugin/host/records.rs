@@ -485,8 +485,7 @@ pub async fn table_query(
 /// NOT NULL on both backends, and `cid_verify` already reads an empty CID as
 /// "nothing to check".
 pub async fn index_put(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     spec: IndexPut,
 ) -> Result<RecordRef, RecordsError> {
     let IndexPut {
@@ -497,7 +496,6 @@ pub async fn index_put(
         cid,
     } = spec;
     let did = did.ok_or_else(|| invalid("index_put needs a did: pass the record's author"))?;
-    let store = crate::record_store::RecordStore::new(db.clone(), backend);
     let prepared = crate::record_store::PreparedRecord {
         did,
         collection,
@@ -551,11 +549,10 @@ pub type MirrorError = crate::record_store::LocalWriteError;
 /// echo's to set: bound NULL on insert and cleared on update, so the
 /// identical echo re-stamps the row.
 pub async fn mirror_network_write(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     write: NetworkWrite<'_>,
 ) -> Result<(), MirrorError> {
-    crate::record_store::RecordStore::new(db.clone(), backend)
+    store
         .write_local(
             crate::record_store::WriteKind::Echoed,
             &crate::record_store::PreparedRecord {
@@ -573,26 +570,20 @@ pub async fn mirror_network_write(
 /// Drop a record the caller just deleted from their PDS, and the references
 /// it made, so a read before the Jetstream echo does not resurrect it.
 pub async fn mirror_network_delete(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     uri: &str,
 ) -> Result<(), RecordsError> {
-    crate::record_store::RecordStore::new(db.clone(), backend)
-        .delete(uri)
-        .await?;
+    store.delete(uri).await?;
     Ok(())
 }
 
 /// Drop one record from the local index. Idempotent; the bool says whether a
 /// row was actually there.
 pub async fn index_delete(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     uri: &str,
 ) -> Result<bool, RecordsError> {
-    Ok(crate::record_store::RecordStore::new(db.clone(), backend)
-        .delete(uri)
-        .await?)
+    Ok(store.delete(uri).await?)
 }
 
 /// The raw JSON of an uploaded lexicon, or `None` when this instance holds no
@@ -1251,8 +1242,7 @@ mod tests {
     async fn index_put_inserts_then_updates() {
         let pool = seeded_pool().await;
         let inserted = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             index_put_spec("did:plc:a", "new", json!({"n": "first"})),
         )
         .await
@@ -1261,8 +1251,7 @@ mod tests {
         assert_eq!(inserted.cid, "");
 
         let updated = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             index_put_spec("did:plc:a", "new", json!({"n": "second"})),
         )
         .await
@@ -1290,8 +1279,7 @@ mod tests {
     async fn index_put_records_a_supplied_cid_on_insert() {
         let pool = seeded_pool().await;
         let inserted = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             IndexPut {
                 collection: "c".into(),
                 rkey: "fresh".into(),
@@ -1312,8 +1300,7 @@ mod tests {
     async fn index_put_never_overwrites_an_existing_cid() {
         let pool = seeded_pool().await;
         let updated = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             IndexPut {
                 collection: "c".into(),
                 rkey: "1".into(),
@@ -1350,8 +1337,7 @@ mod tests {
         .unwrap();
 
         let put = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             IndexPut {
                 collection: "c".into(),
                 rkey: "1".into(),
@@ -1378,8 +1364,7 @@ mod tests {
     async fn index_put_without_a_did_says_so() {
         let pool = seeded_pool().await;
         let err = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             IndexPut {
                 collection: "c".into(),
                 rkey: "1".into(),
@@ -1418,8 +1403,7 @@ mod tests {
         let pool = seeded_pool().await;
         let record = json!({"n": "mine", "subject": "at://did:plc:a/c/1"});
         mirror_network_write(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             NetworkWrite {
                 uri: "at://did:plc:a/c/fresh",
                 did: "did:plc:a",
@@ -1458,8 +1442,7 @@ mod tests {
         .unwrap();
         let record = json!({"n": "edited", "subject": "at://did:plc:b/c/3"});
         mirror_network_write(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             NetworkWrite {
                 uri: "at://did:plc:a/c/2",
                 did: "did:plc:a",
@@ -1493,9 +1476,12 @@ mod tests {
             ref_targets(&pool, "at://did:plc:a/c/2").await,
             vec!["at://did:plc:a/c/1"]
         );
-        mirror_network_delete(&pool, Sqlite, "at://did:plc:a/c/2")
-            .await
-            .unwrap();
+        mirror_network_delete(
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+            "at://did:plc:a/c/2",
+        )
+        .await
+        .unwrap();
         assert!(
             records_get(&pool, Sqlite, "at://did:plc:a/c/2")
                 .await
@@ -1503,9 +1489,12 @@ mod tests {
                 .is_none()
         );
         assert!(ref_targets(&pool, "at://did:plc:a/c/2").await.is_empty());
-        mirror_network_delete(&pool, Sqlite, "at://did:plc:a/c/2")
-            .await
-            .expect("a second delete is a no-op");
+        mirror_network_delete(
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+            "at://did:plc:a/c/2",
+        )
+        .await
+        .expect("a second delete is a no-op");
     }
 
     /// The caller decides what a failed mirror means; the function itself
@@ -1526,9 +1515,12 @@ mod tests {
             record: &record,
             cid: "bafy",
         };
-        let err = mirror_network_write(&pool, Sqlite, write)
-            .await
-            .unwrap_err();
+        let err = mirror_network_write(
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+            write,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, MirrorError::Row(_)), "{err}");
         assert!(err.to_string().starts_with("row not written"), "{err}");
 
@@ -1537,9 +1529,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let err = mirror_network_write(&pool, Sqlite, write)
-            .await
-            .unwrap_err();
+        let err = mirror_network_write(
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+            write,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, MirrorError::Refs(_)), "{err}");
         assert!(err.to_string().starts_with("row written"), "{err}");
         assert!(
@@ -1554,9 +1549,12 @@ mod tests {
     #[tokio::test]
     async fn a_mirror_delete_that_cannot_write_reports_it() {
         let pool = crate::test_support::memory_pool().await;
-        let err = mirror_network_delete(&pool, Sqlite, "at://did:plc:a/c/1")
-            .await
-            .unwrap_err();
+        let err = mirror_network_delete(
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+            "at://did:plc:a/c/1",
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, RecordsError::Database(_)), "{err}");
     }
 
@@ -1564,14 +1562,20 @@ mod tests {
     async fn index_delete_reports_whether_a_row_went() {
         let pool = seeded_pool().await;
         assert!(
-            index_delete(&pool, Sqlite, "at://did:plc:a/c/1")
-                .await
-                .unwrap()
+            index_delete(
+                &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+                "at://did:plc:a/c/1"
+            )
+            .await
+            .unwrap()
         );
         assert!(
-            !index_delete(&pool, Sqlite, "at://did:plc:a/c/1")
-                .await
-                .unwrap()
+            !index_delete(
+                &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+                "at://did:plc:a/c/1"
+            )
+            .await
+            .unwrap()
         );
         assert!(
             records_get(&pool, Sqlite, "at://did:plc:a/c/1")

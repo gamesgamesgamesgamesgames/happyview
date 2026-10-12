@@ -686,8 +686,7 @@ async fn a_put_record_replaces_the_mirrored_cid_and_clears_indexed_at() {
     update_session_pds_url(&app, DID, &format!("{}/pds/{DID}", app.mock_server.uri())).await;
     let uri = format!("at://{DID}/com.example.post/abc");
     happyview::plugin::host::index_put(
-        &app.state.db,
-        app.state.db_backend,
+        &app.state.records,
         happyview_plugin_sdk::wire::IndexPut {
             collection: "com.example.post".into(),
             rkey: "abc".into(),
@@ -750,8 +749,7 @@ async fn a_deleted_record_leaves_the_index_with_its_refs() {
     update_session_pds_url(&app, DID, &format!("{}/pds/{DID}", app.mock_server.uri())).await;
     let uri = format!("at://{DID}/com.example.post/abc");
     happyview::plugin::host::index_put(
-        &app.state.db,
-        app.state.db_backend,
+        &app.state.records,
         happyview_plugin_sdk::wire::IndexPut {
             collection: "com.example.post".into(),
             rkey: "abc".into(),
