@@ -47,6 +47,8 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `VERBOSE_EVENT_LOGGING` | no | `false` | Log every record index, hook execution, and hook skip to the event log. High write volume — recommended only for debugging. Overridden by database setting if set via admin API |
 | `RUST_LOG` | no | `happyview=debug,tower_http=debug,sqlx=warn` | Log filter (uses `tracing_subscriber::EnvFilter`) |
 | `APP_NAME` | no | --- | Application name shown on OAuth authorization screens. Overridden by database setting if set via admin API |
+| `SUPERADMIN_DID` | no | --- | DID seeded as a super user at every boot, before the server accepts requests, so the first person to sign in is not made an admin automatically. Additive: other super users keep their role, and removing it later demotes nobody |
+| `HAPPYVIEW_PROJECT` | no | --- | Path to a project directory. Its `happyview.toml` is read at boot; see [Project file](#project-file-happyviewtoml). A path that does not exist stops boot |
 | `LOGO_URI` | no | --- | URL to application logo for OAuth screens. Overridden by database setting or logo upload |
 | `TOS_URI` | no | --- | URL to terms of service. Overridden by database setting if set via admin API |
 | `POLICY_URI` | no | --- | URL to privacy policy. Overridden by database setting if set via admin API |
@@ -98,6 +100,38 @@ SESSION_SECRET=change-me-in-production
 # TOS_URI=https://example.com/tos
 # POLICY_URI=https://example.com/privacy
 ```
+
+## Project file (`happyview.toml`)
+
+When `HAPPYVIEW_PROJECT` names a directory, HappyView reads `happyview.toml` from it at boot. The file is optional, and **every environment variable wins over it**, including one set to an empty string. Instance settings saved in the dashboard win over both.
+
+```toml
+[happyview]
+version = "3.0.0"            # warns at boot when the running binary differs
+
+[instance]
+app_name = "HappyProto Registry"           # stands in for APP_NAME
+superadmin = "did:plc:..."                 # stands in for SUPERADMIN_DID
+
+[dev]
+port = 3000                  # stands in for PORT, under `happyview dev` only
+backfill = false             # stands in for HAPPYVIEW_DEV_BACKFILL, under `happyview dev` only
+
+[network_lexicons]
+include = ["app.bsky.actor.profile"]
+
+[labels]
+subscribe = ["did:plc:ar7c4by46qjdydhdevvrndac"]
+
+[jetstream]
+protocol = "auto"            # stands in for JETSTREAM_PROTOCOL: auto, v2 or v1
+compression = true           # stands in for JETSTREAM_COMPRESSION
+```
+
+- `[network_lexicons] include` lexicons are tracked at boot, with no target collection and no backfill. One whose id a dashboard lexicon already uses is skipped with a warning; the dashboard lexicon is kept.
+- `[labels] subscribe` labelers are subscribed at boot. Pausing one from the dashboard sticks across restarts.
+- Neither can be removed from the dashboard or the admin API (`409`); remove the line from the file. A line removed from the file leaves its subscription or lexicon in place, now removable from the dashboard.
+- Unknown sections and keys are refused, and every error names the file, line and column: `happyview.toml:3:1: unknown field ...`.
 
 ## Next steps
 

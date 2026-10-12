@@ -459,6 +459,7 @@ interface NetworkLexicon {
   target_collection: string | null;
   last_fetched_at: string;
   created_at: string;
+  declared: boolean;
 }
 
 const response = await fetch("http://127.0.0.1:3000/admin/network-lexicons", {
@@ -545,5 +546,7 @@ curl -X DELETE http://127.0.0.1:3000/admin/network-lexicons/xyz.statusphere.stat
 ```
 
 Removes the network lexicon tracking and also deletes the lexicon from the `happyview_lexicons` table and in-memory registry.
+
+A network lexicon listed under `[network_lexicons] include` in the project's `happyview.toml` reports `declared: true`, and removing it returns `409 Conflict`; remove it from the file instead.
 
 **Response**: `204 No Content`
