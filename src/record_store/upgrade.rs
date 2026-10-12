@@ -37,9 +37,34 @@ const LOOKUP_CHUNK: usize = 200;
 /// Differences a failed verification names.
 const MISMATCHES_NAMED: usize = 5;
 
-/// The refs cursor joins source and target with a unit separator, which
-/// neither contains.
-const CURSOR_SEPARATOR: char = '\u{1f}';
+/// The refs cursor: `[source_uri, target_uri]` as a JSON array, which
+/// round-trips any text either holds.
+fn encode_refs_cursor(source: &str, target: &str) -> String {
+    serde_json::to_string(&(source, target)).expect("two strings serialize")
+}
+
+/// A cursor this module did not write starts the walk over, which only
+/// re-reads refs the copy already holds (`ON CONFLICT DO NOTHING`).
+fn decode_refs_cursor(saved: Option<&str>) -> (String, String) {
+    let Some(saved) = saved else {
+        return Default::default();
+    };
+    serde_json::from_str(saved).unwrap_or_else(|e| {
+        tracing::warn!(
+            cursor = saved,
+            error = %e,
+            "record store upgrade: unreadable refs cursor; copying refs from the start"
+        );
+        Default::default()
+    })
+}
+
+/// Legacy refs after `(source_uri, target_uri)` in key order. The row-value
+/// comparison is a range on the primary key on both backends; the expanded
+/// `a > ? OR (a = ? AND b > ?)` is not on Postgres, which then filters from
+/// the start of the index on every batch.
+const REFS_AFTER: &str = "SELECT source_uri, target_uri, CAST(collection AS TEXT) FROM happyview_record_refs \
+     WHERE (source_uri, target_uri) > (?, ?) ORDER BY source_uri, target_uri LIMIT ?";
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpgradeError {
@@ -50,6 +75,11 @@ pub enum UpgradeError {
          fix or delete that row, then restart (nothing was dropped)"
     )]
     BadUri { uri: String },
+    #[error(
+        "record store upgrade: refs are copied once every record is; \
+         the records copy stopped before {next_uri:?}"
+    )]
+    RecordsPending { next_uri: String },
     #[error("record store upgrade verification failed, nothing was dropped: {0}")]
     Mismatch(String),
 }
@@ -65,6 +95,9 @@ pub struct CopyProgress {
     pub identity_mismatches: u64,
     /// Timestamps that could not be read (see [`legacy_times`]).
     pub unreadable_timestamps: u64,
+    /// Refs whose collection column disagreed with their source record's
+    /// collection.
+    pub ref_collection_mismatches: u64,
 }
 
 /// What a verification compared.
@@ -174,6 +207,40 @@ fn copied(row: &LegacyRow, progress: &mut CopyProgress) -> Result<CopiedRow, Upg
     })
 }
 
+/// A legacy record whose `uri` is empty or NULL (SQLite's `uri TEXT PRIMARY
+/// KEY` allows NULL) sorts before every keyset cursor, so neither the copy
+/// nor the verification would see it. Refuse it by name instead.
+async fn refuse_blank_uris<'e, E>(executor: E) -> Result<(), UpgradeError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
+    // uri, did, collection, rkey, as stored.
+    type Blank = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let blank: Option<Blank> = crate::db::query_as(
+        "SELECT uri, CAST(did AS TEXT), CAST(collection AS TEXT), CAST(rkey AS TEXT) \
+             FROM happyview_records WHERE uri IS NULL OR uri = '' LIMIT 1",
+    )
+    .fetch_optional(executor)
+    .await?;
+    match blank {
+        None => Ok(()),
+        Some((uri, did, collection, rkey)) => Err(UpgradeError::BadUri {
+            uri: format!(
+                "{} (did {}, collection {}, rkey {})",
+                uri.map_or_else(|| "NULL".to_string(), |u| format!("{u:?}")),
+                did.as_deref().unwrap_or("NULL"),
+                collection.as_deref().unwrap_or("NULL"),
+                rkey.as_deref().unwrap_or("NULL"),
+            ),
+        }),
+    }
+}
+
 pub async fn copy_records(
     pool: &AnyPool,
     backend: DatabaseBackend,
@@ -181,6 +248,7 @@ pub async fn copy_records(
     batch: i64,
     max_batches: Option<u64>,
 ) -> Result<CopyProgress, UpgradeError> {
+    refuse_blank_uris(pool).await?;
     let mut progress = CopyProgress::default();
     let mut after = get_setting(pool, backend, RECORDS_CURSOR)
         .await?
@@ -277,6 +345,15 @@ async fn write_records(
     Ok(())
 }
 
+/// source_uri, target_uri, collection.
+type LegacyRef = (String, String, String);
+
+#[derive(Default)]
+struct RefsWritten {
+    skipped: u64,
+    collection_mismatches: u64,
+}
+
 pub async fn copy_refs(
     pool: &AnyPool,
     backend: DatabaseBackend,
@@ -284,41 +361,47 @@ pub async fn copy_refs(
     batch: i64,
     max_batches: Option<u64>,
 ) -> Result<CopyProgress, UpgradeError> {
-    let mut progress = CopyProgress::default();
-    let saved = get_setting(pool, backend, REFS_CURSOR)
+    // A ref whose source is not copied yet would be skipped for good once
+    // the cursor passed it.
+    let records_after = get_setting(pool, backend, RECORDS_CURSOR)
         .await?
         .unwrap_or_default();
-    let (mut after_source, mut after_target) = saved
-        .split_once(CURSOR_SEPARATOR)
-        .map(|(s, t)| (s.to_string(), t.to_string()))
-        .unwrap_or_default();
-    let select = adapt_sql(
-        "SELECT source_uri, target_uri FROM happyview_record_refs \
-         WHERE source_uri > ? OR (source_uri = ? AND target_uri > ?) \
-         ORDER BY source_uri, target_uri LIMIT ?",
+    let pending: Option<(String,)> = crate::db::query_as(&adapt_sql(
+        "SELECT uri FROM happyview_records WHERE uri > ? ORDER BY uri LIMIT 1",
         backend,
-    );
+    ))
+    .bind(&records_after)
+    .fetch_optional(pool)
+    .await?;
+    if let Some((next_uri,)) = pending {
+        return Err(UpgradeError::RecordsPending { next_uri });
+    }
+
+    let mut progress = CopyProgress::default();
+    let saved = get_setting(pool, backend, REFS_CURSOR).await?;
+    let (mut after_source, mut after_target) = decode_refs_cursor(saved.as_deref());
+    let select = adapt_sql(REFS_AFTER, backend);
     loop {
         if max_batches.is_some_and(|max| progress.batches >= max) {
             return Ok(progress);
         }
-        let rows: Vec<(String, String)> = crate::db::query_as(&select)
-            .bind(&after_source)
+        let rows: Vec<LegacyRef> = crate::db::query_as(&select)
             .bind(&after_source)
             .bind(&after_target)
             .bind(batch)
             .fetch_all(pool)
             .await?;
-        let Some((last_source, last_target)) = rows.last().cloned() else {
+        let Some((last_source, last_target, _)) = rows.last().cloned() else {
             progress.done = true;
             return Ok(progress);
         };
-        let cursor = format!("{last_source}{CURSOR_SEPARATOR}{last_target}");
-        let skipped =
+        let cursor = encode_refs_cursor(&last_source, &last_target);
+        let written =
             crate::db::retry_on_busy(|| write_refs(pool, backend, interner, &rows, &cursor))
                 .await?;
         progress.rows += rows.len() as u64;
-        progress.skipped += skipped;
+        progress.skipped += written.skipped;
+        progress.ref_collection_mismatches += written.collection_mismatches;
         progress.batches += 1;
         (after_source, after_target) = (last_source, last_target);
         tracing::info!(copied = progress.rows, "record store upgrade: copying refs");
@@ -369,18 +452,18 @@ async fn write_refs(
     pool: &AnyPool,
     backend: DatabaseBackend,
     interner: &Interner,
-    rows: &[(String, String)],
+    rows: &[LegacyRef],
     cursor: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<RefsWritten, sqlx::Error> {
     let mut tx = crate::db::begin_write(pool, backend).await?;
     let mut scope = InternScope::default();
     let sources: BTreeSet<(&str, &str, &str)> = rows
         .iter()
-        .filter_map(|(source, _)| codec::parse_record_uri(source))
+        .filter_map(|(source, _, _)| codec::parse_record_uri(source))
         .collect();
     let targets: Vec<RefTarget<'_>> = rows
         .iter()
-        .map(|(_, target)| RefTarget::parse(target))
+        .map(|(_, target, _)| RefTarget::parse(target))
         .collect();
     // Every name the batch needs, in one call (T11-4).
     let mut dids: Vec<&str> = sources.iter().map(|(d, _, _)| *d).collect();
@@ -398,17 +481,26 @@ async fn write_refs(
     let ids = record_ids(&mut tx, backend, &keys).await?;
 
     let mut values: Vec<(i64, i64, i64, &str, i64)> = Vec::new();
-    let mut skipped = 0;
-    for ((source, _), target) in rows.iter().zip(&targets) {
+    let mut written = RefsWritten::default();
+    for ((source, target_uri, legacy_collection), target) in rows.iter().zip(&targets) {
         let found = codec::parse_record_uri(source).and_then(|(d, c, r)| {
             let collection_id = scope.collections[c];
             ids.get(&(scope.dids[d], collection_id, r.to_string()))
                 .map(|id| (*id, collection_id))
         });
         let Some((source_id, collection_id)) = found else {
-            skipped += 1;
+            written.skipped += 1;
             continue;
         };
+        if codec::parse_record_uri(source).map(|(_, c, _)| c) != Some(legacy_collection.as_str()) {
+            written.collection_mismatches += 1;
+            tracing::warn!(
+                source_uri = source,
+                target_uri,
+                collection = legacy_collection,
+                "record store upgrade: a ref's collection disagrees with its source record"
+            );
+        }
         let target_collection = match target.collection() {
             Some(nsid) => scope.collections[nsid],
             None => target.kind(),
@@ -445,7 +537,7 @@ async fn write_refs(
     put_setting(&mut tx, backend, REFS_CURSOR, cursor).await?;
     tx.commit().await?;
     interner.remember(scope);
-    Ok(skipped)
+    Ok(written)
 }
 
 /// Undo a copy that failed verification: clear both cursors and empty the
@@ -465,12 +557,18 @@ pub async fn reset_copy(
     .bind(REFS_CURSOR)
     .execute(&mut *tx)
     .await?;
-    crate::db::query("DELETE FROM happyview_record_refs_v2")
-        .execute(&mut *tx)
-        .await?;
-    crate::db::query("DELETE FROM happyview_records_v2")
-        .execute(&mut *tx)
-        .await?;
+    let empty: &[&str] = match backend {
+        // Transactional on Postgres, and far cheaper than a DELETE that
+        // leaves every row dead for vacuum.
+        DatabaseBackend::Postgres => &["TRUNCATE happyview_record_refs_v2, happyview_records_v2"],
+        DatabaseBackend::Sqlite => &[
+            "DELETE FROM happyview_record_refs_v2",
+            "DELETE FROM happyview_records_v2",
+        ],
+    };
+    for sql in empty {
+        crate::db::query(sql).execute(&mut *tx).await?;
+    }
     tx.commit().await?;
     tracing::warn!("record store upgrade: the copy was reset");
     Ok(())
@@ -526,6 +624,7 @@ async fn verify_in_batches(
     staging: CompatNames<'_>,
     batch: i64,
 ) -> Result<VerifySummary, UpgradeError> {
+    refuse_blank_uris(&mut *conn).await?;
     compare_counts(conn).await?;
     let mut summary = VerifySummary::default();
     let mut mismatches = Vec::new();
@@ -731,6 +830,37 @@ async fn compare_records(
 /// source_id, target_did_id, target_collection_id, target_rkey.
 type RefKey<'a> = (i64, i64, i64, &'a str);
 
+/// Which of `uris` are legacy records.
+async fn legacy_uris(
+    conn: &mut AnyConnection,
+    backend: DatabaseBackend,
+    uris: &BTreeSet<&str>,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let uris: Vec<&str> = uris.iter().copied().collect();
+    let mut held = std::collections::HashSet::with_capacity(uris.len());
+    for chunk in uris.chunks(INSERT_CHUNK) {
+        let sql = adapt_sql(
+            &format!(
+                "SELECT uri FROM happyview_records WHERE uri IN ({})",
+                vec!["?"; chunk.len()].join(", ")
+            ),
+            backend,
+        );
+        let mut query = crate::db::query_as::<(String,)>(&sql);
+        for uri in chunk {
+            query = query.bind(*uri);
+        }
+        held.extend(
+            query
+                .fetch_all(&mut *conn)
+                .await?
+                .into_iter()
+                .map(|(uri,)| uri),
+        );
+    }
+    Ok(held)
+}
+
 async fn compare_refs(
     conn: &mut AnyConnection,
     backend: DatabaseBackend,
@@ -738,27 +868,31 @@ async fn compare_refs(
     summary: &mut VerifySummary,
     mismatches: &mut Vec<String>,
 ) -> Result<(), UpgradeError> {
-    let select = adapt_sql(
-        "SELECT f.source_uri, f.target_uri FROM happyview_record_refs f \
-         WHERE (f.source_uri > ? OR (f.source_uri = ? AND f.target_uri > ?)) \
-           AND EXISTS (SELECT 1 FROM happyview_records r WHERE r.uri = f.source_uri) \
-         ORDER BY f.source_uri, f.target_uri LIMIT ?",
-        backend,
-    );
+    let select = adapt_sql(REFS_AFTER, backend);
     let (mut after_source, mut after_target) = (String::new(), String::new());
     while mismatches.len() < MISMATCHES_NAMED {
-        let rows: Vec<(String, String)> = crate::db::query_as(&select)
-            .bind(&after_source)
+        let batch_rows: Vec<LegacyRef> = crate::db::query_as(&select)
             .bind(&after_source)
             .bind(&after_target)
             .bind(batch)
             .fetch_all(&mut *conn)
             .await?;
-        let Some((last_source, last_target)) = rows.last().cloned() else {
+        let Some((last_source, last_target, _)) = batch_rows.last().cloned() else {
             break;
         };
+        (after_source, after_target) = (last_source, last_target);
+        // Only refs whose source is a legacy record count, as in
+        // compare_counts. Checked here rather than with an EXISTS in the
+        // keyset query, which Postgres plans as a merge join that walks
+        // happyview_records from its start on every batch.
+        let source_uris: BTreeSet<&str> = batch_rows.iter().map(|(s, _, _)| s.as_str()).collect();
+        let held = legacy_uris(conn, backend, &source_uris).await?;
+        let rows: Vec<&LegacyRef> = batch_rows
+            .iter()
+            .filter(|(source, _, _)| held.contains(source))
+            .collect();
         let mut sources = Vec::with_capacity(rows.len());
-        for (source, _) in &rows {
+        for (source, _, _) in rows.iter().copied() {
             match codec::parse_record_uri(source) {
                 Some(identity) => sources.push(identity),
                 None => {
@@ -770,7 +904,7 @@ async fn compare_refs(
         }
         let targets: Vec<RefTarget<'_>> = rows
             .iter()
-            .map(|(_, target)| RefTarget::parse(target))
+            .map(|(_, target, _)| RefTarget::parse(target))
             .collect();
         let mut did_names: BTreeSet<&str> = sources.iter().map(|(d, _, _)| *d).collect();
         did_names.extend(targets.iter().map(RefTarget::did_text));
@@ -846,7 +980,7 @@ async fn compare_refs(
             }
         }
 
-        for ((source, target), expected) in rows.iter().zip(&expected) {
+        for ((source, target, _), expected) in rows.iter().copied().zip(&expected) {
             summary.refs += 1;
             let found = expected.and_then(|(collection_id, (s, d, c, r))| {
                 copies
@@ -862,7 +996,6 @@ async fn compare_refs(
             }
         }
         mismatches.truncate(MISMATCHES_NAMED);
-        (after_source, after_target) = (last_source, last_target);
     }
     Ok(())
 }
@@ -1615,6 +1748,218 @@ mod tests {
             assert_eq!((records.rows, records.done), (25, true), "{backend:?}");
             assert!(refs.done);
             verify_on(pool, backend).await.expect("verification passes");
+            db.finish().await;
+        }
+    }
+
+    /// Copy refs one batch per call, as an interrupted boot would, until
+    /// done; returns the rows each call copied.
+    async fn copy_refs_resuming(pool: &AnyPool, backend: DatabaseBackend, batch: i64) -> Vec<u64> {
+        let mut rows = Vec::new();
+        loop {
+            let step = copy_refs(pool, backend, &Interner::new(8), batch, Some(1))
+                .await
+                .expect("one batch of refs");
+            if step.rows == 0 {
+                return rows;
+            }
+            rows.push(step.rows);
+        }
+    }
+
+    async fn count(pool: &AnyPool, table: &str) -> i64 {
+        let (n,): (i64,) = crate::db::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(pool)
+            .await
+            .expect("count");
+        n
+    }
+
+    /// M1: an empty uri (and on SQLite a NULL one) sorts before every
+    /// cursor; the copy and the verification refuse it by name.
+    #[tokio::test]
+    async fn a_blank_uri_stops_the_copy_and_the_verification() {
+        for db in pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            seed_legacy(pool, backend, 3).await;
+            let mut blanks = vec![(
+                "''",
+                r#""" (did did:plc:blank, collection app.test.up, rkey r)"#,
+            )];
+            if backend == DatabaseBackend::Sqlite {
+                blanks.push((
+                    "NULL",
+                    "NULL (did did:plc:blank, collection app.test.up, rkey r)",
+                ));
+            }
+            for (value, named) in blanks {
+                exec(
+                    pool,
+                    &format!(
+                        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) \
+                         VALUES ({value}, 'did:plc:blank', 'app.test.up', 'r', '{{}}', 'c', '2026-01-01T00:00:00Z')"
+                    ),
+                )
+                .await;
+                let err = copy_records(pool, backend, &Interner::new(8), 100, None)
+                    .await
+                    .expect_err("refused");
+                assert!(
+                    matches!(&err, UpgradeError::BadUri { uri } if uri == named),
+                    "{backend:?}: {err}"
+                );
+                let err = verify_on(pool, backend).await.expect_err("refused");
+                assert!(
+                    matches!(&err, UpgradeError::BadUri { uri } if uri == named),
+                    "{backend:?}: {err}"
+                );
+                exec(
+                    pool,
+                    "DELETE FROM happyview_records WHERE did = 'did:plc:blank'",
+                )
+                .await;
+            }
+            db.finish().await;
+        }
+    }
+
+    /// M2: the refs cursor holds any text, a unit separator included, and
+    /// a resumed copy neither re-reads nor skips a ref.
+    #[tokio::test]
+    async fn the_refs_cursor_round_trips_any_text() {
+        for db in pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            let source = format!("at://did:plc:s/{NSID}/a\u{1f}b");
+            exec(
+                pool,
+                &format!(
+                    "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, created_at) \
+                     VALUES ('{source}', 'did:plc:s', '{NSID}', 'a\u{1f}b', '{{}}', 'c', '2026-01-01T00:00:00Z')"
+                ),
+            )
+            .await;
+            let insert = adapt_sql(
+                "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES (?, ?, ?)",
+                backend,
+            );
+            for target in ["x\u{1f}y", "x\u{1f}z", "at://did:plc:t\u{1f}", "zz"] {
+                crate::db::query(&insert)
+                    .bind(&source)
+                    .bind(target)
+                    .bind(NSID)
+                    .execute(pool)
+                    .await
+                    .expect("seed ref");
+            }
+            copy_records(pool, backend, &Interner::new(8), 100, None)
+                .await
+                .expect("records");
+            let first = copy_refs(pool, backend, &Interner::new(8), 1, Some(1))
+                .await
+                .expect("one ref");
+            assert_eq!(first.rows, 1);
+            let (lowest_target,): (String,) = crate::db::query_as(
+                "SELECT target_uri FROM happyview_record_refs ORDER BY source_uri, target_uri LIMIT 1",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("first ref");
+            let saved = get_setting(pool, backend, REFS_CURSOR)
+                .await
+                .expect("cursor");
+            assert_eq!(
+                decode_refs_cursor(saved.as_deref()),
+                (source.clone(), lowest_target),
+                "{backend:?}"
+            );
+            assert_eq!(
+                copy_refs_resuming(pool, backend, 1).await,
+                vec![1, 1, 1],
+                "{backend:?}"
+            );
+            assert_eq!(count(pool, "happyview_record_refs_v2").await, 4);
+            verify_batched(pool, backend, 1)
+                .await
+                .expect("verification passes");
+            db.finish().await;
+        }
+    }
+
+    /// M3: refs wait for every record, or a ref whose source is not copied
+    /// yet would be skipped for good.
+    #[tokio::test]
+    async fn refs_are_not_copied_before_every_record_is() {
+        for db in pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            seed_legacy(pool, backend, 25).await;
+            let err = copy_refs(pool, backend, &Interner::new(8), 10, None)
+                .await
+                .expect_err("no records copied");
+            assert!(
+                matches!(&err, UpgradeError::RecordsPending { next_uri } if next_uri.ends_with("/r000")),
+                "{backend:?}: {err}"
+            );
+            copy_records(pool, backend, &Interner::new(8), 10, Some(1))
+                .await
+                .expect("one batch");
+            let err = copy_refs(pool, backend, &Interner::new(8), 10, None)
+                .await
+                .expect_err("records half copied");
+            assert!(
+                matches!(err, UpgradeError::RecordsPending { .. }),
+                "{backend:?}: {err}"
+            );
+            assert_eq!(count(pool, "happyview_record_refs_v2").await, 0);
+            copy_records(pool, backend, &Interner::new(8), 10, None)
+                .await
+                .expect("the rest");
+            copy_refs(pool, backend, &Interner::new(8), 10, None)
+                .await
+                .expect("refs once records are done");
+            verify_on(pool, backend).await.expect("verification passes");
+            db.finish().await;
+        }
+    }
+
+    /// M5: a resume that falls between two refs of the same source.
+    #[tokio::test]
+    async fn a_resume_inside_one_sources_refs_copies_each_ref_once() {
+        for db in pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            seed_legacy(pool, backend, 3).await;
+            let insert = adapt_sql(
+                "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES (?, ?, ?)",
+                backend,
+            );
+            let source = format!("at://did:plc:u1/{NSID}/r001");
+            for n in 0..4 {
+                crate::db::query(&insert)
+                    .bind(&source)
+                    .bind(format!("at://did:plc:t/{NSID}/many{n}"))
+                    .bind(NSID)
+                    .execute(pool)
+                    .await
+                    .expect("seed ref");
+            }
+            let legacy = count(pool, "happyview_record_refs").await;
+            copy_records(pool, backend, &Interner::new(8), 100, None)
+                .await
+                .expect("records");
+            let steps = copy_refs_resuming(pool, backend, 2).await;
+            assert_eq!(
+                steps.iter().sum::<u64>(),
+                legacy as u64,
+                "{backend:?}: {steps:?}"
+            );
+            let orphans = i64::from(backend == DatabaseBackend::Sqlite);
+            assert_eq!(
+                count(pool, "happyview_record_refs_v2").await,
+                legacy - orphans
+            );
+            let summary = verify_batched(pool, backend, 2)
+                .await
+                .expect("verification passes");
+            assert_eq!(summary.refs, (legacy - orphans) as u64);
             db.finish().await;
         }
     }
