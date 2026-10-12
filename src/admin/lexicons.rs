@@ -355,7 +355,7 @@ pub(super) async fn delete_lexicon(
         return Err(AppError::NotFound(format!("lexicon '{id}' not found")));
     }
 
-    state.lexicons.remove(&id).await;
+    state.lexicons.forget(&id).await;
     notify_collections(&state).await;
 
     log_event(

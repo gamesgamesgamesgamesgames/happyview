@@ -642,7 +642,7 @@ pub async fn handle_lexicon_schema_event(
                 return failed_write_outcome(&e);
             }
 
-            let was_present = lexicons.remove(nsid).await;
+            let was_present = lexicons.forget(nsid).await;
             if was_present {
                 tracing::info!(nsid, "removed network lexicon from network delete event");
                 let collections = lexicons.get_record_collections().await;

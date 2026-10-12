@@ -50,7 +50,7 @@ pub struct HostContext {
     pub db: sqlx::AnyPool,
     pub db_backend: crate::db::DatabaseBackend,
     pub http_client: reqwest::Client,
-    pub lexicons: Arc<crate::lexicon::LexiconRegistry>,
+    pub lexicons: Arc<crate::catalog::LexiconCatalog>,
 }
 
 /// Resource usage tracking for limits

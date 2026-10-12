@@ -1028,7 +1028,7 @@ pub async fn index_delete(
 
 /// The raw JSON of an uploaded lexicon, or `None` when this instance holds no
 /// lexicon under that NSID.
-pub async fn lexicon_get(lexicons: &crate::lexicon::LexiconRegistry, nsid: &str) -> Option<Value> {
+pub async fn lexicon_get(lexicons: &crate::catalog::LexiconCatalog, nsid: &str) -> Option<Value> {
     lexicons.get(nsid).await.map(|lexicon| lexicon.raw)
 }
 

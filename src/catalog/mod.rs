@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
+pub mod lexicon_rows;
+pub mod lexicons;
+
+pub use lexicons::{LexiconCatalog, NetworkLexicon};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Layer {

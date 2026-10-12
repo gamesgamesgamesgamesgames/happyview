@@ -9,8 +9,8 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::AppState;
+use crate::catalog::LexiconCatalog;
 use crate::config::Config;
-use crate::lexicon::LexiconRegistry;
 
 /// An in-memory SQLite pool. `max_connections(1)` is required: every
 /// connection to `sqlite::memory:` gets its own private database, so a larger
@@ -185,6 +185,7 @@ pub fn test_state_with_pool_on(
         http_client: crate::http_retry::HappyViewHttpClient::default(),
     })
     .expect("test OAuth client");
+    let project = crate::project::shared_empty();
     AppState {
         config,
         http: reqwest::Client::new(),
@@ -192,7 +193,8 @@ pub fn test_state_with_pool_on(
         backfill_db: pool.clone(),
         db_backend: backend,
         domain_cache: crate::domain::DomainCache::new(),
-        lexicons: LexiconRegistry::new(),
+        lexicons: LexiconCatalog::new(project.clone()),
+        project,
         collections_tx: tx,
         labeler_subscriptions_tx: labeler_tx,
         labeler_subscription_cache: Arc::new(crate::labeler::SubscriptionCache::default()),

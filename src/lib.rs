@@ -55,10 +55,10 @@ pub mod version;
 pub mod xrpc;
 
 use auth::oauth_store::{DbSessionStore, DbStateStore};
+use catalog::LexiconCatalog;
 use config::Config;
 use db::DatabaseBackend;
 use dns::NativeDnsResolver;
-use lexicon::LexiconRegistry;
 use plugin::official_registry::{RegistryConfig, SharedRegistry};
 use rate_limit::RateLimiter;
 use std::sync::Arc;
@@ -91,7 +91,10 @@ pub struct AppState {
     pub backfill_db: sqlx::AnyPool,
     pub db_backend: DatabaseBackend,
     pub domain_cache: domain::DomainCache,
-    pub lexicons: LexiconRegistry,
+    /// The current project build. Readers that must not see a swap mid-run
+    /// take `load_full()` once and keep it.
+    pub project: Arc<arc_swap::ArcSwap<project::ProjectSnapshot>>,
+    pub lexicons: LexiconCatalog,
     pub collections_tx: watch::Sender<Vec<String>>,
     pub labeler_subscriptions_tx: watch::Sender<()>,
     pub labeler_subscription_cache: Arc<labeler::SubscriptionCache>,

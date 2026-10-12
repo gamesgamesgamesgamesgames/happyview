@@ -230,7 +230,7 @@ pub(super) async fn remove(
         )));
     }
 
-    state.lexicons.remove(&nsid).await;
+    state.lexicons.forget(&nsid).await;
     notify_collections(&state).await;
 
     Ok(StatusCode::NO_CONTENT)

@@ -7,9 +7,9 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::Request;
 use base64::Engine as _;
+use happyview::catalog::LexiconCatalog;
 use happyview::config::Config;
 use happyview::db::{DatabaseBackend, adapt_sql, now_rfc3339};
-use happyview::lexicon::LexiconRegistry;
 use happyview::{AppState, server};
 use http_body_util::BodyExt;
 use p256::elliptic_curve::sec1::ToSec1Point;
@@ -99,7 +99,8 @@ impl TestApp {
             .await
             .expect("failed to seed admin user");
 
-        let lexicons = LexiconRegistry::new();
+        let project = happyview::project::shared_empty();
+        let lexicons = LexiconCatalog::new(project.clone());
         lexicons
             .load_from_db(&pool)
             .await
@@ -163,6 +164,7 @@ impl TestApp {
             db_backend: backend,
             domain_cache,
             lexicons,
+            project,
             collections_tx,
             labeler_subscriptions_tx,
             labeler_subscription_cache: std::sync::Arc::new(

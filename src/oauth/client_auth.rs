@@ -167,7 +167,7 @@ pub async fn resolve_client_by_key(
 pub async fn validate_scopes(
     token_scopes: &str,
     client_scopes: &str,
-    lexicons: &crate::lexicon::LexiconRegistry,
+    lexicons: &crate::catalog::LexiconCatalog,
 ) -> Result<(), AppError> {
     let token_list = happyview_scopes::parse_scope_list(token_scopes);
 
@@ -210,7 +210,7 @@ pub async fn validate_scopes(
 /// whole validation, matching the reference, which skips what it cannot use.
 async fn expand_permission_set(
     scope: &str,
-    lexicons: &crate::lexicon::LexiconRegistry,
+    lexicons: &crate::catalog::LexiconCatalog,
     out: &mut Vec<String>,
 ) {
     let Some(include) = happyview_scopes::IncludeScope::parse(scope) else {
@@ -328,8 +328,8 @@ pub fn verify_pkce(challenge: &str, verifier: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn empty_registry() -> crate::lexicon::LexiconRegistry {
-        crate::lexicon::LexiconRegistry::new()
+    fn empty_registry() -> crate::catalog::LexiconCatalog {
+        crate::catalog::LexiconCatalog::default()
     }
 
     #[tokio::test]

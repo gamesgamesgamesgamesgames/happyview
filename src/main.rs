@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use happyview::auth::oauth_store::{DbSessionStore, DbStateStore};
+use happyview::catalog::LexiconCatalog;
 use happyview::config::Config;
 use happyview::db;
 use happyview::dns::NativeDnsResolver;
-use happyview::lexicon::{LexiconRegistry, ParsedLexicon, ProcedureAction};
+use happyview::lexicon::{ParsedLexicon, ProcedureAction};
 use happyview::rate_limit::{RateLimitDefaults, RateLimiter};
 use happyview::resolve::{fetch_lexicon_from_pds, resolve_nsid_authority};
 use happyview::{AppState, jetstream, labeler, server};
@@ -151,7 +152,8 @@ async fn main() {
         });
     }
 
-    let lexicons = LexiconRegistry::new();
+    let project = happyview::project::shared_empty();
+    let lexicons = LexiconCatalog::new(project.clone());
     lexicons
         .load_from_db(&db_pool)
         .await
@@ -885,6 +887,7 @@ async fn main() {
         db_backend,
         domain_cache: domain_cache.clone(),
         lexicons,
+        project,
         collections_tx,
         labeler_subscriptions_tx,
         labeler_subscription_cache: Arc::new(happyview::labeler::SubscriptionCache::default()),

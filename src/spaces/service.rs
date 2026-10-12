@@ -1143,9 +1143,9 @@ pub(crate) async fn accept_invite(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::LexiconCatalog;
     use crate::config::Config;
     use crate::db::DatabaseBackend;
-    use crate::lexicon::LexiconRegistry;
     use tokio::sync::watch;
 
     macro_rules! require_test_db {
@@ -1227,6 +1227,8 @@ mod tests {
         })
         .expect("Failed to create test OAuth client");
 
+        let project = crate::project::shared_empty();
+
         let state = AppState {
             config,
             http: reqwest::Client::new(),
@@ -1234,7 +1236,8 @@ mod tests {
             backfill_db: pool.clone(),
             db_backend: backend,
             domain_cache: crate::domain::DomainCache::new(),
-            lexicons: LexiconRegistry::new(),
+            lexicons: LexiconCatalog::new(project.clone()),
+            project,
             collections_tx,
             labeler_subscriptions_tx,
             labeler_subscription_cache: std::sync::Arc::new(
