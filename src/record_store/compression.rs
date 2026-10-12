@@ -12,6 +12,7 @@ use std::io::Read;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use futures_util::TryStreamExt;
 use sqlx::AnyPool;
 
 use crate::db::DatabaseBackend;
@@ -182,8 +183,18 @@ pub const DEFAULT_TRAIN_AT: i64 = 5_000;
 pub const TRAIN_SAMPLES: i64 = 20_000;
 /// Dictionary size.
 pub const DICT_BYTES: usize = 64 * 1024;
+/// Largest single body a dictionary is trained from; past this a record
+/// is an outlier that would only crowd out the typical ones.
+pub const TRAIN_SAMPLE_MAX_BYTES: i64 = 1 << 20;
+/// Total sample bytes held for one training. zstd gains nothing from much
+/// more than ~100× the dictionary size, and this bounds the memory a
+/// collection of large records costs (zstd copies the samples once more).
+pub const TRAIN_BUDGET_BYTES: usize = 32 << 20;
 /// Rows per recompression transaction, so ingest interleaves.
 pub const RECOMPRESS_BATCH: i64 = 1_000;
+/// Body bytes per recompression transaction, so a collection of large
+/// records holds neither the write lock nor memory for long.
+pub const RECOMPRESS_BUDGET_BYTES: usize = 32 << 20;
 /// Seconds between maintenance passes.
 pub const DEFAULT_INTERVAL_SECS: u64 = 600;
 
@@ -258,27 +269,56 @@ pub async fn due_for_training(pool: &AnyPool, train_at: i64) -> Result<Vec<i64>,
     Ok(due)
 }
 
-/// Train a dictionary for `collection_id` from up to `TRAIN_SAMPLES` of its
-/// newest bodies, store it, and make new writes through `codec` use it.
-/// The dictionary is committed on its own before anything references it, so
-/// its id never names different bytes.
+/// Up to `TRAIN_SAMPLES` of `collection_id`'s newest bodies, newest first,
+/// skipping any over `max_sample_bytes` and stopping before the total
+/// passes `budget_bytes`. Rows stream in, so memory stays near the budget.
+pub(crate) async fn training_samples(
+    pool: &AnyPool,
+    collection_id: i64,
+    max_sample_bytes: i64,
+    budget_bytes: usize,
+) -> Result<Vec<String>, sqlx::Error> {
+    // A stored body is never longer than its JSON, so `length(body)` rules
+    // out the large ones without decoding them.
+    let mut rows = crate::db::query_as::<(String,)>(
+        "SELECT record FROM (\
+           SELECT id, hv_record(body, body_dict) AS record FROM happyview_records_v2 \
+           WHERE collection_id = ? AND length(body) <= ?\
+         ) WHERE length(CAST(record AS BLOB)) <= ? ORDER BY id DESC LIMIT ?",
+    )
+    .bind(collection_id)
+    .bind(max_sample_bytes)
+    .bind(max_sample_bytes)
+    .bind(TRAIN_SAMPLES)
+    .fetch(pool);
+    let (mut samples, mut total) = (Vec::new(), 0usize);
+    while let Some((body,)) = rows.try_next().await? {
+        if total + body.len() > budget_bytes {
+            break;
+        }
+        total += body.len();
+        samples.push(body);
+    }
+    Ok(samples)
+}
+
+/// Train a dictionary for `collection_id` from its newest bodies (see
+/// `training_samples`), store it, and make new writes through `codec` use
+/// it. The dictionary is committed on its own before anything references
+/// it, so its id never names different bytes.
 pub async fn train(
     pool: &AnyPool,
     codec: &BodyCodec,
     collection_id: i64,
     dict_bytes: usize,
 ) -> Result<i64, TrainError> {
-    let samples: Vec<String> = crate::db::query_as::<(String,)>(
-        "SELECT hv_record(body, body_dict) FROM happyview_records_v2 \
-         WHERE collection_id = ? ORDER BY id DESC LIMIT ?",
+    let samples = training_samples(
+        pool,
+        collection_id,
+        TRAIN_SAMPLE_MAX_BYTES,
+        TRAIN_BUDGET_BYTES,
     )
-    .bind(collection_id)
-    .bind(TRAIN_SAMPLES)
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|(body,)| body)
-    .collect();
+    .await?;
     if samples.is_empty() {
         return Err(TrainError::NoSamples);
     }
@@ -307,28 +347,52 @@ pub async fn train(
     Ok(dict_id)
 }
 
+/// What one recompression batch did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recompressed {
+    /// Rows compressed or marked `RAW_CONSIDERED`.
+    pub considered: u64,
+    /// The batch stopped at its row or byte limit, so rows may be left.
+    pub more: bool,
+}
+
 /// Compress up to `limit` of `collection_id`'s never-considered rows with
-/// its current dictionary, in one write transaction. Returns the rows
-/// considered; fewer than `limit` means none are left.
+/// its current dictionary, in one write transaction, stopping once their
+/// bodies total `budget_bytes` (always taking at least one row, so a batch
+/// makes progress).
 pub async fn recompress_batch(
     pool: &AnyPool,
     codec: &BodyCodec,
     collection_id: i64,
     limit: i64,
-) -> Result<u64, sqlx::Error> {
+    budget_bytes: usize,
+) -> Result<Recompressed, sqlx::Error> {
     if codec.current_dict(collection_id).is_none() {
-        return Ok(0);
+        return Ok(Recompressed {
+            considered: 0,
+            more: false,
+        });
     }
     crate::db::retry_on_busy(|| async {
         let mut tx = crate::db::begin_write(pool, DatabaseBackend::Sqlite).await?;
-        let rows: Vec<(i64, Vec<u8>)> = crate::db::query_as(
-            "SELECT id, body FROM happyview_records_v2 \
-             WHERE collection_id = ? AND body_dict IS NULL ORDER BY id LIMIT ?",
-        )
-        .bind(collection_id)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await?;
+        let (mut rows, mut total, mut capped) = (Vec::<(i64, Vec<u8>)>::new(), 0usize, false);
+        {
+            let mut stream = crate::db::query_as::<(i64, Vec<u8>)>(
+                "SELECT id, body FROM happyview_records_v2 \
+                 WHERE collection_id = ? AND body_dict IS NULL ORDER BY id LIMIT ?",
+            )
+            .bind(collection_id)
+            .bind(limit)
+            .fetch(&mut *tx);
+            while let Some(row) = stream.try_next().await? {
+                total += row.1.len();
+                rows.push(row);
+                if total >= budget_bytes {
+                    capped = true;
+                    break;
+                }
+            }
+        }
         for (id, body) in &rows {
             let (stored, dict) = match std::str::from_utf8(body) {
                 Ok(json) => codec.encode(collection_id, json),
@@ -344,7 +408,10 @@ pub async fn recompress_batch(
             .await?;
         }
         tx.commit().await?;
-        Ok(rows.len() as u64)
+        Ok(Recompressed {
+            considered: rows.len() as u64,
+            more: capped || rows.len() as i64 == limit,
+        })
     })
     .await
 }
@@ -370,9 +437,24 @@ pub async fn pass(store: &RecordStore, train_at: i64) -> Result<u64, TrainError>
     let mut considered = 0;
     for (collection_id,) in collections {
         loop {
-            let n = recompress_batch(pool, codec, collection_id, RECOMPRESS_BATCH).await?;
-            considered += n;
-            if (n as i64) < RECOMPRESS_BATCH {
+            // One collection's bad row must not starve the ones after it.
+            let batch = match recompress_batch(
+                pool,
+                codec,
+                collection_id,
+                RECOMPRESS_BATCH,
+                RECOMPRESS_BUDGET_BYTES,
+            )
+            .await
+            {
+                Ok(batch) => batch,
+                Err(e) => {
+                    tracing::warn!(collection_id, error = %e, "could not recompress record bodies");
+                    break;
+                }
+            };
+            considered += batch.considered;
+            if !batch.more {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -738,11 +820,12 @@ mod tests {
 
         let mut considered = 0;
         loop {
-            let n = recompress_batch(&pool, &codec, collection_id, 500)
-                .await
-                .expect("recompress");
-            considered += n;
-            if n < 500 {
+            let batch =
+                recompress_batch(&pool, &codec, collection_id, 500, RECOMPRESS_BUDGET_BYTES)
+                    .await
+                    .expect("recompress");
+            considered += batch.considered;
+            if !batch.more {
                 break;
             }
         }
@@ -815,5 +898,164 @@ mod tests {
         assert!(!is_zstd_dictionary(b"{\"text\":\"raw content\"}"));
         assert!(!is_zstd_dictionary(&[0x37, 0xA4, 0x30]));
         assert!(!is_zstd_dictionary(&[]));
+    }
+
+    async fn raw_left(pool: &sqlx::AnyPool, collection_id: i64) -> i64 {
+        let (left,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_records_v2 WHERE collection_id = ? AND body_dict IS NULL",
+        )
+        .bind(collection_id)
+        .fetch_one(pool)
+        .await
+        .expect("count raw rows");
+        left
+    }
+
+    #[tokio::test]
+    async fn training_samples_skip_oversized_bodies_and_stop_at_the_byte_budget() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let posts = sample_posts(3);
+        let huge = format!(r#"{{"text":"{}"}}"#, "a".repeat(2000));
+        let bodies = vec![posts[0].clone(), huge, posts[1].clone(), posts[2].clone()];
+        let collection_id = seed_raw(&pool, &bodies).await;
+
+        let all = training_samples(&pool, collection_id, 1000, usize::MAX)
+            .await
+            .expect("samples");
+        assert_eq!(
+            all,
+            vec![posts[2].clone(), posts[1].clone(), posts[0].clone()],
+            "newest first, the body over the per-sample cap skipped"
+        );
+        let budget = posts[2].len() + posts[1].len();
+        let capped = training_samples(&pool, collection_id, 1000, budget)
+            .await
+            .expect("samples");
+        assert_eq!(capped, vec![posts[2].clone(), posts[1].clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_byte_capped_batch_ends_early_and_the_loop_still_finishes() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let bodies = sample_posts(100);
+        let collection_id = seed_raw(&pool, &bodies).await;
+        let codec = BodyCodec::new(Compression::Zstd);
+        let dict = train_dict(&sample_posts(1000), 4096);
+        let (dict_id,): (i64,) = crate::db::query_as(
+            "INSERT INTO happyview_zstd_dicts (collection_id, created_at, dict) VALUES (?, 0, ?) RETURNING id",
+        )
+        .bind(collection_id)
+        .bind(dict.clone())
+        .fetch_one(&pool)
+        .await
+        .expect("dictionary");
+        codec.install(collection_id, dict_id, &dict);
+
+        let one = recompress_batch(&pool, &codec, collection_id, 1000, 1)
+            .await
+            .expect("recompress");
+        assert_eq!(
+            (one.considered, one.more),
+            (1, true),
+            "a batch always makes progress"
+        );
+
+        // The next three bodies fill the budget exactly.
+        let budget: usize = bodies[1..4].iter().map(String::len).sum();
+        let three = recompress_batch(&pool, &codec, collection_id, 1000, budget)
+            .await
+            .expect("recompress");
+        assert_eq!(
+            (three.considered, three.more),
+            (3, true),
+            "the byte cap ends the batch"
+        );
+
+        // A batch passes its budget by at most the row that reaches it.
+        let shortest = bodies.iter().map(String::len).min().unwrap_or(1);
+        let most = (budget / shortest + 1) as u64;
+        let mut considered = one.considered + three.considered;
+        let mut batches = 0;
+        loop {
+            let batch = recompress_batch(&pool, &codec, collection_id, 1000, budget)
+                .await
+                .expect("recompress");
+            assert!(
+                batch.considered <= most,
+                "{} rows past the byte budget",
+                batch.considered
+            );
+            considered += batch.considered;
+            batches += 1;
+            if !batch.more {
+                break;
+            }
+        }
+        assert!(batches > 1);
+        assert_eq!(considered as usize, bodies.len());
+        assert_eq!(raw_left(&pool, collection_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_pass_trains_due_collections_and_recompresses_past_a_failing_one() {
+        let pool = crate::test_support::migrated_memory_pool().await;
+        let store = crate::record_store::RecordStore::with_bodies(
+            pool.clone(),
+            DatabaseBackend::Sqlite,
+            BodyCodec::new(Compression::Zstd),
+        );
+        // A collection with a dictionary whose one raw row was written as
+        // TEXT behind the store's back, so recompressing it fails.
+        let broken = seed_raw(&pool, &[]).await;
+        let dict = train_dict(&sample_posts(1000), 4096);
+        let (dict_id,): (i64,) = crate::db::query_as(
+            "INSERT INTO happyview_zstd_dicts (collection_id, created_at, dict) VALUES (?, 0, ?) RETURNING id",
+        )
+        .bind(broken)
+        .bind(dict.clone())
+        .fetch_one(&pool)
+        .await
+        .expect("dictionary");
+        store.bodies().install(broken, dict_id, &dict);
+        let (did_id,): (i64,) = crate::db::query_as(
+            "INSERT INTO happyview_dids (did) VALUES ('did:plc:text') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("did");
+        crate::db::query(
+            "INSERT INTO happyview_records_v2 (did_id, collection_id, rkey, cid, body, created_at) \
+             VALUES (?, ?, 'text', x'', ?, 0)",
+        )
+        .bind(did_id)
+        .bind(broken)
+        .bind(sample_posts(1)[0].as_str())
+        .execute(&pool)
+        .await
+        .expect("text row");
+        assert!(
+            recompress_batch(&pool, store.bodies(), broken, 10, RECOMPRESS_BUDGET_BYTES)
+                .await
+                .is_err(),
+            "a TEXT body fails its batch"
+        );
+
+        let bodies = sample_posts(1200);
+        let due = seed_raw(&pool, &bodies).await;
+        assert!(due > broken);
+        let considered = pass(&store, 1000).await.expect("pass");
+        assert_eq!(considered as usize, bodies.len());
+        let dict = store
+            .bodies()
+            .current_dict(due)
+            .expect("trained in the pass");
+        let (stored,): (i64,) =
+            crate::db::query_as("SELECT MAX(id) FROM happyview_zstd_dicts WHERE collection_id = ?")
+                .bind(due)
+                .fetch_one(&pool)
+                .await
+                .expect("stored dictionary");
+        assert_eq!(dict, stored);
+        assert_eq!(raw_left(&pool, due).await, 0);
     }
 }

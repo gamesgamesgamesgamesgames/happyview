@@ -2,6 +2,7 @@
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -62,6 +63,14 @@ pub(super) async fn retrain(
     .await
     .map_err(|e| match e {
         TrainError::NoSamples => AppError::NotFound(format!("no records in {}", body.collection)),
+        TrainError::Zstd(message) => AppError::XrpcError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "TrainingFailed",
+            message: format!(
+                "could not train a dictionary for {}: {message}",
+                body.collection
+            ),
+        },
         other => AppError::Internal(format!("failed to train a dictionary: {other}")),
     })?;
     Ok(Json(

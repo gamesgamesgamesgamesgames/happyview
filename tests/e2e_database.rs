@@ -247,3 +247,98 @@ async fn retrain_refuses_postgres_and_collections_without_records() {
     };
     assert_eq!(resp.status(), expected);
 }
+
+/// Seed `n` raw rows of a fresh collection into the SQLite v2 table,
+/// returning `(nsid, collection_id)`.
+async fn seed_v2_collection(app: &TestApp, n: usize) -> (String, i64) {
+    let nsid = format!("app.test.retrain{}", uuid::Uuid::new_v4().simple());
+    let (collection_id,): (i64,) =
+        happyview::db::query_as("INSERT INTO happyview_collections (nsid) VALUES (?) RETURNING id")
+            .bind(&nsid)
+            .fetch_one(&app.state.db)
+            .await
+            .expect("collection");
+    let (did_id,): (i64,) =
+        happyview::db::query_as("INSERT INTO happyview_dids (did) VALUES (?) RETURNING id")
+            .bind(format!("did:plc:r{}", uuid::Uuid::new_v4().simple()))
+            .fetch_one(&app.state.db)
+            .await
+            .expect("did");
+    for i in 0..n {
+        let body = format!(
+            r#"{{"$type":"app.bsky.feed.post","text":"post {i} about retraining","createdAt":"2026-10-12T12:{:02}:{:02}.000Z","langs":["en"]}}"#,
+            i % 60,
+            (i * 7) % 60
+        );
+        happyview::db::query(
+            "INSERT INTO happyview_records_v2 (did_id, collection_id, rkey, cid, body, created_at) \
+             VALUES (?, ?, ?, x'', CAST(? AS BLOB), 0)",
+        )
+        .bind(did_id)
+        .bind(collection_id)
+        .bind(format!("r{i}"))
+        .bind(body)
+        .execute(&app.state.db)
+        .await
+        .expect("seed row");
+    }
+    (nsid, collection_id)
+}
+
+async fn post_retrain(app: &TestApp, nsid: &str) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/storage/retrain")
+                .header(app.admin_cookie().0, app.admin_cookie().1)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "collection": nsid }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn retrain_trains_and_installs_a_dictionary() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    if app.state.db_backend != DatabaseBackend::Sqlite {
+        return;
+    }
+    let (nsid, collection_id) = seed_v2_collection(&app, 1000).await;
+    let resp = post_retrain(&app, &nsid).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_body(resp).await;
+    assert_eq!(body["collection"], nsid);
+    let dict_id = body["dict_id"].as_i64().expect("dict_id");
+    assert_eq!(
+        app.state.records.bodies().current_dict(collection_id),
+        Some(dict_id),
+        "new writes use the retrained dictionary"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn retrain_of_too_few_records_is_unprocessable() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    if app.state.db_backend != DatabaseBackend::Sqlite {
+        return;
+    }
+    let (nsid, collection_id) = seed_v2_collection(&app, 2).await;
+    let resp = post_retrain(&app, &nsid).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = json_body(resp).await;
+    assert!(
+        body["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "{body}"
+    );
+    assert_eq!(app.state.records.bodies().current_dict(collection_id), None);
+}
