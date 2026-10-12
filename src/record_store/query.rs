@@ -167,8 +167,11 @@ fn keyset_cursor(cursor: &str) -> Result<(i64, i64), RecordsError> {
         .ok_or_else(|| invalid("invalid cursor: request the first page again"))
 }
 
-/// The keyset seek after `cursor`, newest first.
-const KEYSET_AFTER: &str = " AND (rec.created_at_us < ? OR (rec.created_at_us = ? AND rec.id < ?))";
+/// The keyset seek after `cursor`, newest first. A row-value comparison, so
+/// both backends seek the `(collection_id, created_at, id)` index to the
+/// cursor; the expanded `a < ? OR (a = ? AND b < ?)` is a filter on Postgres,
+/// which then reads the collection from its newest record on every page.
+const KEYSET_AFTER: &str = " AND (rec.created_at_us, rec.id) < (?, ?)";
 const KEYSET_ORDER: &str = "ORDER BY rec.created_at_us DESC, rec.id DESC";
 
 /// The one place a read turns a row into the shape a guest sees. The
@@ -257,7 +260,7 @@ pub fn records_query_sql(
         if let Some(cursor) = &spec.cursor {
             let (ts, id) = keyset_cursor(cursor)?;
             where_clause.push_str(KEYSET_AFTER);
-            binds.extend([json!(ts), json!(ts), json!(id)]);
+            binds.extend([json!(ts), json!(id)]);
         }
         if let Some(filter) = &spec.filter {
             let clause = filter_sql(filter, backend, &record_bind_on(backend), 0, &mut binds)?;
@@ -439,7 +442,7 @@ pub(crate) fn backlinks_query_sql(
     if let Some(cursor) = &spec.cursor {
         let (ts, id) = keyset_cursor(cursor)?;
         where_clause.push_str(KEYSET_AFTER);
-        binds.extend([json!(ts), json!(ts), json!(id)]);
+        binds.extend([json!(ts), json!(id)]);
     }
     let sql = format!(
         "SELECT {} FROM {} JOIN happyview_record_refs_v2 f ON f.source_id = rec.id \
@@ -489,7 +492,7 @@ mod tests {
                 if did.is_some() {
                     literals.push("'did:plc:a'");
                 }
-                literals.extend(["1767225600000000", "1767225600000000", "42", "50"]);
+                literals.extend(["1767225600000000", "42", "50"]);
                 assert_eq!(binds.len() + 1, literals.len(), "{backend:?}");
                 let sql = crate::test_support::inline_binds_on(&sql, backend, &literals);
                 let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
@@ -497,6 +500,13 @@ mod tests {
                     &plan,
                     "idx_records_v2_collection_created_at_id",
                     backend,
+                );
+                // The cursor bounds the index scan, not a filter after it.
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|line| line.contains("Filter") && line.contains("created_at")),
+                    "{backend:?}: {plan:#?}"
                 );
             }
         }
@@ -522,24 +532,51 @@ mod tests {
     }
 
     /// Backlinks seek the refs target index by interned id; they never
-    /// filter the derived `target_uri`.
+    /// filter the derived `target_uri`. Seeded with many targets and
+    /// analyzed, so the planner weighs a real choice.
     #[tokio::test]
     async fn backlinks_seek_the_refs_target_index() {
-        for (pool, backend) in crate::test_support::test_pools().await {
+        for db in crate::test_support::pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            crate::record_store::upgrade::run(pool, backend)
+                .await
+                .expect("upgrade");
+            let records: Vec<crate::record_store::PreparedRecord> = (0..2000)
+                .map(|i| crate::record_store::PreparedRecord {
+                    did: format!("did:plc:src{}", i % 300),
+                    collection: "app.test.like".to_string(),
+                    rkey: format!("l{i}"),
+                    record_json: json!({
+                        "subject": format!("at://did:plc:t{}/app.test.post/r{}", i % 500, i % 7),
+                        "author": format!("at://did:plc:t{}", i % 500),
+                    })
+                    .to_string(),
+                    cid: "c".to_string(),
+                    rev: None,
+                })
+                .collect();
+            RecordStore::new(pool.clone(), backend)
+                .write_network(pool, &records)
+                .await
+                .expect("seed");
+            crate::db::query("ANALYZE")
+                .execute(pool)
+                .await
+                .expect("analyze");
             for (target, literals) in [
                 (
-                    "at://did:plc:t/app.test.post/r1",
+                    "at://did:plc:t7/app.test.post/r0",
                     vec![
-                        "'did:plc:t'",
+                        "'did:plc:t7'",
                         "'app.test.post'",
-                        "'r1'",
+                        "'r0'",
                         "'app.test.like'",
                         "50",
                     ],
                 ),
                 (
-                    "at://did:plc:t",
-                    vec!["'did:plc:t'", "''", "'app.test.like'", "50"],
+                    "at://did:plc:t7",
+                    vec!["'did:plc:t7'", "''", "'app.test.like'", "50"],
                 ),
             ] {
                 let spec = BacklinksQuery {
@@ -551,13 +588,14 @@ mod tests {
                 };
                 let (sql, _) = backlinks_query_sql(&spec, backend).unwrap();
                 let sql = crate::test_support::inline_binds_on(&sql, backend, &literals);
-                let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
+                let plan = crate::test_support::query_plan(pool, backend, &sql).await;
                 assert!(
                     plan.iter()
                         .any(|line| line.contains("idx_record_refs_v2_target")),
                     "{backend:?} {target}: {plan:#?}"
                 );
             }
+            db.finish().await;
         }
     }
 }

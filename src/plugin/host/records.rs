@@ -666,7 +666,7 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.contains("(rec.created_at_us < ? OR (rec.created_at_us = ? AND rec.id < ?))"),
+            sql.contains("(rec.created_at_us, rec.id) < (?, ?)"),
             "{sql}"
         );
         assert!(
@@ -682,7 +682,6 @@ mod tests {
             vec![
                 json!("c"),
                 json!("did:plc:a"),
-                json!(1_767_225_600_000_000_i64),
                 json!(1_767_225_600_000_000_i64),
                 json!(42),
                 json!("active")
