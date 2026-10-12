@@ -32,6 +32,11 @@
 //!   [`super::execute::execute_procedure_script`] /
 //!   [`super::execute::execute_query_script`] directly.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::catalog::Layer;
+use crate::project::ProjectSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::Ordering;
@@ -181,6 +186,20 @@ pub struct ResolvedScript {
     /// Which interpreter runs `body`, as the row stamped it.
     pub script_type: String,
     pub body: String,
+    /// The layer the script came from.
+    pub layer: Layer,
+    /// Project-relative file path, for a project script only.
+    pub path: Option<PathBuf>,
+    /// What the interpreter names the chunk, so an error points at the file a
+    /// project script lives in. Dashboard scripts keep the name they always had.
+    pub chunk_name: String,
+    /// XRPC methods the script calls, checked against a service-auth token's
+    /// scope before a procedure runs.
+    pub outbound_xrpcs: Vec<String>,
+    /// The snapshot this script was resolved in, whichever layer answered.
+    /// The run carries it so everything it resolves later, such as a local
+    /// module, comes from the same build.
+    pub snapshot: Arc<ProjectSnapshot>,
 }
 
 /// Look up a single trigger. Returns `None` when no row matches.
@@ -212,6 +231,11 @@ pub async fn resolve(state: &AppState, trigger: &ParsedTrigger) -> Option<Resolv
         trigger: trigger.kind,
         script_type,
         body,
+        layer: Layer::Manual,
+        path: None,
+        chunk_name: crate::catalog::DASHBOARD_CHUNK_NAME.to_string(),
+        outbound_xrpcs: Vec::new(),
+        snapshot: state.project.load_full(),
     })
 }
 

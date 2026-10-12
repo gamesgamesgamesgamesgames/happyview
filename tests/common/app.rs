@@ -164,6 +164,7 @@ impl TestApp {
             db_backend: backend,
             domain_cache,
             lexicons,
+            scripts: happyview::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
             project,
             collections_tx,
             labeler_subscriptions_tx,

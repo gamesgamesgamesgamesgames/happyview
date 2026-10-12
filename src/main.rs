@@ -153,6 +153,8 @@ async fn main() {
 
     let project = happyview::project::shared_empty();
     let lexicons = LexiconCatalog::new(project.clone());
+    let scripts =
+        happyview::catalog::ScriptCatalog::new(db_pool.clone(), db_backend, project.clone());
     lexicons
         .load_from_db(&db_pool)
         .await
@@ -856,6 +858,7 @@ async fn main() {
         db_backend,
         domain_cache: domain_cache.clone(),
         lexicons,
+        scripts,
         project,
         collections_tx,
         labeler_subscriptions_tx,

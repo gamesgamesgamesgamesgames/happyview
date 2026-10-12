@@ -475,6 +475,11 @@ mod tests {
             trigger: crate::lua::TriggerKind::XrpcQuery,
             script_type: "lua".to_string(),
             body: body.to_string(),
+            layer: crate::catalog::Layer::Manual,
+            path: None,
+            chunk_name: crate::catalog::DASHBOARD_CHUNK_NAME.to_string(),
+            outbound_xrpcs: Vec::new(),
+            snapshot: std::sync::Arc::new(crate::project::ProjectSnapshot::empty()),
         }
     }
 

@@ -1237,6 +1237,7 @@ mod tests {
             db_backend: backend,
             domain_cache: crate::domain::DomainCache::new(),
             lexicons: LexiconCatalog::new(project.clone()),
+            scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
             project,
             collections_tx,
             labeler_subscriptions_tx,

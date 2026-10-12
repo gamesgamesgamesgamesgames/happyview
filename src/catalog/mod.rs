@@ -13,10 +13,13 @@ use crate::error::AppError;
 
 pub mod lexicon_rows;
 pub mod lexicons;
+pub mod script_rows;
+pub mod scripts;
 
 pub use lexicons::{
     LexiconCatalog, LexiconListing, LexiconWrite, NetworkLexicon, NetworkWriteError,
 };
+pub use scripts::{DASHBOARD_CHUNK_NAME, ManualScript, ScriptCatalog, ScriptListing, ScriptWrite};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

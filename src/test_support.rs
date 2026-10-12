@@ -194,6 +194,7 @@ pub fn test_state_with_pool_on(
         db_backend: backend,
         domain_cache: crate::domain::DomainCache::new(),
         lexicons: LexiconCatalog::new(project.clone()),
+        scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
         project,
         collections_tx: tx,
         labeler_subscriptions_tx: labeler_tx,

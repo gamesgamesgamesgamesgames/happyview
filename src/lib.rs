@@ -95,6 +95,7 @@ pub struct AppState {
     /// take `load_full()` once and keep it.
     pub project: Arc<arc_swap::ArcSwap<project::ProjectSnapshot>>,
     pub lexicons: LexiconCatalog,
+    pub scripts: catalog::ScriptCatalog,
     pub collections_tx: watch::Sender<Vec<String>>,
     pub labeler_subscriptions_tx: watch::Sender<()>,
     pub labeler_subscription_cache: Arc<labeler::SubscriptionCache>,
