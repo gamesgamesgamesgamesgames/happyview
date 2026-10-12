@@ -34,6 +34,7 @@ ENV SQLX_OFFLINE=true
 RUN cargo build --release && rm -rf src target/release/.fingerprint/happyview-*
 
 # Build application code
+COPY build.rs ./
 COPY src/ src/
 COPY crates/ crates/
 COPY migrations/ migrations/

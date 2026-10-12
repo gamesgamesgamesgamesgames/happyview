@@ -9,7 +9,6 @@ use sqlx::pool::PoolOptions;
 use sqlx::query::{Query, QueryAs, QueryScalar};
 use sqlx::{Any, AssertSqlSafe, FromRow};
 use sqlx::{query as sqlx_query, query_as as sqlx_query_as, query_scalar as sqlx_query_scalar};
-use std::path::Path;
 use std::sync::LazyLock;
 
 /// Bind value for `happyview_records.indexed_at` on **local** write paths.
@@ -661,6 +660,12 @@ fn with_sqlite_pragmas(
     })
 }
 
+/// Compiled in rather than read from `./migrations` at boot, so the binary
+/// migrates the same wherever it is run from. `build.rs` makes cargo rebuild
+/// when a migration file is added.
+pub(crate) static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
+pub(crate) static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
+
 /// Connect to the configured database and run migrations.
 pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
     sqlx::any::install_default_drivers();
@@ -724,19 +729,14 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
             .expect("Failed to set busy timeout");
     }
 
-    // Run migrations from the appropriate directory
-    let migration_dir = match backend {
-        DatabaseBackend::Sqlite => "./migrations/sqlite",
-        DatabaseBackend::Postgres => "./migrations/postgres",
+    let migrator = match backend {
+        DatabaseBackend::Sqlite => &SQLITE_MIGRATIONS,
+        DatabaseBackend::Postgres => &POSTGRES_MIGRATIONS,
     };
-
-    let migrator = Migrator::new(Path::new(migration_dir))
-        .await
-        .unwrap_or_else(|e| panic!("Failed to load migrations from {migration_dir}: {e}"));
 
     match backend {
         DatabaseBackend::Sqlite => migrator.run(&pool).await,
-        DatabaseBackend::Postgres => migrate_postgres(&pool, &migrator).await,
+        DatabaseBackend::Postgres => migrate_postgres(&pool, migrator).await,
     }
     .expect("Failed to run migrations");
 
@@ -940,6 +940,25 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use serial_test::serial;
+
+    /// Every migration file in the tree is compiled into the binary, so a
+    /// binary run outside its checkout migrates exactly as one run inside it.
+    #[test]
+    fn embedded_migrations_cover_every_file() {
+        for (dir, migrator) in [
+            ("migrations/sqlite", &super::SQLITE_MIGRATIONS),
+            ("migrations/postgres", &super::POSTGRES_MIGRATIONS),
+        ] {
+            let on_disk =
+                std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "sql"))
+                    .count();
+            assert!(on_disk > 0, "{dir} holds no migrations");
+            assert_eq!(migrator.iter().count(), on_disk, "{dir}");
+        }
+    }
 
     #[test]
     fn json_field_paths() {

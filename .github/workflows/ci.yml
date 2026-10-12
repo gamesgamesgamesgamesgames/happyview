@@ -70,6 +70,7 @@ jobs:
               - 'migrations/**'
               - 'tests/**'
               - 'Cargo.*'
+              - 'build.rs'
               - 'crates/**'
               - 'Dockerfile'
               - 'docker-compose*'
@@ -424,6 +425,60 @@ jobs:
       - name: Clippy (native Lua reference)
         run: cargo clippy --features lua-reference --all-targets -- -D warnings
 
+  # The release targets that no other job compiles. Windows proves the code
+  # builds without unix-only APIs; the musl binary is booted from an empty
+  # directory, which is what proves it carries its migrations and needs no
+  # system OpenSSL.
+  portability:
+    needs: changes
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: depot-windows-2022
+            target: x86_64-pc-windows-msvc
+          - runs-on: depot-ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portability-${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --bin happyview --target ${{ matrix.target }}
+
+      - name: Boot the static binary from an empty directory
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          bin="$PWD/target/${{ matrix.target }}/debug/happyview"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          dir="$(mktemp -d)"
+          cd "$dir"
+          DATABASE_URL="sqlite://$dir/hv.db?mode=rwc" \
+            PUBLIC_URL=http://127.0.0.1:3999 PORT=3999 HOST=127.0.0.1 \
+            JETSTREAM_URL=ws://127.0.0.1:9 PLUGIN_REGISTRY_URL=off \
+            "$bin" > "$dir/boot.log" 2>&1 &
+          for _ in $(seq 120); do
+            if curl -fsS http://127.0.0.1:3999/health; then exit 0; fi
+            sleep 1
+          done
+          cat "$dir/boot.log"
+          exit 1
+
   audit:
     needs: changes
     if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
@@ -645,7 +700,8 @@ jobs:
       && needs.frontend.result == 'success'
       && needs.playwright.result == 'success'
       && needs.lint.result == 'success'
-    needs: [changes, unit-tests, e2e-tests, frontend, playwright, lint]
+      && needs.portability.result == 'success'
+    needs: [changes, unit-tests, e2e-tests, frontend, playwright, lint, portability]
     runs-on: depot-ubuntu-24.04
     outputs:
       version: ${{ steps.semantic.outputs.version }}
