@@ -458,16 +458,18 @@ pub(super) async fn codemod_apply(
         }));
     }
 
+    // Ahead of the fetch and the language check: a project-owned script is
+    // refused as such whatever its language, not as "not Lua".
+    if apply {
+        auth.require(Permission::ScriptsManage).await?;
+        state.scripts.check_writable(&id)?;
+    }
+
     let existing = fetch_one(&state, &id).await?;
     if existing.script_type != NATIVE_LANGUAGE {
         return Err(AppError::BadRequest(
             "codemod applies to Lua scripts".to_string(),
         ));
-    }
-
-    if apply {
-        auth.require(Permission::ScriptsManage).await?;
-        state.scripts.check_writable(&id)?;
     }
 
     let rewrite = rewrite_lua(&existing.body, kind)?;

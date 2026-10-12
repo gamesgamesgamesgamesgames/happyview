@@ -326,3 +326,58 @@ async fn the_handlers_refuse_before_validating_or_rewriting() {
         409
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn applying_the_codemod_to_a_non_lua_project_script_is_a_409_not_a_400() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let mut snap = owning_script();
+    snap.scripts.get_mut(SCRIPT).unwrap().language_id = "typescript".to_string();
+    app.state.project.store(Arc::new(snap));
+    let path = format!("/admin/scripts/{}", encoded(SCRIPT));
+
+    assert_eq!(
+        app.post_json_status(&format!("{path}/codemod"), json!({ "apply": true }))
+            .await
+            .0,
+        409
+    );
+    assert_eq!(
+        app.post_json_status(&format!("{path}/codemod"), json!({}))
+            .await
+            .0,
+        400,
+        "a preview is not a write and still reports the language"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_bodyless_patch_of_a_stored_unmigrated_script_still_succeeds() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state
+        .scripts
+        .put_manual(
+            &app.state.db,
+            app.state.db_backend,
+            happyview::catalog::ScriptWrite {
+                id: SCRIPT.into(),
+                script_type: "lua".into(),
+                body: "function handle()\n  return params.q\nend\n".into(),
+                description: None,
+            },
+        )
+        .await
+        .unwrap();
+    let path = format!("/admin/scripts/{}", encoded(SCRIPT));
+
+    assert_eq!(
+        patch_status(&app, &path, json!({ "description": "kept" })).await,
+        200
+    );
+    let got = app.get_json(&path).await;
+    assert_eq!(got["description"], "kept");
+    assert_eq!(got["layer"], "manual");
+}
