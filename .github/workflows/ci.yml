@@ -404,8 +404,17 @@ jobs:
         with:
           shared-key: frontend
 
+      # Release builds compile the export into the binary, so the test binary
+      # must pass with the directory gone; otherwise it could be reading it
+      # from disk. The binary is run directly because cargo would rebuild (and
+      # fail) once the directory is missing.
       - name: Test the embedded dashboard
-        run: cargo test --release --features embedded-dashboard --lib dashboard::
+        run: |
+          bin=$(cargo test --release --features embedded-dashboard --lib --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.kind[0] == "lib") | .executable' | tail -1)
+          mv web/out web/out.aside
+          "$bin" dashboard::
+          mv web/out.aside web/out
 
   lint:
     needs: changes

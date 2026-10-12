@@ -34,6 +34,23 @@ pub fn attach<S: Clone + Send + Sync + 'static>(router: Router<S>, config: &Conf
     }
 }
 
+/// The files, relative to the export root, that stand in for a path with no
+/// file of its own, best first: the parent's `_/index.html` (the shell Next.js
+/// exports for a dynamic route), then the root `index.html`. Both sources call
+/// this so they cannot disagree about the order.
+fn spa_fallbacks(path: &str) -> Vec<String> {
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let mut candidates = Vec::with_capacity(2);
+    if segments.len() >= 2 {
+        candidates.push(format!(
+            "{}/_/index.html",
+            segments[..segments.len() - 1].join("/")
+        ));
+    }
+    candidates.push("index.html".to_string());
+    candidates
+}
+
 /// `ServeDir` with an SPA fallback: a path with no file of its own gets the
 /// parent's `_/index.html` (the shell Next.js exports for a dynamic route),
 /// and failing that the root `index.html`.
@@ -45,13 +62,8 @@ fn dir_fallback<S: Clone + Send + Sync + 'static>(
     let spa_fallback = tower::service_fn(move |req: axum::http::Request<_>| {
         let dir = fallback_dir.clone();
         async move {
-            let path = req.uri().path();
-            let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-
-            if segments.len() >= 2 {
-                let parent = segments[..segments.len() - 1].join("/");
-                let dynamic_path = format!("{}/{}/_/index.html", dir, parent);
-                if let Ok(body) = tokio::fs::read(&dynamic_path).await {
+            for rel in spa_fallbacks(req.uri().path()) {
+                if let Ok(body) = tokio::fs::read(format!("{dir}/{rel}")).await {
                     return Ok::<_, Infallible>(
                         axum::http::Response::builder()
                             .header("content-type", "text/html; charset=utf-8")
@@ -60,15 +72,10 @@ fn dir_fallback<S: Clone + Send + Sync + 'static>(
                     );
                 }
             }
-
-            let index = format!("{}/index.html", dir);
-            let body = tokio::fs::read(&index).await.unwrap_or_default();
-            Ok::<_, Infallible>(
-                axum::http::Response::builder()
-                    .header("content-type", "text/html; charset=utf-8")
-                    .body(Full::new(Bytes::from(body)))
-                    .unwrap(),
-            )
+            Ok(axum::http::Response::builder()
+                .header("content-type", "text/html; charset=utf-8")
+                .body(Full::new(Bytes::new()))
+                .unwrap())
         }
     });
     router.fallback_service(ServeDir::new(&static_dir).not_found_service(spa_fallback))
@@ -108,6 +115,11 @@ impl<A: Assets> EmbeddedDashboard<A> {
     /// trailing slash redirects to it, and anything else unknown gets the
     /// dynamic-route shell or the root.
     pub fn respond(&self, path: &str) -> axum::response::Response {
+        self.respond_to(path, None)
+    }
+
+    /// `respond`, keeping `query` on the redirect a bare directory gets.
+    pub fn respond_to(&self, path: &str, query: Option<&str>) -> axum::response::Response {
         use axum::response::IntoResponse;
 
         let rel = path.trim_start_matches('/');
@@ -119,21 +131,20 @@ impl<A: Assets> EmbeddedDashboard<A> {
         } else if let Some(res) = self.file(rel) {
             return res;
         } else if self.assets.get(&format!("{rel}/index.html")).is_some() {
+            let location = match query {
+                Some(q) => format!("{path}/?{q}"),
+                None => format!("{path}/"),
+            };
             return (
                 axum::http::StatusCode::TEMPORARY_REDIRECT,
-                [(axum::http::header::LOCATION, format!("{path}/"))],
+                [(axum::http::header::LOCATION, location)],
             )
                 .into_response();
         }
 
-        let segments: Vec<&str> = rel.trim_end_matches('/').split('/').collect();
-        if segments.len() >= 2 {
-            let shell = format!("{}/_/index.html", segments[..segments.len() - 1].join("/"));
-            if let Some(res) = self.file(&shell) {
-                return res;
-            }
-        }
-        self.file("index.html")
+        spa_fallbacks(path)
+            .iter()
+            .find_map(|candidate| self.file(candidate))
             .unwrap_or_else(|| axum::http::StatusCode::NOT_FOUND.into_response())
     }
 
@@ -144,20 +155,23 @@ impl<A: Assets> EmbeddedDashboard<A> {
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| REWRITTEN_EXTENSIONS.contains(&e));
-        let bytes = if rewrite {
-            let mut cache = self.rewritten.lock().unwrap_or_else(|e| e.into_inner());
-            cache
-                .entry(rel.to_string())
-                .or_insert_with(|| {
-                    Bytes::from(
-                        String::from_utf8_lossy(&raw)
-                            .replace(BASE_PATH_SENTINEL, &self.base_path)
-                            .into_bytes(),
-                    )
-                })
-                .clone()
-        } else {
-            Bytes::from(raw.into_owned())
+        let bytes = match raw {
+            std::borrow::Cow::Borrowed(raw) if !rewrite => Bytes::from_static(raw),
+            std::borrow::Cow::Owned(raw) if !rewrite => Bytes::from(raw),
+            // A text asset that is not UTF-8 cannot be searched for the
+            // sentinel without corrupting it, so it goes out as it is.
+            raw => match std::str::from_utf8(&raw) {
+                Ok(text) => {
+                    let mut cache = self.rewritten.lock().unwrap_or_else(|e| e.into_inner());
+                    cache
+                        .entry(rel.to_string())
+                        .or_insert_with(|| {
+                            Bytes::from(text.replace(BASE_PATH_SENTINEL, &self.base_path))
+                        })
+                        .clone()
+                }
+                Err(_) => Bytes::from(raw.into_owned()),
+            },
         };
         Some(
             axum::http::Response::builder()
@@ -178,7 +192,7 @@ mod embedded {
 
     #[derive(rust_embed::Embed)]
     #[folder = "web/out/"]
-    struct Export;
+    pub(super) struct Export;
 
     pub(super) struct RustEmbedAssets;
 
@@ -195,7 +209,7 @@ mod embedded {
         let dashboard = Arc::new(EmbeddedDashboard::new(RustEmbedAssets, base_path));
         router.fallback(move |uri: axum::http::Uri| {
             let dashboard = dashboard.clone();
-            async move { dashboard.respond(uri.path()) }
+            async move { dashboard.respond_to(uri.path(), uri.query()) }
         })
     }
 }
@@ -345,6 +359,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_fallback_candidates_run_from_the_shell_to_the_root() {
+        assert_eq!(
+            spa_fallbacks("/dashboard/records/abc"),
+            ["dashboard/records/_/index.html", "index.html"]
+        );
+        assert_eq!(spa_fallbacks("/nowhere"), ["index.html"]);
+        assert_eq!(spa_fallbacks("/"), ["index.html"]);
+    }
+
+    #[tokio::test]
+    async fn keeps_the_query_on_the_directory_redirect() {
+        let res = EmbeddedDashboard::new(export(), None).respond_to("/dashboard", Some("a=1"));
+        assert_eq!(res.headers()["location"], "/dashboard/?a=1");
+    }
+
+    #[tokio::test]
+    async fn serves_non_utf8_text_untouched() {
+        use http_body_util::BodyExt;
+        let assets = MapAssets(HashMap::from([(
+            "a.js",
+            b"\xff/__HAPPYVIEW_BP__".as_slice(),
+        )]));
+        let res = EmbeddedDashboard::new(assets, Some("/hv")).respond("/a.js");
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"\xff/__HAPPYVIEW_BP__");
+    }
+
     #[tokio::test]
     async fn strips_the_sentinel_when_there_is_no_base_path() {
         let d = EmbeddedDashboard::new(export(), None);
@@ -368,6 +410,20 @@ mod tests {
     #[cfg(feature = "embedded-dashboard")]
     #[test]
     fn the_embedded_copy_holds_the_dashboard() {
+        use embedded::{Export, RustEmbedAssets};
+
+        // A frontend built without `NEXT_PUBLIC_BASE_PATH=/__HAPPYVIEW_BP__`
+        // embeds fine and then ignores the configured base path.
+        let has_sentinel = Export::iter().any(|name| {
+            (name.ends_with(".html") || name.ends_with(".js"))
+                && RustEmbedAssets.get(&name).is_some_and(|bytes| {
+                    String::from_utf8_lossy(&bytes).contains(BASE_PATH_SENTINEL)
+                })
+        });
+        assert!(
+            has_sentinel,
+            "web/out was not exported with the base path sentinel"
+        );
         assert!(embedded::RustEmbedAssets.get("index.html").is_some());
         assert!(
             embedded::RustEmbedAssets
