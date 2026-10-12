@@ -45,6 +45,7 @@ export default defineConfig({
         "linked-repos.spec.ts",
         "link-invite-pages.spec.ts",
         "users-add.spec.ts",
+        "labelers-declared.spec.ts",
         "confidential-client.spec.ts",
         "api-client-duplicate.spec.ts",
         "dpop-session-revocation.spec.ts",

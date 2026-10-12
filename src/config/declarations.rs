@@ -31,6 +31,18 @@ pub async fn apply_at_boot(
         }
     }
 
+    let Some(project) = config.project.as_deref() else {
+        return;
+    };
+
+    match crate::labeler::ensure_declared_subscriptions(db, backend, &project.labels.subscribe)
+        .await
+    {
+        Ok(0) => {}
+        Ok(added) => info!(added, "subscribed to labelers declared in happyview.toml"),
+        Err(e) => error!("could not subscribe to the labelers declared in happyview.toml: {e}"),
+    }
+
     let _ = (http, lexicons);
 }
 
@@ -50,6 +62,34 @@ mod tests {
         .config;
         config.superadmin_did = superadmin.map(str::to_string);
         config
+    }
+
+    #[tokio::test]
+    async fn boot_subscribes_the_declared_labelers() {
+        let db = migrated_memory_pool().await;
+        let mut config = config_with(None).await;
+        config.project = Some(std::sync::Arc::new(
+            crate::config::project::parse_project_config(
+                "[labels]\nsubscribe = [\"did:plc:declared\"]\n",
+                std::path::Path::new("happyview.toml"),
+            )
+            .unwrap(),
+        ));
+        apply_at_boot(
+            &config,
+            &db,
+            DatabaseBackend::Sqlite,
+            &reqwest::Client::new(),
+            &crate::catalog::LexiconCatalog::detached(),
+        )
+        .await;
+        let row: Option<(String,)> =
+            crate::db::query_as("SELECT did FROM happyview_labeler_subscriptions WHERE did = ?")
+                .bind("did:plc:declared")
+                .fetch_optional(&db)
+                .await
+                .unwrap();
+        assert!(row.is_some());
     }
 
     #[tokio::test]

@@ -362,6 +362,7 @@ pub(super) struct AddLabelerBody {
 
 #[derive(Serialize)]
 pub(super) struct LabelerSummary {
+    pub(super) declared: bool,
     pub(super) did: String,
     pub(super) status: String,
     pub(super) cursor: Option<i64>,

@@ -712,6 +712,34 @@ pub async fn spawn_label_gc(db: sqlx::AnyPool, backend: DatabaseBackend) {
     }
 }
 
+/// Subscribe to every labeler the project declares. Only missing rows are
+/// inserted: status and cursor are runtime state, so a subscription the
+/// dashboard paused stays paused across restarts. Runs before `AppState`
+/// exists; a caller on a live instance must invalidate
+/// `labeler_subscription_cache` afterwards.
+pub async fn ensure_declared_subscriptions(
+    db: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    dids: &[String],
+) -> Result<u64, sqlx::Error> {
+    let now = now_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_labeler_subscriptions (did, created_at, updated_at) VALUES (?, ?, ?) ON CONFLICT (did) DO NOTHING",
+        backend,
+    );
+    let mut added = 0;
+    for did in dids {
+        added += crate::db::query(&sql)
+            .bind(did)
+            .bind(&now)
+            .bind(&now)
+            .execute(db)
+            .await?
+            .rows_affected();
+    }
+    Ok(added)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, FixedOffset, Utc};
@@ -1034,6 +1062,66 @@ mod tests {
         assert_eq!(
             stored["unparseable"], None,
             "an expiry no comparison can order is dropped for a deterministic NULL"
+        );
+    }
+}
+
+#[cfg(test)]
+mod declared_tests {
+    use super::*;
+    use crate::test_support::migrated_memory_pool;
+
+    async fn row(db: &sqlx::AnyPool, did: &str) -> Option<(String, Option<i64>)> {
+        crate::db::query_as(
+            "SELECT status, cursor FROM happyview_labeler_subscriptions WHERE did = ?",
+        )
+        .bind(did)
+        .fetch_optional(db)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_declared_labeler_is_subscribed_once() {
+        let db = migrated_memory_pool().await;
+        let dids = vec!["did:plc:lab1".to_string(), "did:plc:lab2".to_string()];
+        assert_eq!(
+            ensure_declared_subscriptions(&db, DatabaseBackend::Sqlite, &dids)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            ensure_declared_subscriptions(&db, DatabaseBackend::Sqlite, &dids)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            row(&db, "did:plc:lab1").await,
+            Some(("active".into(), None))
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_does_not_resume_a_paused_subscription_or_move_its_cursor() {
+        let db = migrated_memory_pool().await;
+        crate::db::query(
+            "INSERT INTO happyview_labeler_subscriptions (did, cursor, status, created_at, updated_at) VALUES (?, ?, 'paused', ?, ?)",
+        )
+        .bind("did:plc:lab1")
+        .bind(42_i64)
+        .bind("2026-01-01T00:00:00+00:00")
+        .bind("2026-01-01T00:00:00+00:00")
+        .execute(&db)
+        .await
+        .unwrap();
+        ensure_declared_subscriptions(&db, DatabaseBackend::Sqlite, &["did:plc:lab1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            row(&db, "did:plc:lab1").await,
+            Some(("paused".into(), Some(42)))
         );
     }
 }
