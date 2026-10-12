@@ -154,11 +154,14 @@ pub(crate) async fn put_setting(
     Ok(())
 }
 
-pub(crate) async fn get_setting(
-    db: &sqlx::AnyPool,
+pub(crate) async fn get_setting<'e, E>(
+    db: E,
     backend: DatabaseBackend,
     key: &str,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
     let sql = adapt_sql(
         "SELECT value FROM happyview_instance_settings WHERE key = ?",
         backend,

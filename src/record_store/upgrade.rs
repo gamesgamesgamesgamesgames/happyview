@@ -99,6 +99,9 @@ pub struct CopyProgress {
     /// Refs whose collection column disagreed with their source record's
     /// collection.
     pub ref_collection_mismatches: u64,
+    /// The legacy tables were already views: another boot finished the
+    /// upgrade while this copy ran, and this one stopped.
+    pub superseded: bool,
 }
 
 /// What a verification compared.
@@ -245,6 +248,32 @@ where
     }
 }
 
+/// Begin a transaction on `conn` that holds the write lock from the start:
+/// `BEGIN IMMEDIATE` on SQLite, so a check made inside it (are the legacy
+/// tables still tables?) cannot go stale before the write it guards.
+async fn begin_write_on(
+    conn: &mut AnyConnection,
+    backend: DatabaseBackend,
+) -> Result<sqlx::Transaction<'_, sqlx::Any>, sqlx::Error> {
+    match backend {
+        DatabaseBackend::Sqlite => conn.begin_with("BEGIN IMMEDIATE").await,
+        DatabaseBackend::Postgres => conn.begin().await,
+    }
+}
+
+/// Wait before retrying a write that found the database busy, or give the
+/// error back once `attempt` is the last.
+async fn busy_backoff(attempt: &mut u32, e: sqlx::Error) -> Result<(), sqlx::Error> {
+    if *attempt < crate::db::BUSY_RETRY_ATTEMPTS && crate::db::is_retryable_write_error(&e) {
+        tokio::time::sleep(std::time::Duration::from_millis(50 << *attempt)).await;
+        *attempt += 1;
+        Ok(())
+    } else {
+        Err(e)
+    }
+}
+
+/// [`copy_records_on`] on a connection of its own from `pool`.
 pub async fn copy_records(
     pool: &AnyPool,
     backend: DatabaseBackend,
@@ -252,9 +281,30 @@ pub async fn copy_records(
     batch: i64,
     max_batches: Option<u64>,
 ) -> Result<CopyProgress, UpgradeError> {
-    refuse_blank_uris(pool).await?;
+    let mut conn = pool.acquire().await?;
+    copy_records_on(&mut conn, backend, interner, batch, max_batches).await
+}
+
+/// Copy legacy records after the saved cursor, `batch` at a time, each batch
+/// committed with its cursor. Stops, marked `superseded`, as soon as the
+/// legacy tables turn out to be views already: every batch checks that in
+/// its own write transaction, so a copy racing another boot's swap never
+/// writes after it.
+pub async fn copy_records_on(
+    conn: &mut AnyConnection,
+    backend: DatabaseBackend,
+    interner: &Interner,
+    batch: i64,
+    max_batches: Option<u64>,
+) -> Result<CopyProgress, UpgradeError> {
     let mut progress = CopyProgress::default();
-    let mut after = get_setting(pool, backend, RECORDS_CURSOR)
+    if !legacy_tables_present(&mut *conn, backend).await? {
+        progress.done = true;
+        progress.superseded = true;
+        return Ok(progress);
+    }
+    refuse_blank_uris(&mut *conn).await?;
+    let mut after = get_setting(&mut *conn, backend, RECORDS_CURSOR)
         .await?
         .unwrap_or_default();
     let select = adapt_sql(
@@ -270,7 +320,7 @@ pub async fn copy_records(
         let rows: Vec<LegacyRow> = crate::db::query_as(&select)
             .bind(&after)
             .bind(batch)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
         let Some(last) = rows.last().map(|row| row.0.clone()) else {
             progress.done = true;
@@ -280,8 +330,18 @@ pub async fn copy_records(
             .iter()
             .map(|row| copied(row, &mut progress))
             .collect::<Result<Vec<_>, _>>()?;
-        crate::db::retry_on_busy(|| write_records(pool, backend, interner, &copied_rows, &last))
-            .await?;
+        let mut attempt = 1;
+        let wrote = loop {
+            match write_records(&mut *conn, backend, interner, &copied_rows, &last).await {
+                Err(e) => busy_backoff(&mut attempt, e).await?,
+                Ok(wrote) => break wrote,
+            }
+        };
+        if !wrote {
+            progress.done = true;
+            progress.superseded = true;
+            return Ok(progress);
+        }
         progress.rows += rows.len() as u64;
         progress.batches += 1;
         after = last;
@@ -292,14 +352,20 @@ pub async fn copy_records(
     }
 }
 
+/// Write one batch and its cursor. `false`, writing nothing, when the
+/// legacy tables are already views.
 async fn write_records(
-    pool: &AnyPool,
+    conn: &mut AnyConnection,
     backend: DatabaseBackend,
     interner: &Interner,
     rows: &[CopiedRow],
     cursor: &str,
-) -> Result<(), sqlx::Error> {
-    let mut tx = crate::db::begin_write(pool, backend).await?;
+) -> Result<bool, sqlx::Error> {
+    let mut tx = begin_write_on(conn, backend).await?;
+    if !legacy_tables_present(&mut *tx, backend).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     let mut scope = InternScope::default();
     let dids: Vec<&str> = rows.iter().map(|r| r.did.as_str()).collect();
     let collections: Vec<&str> = rows.iter().map(|r| r.collection.as_str()).collect();
@@ -346,7 +412,7 @@ async fn write_records(
     put_setting(&mut tx, backend, RECORDS_CURSOR, cursor).await?;
     tx.commit().await?;
     interner.remember(scope);
-    Ok(())
+    Ok(true)
 }
 
 /// source_uri, target_uri, collection.
@@ -358,6 +424,7 @@ struct RefsWritten {
     collection_mismatches: u64,
 }
 
+/// [`copy_refs_on`] on a connection of its own from `pool`.
 pub async fn copy_refs(
     pool: &AnyPool,
     backend: DatabaseBackend,
@@ -365,9 +432,28 @@ pub async fn copy_refs(
     batch: i64,
     max_batches: Option<u64>,
 ) -> Result<CopyProgress, UpgradeError> {
+    let mut conn = pool.acquire().await?;
+    copy_refs_on(&mut conn, backend, interner, batch, max_batches).await
+}
+
+/// Copy legacy refs after the saved cursor once every record is copied,
+/// stopping like [`copy_records_on`] when the legacy tables are views.
+pub async fn copy_refs_on(
+    conn: &mut AnyConnection,
+    backend: DatabaseBackend,
+    interner: &Interner,
+    batch: i64,
+    max_batches: Option<u64>,
+) -> Result<CopyProgress, UpgradeError> {
+    let mut progress = CopyProgress::default();
+    if !legacy_tables_present(&mut *conn, backend).await? {
+        progress.done = true;
+        progress.superseded = true;
+        return Ok(progress);
+    }
     // A ref whose source is not copied yet would be skipped for good once
     // the cursor passed it.
-    let records_after = get_setting(pool, backend, RECORDS_CURSOR)
+    let records_after = get_setting(&mut *conn, backend, RECORDS_CURSOR)
         .await?
         .unwrap_or_default();
     let pending: Option<(String,)> = crate::db::query_as(&adapt_sql(
@@ -375,14 +461,13 @@ pub async fn copy_refs(
         backend,
     ))
     .bind(&records_after)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     if let Some((next_uri,)) = pending {
         return Err(UpgradeError::RecordsPending { next_uri });
     }
 
-    let mut progress = CopyProgress::default();
-    let saved = get_setting(pool, backend, REFS_CURSOR).await?;
+    let saved = get_setting(&mut *conn, backend, REFS_CURSOR).await?;
     let (mut after_source, mut after_target) = decode_refs_cursor(saved.as_deref());
     let select = adapt_sql(REFS_AFTER, backend);
     loop {
@@ -393,16 +478,25 @@ pub async fn copy_refs(
             .bind(&after_source)
             .bind(&after_target)
             .bind(batch)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
         let Some((last_source, last_target, _)) = rows.last().cloned() else {
             progress.done = true;
             return Ok(progress);
         };
         let cursor = encode_refs_cursor(&last_source, &last_target);
-        let written =
-            crate::db::retry_on_busy(|| write_refs(pool, backend, interner, &rows, &cursor))
-                .await?;
+        let mut attempt = 1;
+        let written = loop {
+            match write_refs(&mut *conn, backend, interner, &rows, &cursor).await {
+                Err(e) => busy_backoff(&mut attempt, e).await?,
+                Ok(written) => break written,
+            }
+        };
+        let Some(written) = written else {
+            progress.done = true;
+            progress.superseded = true;
+            return Ok(progress);
+        };
         progress.rows += rows.len() as u64;
         progress.skipped += written.skipped;
         progress.ref_collection_mismatches += written.collection_mismatches;
@@ -452,14 +546,20 @@ async fn record_ids(
     Ok(ids)
 }
 
+/// Write one batch of refs and its cursor; `None`, writing nothing, when the
+/// legacy tables are already views.
 async fn write_refs(
-    pool: &AnyPool,
+    conn: &mut AnyConnection,
     backend: DatabaseBackend,
     interner: &Interner,
     rows: &[LegacyRef],
     cursor: &str,
-) -> Result<RefsWritten, sqlx::Error> {
-    let mut tx = crate::db::begin_write(pool, backend).await?;
+) -> Result<Option<RefsWritten>, sqlx::Error> {
+    let mut tx = begin_write_on(conn, backend).await?;
+    if !legacy_tables_present(&mut *tx, backend).await? {
+        tx.rollback().await?;
+        return Ok(None);
+    }
     let mut scope = InternScope::default();
     let sources: BTreeSet<(&str, &str, &str)> = rows
         .iter()
@@ -546,18 +646,29 @@ async fn write_refs(
     put_setting(&mut tx, backend, REFS_CURSOR, cursor).await?;
     tx.commit().await?;
     interner.remember(scope);
-    Ok(written)
+    Ok(Some(written))
 }
 
 /// Undo a copy that failed verification: clear both cursors and empty the
 /// v2 tables (refs first), so the next boot copies from the start. Interned
-/// names stay; an id never changes meaning. Atomic, nested in the caller's
-/// transaction if it has one.
+/// names stay; an id never changes meaning.
+///
+/// Refused, returning `false` and changing nothing, once the legacy tables
+/// are gone: the v2 tables are then the only copy of every record (a boot
+/// that lost a race to another's swap ends up here). The check and the
+/// delete share one write transaction, so a swap cannot land between them.
 pub async fn reset_copy(
     conn: &mut AnyConnection,
     backend: DatabaseBackend,
-) -> Result<(), UpgradeError> {
-    let mut tx = conn.begin().await?;
+) -> Result<bool, UpgradeError> {
+    let mut tx = begin_write_on(conn, backend).await?;
+    if !legacy_tables_present(&mut *tx, backend).await? {
+        tx.rollback().await?;
+        tracing::warn!(
+            "record store upgrade: not resetting the copy; the legacy tables are already gone"
+        );
+        return Ok(false);
+    }
     crate::db::query(&adapt_sql(
         "DELETE FROM happyview_instance_settings WHERE key IN (?, ?)",
         backend,
@@ -580,7 +691,7 @@ pub async fn reset_copy(
     }
     tx.commit().await?;
     tracing::warn!("record store upgrade: the copy was reset");
-    Ok(())
+    Ok(true)
 }
 
 /// The ids interned for `names` (read only; a missing name has none).
@@ -1120,7 +1231,7 @@ async fn compare_sample(
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpgradeOutcome {
     AlreadyDone,
     Upgraded { records: u64, refs: u64 },
@@ -1128,10 +1239,13 @@ pub enum UpgradeOutcome {
 
 /// Whether `happyview_records` is still the legacy table (and not yet the
 /// compatibility view).
-pub async fn legacy_tables_present(
-    pool: &AnyPool,
+pub async fn legacy_tables_present<'e, E>(
+    executor: E,
     backend: DatabaseBackend,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
     let sql = match backend {
         DatabaseBackend::Sqlite => {
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'happyview_records'"
@@ -1142,7 +1256,10 @@ pub async fn legacy_tables_present(
              AND table_type = 'BASE TABLE'"
         }
     };
-    Ok(crate::db::query_scalar::<i64>(sql).fetch_one(pool).await? > 0)
+    Ok(crate::db::query_scalar::<i64>(sql)
+        .fetch_one(executor)
+        .await?
+        > 0)
 }
 
 /// Copy passes `run` makes when the refs copy finds records written behind
@@ -1150,32 +1267,67 @@ pub async fn legacy_tables_present(
 /// rolling deploy) before it gives up.
 const COPY_ATTEMPTS: u32 = 3;
 
-/// Move the legacy record tables into the compact ones, once. Runs at boot
-/// after the migrations (on Postgres under the migration lock), and blocks
-/// until it is done. A no-op once the legacy tables are gone.
+/// [`run_on`] on one connection from `pool`. On SQLite the swap turns the
+/// connection's foreign keys off for a moment; after a failure they are
+/// turned back on, or the connection is closed rather than returned.
+pub async fn run(pool: &AnyPool, backend: DatabaseBackend) -> Result<UpgradeOutcome, UpgradeError> {
+    let mut conn = pool.acquire().await?;
+    let outcome = run_on(&mut conn, backend).await;
+    if outcome.is_err()
+        && backend == DatabaseBackend::Sqlite
+        && crate::db::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *conn)
+            .await
+            .is_err()
+    {
+        conn.close_on_drop();
+    }
+    outcome
+}
+
+/// Move the legacy record tables into the compact ones, once, all on
+/// `conn`. Runs at boot after the migrations, and blocks until it is done.
+/// On Postgres `conn` is the one holding the migration lock, so a second
+/// instance waits for the copy as it waits for a migration, and the upgrade
+/// needs no second connection. On SQLite nothing locks across processes,
+/// so every decision that could lose data is made inside a write
+/// transaction that first checks the legacy tables are still tables: a
+/// boot that loses a race to another's swap stops with `AlreadyDone` and
+/// never empties the compact tables.
 ///
 /// If verification fails nothing is dropped, the copy is reset, and the
 /// error names the difference; the next boot copies from the start.
-pub async fn run(pool: &AnyPool, backend: DatabaseBackend) -> Result<UpgradeOutcome, UpgradeError> {
-    if !legacy_tables_present(pool, backend).await? {
-        return Ok(UpgradeOutcome::AlreadyDone);
-    }
+pub async fn run_on(
+    conn: &mut AnyConnection,
+    backend: DatabaseBackend,
+) -> Result<UpgradeOutcome, UpgradeError> {
     let started = std::time::Instant::now();
-    let resuming = get_setting(pool, backend, RECORDS_CURSOR).await?.is_some()
-        || get_setting(pool, backend, REFS_CURSOR).await?.is_some();
-    if !resuming {
-        // Rows and their cursor commit together, so without a cursor any rows
-        // here were not written by this copy. Start from empty.
-        crate::db::query("DELETE FROM happyview_record_refs_v2")
-            .execute(pool)
+    let (resuming, total) = {
+        let mut tx = begin_write_on(conn, backend).await?;
+        if !legacy_tables_present(&mut *tx, backend).await? {
+            tx.rollback().await?;
+            return Ok(UpgradeOutcome::AlreadyDone);
+        }
+        let resuming = get_setting(&mut *tx, backend, RECORDS_CURSOR)
+            .await?
+            .is_some()
+            || get_setting(&mut *tx, backend, REFS_CURSOR).await?.is_some();
+        if !resuming {
+            // Rows and their cursor commit together, so without a cursor any
+            // rows here were not written by this copy. Start from empty.
+            crate::db::query("DELETE FROM happyview_record_refs_v2")
+                .execute(&mut *tx)
+                .await?;
+            crate::db::query("DELETE FROM happyview_records_v2")
+                .execute(&mut *tx)
+                .await?;
+        }
+        let total = crate::db::query_scalar::<i64>("SELECT COUNT(*) FROM happyview_records")
+            .fetch_one(&mut *tx)
             .await?;
-        crate::db::query("DELETE FROM happyview_records_v2")
-            .execute(pool)
-            .await?;
-    }
-    let total = crate::db::query_scalar::<i64>("SELECT COUNT(*) FROM happyview_records")
-        .fetch_one(pool)
-        .await?;
+        tx.commit().await?;
+        (resuming, total)
+    };
     tracing::info!(
         records = total,
         resuming,
@@ -1185,11 +1337,14 @@ pub async fn run(pool: &AnyPool, backend: DatabaseBackend) -> Result<UpgradeOutc
     let mut records = CopyProgress::default();
     let mut attempt = 1;
     let refs = loop {
-        let pass = copy_records(pool, backend, &interner, COPY_BATCH, None).await?;
+        let pass = copy_records_on(conn, backend, &interner, COPY_BATCH, None).await?;
         records.rows += pass.rows;
         records.identity_mismatches += pass.identity_mismatches;
         records.unreadable_timestamps += pass.unreadable_timestamps;
-        match copy_refs(pool, backend, &interner, COPY_BATCH, None).await {
+        if pass.superseded {
+            return Ok(another_boot_upgraded());
+        }
+        match copy_refs_on(conn, backend, &interner, COPY_BATCH, None).await {
             Err(UpgradeError::RecordsPending { next_uri }) if attempt < COPY_ATTEMPTS => {
                 tracing::warn!(
                     next_uri,
@@ -1201,6 +1356,9 @@ pub async fn run(pool: &AnyPool, backend: DatabaseBackend) -> Result<UpgradeOutc
             other => break other?,
         }
     };
+    if refs.superseded {
+        return Ok(another_boot_upgraded());
+    }
     if records.identity_mismatches > 0 {
         tracing::warn!(
             rows = records.identity_mismatches,
@@ -1219,7 +1377,9 @@ pub async fn run(pool: &AnyPool, backend: DatabaseBackend) -> Result<UpgradeOutc
             "record store upgrade: refs whose source record no longer exists were not copied"
         );
     }
-    let verified = swap(pool, backend).await?;
+    let Some(verified) = swap(conn, backend).await? else {
+        return Ok(another_boot_upgraded());
+    };
     tracing::info!(
         records = verified.records,
         refs = verified.refs,
@@ -1232,55 +1392,57 @@ pub async fn run(pool: &AnyPool, backend: DatabaseBackend) -> Result<UpgradeOutc
     })
 }
 
+fn another_boot_upgraded() -> UpgradeOutcome {
+    tracing::info!("record store upgrade: another boot finished the upgrade first");
+    UpgradeOutcome::AlreadyDone
+}
+
 const STAGING: CompatNames<'static> = CompatNames {
     records: "happyview_records_staging",
     refs: "happyview_record_refs_staging",
 };
 
-/// Verify and swap in one transaction, then (SQLite) reclaim the space. On
-/// any failure the transaction is rolled back first, releasing its locks,
-/// and then the copy is reset on a connection of its own.
+/// Verify and swap in one transaction, then (SQLite) reclaim the space.
+/// `None` when another boot swapped first. On any failure the transaction
+/// is rolled back first, releasing its locks, and then the copy is reset
+/// (which itself refuses once the legacy tables are gone).
 ///
 /// SQLite's foreign keys are off on this connection for the swap: with them
 /// on, `DROP TABLE` first deletes every row one by one.
-async fn swap(pool: &AnyPool, backend: DatabaseBackend) -> Result<VerifySummary, UpgradeError> {
-    let mut conn = pool.acquire().await?;
+async fn swap(
+    conn: &mut AnyConnection,
+    backend: DatabaseBackend,
+) -> Result<Option<VerifySummary>, UpgradeError> {
     if backend == DatabaseBackend::Sqlite {
         crate::db::query("PRAGMA foreign_keys = OFF")
             .execute(&mut *conn)
             .await?;
     }
-    let swapped = swap_in_transaction(&mut conn, backend).await;
-    let restored = match backend {
-        DatabaseBackend::Sqlite => crate::db::query("PRAGMA foreign_keys = ON")
+    let swapped = swap_in_transaction(conn, backend).await;
+    if backend == DatabaseBackend::Sqlite {
+        crate::db::query("PRAGMA foreign_keys = ON")
             .execute(&mut *conn)
-            .await
-            .map(|_| ()),
-        DatabaseBackend::Postgres => Ok(()),
-    };
-    if let Err(e) = restored {
-        // A connection whose foreign keys may be off must not go back to the
-        // pool.
-        conn.close_on_drop();
-        swapped?;
-        return Err(e.into());
+            .await?;
     }
     let summary = match swapped {
         Ok(summary) => summary,
-        Err(e) => {
-            drop(conn);
-            let reset = async {
-                let mut fresh = pool.acquire().await?;
-                reset_copy(&mut fresh, backend).await
-            }
-            .await;
-            if let Err(reset) = reset {
+        Err(Refused {
+            error,
+            rolled_back: false,
+        }) => {
+            tracing::error!(
+                "record store upgrade: the swap could not be rolled back; not resetting the copy"
+            );
+            return Err(error);
+        }
+        Err(Refused { error, .. }) => {
+            if let Err(reset) = reset_copy(conn, backend).await {
                 tracing::error!(error = %reset, "record store upgrade: could not reset the copy");
             }
-            return Err(e);
+            return Err(error);
         }
     };
-    if backend == DatabaseBackend::Sqlite {
+    if summary.is_some() && backend == DatabaseBackend::Sqlite {
         tracing::info!(
             "record store upgrade: returning the legacy tables' pages to the filesystem"
         );
@@ -1291,15 +1453,28 @@ async fn swap(pool: &AnyPool, backend: DatabaseBackend) -> Result<VerifySummary,
     Ok(summary)
 }
 
+/// A swap that failed, and whether its transaction was rolled back (so the
+/// connection is free and holds no locks).
+struct Refused {
+    error: UpgradeError,
+    rolled_back: bool,
+}
+
 async fn swap_in_transaction(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Any>,
+    conn: &mut AnyConnection,
     backend: DatabaseBackend,
-) -> Result<VerifySummary, UpgradeError> {
-    let mut tx = match backend {
-        DatabaseBackend::Sqlite => conn.begin_with("BEGIN IMMEDIATE").await?,
-        DatabaseBackend::Postgres => conn.begin().await?,
-    };
+) -> Result<Option<VerifySummary>, Refused> {
+    let mut tx = begin_write_on(conn, backend).await.map_err(|e| Refused {
+        error: e.into(),
+        rolled_back: true,
+    })?;
     let swapped = async {
+        // Another boot may have swapped while this one copied: on SQLite
+        // nothing serialises two processes until this transaction's write
+        // lock. Then there is nothing left to do, and nothing to undo.
+        if !legacy_tables_present(&mut *tx, backend).await? {
+            return Ok(None);
+        }
         if backend == DatabaseBackend::Postgres {
             // An instance still on the old release could write the legacy
             // tables during the copy. Locked, the verification sees every
@@ -1337,23 +1512,36 @@ async fn swap_in_transaction(
         .bind(REFS_CURSOR)
         .execute(&mut *tx)
         .await?;
-        Ok::<_, UpgradeError>(summary)
+        Ok::<_, UpgradeError>(Some(summary))
     }
     .await;
     match swapped {
-        Ok(summary) => {
-            tx.commit().await?;
-            Ok(summary)
+        Ok(Some(summary)) => {
+            tx.commit().await.map_err(|e| Refused {
+                error: e.into(),
+                rolled_back: false,
+            })?;
+            Ok(Some(summary))
         }
-        Err(e) => {
+        Ok(None) => {
+            tx.rollback().await.map_err(|e| Refused {
+                error: e.into(),
+                rolled_back: false,
+            })?;
+            Ok(None)
+        }
+        Err(error) => {
             // Explicitly, not on drop: a dropped transaction's rollback waits
             // for the connection's next use, and until then it holds its
             // locks, which the reset's TRUNCATE on Postgres would wait on.
-            if let Err(rollback) = tx.rollback().await {
-                tracing::error!(error = %rollback, "record store upgrade: rollback failed");
-                conn.close_on_drop();
-            }
-            Err(e)
+            let rolled_back = match tx.rollback().await {
+                Ok(()) => true,
+                Err(rollback) => {
+                    tracing::error!(error = %rollback, "record store upgrade: rollback failed");
+                    false
+                }
+            };
+            Err(Refused { error, rolled_back })
         }
     }
 }
@@ -1979,7 +2167,7 @@ mod tests {
                 .await
                 .expect("some refs");
             let mut conn = pool.acquire().await.expect("acquire");
-            reset_copy(&mut conn, backend).await.expect("reset");
+            assert!(reset_copy(&mut conn, backend).await.expect("reset"));
             drop(conn);
             for table in ["happyview_records_v2", "happyview_record_refs_v2"] {
                 let (n,): (i64,) = crate::db::query_as(&format!("SELECT COUNT(*) FROM {table}"))
@@ -2284,6 +2472,136 @@ mod tests {
                 err.to_string()
                     .contains(&format!("{source} -> {target}: ref collection differs")),
                 "{backend:?}: {err}"
+            );
+            db.finish().await;
+        }
+    }
+
+    /// A migrated, not yet upgraded SQLite file seeded with `n` legacy
+    /// records (and their refs), and its path.
+    async fn seeded_sqlite_file(n: usize) -> std::path::PathBuf {
+        crate::db::install_drivers();
+        let path = std::env::temp_dir().join(format!("hv-race-{}.db", uuid::Uuid::new_v4()));
+        let pool = sqlite_file_pool(&path).await;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite");
+        sqlx::migrate::Migrator::new(dir)
+            .await
+            .expect("load")
+            .run(&pool)
+            .await
+            .expect("migrate");
+        seed_legacy(&pool, DatabaseBackend::Sqlite, n).await;
+        pool.close().await;
+        path
+    }
+
+    /// Another process's pool on the same file: its own connections, WAL and
+    /// a busy timeout, as `db::connect` opens one.
+    async fn sqlite_file_pool(path: &std::path::Path) -> AnyPool {
+        let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+            .max_connections(4)
+            .connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .expect("connect");
+        crate::db::query("PRAGMA journal_mode = WAL")
+            .execute(&pool)
+            .await
+            .expect("wal");
+        pool
+    }
+
+    fn remove_sqlite_file(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// Two processes booting one SQLite file at once: whichever loses the
+    /// race must never empty the compact tables the winner swapped in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_upgrades_racing_on_one_sqlite_file_keep_every_record() {
+        for round in 0..5 {
+            let path = seeded_sqlite_file(200).await;
+            let (a, b) = (sqlite_file_pool(&path).await, sqlite_file_pool(&path).await);
+            let (ra, rb) = tokio::join!(
+                run(&a, DatabaseBackend::Sqlite),
+                run(&b, DatabaseBackend::Sqlite)
+            );
+            // One boot upgrades; the other finds it done, whichever point of
+            // the upgrade it had reached.
+            let mut outcomes = [
+                ra.as_ref().expect("boot a").clone(),
+                rb.as_ref().expect("boot b").clone(),
+            ];
+            outcomes.sort_by_key(|o| matches!(o, UpgradeOutcome::AlreadyDone));
+            assert_eq!(
+                outcomes,
+                [
+                    UpgradeOutcome::Upgraded {
+                        records: 200,
+                        refs: 200
+                    },
+                    UpgradeOutcome::AlreadyDone
+                ],
+                "round {round}"
+            );
+            assert!(
+                !legacy_tables_present(&a, DatabaseBackend::Sqlite)
+                    .await
+                    .expect("check")
+            );
+            assert_eq!(
+                count(&a, "happyview_records_v2").await,
+                200,
+                "round {round}: {ra:?} / {rb:?}"
+            );
+            assert_eq!(
+                count(&a, "happyview_record_refs_v2").await,
+                200,
+                "round {round}"
+            );
+            assert_eq!(
+                count(&a, "happyview_records").await,
+                200,
+                "round {round}: through the view"
+            );
+            assert_eq!(
+                count(&a, "happyview_record_refs").await,
+                200,
+                "round {round}: through the view"
+            );
+            // A third boot afterwards changes nothing.
+            assert_eq!(
+                run(&b, DatabaseBackend::Sqlite).await.expect("again"),
+                UpgradeOutcome::AlreadyDone
+            );
+            assert_eq!(count(&b, "happyview_records_v2").await, 200);
+            a.close().await;
+            b.close().await;
+            remove_sqlite_file(&path);
+        }
+    }
+
+    /// A reset that comes after the swap (a boot that lost a race and then
+    /// failed) is refused: the compact tables are the only copy by then.
+    #[tokio::test]
+    async fn reset_copy_after_a_completed_swap_leaves_the_records_alone() {
+        for db in pre_upgrade_pools().await {
+            let (pool, backend) = (&db.pool, db.backend);
+            seed_legacy(pool, backend, 12).await;
+            run(pool, backend).await.expect("upgrade");
+            let mut conn = pool.acquire().await.expect("acquire");
+            assert!(
+                !reset_copy(&mut conn, backend)
+                    .await
+                    .expect("refused, not failed")
+            );
+            drop(conn);
+            assert_eq!(count(pool, "happyview_records_v2").await, 12, "{backend:?}");
+            assert_eq!(
+                count(pool, "happyview_record_refs_v2").await,
+                12,
+                "{backend:?}"
             );
             db.finish().await;
         }
