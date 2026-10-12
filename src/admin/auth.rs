@@ -381,3 +381,157 @@ fn parse_permissions(key_permissions: &[String]) -> HashSet<Permission> {
         })
         .collect()
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuperadminSeed {
+    Created,
+    Promoted,
+    Unchanged,
+}
+
+/// Make the configured account a super user. Additive only: other super
+/// users keep their role, because the configuration names who must be an
+/// admin, not who must not be.
+pub(crate) async fn ensure_configured_superadmin(
+    db: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    did: &str,
+) -> Result<SuperadminSeed, sqlx::Error> {
+    let now = now_rfc3339();
+    let mut tx = db.begin().await?;
+
+    let existing: Option<(String, i32)> = crate::db::query_as(&adapt_sql(
+        "SELECT id, is_super FROM happyview_users WHERE did = ?",
+        backend,
+    ))
+    .bind(did)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let (user_id, seed) = match existing {
+        Some((_, is_super)) if is_super != 0 => return Ok(SuperadminSeed::Unchanged),
+        Some((id, _)) => {
+            crate::db::query(&adapt_sql(
+                "UPDATE happyview_users SET is_super = ? WHERE id = ?",
+                backend,
+            ))
+            .bind(1_i32)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+            (id, SuperadminSeed::Promoted)
+        }
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, ?, ?)",
+                backend,
+            ))
+            .bind(&id)
+            .bind(did)
+            .bind(1_i32)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+            (id, SuperadminSeed::Created)
+        }
+    };
+
+    let perm_sql = adapt_sql(
+        "INSERT INTO happyview_user_permissions (user_id, permission, granted_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+        backend,
+    );
+    for perm in Permission::all() {
+        crate::db::query(&perm_sql)
+            .bind(&user_id)
+            .bind(perm.as_str())
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+
+    log_event(
+        db,
+        EventLog {
+            event_type: "user.bootstrapped".to_string(),
+            severity: Severity::Info,
+            actor_did: None,
+            subject: Some(did.to_string()),
+            detail: serde_json::json!({ "source": "config" }),
+        },
+        backend,
+    )
+    .await;
+
+    Ok(seed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::migrated_memory_pool;
+
+    async fn user(db: &sqlx::AnyPool, did: &str) -> Option<(String, i32)> {
+        crate::db::query_as("SELECT id, is_super FROM happyview_users WHERE did = ?")
+            .bind(did)
+            .fetch_optional(db)
+            .await
+            .unwrap()
+    }
+
+    async fn insert_user(db: &sqlx::AnyPool, did: &str, is_super: i32) {
+        crate::db::query(
+            "INSERT INTO happyview_users (id, did, is_super, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(did)
+        .bind(is_super)
+        .bind(now_rfc3339())
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_absent_superadmin_is_created_with_every_permission() {
+        let db = migrated_memory_pool().await;
+        let seed = ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss")
+            .await
+            .unwrap();
+        assert_eq!(seed, SuperadminSeed::Created);
+        let (id, is_super) = user(&db, "did:plc:boss").await.unwrap();
+        assert_eq!(is_super, 1);
+        let (granted,): (i64,) = crate::db::query_as(
+            "SELECT COUNT(*) FROM happyview_user_permissions WHERE user_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(granted as usize, Permission::all().len());
+    }
+
+    #[tokio::test]
+    async fn an_existing_user_is_promoted_and_others_keep_their_role() {
+        let db = migrated_memory_pool().await;
+        insert_user(&db, "did:plc:boss", 0).await;
+        insert_user(&db, "did:plc:other-super", 1).await;
+        let seed = ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss")
+            .await
+            .unwrap();
+        assert_eq!(seed, SuperadminSeed::Promoted);
+        assert_eq!(user(&db, "did:plc:boss").await.unwrap().1, 1);
+        assert_eq!(user(&db, "did:plc:other-super").await.unwrap().1, 1);
+    }
+
+    #[tokio::test]
+    async fn a_superadmin_already_in_place_is_left_alone() {
+        let db = migrated_memory_pool().await;
+        insert_user(&db, "did:plc:boss", 1).await;
+        let seed = ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss")
+            .await
+            .unwrap();
+        assert_eq!(seed, SuperadminSeed::Unchanged);
+    }
+}

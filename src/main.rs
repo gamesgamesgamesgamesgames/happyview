@@ -208,6 +208,9 @@ async fn main() {
         );
     }
 
+    happyview::config::declarations::apply_at_boot(&config, &db_pool, db_backend, &http, &lexicons)
+        .await;
+
     // Initialize WASM runtime
     if config.plugin_cache_dir.is_none() {
         tracing::info!(

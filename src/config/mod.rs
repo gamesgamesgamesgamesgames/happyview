@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::db::DatabaseBackend;
 
+pub mod declarations;
 pub mod project;
 pub mod vars;
 
