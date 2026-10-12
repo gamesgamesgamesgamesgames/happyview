@@ -462,9 +462,11 @@ pub async fn pass(store: &RecordStore, train_at: i64) -> Result<u64, TrainError>
     }
     if considered > 0 {
         tracing::info!(considered, "recompressed record bodies");
-        if let Err(e) = crate::db::query("PRAGMA incremental_vacuum")
-            .execute(pool)
-            .await
+        if let Err(e) = crate::maintenance::sqlite::reclaim_free_pages(
+            pool,
+            crate::maintenance::sqlite::RECLAIM_CHUNK_BYTES,
+        )
+        .await
         {
             tracing::warn!(error = %e, "incremental vacuum after recompression failed");
         }

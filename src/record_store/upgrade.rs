@@ -1402,7 +1402,8 @@ const STAGING: CompatNames<'static> = CompatNames {
     refs: "happyview_record_refs_staging",
 };
 
-/// Verify and swap in one transaction, then (SQLite) reclaim the space.
+/// Verify and swap in one transaction, then (SQLite) reclaim the space in
+/// checkpointed steps.
 /// `None` when another boot swapped first. On any failure the transaction
 /// is rolled back first, releasing its locks, and then the copy is reset
 /// (which itself refuses once the legacy tables are gone).
@@ -1446,9 +1447,18 @@ async fn swap(
         tracing::info!(
             "record store upgrade: returning the legacy tables' pages to the filesystem"
         );
-        crate::db::query("PRAGMA incremental_vacuum")
-            .execute(&mut *conn)
-            .await?;
+        // In checkpointed steps: one `incremental_vacuum` over every legacy
+        // page would grow the WAL to about the legacy tables' size.
+        let reclaimed = crate::maintenance::sqlite::reclaim_free_pages_on(
+            conn,
+            crate::maintenance::sqlite::RECLAIM_CHUNK_BYTES,
+        )
+        .await?;
+        tracing::info!(
+            pages = reclaimed.pages,
+            steps = reclaimed.chunks,
+            "record store upgrade: returned the legacy tables' pages"
+        );
     }
     Ok(summary)
 }
