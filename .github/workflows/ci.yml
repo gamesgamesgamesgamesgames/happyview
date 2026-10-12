@@ -438,6 +438,9 @@ jobs:
       - name: Check that nothing links OpenSSL
         run: bash scripts/check-no-openssl.sh
 
+      - name: Version stamp
+        run: bash scripts/stamp-version.test.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
