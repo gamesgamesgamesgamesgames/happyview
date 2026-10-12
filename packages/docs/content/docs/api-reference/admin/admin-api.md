@@ -125,6 +125,7 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `GET /admin/database/status`             | `settings:manage`          |
 | `POST /admin/database/vacuum/schedule`   | `settings:manage`          |
 | `DELETE /admin/database/vacuum/schedule` | `settings:manage`          |
+| `POST /admin/storage/retrain`           | `settings:manage`          |
 | `GET /admin/settings`                    | `settings:manage`          |
 | `GET /admin/settings/db-info`            | `settings:manage`          |
 | `PUT /admin/settings/{key}`              | `settings:manage`          |
@@ -211,3 +212,23 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 ### Database disk usage and vacuum
 
 `GET /admin/database/status` reports the database and write-ahead log size, free disk space, and the status of the one-time SQLite vacuum described in [Configuration](../../getting-started/configuration.md). It also reports the periodic SQLite WAL checkpoint: `checkpoint_interval_secs` is the `SQLITE_CHECKPOINT_INTERVAL_SECS` in effect (`0` when disabled), and `checkpoint` is the latest run since the process started, or `null` before the first one and always on Postgres. A run has `at` (RFC 3339), `busy` (`true` when a reader or writer kept it from finishing), `wal_frames` (frames in the WAL when it ran) and `checkpointed_frames` (frames copied back into the database file). `POST /admin/database/vacuum/schedule` arms the vacuum to run at the next restart; `DELETE /admin/database/vacuum/schedule` disarms it. These only apply to SQLite — on a Postgres-backed instance, scheduling returns `400 Bad Request` rather than silently doing nothing.
+
+### Record compression
+
+`POST /admin/storage/retrain` trains a new zstd dictionary for one collection from up to 20,000 of its most recently stored records, as the background task does when a collection first reaches `ZSTD_DICT_TRAIN_AT` records (see [the compact record format](../../guides/database/database-setup.md#after-the-upgrade)). Records written from then on are compressed with it. Records already compressed keep the dictionary they were compressed with, and records the background task has not reached yet get the new one. SQLite only.
+
+```sh
+curl -X POST "http://127.0.0.1:3000/admin/storage/retrain" -H "$AUTH" \
+  -H 'content-type: application/json' -d '{"collection": "app.bsky.feed.post"}'
+```
+
+```json
+{ "collection": "app.bsky.feed.post", "dict_id": 3 }
+```
+
+| Status | When |
+| --- | --- |
+| `200 OK` | The dictionary was trained and is in use |
+| `400 Bad Request` | The instance runs on Postgres, or `RECORD_COMPRESSION=none` |
+| `404 Not Found` | The instance holds no records in that collection |
+| `422 Unprocessable Entity` | zstd could not train a dictionary from the records (`TrainingFailed`) |
