@@ -19,6 +19,39 @@ pub async fn apply_at_boot(
     http: &reqwest::Client,
     lexicons: &LexiconCatalog,
 ) {
+    apply_with(config, db, backend, lexicons, |nsid| async move {
+        crate::admin::network_lexicons::track_network_lexicon(
+            http,
+            &config.plc_url,
+            db,
+            backend,
+            lexicons,
+            &nsid,
+            None,
+            false,
+        )
+        .await
+    })
+    .await;
+}
+
+/// `apply_at_boot` with the per-NSID network-lexicon tracker injected, since
+/// the real one resolves over DNS.
+async fn apply_with<T, Fut>(
+    config: &Config,
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    lexicons: &LexiconCatalog,
+    track: T,
+) where
+    T: Fn(String) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                crate::admin::network_lexicons::TrackedNetworkLexicon,
+                crate::error::AppError,
+            >,
+        >,
+{
     if let Some(did) = config.superadmin_did.as_deref() {
         match ensure_configured_superadmin(db, backend, did).await {
             Ok(SuperadminSeed::Created) => info!(did, "created the configured superadmin"),
@@ -44,12 +77,11 @@ pub async fn apply_at_boot(
     }
 
     if let Err(e) = crate::admin::network_lexicons::track_declared(
-        http,
-        &config.plc_url,
+        lexicons,
         db,
         backend,
-        lexicons,
         &project.network_lexicons.include,
+        track,
     )
     .await
     {
@@ -122,5 +154,40 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(row, Some((1,)));
+    }
+
+    #[tokio::test]
+    async fn boot_hands_the_declared_network_lexicons_to_the_tracker() {
+        let db = migrated_memory_pool().await;
+        let mut config = config_with(None).await;
+        config.project = Some(std::sync::Arc::new(
+            crate::config::project::parse_project_config(
+                "[network_lexicons]\ninclude = [\"at.example.declared\"]\n",
+                std::path::Path::new("happyview.toml"),
+            )
+            .unwrap(),
+        ));
+        let seen = std::sync::Mutex::new(Vec::new());
+        apply_with(
+            &config,
+            &db,
+            DatabaseBackend::Sqlite,
+            &crate::catalog::LexiconCatalog::detached(),
+            |nsid| {
+                seen.lock().unwrap().push(nsid);
+                async {
+                    Ok(crate::admin::network_lexicons::TrackedNetworkLexicon {
+                        authority_did: "did:plc:x".into(),
+                        revision: 1,
+                        is_record: true,
+                    })
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["at.example.declared".to_string()]
+        );
     }
 }

@@ -267,26 +267,36 @@ pub(crate) async fn existing_lexicon_sources(
 /// fails to resolve is skipped with a warning and tried again next boot,
 /// so an offline laptop still starts. No backfill starts: nobody asked for
 /// a relay crawl at boot.
-pub(crate) async fn track_declared(
-    http: &reqwest::Client,
-    plc_url: &str,
+pub(crate) async fn track_declared<T, Fut>(
+    lexicons: &LexiconCatalog,
     db: &AnyPool,
     backend: DatabaseBackend,
-    lexicons: &LexiconCatalog,
     declared: &[String],
-) -> Result<DeclaredPlan, CatalogError> {
-    let plan = plan_declared(
-        declared,
-        &existing_lexicon_sources(lexicons, db, backend).await?,
-    );
+    track: T,
+) -> Result<DeclaredPlan, CatalogError>
+where
+    T: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<TrackedNetworkLexicon, AppError>>,
+{
+    let existing = existing_lexicon_sources(lexicons, db, backend).await?;
+    let plan = plan_declared(declared, &existing);
     for nsid in &plan.owned_by_dashboard {
+        let layer = existing
+            .iter()
+            .find(|(id, _)| id == nsid)
+            .map(|(_, layer)| layer.as_str());
+        let owner = if layer == Some("project") {
+            "a project file defines"
+        } else {
+            "a dashboard lexicon has"
+        };
         warn!(
             nsid,
-            "happyview.toml declares this network lexicon, but a dashboard lexicon has the same id; the dashboard lexicon is kept"
+            "happyview.toml declares this network lexicon, but {owner} the same id; that one is kept"
         );
     }
     for nsid in &plan.to_track {
-        match track_network_lexicon(http, plc_url, db, backend, lexicons, nsid, None, false).await {
+        match track(nsid.clone()).await {
             Ok(_) => info!(nsid, "tracking network lexicon declared in happyview.toml"),
             Err(e) => warn!(
                 nsid,
@@ -311,12 +321,14 @@ mod tests {
         let existing = vec![
             ("app.bsky.actor.profile".to_string(), "network".to_string()),
             ("at.example.mine".to_string(), "manual".to_string()),
+            ("at.example.file".to_string(), "project".to_string()),
         ];
         let plan = plan_declared(
             &ids(&[
                 "app.bsky.actor.profile",
                 "app.bsky.feed.post",
                 "at.example.mine",
+                "at.example.file",
                 "app.bsky.feed.post",
             ]),
             &existing,
@@ -326,7 +338,10 @@ mod tests {
             ids(&["app.bsky.feed.post"]),
             "tracked once, already-tracked skipped"
         );
-        assert_eq!(plan.owned_by_dashboard, ids(&["at.example.mine"]));
+        assert_eq!(
+            plan.owned_by_dashboard,
+            ids(&["at.example.mine", "at.example.file"])
+        );
     }
 
     #[tokio::test]
@@ -354,6 +369,62 @@ mod tests {
             .unwrap();
         let plan = plan_declared(&ids(&["at.example.mine"]), &existing);
         assert!(plan.to_track.is_empty());
+        assert_eq!(plan.owned_by_dashboard, ids(&["at.example.mine"]));
+    }
+
+    fn stub_tracked() -> TrackedNetworkLexicon {
+        TrackedNetworkLexicon {
+            authority_did: "did:plc:x".into(),
+            revision: 1,
+            is_record: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_failed_track_does_not_stop_the_rest_and_owned_ids_are_skipped() {
+        let db = migrated_memory_pool().await;
+        let lexicons = LexiconCatalog::detached();
+        lexicons
+            .put_manual(
+                &db,
+                DatabaseBackend::Sqlite,
+                LexiconWrite {
+                    lexicon_json: serde_json::json!({"lexicon":1,"id":"at.example.mine","defs":{"main":{"type":"record","key":"tid","record":{"type":"object","properties":{}}}}}),
+                    backfill: false,
+                    target_collection: None,
+                    action: ProcedureAction::Upsert,
+                    token_cost: None,
+                    authority_did: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let plan = track_declared(
+            &lexicons,
+            &db,
+            DatabaseBackend::Sqlite,
+            &ids(&["at.example.bad", "at.example.mine", "at.example.good"]),
+            |nsid| {
+                seen.lock().unwrap().push(nsid.clone());
+                async move {
+                    if nsid == "at.example.bad" {
+                        Err(AppError::BadRequest("unresolvable".into()))
+                    } else {
+                        Ok(stub_tracked())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ids(&["at.example.bad", "at.example.good"]),
+            "the failure came first and the next id was still tried; the manual id never reached the tracker"
+        );
         assert_eq!(plan.owned_by_dashboard, ids(&["at.example.mine"]));
     }
 }
