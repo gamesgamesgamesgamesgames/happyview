@@ -155,6 +155,8 @@ pub struct Reclaimed {
     pub chunks: u32,
     /// TRUNCATE checkpoints run between and after them.
     pub checkpoints: u32,
+    /// Those checkpoints that a reader or writer kept from emptying the WAL.
+    pub busy_checkpoints: u32,
     /// The most frames the WAL held at any of those checkpoints.
     pub max_wal_frames: i64,
 }
@@ -248,14 +250,24 @@ async fn reclaim(mut on: On<'_>, chunk_bytes: i64) -> Result<Reclaimed, sqlx::Er
         done.checkpoints += 1;
         done.max_wal_frames = done.max_wal_frames.max(frames);
         if busy {
-            tracing::debug!(
-                frames,
-                "checkpoint between incremental vacuum steps was busy"
-            );
+            done.busy_checkpoints += 1;
         }
+    }
+    // Every checkpoint busy means a long-lived reader kept the WAL from
+    // rewinding, so it grew by every step: the growth the steps exist to
+    // prevent, and worth saying so once.
+    if done.checkpoints > 0 && done.busy_checkpoints == done.checkpoints {
+        tracing::warn!(
+            steps = done.chunks,
+            wal_bytes = done.max_wal_frames * (page_size + WAL_FRAME_HEADER_BYTES),
+            "every checkpoint between incremental vacuum steps was busy; the write-ahead log was not emptied"
+        );
     }
     Ok(done)
 }
+
+/// Bytes of header before each page in a WAL frame.
+const WAL_FRAME_HEADER_BYTES: i64 = 24;
 
 /// Counts consecutive busy checkpoints so the task warns once per streak
 /// rather than every minute.
@@ -645,8 +657,14 @@ mod tests {
         remove_db_files(&path);
     }
 
-    /// A file database with incremental vacuum, holding `mib` MiB of free
-    /// pages from a dropped table, on a one-connection pool.
+    /// A file database of its own, holding `mib` MiB of free pages from a
+    /// dropped table, on a one-connection pool that never checkpoints by
+    /// itself. Its page cache holds `CACHE_PAGES`: an `incremental_vacuum`
+    /// step that dirties more pages than that spills them into the WAL,
+    /// while a smaller one writes only the few pages it keeps (the freed
+    /// ones are cut off the end of the file and never reach the WAL). A
+    /// fixed cache makes that split the same on every run; the default one
+    /// is shared with SQLite's process-wide memory accounting.
     async fn database_with_free_pages(auto_vacuum: &str, mib: usize) -> (AnyPool, PathBuf) {
         crate::db::install_drivers();
         let path = std::env::temp_dir().join(format!("hv-reclaim-{}.db", uuid::Uuid::new_v4()));
@@ -659,6 +677,8 @@ mod tests {
         for sql in [
             format!("PRAGMA auto_vacuum = {auto_vacuum}"),
             "PRAGMA journal_mode = WAL".to_string(),
+            "PRAGMA wal_autocheckpoint = 0".to_string(),
+            format!("PRAGMA cache_size = {CACHE_PAGES}"),
             "CREATE TABLE keep (id INTEGER PRIMARY KEY)".to_string(),
             "CREATE TABLE gone (id INTEGER PRIMARY KEY, body BLOB NOT NULL)".to_string(),
             format!(
@@ -675,6 +695,10 @@ mod tests {
         (pool, path)
     }
 
+    const CACHE_PAGES: i64 = 100;
+    /// Smaller than the cache, so a step never spills.
+    const CHUNK_PAGES: i64 = 64;
+
     async fn freelist(pool: &AnyPool) -> i64 {
         crate::db::query_scalar::<i64>("PRAGMA freelist_count")
             .fetch_one(pool)
@@ -689,21 +713,20 @@ mod tests {
         assert!(free >= 2000, "{free} free pages");
 
         let mut conn = pool.acquire().await.expect("acquire");
-        let chunk_pages = 256;
-        let done = reclaim_free_pages_on(&mut conn, 256 * 4096)
+        let done = reclaim_free_pages_on(&mut conn, CHUNK_PAGES * 4096)
             .await
             .expect("reclaim");
         drop(conn);
 
         assert_eq!(done.pages, free);
-        assert!(done.chunks >= (free / chunk_pages) as u32, "{done:?}");
+        assert!(done.chunks >= (free / CHUNK_PAGES) as u32, "{done:?}");
         assert_eq!(
             done.checkpoints, done.chunks,
             "a checkpoint after every chunk"
         );
         assert!(
-            done.max_wal_frames < 4 * chunk_pages,
-            "the WAL held one chunk's worth at most: {done:?}"
+            done.max_wal_frames < CHUNK_PAGES,
+            "the WAL held less than one step's pages: {done:?}"
         );
         assert_eq!(freelist(&pool).await, 0);
         assert_eq!(
@@ -726,10 +749,39 @@ mod tests {
             .expect("reclaim");
         assert_eq!(done.chunks, 1);
         assert!(
-            done.max_wal_frames >= 4 * 256,
-            "one chunk writes far more than the chunked loop lets through: {done:?}"
+            done.max_wal_frames >= done.pages / 2,
+            "one step past the cache spills most of the freed pages into the WAL: {done:?}"
         );
         drop(conn);
+        drop(pool);
+        remove_db_files(&path);
+    }
+
+    #[tokio::test]
+    async fn a_reader_that_keeps_every_checkpoint_busy_is_counted() {
+        let (pool, path) = database_with_free_pages("INCREMENTAL", 1).await;
+        let free = freelist(&pool).await;
+        drop(pool);
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect");
+        let mut reader = pool.begin().await.expect("begin read");
+        let _: (i64,) = crate::db::query_as("SELECT COUNT(*) FROM keep")
+            .fetch_one(&mut *reader)
+            .await
+            .expect("read");
+
+        let done = reclaim_free_pages(&pool, (free + 1) / 2 * 4096)
+            .await
+            .expect("reclaim");
+        assert_eq!(done.pages, free);
+        assert!(done.checkpoints > 0, "{done:?}");
+        assert_eq!(done.busy_checkpoints, done.checkpoints, "{done:?}");
+
+        reader.rollback().await.expect("end read");
         drop(pool);
         remove_db_files(&path);
     }
