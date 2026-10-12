@@ -905,3 +905,43 @@ async fn instance_key_list_reports_per_kid_session_counts_including_zero() {
         "a kid with no sessions must report zero, not be omitted"
     );
 }
+
+/// Clears the project layer and `APP_NAME` when dropped, so a failing
+/// assertion cannot leak either into the next test.
+struct ProjectLayerGuard;
+
+impl Drop for ProjectLayerGuard {
+    fn drop(&mut self) {
+        happyview::config::vars::set_project_layer(Default::default());
+        unsafe { std::env::remove_var("APP_NAME") };
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn the_listing_reports_a_project_file_value_with_its_source() {
+    let app = TestApp::new().await;
+    let _guard = ProjectLayerGuard;
+    unsafe { std::env::remove_var("APP_NAME") };
+    happyview::config::vars::set_project_layer(
+        [("APP_NAME".to_string(), "From The File".to_string())].into(),
+    );
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_get("/admin/settings", app.admin_cookie()))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = json_body(resp).await;
+    let entry = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["key"] == "app_name")
+        .expect("app_name entry not found in settings");
+    assert_eq!(entry["value"], "From The File");
+    assert_eq!(entry["source"], "project");
+}
