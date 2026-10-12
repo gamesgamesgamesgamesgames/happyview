@@ -160,7 +160,7 @@ test.describe("Project-owned entries", () => {
     const manualRow = page.locator("table tbody tr", { hasText: manualLexicon.id })
     await expect(manualRow).toBeVisible({ timeout: 5000 })
 
-    await page.getByRole("button", { name: /source/i }).click()
+    await page.getByRole("toolbar").getByRole("button", { name: "Source" }).click()
     await page.getByRole("option", { name: /^project/i }).click()
 
     await expect(projectRow).toBeVisible()
