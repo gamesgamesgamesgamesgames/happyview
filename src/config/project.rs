@@ -6,9 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::marker::PhantomData;
+use std::path::{Component, Path, PathBuf};
 
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
 
 pub const PROJECT_FILE: &str = "happyview.toml";
 
@@ -26,33 +28,42 @@ pub enum ConfigMode {
 pub struct ProjectConfig {
     pub happyview: HappyviewSection,
     pub instance: InstanceSection,
+    #[serde(deserialize_with = "de_interpreter_versions")]
     pub interpreters: BTreeMap<String, String>,
+    #[serde(deserialize_with = "de_library_versions")]
     pub libraries: BTreeMap<String, String>,
     pub dev: DevSection,
     pub network_lexicons: NetworkLexiconsSection,
     pub labels: LabelsSection,
     pub jetstream: JetstreamSection,
+    #[serde(deserialize_with = "de_keyed::<_, NsidRule, _>")]
     pub lexicons: BTreeMap<String, LexiconOverride>,
+    #[serde(deserialize_with = "de_keyed::<_, TriggerRule, _>")]
     pub scripts: BTreeMap<String, ScriptOverride>,
+    #[serde(deserialize_with = "de_keyed::<_, IdentifierRule, _>")]
     pub modules: BTreeMap<String, ModuleDecl>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HappyviewSection {
+    #[serde(deserialize_with = "de_some::<_, NonEmptyRule>")]
     pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InstanceSection {
+    #[serde(deserialize_with = "de_some::<_, NonEmptyRule>")]
     pub app_name: Option<String>,
+    #[serde(deserialize_with = "de_some::<_, DidRule>")]
     pub superadmin: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DevSection {
+    #[serde(deserialize_with = "de_port")]
     pub port: Option<u16>,
     pub backfill: bool,
 }
@@ -60,12 +71,14 @@ pub struct DevSection {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkLexiconsSection {
+    #[serde(deserialize_with = "de_list::<_, NsidRule>")]
     pub include: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LabelsSection {
+    #[serde(deserialize_with = "de_list::<_, DidRule>")]
     pub subscribe: Vec<String>,
 }
 
@@ -104,6 +117,7 @@ impl JetstreamProtocol {
 #[serde(default, deny_unknown_fields)]
 pub struct LexiconOverride {
     pub backfill: Option<bool>,
+    #[serde(deserialize_with = "de_some::<_, NsidRule>")]
     pub target_collection: Option<String>,
     pub action: Option<OverrideAction>,
     pub token_cost: Option<u32>,
@@ -139,10 +153,181 @@ pub struct ScriptOverride {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleDecl {
+    #[serde(deserialize_with = "de_one::<_, IdentifierRule>")]
     pub language: String,
+    #[serde(deserialize_with = "de_module_path")]
     pub path: PathBuf,
     #[serde(default)]
     pub capabilities: Vec<crate::plugin::capabilities::PluginCapability>,
+}
+
+/// A check a string must pass to be accepted where it is written. Raising
+/// it from inside deserialisation is what lets the parser report the
+/// offending value's own line.
+trait Rule {
+    fn check(value: &str) -> Result<(), String>;
+}
+
+struct NonEmptyRule;
+impl Rule for NonEmptyRule {
+    fn check(value: &str) -> Result<(), String> {
+        if value.trim().is_empty() {
+            Err("must not be empty".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct DidRule;
+impl Rule for DidRule {
+    fn check(value: &str) -> Result<(), String> {
+        atrium_api::types::string::Did::new(value.to_string())
+            .map(|_| ())
+            .map_err(|e| format!("invalid DID '{value}': {e}"))
+    }
+}
+
+struct NsidRule;
+impl Rule for NsidRule {
+    fn check(value: &str) -> Result<(), String> {
+        happyview_nsid::validate_nsid(value).map_err(|e| e.to_string())
+    }
+}
+
+/// The same grammar, reserved prefixes included, that the dashboard's
+/// script editor enforces, so a file cannot name a trigger the dashboard
+/// would refuse.
+struct TriggerRule;
+impl Rule for TriggerRule {
+    fn check(value: &str) -> Result<(), String> {
+        crate::lua::scripts::ParsedTrigger::parse(value).map(|_| ())
+    }
+}
+
+/// Interpreter language ids and module names end up in columns, URLs and
+/// build output paths, so they take the conservative shape an
+/// interpreter's `language_id` already has.
+struct IdentifierRule;
+impl Rule for IdentifierRule {
+    fn check(value: &str) -> Result<(), String> {
+        if crate::plugin::loader::is_valid_language_id(value) {
+            Ok(())
+        } else {
+            Err(format!(
+                "'{value}' must be lowercase letters, digits, '-' or '_', starting with a letter"
+            ))
+        }
+    }
+}
+
+struct Checked<R>(String, PhantomData<R>);
+
+impl<'de, R: Rule> Deserialize<'de> for Checked<R> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // The check runs inside the visitor, where the toml deserializer
+        // stamps the value's own span on a failure; one run after
+        // `String::deserialize` returns would get the enclosing array's.
+        struct CheckedVisitor<R>(PhantomData<R>);
+
+        impl<R: Rule> serde::de::Visitor<'_> for CheckedVisitor<R> {
+            type Value = Checked<R>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                R::check(value).map_err(E::custom)?;
+                Ok(Checked(value.to_string(), PhantomData))
+            }
+        }
+
+        d.deserialize_str(CheckedVisitor(PhantomData))
+    }
+}
+
+// Map keys need an order; `R` is a marker and takes no part in it.
+impl<R> PartialEq for Checked<R> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl<R> Eq for Checked<R> {}
+impl<R> PartialOrd for Checked<R> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<R> Ord for Checked<R> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+fn de_one<'de, D: Deserializer<'de>, R: Rule>(d: D) -> Result<String, D::Error> {
+    Checked::<R>::deserialize(d).map(|c| c.0)
+}
+
+fn de_some<'de, D: Deserializer<'de>, R: Rule>(d: D) -> Result<Option<String>, D::Error> {
+    de_one::<D, R>(d).map(Some)
+}
+
+fn de_list<'de, D: Deserializer<'de>, R: Rule>(d: D) -> Result<Vec<String>, D::Error> {
+    Vec::<Checked<R>>::deserialize(d).map(|items| items.into_iter().map(|c| c.0).collect())
+}
+
+fn de_keyed<'de, D, R, V>(d: D) -> Result<BTreeMap<String, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    R: Rule,
+    V: Deserialize<'de>,
+{
+    BTreeMap::<Checked<R>, V>::deserialize(d)
+        .map(|map| map.into_iter().map(|(k, v)| (k.0, v)).collect())
+}
+
+fn de_versions<'de, D: Deserializer<'de>, K: Rule>(
+    d: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    BTreeMap::<Checked<K>, Checked<NonEmptyRule>>::deserialize(d)
+        .map(|map| map.into_iter().map(|(k, v)| (k.0, v.0)).collect())
+}
+
+fn de_interpreter_versions<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    de_versions::<D, IdentifierRule>(d)
+}
+
+fn de_library_versions<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    de_versions::<D, NonEmptyRule>(d)
+}
+
+fn de_port<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u16>, D::Error> {
+    match u16::deserialize(d)? {
+        0 => Err(D::Error::custom("port must be between 1 and 65535")),
+        port => Ok(Some(port)),
+    }
+}
+
+/// A module is built from a directory the project owns, so the path can't
+/// be absolute or climb out of the root.
+fn de_module_path<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
+    let raw = String::deserialize(d)?;
+    let path = PathBuf::from(&raw);
+    let escapes = path.has_root()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)));
+    if raw.trim().is_empty() || escapes {
+        return Err(D::Error::custom(format!(
+            "module path '{raw}' must be relative to the project root and stay inside it"
+        )));
+    }
+    Ok(path)
 }
 
 #[derive(Debug)]
@@ -498,5 +683,144 @@ capabilities = ["library:call"]
         let err = load_project_config(broken.path()).unwrap_err();
         let expected = format!("{}:2:1: ", broken.path().join(PROJECT_FILE).display());
         assert!(err.to_string().starts_with(&expected), "{err}");
+    }
+
+    fn assert_refused_at(text: &str, line: usize, needle: &str) {
+        let err = parse_err(text);
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with(&format!("happyview.toml:{line}:")),
+            "expected line {line}: {rendered}"
+        );
+        assert!(
+            rendered.contains(needle),
+            "expected {needle:?} in: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_superadmin_that_is_not_a_did_is_refused() {
+        assert_refused_at(
+            "[instance]\nsuperadmin = \"alice.bsky.social\"\n",
+            2,
+            "alice.bsky.social",
+        );
+    }
+
+    #[test]
+    fn a_bad_subscription_names_the_element_line_not_the_array() {
+        assert_refused_at(
+            "[labels]\nsubscribe = [\n  \"did:plc:ar7c4by46qjdydhdevvrndac\",\n  \"not-a-did\",\n]\n",
+            4,
+            "not-a-did",
+        );
+    }
+
+    #[test]
+    fn a_network_lexicon_that_is_not_an_nsid_is_refused() {
+        assert_refused_at(
+            "[network_lexicons]\ninclude = [\"profile\"]\n",
+            2,
+            "profile",
+        );
+    }
+
+    #[test]
+    fn a_lexicon_override_keyed_by_a_non_nsid_is_refused() {
+        assert_refused_at(
+            "[lexicons.\"getArtifact\"]\nbackfill = true\n",
+            1,
+            "getArtifact",
+        );
+    }
+
+    #[test]
+    fn a_target_collection_that_is_not_an_nsid_is_refused() {
+        assert_refused_at(
+            "[lexicons.\"at.example.get\"]\ntarget_collection = \"artifact\"\n",
+            2,
+            "artifact",
+        );
+    }
+
+    #[test]
+    fn a_script_override_keyed_by_a_bad_trigger_is_refused() {
+        assert_refused_at(
+            "[scripts.\"query:at.example.get\"]\ndescription = \"x\"\n",
+            1,
+            "query",
+        );
+    }
+
+    #[test]
+    fn a_job_trigger_with_a_reserved_prefix_is_refused() {
+        assert_refused_at(
+            "[scripts.\"job.run:happyview.delete-collection\"]\ndescription = \"x\"\n",
+            1,
+            "happyview.",
+        );
+    }
+
+    #[test]
+    fn an_interpreter_named_outside_the_language_id_shape_is_refused() {
+        assert_refused_at("[interpreters]\nLua = \"1.4.0\"\n", 2, "Lua");
+    }
+
+    #[test]
+    fn an_empty_version_is_refused() {
+        assert_refused_at("[libraries]\nhttp = \"\"\n", 2, "empty");
+        assert_refused_at("[happyview]\nversion = \" \"\n", 2, "empty");
+    }
+
+    #[test]
+    fn an_empty_app_name_is_refused() {
+        assert_refused_at("[instance]\napp_name = \"\"\n", 2, "empty");
+    }
+
+    #[test]
+    fn port_zero_is_refused() {
+        assert_refused_at("[dev]\nport = 0\n", 2, "port");
+    }
+
+    #[test]
+    fn a_module_path_must_stay_inside_the_project() {
+        for (path, line) in [
+            ("../elsewhere", 3),
+            ("/opt/module", 3),
+            ("modules/../../x", 3),
+        ] {
+            assert_refused_at(
+                &format!("[modules.registry]\nlanguage = \"rust\"\npath = \"{path}\"\n"),
+                line,
+                "inside",
+            );
+        }
+        assert!(
+            parse("[modules.registry]\nlanguage = \"rust\"\npath = \"./modules/registry\"\n")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_module_name_must_be_usable_as_a_file_name() {
+        assert_refused_at(
+            "[modules.\"My Module\"]\nlanguage = \"rust\"\npath = \"m\"\n",
+            1,
+            "My Module",
+        );
+    }
+
+    #[test]
+    fn a_module_language_outside_the_identifier_shape_is_refused() {
+        assert_refused_at(
+            "[modules.m]\nlanguage = \"Rust\"\npath = \"m\"\n",
+            2,
+            "Rust",
+        );
+    }
+
+    #[test]
+    fn the_full_example_still_parses_under_validation() {
+        parse(FULL).unwrap();
     }
 }
