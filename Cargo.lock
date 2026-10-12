@@ -1945,6 +1945,7 @@ dependencies = [
  "k256",
  "libc",
  "libsqlite3-sys",
+ "lru",
  "mlua",
  "multibase",
  "p256 0.14.0",

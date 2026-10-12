@@ -629,10 +629,10 @@ pub async fn sqlite_optimize(pool: &AnyPool) -> Result<(), sqlx::Error> {
 
 /// Apply per-connection SQLite pragmas to every pooled connection.
 ///
-/// `journal_size_limit` and `synchronous` are per-connection and not persisted
-/// in the database file, so unlike `journal_mode` they cannot be set once
-/// against the pool — that would reach only whichever single connection served
-/// the statement.
+/// `journal_size_limit`, `synchronous` and `foreign_keys` are per-connection
+/// and not persisted in the database file, so unlike `journal_mode` they
+/// cannot be set once against the pool — that would reach only whichever
+/// single connection served the statement.
 fn with_sqlite_pragmas(
     opts: PoolOptions<sqlx::Any>,
     backend: DatabaseBackend,
@@ -656,6 +656,12 @@ fn with_sqlite_pragmas(
                 DatabaseBackend::Sqlite,
             );
             crate::db::query(&sync_sql).execute(&mut *conn).await?;
+            // sqlx's SQLite driver already turns foreign keys on for every
+            // connection it opens; set here as well, so `ON DELETE CASCADE`
+            // from a record to its refs never rests on that default alone.
+            crate::db::query("PRAGMA foreign_keys = ON")
+                .execute(&mut *conn)
+                .await?;
             Ok(())
         })
     })
@@ -707,7 +713,7 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
     .await
     .expect("Failed to connect to database");
 
-    // Enable foreign keys and WAL mode for SQLite
+    // Incremental vacuum, WAL mode and the busy timeout for SQLite
     if backend == DatabaseBackend::Sqlite {
         // Must run before any table exists: on a populated database this is a
         // silent no-op until a full VACUUM rebuilds the file. New instances get
@@ -717,11 +723,6 @@ pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
             .execute(&pool)
             .await
             .expect("Failed to set auto_vacuum");
-
-        crate::db::query("PRAGMA foreign_keys = ON")
-            .execute(&pool)
-            .await
-            .expect("Failed to enable foreign keys");
 
         crate::db::query("PRAGMA journal_mode = WAL")
             .execute(&pool)
@@ -932,11 +933,6 @@ pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPo
     .expect("Failed to connect backfill database pool");
 
     if backend == DatabaseBackend::Sqlite {
-        crate::db::query("PRAGMA foreign_keys = ON")
-            .execute(&pool)
-            .await
-            .expect("Failed to enable foreign keys on backfill pool");
-
         crate::db::query("PRAGMA journal_mode = WAL")
             .execute(&pool)
             .await
