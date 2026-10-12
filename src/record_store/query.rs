@@ -158,13 +158,18 @@ type RecordRow = (
     i64,
 );
 
+/// What a page cursor that does not parse is refused with. Script runners
+/// recognise it and answer the caller 400 `InvalidRequest`
+/// (`lua::execute`), since the cursor is the caller's.
+pub const INVALID_CURSOR: &str = "invalid cursor: request the first page again";
+
 /// A keyset cursor: `(created_at_us, id)`. Anything else, including a cursor
 /// from before the compact format (`created_at|uri`), is refused rather than
 /// read as the first page.
 fn keyset_cursor(cursor: &str) -> Result<(i64, i64), RecordsError> {
     decode_cursor(cursor)
         .and_then(|(ts, id)| Some((ts.parse().ok()?, id.parse().ok()?)))
-        .ok_or_else(|| invalid("invalid cursor: request the first page again"))
+        .ok_or_else(|| invalid(INVALID_CURSOR))
 }
 
 /// The keyset seek after `cursor`, newest first. A row-value comparison, so
