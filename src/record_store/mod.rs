@@ -13,6 +13,7 @@ pub mod compression;
 pub mod intern;
 pub mod query;
 pub mod sqlite_functions;
+pub mod upgrade;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

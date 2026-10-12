@@ -131,7 +131,7 @@ pub enum RebuildOutcome {
     },
 }
 
-async fn put_setting(
+pub(crate) async fn put_setting(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     key: &str,
@@ -154,7 +154,7 @@ async fn put_setting(
     Ok(())
 }
 
-async fn get_setting(
+pub(crate) async fn get_setting(
     db: &sqlx::AnyPool,
     backend: DatabaseBackend,
     key: &str,
