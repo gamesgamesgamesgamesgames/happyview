@@ -166,6 +166,9 @@ export default function ScriptDetail() {
   }
 
   const canManage = hasPermission("scripts:manage");
+  // A project file owns this script: it changes by editing the file, so the
+  // page offers nothing that would write.
+  const projectPath = script?.layer === "project" ? script.path : null;
   const parsed = parseTriggerId(id);
   const familyLabel: Record<TriggerFamily, string> = {
     record: "Record event",
@@ -248,9 +251,29 @@ export default function ScriptDetail() {
             </div>
           )}
 
-          <ScriptForm state={state} onChange={setState} idLocked />
+          {projectPath && script?.shadows_stored && (
+            <p className="text-muted-foreground text-xs">
+              A dashboard version of this script is kept and runs again if the
+              file is removed.
+            </p>
+          )}
+
+          <ScriptForm
+            state={state}
+            onChange={setState}
+            idLocked
+            readOnly={projectPath !== null}
+          />
         </div>
 
+        {projectPath ? (
+          <footer className="bg-sidebar-accent flex gap-2 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
+            <p className="text-muted-foreground text-sm">
+              Defined by <span className="font-mono">{projectPath}</span>. Edit
+              that file to change this script.
+            </p>
+          </footer>
+        ) : (
         <footer className="bg-sidebar-accent flex justify-between gap-2 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
           {canManage && (
             <AlertDialog>
@@ -322,6 +345,7 @@ export default function ScriptDetail() {
             )}
           </div>
         </footer>
+        )}
       </div>
     </>
   );

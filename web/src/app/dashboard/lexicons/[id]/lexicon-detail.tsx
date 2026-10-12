@@ -130,6 +130,9 @@ export default function LexiconDetailPage() {
 
   const isNetwork = lexicon.source === "network";
   const isRecord = lexicon.lexicon_type === "record";
+  // A project file owns this lexicon: it changes by editing the file.
+  const projectPath = lexicon.layer === "project" ? lexicon.path : null;
+  const readOnly = isNetwork || projectPath !== null;
 
   // Triggers that target this lexicon's id, given its type.
   //
@@ -193,18 +196,22 @@ export default function LexiconDetailPage() {
                 </p>
               </div>
             )}
-            <div>
-              <Label className="text-muted-foreground">Created</Label>
-              <p className="mt-1 text-sm">
-                {new Date(lexicon.created_at).toLocaleString()}
-              </p>
-            </div>
-            <div>
-              <Label className="text-muted-foreground">Updated</Label>
-              <p className="mt-1 text-sm">
-                {new Date(lexicon.updated_at).toLocaleString()}
-              </p>
-            </div>
+            {lexicon.created_at && (
+              <div>
+                <Label className="text-muted-foreground">Created</Label>
+                <p className="mt-1 text-sm">
+                  {new Date(lexicon.created_at).toLocaleString()}
+                </p>
+              </div>
+            )}
+            {lexicon.updated_at && (
+              <div>
+                <Label className="text-muted-foreground">Updated</Label>
+                <p className="mt-1 text-sm">
+                  {new Date(lexicon.updated_at).toLocaleString()}
+                </p>
+              </div>
+            )}
             {lexicon.last_fetched_at && (
               <div>
                 <Label className="text-muted-foreground">Last Fetched</Label>
@@ -227,7 +234,7 @@ export default function LexiconDetailPage() {
                   placeholder="default"
                   value={tokenCost}
                   onChange={(e) => setTokenCost(e.target.value)}
-                  disabled={!hasPermission("lexicons:create")}
+                  disabled={projectPath !== null || !hasPermission("lexicons:create")}
                 />
               </div>
             )}
@@ -239,8 +246,8 @@ export default function LexiconDetailPage() {
           <CodePanels
             className="flex-1 min-h-0"
             jsonValue={jsonText}
-            onJsonChange={isNetwork ? undefined : setJsonText}
-            jsonReadOnly={isNetwork}
+            onJsonChange={readOnly ? undefined : setJsonText}
+            jsonReadOnly={readOnly}
           />
 
           {targetingTriggers.length > 0 && (
@@ -261,14 +268,21 @@ export default function LexiconDetailPage() {
 
         {/* Actions */}
         <footer className="bg-sidebar-accent flex justify-between gap-2 ps-4 py-2 md:px-6 md:py-4 rounded-b-md">
-          {hasPermission("lexicons:delete") && (
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleting}
-            >
-              {deleting ? "Deleting..." : "Delete Lexicon"}
-            </Button>
+          {projectPath ? (
+            <p className="text-muted-foreground text-sm self-center">
+              Defined by <span className="font-mono">{projectPath}</span>. Edit
+              that file to change this lexicon.
+            </p>
+          ) : (
+            hasPermission("lexicons:delete") && (
+              <Button
+                variant="destructive"
+                onClick={handleDelete}
+                disabled={deleting}
+              >
+                {deleting ? "Deleting..." : "Delete Lexicon"}
+              </Button>
+            )
           )}
 
           <div className="flex gap-2">
@@ -282,7 +296,7 @@ export default function LexiconDetailPage() {
                 Services
               </Button>
             )}
-            {hasPermission("lexicons:create") && (
+            {projectPath === null && hasPermission("lexicons:create") && (
               <Button onClick={handleSave} disabled={!isDirty || saving}>
                 {saving ? "Saving..." : "Save"}
               </Button>

@@ -8,8 +8,15 @@ export interface LexiconSummary {
   source: string
   authority_did: string | null
   last_fetched_at: string | null
-  created_at: string
-  updated_at: string
+  /** `null` for a project lexicon, which has no stored row. */
+  created_at: string | null
+  updated_at: string | null
+  /** `"project"` when a file in the instance's project defines this lexicon. */
+  layer: "project" | "manual" | "network"
+  /** Project-relative file path, for a project lexicon only. */
+  path: string | null
+  /** A stored lexicon sits under this project file and answers again if it is removed. */
+  shadows_stored: boolean
   token_cost: number | null
 }
 

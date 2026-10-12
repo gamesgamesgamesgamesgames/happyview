@@ -190,6 +190,7 @@ export function ScriptForm({
   idLocked,
   lexicons,
   lexiconsLoading,
+  readOnly,
 }: {
   state: ScriptFormState;
   onChange: (next: ScriptFormState) => void;
@@ -198,6 +199,8 @@ export function ScriptForm({
   lexicons?: LexiconSummary[];
   /** True while the lexicon list is being fetched. */
   lexiconsLoading?: boolean;
+  /** For a script a project file owns: everything shows, nothing edits. */
+  readOnly?: boolean;
 }) {
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
@@ -220,6 +223,7 @@ export function ScriptForm({
           id="description"
           value={state.description}
           onChange={(e) => onChange({ ...state, description: e.target.value })}
+          readOnly={readOnly}
           maxLength={300}
           rows={2}
           placeholder="What does this script do?"
@@ -236,6 +240,7 @@ export function ScriptForm({
             value={state.body}
             onChange={(v) => onChange({ ...state, body: v })}
             language="lua"
+            readOnly={readOnly}
             className="h-full"
           />
         </div>

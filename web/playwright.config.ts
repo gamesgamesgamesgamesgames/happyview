@@ -52,6 +52,7 @@ export default defineConfig({
         // had never actually run.
         "telemetry-settings.spec.ts",
         "telemetry-prompt.spec.ts",
+        "project-layer.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },
