@@ -4,9 +4,8 @@ use axum::http::StatusCode;
 use serde_json::Value;
 
 use crate::AppState;
-use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
-use crate::lexicon::{LexiconType, ParsedLexicon, ProcedureAction};
+use crate::lexicon::{LexiconType, ProcedureAction};
 use crate::resolve::{fetch_lexicon_from_pds, resolve_nsid_authority};
 
 use super::auth::UserAuth;
@@ -57,6 +56,9 @@ pub(super) async fn add(
     auth.require(Permission::LexiconsCreate).await?;
     let nsid = &body.nsid;
 
+    // Ahead of resolution: a file the project owns is never the network's.
+    state.lexicons.check_writable(nsid)?;
+
     // Resolve NSID authority via DNS TXT lookup.
     let (authority_did, pds_endpoint) =
         resolve_nsid_authority(&state.http, &state.config.plc_url, nsid).await?;
@@ -65,65 +67,26 @@ pub(super) async fn add(
     let lexicon_json =
         fetch_lexicon_from_pds(&state.http, &pds_endpoint, &authority_did, nsid).await?;
 
-    // Parse to validate.
-    let parsed = ParsedLexicon::parse(
-        lexicon_json.clone(),
-        1,
-        body.target_collection.clone(),
-        ProcedureAction::Upsert,
-        None,
-    )
-    .map_err(|e| AppError::BadRequest(format!("failed to parse lexicon: {e}")))?;
-
-    let backend = state.db_backend;
-    let now = now_rfc3339();
-    let lexicon_json_str = serde_json::to_string(&lexicon_json).unwrap_or_default();
-
-    // Upsert into lexicons table with network source.
-    let sql = adapt_sql(
-        r#"
-        INSERT INTO happyview_lexicons (id, lexicon_json, backfill, target_collection, source, authority_did, last_fetched_at, created_at)
-        VALUES (?, ?, ?, ?, 'network', ?, ?, ?)
-        ON CONFLICT (id) DO UPDATE SET
-            lexicon_json = EXCLUDED.lexicon_json,
-            backfill = EXCLUDED.backfill,
-            target_collection = EXCLUDED.target_collection,
-            source = 'network',
-            authority_did = EXCLUDED.authority_did,
-            last_fetched_at = ?,
-            revision = happyview_lexicons.revision + 1,
-            updated_at = ?
-        RETURNING revision
-        "#,
-        backend,
-    );
-    let row: (i32,) = crate::db::query_as(&sql)
-        .bind(nsid)
-        .bind(&lexicon_json_str)
-        .bind(if body.backfill { 1_i32 } else { 0_i32 })
-        .bind(&body.target_collection)
-        .bind(&authority_did)
-        .bind(&now)
-        .bind(&now)
-        .bind(&now)
-        .bind(&now)
-        .fetch_one(&state.db)
+    let revision = state
+        .lexicons
+        .put_network(
+            &state.db,
+            state.db_backend,
+            crate::catalog::LexiconWrite {
+                lexicon_json,
+                backfill: body.backfill,
+                target_collection: body.target_collection,
+                action: ProcedureAction::Upsert,
+                token_cost: None,
+                authority_did: Some(authority_did.clone()),
+            },
+        )
+        .await?;
+    let is_record = state
+        .lexicons
+        .get(nsid)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to upsert network lexicon: {e}")))?;
-
-    let revision = row.0;
-
-    // Update in-memory registry.
-    let is_record = parsed.lexicon_type == LexiconType::Record;
-    let parsed = ParsedLexicon::parse(
-        lexicon_json,
-        revision,
-        body.target_collection,
-        ProcedureAction::Upsert,
-        None,
-    )
-    .map_err(|e| AppError::Internal(format!("failed to re-parse lexicon: {e}")))?;
-    state.lexicons.upsert(parsed).await;
+        .is_some_and(|l| l.lexicon_type == LexiconType::Record);
 
     if is_record {
         notify_collections(&state).await;
@@ -170,36 +133,18 @@ pub(super) async fn list(
 ) -> Result<Json<Vec<NetworkLexiconSummary>>, AppError> {
     auth.require(Permission::LexiconsRead).await?;
 
-    let backend = state.db_backend;
-    let sql = adapt_sql(
-        "SELECT id, authority_did, target_collection, last_fetched_at, created_at FROM happyview_lexicons WHERE source = 'network' ORDER BY id",
-        backend,
-    );
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-    )> = crate::db::query_as(&sql)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list network lexicons: {e}")))?;
-
-    let summaries: Vec<NetworkLexiconSummary> = rows
+    let summaries: Vec<NetworkLexiconSummary> = state
+        .lexicons
+        .list_network(&state.db, state.db_backend)
+        .await?
         .into_iter()
-        .map(
-            |(nsid, authority_did, target_collection, last_fetched_at, created_at)| {
-                NetworkLexiconSummary {
-                    nsid,
-                    authority_did: authority_did.unwrap_or_default(),
-                    target_collection,
-                    last_fetched_at,
-                    created_at,
-                }
-            },
-        )
+        .map(|l| NetworkLexiconSummary {
+            nsid: l.id,
+            authority_did: l.authority_did.unwrap_or_default(),
+            target_collection: l.target_collection,
+            last_fetched_at: l.last_fetched_at,
+            created_at: l.created_at.unwrap_or_default(),
+        })
         .collect();
 
     Ok(Json(summaries))
@@ -213,25 +158,16 @@ pub(super) async fn remove(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::LexiconsDelete).await?;
 
-    let backend = state.db_backend;
-    let sql = adapt_sql(
-        "DELETE FROM happyview_lexicons WHERE id = ? AND source = 'network'",
-        backend,
-    );
-    let result = crate::db::query(&sql)
-        .bind(&nsid)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to delete network lexicon: {e}")))?;
-
-    if result.rows_affected() == 0 {
+    state.lexicons.check_writable(&nsid)?;
+    if !state
+        .lexicons
+        .remove_network(&state.db, state.db_backend, &nsid)
+        .await?
+    {
         return Err(AppError::NotFound(format!(
             "network lexicon '{nsid}' not found"
         )));
     }
-
-    state.lexicons.forget(&nsid).await;
     notify_collections(&state).await;
-
     Ok(StatusCode::NO_CONTENT)
 }

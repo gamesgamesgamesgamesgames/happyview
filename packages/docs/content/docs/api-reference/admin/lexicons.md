@@ -208,8 +208,17 @@ interface Lexicon {
   revision: number;
   lexicon_type: string;
   backfill: boolean;
-  created_at: string;
-  updated_at: string;
+  // "project" when a file in the instance's project defines this lexicon,
+  // otherwise "manual" or "network". `source` carries the same value.
+  layer: "project" | "manual" | "network";
+  // Project-relative path of the file, for a project lexicon only.
+  path: string | null;
+  // A dashboard or network row sits under this project file. It is kept and
+  // answers again if the file is removed.
+  shadows_stored: boolean;
+  // null for a project lexicon, which has no stored row.
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 const response = await fetch("http://127.0.0.1:3000/admin/lexicons", {
@@ -335,6 +344,14 @@ curl -X DELETE http://127.0.0.1:3000/admin/lexicons/xyz.statusphere.status -H "$
 ```
 
 **Response**: `204 No Content`
+
+## Lexicons a project file defines
+
+When the instance runs a project, a lexicon defined by a file under `src/` answers ahead of any stored row with the same id. Uploading, deleting, adding as a network lexicon or removing as one is refused with `409 Conflict`:
+
+    { "error": "defined by the project file src/lexicons/com/example/thing.json; change that file instead" }
+
+A stored row the file shadows is kept as it is and answers again when the file is removed.
 
 ## Network Lexicons
 
