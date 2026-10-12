@@ -1,9 +1,15 @@
+use std::collections::HashSet;
+
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde_json::Value;
+use sqlx::AnyPool;
+use tracing::{info, warn};
 
 use crate::AppState;
+use crate::catalog::{CatalogError, LexiconCatalog, LexiconWrite};
+use crate::db::DatabaseBackend;
 use crate::error::AppError;
 use crate::lexicon::{LexiconType, ProcedureAction};
 use crate::resolve::{fetch_lexicon_from_pds, resolve_nsid_authority};
@@ -47,6 +53,58 @@ pub(super) async fn resolve(
     })))
 }
 
+pub(crate) struct TrackedNetworkLexicon {
+    pub authority_did: String,
+    pub revision: i32,
+    pub is_record: bool,
+}
+
+/// Resolve an NSID's authority, fetch its lexicon and store it as a network
+/// row through the catalog. Shared by the dashboard's add and the boot-time
+/// application of `[network_lexicons]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn track_network_lexicon(
+    http: &reqwest::Client,
+    plc_url: &str,
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    lexicons: &LexiconCatalog,
+    nsid: &str,
+    target_collection: Option<String>,
+    backfill: bool,
+) -> Result<TrackedNetworkLexicon, AppError> {
+    // Ahead of resolution: a file the project owns is never the network's.
+    lexicons.check_writable(nsid)?;
+
+    let (authority_did, pds_endpoint) = resolve_nsid_authority(http, plc_url, nsid).await?;
+    let lexicon_json = fetch_lexicon_from_pds(http, &pds_endpoint, &authority_did, nsid).await?;
+
+    let revision = lexicons
+        .put_network(
+            db,
+            backend,
+            LexiconWrite {
+                lexicon_json,
+                backfill,
+                target_collection,
+                action: ProcedureAction::Upsert,
+                token_cost: None,
+                authority_did: Some(authority_did.clone()),
+            },
+        )
+        .await?;
+    let is_record = lexicons
+        .get(nsid)
+        .await
+        .is_some_and(|l| l.lexicon_type == LexiconType::Record);
+
+    Ok(TrackedNetworkLexicon {
+        authority_did,
+        revision,
+        is_record,
+    })
+}
+
 /// POST /admin/network-lexicons — add a network lexicon to watch.
 pub(super) async fn add(
     State(state): State<AppState>,
@@ -56,71 +114,54 @@ pub(super) async fn add(
     auth.require(Permission::LexiconsCreate).await?;
     let nsid = &body.nsid;
 
-    // Ahead of resolution: a file the project owns is never the network's.
-    state.lexicons.check_writable(nsid)?;
+    let tracked = track_network_lexicon(
+        &state.http,
+        &state.config.plc_url,
+        &state.db,
+        state.db_backend,
+        &state.lexicons,
+        nsid,
+        body.target_collection.clone(),
+        body.backfill,
+    )
+    .await?;
 
-    // Resolve NSID authority via DNS TXT lookup.
-    let (authority_did, pds_endpoint) =
-        resolve_nsid_authority(&state.http, &state.config.plc_url, nsid).await?;
-
-    // Fetch the lexicon from the authority's PDS.
-    let lexicon_json =
-        fetch_lexicon_from_pds(&state.http, &pds_endpoint, &authority_did, nsid).await?;
-
-    let revision = state
-        .lexicons
-        .put_network(
-            &state.db,
-            state.db_backend,
-            crate::catalog::LexiconWrite {
-                lexicon_json,
-                backfill: body.backfill,
-                target_collection: body.target_collection,
-                action: ProcedureAction::Upsert,
-                token_cost: None,
-                authority_did: Some(authority_did.clone()),
-            },
-        )
-        .await?;
-    let is_record = state
-        .lexicons
-        .get(nsid)
-        .await
-        .is_some_and(|l| l.lexicon_type == LexiconType::Record);
-
-    if is_record {
+    if tracked.is_record {
         notify_collections(&state).await;
     }
 
-    let backfill_job_id: Option<String> =
-        if is_record && body.backfill && revision == 1 && auth.has(Permission::BackfillCreate) {
-            match crate::admin::backfill::start_backfill(
-                &state,
-                Some(nsid.clone()),
-                Vec::new(),
-                &auth.did,
-            )
-            .await
-            {
-                Ok(job_id) => Some(job_id),
-                Err(e) => {
-                    tracing::warn!(
-                        lexicon = nsid.as_str(),
-                        "failed to start backfill for network lexicon: {e}"
-                    );
-                    None
-                }
+    let backfill_job_id: Option<String> = if tracked.is_record
+        && body.backfill
+        && tracked.revision == 1
+        && auth.has(Permission::BackfillCreate)
+    {
+        match crate::admin::backfill::start_backfill(
+            &state,
+            Some(nsid.clone()),
+            Vec::new(),
+            &auth.did,
+        )
+        .await
+        {
+            Ok(job_id) => Some(job_id),
+            Err(e) => {
+                warn!(
+                    lexicon = nsid.as_str(),
+                    "failed to start backfill for network lexicon: {e}"
+                );
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     Ok((
         StatusCode::CREATED,
         Json(serde_json::json!({
             "nsid": nsid,
-            "authority_did": authority_did,
-            "revision": revision,
+            "authority_did": tracked.authority_did,
+            "revision": tracked.revision,
             "backfill_job_id": backfill_job_id,
         })),
     ))
@@ -139,6 +180,7 @@ pub(super) async fn list(
         .await?
         .into_iter()
         .map(|l| NetworkLexiconSummary {
+            declared: state.config.declares_network_lexicon(&l.id),
             nsid: l.id,
             authority_did: l.authority_did.unwrap_or_default(),
             target_collection: l.target_collection,
@@ -158,6 +200,14 @@ pub(super) async fn remove(
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::LexiconsDelete).await?;
 
+    // The dashboard's error toast rewrites any message containing "network"
+    // into a connection failure, so this one names the file instead.
+    if state.config.declares_network_lexicon(&nsid) {
+        return Err(AppError::Conflict(format!(
+            "'{nsid}' is declared in happyview.toml; remove it from the file instead"
+        )));
+    }
+
     state.lexicons.check_writable(&nsid)?;
     if !state
         .lexicons
@@ -170,4 +220,140 @@ pub(super) async fn remove(
     }
     notify_collections(&state).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) struct DeclaredPlan {
+    pub to_track: Vec<String>,
+    pub owned_by_dashboard: Vec<String>,
+}
+
+/// Which declared NSIDs still need tracking. One a dashboard lexicon already
+/// uses is reported rather than tracked: tracking would rewrite that row as
+/// a network lexicon, and the project never changes a dashboard row.
+pub(crate) fn plan_declared(declared: &[String], existing: &[(String, String)]) -> DeclaredPlan {
+    let mut plan = DeclaredPlan {
+        to_track: Vec::new(),
+        owned_by_dashboard: Vec::new(),
+    };
+    let mut seen = HashSet::new();
+    for nsid in declared {
+        if !seen.insert(nsid.as_str()) {
+            continue;
+        }
+        match existing.iter().find(|(id, _)| id == nsid) {
+            None => plan.to_track.push(nsid.clone()),
+            Some((_, source)) if source == "network" => {}
+            Some(_) => plan.owned_by_dashboard.push(nsid.clone()),
+        }
+    }
+    plan
+}
+
+/// Every lexicon id the catalog answers for, with the layer it comes from.
+pub(crate) async fn existing_lexicon_sources(
+    lexicons: &LexiconCatalog,
+    db: &AnyPool,
+    backend: DatabaseBackend,
+) -> Result<Vec<(String, String)>, CatalogError> {
+    Ok(lexicons
+        .list(db, backend)
+        .await?
+        .into_iter()
+        .map(|l| (l.id, l.layer.as_str().to_string()))
+        .collect())
+}
+
+/// Track every declared network lexicon not already tracked. An NSID that
+/// fails to resolve is skipped with a warning and tried again next boot,
+/// so an offline laptop still starts. No backfill starts: nobody asked for
+/// a relay crawl at boot.
+pub(crate) async fn track_declared(
+    http: &reqwest::Client,
+    plc_url: &str,
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    lexicons: &LexiconCatalog,
+    declared: &[String],
+) -> Result<DeclaredPlan, CatalogError> {
+    let plan = plan_declared(
+        declared,
+        &existing_lexicon_sources(lexicons, db, backend).await?,
+    );
+    for nsid in &plan.owned_by_dashboard {
+        warn!(
+            nsid,
+            "happyview.toml declares this network lexicon, but a dashboard lexicon has the same id; the dashboard lexicon is kept"
+        );
+    }
+    for nsid in &plan.to_track {
+        match track_network_lexicon(http, plc_url, db, backend, lexicons, nsid, None, false).await {
+            Ok(_) => info!(nsid, "tracking network lexicon declared in happyview.toml"),
+            Err(e) => warn!(
+                nsid,
+                "could not track network lexicon declared in happyview.toml: {e}"
+            ),
+        }
+    }
+    Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::migrated_memory_pool;
+
+    fn ids(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_untracked_declarations_are_tracked() {
+        let existing = vec![
+            ("app.bsky.actor.profile".to_string(), "network".to_string()),
+            ("at.example.mine".to_string(), "manual".to_string()),
+        ];
+        let plan = plan_declared(
+            &ids(&[
+                "app.bsky.actor.profile",
+                "app.bsky.feed.post",
+                "at.example.mine",
+                "app.bsky.feed.post",
+            ]),
+            &existing,
+        );
+        assert_eq!(
+            plan.to_track,
+            ids(&["app.bsky.feed.post"]),
+            "tracked once, already-tracked skipped"
+        );
+        assert_eq!(plan.owned_by_dashboard, ids(&["at.example.mine"]));
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_lexicon_with_a_declared_id_is_never_converted() {
+        let db = migrated_memory_pool().await;
+        let lexicons = LexiconCatalog::detached();
+        lexicons
+            .put_manual(
+                &db,
+                DatabaseBackend::Sqlite,
+                LexiconWrite {
+                    lexicon_json: serde_json::json!({"lexicon":1,"id":"at.example.mine","defs":{"main":{"type":"record","key":"tid","record":{"type":"object","properties":{}}}}}),
+                    backfill: false,
+                    target_collection: None,
+                    action: ProcedureAction::Upsert,
+                    token_cost: None,
+                    authority_did: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let existing = existing_lexicon_sources(&lexicons, &db, DatabaseBackend::Sqlite)
+            .await
+            .unwrap();
+        let plan = plan_declared(&ids(&["at.example.mine"]), &existing);
+        assert!(plan.to_track.is_empty());
+        assert_eq!(plan.owned_by_dashboard, ids(&["at.example.mine"]));
+    }
 }

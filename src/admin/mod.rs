@@ -15,7 +15,7 @@ mod jobs;
 mod labelers;
 mod lexicons;
 mod linked_repos;
-mod network_lexicons;
+pub(crate) mod network_lexicons;
 pub(crate) mod permissions;
 mod platform;
 mod plugins;

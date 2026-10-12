@@ -280,6 +280,7 @@ pub(super) struct NetworkLexiconSummary {
     pub(super) target_collection: Option<String>,
     pub(super) last_fetched_at: Option<String>,
     pub(super) created_at: String,
+    pub(super) declared: bool,
 }
 
 // ---------------------------------------------------------------------------

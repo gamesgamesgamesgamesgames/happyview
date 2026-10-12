@@ -43,7 +43,18 @@ pub async fn apply_at_boot(
         Err(e) => error!("could not subscribe to the labelers declared in happyview.toml: {e}"),
     }
 
-    let _ = (http, lexicons);
+    if let Err(e) = crate::admin::network_lexicons::track_declared(
+        http,
+        &config.plc_url,
+        db,
+        backend,
+        lexicons,
+        &project.network_lexicons.include,
+    )
+    .await
+    {
+        error!("could not read lexicons to apply happyview.toml's [network_lexicons]: {e}");
+    }
 }
 
 #[cfg(test)]
