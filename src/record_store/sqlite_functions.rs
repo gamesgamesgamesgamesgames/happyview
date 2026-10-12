@@ -19,9 +19,10 @@
 //! agreement. NULL in gives NULL out, for every function but
 //! `hv_now_micros`.
 
-use std::ffi::{CStr, c_char, c_int};
+use std::collections::HashMap;
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 
 use libsqlite3_sys as ffi;
 
@@ -58,8 +59,26 @@ unsafe extern "C" fn init(
     _err: *mut *mut c_char,
     _api: *const ffi::sqlite3_api_routines,
 ) -> c_int {
-    let functions: [(&CStr, c_int, c_int, ScalarFn); 7] = [
-        (c"hv_record", 2, PURE, hv_record),
+    let state = Box::into_raw(Box::new(ConnDicts::default())).cast::<c_void>();
+    // SAFETY: as below; SQLite owns `state` from here and frees it with
+    // `drop_conn_dicts`, also when registration fails.
+    let rc = unsafe {
+        ffi::sqlite3_create_function_v2(
+            db,
+            c"hv_record".as_ptr(),
+            2,
+            PURE,
+            state,
+            Some(hv_record),
+            None,
+            None,
+            Some(drop_conn_dicts),
+        )
+    };
+    if rc != ffi::SQLITE_OK {
+        return rc;
+    }
+    let functions: [(&CStr, c_int, c_int, ScalarFn); 6] = [
         (c"hv_cid_text", 1, PURE, hv_cid_text),
         (c"hv_cid_bytes", 1, PURE, hv_cid_bytes),
         (c"hv_ts_text", 1, PURE, hv_ts_text),
@@ -93,6 +112,20 @@ unsafe extern "C" fn init(
         }
     }
     ffi::SQLITE_OK
+}
+
+/// One connection's decoded dictionaries, by `happyview_zstd_dicts.id`.
+/// Per connection because a dictionary id means something only in its own
+/// database, and a process may have several open.
+#[derive(Default)]
+struct ConnDicts {
+    dicts: Mutex<HashMap<i64, Arc<zstd::dict::DecoderDictionary<'static>>>>,
+}
+
+unsafe extern "C" fn drop_conn_dicts(state: *mut c_void) {
+    // SAFETY: `state` is the `Box<ConnDicts>` `init` leaked for this
+    // connection; SQLite calls this once, when the function is dropped.
+    drop(unsafe { Box::from_raw(state.cast::<ConnDicts>()) });
 }
 
 /// What a function hands back to SQLite.
@@ -214,9 +247,50 @@ unsafe fn text<'a>(value: *mut ffi::sqlite3_value) -> Result<&'a str, Fail> {
     std::str::from_utf8(bytes).map_err(|e| Fail::Error(e.to_string()))
 }
 
+/// The bytes of dictionary `id`, read on the connection running the query.
+unsafe fn load_dict(db: *mut ffi::sqlite3, id: i64) -> Result<Vec<u8>, Fail> {
+    // SAFETY: `db` is the live connection from `sqlite3_context_db_handle`;
+    // a scalar function may run its own statements on it. The statement is
+    // finalized on every path.
+    unsafe {
+        let mut stmt = std::ptr::null_mut();
+        let rc = ffi::sqlite3_prepare_v2(
+            db,
+            c"SELECT dict FROM happyview_zstd_dicts WHERE id = ?1".as_ptr(),
+            -1,
+            &mut stmt,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(format!("hv_record: cannot read zstd dictionary {id} (error {rc})").into());
+        }
+        ffi::sqlite3_bind_int64(stmt, 1, id);
+        let out = match ffi::sqlite3_step(stmt) {
+            ffi::SQLITE_ROW => {
+                let ptr = ffi::sqlite3_column_blob(stmt, 0) as *const u8;
+                let len = ffi::sqlite3_column_bytes(stmt, 0) as usize;
+                if !ptr.is_null() {
+                    Ok(std::slice::from_raw_parts(ptr, len).to_vec())
+                } else if len == 0 {
+                    Ok(Vec::new())
+                } else {
+                    Err(Fail::NoMem)
+                }
+            }
+            ffi::SQLITE_DONE => {
+                Err(format!("hv_record: zstd dictionary {id} does not exist").into())
+            }
+            rc => Err(format!("hv_record: cannot read zstd dictionary {id} (error {rc})").into()),
+        };
+        ffi::sqlite3_finalize(stmt);
+        out
+    }
+}
+
 /// `hv_record(body, body_dict)`: the stored body as JSON text. A NULL or `0`
-/// dictionary means the body is stored raw; Task 8 adds dictionaries. A
-/// negative id is no dictionary at all, so it is an error.
+/// dictionary means the body is stored raw; a positive one is the
+/// `happyview_zstd_dicts` row it was compressed with, read once per
+/// connection. A negative id is no dictionary at all, so it is an error.
 unsafe extern "C" fn hv_record(
     ctx: *mut ffi::sqlite3_context,
     _argc: c_int,
@@ -230,15 +304,42 @@ unsafe extern "C" fn hv_record(
         let dict = arg(argv, 1)
             .map(|v| ffi::sqlite3_value_int64(v))
             .unwrap_or(0);
+        let state = ffi::sqlite3_user_data(ctx).cast::<ConnDicts>().cast_const();
+        let db = ffi::sqlite3_context_db_handle(ctx);
         finish(ctx, || {
             let body = body?;
             match dict {
-                0 => std::str::from_utf8(body)
-                    .map(|s| Out::Text(s.to_string()))
-                    .map_err(|e| format!("hv_record: stored body is not UTF-8: {e}").into()),
-                ..0 => Err(format!("hv_record: {dict} is not a dictionary id").into()),
-                _ => Err(format!("hv_record: zstd dictionary {dict} is not available").into()),
+                0 => {
+                    return std::str::from_utf8(body)
+                        .map(|s| Out::Text(s.to_string()))
+                        .map_err(|e| format!("hv_record: stored body is not UTF-8: {e}").into());
+                }
+                ..0 => return Err(format!("hv_record: {dict} is not a dictionary id").into()),
+                _ => {}
             }
+            // SAFETY: `state` is this connection's `ConnDicts`, alive until
+            // SQLite drops the function, which outlives every call.
+            let dicts = &(*state).dicts;
+            let cached = dicts
+                .lock()
+                .expect("dictionary cache poisoned")
+                .get(&dict)
+                .cloned();
+            let decoder = match cached {
+                Some(decoder) => decoder,
+                None => {
+                    let bytes = load_dict(db, dict)?;
+                    let decoder = Arc::new(zstd::dict::DecoderDictionary::copy(&bytes));
+                    dicts
+                        .lock()
+                        .expect("dictionary cache poisoned")
+                        .insert(dict, Arc::clone(&decoder));
+                    decoder
+                }
+            };
+            super::compression::decompress(body, &decoder)
+                .map(Out::Text)
+                .map_err(|e| format!("hv_record: dictionary {dict}: {e}").into())
         })
     }
 }
