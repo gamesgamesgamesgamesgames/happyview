@@ -140,7 +140,10 @@ impl UserAuth {
             .await
             .map_err(|e| AppError::Internal(format!("user count query failed: {e}")))?;
 
-        if count.0 == 0 {
+        // A configured superadmin is seeded at boot. If that seeding failed the
+        // table is still empty, and promoting whoever signs in first would hand
+        // the instance to a stranger instead of the account the file names.
+        if count.0 == 0 && state.config.superadmin_did.is_none() {
             // Bootstrap first user
             let id = uuid::Uuid::new_v4().to_string();
             let now = now_rfc3339();
@@ -523,6 +526,74 @@ mod tests {
         assert_eq!(seed, SuperadminSeed::Promoted);
         assert_eq!(user(&db, "did:plc:boss").await.unwrap().1, 1);
         assert_eq!(user(&db, "did:plc:other-super").await.unwrap().1, 1);
+    }
+
+    #[tokio::test]
+    async fn seeding_twice_creates_one_row() {
+        let db = migrated_memory_pool().await;
+        let first = ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss")
+            .await
+            .unwrap();
+        let second = ensure_configured_superadmin(&db, DatabaseBackend::Sqlite, "did:plc:boss")
+            .await
+            .unwrap();
+        assert_eq!(first, SuperadminSeed::Created);
+        assert_eq!(second, SuperadminSeed::Unchanged);
+        let (rows,): (i64,) =
+            crate::db::query_as("SELECT COUNT(*) FROM happyview_users WHERE did = ?")
+                .bind("did:plc:boss")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// Run `UserAuth::authenticate` for `did` over a signed session cookie,
+    /// against an empty users table.
+    async fn sign_in_to_empty_instance(
+        configured: Option<&str>,
+        did: &str,
+    ) -> (Result<UserAuth, AppError>, sqlx::AnyPool) {
+        use axum::response::IntoResponse;
+        use axum_extra::extract::cookie::{Cookie, SignedCookieJar};
+
+        let db = migrated_memory_pool().await;
+        let mut state =
+            crate::test_support::test_state_with_pool_on(db.clone(), DatabaseBackend::Sqlite);
+        state.config.session_secret = "a-securely-generated-32plus-byte-secret!!".into();
+        state.config.superadmin_did = configured.map(str::to_string);
+
+        let jar = SignedCookieJar::new(state.cookie_key.clone())
+            .add(Cookie::new(crate::auth::COOKIE_NAME, did.to_string()));
+        let set_cookie = jar.into_response();
+        let cookie = set_cookie.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let (mut parts, _) = axum::http::Request::builder()
+            .header("cookie", cookie)
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        (UserAuth::authenticate(&mut parts, &state).await, db)
+    }
+
+    #[tokio::test]
+    async fn a_configured_superadmin_stops_the_first_sign_in_becoming_admin() {
+        let (auth, db) = sign_in_to_empty_instance(Some("did:plc:boss"), "did:plc:stranger").await;
+        assert!(auth.is_err());
+        assert!(user(&db, "did:plc:stranger").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn without_a_configured_superadmin_the_first_sign_in_becomes_admin() {
+        let (auth, db) = sign_in_to_empty_instance(None, "did:plc:first").await;
+        assert!(auth.is_ok());
+        assert_eq!(user(&db, "did:plc:first").await.unwrap().1, 1);
     }
 
     #[tokio::test]

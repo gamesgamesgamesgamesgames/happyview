@@ -24,7 +24,10 @@ pub async fn apply_at_boot(
             Ok(SuperadminSeed::Created) => info!(did, "created the configured superadmin"),
             Ok(SuperadminSeed::Promoted) => info!(did, "promoted the configured superadmin"),
             Ok(SuperadminSeed::Unchanged) => {}
-            Err(e) => error!(did, "could not seed the configured superadmin: {e}"),
+            Err(e) => error!(
+                did,
+                "could not seed the configured superadmin: {e}; no one can be bootstrapped as admin until seeding succeeds, restart to retry"
+            ),
         }
     }
 
