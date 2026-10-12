@@ -10,7 +10,8 @@
 //! What does not carry over, on purpose: an upsert (`INSERT … ON CONFLICT`)
 //! on either view fails, and on SQLite writes through a view report no
 //! affected rows (SQLite does not count changes made by `INSTEAD OF`
-//! triggers) and `INSERT … RETURNING` returns nothing.
+//! triggers) and `INSERT … RETURNING` returns one row of the values the
+//! statement supplied, not the stored row (`uri` is NULL when omitted).
 //!
 //! [`create_statements`] takes the view names so tests can build the views
 //! under staging names beside the legacy tables; the upgrade builds them
@@ -610,6 +611,95 @@ mod tests {
                 .expect("count");
                 assert_eq!(dids, 1, "the DID row was not replaced");
             }
+            db.finish().await;
+        }
+    }
+
+    /// SQLite's `INSERT OR REPLACE` through the view replaces the v2 row,
+    /// and its refs go with the old row, as they did on the legacy table:
+    /// nothing is orphaned and no foreign key is left dangling.
+    #[tokio::test]
+    async fn sqlite_insert_or_replace_drops_the_old_refs_cleanly() {
+        for db in pre_upgrade_pools().await {
+            let (pool, backend, staged) = (&db.pool, db.backend, Staged::new());
+            if backend != DatabaseBackend::Sqlite {
+                db.finish().await;
+                continue;
+            }
+            create(pool, backend, &staged).await;
+            insert(pool, backend, &staged.records, "did:plc:rep", "a", BODY)
+                .await
+                .expect("insert");
+            insert(pool, backend, &staged.records, "did:plc:rep", "b", BODY)
+                .await
+                .expect("insert a neighbour");
+            let (a, b) = (
+                "at://did:plc:rep/app.test.compat/a",
+                "at://did:plc:rep/app.test.compat/b",
+            );
+            for (source, target) in [
+                (a, "at://did:plc:x/app.test.compat/1"),
+                (a, "at://did:plc:x/app.test.compat/2"),
+                (b, "at://did:plc:x/app.test.compat/3"),
+            ] {
+                crate::db::query(&format!(
+                    "INSERT INTO {} (source_uri, target_uri, collection) VALUES ('{source}', '{target}', 'app.test.compat')",
+                    staged.refs
+                ))
+                .execute(pool)
+                .await
+                .expect("insert a ref");
+            }
+
+            crate::db::query(&format!(
+                "INSERT OR REPLACE INTO {} (uri, did, collection, rkey, record, cid, created_at) \
+                 VALUES ('{a}', 'did:plc:rep', 'app.test.compat', 'a', '{{\"n\":9}}', 'c', '2026-01-01T00:00:00Z')",
+                staged.records
+            ))
+            .execute(pool)
+            .await
+            .expect("INSERT OR REPLACE");
+
+            let (record,): (String,) = crate::db::query_as(&format!(
+                "SELECT record FROM {} WHERE uri = '{a}'",
+                staged.records
+            ))
+            .fetch_one(pool)
+            .await
+            .expect("read the replaced row");
+            assert_eq!(record, r#"{"n":9}"#);
+            let refs: Vec<(String, String)> = crate::db::query_as(&format!(
+                "SELECT source_uri, target_uri FROM {} ORDER BY target_uri",
+                staged.refs
+            ))
+            .fetch_all(pool)
+            .await
+            .expect("read refs");
+            assert_eq!(
+                refs,
+                vec![(
+                    b.to_string(),
+                    "at://did:plc:x/app.test.compat/3".to_string()
+                )],
+                "the replaced row's refs are gone, its neighbour's kept"
+            );
+            let (orphans,): (i64,) = crate::db::query_as(
+                "SELECT COUNT(*) FROM happyview_record_refs_v2 f \
+                 WHERE NOT EXISTS (SELECT 1 FROM happyview_records_v2 v WHERE v.id = f.source_id)",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("count orphans");
+            assert_eq!(orphans, 0);
+            let violations = crate::db::query("PRAGMA foreign_key_check")
+                .fetch_all(pool)
+                .await
+                .expect("foreign_key_check");
+            assert!(
+                violations.is_empty(),
+                "{} foreign key violations",
+                violations.len()
+            );
             db.finish().await;
         }
     }
