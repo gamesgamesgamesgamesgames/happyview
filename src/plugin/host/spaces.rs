@@ -541,7 +541,7 @@ mod tests {
             jetstream_url: String::new(),
             relay_url: String::new(),
             plc_url: String::new(),
-            static_dir: String::new(),
+            static_dir: None,
             base_path: None,
             event_log_retention_days: 30,
             app_name: None,

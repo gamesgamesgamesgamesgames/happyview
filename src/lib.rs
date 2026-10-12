@@ -6,6 +6,7 @@ pub mod cid_verify;
 pub mod codemod;
 pub mod config;
 pub mod constant_time;
+pub mod dashboard;
 pub mod db;
 pub mod delegation;
 pub mod dev_happyview;

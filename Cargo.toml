@@ -118,6 +118,8 @@ sfv = "0.15"
 # that a release build carries no Lua interpreter of its own and the plugin is
 # the only path a script run can take.
 lua-reference = ["dep:mlua"]
+# Serve the dashboard compiled into the binary when `STATIC_DIR` is unset.
+embedded-dashboard = []
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -152,3 +154,4 @@ urlencoding = "2.1.3"
 futures = "0.3"
 rcgen = "0.14"
 wat = "1"
+tempfile = "3"

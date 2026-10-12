@@ -69,7 +69,7 @@ impl TestApp {
             jetstream_url: "wss://jetstream1.us-east.bsky.network".into(),
             relay_url: mock_url.clone(),
             plc_url: mock_url.clone(),
-            static_dir: "./web/out".into(),
+            static_dir: Some("./web/out".into()),
             base_path: None,
             event_log_retention_days: 30,
             app_name: None,
