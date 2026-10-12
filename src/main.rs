@@ -36,7 +36,13 @@ async fn main() {
         )
         .init();
 
-    let config = Config::from_env();
+    let config = match Config::load() {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        }
+    };
     let db_backend = config.database_backend;
 
     // Connect to database and run migrations.

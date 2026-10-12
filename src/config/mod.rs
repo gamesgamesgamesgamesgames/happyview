@@ -7,7 +7,10 @@ use crate::db::DatabaseBackend;
 pub mod project;
 pub mod vars;
 
+pub use project::ConfigMode;
 use project::ProjectConfig;
+use std::collections::BTreeMap;
+use std::env;
 use vars::var;
 
 /// Placeholder session secrets that have shipped in this repo's docs/examples.
@@ -195,6 +198,71 @@ pub fn plugin_cache_dir(override_dir: Option<String>, database_url: &str) -> Opt
 }
 
 impl Config {
+    /// Build the configuration for this process. `HAPPYVIEW_PROJECT` names
+    /// a project root; without it the instance runs from the environment
+    /// alone, as it always has.
+    pub fn load() -> Result<Self, project::ProjectConfigError> {
+        let root = env::var_os("HAPPYVIEW_PROJECT")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        Self::load_from(root.as_deref(), ConfigMode::Serve)
+    }
+
+    pub fn load_from(
+        root: Option<&Path>,
+        mode: ConfigMode,
+    ) -> Result<Self, project::ProjectConfigError> {
+        Self::load_from_with(root, mode, |_| Vec::new())
+    }
+
+    /// Install the project's settings as the layer beneath the environment,
+    /// then read the configuration through it. `defaults` sees the merged
+    /// environment-and-file view and answers values to place beneath both:
+    /// they live in the layer, never in the process environment, so
+    /// environment > file > defaults holds for every reader.
+    pub fn load_from_with(
+        root: Option<&Path>,
+        mode: ConfigMode,
+        defaults: impl FnOnce(&BTreeMap<String, String>) -> Vec<(String, String)>,
+    ) -> Result<Self, project::ProjectConfigError> {
+        let project = match root {
+            Some(root) => project::load_project_config(root)?,
+            None => None,
+        };
+        let mut layer = project
+            .as_ref()
+            .map(|p| p.env_layer(mode))
+            .unwrap_or_default();
+        let mut view: BTreeMap<String, String> = layer.clone();
+        view.extend(env::vars());
+        for (name, value) in defaults(&view) {
+            layer.entry(name).or_insert(value);
+        }
+        vars::set_project_layer(layer);
+        if let Some(message) = project
+            .as_ref()
+            .and_then(|p| p.version_mismatch(crate::version::version()))
+        {
+            tracing::warn!("{message}");
+        }
+        let mut config = Self::from_env();
+        config.project_root = root.map(Path::to_path_buf);
+        config.project = project.map(Arc::new);
+        Ok(config)
+    }
+
+    pub fn declares_labeler(&self, did: &str) -> bool {
+        self.project
+            .as_deref()
+            .is_some_and(|p| p.declares_labeler(did))
+    }
+
+    pub fn declares_network_lexicon(&self, nsid: &str) -> bool {
+        self.project
+            .as_deref()
+            .is_some_and(|p| p.declares_network_lexicon(nsid))
+    }
+
     pub fn from_env() -> Self {
         let database_url = var("DATABASE_URL").expect("DATABASE_URL must be set");
         let database_backend = var("DATABASE_BACKEND")
@@ -339,6 +407,13 @@ mod tests {
     use serial_test::serial;
     use std::env;
 
+    struct EnvGuard(&'static str);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe { env::remove_var(self.0) };
+        }
+    }
+
     unsafe fn clear_env() {
         for key in [
             "HOST",
@@ -442,6 +517,134 @@ mod tests {
             config.listen_addr(),
             "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    #[serial]
+    fn load_from_a_missing_root_refuses() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let root = env::temp_dir().join(format!("hv-missing-{}", uuid::Uuid::new_v4()));
+        let err = Config::load_from(Some(&root), ConfigMode::Serve).unwrap_err();
+        assert!(
+            matches!(err, project::ProjectConfigError::RootNotFound { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn load_from_a_root_without_the_file_has_no_project_config() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let dir = project::TempProject::new(None);
+        let config = Config::load_from(Some(dir.path()), ConfigMode::Serve).unwrap();
+        assert_eq!(config.project_root.as_deref(), Some(dir.path()));
+        assert!(config.project.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn load_from_applies_the_file_and_keeps_it() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let dir = project::TempProject::new(Some(
+            "[instance]\napp_name = \"Loaded\"\n[labels]\nsubscribe = [\"did:plc:lab1\"]\n",
+        ));
+        let config = Config::load_from(Some(dir.path()), ConfigMode::Serve).unwrap();
+        assert_eq!(config.app_name.as_deref(), Some("Loaded"));
+        assert!(config.declares_labeler("did:plc:lab1"));
+        assert!(!config.declares_network_lexicon("app.bsky.actor.profile"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_reads_the_root_from_happyview_project() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let dir = project::TempProject::new(Some("[instance]\napp_name = \"Via Env\"\n"));
+        let _unset = EnvGuard("HAPPYVIEW_PROJECT");
+        unsafe { env::set_var("HAPPYVIEW_PROJECT", dir.path()) };
+        let config = Config::load().unwrap();
+        assert_eq!(config.app_name.as_deref(), Some("Via Env"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_without_a_project_is_from_env() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::remove_var("HAPPYVIEW_PROJECT");
+        }
+        let _reset = vars::LayerReset;
+        let config = Config::load().unwrap();
+        assert!(config.project_root.is_none() && config.project.is_none());
+        assert!(!config.declares_labeler("did:plc:anything"));
+    }
+
+    #[test]
+    #[serial]
+    fn defaults_sit_beneath_the_file_and_the_environment() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let _unset = EnvGuard("APP_NAME");
+        let dir = project::TempProject::new(Some("[instance]\napp_name = \"File\"\n"));
+        let defaults = |_: &BTreeMap<String, String>| {
+            vec![
+                ("APP_NAME".to_string(), "Default".to_string()),
+                ("BASE_PATH".to_string(), "/from-default".to_string()),
+            ]
+        };
+
+        // A default is used when neither the environment nor the file sets it.
+        let config = Config::load_from_with(Some(dir.path()), ConfigMode::Serve, defaults).unwrap();
+        assert_eq!(config.base_path.as_deref(), Some("/from-default"));
+        // The file beats a default.
+        assert_eq!(config.app_name.as_deref(), Some("File"));
+        // The environment beats both, and defaults never reach it.
+        unsafe { env::set_var("APP_NAME", "Env") };
+        let config = Config::load_from_with(Some(dir.path()), ConfigMode::Serve, defaults).unwrap();
+        assert_eq!(config.app_name.as_deref(), Some("Env"));
+        assert!(env::var("BASE_PATH").is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn defaults_see_the_merged_view() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let dir = project::TempProject::new(Some("[instance]\napp_name = \"File\"\n"));
+        let mut seen = None;
+        Config::load_from_with(Some(dir.path()), ConfigMode::Serve, |view| {
+            seen = Some((
+                view.get("APP_NAME").cloned(),
+                view.get("DATABASE_URL").cloned(),
+            ));
+            Vec::new()
+        })
+        .unwrap();
+        let (app, db) = seen.unwrap();
+        assert_eq!(app.as_deref(), Some("File"));
+        assert!(db.is_some(), "the process environment is part of the view");
     }
 
     #[test]

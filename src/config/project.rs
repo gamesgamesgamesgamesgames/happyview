@@ -175,6 +175,32 @@ impl ProjectConfig {
         }
         layer
     }
+
+    /// `hpy` runs the pinned binary, so a mismatch means the binary was
+    /// started some other way, typically an image tag that moved on. That is
+    /// worth saying, not worth refusing to boot over.
+    pub fn version_mismatch(&self, running: &str) -> Option<String> {
+        let pinned = self
+            .happyview
+            .version
+            .as_deref()?
+            .trim()
+            .trim_start_matches('v');
+        (pinned != running).then(|| {
+            format!(
+                "{PROJECT_FILE} pins HappyView {pinned}, but this binary is {running}; \
+                 `hpy happyview dev` runs the pinned version"
+            )
+        })
+    }
+
+    pub fn declares_labeler(&self, did: &str) -> bool {
+        self.labels.subscribe.iter().any(|d| d == did)
+    }
+
+    pub fn declares_network_lexicon(&self, nsid: &str) -> bool {
+        self.network_lexicons.include.iter().any(|n| n == nsid)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -896,5 +922,32 @@ capabilities = ["library:call"]
     #[test]
     fn an_empty_file_contributes_no_serve_variables() {
         assert!(parse("").unwrap().env_layer(ConfigMode::Serve).is_empty());
+    }
+
+    #[test]
+    fn a_pinned_version_that_differs_is_reported() {
+        let config = parse("[happyview]\nversion = \"3.0.0\"\n").unwrap();
+        let message = config.version_mismatch("3.1.0").unwrap();
+        assert!(
+            message.contains("3.0.0") && message.contains("3.1.0"),
+            "{message}"
+        );
+        assert_eq!(config.version_mismatch("3.0.0"), None);
+        let with_v = parse("[happyview]\nversion = \"v3.0.0\"\n").unwrap();
+        assert_eq!(
+            with_v.version_mismatch("3.0.0"),
+            None,
+            "a leading v is the same version"
+        );
+        assert_eq!(parse("").unwrap().version_mismatch("3.0.0"), None);
+    }
+
+    #[test]
+    fn declared_layers_answer_membership() {
+        let config = parse(FULL).unwrap();
+        assert!(config.declares_labeler("did:plc:ar7c4by46qjdydhdevvrndac"));
+        assert!(!config.declares_labeler("did:plc:other"));
+        assert!(config.declares_network_lexicon("app.bsky.actor.profile"));
+        assert!(!config.declares_network_lexicon("app.bsky.feed.post"));
     }
 }
