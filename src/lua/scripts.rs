@@ -179,7 +179,7 @@ pub struct ResolvedScript {
     /// Project-relative file path, for a project script only.
     pub path: Option<PathBuf>,
     /// What the interpreter names the chunk, so an error points at the file a
-    /// project script lives in. Dashboard scripts keep the name they always had.
+    /// project script lives in. Dashboard scripts use `DASHBOARD_CHUNK_NAME`.
     pub chunk_name: String,
     /// XRPC methods the script calls, checked against a service-auth token's
     /// scope before a procedure runs.

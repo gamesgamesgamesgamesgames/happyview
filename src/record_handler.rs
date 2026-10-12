@@ -603,9 +603,11 @@ pub async fn handle_lexicon_schema_event(
 mod tests {
     use super::*;
 
+    use crate::catalog::LexiconWrite;
     use crate::lexicon::ParsedLexicon;
     use crate::lexicon::ProcedureAction;
     use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
+    use crate::project::{ProjectLexicon, ProjectSnapshot};
     use crate::test_support::test_state_with_pool;
 
     const NSID: &str = "com.example.thing";
@@ -1714,11 +1716,6 @@ mod tests {
         }
     }
 
-    /// A schema event cannot be dropped because the database was down: the
-    /// caller is told to retry it.
-    use crate::catalog::LexiconWrite;
-    use crate::project::{ProjectLexicon, ProjectSnapshot};
-
     const NET: &str = "com.example.net";
     const AUTHORITY: &str = "did:plc:authority";
 
@@ -1781,7 +1778,7 @@ mod tests {
             (net.parsed.revision, net.parsed.raw["description"].clone()),
             (2, "v2".into())
         );
-        let fresh = crate::catalog::LexiconCatalog::default();
+        let fresh = crate::catalog::LexiconCatalog::detached();
         fresh.load_from_db(&state.db).await.unwrap();
         assert_eq!(
             fresh.get(NET).await.unwrap().revision,
@@ -1819,7 +1816,7 @@ mod tests {
             handle_lexicon_schema_event(&state, AUTHORITY, &net_event("delete", None)).await;
         assert_eq!(outcome, RecordOutcome::SchemaEvent);
         assert!(state.lexicons.get(NET).await.is_none());
-        let fresh = crate::catalog::LexiconCatalog::default();
+        let fresh = crate::catalog::LexiconCatalog::detached();
         fresh.load_from_db(&state.db).await.unwrap();
         assert!(fresh.get(NET).await.is_none());
     }
@@ -1891,6 +1888,8 @@ mod tests {
             .expect("track the schema NSID");
     }
 
+    /// A schema event cannot be dropped because the database was down: the
+    /// caller is told to retry it.
     #[tokio::test]
     async fn a_schema_event_during_an_outage_is_unavailable() {
         let state = tracked_state().await;

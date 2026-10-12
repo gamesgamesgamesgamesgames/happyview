@@ -75,7 +75,7 @@ async fn executor() -> (PluginExecutor, Arc<PluginRegistry>) {
         db,
         DatabaseBackend::Sqlite,
         reqwest::Client::new(),
-        Arc::new(LexiconCatalog::default()),
+        Arc::new(LexiconCatalog::detached()),
     );
     (executor, registry)
 }
@@ -310,7 +310,7 @@ async fn executor_with_table() -> (PluginExecutor, Arc<PluginRegistry>, sqlx::An
         db.clone(),
         DatabaseBackend::Sqlite,
         reqwest::Client::new(),
-        Arc::new(LexiconCatalog::default()),
+        Arc::new(LexiconCatalog::detached()),
     );
     (executor, registry, db)
 }

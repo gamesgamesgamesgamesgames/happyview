@@ -329,7 +329,7 @@ mod tests {
     use super::*;
 
     fn empty_registry() -> crate::catalog::LexiconCatalog {
-        crate::catalog::LexiconCatalog::default()
+        crate::catalog::LexiconCatalog::detached()
     }
 
     #[tokio::test]

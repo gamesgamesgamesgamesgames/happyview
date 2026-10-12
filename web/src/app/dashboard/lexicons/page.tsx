@@ -151,6 +151,7 @@ export default function LexiconsPage() {
           options: [
             { label: "Manual", value: "manual" },
             { label: "Network", value: "network" },
+            { label: "Project", value: "project" },
           ],
         },
       },

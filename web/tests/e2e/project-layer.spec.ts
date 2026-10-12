@@ -136,4 +136,34 @@ test.describe("Project-owned entries", () => {
     await expect(row).toBeVisible({ timeout: 5000 })
     await expect(row.getByRole("button", { name: /delete/i })).toHaveCount(0)
   })
+
+  test("the lexicons list filters to project lexicons", async ({ page }) => {
+    const manualLexicon = {
+      ...projectLexicon,
+      id: "test.e2e.manual.thing",
+      source: "manual",
+      layer: "manual",
+      path: null,
+      shadows_stored: false,
+    }
+    await page.route(
+      (url) => url.pathname.endsWith("/admin/lexicons"),
+      async (route) => {
+        if (route.request().method() !== "GET") return route.continue()
+        await route.fulfill({ json: [projectLexicon, manualLexicon] })
+      },
+    )
+
+    await page.goto("/dashboard/lexicons")
+
+    const projectRow = page.locator("table tbody tr", { hasText: LEXICON_ID })
+    const manualRow = page.locator("table tbody tr", { hasText: manualLexicon.id })
+    await expect(manualRow).toBeVisible({ timeout: 5000 })
+
+    await page.getByRole("button", { name: /source/i }).click()
+    await page.getByRole("option", { name: /^project/i }).click()
+
+    await expect(projectRow).toBeVisible()
+    await expect(manualRow).toHaveCount(0)
+  })
 })

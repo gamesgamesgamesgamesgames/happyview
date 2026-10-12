@@ -41,7 +41,7 @@ impl Layer {
     }
 
     /// The layer a stored row's `source` column names. Anything other than
-    /// `network` is manual, which is what the column's default has always meant.
+    /// `network` is manual, which is the column's default.
     pub fn from_source(source: &str) -> Self {
         if source == "network" {
             Layer::Network
@@ -92,7 +92,8 @@ impl From<CatalogError> for AppError {
 
 /// A project path as clients and error messages show it. Joined by hand
 /// because `Path::display` uses the platform separator, and these strings
-/// must read the same on every platform.
+/// must read the same on every platform. Takes project-relative paths only: an
+/// absolute path would keep its root component in the result.
 pub fn path_string(path: &Path) -> String {
     path.components()
         .map(|c| c.as_os_str().to_string_lossy())

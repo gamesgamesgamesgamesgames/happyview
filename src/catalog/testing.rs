@@ -1,5 +1,5 @@
 //! Bare-table helpers for tests elsewhere in the crate that need a lexicon
-//! table without the rest of the schema.
+//! table without the rest of the schema. The DDL is SQLite-only.
 
 use sqlx::AnyPool;
 

@@ -327,3 +327,18 @@ pub(crate) async fn insert_raw_for_test(
         .await
         .expect("insert a raw lexicon row");
 }
+
+/// Overwrites a row's document with text that does not parse, for tests of a
+/// row that was valid when written and is not now.
+#[cfg(test)]
+pub(crate) async fn corrupt_for_test(db: &AnyPool, backend: DatabaseBackend, id: &str) {
+    let sql = adapt_sql(
+        "UPDATE happyview_lexicons SET lexicon_json = '{not json' WHERE id = ?",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(id)
+        .execute(db)
+        .await
+        .expect("corrupt a lexicon row");
+}

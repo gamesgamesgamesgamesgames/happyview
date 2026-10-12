@@ -245,7 +245,7 @@ mod tests {
             db: sqlx::AnyPool::connect_lazy("sqlite::memory:").unwrap(),
             db_backend: crate::db::DatabaseBackend::Sqlite,
             http_client: reqwest::Client::new(),
-            lexicons: std::sync::Arc::new(crate::catalog::LexiconCatalog::default()),
+            lexicons: std::sync::Arc::new(crate::catalog::LexiconCatalog::detached()),
         }
     }
 

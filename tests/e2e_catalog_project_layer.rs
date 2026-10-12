@@ -84,6 +84,27 @@ async fn uploading_a_lexicon_a_project_file_owns_is_a_409_naming_the_file() {
 
 #[tokio::test]
 #[serial]
+async fn a_project_owned_id_is_a_409_even_when_the_rest_of_the_upload_is_invalid() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    app.state.project.store(Arc::new(owning_game()));
+
+    let (status, body) = app
+        .post_json_status(
+            "/admin/lexicons",
+            json!({
+                "lexicon_json": fixtures::game_record_lexicon(),
+                "backfill": false,
+                "action": "not-an-action",
+            }),
+        )
+        .await;
+
+    assert_eq!(status, 409, "{body}");
+}
+
+#[tokio::test]
+#[serial]
 async fn deleting_a_lexicon_a_project_file_shadows_is_a_409_and_the_row_survives() {
     common::require_db!();
     let app = TestApp::new().await;

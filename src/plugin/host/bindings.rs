@@ -2715,7 +2715,7 @@ mod tests {
             db: None,
             db_backend: crate::db::DatabaseBackend::Sqlite,
             http_client: reqwest::Client::new(),
-            lexicons: Arc::new(crate::catalog::LexiconCatalog::default()),
+            lexicons: Arc::new(crate::catalog::LexiconCatalog::detached()),
             usage: Default::default(),
             memory: None,
             alloc: None,

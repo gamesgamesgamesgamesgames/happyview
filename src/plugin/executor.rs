@@ -1082,7 +1082,7 @@ mod wasi {
             db,
             DatabaseBackend::Sqlite,
             reqwest::Client::new(),
-            Arc::new(LexiconCatalog::default()),
+            Arc::new(LexiconCatalog::detached()),
         )
     }
 
@@ -1330,7 +1330,7 @@ mod deadline {
             crate::test_support::memory_pool().await,
             DatabaseBackend::Sqlite,
             reqwest::Client::new(),
-            Arc::new(LexiconCatalog::default()),
+            Arc::new(LexiconCatalog::detached()),
         )
     }
 
@@ -1631,7 +1631,7 @@ mod deadline {
             crate::test_support::memory_pool().await,
             DatabaseBackend::Sqlite,
             reqwest::Client::new(),
-            Arc::new(LexiconCatalog::default()),
+            Arc::new(LexiconCatalog::detached()),
         )
         .with_app_state(state);
         let mut inst = executor
@@ -1683,7 +1683,7 @@ mod deadline {
             crate::test_support::memory_pool().await,
             DatabaseBackend::Sqlite,
             reqwest::Client::new(),
-            Arc::new(LexiconCatalog::default()),
+            Arc::new(LexiconCatalog::detached()),
         )
         .with_app_state(state)
     }
@@ -1786,7 +1786,7 @@ mod deadline {
             db: None,
             db_backend: DatabaseBackend::Sqlite,
             http_client: reqwest::Client::new(),
-            lexicons: Arc::new(LexiconCatalog::default()),
+            lexicons: Arc::new(LexiconCatalog::detached()),
             usage: Default::default(),
             memory: None,
             alloc: None,
@@ -1867,7 +1867,7 @@ mod interpreter {
             db,
             DatabaseBackend::Sqlite,
             reqwest::Client::new(),
-            Arc::new(LexiconCatalog::default()),
+            Arc::new(LexiconCatalog::detached()),
         )
         .with_app_state(state)
         .instantiate("echo", "test", HashMap::new(), serde_json::Value::Null)
@@ -1992,7 +1992,7 @@ mod memory {
             crate::test_support::memory_pool().await,
             DatabaseBackend::Sqlite,
             reqwest::Client::new(),
-            Arc::new(LexiconCatalog::default()),
+            Arc::new(LexiconCatalog::detached()),
         );
         executor
             .instantiate("g", "test", HashMap::new(), serde_json::Value::Null)
@@ -2130,7 +2130,7 @@ mod memory {
             crate::test_support::memory_pool().await,
             DatabaseBackend::Sqlite,
             reqwest::Client::new(),
-            Arc::new(LexiconCatalog::default()),
+            Arc::new(LexiconCatalog::detached()),
         );
         let err = executor
             .instantiate("two", "test", HashMap::new(), serde_json::Value::Null)
@@ -2194,7 +2194,7 @@ mod cache {
             crate::test_support::memory_pool().await,
             DatabaseBackend::Sqlite,
             reqwest::Client::new(),
-            Arc::new(LexiconCatalog::default()),
+            Arc::new(LexiconCatalog::detached()),
         );
         for _ in 0..3 {
             executor
@@ -2265,7 +2265,7 @@ mod fuel {
             crate::test_support::memory_pool().await,
             DatabaseBackend::Sqlite,
             reqwest::Client::new(),
-            Arc::new(LexiconCatalog::default()),
+            Arc::new(LexiconCatalog::detached()),
         )
         .instantiate("g", "test", HashMap::new(), serde_json::Value::Null)
         .await
@@ -2380,7 +2380,7 @@ mod baseline {
             db,
             DatabaseBackend::Sqlite,
             reqwest::Client::new(),
-            Arc::new(LexiconCatalog::default()),
+            Arc::new(LexiconCatalog::detached()),
         )
     }
 

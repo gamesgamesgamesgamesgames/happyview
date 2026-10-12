@@ -162,9 +162,17 @@ async fn main() {
 
     // Re-fetch all network lexicons from their respective PDSes.
     let http = happyview::http_retry::init_shared_client(&config.user_agent);
-    let network = lexicons.network_lexicons().await;
-    for lexicon in &network {
-        let nsid = lexicon.parsed.id.as_str();
+    // From the table rather than memory, so a row that failed to parse at load
+    // is fetched again and repaired.
+    let network: Vec<String> = match lexicons.list_network(&db_pool, db_backend).await {
+        Ok(rows) => rows.into_iter().map(|l| l.id).collect(),
+        Err(e) => {
+            warn!("failed to list network lexicons for refresh: {e}");
+            Vec::new()
+        }
+    };
+    for nsid in &network {
+        let nsid = nsid.as_str();
         match resolve_nsid_authority(&http, &config.plc_url, nsid).await {
             Ok((did, pds_endpoint)) => {
                 match fetch_lexicon_from_pds(&http, &pds_endpoint, &did, nsid).await {
@@ -173,7 +181,10 @@ async fn main() {
                             .refresh_network(&db_pool, db_backend, nsid, lexicon_json)
                             .await
                         {
-                            Ok(_) => info!(nsid, "refreshed network lexicon"),
+                            Ok(Some(_)) => info!(nsid, "refreshed network lexicon"),
+                            Ok(None) => {
+                                info!(nsid, "network lexicon was removed before it was refreshed")
+                            }
                             Err(e) => warn!(nsid, "failed to refresh network lexicon: {e}"),
                         }
                     }

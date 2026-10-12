@@ -27,6 +27,16 @@ pub(super) async fn upload_lexicon(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     auth.require(Permission::LexiconsCreate).await?;
     let backend = state.db_backend;
+    let id = body
+        .lexicon_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::BadRequest("lexicon JSON must have a string 'id' field".into()))?
+        .to_string();
+
+    // Before any other validation, so a project-owned id is always a 409.
+    state.lexicons.check_writable(&id)?;
+
     // Validate basic structure
     let lexicon_version = body
         .lexicon_json
@@ -41,13 +51,6 @@ pub(super) async fn upload_lexicon(
             "unsupported lexicon version: {lexicon_version}"
         )));
     }
-
-    let id = body
-        .lexicon_json
-        .get("id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| AppError::BadRequest("lexicon JSON must have a string 'id' field".into()))?
-        .to_string();
 
     happyview_nsid::validate_nsid(&id).map_err(|e| AppError::BadRequest(e.to_string()))?;
 

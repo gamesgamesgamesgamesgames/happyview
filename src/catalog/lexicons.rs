@@ -185,19 +185,25 @@ impl From<NetworkWriteError> for crate::error::AppError {
 #[derive(Debug, Clone)]
 pub struct LexiconCatalog {
     stored: Arc<RwLock<HashMap<String, StoredLexicon>>>,
+    /// Held across each row write and the memory update that follows it.
+    /// Without it two writers to one id can commit in one order and update
+    /// memory in the other, leaving memory on a version the table no longer
+    /// holds. Writes are rare, so serialising them costs nothing.
+    write_gate: Arc<tokio::sync::Mutex<()>>,
     project: SharedSnapshot,
 }
 
-impl Default for LexiconCatalog {
-    fn default() -> Self {
+impl LexiconCatalog {
+    /// A catalog with an empty project layer, for a process that runs no
+    /// project, and for tests.
+    pub fn detached() -> Self {
         Self::new(shared_empty())
     }
-}
 
-impl LexiconCatalog {
     pub fn new(project: SharedSnapshot) -> Self {
         Self {
             stored: Arc::new(RwLock::new(HashMap::new())),
+            write_gate: Arc::new(tokio::sync::Mutex::new(())),
             project,
         }
     }
@@ -383,6 +389,7 @@ impl LexiconCatalog {
         let id = lexicon.id()?;
         self.check_writable(&id)?;
         let mut parsed = lexicon.parse(1)?;
+        let _gate = self.write_gate.lock().await;
         let revision = lexicon_rows::upsert_manual(db, backend, &id, &lexicon).await?;
         parsed.revision = revision;
         self.stored_mut().insert(
@@ -408,6 +415,7 @@ impl LexiconCatalog {
             CatalogError::Invalid("a network lexicon needs the DID its NSID resolved to".into())
         })?;
         let mut parsed = lexicon.parse(1)?;
+        let _gate = self.write_gate.lock().await;
         let revision =
             lexicon_rows::upsert_network(db, backend, &id, &lexicon, &authority_did).await?;
         parsed.revision = revision;
@@ -423,7 +431,8 @@ impl LexiconCatalog {
     }
 
     /// Replaces a network row's document, keeping its other settings. `None`
-    /// when no network row has this id.
+    /// when no network row has this id. A row memory could not load is read
+    /// from the table, so refreshing it repairs it.
     pub async fn refresh_network(
         &self,
         db: &AnyPool,
@@ -431,8 +440,13 @@ impl LexiconCatalog {
         id: &str,
         lexicon_json: Value,
     ) -> Result<Option<i32>, NetworkWriteError> {
-        let Some(current) = self.get_network(id).await else {
-            return Ok(None);
+        let _gate = self.write_gate.lock().await;
+        let current = match self.get_network(id).await {
+            Some(current) => current,
+            None => match self.unloaded_network_row(db, backend, id).await? {
+                Some(current) => current,
+                None => return Ok(None),
+            },
         };
         let mut parsed = ParsedLexicon::parse(
             lexicon_json.clone(),
@@ -461,6 +475,38 @@ impl LexiconCatalog {
         Ok(Some(revision))
     }
 
+    /// The settings of a network row that is in the table but not in memory,
+    /// because its document no longer parsed when memory loaded.
+    async fn unloaded_network_row(
+        &self,
+        db: &AnyPool,
+        backend: DatabaseBackend,
+        id: &str,
+    ) -> Result<Option<NetworkLexicon>, NetworkWriteError> {
+        let Some(row) = lexicon_rows::get_full(db, backend, id).await? else {
+            return Ok(None);
+        };
+        if row.source != "network" {
+            return Ok(None);
+        }
+        // A placeholder document: the caller replaces it, and only the row's
+        // settings are read from it.
+        let action = ProcedureAction::from_optional_str(row.action.as_deref())
+            .unwrap_or(ProcedureAction::Upsert);
+        let placeholder = ParsedLexicon::parse(
+            serde_json::json!({"lexicon": 1, "id": id, "defs": {}}),
+            row.revision,
+            row.target_collection,
+            action,
+            row.token_cost.map(|c| c as u32),
+        )
+        .map_err(|e| NetworkWriteError::Invalid(format!("failed to parse lexicon: {e}")))?;
+        Ok(Some(NetworkLexicon {
+            parsed: placeholder,
+            authority_did: row.authority_did,
+        }))
+    }
+
     pub async fn remove(
         &self,
         db: &AnyPool,
@@ -468,6 +514,7 @@ impl LexiconCatalog {
         id: &str,
     ) -> Result<bool, CatalogError> {
         self.check_writable(id)?;
+        let _gate = self.write_gate.lock().await;
         let removed = lexicon_rows::delete(db, backend, id).await? > 0;
         if removed {
             self.stored_mut().remove(id);
@@ -483,6 +530,7 @@ impl LexiconCatalog {
         backend: DatabaseBackend,
         id: &str,
     ) -> Result<bool, NetworkWriteError> {
+        let _gate = self.write_gate.lock().await;
         let removed =
             crate::db::retry_on_busy(|| lexicon_rows::delete_network(db, backend, id)).await? > 0;
         if removed {
@@ -679,13 +727,13 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_new_is_empty() {
-        let reg = LexiconCatalog::default();
+        let reg = LexiconCatalog::detached();
         assert_eq!(reg.count().await, 0);
     }
 
     #[tokio::test]
     async fn catalog_upsert_and_get() {
-        let reg = LexiconCatalog::default();
+        let reg = LexiconCatalog::detached();
         reg.upsert(parse(record_lexicon_json(), 1)).await;
         let got = reg.get("games.gamesgamesgamesgames.game").await;
         assert!(got.is_some());
@@ -694,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_upsert_replaces() {
-        let reg = LexiconCatalog::default();
+        let reg = LexiconCatalog::detached();
         reg.upsert(parse(record_lexicon_json(), 1)).await;
         reg.upsert(parse(record_lexicon_json(), 5)).await;
         assert_eq!(reg.count().await, 1);
@@ -709,13 +757,13 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_get_nonexistent() {
-        let reg = LexiconCatalog::default();
+        let reg = LexiconCatalog::detached();
         assert!(reg.get("nonexistent").await.is_none());
     }
 
     #[tokio::test]
     async fn catalog_type_filtered_collections() {
-        let reg = LexiconCatalog::default();
+        let reg = LexiconCatalog::detached();
         reg.upsert(parse(record_lexicon_json(), 1)).await;
         reg.upsert(parse(query_lexicon_json(), 1)).await;
         reg.upsert(parse(procedure_lexicon_json(), 1)).await;
@@ -738,7 +786,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_get_space_declaration() {
-        let reg = LexiconCatalog::default();
+        let reg = LexiconCatalog::detached();
         reg.upsert(parse(space_declaration_lexicon_json(), 1)).await;
 
         let decl = reg.get_space_declaration("com.example.forum").await;
@@ -755,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_get_space_declaration_excludes_non_space_types() {
-        let reg = LexiconCatalog::default();
+        let reg = LexiconCatalog::detached();
         reg.upsert(parse(record_lexicon_json(), 1)).await;
         assert!(
             reg.get_space_declaration("games.gamesgamesgamesgames.game")
@@ -940,7 +988,7 @@ mod tests {
     #[tokio::test]
     async fn put_manual_writes_the_row_and_memory_together() {
         for (db, backend) in backends().await {
-            let catalog = LexiconCatalog::default();
+            let catalog = LexiconCatalog::detached();
             let id = unique("thing");
 
             assert_eq!(
@@ -959,7 +1007,7 @@ mod tests {
             );
             assert_eq!(catalog.get(&id).await.unwrap().revision, 2);
 
-            let fresh = LexiconCatalog::default();
+            let fresh = LexiconCatalog::detached();
             fresh.load_from_db(&db).await.unwrap();
             let entry = fresh.get_entry(&id).await.unwrap();
             assert_eq!((entry.layer, entry.value.revision), (Layer::Manual, 2));
@@ -1034,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn put_network_needs_an_authority_and_records_it() {
         for (db, backend) in backends().await {
-            let catalog = LexiconCatalog::default();
+            let catalog = LexiconCatalog::detached();
             let id = unique("net");
 
             assert!(matches!(
@@ -1057,7 +1105,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_network_touches_only_network_rows_and_keeps_their_settings() {
         for (db, backend) in backends().await {
-            let catalog = LexiconCatalog::default();
+            let catalog = LexiconCatalog::detached();
             let net_id = unique("net");
             let man_id = unique("man");
             let mut write = network(record_json(&net_id), "did:plc:authority");
@@ -1135,7 +1183,7 @@ mod tests {
     #[tokio::test]
     async fn load_from_db_reads_back_layers_and_authority_and_skips_unparseable_rows() {
         for (db, backend) in backends().await {
-            let catalog = LexiconCatalog::default();
+            let catalog = LexiconCatalog::detached();
             let man_id = unique("man");
             let net_id = unique("net");
             let broken_id = unique("broken");
@@ -1153,7 +1201,7 @@ mod tests {
                 .unwrap();
             lexicon_rows::insert_raw_for_test(&db, backend, &broken_id, "{not json").await;
 
-            let fresh = LexiconCatalog::default();
+            let fresh = LexiconCatalog::detached();
             fresh.load_from_db(&db).await.unwrap();
             assert_eq!(fresh.get_entry(&man_id).await.unwrap().layer, Layer::Manual);
             assert_eq!(
@@ -1188,7 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn a_manual_write_over_a_network_row_clears_its_authority() {
         for (db, backend) in backends().await {
-            let catalog = LexiconCatalog::default();
+            let catalog = LexiconCatalog::detached();
             let id = unique("convert");
             catalog
                 .put_network(&db, backend, network(record_json(&id), "did:plc:authority"))
@@ -1199,7 +1247,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let fresh = LexiconCatalog::default();
+            let fresh = LexiconCatalog::detached();
             fresh.load_from_db(&db).await.unwrap();
             assert_eq!(fresh.get_entry(&id).await.unwrap().layer, Layer::Manual);
             assert!(fresh.get_network(&id).await.is_none());
@@ -1215,6 +1263,114 @@ mod tests {
                 assert!(listing.authority_did.is_none(), "{listing:?}");
                 assert!(listing.last_fetched_at.is_none(), "{listing:?}");
             }
+
+            catalog.remove(&db, backend, &id).await.unwrap();
+        }
+    }
+
+    fn described(id: &str, description: &str) -> Value {
+        json!({
+            "lexicon": 1, "id": id, "description": description,
+            "defs": { "main": { "type": "record", "key": "tid" } },
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_to_one_id_leave_memory_matching_the_table() {
+        for (db, backend) in backends().await {
+            let catalog = LexiconCatalog::detached();
+            let id = unique("race");
+            catalog
+                .put_network(&db, backend, network(record_json(&id), "did:plc:authority"))
+                .await
+                .unwrap();
+
+            for round in 0..40 {
+                let (a, b, c) = tokio::join!(
+                    catalog.put_manual(&db, backend, manual(described(&id, &format!("m{round}")))),
+                    catalog.put_network(
+                        &db,
+                        backend,
+                        network(described(&id, &format!("n{round}")), "did:plc:authority")
+                    ),
+                    catalog.refresh_network(
+                        &db,
+                        backend,
+                        &id,
+                        described(&id, &format!("r{round}"))
+                    ),
+                );
+                a.unwrap();
+                b.unwrap();
+                c.unwrap();
+
+                let fresh = LexiconCatalog::detached();
+                fresh.load_from_db(&db).await.unwrap();
+                let (mem, row) = (
+                    catalog.get_entry(&id).await.unwrap(),
+                    fresh.get_entry(&id).await.unwrap(),
+                );
+                assert_eq!(
+                    (
+                        mem.layer,
+                        mem.value.revision,
+                        mem.value.raw["description"].clone()
+                    ),
+                    (
+                        row.layer,
+                        row.value.revision,
+                        row.value.raw["description"].clone()
+                    ),
+                    "round {round}: memory drifted from the table"
+                );
+            }
+
+            catalog.remove(&db, backend, &id).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_network_row_that_failed_to_load_is_listed_for_refresh_and_repaired_by_it() {
+        for (db, backend) in backends().await {
+            let catalog = LexiconCatalog::detached();
+            let id = unique("corrupt");
+            catalog
+                .put_network(&db, backend, network(record_json(&id), "did:plc:authority"))
+                .await
+                .unwrap();
+            lexicon_rows::corrupt_for_test(&db, backend, &id).await;
+
+            let booted = LexiconCatalog::detached();
+            booted.load_from_db(&db).await.unwrap();
+            assert!(
+                booted
+                    .network_lexicons()
+                    .await
+                    .iter()
+                    .all(|n| n.parsed.id != id),
+                "memory never loaded it"
+            );
+            assert!(
+                booted
+                    .list_network(&db, backend)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.id == id),
+                "the refresh set still has it"
+            );
+
+            let revision = booted
+                .refresh_network(&db, backend, &id, described(&id, "repaired"))
+                .await
+                .unwrap();
+            assert!(revision.is_some());
+            let repaired = booted.get_network(&id).await.unwrap();
+            assert_eq!(repaired.authority_did.as_deref(), Some("did:plc:authority"));
+
+            let fresh = LexiconCatalog::detached();
+            fresh.load_from_db(&db).await.unwrap();
+            assert_eq!(fresh.get(&id).await.unwrap().raw["description"], "repaired");
 
             catalog.remove(&db, backend, &id).await.unwrap();
         }
