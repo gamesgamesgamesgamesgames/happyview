@@ -59,6 +59,24 @@ pub fn parse_concurrency(raw: Option<&str>) -> usize {
     }
 }
 
+/// `BACKFILL_SOURCE`: unset or blank means `crawl`; anything unrecognised
+/// logs a warning and means `crawl`. Replay is an opt-in: the archive holds
+/// only what it holds, and some repos' history in it starts after their
+/// first record.
+pub fn parse_default_source(raw: Option<&str>) -> SourceChoice {
+    match raw {
+        None => SourceChoice::Crawl,
+        Some(raw) if raw.trim().is_empty() => SourceChoice::Crawl,
+        Some(raw) => parse_source(raw).unwrap_or_else(|| {
+            tracing::warn!(
+                value = raw,
+                "BACKFILL_SOURCE must be auto, replay or crawl; using crawl"
+            );
+            SourceChoice::Crawl
+        }),
+    }
+}
+
 /// The key, trimmed; blank means none.
 pub fn parse_api_key(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim)
@@ -69,9 +87,8 @@ pub fn parse_api_key(raw: Option<&str>) -> Option<String> {
 /// Replay settings, read once at startup. The archive's host is
 /// `JETSTREAM_URL`'s, taken from `Config` when a job starts.
 ///
-/// `Default` is for tests and embedded states: it crawls, so nothing probes a
-/// Jetstream archive unless a job asks for replay. `from_env` defaults to
-/// `auto`.
+/// Both `Default` and `from_env` crawl unless told otherwise, so nothing
+/// probes a Jetstream archive unless `BACKFILL_SOURCE` or a job asks for it.
 #[derive(Clone, Debug)]
 pub struct ArchiveConfig {
     /// `JETSTREAM_API_KEY`, sent only to the archive endpoints.
@@ -107,17 +124,7 @@ impl Default for ArchiveConfig {
 impl ArchiveConfig {
     pub fn from_env() -> Self {
         let var = |name: &str| std::env::var(name).ok();
-        let default_source = match var("BACKFILL_SOURCE") {
-            None => SourceChoice::Auto,
-            Some(raw) if raw.trim().is_empty() => SourceChoice::Auto,
-            Some(raw) => parse_source(&raw).unwrap_or_else(|| {
-                tracing::warn!(
-                    value = raw,
-                    "BACKFILL_SOURCE must be auto, replay or crawl; using auto"
-                );
-                SourceChoice::Auto
-            }),
-        };
+        let default_source = parse_default_source(var("BACKFILL_SOURCE").as_deref());
         Self {
             api_key: parse_api_key(var("JETSTREAM_API_KEY").as_deref()),
             concurrency: parse_concurrency(var("BACKFILL_REPLAY_CONCURRENCY").as_deref()),
@@ -151,6 +158,16 @@ mod tests {
         ] {
             assert_eq!(parse_source(choice.as_str()), Some(choice));
         }
+    }
+
+    #[test]
+    fn backfill_source_defaults_to_crawl() {
+        assert_eq!(parse_default_source(None), SourceChoice::Crawl);
+        assert_eq!(parse_default_source(Some("  ")), SourceChoice::Crawl);
+        assert_eq!(parse_default_source(Some("relay")), SourceChoice::Crawl);
+        assert_eq!(parse_default_source(Some("Auto")), SourceChoice::Auto);
+        assert_eq!(parse_default_source(Some("replay")), SourceChoice::Replay);
+        assert_eq!(parse_default_source(Some("crawl")), SourceChoice::Crawl);
     }
 
     #[test]
