@@ -19,6 +19,8 @@ pub mod lua_plugin;
 #[allow(dead_code, unused_imports)]
 pub mod plc;
 #[allow(dead_code, unused_imports)]
+pub mod segment_writer;
+#[allow(dead_code, unused_imports)]
 pub mod syncer;
 #[allow(dead_code, unused_imports)]
 pub mod tls;
