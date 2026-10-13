@@ -144,7 +144,7 @@ pub(crate) async fn require_membership(
 
 /// Fetch a space blob from its author's PDS, with the content type the PDS
 /// reported.
-pub(crate) async fn fetch_space_blob(
+pub async fn fetch_space_blob(
     state: &AppState,
     author_did: &str,
     cid: &str,
@@ -159,6 +159,13 @@ pub(crate) async fn fetch_space_blob(
     let pds_endpoint =
         crate::profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, author_did)
             .await?;
+    crate::testing::identity::refuse_forged_pds(&pds_endpoint, "fetching a space blob").map_err(
+        |message| AppError::XrpcError {
+            status: axum::http::StatusCode::NOT_IMPLEMENTED,
+            code: "MethodNotImplemented",
+            message,
+        },
+    )?;
 
     let url = format!(
         "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",

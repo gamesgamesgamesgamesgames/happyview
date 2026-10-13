@@ -201,6 +201,7 @@ async fn run_subscription_once(
     let pds_endpoint = profile::resolve_labeler_endpoint(&state.http, &state.config.plc_url, did)
         .await
         .map_err(|e| format!("failed to resolve labeler endpoint for {did}: {e:?}"))?;
+    crate::testing::identity::refuse_forged_pds(&pds_endpoint, "subscribing to a labeler")?;
 
     // Convert HTTP URL to WebSocket URL.
     let ws_url = http_to_ws(&pds_endpoint);
@@ -563,6 +564,7 @@ async fn backfill_from_labeler(
         profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, labeler_did)
             .await
             .map_err(|e| format!("failed to resolve PDS for {labeler_did}: {e:?}"))?;
+    crate::testing::identity::refuse_forged_pds(&pds_endpoint, "querying a labeler")?;
 
     let encoded_uri = urlencoding::encode(uri);
     let url = format!(

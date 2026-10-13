@@ -5,6 +5,7 @@
 pub mod env;
 pub mod fake_pds;
 pub mod harness;
+pub mod identity;
 pub mod mocks;
 pub mod seed;
 pub mod triggers;
