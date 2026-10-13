@@ -87,7 +87,11 @@ async fn prepare_scripts<'s>(
         ..
     } in scripts
     {
-        let ScriptBody::Source { source, artifact } = body;
+        // A compiled module has nothing to prepare, and no interpreter for
+        // its language need be installed.
+        let ScriptBody::Source { source, artifact } = body else {
+            continue;
+        };
         let path = path_string(path);
         match prepare_one(env, language_id, source, &path, role).await {
             Ok(ready) => {

@@ -114,6 +114,7 @@ impl ScriptListing {
 fn source_of(script: &ProjectScript) -> String {
     match &script.body {
         ScriptBody::Source { source, .. } => source.to_string(),
+        ScriptBody::Module { .. } => String::new(),
     }
 }
 

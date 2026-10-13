@@ -394,6 +394,8 @@ fn project_module(id: String, path: PathBuf, language_id: String, source: String
 fn body_text(body: &ScriptBody) -> &str {
     match body {
         ScriptBody::Source { source, .. } => source.as_ref(),
+        // A rebuilt module is a changed script.
+        ScriptBody::Module { hash, .. } => hash.as_str(),
     }
 }
 

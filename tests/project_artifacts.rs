@@ -249,7 +249,9 @@ async fn build_snapshot_prepares_what_it_builds_and_refuses_a_broken_import() {
     let report = build_snapshot(&app.state, &root, BuildOptions::default())
         .await
         .unwrap_or_else(|d| panic!("{d:?}"));
-    let ScriptBody::Source { artifact, .. } = &report.snapshot.scripts["job.run:tick"].body;
+    let ScriptBody::Source { artifact, .. } = &report.snapshot.scripts["job.run:tick"].body else {
+        panic!("the handler is a source file");
+    };
     assert!(artifact.is_some());
     assert!(
         report.snapshot.modules["src/lib/format.echo"]

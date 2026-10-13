@@ -62,6 +62,13 @@ pub enum ScriptBody {
         /// for an interpreter that cannot.
         artifact: Option<crate::plugin::PreparedArtifact>,
     },
+    /// A handler of a compiled module, which has no source to prepare.
+    Module {
+        /// The `[modules.<name>]` key.
+        module: String,
+        /// Hex sha256 of the build that was loaded.
+        hash: String,
+    },
 }
 
 #[derive(Debug, Clone)]
