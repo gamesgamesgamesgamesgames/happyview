@@ -22,14 +22,23 @@ fn default_plugin_dirs(root: &Path) -> Vec<PathBuf> {
     loader::plugin_dirs_in(&dir)
 }
 
+/// One connection that is never reaped: a connection closed for idling or age
+/// would reopen as a fresh, unmigrated `sqlite::memory:`.
+fn in_memory_pool() -> sqlx::pool::PoolOptions<sqlx::Any> {
+    sqlx::any::install_default_drivers();
+    sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+}
+
 /// An executor with no instance behind it. `validate` reads no database; the
 /// pool is there because every plugin instance's host state carries one. It is
 /// migrated so that what a plugin reads or writes through it (its log lines,
 /// its allowed hosts) behaves as it does on an instance.
 async fn standalone_executor(registry: Arc<PluginRegistry>) -> Result<PluginExecutor, String> {
-    sqlx::any::install_default_drivers();
-    let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
-        .max_connections(1)
+    let pool = in_memory_pool()
         .connect("sqlite::memory:")
         .await
         .map_err(|e| format!("could not open an in-memory database: {e}"))?;
@@ -122,4 +131,17 @@ pub async fn run(args: &CheckArgs, out: &mut dyn Write) -> u8 {
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 { one } else { many }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn the_in_memory_database_is_never_reaped() {
+        let options = in_memory_pool();
+        assert_eq!(options.get_min_connections(), 1);
+        assert_eq!(options.get_idle_timeout(), None);
+        assert_eq!(options.get_max_lifetime(), None);
+    }
 }
