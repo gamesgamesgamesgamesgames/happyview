@@ -14,8 +14,15 @@ pub async fn seed(db: &AnyPool, backend: DatabaseBackend) -> Result<(), AppError
         return Ok(());
     }
     // So is one the wizard started and did not finish: replacing it would
-    // discard whatever the developer chose.
-    if status.identity_mode.is_some() {
+    // discard whatever the developer chose. An unfinished not-exposed row is
+    // the exception, since it is what an earlier seed leaves if it stops
+    // before marking setup complete, and leaving it would show the wizard on
+    // every boot after.
+    if status
+        .identity_mode
+        .as_ref()
+        .is_some_and(|mode| *mode != IdentityMode::NotExposed)
+    {
         tracing::info!("setup is unfinished; the dashboard's setup wizard can complete it");
         return Ok(());
     }
@@ -59,18 +66,53 @@ mod tests {
         assert!(vacuum.completed_at.is_some());
     }
 
-    /// A wizard the developer started and did not finish is left as it was.
+    /// A wizard the developer started and did not finish is left as it was,
+    /// whichever mode they chose other than not-exposed.
     #[tokio::test]
     async fn an_unfinished_identity_is_left_alone() {
+        for mode in [
+            IdentityMode::DidWeb,
+            IdentityMode::DidPlc,
+            IdentityMode::AttachAccount,
+        ] {
+            let db = migrated_memory_pool().await;
+            crate::service_identity::upsert_identity(
+                &db,
+                DatabaseBackend::Sqlite,
+                &mode,
+                Some("did:plc:acct"),
+                Some("enc-signing"),
+                None,
+                Some("did:plc:acct"),
+            )
+            .await
+            .unwrap();
+
+            seed(&db, DatabaseBackend::Sqlite).await.unwrap();
+
+            let identity = get_identity(&db, DatabaseBackend::Sqlite)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(identity.mode, mode);
+            assert_eq!(identity.signing_key_enc.as_deref(), Some("enc-signing"));
+            assert!(!identity.setup_complete, "{mode:?}");
+        }
+    }
+
+    /// A seed that stopped between writing the identity and marking setup
+    /// complete is finished by the next boot.
+    #[tokio::test]
+    async fn an_interrupted_seed_is_finished() {
         let db = migrated_memory_pool().await;
         crate::service_identity::upsert_identity(
             &db,
             DatabaseBackend::Sqlite,
-            &IdentityMode::AttachAccount,
-            Some("did:plc:acct"),
-            Some("enc-signing"),
+            &IdentityMode::NotExposed,
             None,
-            Some("did:plc:acct"),
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -81,9 +123,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(identity.mode, IdentityMode::AttachAccount);
-        assert_eq!(identity.signing_key_enc.as_deref(), Some("enc-signing"));
-        assert!(!identity.setup_complete);
+        assert_eq!(identity.mode, IdentityMode::NotExposed);
+        assert!(identity.setup_complete);
     }
 
     /// An identity a developer completed through the wizard is theirs, and a
