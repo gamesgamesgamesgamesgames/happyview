@@ -122,7 +122,7 @@ See [Backfill](./backfill.md) for background on backfill jobs.
 
 `jetstream.gap` means events may have been missed. The same gap (same reason and cursor) is logged once per run of the Jetstream consumer. Its `reason` is one of:
 
-- `cursor_too_old`: the saved cursor was past Jetstream's retention and no saved time could replace it, so HappyView resumed from the live tip. `after_seq` is the saved seq (the last one known applied), `resumed_at_seq` the first seq received after it, and `message` Jetstream's explanation.
+- `cursor_too_old`: the saved cursor was past Jetstream's retention and no saved time could replace it, so HappyView resumed from the live tip. `after_seq` is the saved seq (the last one known applied), `resumed_at_seq` the first seq received after it, and `message` Jetstream's explanation. When HappyView replays the gap from the Jetstream archive instead, `resumed_at_seq` is the archive's sealed tip and `replay_job_id` names the [backfill](backfill.md) job that fills the gap.
 - `outdated_cursor`: Jetstream moved a time cursor older than its retention up to the oldest event it has. `message` names where it resumed.
 - `future_cursor`: the saved seq was past Jetstream's newest, because its seq numbering restarted. HappyView reconnects by the saved witnessed time, which Jetstream translates to the new numbering, or, with none saved, follows the new numbering from the live tip. `from_seq` is the cursor it asked for.
 

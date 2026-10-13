@@ -2,7 +2,7 @@
 title: "Backfill"
 ---
 
-When you add a new record-type lexicon, HappyView starts indexing new records from that moment via [Jetstream](https://github.com/bluesky-social/jetstream). But what about records that already exist on the network? That's what backfill does: HappyView discovers repos via the relay and fetches records directly from each user's PDS.
+When you add a new record-type lexicon, HappyView starts indexing new records from that moment via [Jetstream](https://github.com/bluesky-social/jetstream). But what about records that already exist on the network? That's what backfill does: HappyView reads them from the Jetstream archive when it can, and otherwise discovers repos via the relay and fetches records directly from each user's PDS.
 
 ## When backfill runs
 
@@ -19,6 +19,34 @@ A backfill job starts with a discovery phase and then pipelines resolution and f
 2. **Resolving PDS + Fetching records** (pipelined, alongside discovery) — Resolution and fetching run concurrently. As each DID is resolved (via PLC directory or `did:web`), it's immediately handed off for record fetching — there's no need to wait for all DIDs to resolve before fetching begins. HappyView calls `com.atproto.repo.listRecords` on each PDS for the target collection(s), upserting each record into the local database. PDS endpoints are processed concurrently (up to 10 PDS hosts, 3 DIDs per host).
 
 Progress counters (`total_repos`, `resolved_repos`, `processed_repos`, `total_records`) and the current `stage` are updated in real time. The repo counters count work units, so a repo discovered under two collections counts twice. The dashboard's Backfill page shows live progress, and clicking a job opens a detail sheet with a stage-by-stage progress log.
+
+## Replay and crawl
+
+A backfill job reads records from one of two sources:
+
+- **Replay** reads the Jetstream archive. One read of the archive replaces a crawl of every PDS.
+- **Crawl** is the process described above: list repos from the relay, then fetch each one from its PDS.
+
+`BACKFILL_SOURCE` sets the default, and `POST /admin/backfill` takes a `source` that overrides it for one job. The values are `auto`, `replay` and `crawl`. `auto` is the default: a job replays when `JETSTREAM_URL` points at a Jetstream with an archive, and crawls when the archive answers 404 or 501 or can't be reached. A job created as `replay` fails instead of falling back to a crawl.
+
+A replay job downloads in two sweeps:
+
+1. **Records.** The archive's commits for the job's collections, from the start of the archive to its newest sealed segment. A job with accounts only asks for those accounts.
+2. **Accounts.** The account and sync events for the accounts that hold records in those collections.
+
+Account takedowns, deletions and repo resyncs are applied as of when they happened. A takedown from three days ago removes only what the account had at that time, so records it wrote since stay.
+
+Each record goes through the same checks as a crawled one: the lexicon script runs, and the record's CID is checked against its body. A record that fails the check is skipped and logged.
+
+The job page shows `seq {n} of {tip}` while it runs, along with the bytes downloaded and any failed blocks. A block that can't be downloaded or decoded after retries is recorded as an `replay_block` error. `POST /admin/backfill/{id}/retry-failed` starts a new job that fetches only those blocks. See [Retry failed](../api-reference/admin/backfill.md#retry-failed).
+
+Replay needs a Jetstream that serves the v2 archive. If `JETSTREAM_API_KEY` is set, it is sent to the archive and nowhere else. Replay jobs spool each segment to `BACKFILL_REPLAY_DIR` while they decode it, up to 1 GiB per segment.
+
+Crawl stays available. It is what runs when the Jetstream has no archive, and `BACKFILL_SOURCE=crawl` keeps every job on it.
+
+### Gaps in the live stream
+
+When the live stream falls further behind than Jetstream keeps, Jetstream refuses the saved cursor (`CursorTooOld`). HappyView now replays the gap from the archive instead of skipping it. It resumes the live stream at the archive's newest sealed segment right away, and a replay job fills in the records between. The `jetstream.gap` event names that job in `replay_job_id`. If the archive can't be asked, HappyView resumes as before and a [backfill](#when-backfill-runs) is the way to recover what was missed. With `BACKFILL_SOURCE=crawl`, gaps are never replayed.
 
 ### Rate limiting
 
@@ -38,7 +66,7 @@ A backfill job has both a `status` (overall state) and a `stage` (current phase)
 | `completed`  | Worker finished processing all resolvable repos      |
 | `failed`     | An error occurred                                    |
 
-The `stage` field tracks which phase the job is in: `pending`, `discovering_repos`, `resolving_and_fetching`, `completed`, `failed`, or `cancelled`.
+The `stage` field tracks which phase the job is in: `pending`, `discovering_repos`, `resolving_and_fetching`, `completed`, `failed`, or `cancelled`. A replay job moves through `replaying` (records), `replaying_accounts` (account events) and, in a retry job, `retrying_blocks`.
 
 If a job runs out of work while repos it could not complete are still queued, HappyView pauses it rather than marking it completed, and records why in the job's `error` (for example "paused: 3 units could not be completed; resume to retry"). The dashboard shows such a job as **paused automatically** with that reason. Resuming it retries the queued repos.
 
@@ -62,7 +90,7 @@ The queue is kept in the database, so a job that was halfway through fetching re
 
 ## Re-running backfills
 
-Re-running a backfill for a collection that's already been backfilled is safe. Each record is upserted by its AT URI, so existing records are refreshed in place and any new records discovered since the last run are added. This also picks up new repos that have joined the network since the previous backfill.
+Re-running a backfill for a collection that's already been backfilled is safe, whichever source it uses. Each record is upserted by its AT URI, so existing records are refreshed in place and any new records discovered since the last run are added. This also picks up new repos that have joined the network since the previous backfill.
 
 ## Restoring deleted records
 
@@ -75,6 +103,8 @@ The dashboard's backfill detail panel includes expandable sections for each proc
 ### Per-repo tracking
 
 A backfill keeps a bounded queue of the repos it is working on, counters for its progress, a per-PDS summary and its 1,000 most recently fetched repos. These power three expandable sections:
+
+A replay job has no repos to list, so it shows its seq progress instead of these sections.
 
 - **Discovering repos** — the repos queued right now, with profile avatars and handles resolved from the Bluesky API. The count beside it is everything discovered so far, labelled "found so far" until discovery finishes.
 - **Resolving PDS** — summarises PDS endpoints involved in the job, showing how many repos each PDS is responsible for and how many have been processed.
