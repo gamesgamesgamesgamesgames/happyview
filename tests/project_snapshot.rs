@@ -174,3 +174,95 @@ async fn a_lua_project_builds_through_the_real_interpreter() {
         errors[0]
     );
 }
+
+async fn post_admin(app: &TestApp, uri: &str, body: &Value) -> axum::response::Response {
+    let cookie = app.admin_cookie();
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(cookie.0, cookie.1)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// A dashboard lexicon and a dashboard script the project overrides are
+/// reported, and kept.
+#[tokio::test]
+async fn boot_reports_what_the_project_shadows() {
+    common::require_db!();
+    require_fixture!();
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin_with_extensions("lua", &["lua"]))
+        .await;
+
+    let lexicon = serde_json::json!({
+        "lexicon": 1,
+        "id": "com.example.project.thing",
+        "defs": {"main": {"type": "record", "key": "tid", "record": {"type": "object", "properties": {}}}}
+    });
+    let resp = post_admin(
+        &app,
+        "/admin/lexicons",
+        &serde_json::json!({"lexicon_json": lexicon}),
+    )
+    .await;
+    assert!(resp.status().is_success(), "{}", resp.status());
+
+    let body = "function handle(input, ctx)\n  return input\nend\n";
+    let resp = post_admin(
+        &app,
+        "/admin/scripts",
+        &serde_json::json!({
+            "id": "record.index:com.example.project.thing",
+            "script_type": "lua",
+            "body": body,
+        }),
+    )
+    .await;
+    let status = resp.status();
+    assert!(status.is_success(), "{status}: {}", json_body(resp).await);
+
+    let root = tempfile::tempdir().unwrap();
+    let write = |rel: &str, contents: &str| {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    write(
+        "src/lexicons/com/example/project/thing.json",
+        &lexicon.to_string(),
+    );
+    write("src/lexicons/com/example/project/thing.index.lua", body);
+
+    let installed = happyview::project::boot::build_and_install(&app.state, root.path())
+        .await
+        .unwrap_or_else(|d| {
+            panic!(
+                "{}",
+                d.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+    let shown: Vec<String> = installed.warnings.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        shown,
+        [
+            "src/lexicons/com/example/project/thing.index.lua: warning: overrides the dashboard \
+             script record.index:com.example.project.thing, which answers again if this file is \
+             removed",
+            "src/lexicons/com/example/project/thing.json: warning: overrides the dashboard lexicon \
+             com.example.project.thing, which answers again if this file is removed",
+        ]
+    );
+}

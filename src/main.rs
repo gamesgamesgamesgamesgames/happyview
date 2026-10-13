@@ -930,6 +930,29 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
         script_limits,
     };
 
+    // Before anything that runs a script starts: a worker that came first
+    // would run against no project at all, and serving without the project
+    // would answer its routes with nothing.
+    if let Some(root) = state.config.project_root.clone() {
+        match happyview::project::boot::build_and_install(&state, &root).await {
+            Ok(installed) => {
+                for warning in &installed.warnings {
+                    eprintln!("{warning}");
+                }
+            }
+            Err(diagnostics) => {
+                for diagnostic in &diagnostics {
+                    eprintln!("{diagnostic}");
+                }
+                eprintln!(
+                    "{}: the project did not build, so HappyView is not starting",
+                    root.display()
+                );
+                return std::process::ExitCode::from(1);
+            }
+        }
+    }
+
     tokio::spawn(happyview::lua::limits::run_refresh_loop(
         state.script_limits.clone(),
         state.db.clone(),

@@ -1,5 +1,6 @@
 //! The project layer: an immutable view of a project's `src/`, swapped whole.
 
+pub mod boot;
 pub mod build;
 pub mod check;
 pub mod describe;
