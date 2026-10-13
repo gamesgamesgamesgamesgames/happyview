@@ -1457,15 +1457,21 @@ pub enum ScriptKind {
     RecordEvent,
     Label,
     Job,
+    /// A `*.test.<ext>` file run by `happyview test`. It defines no `handle`:
+    /// the interpreter runs the file, collects its tests, runs them and
+    /// reports each through `host_test_report`. An interpreter built before
+    /// this variant existed fails to decode the input and answers `BAD_INPUT`.
+    Test,
 }
 
 impl ScriptKind {
-    pub const ALL: [ScriptKind; 5] = [
+    pub const ALL: [ScriptKind; 6] = [
         ScriptKind::XrpcQuery,
         ScriptKind::XrpcProcedure,
         ScriptKind::RecordEvent,
         ScriptKind::Label,
         ScriptKind::Job,
+        ScriptKind::Test,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -1475,6 +1481,7 @@ impl ScriptKind {
             ScriptKind::RecordEvent => "record_event",
             ScriptKind::Label => "label",
             ScriptKind::Job => "job",
+            ScriptKind::Test => "test",
         }
     }
 }
@@ -1880,6 +1887,127 @@ pub struct JobShouldStopRequest {}
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct JobWaitRequest {
     pub seconds: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Test runner imports
+// ---------------------------------------------------------------------------
+
+/// Which trigger `host_test_trigger` fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestTriggerKind {
+    Query,
+    Procedure,
+    RecordCreate,
+    RecordUpdate,
+    RecordDelete,
+    Job,
+    Label,
+}
+
+impl TestTriggerKind {
+    pub const ALL: [TestTriggerKind; 7] = [
+        TestTriggerKind::Query,
+        TestTriggerKind::Procedure,
+        TestTriggerKind::RecordCreate,
+        TestTriggerKind::RecordUpdate,
+        TestTriggerKind::RecordDelete,
+        TestTriggerKind::Job,
+        TestTriggerKind::Label,
+    ];
+}
+
+/// What `host_test_trigger` receives. `target` is the NSID, collection, job
+/// type or label subject URI the kind needs; `input` is the query's
+/// parameters, the procedure's body, the record, the job's input or the
+/// label's body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestTrigger {
+    pub kind: TestTriggerKind,
+    pub target: String,
+    #[serde(default)]
+    pub input: Value,
+    /// The record's author, for the three record kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkey: Option<String>,
+    /// The caller the trigger is forged as.
+    #[serde(default, rename = "as", skip_serializing_if = "Option::is_none")]
+    pub as_did: Option<String>,
+}
+
+/// What a trigger produced: an HTTP status and a JSON body for every kind, so
+/// a test asserts on one shape whichever trigger it fired.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestTriggerResult {
+    pub status: u16,
+    pub body: Value,
+}
+
+/// What `host_test_mock` receives: `{method: response | [responses]}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestMock {
+    pub namespace: String,
+    pub responses: Value,
+}
+
+/// What `host_test_calls` receives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCalls {
+    pub namespace: String,
+}
+
+/// One recorded library call, `args` as the JSON array the call carried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestCall {
+    pub method: String,
+    pub args: Value,
+}
+
+/// What `host_test_pds_writes` receives. Empty: the writes are the run's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestPdsWritesRequest {}
+
+/// One write the in-process PDS accepted. `record` and `cid` are absent for a
+/// delete.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestPdsWrite {
+    pub action: String,
+    pub repo: String,
+    pub collection: String,
+    pub rkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+}
+
+/// A test's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestStatus {
+    Pass,
+    Fail,
+    Skip,
+}
+
+/// What `host_test_report` receives, once per test. `name` is the test's
+/// full name, its `describe` blocks joined with ` > `; `file` and `line` place
+/// the failing assertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestReport {
+    pub path: String,
+    pub name: String,
+    pub status: TestStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub duration_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -4068,6 +4196,9 @@ mod interpreter_tests {
                     id: "job-1".to_string(),
                 });
             }
+            ScriptKind::Test => {
+                ctx.trigger = "test:src/lib/format.test.lua".to_string();
+            }
         }
         ctx
     }
@@ -4094,7 +4225,7 @@ mod interpreter_tests {
                 id: "happyview-db".to_string(),
             }],
             limits: ExecuteLimits {
-                instructions: if kind == ScriptKind::Job {
+                instructions: if matches!(kind, ScriptKind::Job | ScriptKind::Test) {
                     None
                 } else {
                     Some(1_000_000)
@@ -4219,6 +4350,62 @@ mod interpreter_tests {
     }
 
     #[test]
+    fn the_test_runner_types_carry_their_wire_names() {
+        let trigger: TestTrigger = serde_json::from_value(json!({
+            "kind": "record_create", "target": "app.test.rec", "input": {"a": 1},
+            "did": "did:plc:alice", "rkey": "3k", "as": "did:plc:bob",
+        }))
+        .unwrap();
+        assert_eq!(trigger.kind, TestTriggerKind::RecordCreate);
+        assert_eq!(trigger.as_did.as_deref(), Some("did:plc:bob"));
+        assert_eq!(
+            serde_json::to_value(&trigger).unwrap()["as"],
+            json!("did:plc:bob")
+        );
+
+        let bare: TestTrigger =
+            serde_json::from_value(json!({"kind": "query", "target": "app.test.q"})).unwrap();
+        assert_eq!(bare.input, Value::Null);
+        assert!(bare.did.is_none() && bare.rkey.is_none() && bare.as_did.is_none());
+
+        let kinds: Vec<Value> = TestTriggerKind::ALL
+            .iter()
+            .map(|k| serde_json::to_value(k).unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                json!("query"),
+                json!("procedure"),
+                json!("record_create"),
+                json!("record_update"),
+                json!("record_delete"),
+                json!("job"),
+                json!("label"),
+            ]
+        );
+
+        let report: TestReport = serde_json::from_value(json!({
+            "path": "src/lib/a.test.lua", "name": "a > b", "status": "fail",
+            "message": "expected 1, got 2", "file": "src/lib/a.test.lua", "line": 3, "duration_ms": 4,
+        }))
+        .unwrap();
+        assert_eq!(report.status, TestStatus::Fail);
+        assert_eq!(report.line, Some(3));
+        let minimal: TestReport = serde_json::from_value(json!({
+            "path": "p", "name": "n", "status": "skip", "duration_ms": 0,
+        }))
+        .unwrap();
+        assert!(minimal.message.is_none() && minimal.file.is_none() && minimal.line.is_none());
+
+        let write: TestPdsWrite = serde_json::from_value(json!({
+            "action": "delete", "repo": "did:plc:a", "collection": "c", "rkey": "r",
+        }))
+        .unwrap();
+        assert!(write.record.is_none() && write.cid.is_none());
+    }
+
+    #[test]
     fn script_enums_serialize_snake_case() {
         let kinds: Vec<Value> = ScriptKind::ALL
             .iter()
@@ -4231,7 +4418,8 @@ mod interpreter_tests {
                 json!("xrpc_procedure"),
                 json!("record_event"),
                 json!("label"),
-                json!("job")
+                json!("job"),
+                json!("test")
             ]
         );
         for kind in ScriptKind::ALL {

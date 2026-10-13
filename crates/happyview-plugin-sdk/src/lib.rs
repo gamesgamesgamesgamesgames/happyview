@@ -67,7 +67,9 @@ pub use types::{
     SpaceMemberAdd, SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete, SpaceRecordInfo,
     SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite,
     SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers, SpacesQuery, Step, StrongRef,
-    TableQuery, TokenInput, TokenSet, ValidateError, ValidateInput, ValidateOutput,
+    TableQuery, TestCall, TestCalls, TestMock, TestPdsWrite, TestPdsWritesRequest, TestReport,
+    TestStatus, TestTrigger, TestTriggerKind, TestTriggerResult, TokenInput, TokenSet,
+    ValidateError, ValidateInput, ValidateOutput,
 };
 pub use wire::DEFAULT_CHUNK_NAME;
 
