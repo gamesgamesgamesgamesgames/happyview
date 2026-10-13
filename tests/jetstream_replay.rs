@@ -1508,8 +1508,8 @@ fn consume(
     (handle, tx)
 }
 
-/// `app` with `BACKFILL_SOURCE=auto`, the production default. The TestApp
-/// default crawls, and under `crawl` gap replay is off (P8).
+/// `app` with `BACKFILL_SOURCE=auto`, the opt-in that turns gap replay on.
+/// The default crawls, and under `crawl` gap replay is off (P8).
 async fn auto_app(mock: &MockJetstream) -> Option<TestApp> {
     let mut app = app(mock, None).await?;
     app.state.archive.default_source = SourceChoice::Auto;
@@ -1707,7 +1707,7 @@ async fn cursor_too_old_with_a_hung_archive_resumes_as_before() {
 #[tokio::test]
 #[serial]
 async fn cursor_too_old_under_crawl_never_asks_the_archive() {
-    // P8: with BACKFILL_SOURCE=crawl (the TestApp default), CursorTooOld is
+    // P8: with BACKFILL_SOURCE=crawl (the default), CursorTooOld is
     // handled exactly as before, even though this host has an archive.
     let mock = MockJetstream::start().await;
     let Some(app) = app(&mock, None).await else {
