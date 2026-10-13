@@ -2,6 +2,7 @@
 
 pub mod env;
 pub mod instance;
+pub mod reload;
 pub mod report;
 pub mod secrets;
 
@@ -13,6 +14,7 @@ use crate::config::project::ConfigMode;
 pub struct DevSession {
     pub root: PathBuf,
     pub public_url: String,
+    pub secrets: secrets::Secrets,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +48,7 @@ pub fn prepare(root: &Path) -> Result<(DevSession, Config), DevError> {
     let session = DevSession {
         public_url: config.public_url.clone(),
         root,
+        secrets,
     };
     Ok((session, config))
 }

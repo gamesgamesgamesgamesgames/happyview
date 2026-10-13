@@ -146,6 +146,10 @@ mod tests {
         let session = DevSession {
             root: PathBuf::from("/work/app"),
             public_url: "http://127.0.0.1:3000".into(),
+            secrets: crate::dev::secrets::Secrets {
+                session_secret: String::new(),
+                token_encryption_key: String::new(),
+            },
         };
         assert_eq!(
             banner(&session),
