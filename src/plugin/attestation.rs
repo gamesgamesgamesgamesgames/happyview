@@ -643,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_or_generate_creates_key() {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         let pool = sqlx::pool::PoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -679,7 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_or_generate_sign_verify_roundtrip() {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         let pool = sqlx::pool::PoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")

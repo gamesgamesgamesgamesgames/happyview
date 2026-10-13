@@ -41,10 +41,14 @@ async function seedRecords(
     for (let i = 1; i <= 3; i++) {
       const uri = `at://did:plc:e2e-test-admin/${COLLECTION}/record-${i}`
       const now = new Date().toISOString()
+      // happyview_records is a view: it takes no ON CONFLICT, so replace the row.
+      await client.query(
+        `DELETE FROM happyview_records WHERE did = $1 AND collection = $2 AND rkey = $3`,
+        ["did:plc:e2e-test-admin", COLLECTION, `record-${i}`],
+      )
       await client.query(
         `INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (uri) DO NOTHING`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
         [
           uri,
           "did:plc:e2e-test-admin",

@@ -280,19 +280,13 @@ pub async fn labels_get(
         }
     }
 
-    let record_sql = adapt_sql(
-        "SELECT did, record FROM happyview_records WHERE uri = ?",
-        backend,
-    );
+    let store = crate::record_store::RecordStore::new(db.clone(), backend);
     for uri in uris {
-        let record: Option<(String, String)> = crate::db::query_as(&record_sql)
-            .bind(uri)
-            .fetch_optional(db)
-            .await?;
-        let Some((did, record_str)) = record else {
+        let Some(stored) = store.get(uri).await? else {
             continue;
         };
-        let record_val: Value = serde_json::from_str(&record_str).unwrap_or(Value::Null);
+        let did = stored.did;
+        let record_val: Value = serde_json::from_str(&stored.record).unwrap_or(Value::Null);
         let Some(arr) = record_val
             .get("labels")
             .and_then(|l| l.get("values"))
@@ -361,13 +355,11 @@ mod tests {
     use super::*;
 
     async fn seeded_pool() -> sqlx::AnyPool {
-        let pool = crate::test_support::memory_pool().await;
+        let pool = crate::test_support::migrated_memory_pool().await;
         for sql in [
-            "CREATE TABLE happyview_labels (src TEXT NOT NULL, uri TEXT NOT NULL, val TEXT NOT NULL, cts TEXT NOT NULL, exp TEXT)",
-            "CREATE TABLE happyview_records (uri TEXT PRIMARY KEY, did TEXT NOT NULL, collection TEXT NOT NULL, rkey TEXT, record TEXT NOT NULL, cid TEXT, indexed_at TEXT, created_at TEXT)",
-            "INSERT INTO happyview_labels VALUES ('did:plc:labeler', 'at://a/c/1', 'spam', '2026-01-01T00:00:00Z', NULL)",
-            "INSERT INTO happyview_labels VALUES ('did:plc:labeler', 'at://a/c/1', 'expired', '2020-01-01T00:00:00Z', '2020-06-01T00:00:00Z')",
-            "INSERT INTO happyview_records VALUES ('at://a/c/1', 'did:plc:a', 'c', '1', '{\"labels\":{\"values\":[{\"val\":\"self-applied\"}]}}', 'cid1', NULL, '2026-01-01T00:00:01Z')",
+            "INSERT INTO happyview_labels VALUES ('did:plc:labeler', 'at://did:plc:a/c/1', 'spam', '2026-01-01T00:00:00Z', NULL)",
+            "INSERT INTO happyview_labels VALUES ('did:plc:labeler', 'at://did:plc:a/c/1', 'expired', '2020-01-01T00:00:00Z', '2020-06-01T00:00:00Z')",
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES ('at://did:plc:a/c/1', 'did:plc:a', 'c', '1', '{\"labels\":{\"values\":[{\"val\":\"self-applied\"}]}}', 'cid1', NULL, '2026-01-01T00:00:01Z')",
         ] {
             crate::db::query(sql).execute(&pool).await.unwrap();
         }
@@ -377,11 +369,15 @@ mod tests {
     #[tokio::test]
     async fn labels_get_excludes_expired_and_includes_self_labels() {
         let pool = seeded_pool().await;
-        let result = labels_get(&pool, DatabaseBackend::Sqlite, &["at://a/c/1".to_string()])
-            .await
-            .unwrap();
+        let result = labels_get(
+            &pool,
+            DatabaseBackend::Sqlite,
+            &["at://did:plc:a/c/1".to_string()],
+        )
+        .await
+        .unwrap();
 
-        let labels = result.get("at://a/c/1").expect("uri present");
+        let labels = result.get("at://did:plc:a/c/1").expect("uri present");
         assert_eq!(labels.len(), 2, "{labels:?}");
 
         let external = labels.iter().find(|l| l.val == "spam").unwrap();
@@ -425,13 +421,16 @@ mod tests {
         let result = labels_get(
             &pool,
             DatabaseBackend::Sqlite,
-            &["at://a/c/1".to_string(), "at://nowhere/c/1".to_string()],
+            &[
+                "at://did:plc:a/c/1".to_string(),
+                "at://nowhere/c/1".to_string(),
+            ],
         )
         .await
         .unwrap();
 
         assert_eq!(result.len(), 2);
-        assert!(!result["at://a/c/1"].is_empty());
+        assert!(!result["at://did:plc:a/c/1"].is_empty());
         assert!(result["at://nowhere/c/1"].is_empty());
     }
 
@@ -870,7 +869,7 @@ mod tests {
     async fn labels_get_refuses_more_than_the_uri_cap() {
         let pool = seeded_pool().await;
         let too_many: Vec<String> = (0..=MAX_LABEL_URIS)
-            .map(|i| format!("at://a/c/{i}"))
+            .map(|i| format!("at://did:plc:a/c/{i}"))
             .collect();
 
         let err = labels_get(&pool, DatabaseBackend::Sqlite, &too_many)

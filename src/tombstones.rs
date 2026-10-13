@@ -304,100 +304,34 @@ pub async fn write_did_tombstone(
 /// Otherwise the purge waits forever on a lock its caller holds, and Postgres
 /// cannot report it as a deadlock because the holder is idle in transaction.
 pub async fn purge_did_records(
-    db: &AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     did: &str,
     collections: Option<&[String]>,
 ) -> Result<u64, sqlx::Error> {
     if collections.is_some_and(<[String]>::is_empty) {
         return Ok(0);
     }
-    if held_uris(db, backend, did, collections, 1)
-        .await?
-        .is_empty()
-    {
+    if !store.holds_network_records(did, collections).await? {
         return Ok(0);
     }
+    let backend = store.backend();
     let mut purged = 0;
     loop {
-        let deleted =
-            crate::db::retry_on_busy(|| purge_batch(db, backend, did, collections)).await?;
+        let deleted = crate::db::retry_on_busy(|| async {
+            let mut tx = begin_write(store.db(), backend).await?;
+            lock_did(&mut tx, backend, did).await?;
+            let deleted = store
+                .purge_network_batch(&mut tx, did, collections, PURGE_BATCH)
+                .await?;
+            tx.commit().await?;
+            Ok(deleted)
+        })
+        .await?;
         purged += deleted;
         if (deleted as i64) < PURGE_BATCH {
             return Ok(purged);
         }
     }
-}
-
-/// Up to `limit` of the network records `did` holds, optionally only in
-/// `collections`.
-async fn held_uris<'e, E>(
-    executor: E,
-    backend: DatabaseBackend,
-    did: &str,
-    collections: Option<&[String]>,
-    limit: i64,
-) -> Result<Vec<String>, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Any>,
-{
-    let mut select =
-        "SELECT uri FROM happyview_records WHERE did = ? AND indexed_at IS NOT NULL".to_string();
-    if let Some(collections) = collections {
-        select.push_str(&format!(
-            " AND collection IN ({})",
-            placeholders(collections.len())
-        ));
-    }
-    select.push_str(" LIMIT ?");
-    let select = adapt_sql(&select, backend);
-
-    let mut query = crate::db::query_as::<(String,)>(&select).bind(did);
-    for collection in collections.unwrap_or_default() {
-        query = query.bind(collection.as_str());
-    }
-    Ok(query
-        .bind(limit)
-        .fetch_all(executor)
-        .await?
-        .into_iter()
-        .map(|(uri,)| uri)
-        .collect())
-}
-
-async fn purge_batch(
-    db: &AnyPool,
-    backend: DatabaseBackend,
-    did: &str,
-    collections: Option<&[String]>,
-) -> Result<u64, sqlx::Error> {
-    let mut tx = begin_write(db, backend).await?;
-    lock_did(&mut tx, backend, did).await?;
-    let uris = held_uris(&mut *tx, backend, did, collections, PURGE_BATCH).await?;
-    if uris.is_empty() {
-        tx.commit().await?;
-        return Ok(0);
-    }
-
-    for (table, column) in [
-        ("happyview_record_refs", "source_uri"),
-        ("happyview_records", "uri"),
-    ] {
-        let sql = adapt_sql(
-            &format!(
-                "DELETE FROM {table} WHERE {column} IN ({})",
-                placeholders(uris.len())
-            ),
-            backend,
-        );
-        let mut delete = crate::db::query(&sql);
-        for uri in &uris {
-            delete = delete.bind(uri.as_str());
-        }
-        delete.execute(&mut *tx).await?;
-    }
-    tx.commit().await?;
-    Ok(uris.len() as u64)
 }
 
 /// Delete tombstones older than `retention_hours`, in batches. `0` keeps
@@ -664,10 +598,13 @@ mod tests {
             .await
             .expect("seed ref");
 
-            let purged =
-                purge_did_records(&pool, backend, &did, Some([POST.to_string()].as_slice()))
-                    .await
-                    .expect("collection purge");
+            let purged = purge_did_records(
+                &crate::record_store::RecordStore::new(pool.clone(), backend),
+                &did,
+                Some([POST.to_string()].as_slice()),
+            )
+            .await
+            .expect("collection purge");
             assert_eq!(purged, 2, "{backend:?}");
             assert_eq!(rkeys(&pool, backend, &did).await, vec!["c", "local"]);
             let (refs,): (i64,) = crate::db::query_as(&adapt_sql(
@@ -681,9 +618,13 @@ mod tests {
             assert_eq!(refs, 0, "a purged record's refs go with it");
 
             assert_eq!(
-                purge_did_records(&pool, backend, &did, None)
-                    .await
-                    .expect("purge"),
+                purge_did_records(
+                    &crate::record_store::RecordStore::new(pool.clone(), backend),
+                    &did,
+                    None
+                )
+                .await
+                .expect("purge"),
                 1
             );
             assert_eq!(
@@ -693,9 +634,13 @@ mod tests {
             );
             assert_eq!(rkeys(&pool, backend, &other).await, vec!["x"]);
             assert_eq!(
-                purge_did_records(&pool, backend, &did, Some(&[][..]))
-                    .await
-                    .expect("empty"),
+                purge_did_records(
+                    &crate::record_store::RecordStore::new(pool.clone(), backend),
+                    &did,
+                    Some(&[][..])
+                )
+                .await
+                .expect("empty"),
                 0
             );
 
@@ -961,8 +906,18 @@ mod tests {
             let purged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 let posts = [POST.to_string()];
                 (
-                    purge_did_records(&pool, backend, &empty, None).await,
-                    purge_did_records(&pool, backend, &did, Some(&posts)).await,
+                    purge_did_records(
+                        &crate::record_store::RecordStore::new(pool.clone(), backend),
+                        &empty,
+                        None,
+                    )
+                    .await,
+                    purge_did_records(
+                        &crate::record_store::RecordStore::new(pool.clone(), backend),
+                        &did,
+                        Some(&posts),
+                    )
+                    .await,
                 )
             })
             .await
@@ -988,7 +943,14 @@ mod tests {
             lock_did(&mut held, backend, &did).await.expect("lock did");
             let purge = tokio::spawn({
                 let (pool, did) = (pool.clone(), did.clone());
-                async move { purge_did_records(&pool, backend, &did, None).await }
+                async move {
+                    purge_did_records(
+                        &crate::record_store::RecordStore::new(pool.clone(), backend),
+                        &did,
+                        None,
+                    )
+                    .await
+                }
             });
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             assert!(!purge.is_finished(), "the purge waits for the DID's lock");

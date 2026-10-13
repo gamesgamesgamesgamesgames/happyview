@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::State;
 
@@ -15,36 +17,37 @@ pub(super) async fn stats(
     AllowPlatform(auth): AllowPlatform,
 ) -> Result<Json<StatsResponse>, AppError> {
     auth.require(Permission::StatsRead).await?;
-    let total: (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_records")
-        .fetch_one(&state.db)
+    let total = state
+        .records
+        .count_all()
         .await
         .map_err(|e| AppError::Internal(format!("failed to count records: {e}")))?;
 
-    let collection_sql = adapt_sql(
-        r#"
-        SELECT c.collection, COALESCE(r.cnt, 0) AS count
-        FROM (
-            SELECT id AS collection FROM happyview_lexicons
-            WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record'
-        ) c
-        LEFT JOIN (
-            SELECT collection, COUNT(*) AS cnt FROM happyview_records GROUP BY collection
-        ) r ON r.collection = c.collection
-        ORDER BY c.collection
-        "#,
+    let lexicon_sql = adapt_sql(
+        "SELECT id FROM happyview_lexicons \
+         WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record' ORDER BY id",
         state.db_backend,
     );
-
-    let collections: Vec<(String, i64)> = crate::db::query_as(&collection_sql)
+    let record_lexicons: Vec<(String,)> = crate::db::query_as(&lexicon_sql)
         .fetch_all(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to count by collection: {e}")))?;
+    let counts: HashMap<String, i64> = state
+        .records
+        .count_by_collection()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to count by collection: {e}")))?
+        .into_iter()
+        .collect();
 
     Ok(Json(StatsResponse {
-        total_records: total.0,
-        collections: collections
+        total_records: total,
+        collections: record_lexicons
             .into_iter()
-            .map(|(collection, count)| CollectionStat { collection, count })
+            .map(|(collection,)| {
+                let count = counts.get(&collection).copied().unwrap_or(0);
+                CollectionStat { collection, count }
+            })
             .collect(),
     }))
 }

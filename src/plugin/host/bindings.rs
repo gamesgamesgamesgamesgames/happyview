@@ -863,12 +863,17 @@ pub(crate) fn define_host_functions(
         "host_records_index_put",
         |caller, (req_ptr, req_len): (i32, i32)| {
             Box::pin(async move {
+                let shared = shared_records(caller.data());
                 host_spec_impl(
                     caller,
                     "host_records_index_put",
                     req_ptr,
                     req_len,
-                    |db, backend, spec| async move { super::index_put(&db, backend, spec).await },
+                    |db, backend, spec| async move {
+                        let store = shared
+                            .unwrap_or_else(|| crate::record_store::RecordStore::new(db, backend));
+                        super::index_put(&store, spec).await
+                    },
                 )
                 .await
             })
@@ -879,13 +884,16 @@ pub(crate) fn define_host_functions(
         "host_records_index_delete",
         |caller, (req_ptr, req_len): (i32, i32)| {
             Box::pin(async move {
+                let shared = shared_records(caller.data());
                 host_spec_impl(
                     caller,
                     "host_records_index_delete",
                     req_ptr,
                     req_len,
                     |db, backend, spec: happyview_plugin_sdk::wire::IndexDelete| async move {
-                        super::index_delete(&db, backend, &spec.uri).await
+                        let store = shared
+                            .unwrap_or_else(|| crate::record_store::RecordStore::new(db, backend));
+                        super::index_delete(&store, &spec.uri).await
                     },
                 )
                 .await
@@ -1664,6 +1672,13 @@ async fn host_allowed_hosts_impl(
     let hosts = resolved_allowed_hosts(caller.data());
     let response = serde_json::to_vec(&serde_json::json!({"ok": hosts})).unwrap_or_default();
     write_guest_response(caller, &response).await
+}
+
+/// The instance's shared record store, which carries the interned-id cache
+/// and the compression dictionaries; `None` for an instance built without
+/// the app state, which then writes through a store of its own.
+fn shared_records(state: &PluginState) -> Option<crate::record_store::RecordStore> {
+    state.app_state.as_ref().map(|app| app.records.clone())
 }
 
 /// One entry point for every spec-taking record/table query import: gate on
@@ -2706,7 +2721,7 @@ mod tests {
     /// or two fields (here, `allowed_hosts`) use this rather than each
     /// re-deriving the rest.
     fn test_plugin_state(allowed_hosts: Vec<String>) -> PluginState {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         PluginState {
             plugin_id: "test-plugin".into(),
             scope: "did:example:test".into(),

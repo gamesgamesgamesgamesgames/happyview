@@ -236,7 +236,7 @@ mod tests {
     /// SQLite pool (same pattern used elsewhere for host-context test
     /// fixtures) is enough without a real database.
     fn test_host_context() -> HostContext {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         HostContext {
             plugin_id: "test-plugin".into(),
             scope: "did:example:test".into(),

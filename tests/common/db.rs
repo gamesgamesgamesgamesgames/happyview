@@ -77,7 +77,7 @@ pub async fn truncate_all(pool: &AnyPool) {
     match backend {
         DatabaseBackend::Postgres => {
             happyview::db::query(
-                "TRUNCATE happyview_records, happyview_record_tombstones, happyview_did_tombstones, happyview_lexicons, happyview_backfill_jobs, happyview_users, happyview_user_permissions, happyview_api_keys, happyview_event_logs, happyview_script_variables, happyview_scripts, happyview_dead_letter_scripts, happyview_dead_letter_hooks, happyview_record_refs, happyview_labeler_subscriptions, happyview_labels, happyview_instance_settings, happyview_domains, happyview_dpop_sessions, happyview_dpop_keys, happyview_api_clients, happyview_api_client_probes, happyview_delegated_accounts, happyview_account_delegates, happyview_service_identity, happyview_service_entries, happyview_service_entry_xrpcs, happyview_jobs, happyview_spaces, happyview_space_members, happyview_space_records, happyview_space_repo_state, happyview_space_record_oplog, happyview_space_notify_registrations, happyview_space_invites, happyview_linked_repo_sessions, happyview_linked_repo_auth_state, happyview_linked_repos, happyview_oauth_sessions, happyview_auth_login_redirects, happyview_oauth_client_keys, happyview_verification_methods, happyview_space_pds_support RESTART IDENTITY CASCADE",
+                "TRUNCATE happyview_records_v2, happyview_record_refs_v2, happyview_record_tombstones, happyview_did_tombstones, happyview_lexicons, happyview_backfill_jobs, happyview_users, happyview_user_permissions, happyview_api_keys, happyview_event_logs, happyview_script_variables, happyview_scripts, happyview_dead_letter_scripts, happyview_dead_letter_hooks, happyview_labeler_subscriptions, happyview_labels, happyview_instance_settings, happyview_domains, happyview_dpop_sessions, happyview_dpop_keys, happyview_api_clients, happyview_api_client_probes, happyview_delegated_accounts, happyview_account_delegates, happyview_service_identity, happyview_service_entries, happyview_service_entry_xrpcs, happyview_jobs, happyview_spaces, happyview_space_members, happyview_space_records, happyview_space_repo_state, happyview_space_record_oplog, happyview_space_notify_registrations, happyview_space_invites, happyview_linked_repo_sessions, happyview_linked_repo_auth_state, happyview_linked_repos, happyview_oauth_sessions, happyview_auth_login_redirects, happyview_oauth_client_keys, happyview_verification_methods, happyview_space_pds_support RESTART IDENTITY CASCADE",
             )
             .execute(pool)
             .await
@@ -113,7 +113,10 @@ pub async fn truncate_all(pool: &AnyPool) {
                 "happyview_dpop_keys",
                 "happyview_api_client_probes",
                 "happyview_api_clients",
-                "happyview_records",
+                // Refs before the records they reference. The interned
+                // names stay: a live store's cached ids must remain valid.
+                "happyview_record_refs_v2",
+                "happyview_records_v2",
                 "happyview_record_tombstones",
                 "happyview_did_tombstones",
                 "happyview_lexicons",
@@ -130,7 +133,6 @@ pub async fn truncate_all(pool: &AnyPool) {
                 "happyview_scripts",
                 "happyview_dead_letter_scripts",
                 "happyview_dead_letter_hooks",
-                "happyview_record_refs",
                 "happyview_labeler_subscriptions",
                 "happyview_labels",
                 "happyview_instance_settings",

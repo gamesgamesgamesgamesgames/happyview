@@ -109,60 +109,6 @@ fn collect_at_uris(value: &Value, uris: &mut HashSet<String>) {
 /// 999 of SQLite builds before 3.32 too.
 pub const REFS_PER_INSERT: usize = 300;
 
-/// Replace `source_uri`'s refs with those in `record`, on a connection the
-/// caller owns, so they can share the caller's transaction.
-pub async fn sync_refs_in(
-    conn: &mut sqlx::AnyConnection,
-    source_uri: &str,
-    collection: &str,
-    record: &Value,
-    backend: DatabaseBackend,
-) -> Result<(), sqlx::Error> {
-    let delete_sql = adapt_sql(
-        "DELETE FROM happyview_record_refs WHERE source_uri = ?",
-        backend,
-    );
-    crate::db::query(&delete_sql)
-        .bind(source_uri)
-        .execute(&mut *conn)
-        .await?;
-
-    let targets: Vec<String> = extract_at_uris(record).into_iter().collect();
-    for chunk in targets.chunks(REFS_PER_INSERT) {
-        let placeholders = vec!["(?, ?, ?)"; chunk.len()].join(", ");
-        let insert_sql = adapt_sql(
-            &format!(
-                "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) VALUES {placeholders} ON CONFLICT DO NOTHING"
-            ),
-            backend,
-        );
-        let mut insert = crate::db::query(&insert_sql);
-        for target in chunk {
-            insert = insert
-                .bind(source_uri)
-                .bind(target.as_str())
-                .bind(collection);
-        }
-        insert.execute(&mut *conn).await?;
-    }
-
-    Ok(())
-}
-
-/// Update record_refs for a given source record: delete the old refs and
-/// insert the new ones, in one transaction.
-pub async fn sync_refs(
-    db: &sqlx::AnyPool,
-    source_uri: &str,
-    collection: &str,
-    record: &Value,
-    backend: DatabaseBackend,
-) -> Result<(), sqlx::Error> {
-    let mut tx = db.begin().await?;
-    sync_refs_in(&mut tx, source_uri, collection, record, backend).await?;
-    tx.commit().await
-}
-
 /// Instance setting recording that the one-time refs rebuild has run.
 pub const REFS_REBUILT_SETTING: &str = "record_refs_rebuilt";
 
@@ -185,7 +131,7 @@ pub enum RebuildOutcome {
     },
 }
 
-async fn put_setting(
+pub(crate) async fn put_setting(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
     key: &str,
@@ -208,11 +154,14 @@ async fn put_setting(
     Ok(())
 }
 
-async fn get_setting(
-    db: &sqlx::AnyPool,
+pub(crate) async fn get_setting<'e, E>(
+    db: E,
     backend: DatabaseBackend,
     key: &str,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Any>,
+{
     let sql = adapt_sql(
         "SELECT value FROM happyview_instance_settings WHERE key = ?",
         backend,
@@ -230,7 +179,7 @@ async fn get_setting(
 /// The old check rebuilt whenever the table happened to be empty, which on a
 /// collection whose records reference nothing meant a full OFFSET scan and
 /// rewrite on every boot. An instance setting now records that the rebuild
-/// ran, and the walk is keyset-paged on `uri`. Each page commits together with
+/// ran, and the walk is keyset-paged on the record id. Each page commits together with
 /// a resume cursor, and the done marker is written only after the last page,
 /// so an interrupted rebuild picks up where it stopped.
 pub async fn rebuild_once(
@@ -256,18 +205,12 @@ async fn rebuild_pages(
         return Ok(Some(RebuildOutcome::AlreadyDone));
     }
 
+    let store = crate::record_store::RecordStore::new(db.clone(), backend);
     let cursor = get_setting(db, backend, REFS_REBUILD_CURSOR_SETTING).await?;
-    if cursor.is_none() {
-        let (has_refs,): (i64,) = crate::db::query_as(
-            "SELECT COUNT(*) FROM (SELECT 1 FROM happyview_record_refs LIMIT 1) AS any_ref",
-        )
-        .fetch_one(db)
-        .await?;
-        if has_refs > 0 {
-            let mut conn = db.acquire().await?;
-            put_setting(&mut conn, backend, REFS_REBUILT_SETTING, "true").await?;
-            return Ok(Some(RebuildOutcome::NotNeeded));
-        }
+    if cursor.is_none() && store.has_refs().await? {
+        let mut conn = db.acquire().await?;
+        put_setting(&mut conn, backend, REFS_REBUILT_SETTING, "true").await?;
+        return Ok(Some(RebuildOutcome::NotNeeded));
     }
 
     // Record that a rebuild has started before any page commits, so a crash
@@ -281,10 +224,6 @@ async fn rebuild_pages(
         .await?;
     }
 
-    let page_sql = adapt_sql(
-        "SELECT uri, collection, record FROM happyview_records WHERE uri > ? ORDER BY uri LIMIT ?",
-        backend,
-    );
     let mut after = cursor.unwrap_or_default();
     let mut records: u64 = 0;
     let mut pages = 0usize;
@@ -292,30 +231,26 @@ async fn rebuild_pages(
         if max_pages.is_some_and(|max| pages >= max) {
             return Ok(None);
         }
-        let page: Vec<(String, String, String)> = crate::db::query_as(&page_sql)
-            .bind(&after)
-            .bind(REBUILD_PAGE_SIZE)
-            .fetch_all(db)
-            .await?;
-        let Some((last, _, _)) = page.last() else {
-            break;
-        };
-        after = last.clone();
-
-        crate::db::retry_on_busy(|| async {
-            let mut tx = db.begin().await?;
-            for (uri, collection, body) in &page {
-                let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-                sync_refs_in(&mut tx, uri, collection, &value, backend).await?;
+        // The page is read and rewritten on one write transaction, so a
+        // deferred SQLite transaction never has to upgrade its read lock.
+        let (walked, last) = crate::db::retry_on_busy(|| async {
+            let mut tx = crate::db::begin_write(db, backend).await?;
+            let (walked, last) = store
+                .rebuild_refs_page(&mut tx, &after, REBUILD_PAGE_SIZE)
+                .await?;
+            if let Some(last) = &last {
+                put_setting(&mut tx, backend, REFS_REBUILD_CURSOR_SETTING, last).await?;
             }
-            put_setting(&mut tx, backend, REFS_REBUILD_CURSOR_SETTING, &after).await?;
-            tx.commit().await
+            tx.commit().await?;
+            Ok((walked, last))
         })
         .await?;
+        let Some(last) = last else { break };
+        after = last;
 
         pages += 1;
         let before = records;
-        records += page.len() as u64;
+        records += walked;
         if before / 10_000 != records / 10_000 {
             tracing::info!(records, "record_refs rebuild progress");
         }
@@ -386,57 +321,6 @@ mod tests {
         assert_eq!(uris.len(), 1);
     }
 
-    #[tokio::test]
-    async fn sync_refs_replaces_a_records_refs_in_one_go() {
-        let pool = crate::test_support::migrated_memory_pool().await;
-        let backend = DatabaseBackend::Sqlite;
-        crate::db::query(
-            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
-             VALUES ('at://did:plc:s/app.test.post/1', 'did:plc:s', 'app.test.post', '1', '{}', 'bafyreiabc', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
-        )
-        .execute(&pool)
-        .await
-        .expect("seed record");
-        let targets: Vec<String> = (0..(REFS_PER_INSERT + 5))
-            .map(|i| format!("at://did:plc:t/app.test.post/{i}"))
-            .collect();
-        let record = json!({ "refs": targets });
-
-        sync_refs(
-            &pool,
-            "at://did:plc:s/app.test.post/1",
-            "app.test.post",
-            &record,
-            backend,
-        )
-        .await
-        .expect("sync refs");
-        let (count,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_record_refs")
-            .fetch_one(&pool)
-            .await
-            .expect("count refs");
-        assert_eq!(
-            count as usize,
-            REFS_PER_INSERT + 5,
-            "every ref lands across insert chunks"
-        );
-
-        sync_refs(
-            &pool,
-            "at://did:plc:s/app.test.post/1",
-            "app.test.post",
-            &json!({}),
-            backend,
-        )
-        .await
-        .expect("clear refs");
-        let (count,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_record_refs")
-            .fetch_one(&pool)
-            .await
-            .expect("count refs");
-        assert_eq!(count, 0);
-    }
-
     async fn seed_record(pool: &sqlx::AnyPool, rkey: &str, body: &Value) {
         crate::db::query(
             "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
@@ -448,6 +332,19 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed record");
+    }
+
+    /// A ref live ingest would have written for `source`'s `subject`.
+    async fn live_ref(pool: &sqlx::AnyPool, source: &str, body: &Value) {
+        crate::db::query(
+            "INSERT INTO happyview_record_refs (source_uri, target_uri, collection) \
+             VALUES (?, ?, 'app.test.post')",
+        )
+        .bind(source)
+        .bind(body["subject"].as_str().expect("a subject"))
+        .execute(pool)
+        .await
+        .expect("live ref");
     }
 
     async fn refs(pool: &sqlx::AnyPool) -> i64 {
@@ -537,15 +434,7 @@ mod tests {
         let backend = DatabaseBackend::Sqlite;
         let body = json!({"subject": "at://did:plc:t/app.test.post/1"});
         seed_record(&pool, "a", &body).await;
-        sync_refs(
-            &pool,
-            "at://did:plc:r/app.test.post/a",
-            "app.test.post",
-            &body,
-            backend,
-        )
-        .await
-        .expect("live refs");
+        live_ref(&pool, "at://did:plc:r/app.test.post/a", &body).await;
         seed_record(&pool, "b", &body).await;
 
         assert_eq!(
@@ -576,15 +465,7 @@ mod tests {
         // Live ingest writes a ref in the meantime.
         let body = json!({"subject": "at://did:plc:t/app.test.post/live"});
         seed_record(&pool, "live", &body).await;
-        sync_refs(
-            &pool,
-            "at://did:plc:r/app.test.post/live",
-            "app.test.post",
-            &body,
-            backend,
-        )
-        .await
-        .expect("live refs");
+        live_ref(&pool, "at://did:plc:r/app.test.post/live", &body).await;
 
         assert_eq!(
             rebuild_once(&pool, backend).await.expect("resume"),
