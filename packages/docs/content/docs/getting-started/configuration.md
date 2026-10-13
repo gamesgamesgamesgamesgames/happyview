@@ -2,7 +2,7 @@
 title: "Configuration"
 ---
 
-HappyView is configured via environment variables. A `.env` file in the project root is loaded automatically on startup. See [Local Development](deployment/local-development.md) for local setup, [Docker](deployment/docker.md) for deploying from published images, or [Production](deployment/production.md) for the hardening checklist.
+HappyView is configured via environment variables. A `.env` file in the project root is loaded automatically on startup. See [Local Development](deployment/local-development.md) for local setup, [Docker](deployment/docker.md) for deploying from published images, [Native binary](deployment/binary.md) for a released binary, or [Production](deployment/production.md) for the hardening checklist.
 
 ## Environment variables
 
@@ -24,7 +24,9 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `JETSTREAM_WORKERS` | no | `8` | Workers applying events in parallel, 1 to 64. Larger values are capped at 64, and 0 or an invalid value uses 8 with a warning. A repo's events always go to the same worker, in order. A worker waits for each event's [record script](../guides/record-scripts.md), so slow scripts limit throughput; on Postgres, raise this to apply more repos at once. On SQLite writes take turns, so more workers help less. See [Real-time indexing](../reference/architecture.md#real-time-indexing) |
 | `RELAY_URL` | no | `https://bsky.network` | Relay URL for [backfill](../guides/backfill.md) repo discovery |
 | `PLC_URL` | no | `https://plc.directory` | [PLC directory](https://github.com/did-method-plc/did-method-plc) URL for DID resolution |
-| `STATIC_DIR` | no | `./web/out` | Directory containing the built dashboard static assets |
+| `STATIC_DIR` | no | _(embedded)_ | Directory to serve the dashboard from instead of the copy built into release binaries. Set but empty is the same as unset. A binary built from source without the `embedded-dashboard` feature falls back to `./web/out` |
+| `PLUGIN_REGISTRY_URL` | no | `https://api.happyproto.at` | Registry the plugin catalogue is read from. Empty reads only the GitHub fallback; `off` turns the catalogue off entirely, so neither the registry nor GitHub is contacted |
+| `PLUGIN_GITHUB_API_BASE` | no | `https://api.github.com` | GitHub API the catalogue falls back to when the registry lists nothing installable |
 | `SCRIPT_INSTRUCTION_LIMIT` | no | `1000000` | Lua VM instructions a query, procedure, record or label script may execute per run, from loading the chunk to `handle` returning, before it fails with `timeout`. An integer from `1000` to `1000000000`. Job scripts are not limited. The **Instruction limit** setting in Settings → General takes precedence when set. See [Lua Scripting](../guides/lua-scripting.md#sandbox) |
 | `SCRIPT_WALL_CLOCK_SECONDS` | no | `10` | Seconds a query, procedure, record or label script may spend running, before it fails with `timeout`. Time spent awaiting the host — an HTTP request, a database read — is not charged against it. An integer from `1` to `300`. Job scripts are not clocked. The **Request wall clock** setting in Settings → General takes precedence when set |
 | `EVENT_LOG_RETENTION_DAYS` | no | `30` | Number of days to keep event logs before automatic cleanup. Set to `0` to disable cleanup |
