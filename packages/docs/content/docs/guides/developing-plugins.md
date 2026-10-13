@@ -46,7 +46,7 @@ Each plugin has a `manifest.json` that describes its metadata:
 
 Each `required_secrets` key is a full environment variable name: `PLUGIN_`, then the plugin's `id` upper-cased with every non-alphanumeric character replaced by `_`, then the secret's own name — so a plugin with the id `auth-steam` asks for `PLUGIN_AUTH_STEAM_API_KEY`. The plugin itself reads the part after that prefix: `host_get_secret("API_KEY")`.
 
-The fields above are the `auth` baseline. [Plugin Types](#plugin-types) below covers the fields a `library` or `interpreter` manifest adds: `plugin_type`, `capabilities`, `allowed_hosts`, `publisher`, `dependencies`, and `namespace`.
+The fields above are the `auth` baseline. [Plugin Types](#plugin-types) below covers the fields a `library` or `interpreter` manifest adds: `plugin_type`, `capabilities`, `allowed_hosts`, `publisher`, `dependencies`, `namespace`, and an interpreter's `language_id` and `extensions`.
 
 ## Plugin Types
 
@@ -56,13 +56,38 @@ The manifest's `plugin_type` field decides what the host expects the plugin to e
 | --- | --- |
 | `auth` (default) | An external-auth plugin: OAuth/OpenID/API-key login plus profile lookup. The [Plugin Exports](#plugin-exports) and [Host Functions](#host-functions) below are the `auth` contract. |
 | `library` | A plugin other plugins and Lua scripts call into, via `host_call_library` or `require(namespace)`. See [Library Plugins](#library-plugins) below. |
-| `interpreter` | Reserved for future non-Lua script runtimes. Not yet implemented. |
+| `interpreter` | A script runtime. It runs the scripts written in its language. See [Interpreter manifests](#interpreter-manifests) below. |
 
 Every plugin, `auth` included, needs `api_version` `"2"` and a `capabilities` list covering everything its compiled module imports. The loader refuses an older or missing `api_version` with an error naming the plugin type and the version it found.
 
 A `library` plugin may declare `namespace` — the name scripts use in `require(namespace)`. It defaults to `id` when omitted.
 
 Namespaces are dotted `publisher.name` (`happyview.db`); ids are hyphenated (`happyview-db`). A script's `require("happyview.db")` names the implementation it depends on, since a script is often read without the instance that runs it.
+
+### Interpreter manifests
+
+An `interpreter` manifest names its language and the file extensions it runs:
+
+```json
+{
+  "id": "happyview-lua",
+  "name": "Lua",
+  "version": "1.0.0",
+  "api_version": "2",
+  "plugin_type": "interpreter",
+  "language_id": "lua",
+  "extensions": ["lua"],
+  "capabilities": ["library:call", "script:host", "wasi:clock", "wasi:random", "wasi:stdio"],
+  "wasm_file": "happyview-lua.wasm"
+}
+```
+
+| Field | Description |
+| --- | --- |
+| `language_id` | The language's name, stored as each script's `script_type`. Lowercase letters, digits, `-` and `_`, starting with a letter. Two installed interpreters cannot share one |
+| `extensions` | The file extensions this interpreter runs in a project's `src/`, without the dot. Each is 1 to 16 lowercase letters or digits, none may be `json` (lexicons use it), and none may be listed twice |
+
+A file in a project's `src/` with one of these extensions belongs to this interpreter, which checks it when the project builds and runs it when it is a script. Two installed interpreters cannot claim the same extension: installing the second is refused with `files ending in .<ext> are already run by interpreter '<id>'`. A manifest with no `extensions` claims its older `file_extension` field instead, if it has one.
 
 ### Dependencies
 

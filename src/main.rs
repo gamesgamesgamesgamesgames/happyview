@@ -1017,6 +1017,12 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
 
     happyview::admin::backfill::resume_backfill_jobs(&state).await;
 
+    // After the resume, which re-spawns running jobs and would otherwise run
+    // one started here twice.
+    if state.config.project_root.is_some() {
+        happyview::project::boot::start_declared_backfills(&state).await;
+    }
+
     // Resume interrupted jobs and start the job worker
     happyview::jobs::worker::resume_interrupted_jobs(&state).await;
     happyview::jobs::worker::spawn_workers(state.clone(), state.config.job_worker_concurrency);

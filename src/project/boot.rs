@@ -79,3 +79,56 @@ pub async fn shadow_warnings(state: &AppState) -> Vec<Diagnostic> {
     diagnostic::sort(&mut out);
     out
 }
+
+/// Starts a backfill for each project record lexicon declaring
+/// `backfill = true` whose collection has never had one. An upload backfills
+/// on a lexicon's first revision only; for a file, "first" is a collection
+/// with no network backfill job on record, which survives restarts because
+/// those rows are kept. A job for named accounts doesn't count: it fetched
+/// those accounts' records, not the collection's.
+pub async fn start_declared_backfills(state: &AppState) -> Vec<String> {
+    let snapshot = state.project.load_full();
+    let mut started = Vec::new();
+    for lexicon in snapshot.lexicons.values() {
+        if !lexicon.backfill || lexicon.parsed.lexicon_type != crate::lexicon::LexiconType::Record {
+            continue;
+        }
+        let collection = &lexicon.parsed.id;
+        let sql = crate::db::adapt_sql(
+            "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE collection = ? AND scope = 'network'",
+            state.db_backend,
+        );
+        let seen: Result<(i64,), _> = crate::db::query_as(&sql)
+            .bind(collection)
+            .fetch_one(&state.db)
+            .await;
+        match seen {
+            Ok((0,)) => {}
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    collection = %collection,
+                    error = %e,
+                    "could not tell whether this collection was backfilled; not starting one"
+                );
+                continue;
+            }
+        }
+        match crate::admin::backfill::start_automatic_backfill(
+            state,
+            collection.clone(),
+            "happyview.toml",
+        )
+        .await
+        {
+            Ok(Some(_)) => started.push(collection.clone()),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                collection = %collection,
+                error = %e,
+                "failed to start the declared backfill"
+            ),
+        }
+    }
+    started
+}

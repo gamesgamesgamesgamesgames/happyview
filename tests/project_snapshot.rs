@@ -266,3 +266,87 @@ async fn boot_reports_what_the_project_shadows() {
         ]
     );
 }
+
+#[tokio::test]
+async fn a_declared_backfill_starts_once() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let root = tempfile::tempdir().unwrap();
+    let write = |rel: &str, contents: &str| {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    write(
+        "happyview.toml",
+        "[lexicons.\"com.example.project.thing\"]\nbackfill = true\n",
+    );
+    write(
+        "src/lexicons/com/example/project/thing.json",
+        r#"{"lexicon":1,"id":"com.example.project.thing","defs":{"main":{"type":"record","key":"tid","record":{"type":"object","properties":{}}}}}"#,
+    );
+    write(
+        "src/lexicons/com/example/project/other.json",
+        r#"{"lexicon":1,"id":"com.example.project.other","defs":{"main":{"type":"record","key":"tid","record":{"type":"object","properties":{}}}}}"#,
+    );
+    happyview::project::boot::build_and_install(&app.state, root.path())
+        .await
+        .unwrap();
+
+    let started = happyview::project::boot::start_declared_backfills(&app.state).await;
+    assert_eq!(started, ["com.example.project.thing"]);
+    let (jobs,): (i64,) = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE collection = ?",
+        app.state.db_backend,
+    ))
+    .bind("com.example.project.thing")
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(jobs, 1);
+
+    // The next boot finds the job and starts nothing.
+    assert!(
+        happyview::project::boot::start_declared_backfills(&app.state)
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_backfill_of_named_accounts_does_not_stand_in_for_the_declared_one() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let root = tempfile::tempdir().unwrap();
+    let write = |rel: &str, contents: &str| {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    };
+    write(
+        "happyview.toml",
+        "[lexicons.\"com.example.project.named\"]\nbackfill = true\n",
+    );
+    write(
+        "src/lexicons/com/example/project/named.json",
+        r#"{"lexicon":1,"id":"com.example.project.named","defs":{"main":{"type":"record","key":"tid","record":{"type":"object","properties":{}}}}}"#,
+    );
+    happyview::project::boot::build_and_install(&app.state, root.path())
+        .await
+        .unwrap();
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_backfill_jobs (id, collection, did, scope, status, created_at) \
+         VALUES (?, ?, ?, 'dids', 'completed', ?)",
+        app.state.db_backend,
+    ))
+    .bind("named-accounts-job")
+    .bind("com.example.project.named")
+    .bind("did:plc:someone")
+    .bind(happyview::db::now_rfc3339())
+    .execute(&app.state.db)
+    .await
+    .unwrap();
+
+    let started = happyview::project::boot::start_declared_backfills(&app.state).await;
+    assert_eq!(started, ["com.example.project.named"]);
+}

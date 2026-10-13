@@ -128,12 +128,46 @@ subscribe = ["did:plc:ar7c4by46qjdydhdevvrndac"]
 [jetstream]
 protocol = "auto"            # stands in for JETSTREAM_PROTOCOL: auto, v2 or v1
 compression = true           # stands in for JETSTREAM_COMPRESSION
+
+[lexicons."com.example.thing"]
+backfill = true              # backfill this record collection once
 ```
 
 - `[network_lexicons] include` lexicons are tracked at boot, with no target collection and no backfill. One whose id a dashboard lexicon already uses is skipped with a warning; the dashboard lexicon is kept.
 - `[labels] subscribe` labelers are subscribed at boot. Pausing one from the dashboard sticks across restarts.
 - Neither can be removed from the dashboard or the admin API (`409`); remove the line from the file. A line removed from the file leaves its subscription or lexicon in place, now removable from the dashboard.
+- `backfill = true` on a record lexicon in the project's `src/lexicons/` starts a backfill only the first time. At boot, HappyView starts one for the collection unless a network backfill of that collection already exists, whatever its outcome: completed, failed, cancelled or still running. A backfill of named accounts does not count, and neither does a backfill of all collections, so either of those leaves the declared one to start. Restarting does not crawl the network again, even if the first backfill failed or was cancelled. To run it again, open **Backfill** in the dashboard, choose **Create Backfill Job** and select the collection, or call [`POST /admin/backfill`](../api-reference/admin/backfill.md) with `{"collection": "..."}`.
 - Unknown sections and keys are refused, and every error names the file, line and column: `happyview.toml:3:1: unknown field ...`.
+
+## Checking a project
+
+`happyview check <root>` builds the project at `<root>` the way boot does, without serving it, and prints what it found. It needs no database and no `DATABASE_URL`, so it can run in CI on every pull request.
+
+```sh
+happyview check ./my-project
+happyview check ./my-project --plugin ./plugins/lua
+```
+
+Each problem is printed on its own line, with paths relative to the project root. An error reads `path:line: message`, or `path: message` when there is no line; a warning reads the same with `warning: ` before the message:
+
+```text
+src/lexicons/com/example/getThing.json: the lexicon's id is 'com.example.getOther', ...
+src/lexicons/com/example/thing.index.lua: warning: overrides the dashboard script ...
+```
+
+A project that fails prints its problems followed by a count of errors. A project that builds prints its warnings and a summary such as `ok: 4 lexicons, 6 scripts, 1 module`.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The project builds |
+| `1` | The project does not build; the reasons are printed |
+| `2` | The check could not run, for example because an interpreter plugin failed to load |
+
+Scripts are checked by the interpreter that claims their file extension, so `check` needs the interpreter plugins. It loads them from, in order:
+
+1. each `--plugin <dir>`, where the directory holds one plugin's `manifest.json`, when any are given;
+2. otherwise every plugin directory inside `$PLUGIN_DIR`;
+3. otherwise every plugin directory inside `<root>/.happyview/plugins`.
 
 ## Next steps
 

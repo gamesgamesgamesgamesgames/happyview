@@ -4033,6 +4033,19 @@ pub(crate) async fn start_backfill(
     Ok(job_id)
 }
 
+/// The one way to start a backfill nobody explicitly asked for, such as a
+/// project lexicon's `backfill = true`, so that `HAPPYVIEW_DEV_BACKFILL` can
+/// be honoured in one place. `None` means it was not started.
+pub(crate) async fn start_automatic_backfill(
+    state: &AppState,
+    collection: String,
+    actor_did: &str,
+) -> Result<Option<String>, AppError> {
+    start_backfill(state, Some(collection), Vec::new(), actor_did)
+        .await
+        .map(Some)
+}
+
 /// POST /admin/backfill/{id}/cancel — cancel a running backfill job.
 pub(super) async fn cancel_backfill(
     State(state): State<AppState>,
