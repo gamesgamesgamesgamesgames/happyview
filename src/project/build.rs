@@ -269,6 +269,30 @@ pub async fn build_snapshot_with(
     })
 }
 
+/// Serve `snapshot` from now on. One atomic swap, so a run that started
+/// before it keeps the snapshot it pinned and a run that starts after sees
+/// all of the new one.
+///
+/// Installs come from one place at a time, boot and then the dev watcher,
+/// so reading the generation and storing the next one are not raced.
+pub async fn install(state: &AppState, mut snapshot: ProjectSnapshot) {
+    snapshot.generation = state.project.load().generation + 1;
+    state.project.store(Arc::new(snapshot));
+
+    // Jetstream filters on these, so a project record lexicon it isn't told
+    // about never indexes. The subscription reconnects on every change it
+    // hears of, so an install that changes nothing must stay silent. The
+    // catalog answers sorted, which makes equality the set comparison.
+    let collections = state.lexicons.get_record_collections().await;
+    state.collections_tx.send_if_modified(|current| {
+        if *current == collections {
+            return false;
+        }
+        *current = collections;
+        true
+    });
+}
+
 /// A `happyview.toml` problem as a diagnostic on that file. A parse error
 /// already knows its line; its own `Display` names the absolute path, which
 /// the diagnostic's path makes redundant.
@@ -1065,5 +1089,52 @@ mod tests {
                 .to_string()
                 .contains("com.example.remote.test is a lexicon")
         );
+    }
+
+    #[tokio::test]
+    async fn an_installed_snapshot_is_what_the_catalog_answers() {
+        let Some(state) = env().await else { return };
+        let root = basic();
+        let report = build_snapshot(&state, root.path(), BuildOptions::default())
+            .await
+            .unwrap();
+        let before = state.project.load().generation;
+        install(&state, report.snapshot).await;
+
+        assert_eq!(state.project.load().generation, before + 1);
+        let query = state
+            .lexicons
+            .get("com.example.getThing")
+            .await
+            .expect("the project query");
+        assert_eq!(
+            query.target_collection.as_deref(),
+            Some("com.example.thing")
+        );
+        assert!(
+            state
+                .lexicons
+                .get_space_declaration("com.example.room")
+                .await
+                .is_some()
+        );
+        assert!(
+            state
+                .collections_tx
+                .borrow()
+                .contains(&"com.example.thing".to_string())
+        );
+
+        // An install that changes no collection doesn't wake the Jetstream
+        // subscription, which reconnects on every change it is told about.
+        let mut rx = state.collections_tx.subscribe();
+        let _ = rx.borrow_and_update();
+        let again = build_snapshot(&state, root.path(), BuildOptions::default())
+            .await
+            .unwrap();
+        assert!(again.changes.is_empty(), "{:?}", again.changes);
+        install(&state, again.snapshot).await;
+        assert_eq!(state.project.load().generation, before + 2);
+        assert!(!rx.has_changed().unwrap());
     }
 }
