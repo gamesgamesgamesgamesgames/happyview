@@ -15,6 +15,7 @@ exclude = [
     "tests/fixtures/wasi_forbidden",
     "tests/fixtures/interpreter_echo",
     "tests/fixtures/differential_library",
+    "tests/fixtures/script_module",
 ]
 
 [workspace.dependencies]
