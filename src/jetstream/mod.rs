@@ -85,6 +85,10 @@ struct Session {
     /// A resume from the tip that lost events, reported once the first event
     /// shows where the stream picked up again.
     pending_gap: Option<Gap>,
+    /// The archive's sealed tip a gap replay resumed the stream at. If the
+    /// server refuses that cursor too, the next `CursorTooOld` resumes
+    /// without a seq instead of planning the same gap again.
+    gap_resumed_at: Option<i64>,
     /// 400s in a row with no error name to go by (`handle_rejection`).
     unexplained_400s: u32,
     /// After `FutureCursor`, the first ticket of the new seq numbering:
@@ -132,6 +136,7 @@ impl Session {
             stale_seq: None,
             from_tip: false,
             pending_gap: None,
+            gap_resumed_at: None,
             unexplained_400s: 0,
             save_barrier: None,
             logged_gaps: HashSet::new(),
@@ -223,8 +228,12 @@ async fn handle_rejection(
         }
         Rejection::CursorTooOld(message) => {
             // P8: under BACKFILL_SOURCE=crawl the archive is never asked.
+            // A refusal of the tip a gap replay already resumed at would only
+            // plan the same gap and send the same cursor again, forever.
             if session.protocol == Protocol::V2
                 && state.archive.default_source != crate::jetstream::archive::SourceChoice::Crawl
+                && (session.gap_resumed_at.is_none()
+                    || session.sent_cursor != session.gap_resumed_at)
                 && let Some(after_seq) = gap_floor(state, settings).await
             {
                 match crate::admin::backfill::replay::start_gap_replay(state, after_seq).await {
@@ -239,6 +248,7 @@ async fn handle_rejection(
                         session.stale_seq = Some(after_seq);
                         session.from_tip = false;
                         session.pending_gap = None;
+                        session.gap_resumed_at = Some(tip);
                         *last_dispatched = Some(tip);
                         let sent = session.sent_cursor;
                         log_gap(

@@ -675,26 +675,9 @@ pub(crate) async fn start_gap_replay(
         );
         return Ok((job_id, tip));
     }
-    let job_id = super::create_backfill_job_with(
-        state,
-        None,
-        &[],
-        crate::jetstream::archive::SourceChoice::Replay,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    let sql = crate::db::adapt_sql(
-        "UPDATE happyview_backfill_jobs SET replay_after_seq = ? WHERE id = ?",
-        state.db_backend,
-    );
-    crate::db::retry_on_busy(|| {
-        crate::db::query(&sql)
-            .bind(after_seq)
-            .bind(&job_id)
-            .execute(&state.backfill_db)
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let job_id = super::create_gap_replay_job(state, after_seq)
+        .await
+        .map_err(|e| e.to_string())?;
     super::log_event(
         &state.db,
         super::EventLog {

@@ -3942,24 +3942,58 @@ pub(crate) async fn create_backfill_job_with(
         return Ok(job_id);
     }
 
+    insert_network_job(state, &state.db, &job_id, collection, source, None).await?;
+    Ok(job_id)
+}
+
+/// Create a network replay job for everything after `after_seq` (a gap in
+/// the live stream). `replay_after_seq` goes in with the row, so no reader,
+/// including a restart's resume, ever sees the job without it.
+pub(crate) async fn create_gap_replay_job(
+    state: &AppState,
+    after_seq: i64,
+) -> Result<String, AppError> {
+    let job_id = Uuid::new_v4().to_string();
+    insert_network_job(
+        state,
+        &state.backfill_db,
+        &job_id,
+        None,
+        SourceChoice::Replay,
+        Some(after_seq),
+    )
+    .await?;
+    Ok(job_id)
+}
+
+async fn insert_network_job(
+    state: &AppState,
+    pool: &sqlx::AnyPool,
+    job_id: &str,
+    collection: Option<&str>,
+    source: SourceChoice,
+    replay_after_seq: Option<i64>,
+) -> Result<(), AppError> {
     let now = now_rfc3339();
     let sql = adapt_sql(
         "INSERT INTO happyview_backfill_jobs \
-         (id, collection, did, scope, status, stage, total_repos, queue_version, discovery_complete, started_at, created_at, source) \
-         VALUES (?, ?, NULL, 'network', 'running', 'pending', 0, 2, 0, ?, ?, ?)",
+         (id, collection, did, scope, status, stage, total_repos, queue_version, discovery_complete, started_at, created_at, source, replay_after_seq) \
+         VALUES (?, ?, NULL, 'network', 'running', 'pending', 0, 2, 0, ?, ?, ?, ?)",
         state.db_backend,
     );
-    crate::db::query(&sql)
-        .bind(&job_id)
-        .bind(collection)
-        .bind(&now)
-        .bind(&now)
-        .bind(source.as_str())
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to create backfill job: {e}")))?;
-
-    Ok(job_id)
+    crate::db::retry_on_busy(|| {
+        crate::db::query(&sql)
+            .bind(job_id)
+            .bind(collection)
+            .bind(&now)
+            .bind(&now)
+            .bind(source.as_str())
+            .bind(replay_after_seq)
+            .execute(pool)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("failed to create backfill job: {e}")))?;
+    Ok(())
 }
 
 pub(crate) async fn start_backfill(
@@ -5262,6 +5296,31 @@ mod tests {
 
     async fn migrated_state() -> AppState {
         test_state_with_pool(crate::test_support::migrated_memory_pool().await)
+    }
+
+    #[tokio::test]
+    async fn a_gap_replay_job_row_is_created_with_its_floor() {
+        // A restart's resume must never see the job without its floor, or
+        // it would replay the whole archive from seq 0.
+        let mut states = vec![migrated_state().await];
+        if let Some(state) = crate::test_support::test_state_from_env().await {
+            states.push(state);
+        }
+        for state in states {
+            let job_id = create_gap_replay_job(&state, 20).await.expect("gap job");
+            let row: (Option<i64>, String, String, Option<String>) = crate::db::query_as(&adapt_sql(
+                "SELECT replay_after_seq, source, scope, collection FROM happyview_backfill_jobs WHERE id = ?",
+                state.db_backend,
+            ))
+            .bind(&job_id)
+            .fetch_one(&state.db)
+            .await
+            .expect("the job row");
+            assert_eq!(
+                row,
+                (Some(20), "replay".to_string(), "network".to_string(), None)
+            );
+        }
     }
 
     #[tokio::test]

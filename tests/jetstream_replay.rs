@@ -1177,6 +1177,14 @@ async fn cursor_too_old_under_crawl_never_asks_the_archive() {
     );
 }
 
+/// The ids of the replay jobs listed.
+async fn gap_job_ids(app: &TestApp) -> Vec<String> {
+    replay_jobs(&app.get_json("/admin/backfill/status").await)
+        .iter()
+        .map(|j| j["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
 #[tokio::test]
 #[serial]
 async fn a_repeated_cursor_too_old_reuses_the_running_gap_job() {
@@ -1189,35 +1197,89 @@ async fn a_repeated_cursor_too_old_reuses_the_running_gap_job() {
     // in segment mode and `hold_segment` can keep the job running.
     let segment = mock.seal(games(1..=50, did), 25);
     mock.hold_segment(&segment);
-    mock.push((51..=55).map(|s| js::create(s, did, GAME, &format!("g{s:04}"), game("t"))));
     save_setting(&app, "jetstream_seq", "20").await;
     save_setting(&app, "jetstream_host", &mock.host()).await;
-    // Refused twice: at the saved seq 20, then again at the sealed tip 50,
-    // before anything is applied, so the saved seq is still 20.
+    // The first consumer is refused at seq 20, starts the gap job and
+    // resumes at the sealed tip. Nothing new arrives, so the saved seq is
+    // still 20 when it stops.
     mock.reject_next(400, "CursorTooOld", "too old");
+    let (first, _first_collections) = consume(&app, &mock);
+    wait_until!(
+        "the first consumer to resume at the sealed tip",
+        mock.connections()
+            .iter()
+            .any(|c| c.param("cursor").as_deref() == Some("50"))
+    );
+    first.abort();
+    // A restarted consumer is refused at seq 20 again: the same gap.
     mock.reject_next(400, "CursorTooOld", "still too old");
+    mock.push((51..=55).map(|s| js::create(s, did, GAME, &format!("g{s:04}"), game("t"))));
     let (consumer, _collections) = consume(&app, &mock);
     wait_until!(
         "the live stream to resume",
         dump(&app).await.iter().any(|r| r.0.ends_with("g0055"))
     );
-    let jobs = replay_jobs(&app.get_json("/admin/backfill/status").await);
+    let jobs = gap_job_ids(&app).await;
     assert_eq!(
         jobs.len(),
         1,
         "one gap job for seq 20, however often it is refused: {jobs:?}"
     );
     mock.release_segment(&segment);
-    assert_eq!(
-        finished(&app, jobs[0]["id"].as_str().unwrap()).await["status"],
-        "completed"
-    );
+    assert_eq!(finished(&app, &jobs[0]).await["status"], "completed");
     consumer.abort();
     let gaps = gap_events(&app).await;
     assert_eq!(gaps.len(), 2, "{gaps:?}");
     assert!(
-        gaps.iter().all(|g| g["replay_job_id"] == jobs[0]["id"]),
+        gaps.iter().all(|g| g["replay_job_id"] == jobs[0].as_str()),
         "{gaps:?}"
     );
     assert_eq!(dump(&app).await.len(), 35);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_refused_sealed_tip_falls_back_to_the_live_tip() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = auto_app(&mock).await else {
+        return;
+    };
+    let did = "did:plc:tiprefused";
+    let segment = mock.seal(games(1..=50, did), 25);
+    mock.hold_segment(&segment);
+    mock.push((51..=55).map(|s| js::create(s, did, GAME, &format!("g{s:04}"), game("t"))));
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    // Refused at the saved seq 20, then at the sealed tip 50 the gap replay
+    // resumed at. Planning the gap again would only send 50 again.
+    mock.reject_next(400, "CursorTooOld", "too old");
+    mock.reject_next(400, "CursorTooOld", "the tip is too old too");
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!(
+        "the live stream to resume from the tip",
+        dump(&app).await.iter().any(|r| r.0.ends_with("g0055"))
+    );
+    // The gap job's own first page, besides the gap replay's plan.
+    wait_until!("the gap job to plan", mock.plan_requests().len() >= 2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        mock.plan_requests().len(),
+        2,
+        "the refused tip is not planned again: {:?}",
+        mock.plan_requests()
+    );
+    let connections = mock.connections();
+    assert_eq!(connections.len(), 3, "seq 20, the tip 50, then no cursor");
+    assert_eq!(connections[1].param("cursor").as_deref(), Some("50"));
+    assert_eq!(connections[2].param("cursor"), None, "resumed from the tip");
+    let jobs = gap_job_ids(&app).await;
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    let gaps = gap_events(&app).await;
+    assert_eq!(gaps.len(), 2, "{gaps:?}");
+    assert_eq!(gaps[0]["replay_job_id"], jobs[0].as_str());
+    assert_eq!(gaps[1]["reason"], "cursor_too_old");
+    assert!(gaps[1].get("replay_job_id").is_none(), "{gaps:?}");
+    mock.release_segment(&segment);
+    assert_eq!(finished(&app, &jobs[0]).await["status"], "completed");
+    consumer.abort();
 }
