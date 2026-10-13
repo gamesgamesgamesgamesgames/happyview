@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+pub mod client;
 pub mod rows;
 pub mod segment;
 
@@ -78,6 +79,9 @@ pub struct ArchiveConfig {
     pub download_dir: PathBuf,
     /// `BACKFILL_SOURCE`: the source of a job created without one.
     pub default_source: SourceChoice,
+    /// The first backoff step after a 5xx or a transport error; doubles per
+    /// attempt. One second in production; tests shorten it.
+    pub retry_unit: std::time::Duration,
 }
 
 impl Default for ArchiveConfig {
@@ -87,6 +91,7 @@ impl Default for ArchiveConfig {
             concurrency: DEFAULT_CONCURRENCY,
             download_dir: std::env::temp_dir().join("happyview-replay"),
             default_source: SourceChoice::Crawl,
+            retry_unit: std::time::Duration::from_secs(1),
         }
     }
 }
@@ -114,6 +119,7 @@ impl ArchiveConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| Self::default().download_dir),
             default_source,
+            retry_unit: std::time::Duration::from_secs(1),
         }
     }
 }
