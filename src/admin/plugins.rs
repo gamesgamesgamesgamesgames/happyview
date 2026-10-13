@@ -104,6 +104,7 @@ async fn recorded_publisher(state: &AppState, plugin_id: &str) -> Result<Option<
 /// install is someone else's.
 async fn record_publisher(state: &AppState, plugin_id: &str, url: &str) -> Result<(), AppError> {
     let publisher = crate::plugin::official_registry::publisher_for_install(
+        &state.official_registry_config,
         &*state.official_registry.read().await,
         plugin_id,
         url,
@@ -125,6 +126,10 @@ struct UpdateInfo {
     update_available: bool,
     latest_version: Option<String>,
     pending_releases: Vec<ReleaseEntry>,
+    /// The approved entry's manifest, so an update installs the entry the
+    /// gate passed rather than whatever the catalogue holds by the time it
+    /// is applied.
+    latest_manifest_url: Option<String>,
 }
 
 fn compute_update_info(
@@ -137,6 +142,7 @@ fn compute_update_info(
             update_available: false,
             latest_version: None,
             pending_releases: Vec::new(),
+            latest_manifest_url: None,
         };
     };
 
@@ -147,6 +153,7 @@ fn compute_update_info(
                 update_available: false,
                 latest_version: Some(entry.latest_version.clone()),
                 pending_releases: Vec::new(),
+                latest_manifest_url: Some(entry.manifest_url.clone()),
             };
         }
     };
@@ -166,6 +173,7 @@ fn compute_update_info(
         update_available: !pending.is_empty(),
         latest_version: Some(entry.latest_version.clone()),
         pending_releases: pending,
+        latest_manifest_url: Some(entry.manifest_url.clone()),
     }
 }
 
@@ -301,6 +309,7 @@ pub(super) async fn list(
                 update_available: update_info.update_available,
                 latest_version: update_info.latest_version,
                 pending_releases: update_info.pending_releases,
+                latest_manifest_url: update_info.latest_manifest_url,
                 plugin_type: cap_fields.plugin_type,
                 namespace: cap_fields.namespace,
                 dependencies: cap_fields.dependencies,
@@ -462,6 +471,7 @@ pub(super) async fn add(
         update_available: false,
         latest_version: None,
         pending_releases: Vec::new(),
+        latest_manifest_url: None,
         plugin_type: cap_fields.plugin_type,
         namespace: cap_fields.namespace,
         dependencies: cap_fields.dependencies,
@@ -609,6 +619,28 @@ pub(super) async fn reload(
     let installed_url = url.clone();
     let (url, sha256) = resolve_reload_url((url, sha256), body);
 
+    // A recorded install stays with its publisher: a new URL must be one the
+    // catalogue offers under this id from that same publisher. Without this
+    // the update gate decides what is offered and anything else decides what
+    // is installed. An unrecorded install has no publisher to hold to.
+    if url != installed_url
+        && let Some(recorded) = recorded_publisher(&state, &plugin_id).await?
+    {
+        let offered = crate::plugin::official_registry::publisher_for_install(
+            &state.official_registry_config,
+            &*state.official_registry.read().await,
+            &plugin_id,
+            &url,
+        );
+        if offered.as_deref() != Some(recorded.as_str()) {
+            return Err(AppError::Conflict(format!(
+                "'{plugin_id}' was installed from {recorded}'s package, and this URL is not \
+                 one that publisher offers. Remove the plugin and add it again to install \
+                 another publisher's."
+            )));
+        }
+    }
+
     // Reload via manifest
     let preview = loader::fetch_manifest(&state.http, &url)
         .await
@@ -685,6 +717,7 @@ pub(super) async fn reload(
         update_available: false,
         latest_version: None,
         pending_releases: Vec::new(),
+        latest_manifest_url: None,
         plugin_type: cap_fields.plugin_type,
         namespace: cap_fields.namespace,
         dependencies: cap_fields.dependencies,
@@ -1079,6 +1112,7 @@ pub(super) async fn check_update(
         update_available: update_info.update_available,
         latest_version: update_info.latest_version,
         pending_releases: update_info.pending_releases,
+        latest_manifest_url: update_info.latest_manifest_url,
         plugin_type: cap_fields.plugin_type,
         namespace: cap_fields.namespace,
         dependencies: cap_fields.dependencies,

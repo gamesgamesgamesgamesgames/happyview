@@ -382,6 +382,10 @@ async fn check_update_reads_the_registry() {
     assert_eq!(body["id"], "happyview-http");
     assert_eq!(body["update_available"], true);
     assert_eq!(body["latest_version"], "1.0.0");
+    assert_eq!(
+        body["latest_manifest_url"], "https://example.com/d/manifest.json",
+        "the update installs the entry the gate approved"
+    );
     let pending = body["pending_releases"].as_array().unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0]["version"], "1.0.0");
@@ -778,6 +782,14 @@ async fn a_strangers_package_is_never_the_update_for_an_official_install() {
     let summary = http_summary(&app).await;
     assert_eq!(summary["update_available"], true);
     assert_eq!(summary["latest_version"], "1.1.0");
+    assert_eq!(
+        summary["latest_manifest_url"],
+        format!(
+            "{}/happyview-http-v1.1.0/manifest.json",
+            config.release_base
+        ),
+        "the update installs the official entry, not the stranger's"
+    );
 }
 
 /// The same, with the walk listing nothing: no offer at all, rather than the
@@ -808,6 +820,7 @@ async fn with_no_official_entry_an_official_install_is_offered_nothing() {
     let summary = http_summary(&app).await;
     assert_eq!(summary["update_available"], false);
     assert!(summary["latest_version"].is_null());
+    assert!(summary["latest_manifest_url"].is_null());
 }
 
 /// The same, through the on-demand check.
@@ -849,6 +862,7 @@ async fn check_update_never_offers_a_strangers_package_to_an_official_install() 
     let body = json_body(resp).await;
     assert_eq!(body["update_available"], false);
     assert!(body["latest_version"].is_null());
+    assert!(body["latest_manifest_url"].is_null());
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,6 +1058,7 @@ async fn a_third_party_install_is_never_offered_the_official_entry() {
     let summary = summary_of(&app, "lua").await;
     assert_eq!(summary["update_available"], false);
     assert!(summary["latest_version"].is_null());
+    assert!(summary["latest_manifest_url"].is_null());
 }
 
 /// Install the official `lua` from a GitHub-walk entry, at a URL the fallback
@@ -1167,6 +1182,7 @@ async fn refresh_and_expect_no_offer(app: &TestApp) {
     let summary = summary_of(app, "lua").await;
     assert_eq!(summary["update_available"], false);
     assert!(summary["latest_version"].is_null());
+    assert!(summary["latest_manifest_url"].is_null());
 }
 
 /// The official package sits past the registry's first page, so the listing
@@ -1212,4 +1228,53 @@ async fn a_strangers_lua_is_not_offered_on_a_cold_start() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["update_available"], false);
     assert!(body["latest_version"].is_null());
+    assert!(body["latest_manifest_url"].is_null());
+}
+
+/// A recorded install is never re-bound to another publisher by a reload:
+/// a URL the catalogue offers under this id from someone else is refused
+/// with 409 and the install is left as it was, while the recorded
+/// publisher's own new release reloads.
+#[tokio::test]
+#[serial]
+async fn reload_refuses_a_url_from_another_publisher() {
+    common::require_db!();
+    let app =
+        an_official_lua_install(happyview::plugin::official_registry::RegistryConfig::production())
+            .await;
+
+    let theirs = serve_module(&app, "their-lua-v2", "lua", "2.0.0").await;
+    put_in_catalogue(
+        &app,
+        catalogue_entry("lua", Some(STRANGER), &theirs, &["2.0.0"]),
+    )
+    .await;
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "url": theirs }))
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(
+        recorded_publisher(&app, "lua").await.as_deref(),
+        Some(happyview::plugin::official_registry::OFFICIAL_PUBLISHER_DID)
+    );
+    assert_eq!(summary_of(&app, "lua").await["version"], "1.0.0");
+
+    // A hand-typed URL is no publisher's offer either.
+    let typed = serve_module(&app, "typed-lua", "lua", "2.0.0").await;
+    let (status, _) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "url": typed }))
+        .await;
+    assert_eq!(status, 409);
+
+    let ours = serve_module(&app, "our-lua-v2", "lua", "2.0.0").await;
+    put_in_catalogue(&app, catalogue_entry("lua", None, &ours, &["2.0.0"])).await;
+    let (status, body) = app
+        .post_json_status("/admin/plugins/lua/reload", json!({ "url": ours }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(summary_of(&app, "lua").await["version"], "2.0.0");
+    assert_eq!(
+        recorded_publisher(&app, "lua").await.as_deref(),
+        Some(happyview::plugin::official_registry::OFFICIAL_PUBLISHER_DID)
+    );
 }

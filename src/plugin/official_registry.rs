@@ -1,10 +1,11 @@
 //! The plugin catalogue cache.
 //!
-//! Filled from an AT Protocol registry where one is configured (see
-//! [`registry_source`](super::registry_source)), and from walking
-//! [`OFFICIAL_REPO`]'s GitHub releases otherwise. The GitHub walk is the
-//! fallback rather than the source: it can only ever describe one org's
-//! plugins.
+//! Filled from two sources on every refresh: an AT Protocol registry where
+//! one is configured (see [`registry_source`](super::registry_source)), which
+//! describes whatever anyone has published, and a walk of [`OFFICIAL_REPO`]'s
+//! GitHub releases, which is official by construction. The registry's entry
+//! is preferred for any id it answers, and a walk entry holds any id the
+//! registry gave only to another publisher.
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -12,8 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// The repo the GitHub fallback reads. Only a fallback: the catalogue comes
-/// from the registry, and this answers while the registry has nothing to say.
+/// The repo the GitHub walk reads. Every plugin it finds is official.
 pub const OFFICIAL_REPO: &str = "happyproto/plugins";
 
 /// The account HappyProto publishes its own plugins from.
@@ -299,13 +299,19 @@ pub fn effective_publisher(plugin: &OfficialPlugin) -> Option<&str> {
 /// the installed plugin's own id, and only when its manifest URL is exactly
 /// the one installed. Looked up by id because two packages can name the same
 /// artifact, and a stranger's entry pointing at the official module must not
-/// lend its DID to the official install. `None` for a URL the entry does not
-/// offer, such as one typed by hand.
+/// lend its DID to the official install. A URL under [`OFFICIAL_REPO`]'s
+/// releases is the official artifact whichever entry offered it, or none, so
+/// it records [`OFFICIAL_PUBLISHER_DID`] outright. `None` for any other URL
+/// the entry does not offer, such as one typed by hand.
 pub fn publisher_for_install(
+    config: &RegistryConfig,
     state: &OfficialRegistryState,
     plugin_id: &str,
     url: &str,
 ) -> Option<String> {
+    if is_official_manifest_url(config, url) {
+        return Some(OFFICIAL_PUBLISHER_DID.to_owned());
+    }
     state
         .plugins
         .get(plugin_id)
@@ -313,12 +319,17 @@ pub fn publisher_for_install(
         .and_then(|p| effective_publisher(p).map(str::to_owned))
 }
 
-/// Whether an installed plugin's stored manifest URL lies under
-/// [`OFFICIAL_REPO`]'s releases. Only consulted for an install that recorded
-/// no publisher. Scheme, host and path are compared case-insensitively, as
-/// GitHub resolves them. A URL whose path the parser rewrites (a `..` or `.`
-/// segment in any spelling, a backslash) is refused rather than judged by
-/// its normalised form, since that is not the text that was stored.
+/// Whether a manifest URL lies under [`OFFICIAL_REPO`]'s releases. Decides
+/// the publisher an install of such a URL records, and is the whole rule for
+/// an install that recorded none. Scheme, host and path are compared
+/// case-insensitively, as GitHub resolves them. A URL whose path the parser
+/// rewrites (a `..` or `.` segment in any spelling, a backslash) answers
+/// `false` rather than being judged by its normalised form, since that is
+/// not the text that was stored. `false` is not the cautious answer for an
+/// unrecorded install: it lifts the official-only restriction and lets any
+/// publisher's entry under that id be offered. It is accepted because only a
+/// hand-typed URL reaches it, and an install from the catalogue records its
+/// publisher instead.
 pub fn is_official_manifest_url(config: &RegistryConfig, url: &str) -> bool {
     let (Ok(base), Ok(candidate)) = (
         reqwest::Url::parse(&config.release_base),
@@ -1151,8 +1162,8 @@ mod tests {
     /// however the cache happens to iterate.
     #[test]
     fn an_install_takes_the_publisher_of_its_own_id_when_two_entries_share_a_url() {
-        let url =
-            "https://github.com/happyproto/plugins/releases/download/lua-v1.0.0/manifest.json";
+        // Not under the official release base, so the entry decides.
+        let url = "https://mirror.example/lua-v1.0.0/manifest.json";
         let official = OfficialPlugin {
             id: "lua".into(),
             publisher_did: None,
@@ -1183,14 +1194,50 @@ mod tests {
                 );
             }
             assert_eq!(
-                publisher_for_install(&state, "lua", url).as_deref(),
+                publisher_for_install(&RegistryConfig::production(), &state, "lua", url).as_deref(),
                 Some(OFFICIAL_PUBLISHER_DID)
             );
             assert_eq!(
-                publisher_for_install(&state, "notlua0", url).as_deref(),
+                publisher_for_install(&RegistryConfig::production(), &state, "notlua0", url)
+                    .as_deref(),
                 Some(STRANGER)
             );
         }
+    }
+
+    /// A stranger's package can name the official artifact under the very id
+    /// the official plugin uses, while the walk holds nothing for it. The
+    /// install is still the official module and records the official DID.
+    #[test]
+    fn an_official_artifact_records_the_official_publisher_whoever_offered_it() {
+        let config = RegistryConfig::production();
+        let url = format!("{}/lua-v1.0.0/manifest.json", config.release_base);
+        let mut state = OfficialRegistryState::default();
+        state.plugins.insert(
+            "lua".into(),
+            OfficialPlugin {
+                id: "lua".into(),
+                publisher_did: Some(STRANGER.into()),
+                official: false,
+                name: "lua".into(),
+                description: None,
+                icon_url: None,
+                latest_version: "1.0.0".into(),
+                manifest_url: url.clone(),
+                wasm_url: url.replace("manifest.json", "lua.wasm"),
+                releases: vec![],
+            },
+        );
+        assert_eq!(
+            publisher_for_install(&config, &state, "lua", &url).as_deref(),
+            Some(OFFICIAL_PUBLISHER_DID)
+        );
+        assert_eq!(
+            publisher_for_install(&config, &OfficialRegistryState::default(), "lua", &url)
+                .as_deref(),
+            Some(OFFICIAL_PUBLISHER_DID),
+            "an official URL typed by hand is still the official artifact"
+        );
     }
 
     #[test]
@@ -1219,16 +1266,33 @@ mod tests {
         state.plugins.insert(registry.id.clone(), registry);
 
         assert_eq!(
-            publisher_for_install(&state, "lua", "https://a.example/lua/manifest.json").as_deref(),
+            publisher_for_install(
+                &RegistryConfig::production(),
+                &state,
+                "lua",
+                "https://a.example/lua/manifest.json"
+            )
+            .as_deref(),
             Some(OFFICIAL_PUBLISHER_DID)
         );
         assert_eq!(
-            publisher_for_install(&state, "extra", "https://b.example/extra/manifest.json")
-                .as_deref(),
+            publisher_for_install(
+                &RegistryConfig::production(),
+                &state,
+                "extra",
+                "https://b.example/extra/manifest.json"
+            )
+            .as_deref(),
             Some(STRANGER)
         );
         assert!(
-            publisher_for_install(&state, "lua", "https://typed.example/manifest.json").is_none()
+            publisher_for_install(
+                &RegistryConfig::production(),
+                &state,
+                "lua",
+                "https://typed.example/manifest.json"
+            )
+            .is_none()
         );
     }
 

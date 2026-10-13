@@ -55,6 +55,7 @@ export default defineConfig({
         "telemetry-prompt.spec.ts",
         "project-layer.spec.ts",
         "plugin-catalogue.spec.ts",
+        "plugin-update-approved-url.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },

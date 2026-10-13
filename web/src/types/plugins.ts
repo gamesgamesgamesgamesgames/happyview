@@ -47,6 +47,8 @@ export interface PluginSummary {
   update_available: boolean;
   latest_version: string | null;
   pending_releases: ReleaseEntry[];
+  /** The manifest an update installs; absent when no update is offered. */
+  latest_manifest_url?: string;
   plugin_type: PluginType;
   namespace: string | null;
   dependencies: PluginDependency[];

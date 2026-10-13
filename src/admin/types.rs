@@ -439,6 +439,11 @@ pub(super) struct PluginSummary {
     pub(super) latest_version: Option<String>,
     #[serde(default)]
     pub(super) pending_releases: Vec<crate::plugin::official_registry::ReleaseEntry>,
+    /// The manifest of the catalogue entry the update gate approved for this
+    /// install, which is what an update installs. Absent when no entry is
+    /// offered to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) latest_manifest_url: Option<String>,
     pub(super) plugin_type: String,
     pub(super) namespace: Option<String>,
     #[serde(default)]
