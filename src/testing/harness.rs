@@ -78,8 +78,9 @@ impl TestHarness {
             .collect()
     }
 
-    /// A record or label script that failed. Those runners are fail-open and
-    /// only dead-letter, so this is how a trigger learns its script failed.
+    /// A record or label script that failed, or a label that could not be
+    /// stored. Those paths are fail-open and only log or dead-letter, so this
+    /// is how a trigger learns of the failure.
     pub fn note_script_failure(&self, error: &str) {
         self.failures.lock().unwrap().push(error.to_string());
     }

@@ -399,15 +399,19 @@ async fn apply_label(state: &AppState, label: &Label) {
         cts: label.cts.clone(),
         exp: label.exp.clone(),
     };
-    let final_label = match crate::lua::run_label_applied_script(state, event).await {
+    apply_label_event(state, event).await;
+}
+
+/// Run the label-applied script for `event` and persist what it decided.
+/// Returns the label as persisted, or `None` when the script skipped it or
+/// the write failed.
+pub async fn apply_label_event(
+    state: &AppState,
+    event: crate::lua::LabelAppliedEvent,
+) -> Option<crate::lua::LabelAppliedEvent> {
+    let mut final_label = match crate::lua::run_label_applied_script(state, event).await {
         crate::lua::LabelHookOutcome::Continue(next) => next,
-        crate::lua::LabelHookOutcome::Skip => {
-            tracing::debug!(
-                src = %label.src, uri = %label.uri, val = %label.val,
-                "label.applied script skipped persistence"
-            );
-            return;
-        }
+        crate::lua::LabelHookOutcome::Skip => return None,
     };
 
     let db = &state.db;
@@ -430,6 +434,7 @@ async fn apply_label(state: &AppState, label: &Label) {
                 src = %final_label.src, uri = %final_label.uri, val = %final_label.val,
                 "failed to delete negated label: {e}"
             );
+            return not_stored(state, format!("failed to delete negated label: {e}"));
         }
     } else {
         // The label lexicon types `exp` as a datetime, so an upstream labeler
@@ -484,8 +489,20 @@ async fn apply_label(state: &AppState, label: &Label) {
                 src = %final_label.src, uri = %final_label.uri, val = %final_label.val,
                 "failed to upsert label: {e}"
             );
+            return not_stored(state, format!("failed to upsert label: {e}"));
         }
+        final_label.exp = exp;
     }
+    Some(final_label)
+}
+
+/// The firehose only logs a label it could not store; a test run's trigger
+/// has to hear about it, or it would report a label that is not there.
+fn not_stored(state: &AppState, message: String) -> Option<crate::lua::LabelAppliedEvent> {
+    if let Some(test) = &state.test {
+        test.note_script_failure(&message);
+    }
+    None
 }
 
 async fn persist_cursor(db: &sqlx::AnyPool, did: &str, seq: i64, backend: DatabaseBackend) {

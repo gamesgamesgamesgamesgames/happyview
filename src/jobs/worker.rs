@@ -67,7 +67,7 @@ pub async fn resume_interrupted_jobs(state: &AppState) {
     }
 }
 
-async fn execute_job(state: &AppState, job: &super::Job) {
+pub(crate) async fn execute_job(state: &AppState, job: &super::Job) {
     let backend = state.db_backend;
 
     log_event(

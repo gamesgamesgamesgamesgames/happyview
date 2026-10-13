@@ -430,6 +430,19 @@ async fn forward_write_if_native(
         return Ok(None);
     }
 
+    // The in-process PDS answers repo writes only, so re-authenticating, which
+    // is the advice below, could never help here.
+    if state.test.is_some() {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::NOT_IMPLEMENTED,
+            code: "MethodNotImplemented",
+            message: format!(
+                "this space lives on {author_did}'s PDS, and a test run serves no \
+                 PDS-backed spaces; {method} reaches only spaces HappyView hosts"
+            ),
+        });
+    }
+
     tracing::warn!(
         space_id = %space.id,
         author_did,
@@ -2269,6 +2282,33 @@ mod native_write_bridge_tests {
             format!("{err}").contains("re-authenticate"),
             "the error should tell the user what to do: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_native_write_in_a_test_run_says_the_run_serves_no_pds_spaces() {
+        let (mut state, space) = state_with_space(HostMode::Native).await;
+        state.test = Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+            "src/a.test.lua",
+        )));
+        let err = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("a test run cannot forward a write to a PDS");
+
+        let AppError::XrpcError {
+            status, message, ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(*status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(message.contains("test run"), "{message}");
+        assert!(!message.contains("re-authenticate"), "{message}");
     }
 }
 

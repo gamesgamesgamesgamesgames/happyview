@@ -1144,6 +1144,24 @@ pub(crate) fn define_host_functions(
     )?;
 
     imports.define(
+        "host_test_trigger",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_test_impl(
+                    caller,
+                    "host_test_trigger",
+                    req_ptr,
+                    req_len,
+                    |state, harness, spec: crate::plugin::TestTrigger| async move {
+                        crate::testing::triggers::fire(&state, &harness, spec).await
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
         "host_test_mock",
         |caller, (req_ptr, req_len): (i32, i32)| {
             Box::pin(async move {

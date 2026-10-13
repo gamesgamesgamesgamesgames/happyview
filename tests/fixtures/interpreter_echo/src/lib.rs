@@ -94,6 +94,7 @@ extern "C" {
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
 extern "C" {
+    fn host_test_trigger(req_ptr: i32, req_len: i32) -> i64;
     fn host_test_mock(req_ptr: i32, req_len: i32) -> i64;
     fn host_test_calls(req_ptr: i32, req_len: i32) -> i64;
     fn host_test_pds_writes(req_ptr: i32, req_len: i32) -> i64;
@@ -265,6 +266,7 @@ mod imports {
 
     pub fn test_import(name: &str, request: &Value) -> Value {
         let import: unsafe extern "C" fn(i32, i32) -> i64 = match name {
+            "trigger" => host_test_trigger,
             "mock" => host_test_mock,
             "calls" => host_test_calls,
             "pds_writes" => host_test_pds_writes,
@@ -466,10 +468,20 @@ fn raised(message: &str, chunk: &str) -> Value {
 /// A test file for the host's own tests: each step calls one test import, or
 /// checks a JSON pointer into an earlier answer and reports the result, which
 /// is enough for a host test to see triggers, mocks and reports end to end
-/// without an assertion library.
+/// without an assertion library. A `spin` step never returns, for a test of
+/// the file's own deadline after the steps before it; a `burn` step spends
+/// that many iterations of guest time and answers null.
 fn run_test_steps(steps: &Value) -> Value {
     let mut answers: alloc::vec::Vec<Value> = alloc::vec::Vec::new();
     for step in steps.as_array().into_iter().flatten() {
+        if step.get("spin").is_some() {
+            spin_forever()
+        }
+        if let Some(iterations) = step.get("burn").and_then(Value::as_u64) {
+            burn(iterations);
+            answers.push(Value::Null);
+            continue;
+        }
         let answer = if let Some(check) = step.get("check") {
             let index = check["answer"].as_u64().unwrap_or(0) as usize;
             let earlier = answers.get(index).cloned().unwrap_or(Value::Null);

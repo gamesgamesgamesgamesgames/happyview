@@ -101,6 +101,18 @@ pub(crate) async fn handle_procedure(
             }
         }
     }
+    // A forged caller holds no DPoP session, so the delegation guard below
+    // would refuse it for missing authentication, and the scriptless path
+    // would write `delegateDid` into the record. A test acts as an account
+    // by naming it.
+    if state.test.is_some() && input.get("delegateDid").is_some() {
+        return Err(AppError::BadRequest(
+            "a test run does not support delegateDid; fire the trigger `as` the \
+             delegated account instead"
+                .into(),
+        ));
+    }
+
     if let Some(resolved) = resolved {
         // Delegation guard preserved from origin/dev: scripts that run
         // under a `delegateDid` must come from a caller who is an
