@@ -717,6 +717,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_job_trigger_grammar_refuses_a_final_test_segment() {
+        let err = ParsedTrigger::parse("job.run:instance.operation.test").unwrap_err();
+        assert!(err.contains(".test"), "{err}");
+        assert!(err.contains("test file"), "{err}");
+
+        for fine in [
+            "test",
+            "test.export",
+            "instance.testing",
+            "contest",
+            "a.tests",
+        ] {
+            assert!(
+                ParsedTrigger::parse(&format!("job.run:{fine}")).is_ok(),
+                "{fine}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_record_index_trigger() {
         let t = ParsedTrigger::parse("record.index:com.example.thing").unwrap();
         assert_eq!(t.kind, TriggerKind::RecordIndex);
