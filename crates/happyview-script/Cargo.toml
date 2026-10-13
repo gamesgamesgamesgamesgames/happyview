@@ -1,0 +1,12 @@
+[package]
+name = "happyview-script"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Write HappyView script handlers in Rust, compiled to a wasm32-wasip1 module"
+
+[dependencies]
+happyview-plugin-sdk = { path = "../happyview-plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = { version = "0.3", default-features = false, features = ["async-await-macro"] }
