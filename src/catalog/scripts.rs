@@ -114,6 +114,7 @@ impl ScriptListing {
 fn source_of(script: &ProjectScript) -> String {
     match &script.body {
         ScriptBody::Source { source, .. } => source.to_string(),
+        // A compiled module has no source; dispatch runs the module.
         ScriptBody::Module { .. } => String::new(),
     }
 }

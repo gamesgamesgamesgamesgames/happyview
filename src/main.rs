@@ -386,10 +386,6 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
         );
     }
 
-    // Every plugin this boot will run is registered by now, so anything
-    // else in the cache directory is a module nothing will load.
-    wasm_runtime.sweep_cache_dir(&plugin_registry.live_wasm_sha256s().await);
-
     // Seed and load per-instance default token costs from instance_settings.
     let defaults = seed_and_load_rate_limit_defaults(&db_pool, db_backend).await;
     let rate_limiter = RateLimiter::new(defaults);
@@ -1001,6 +997,14 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
             }
         }
     }
+
+    // Every plugin and project module this boot will run is known by now, so
+    // anything else in the cache directory is a module nothing will load. A
+    // dev rebuild does not sweep, so a long dev session leaves its replaced
+    // builds behind until the next boot.
+    let mut live = state.plugin_registry.live_wasm_sha256s().await;
+    live.extend(state.project.load().script_modules.keys().cloned());
+    state.wasm_runtime.sweep_cache_dir(&live);
 
     tokio::spawn(happyview::lua::limits::run_refresh_loop(
         state.script_limits.clone(),
