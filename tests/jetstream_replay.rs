@@ -1149,6 +1149,53 @@ async fn cursor_too_old_without_an_archive_resumes_as_before() {
 
 #[tokio::test]
 #[serial]
+async fn cursor_too_old_with_a_hung_archive_resumes_as_before() {
+    let mock = MockJetstream::start().await;
+    let Some(mut app) = auto_app(&mock).await else {
+        return;
+    };
+    app.state.archive.gap_plan_timeout = Duration::from_millis(200);
+    app.rebuild_router();
+    mock.seal(games(1..=50, "did:plc:hungarchive"), 10);
+    // Far longer than the gap plan may take, retries or not.
+    mock.delay_plan(Duration::from_secs(60));
+    mock.push((51..=55).map(|s| {
+        js::create(
+            s,
+            "did:plc:hungarchive",
+            GAME,
+            &format!("g{s:04}"),
+            game("t"),
+        )
+    }));
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(400, "CursorTooOld", "too old");
+    let started = std::time::Instant::now();
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!("live events applied", dump(&app).await.len() == 5);
+    consumer.abort();
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the consumer waited {:?} on the archive",
+        started.elapsed()
+    );
+    assert_eq!(mock.plan_requests().len(), 1, "the gap plan was asked for");
+    let jobs = app.get_json("/admin/backfill/status").await;
+    assert!(
+        jobs.as_array().unwrap().is_empty(),
+        "no gap job when the plan times out: {jobs}"
+    );
+    let connections = mock.connections();
+    assert_eq!(
+        connections.last().unwrap().param("cursor"),
+        None,
+        "resumed from the tip, as without an archive"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn cursor_too_old_under_crawl_never_asks_the_archive() {
     // P8: with BACKFILL_SOURCE=crawl (the TestApp default), CursorTooOld is
     // handled exactly as before, even though this host has an archive.

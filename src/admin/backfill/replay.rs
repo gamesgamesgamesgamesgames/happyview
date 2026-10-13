@@ -635,8 +635,13 @@ pub(crate) async fn start_gap_replay(
     }
     let endpoint = crate::jetstream::config::parse_endpoint(&state.config.jetstream_url);
     let client = ArchiveClient::new(state.http.clone(), &endpoint, &state.archive);
-    let page = client
-        .plan(&PlanRequest {
+    // The live consumer waits on this call, and the archive's retry policy
+    // can stretch a hung or throttled archive into minutes. Bound it, so the
+    // consumer resumes without the archive instead.
+    let timeout = state.archive.gap_plan_timeout;
+    let page = tokio::time::timeout(
+        timeout,
+        client.plan(&PlanRequest {
             kinds: vec!["commit".into()],
             collections: collections
                 .iter()
@@ -645,9 +650,11 @@ pub(crate) async fn start_gap_replay(
                 .collect(),
             after_seq: after_seq.max(0) as u64,
             ..PlanRequest::default()
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+        }),
+    )
+    .await
+    .map_err(|_| format!("the archive did not plan the gap within {timeout:?}"))?
+    .map_err(|e| e.to_string())?;
     let tip = page.sealed_tip_seq as i64;
     if tip <= after_seq {
         return Err(format!(

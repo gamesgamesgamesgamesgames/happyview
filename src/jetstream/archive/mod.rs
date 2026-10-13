@@ -9,6 +9,9 @@ pub mod segment;
 
 pub const DEFAULT_CONCURRENCY: usize = 8;
 pub const MAX_CONCURRENCY: usize = 64;
+/// How long the live consumer waits for the archive to plan a gap replay
+/// before resuming without it.
+pub const GAP_PLAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Where a backfill job's records come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +85,10 @@ pub struct ArchiveConfig {
     /// The first backoff step after a 5xx or a transport error; doubles per
     /// attempt. One second in production; tests shorten it.
     pub retry_unit: std::time::Duration,
+    /// The longest a gap replay's `planSnapshot` may take, retries included,
+    /// before the live consumer resumes without it. `GAP_PLAN_TIMEOUT` in
+    /// production; tests shorten it.
+    pub gap_plan_timeout: std::time::Duration,
 }
 
 impl Default for ArchiveConfig {
@@ -92,6 +99,7 @@ impl Default for ArchiveConfig {
             download_dir: std::env::temp_dir().join("happyview-replay"),
             default_source: SourceChoice::Crawl,
             retry_unit: std::time::Duration::from_secs(1),
+            gap_plan_timeout: GAP_PLAN_TIMEOUT,
         }
     }
 }
@@ -120,6 +128,7 @@ impl ArchiveConfig {
                 .unwrap_or_else(|| Self::default().download_dir),
             default_source,
             retry_unit: std::time::Duration::from_secs(1),
+            gap_plan_timeout: GAP_PLAN_TIMEOUT,
         }
     }
 }

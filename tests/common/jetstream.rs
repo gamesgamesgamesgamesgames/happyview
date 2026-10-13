@@ -345,6 +345,8 @@ struct Inner {
     plan_page_entries: usize, // 0 means 1000
     stalls: usize,
     throttles: usize,
+    /// How long every `planSnapshot` waits before answering.
+    plan_delay: Option<std::time::Duration>,
     block_failures: HashMap<(String, u32), usize>,
     corrupt_blocks: HashSet<(String, u32)>,
     /// Segments whose `getSegment` answers 500.
@@ -510,6 +512,11 @@ impl MockJetstream {
     /// The next `times` plan pages come back empty and not advanced.
     pub fn stall_plan(&self, times: usize) {
         self.shared.lock().stalls = times;
+    }
+
+    /// Every `planSnapshot` waits `delay` before answering.
+    pub fn delay_plan(&self, delay: std::time::Duration) {
+        self.shared.lock().plan_delay = Some(delay);
     }
 
     /// The next `times` archive requests are answered 503, `Retry-After: 0`.
@@ -841,11 +848,18 @@ async fn plan_snapshot(
     headers: HeaderMap,
     axum::Json(body): axum::Json<Value>,
 ) -> Response {
+    let delay = {
+        let mut inner = shared.lock();
+        inner
+            .authorizations
+            .push(("plan".into(), authorization(&headers)));
+        inner.plan_requests.push(body.clone());
+        inner.plan_delay
+    };
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
     let mut inner = shared.lock();
-    inner
-        .authorizations
-        .push(("plan".into(), authorization(&headers)));
-    inner.plan_requests.push(body.clone());
     if let Some(response) = throttled(&mut inner) {
         return response;
     }
