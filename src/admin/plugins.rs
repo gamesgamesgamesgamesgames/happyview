@@ -29,6 +29,98 @@ fn resolve_reload_url(
     }
 }
 
+/// Whose updates an installed plugin may be offered (see `official_registry`).
+enum InstalledPublisher {
+    /// The publisher of the catalogue entry it was installed from.
+    Recorded(String),
+    /// Installed from a URL the catalogue did not offer, or before the
+    /// publisher was recorded: judged by whether its stored manifest URL lies
+    /// under the official repo's releases.
+    Unrecorded { official_url: bool },
+}
+
+impl InstalledPublisher {
+    fn of(
+        state: &AppState,
+        recorded: Option<String>,
+        source: &crate::plugin::PluginSource,
+    ) -> Self {
+        if let Some(did) = recorded {
+            return Self::Recorded(did);
+        }
+        let official_url = match source {
+            crate::plugin::PluginSource::Url { url, .. } => {
+                crate::plugin::official_registry::is_official_manifest_url(
+                    &state.official_registry_config,
+                    url,
+                )
+            }
+            crate::plugin::PluginSource::File { .. } => false,
+        };
+        Self::Unrecorded { official_url }
+    }
+
+    fn may_be_updated_by(&self, entry: &OfficialPlugin) -> bool {
+        match self {
+            Self::Recorded(did) => {
+                crate::plugin::official_registry::effective_publisher(entry) == Some(did.as_str())
+            }
+            Self::Unrecorded { official_url } => entry.official || !official_url,
+        }
+    }
+}
+
+/// The publisher each installed plugin recorded, by id; ids that recorded
+/// none are absent.
+async fn recorded_publishers(state: &AppState) -> Result<HashMap<String, String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT id, publisher_did FROM happyview_plugins WHERE publisher_did IS NOT NULL",
+        state.db_backend,
+    );
+    let rows: Vec<(String, String)> = crate::db::query_as(&sql)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to read plugin publishers: {e}")))?;
+    Ok(rows.into_iter().collect())
+}
+
+/// The publisher one installed plugin recorded, if any.
+async fn recorded_publisher(state: &AppState, plugin_id: &str) -> Result<Option<String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT publisher_did FROM happyview_plugins WHERE id = ?",
+        state.db_backend,
+    );
+    let row: Option<(Option<String>,)> = crate::db::query_as(&sql)
+        .bind(plugin_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to read plugin publisher: {e}")))?;
+    Ok(row.and_then(|(publisher,)| publisher))
+}
+
+/// Record the publisher of the catalogue entry this plugin was installed
+/// from, or clear it when the entry under its id does not offer `url`.
+/// Derived here, never taken from the request, so a caller cannot claim an
+/// install is someone else's.
+async fn record_publisher(state: &AppState, plugin_id: &str, url: &str) -> Result<(), AppError> {
+    let publisher = crate::plugin::official_registry::publisher_for_install(
+        &*state.official_registry.read().await,
+        plugin_id,
+        url,
+    );
+    let sql = adapt_sql(
+        "UPDATE happyview_plugins SET publisher_did = ? WHERE id = ?",
+        state.db_backend,
+    );
+    crate::db::query(&sql)
+        .bind(publisher)
+        .bind(plugin_id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to record plugin publisher: {e}")))?;
+    Ok(())
+}
+
 struct UpdateInfo {
     update_available: bool,
     latest_version: Option<String>,
@@ -37,9 +129,10 @@ struct UpdateInfo {
 
 fn compute_update_info(
     installed_version: &str,
+    installed: &InstalledPublisher,
     cache_entry: Option<&OfficialPlugin>,
 ) -> UpdateInfo {
-    let Some(entry) = cache_entry else {
+    let Some(entry) = cache_entry.filter(|e| installed.may_be_updated_by(e)) else {
         return UpdateInfo {
             update_available: false,
             latest_version: None,
@@ -140,6 +233,7 @@ pub(super) async fn list(
             .collect()
     };
 
+    let publishers = recorded_publishers(&state).await?;
     let official_guard = state.official_registry.read().await;
 
     let summaries: Vec<PluginSummary> = plugins
@@ -185,8 +279,11 @@ pub(super) async fn list(
             let secrets_configured =
                 required_secrets.is_empty() || configured_plugins.contains(&p.info.id);
 
-            let update_info =
-                compute_update_info(&p.info.version, official_guard.plugins.get(&p.info.id));
+            let update_info = compute_update_info(
+                &p.info.version,
+                &InstalledPublisher::of(&state, publishers.get(&p.info.id).cloned(), &p.source),
+                official_guard.plugins.get(&p.info.id),
+            );
             let cap_fields = capability_fields(&p);
 
             PluginSummary {
@@ -381,6 +478,12 @@ pub(super) async fn add(
         .install(plugin)
         .await
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    // The plugin is installed whatever happens here. A row left without a
+    // publisher is judged by its URL instead, which is weaker but not open,
+    // so a failed write is not worth failing the install over.
+    if let Err(e) = record_publisher(&state, &plugin_id, &body.url).await {
+        tracing::warn!(plugin = %plugin_id, error = ?e, "plugin installed without a recorded publisher");
+    }
 
     let mut detail = serde_json::json!({ "url": body.url });
     if let Some(caps) = consented_capabilities {
@@ -503,6 +606,7 @@ pub(super) async fn reload(
 
     let body = body.map(|Json(b)| b);
     let accepted_capabilities = body.as_ref().and_then(|b| b.accepted_capabilities.clone());
+    let installed_url = url.clone();
     let (url, sha256) = resolve_reload_url((url, sha256), body);
 
     // Reload via manifest
@@ -599,6 +703,11 @@ pub(super) async fn reload(
         .execute(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to persist plugin URL: {}", e)))?;
+    // A new URL may come from a different catalogue entry, so its publisher is
+    // derived afresh; reloading the same URL keeps the recorded one.
+    if url != installed_url {
+        record_publisher(&state, &plugin_id, &url).await?;
+    }
 
     // Validate against the dependency graph and register the reloaded plugin
     state
@@ -912,8 +1021,13 @@ pub(super) async fn check_update(
         .await
         .ok_or_else(|| AppError::NotFound(format!("Plugin '{}' not found", plugin_id)))?;
 
+    let recorded = recorded_publisher(&state, &plugin_id).await?;
     let guard = state.official_registry.read().await;
-    let update_info = compute_update_info(&current.info.version, guard.plugins.get(&plugin_id));
+    let update_info = compute_update_info(
+        &current.info.version,
+        &InstalledPublisher::of(&state, recorded, &current.source),
+        guard.plugins.get(&plugin_id),
+    );
 
     let required_secrets: Vec<super::types::SecretDefinition> =
         if let Some(manifest) = &current.manifest {
@@ -991,6 +1105,7 @@ pub(super) async fn list_official(
             icon_url: p.icon_url.clone(),
             latest_version: p.latest_version.clone(),
             manifest_url: p.manifest_url.clone(),
+            official: p.official,
         })
         .collect::<Vec<_>>();
 
@@ -1008,6 +1123,8 @@ mod tests {
     fn entry(versions: &[&str]) -> OfficialPlugin {
         OfficialPlugin {
             id: "steam".into(),
+            publisher_did: None,
+            official: true,
             name: "steam".into(),
             description: None,
             icon_url: None,
@@ -1029,7 +1146,7 @@ mod tests {
     #[test]
     fn compute_update_info_flags_update_when_behind() {
         let cached = entry(&["1.2.0", "1.1.0", "1.0.0"]);
-        let info = compute_update_info("1.0.0", Some(&cached));
+        let info = compute_update_info("1.0.0", &unrecorded(false), Some(&cached));
         assert!(info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
         assert_eq!(info.pending_releases.len(), 2);
@@ -1040,15 +1157,74 @@ mod tests {
     #[test]
     fn compute_update_info_no_update_when_current() {
         let cached = entry(&["1.2.0"]);
-        let info = compute_update_info("1.2.0", Some(&cached));
+        let info = compute_update_info("1.2.0", &unrecorded(false), Some(&cached));
         assert!(!info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
         assert!(info.pending_releases.is_empty());
     }
 
+    fn unrecorded(official_url: bool) -> InstalledPublisher {
+        InstalledPublisher::Unrecorded { official_url }
+    }
+
+    fn stranger(versions: &[&str]) -> OfficialPlugin {
+        OfficialPlugin {
+            official: false,
+            publisher_did: Some("did:plc:someoneelse".into()),
+            ..entry(versions)
+        }
+    }
+
+    /// An install is offered only its own publisher's releases: an official
+    /// install never sees a stranger's entry under its id, and a stranger's
+    /// install never sees the official one.
+    #[test]
+    fn an_install_is_only_updated_by_its_own_publisher() {
+        let official = InstalledPublisher::Recorded(
+            crate::plugin::official_registry::OFFICIAL_PUBLISHER_DID.into(),
+        );
+        let theirs = InstalledPublisher::Recorded("did:plc:someoneelse".into());
+        let third = InstalledPublisher::Recorded("did:plc:third".into());
+
+        assert!(compute_update_info("1.0.0", &official, Some(&entry(&["1.2.0"]))).update_available);
+        let info = compute_update_info("1.0.0", &official, Some(&stranger(&["9.0.0"])));
+        assert!(!info.update_available);
+        assert!(info.latest_version.is_none());
+
+        assert!(
+            compute_update_info("1.0.0", &theirs, Some(&stranger(&["9.0.0"]))).update_available
+        );
+        assert!(!compute_update_info("1.0.0", &theirs, Some(&entry(&["1.2.0"]))).update_available);
+        assert!(
+            !compute_update_info("1.0.0", &third, Some(&stranger(&["9.0.0"]))).update_available
+        );
+    }
+
+    /// A row that recorded no publisher keeps the URL rule: from the official
+    /// repo's releases, only official entries; from anywhere else, any.
+    #[test]
+    fn an_unrecorded_install_falls_back_to_its_url() {
+        assert!(
+            !compute_update_info("1.0.0", &unrecorded(true), Some(&stranger(&["9.0.0"])))
+                .update_available
+        );
+        assert!(
+            compute_update_info("1.0.0", &unrecorded(true), Some(&entry(&["1.2.0"])))
+                .update_available
+        );
+        assert!(
+            compute_update_info("1.0.0", &unrecorded(false), Some(&stranger(&["9.0.0"])))
+                .update_available
+        );
+        assert!(
+            compute_update_info("1.0.0", &unrecorded(false), Some(&entry(&["1.2.0"])))
+                .update_available
+        );
+    }
+
     #[test]
     fn compute_update_info_no_cache_entry() {
-        let info = compute_update_info("1.2.0", None);
+        let info = compute_update_info("1.2.0", &unrecorded(false), None);
         assert!(!info.update_available);
         assert!(info.latest_version.is_none());
         assert!(info.pending_releases.is_empty());
@@ -1057,7 +1233,7 @@ mod tests {
     #[test]
     fn compute_update_info_handles_malformed_installed_version() {
         let cached = entry(&["1.2.0"]);
-        let info = compute_update_info("not-semver", Some(&cached));
+        let info = compute_update_info("not-semver", &unrecorded(false), Some(&cached));
         assert!(!info.update_available);
         assert_eq!(info.latest_version.as_deref(), Some("1.2.0"));
     }

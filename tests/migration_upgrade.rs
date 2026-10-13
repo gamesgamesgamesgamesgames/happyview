@@ -370,6 +370,11 @@ async fn postgres_boot_rebuilds_an_index_a_failed_concurrent_build_left_invalid(
 /// The last migration before Phase 2a's tombstones.
 const PRE_TOMBSTONES_CUTOFF: &str = "20261009000003";
 
+/// The tombstone release's last migration. The rollback starts from that
+/// release rather than from the current set, so a later migration does not
+/// leave a row the previous release cannot account for.
+const TOMBSTONES_CUTOFF: &str = "20261010000001";
+
 /// The documented rollback from the tombstone release, then an upgrade again:
 /// delete the two migrations' rows so the older binary boots; on SQLite, drop
 /// `rev` before upgrading again. The tables the rollback left must not stop
@@ -378,7 +383,15 @@ async fn assert_rollback_then_upgrade(pool: &AnyPool, migrations_dir: &str, sqli
     let current = Migrator::new(Path::new(migrations_dir))
         .await
         .expect("load current migrations");
-    current.run(pool).await.expect("upgrade");
+    let tombstones_dir =
+        std::env::temp_dir().join(format!("hv-tombstones-{}", uuid::Uuid::new_v4()));
+    stage_baseline_migrations(migrations_dir, &tombstones_dir, TOMBSTONES_CUTOFF);
+    Migrator::new(tombstones_dir.as_path())
+        .await
+        .expect("load the tombstone release's migrations")
+        .run(pool)
+        .await
+        .expect("upgrade");
     sqlx::query(
         "INSERT INTO happyview_record_tombstones (uri, rev, deleted_at) \
          VALUES ('at://did:plc:rb/app.test.post/1', '3l', '2026-10-10T00:00:00+00:00')",
@@ -419,6 +432,7 @@ async fn assert_rollback_then_upgrade(pool: &AnyPool, migrations_dir: &str, sqli
         .expect("rev is back");
 
     let _ = std::fs::remove_dir_all(&previous_dir);
+    let _ = std::fs::remove_dir_all(&tombstones_dir);
 }
 
 #[tokio::test]

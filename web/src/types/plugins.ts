@@ -66,6 +66,7 @@ export interface OfficialPluginSummary {
   icon_url: string | null;
   latest_version: string;
   manifest_url: string;
+  official: boolean;
 }
 
 export interface OfficialPluginsListResponse {

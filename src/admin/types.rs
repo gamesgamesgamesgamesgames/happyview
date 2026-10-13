@@ -470,6 +470,7 @@ pub(super) struct OfficialPluginSummary {
     pub(super) icon_url: Option<String>,
     pub(super) latest_version: String,
     pub(super) manifest_url: String,
+    pub(super) official: bool,
 }
 
 #[derive(Serialize)]

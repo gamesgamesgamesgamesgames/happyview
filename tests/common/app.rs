@@ -40,10 +40,35 @@ impl TestApp {
     pub async fn new_with_registry_config(
         registry_config: happyview::plugin::official_registry::RegistryConfig,
     ) -> Self {
+        Self::build(registry_config, false).await
+    }
+
+    /// A [`TestApp`] whose plugin registry writes `happyview_plugins` rows, as
+    /// production's does, for tests that read what an install recorded. The
+    /// table is cleared first; its child tables cascade.
+    pub async fn new_with_persisted_plugins(
+        registry_config: happyview::plugin::official_registry::RegistryConfig,
+    ) -> Self {
+        Self::build(registry_config, true).await
+    }
+
+    async fn build(
+        registry_config: happyview::plugin::official_registry::RegistryConfig,
+        persist_plugins: bool,
+    ) -> Self {
         let _db_lock = db::acquire_test_lock().await;
         let pool = db::test_pool().await;
         let backend = db::test_backend();
         db::truncate_all(&pool).await;
+        let plugin_registry = if persist_plugins {
+            happyview::db::query("DELETE FROM happyview_plugins")
+                .execute(&pool)
+                .await
+                .expect("failed to clear happyview_plugins");
+            happyview::plugin::PluginRegistry::with_db(pool.clone(), backend)
+        } else {
+            happyview::plugin::PluginRegistry::new()
+        };
 
         let mock_server = MockServer::start().await;
         let mock_url = mock_server.uri();
@@ -207,7 +232,7 @@ impl TestApp {
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-that-is-at-least-32-bytes-long",
             ),
-            plugin_registry: std::sync::Arc::new(happyview::plugin::PluginRegistry::new()),
+            plugin_registry: std::sync::Arc::new(plugin_registry),
             wasm_runtime: std::sync::Arc::new(
                 happyview::plugin::WasmRuntime::new().expect("wasm runtime"),
             ),
@@ -760,6 +785,13 @@ impl TestApp {
 
     /// Install a fake plugin directly into the registry at the given version.
     pub async fn install_fake_plugin(&self, id: &str, version: &str) {
+        self.install_fake_plugin_from(id, version, &format!("https://example.com/{id}.wasm"))
+            .await;
+    }
+
+    /// [`Self::install_fake_plugin`], recording `url` as where its module
+    /// came from.
+    pub async fn install_fake_plugin_from(&self, id: &str, version: &str, url: &str) {
         use happyview::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource};
 
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
@@ -779,7 +811,7 @@ impl TestApp {
                 config_schema: None,
             },
             source: PluginSource::Url {
-                url: format!("https://example.com/{id}.wasm"),
+                url: url.to_string(),
                 sha256: None,
             },
             // Valid, trivial WASM — not `vec![]`, which `analyze_imports`
