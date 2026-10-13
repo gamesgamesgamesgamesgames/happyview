@@ -38,6 +38,29 @@ pub fn fuel_for(plugin_type: PluginType) -> u64 {
     }
 }
 
+/// Fuel a guest is granted for each byte the host writes into it — a call's
+/// input, or an import's answer. Data the host hands over brings the fuel to
+/// handle it: parsing it, decoding `$bytes`, and encoding it again on the way
+/// out each cost a few instructions a byte, so a fixed budget would cap every
+/// payload a library plugin can move at a couple of hundred kilobytes, far
+/// below what the host itself allows. Computation that brings no data stays
+/// bounded by [`DEFAULT_FUEL`].
+///
+/// Measured on `tests/plugin_blobs.rs`'s 4 MiB round trip, where a blob is
+/// decoded and encoded again in each direction: 64 a byte runs out and 128
+/// does not. 256 is that with room to spare.
+pub const FUEL_PER_BYTE_RECEIVED: u64 = 256;
+
+/// Add [`FUEL_PER_BYTE_RECEIVED`] for `len` bytes to a store's remaining
+/// fuel. A store whose fuel is already unbounded stays so.
+pub fn grant_fuel_for_bytes(store: &mut impl wasmtime::AsContextMut, len: usize) {
+    let mut store = store.as_context_mut();
+    if let Ok(fuel) = store.get_fuel() {
+        let grant = (len as u64).saturating_mul(FUEL_PER_BYTE_RECEIVED);
+        let _ = store.set_fuel(fuel.saturating_add(grant));
+    }
+}
+
 /// How often the epoch advances. Against a budget whose floor is one second
 /// this is a one-percent granularity, for a few hundred atomic increments a
 /// second.

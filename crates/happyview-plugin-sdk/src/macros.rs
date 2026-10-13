@@ -12,30 +12,36 @@
 /// Use it directly only for a plugin that uses neither [`library_plugin!`] nor
 /// [`auth_plugin!`], both of which emit it already. Exactly one call per crate.
 ///
-/// The `alloc = system` form emits no allocator of its own: `alloc`/`dealloc`
-/// go to whichever global allocator the plugin crate links, and `dealloc`
-/// really frees. That is what an interpreter needs — it allocates and frees for
-/// the whole run, which a heap that never reuses memory cannot serve — and it
-/// requires the crate to bring an allocator, as a `std` target does.
+/// The bare form installs dlmalloc as the crate's global allocator, for a
+/// `no_std` plugin: memory grows as a call needs it, up to the host's ceiling,
+/// and `dealloc` really frees. So a plugin holds a payload of any size the
+/// host allows — a blob, a large response — rather than whatever a fixed heap
+/// had room for.
 ///
-/// It emits a `#[panic_handler]` everywhere but wasi, which is a proxy for
+/// The `alloc = system` form emits no allocator of its own: `alloc`/`dealloc`
+/// go to whichever global allocator the plugin crate links, as a `std` target
+/// does. That is what an interpreter uses.
+///
+/// Both emit a `#[panic_handler]` everywhere but wasi, which is a proxy for
 /// "this crate does not link `std`" and not the same thing: a `std` plugin on
 /// `wasm32-unknown-unknown` gets two handlers and will not compile. There is
-/// no cfg for what actually matters, so such a plugin drops `alloc = system`
-/// and writes its own `alloc`/`dealloc` over
-/// [`alloc_bytes`](crate::abi::alloc_bytes) and
-/// [`free_bytes`](crate::abi::free_bytes). The interpreter this form exists
-/// for targets wasip1.
+/// no cfg for what actually matters, so such a plugin writes its own
+/// `alloc`/`dealloc` over [`alloc_bytes`](crate::abi::alloc_bytes) and
+/// [`free_bytes`](crate::abi::free_bytes) instead.
 ///
 /// ```ignore
-/// happyview_plugin_sdk::export_abi!();            // 512 KiB heap
-/// happyview_plugin_sdk::export_abi!(heap = 1 << 20);
-/// happyview_plugin_sdk::export_abi!(alloc = system);
+/// happyview_plugin_sdk::export_abi!();               // no_std: dlmalloc
+/// happyview_plugin_sdk::export_abi!(alloc = system); // std: the crate's own
 /// ```
 #[macro_export]
 macro_rules! export_abi {
     () => {
-        $crate::export_abi!(heap = $crate::abi::DEFAULT_HEAP_SIZE);
+        #[cfg(target_arch = "wasm32")]
+        #[global_allocator]
+        static __HV_ALLOCATOR: $crate::__private::GlobalDlmalloc =
+            $crate::__private::GlobalDlmalloc;
+
+        $crate::export_abi!(alloc = system);
     };
     (alloc = system) => {
         /// Trap rather than spin: a panic that looped here would burn the
@@ -54,57 +60,6 @@ macro_rules! export_abi {
         #[cfg_attr(target_arch = "wasm32", no_mangle)]
         pub extern "C" fn dealloc(ptr: u32, size: u32) {
             $crate::abi::free_bytes(ptr, size)
-        }
-    };
-    (heap = $heap:expr) => {
-        #[cfg(target_arch = "wasm32")]
-        const __HV_HEAP_SIZE: usize = $heap;
-        #[cfg(target_arch = "wasm32")]
-        static mut __HV_HEAP: [u8; __HV_HEAP_SIZE] = [0; __HV_HEAP_SIZE];
-        #[cfg(target_arch = "wasm32")]
-        static mut __HV_HEAP_POS: usize = 0;
-
-        #[cfg(target_arch = "wasm32")]
-        struct __HvBumpAllocator;
-
-        // SAFETY: the heap is a single static buffer owned by this allocator,
-        // and `bump_alloc` never hands out overlapping regions.
-        #[cfg(target_arch = "wasm32")]
-        unsafe impl core::alloc::GlobalAlloc for __HvBumpAllocator {
-            unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-                $crate::abi::bump_alloc(
-                    &raw mut __HV_HEAP as *mut u8,
-                    __HV_HEAP_SIZE,
-                    &raw mut __HV_HEAP_POS,
-                    layout,
-                )
-            }
-
-            /// A plugin instance is torn down after each call, so memory is
-            /// reclaimed by dropping the whole instance, never here.
-            unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        #[global_allocator]
-        static __HV_ALLOCATOR: __HvBumpAllocator = __HvBumpAllocator;
-
-        /// Trap rather than spin: a panic that looped here would burn the
-        /// host's fuel budget instead of surfacing as an execution error.
-        #[cfg(target_arch = "wasm32")]
-        #[panic_handler]
-        fn __hv_panic(_info: &core::panic::PanicInfo) -> ! {
-            core::arch::wasm32::unreachable()
-        }
-
-        #[cfg_attr(target_arch = "wasm32", no_mangle)]
-        pub extern "C" fn alloc(size: u32) -> u32 {
-            $crate::abi::alloc_bytes(size)
-        }
-
-        #[cfg_attr(target_arch = "wasm32", no_mangle)]
-        pub extern "C" fn dealloc(ptr: u32, size: u32) {
-            $crate::abi::dealloc_bytes(ptr, size)
         }
     };
 }
@@ -128,20 +83,10 @@ macro_rules! export_abi {
 /// fn dispatch(function: &str, args: &[Value], ctx: &CallContext)
 ///     -> Result<Value, PluginError> { todo!() }
 /// ```
-///
-/// Pass `heap = <bytes>` as the first field to size the guest heap.
 #[macro_export]
 macro_rules! library_plugin {
     (info: $info:expr, surface: $surface:expr, call: $call:expr $(,)?) => {
-        $crate::library_plugin! {
-            heap = $crate::abi::DEFAULT_HEAP_SIZE,
-            info: $info,
-            surface: $surface,
-            call: $call,
-        }
-    };
-    (heap = $heap:expr, info: $info:expr, surface: $surface:expr, call: $call:expr $(,)?) => {
-        $crate::export_abi!(heap = $heap);
+        $crate::export_abi!();
 
         #[cfg_attr(target_arch = "wasm32", no_mangle)]
         pub extern "C" fn plugin_info() -> i64 {
@@ -196,8 +141,6 @@ macro_rules! library_plugin {
 /// fn refresh(input: &RefreshInput) -> Result<TokenSet, PluginError> { todo!() }
 /// fn profile(input: &TokenInput) -> Result<ExternalProfile, PluginError> { todo!() }
 /// ```
-///
-/// Pass `heap = <bytes>` as the first field to size the guest heap.
 #[macro_export]
 macro_rules! auth_plugin {
     (
@@ -207,24 +150,7 @@ macro_rules! auth_plugin {
         refresh: $refresh:expr,
         profile: $profile:expr $(,)?
     ) => {
-        $crate::auth_plugin! {
-            heap = $crate::abi::DEFAULT_HEAP_SIZE,
-            info: $info,
-            authorize_url: $authorize_url,
-            callback: $callback,
-            refresh: $refresh,
-            profile: $profile,
-        }
-    };
-    (
-        heap = $heap:expr,
-        info: $info:expr,
-        authorize_url: $authorize_url:expr,
-        callback: $callback:expr,
-        refresh: $refresh:expr,
-        profile: $profile:expr $(,)?
-    ) => {
-        $crate::export_abi!(heap = $heap);
+        $crate::export_abi!();
 
         #[cfg_attr(target_arch = "wasm32", no_mangle)]
         pub extern "C" fn plugin_info() -> i64 {
@@ -280,9 +206,8 @@ macro_rules! auth_plugin {
 /// half is for the interpreter itself failing.
 ///
 /// The allocator is the crate's own, through
-/// [`export_abi!(alloc = system)`](export_abi) — no heap of a fixed size
-/// survives an interpreter — so an interpreter plugin links `std` or declares
-/// a `#[global_allocator]`.
+/// [`export_abi!(alloc = system)`](export_abi), so an interpreter plugin links
+/// `std` or declares a `#[global_allocator]`.
 ///
 /// ```ignore
 /// happyview_plugin_sdk::interpreter_plugin! {

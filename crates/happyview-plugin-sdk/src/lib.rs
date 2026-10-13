@@ -53,7 +53,7 @@ pub mod wire;
 pub use envelope::{PluginError, Response};
 pub use types::{
     ApiExport, ApiMethod, ApiSurface, AtprotoBlobDownload, AtprotoResolveService, AttestSign,
-    AttestVerify, AuthorizeUrlInput, BacklinksQuery, BlobData, CallContext, CallInput,
+    AttestVerify, AuthorizeUrlInput, BacklinksQuery, BlobData, Bytes, CallContext, CallInput,
     CallbackInput, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
     CallerXrpcProcedure, CallerXrpcQuery, Condition, ExecuteContext, ExecuteInput, ExecuteLimits,
     ExecuteOutput, ExternalProfile, Filter, IndexDelete, IndexPut, JobCreate, JobGet, JobListAny,
@@ -75,6 +75,8 @@ pub use types::{
 #[doc(hidden)]
 pub mod __private {
     pub use alloc::string::String;
+    #[cfg(target_arch = "wasm32")]
+    pub use dlmalloc::GlobalDlmalloc;
 }
 
 pub use serde_json;
