@@ -1019,6 +1019,69 @@ async fn sixteen_failed_blocks_in_a_row_stop_the_job_inside_the_entry() {
 
 #[tokio::test]
 #[serial]
+async fn a_failed_replay_job_resumes_where_it_stopped() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.set_plan_page_entries(1);
+    let did = "did:plc:resumefailed";
+    let first = mock.seal(games(1..=4, did), 4);
+    let second = mock.seal(games_among_noise(5..=36, 5..=24, did), 1);
+    for index in 2..=17 {
+        mock.fail_block(&second, index, 3);
+    }
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert_eq!(job["replay"]["through_seq"], 4, "{job}");
+
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["error"], serde_json::Value::Null, "{job}");
+    assert_eq!(job["total_records"], 24, "{job}");
+    assert_eq!(job["replay"]["blocks_failed"], 0, "{job}");
+    assert_eq!(dump(&app).await.len(), 24);
+    assert!(errors(&app, &id).await.is_empty());
+    let downloads = mock.segment_downloads();
+    assert_eq!(
+        downloads.iter().filter(|n| **n == first).count(),
+        1,
+        "the finished entry is not refetched: {downloads:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failed_crawl_job_cannot_be_resumed() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    happyview::db::query(&happyview::db::adapt_sql(
+        "INSERT INTO happyview_backfill_jobs (id, collection, scope, status, stage, source, error, created_at) \
+         VALUES (?, ?, 'network', 'failed', 'pending', 'crawl', 'boom', '2026-10-12T00:00:00+00:00')",
+        app.state.db_backend,
+    ))
+    .bind(&id)
+    .bind(GAME)
+    .execute(&app.state.db)
+    .await
+    .expect("a failed crawl job");
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(job(&app, &id).await["status"], "failed");
+}
+
+#[tokio::test]
+#[serial]
 async fn a_failed_block_whose_error_row_cannot_be_stored_stops_the_job() {
     let mock = MockJetstream::start().await;
     let Some(app) = app(&mock, None).await else {

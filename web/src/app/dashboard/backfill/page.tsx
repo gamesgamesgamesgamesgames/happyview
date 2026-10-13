@@ -812,6 +812,10 @@ function JobDetail({
   const allDone = job.status === "completed";
   const isActive = job.status === "running" || job.status === "cancelling" || job.status === "pausing";
   const isPaused = job.status === "paused" || job.status === "pausing";
+  // A failed replay resumes from its saved sweeps.
+  const resumable =
+    job.status === "paused" ||
+    (job.status === "failed" && job.source === "replay");
   // Discovery runs alongside resolving and fetching on the bounded queue.
   const discovering = job.discovery_complete === false;
   const bounded = job.recent_completions_limit != null;
@@ -1398,7 +1402,7 @@ function JobDetail({
             {pausing || job.status === "pausing" ? "Pausing…" : "Pause Job"}
           </Button>
         )}
-        {canCancel && job.status === "paused" && (
+        {canCancel && resumable && (
           <Button
             variant="default"
             size="sm"

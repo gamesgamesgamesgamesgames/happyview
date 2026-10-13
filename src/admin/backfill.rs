@@ -4162,7 +4162,9 @@ pub(super) async fn pause_backfill(
     }
 }
 
-/// POST /admin/backfill/{id}/resume — resume a paused backfill job.
+/// POST /admin/backfill/{id}/resume — resume a paused backfill job, or a
+/// failed replay job: its sweeps, cursors and retry rows say exactly where it
+/// stopped, so a transient failure doesn't throw away a long replay.
 pub(super) async fn resume_backfill(
     State(state): State<AppState>,
     admin: UserAuth,
@@ -4171,10 +4173,10 @@ pub(super) async fn resume_backfill(
     admin.require(Permission::BackfillCreate).await?;
 
     let sql = adapt_sql(
-        "SELECT status FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT status, source FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     );
-    let row: Option<(String,)> = crate::db::query_as(&sql)
+    let row: Option<(String, String)> = crate::db::query_as(&sql)
         .bind(&job_id)
         .fetch_optional(&state.backfill_db)
         .await
@@ -4182,12 +4184,17 @@ pub(super) async fn resume_backfill(
 
     match row {
         None => Err(AppError::NotFound("backfill job not found".into())),
-        Some((status,)) if status != "paused" => Err(AppError::BadRequest(format!(
-            "job is not paused (status: {status})"
-        ))),
+        Some((status, source))
+            if status != "paused" && !(status == "failed" && source == "replay") =>
+        {
+            Err(AppError::BadRequest(format!(
+                "job is not paused (status: {status})"
+            )))
+        }
         Some(_) => {
+            // A failed job has a `completed_at`; a paused one has none.
             let sql = adapt_sql(
-                "UPDATE happyview_backfill_jobs SET status = 'running', error = NULL WHERE id = ?",
+                "UPDATE happyview_backfill_jobs SET status = 'running', error = NULL, completed_at = NULL WHERE id = ?",
                 state.db_backend,
             );
             crate::db::retry_on_busy(|| {
