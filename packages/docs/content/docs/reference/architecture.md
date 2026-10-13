@@ -220,7 +220,7 @@ sequenceDiagram
 
 **Two sources.** A backfill job reads its records from one of two places, chosen by `BACKFILL_SOURCE` or the job's `source`. A crawl runs the pipeline above. A replay asks the Jetstream archive for a plan (`planSnapshot`), downloads the segments and blocks that hold the job's collections, and writes the records through the same path as live events. A second sweep then applies the account and sync events for the accounts that hold records. Markers are applied as of their own time, so the two sweeps give the same result in either order and never remove records written after them. `auto` replays when the Jetstream has an archive and crawls when it doesn't.
 
-**Gap replay.** When the live consumer's cursor is older than Jetstream keeps, HappyView creates a replay job for the gap between its last applied seq and the archive's sealed tip, and resumes the live stream at that tip. Live events and the replay overlap safely, because the rev guard and tombstones make every write idempotent. Instances on `BACKFILL_SOURCE=crawl`, or on a Jetstream without an archive, keep the old behaviour of skipping the gap.
+**Gap replay.** When the live consumer's cursor is older than Jetstream keeps, HappyView creates a replay job for the gap between its last applied seq and the archive's sealed tip, and resumes the live stream at that tip. The consumer waits at most 30 seconds for the archive's plan; past that it resumes without a replay. Live events and the replay overlap safely, because the rev guard and tombstones make every write idempotent. Instances on `BACKFILL_SOURCE=crawl`, or on a Jetstream without an archive, keep the old behaviour of skipping the gap.
 
 
 ### `records`

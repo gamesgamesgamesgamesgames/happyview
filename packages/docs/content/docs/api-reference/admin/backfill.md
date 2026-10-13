@@ -184,7 +184,7 @@ Returns `400` if the job is not currently running, or `404` if the job ID is not
 POST /admin/backfill/{id}/resume
 ```
 
-Resume a paused backfill job. The job status transitions back to `running` and processing continues from where it left off.
+Resume a paused backfill job, or a failed replay job. The job status transitions back to `running`, its `error` is cleared, and processing continues from where it left off. A replay job carries on from the last plan entry it finished, so a job that failed on an archive outage, or after 16 failed blocks in a row, doesn't start over. A failed crawl job can't be resumed and returns `400`.
 
 ```sh tab="cURL" tab-group="language"
 curl -X POST "http://127.0.0.1:3000/admin/backfill/$JOB_ID/resume" -H "$AUTH"
@@ -355,12 +355,12 @@ curl "http://127.0.0.1:3000/admin/backfill/$JOB_ID/errors?kind=replay_block" -H 
 {
   "errors": [
     {
-      "did": "segment-0000000000008412.jss",
+      "did": "seg_0000000001.jss",
       "collection": null,
       "phase": "replay_block:17",
       "kind": "replay_block",
-      "message": "getBlock answered HTTP 502",
-      "attempts": 3,
+      "message": "HTTP 502",
+      "attempts": 1,
       "last_at": "2025-01-01T00:03:00Z"
     }
   ],
@@ -401,7 +401,7 @@ curl -X POST "http://127.0.0.1:3000/admin/backfill/$JOB_ID/retry-failed" \
 What the new job does depends on the source of the job it retries:
 
 - **Crawl:** a `dids` job for the accounts that failed, in the same collection. It starts at the resolve step, so the accounts' PDS lookups run again.
-- **Replay:** a replay job that downloads exactly the failed blocks again, and nothing else. It runs in the `retrying_blocks` stage. For a `dids` job it keeps the original accounts.
+- **Replay:** a replay job that downloads exactly the failed blocks again. It runs in the `retrying_blocks` stage, then, in the `replaying_accounts` stage, applies the account and sync events of every account those blocks wrote records for. For a `dids` job it keeps the original accounts.
 
 **Response**: `201 Created`
 

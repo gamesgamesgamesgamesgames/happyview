@@ -38,7 +38,9 @@ Account takedowns, deletions and repo resyncs are applied as of when they happen
 
 Each record goes through the same checks as a crawled one: the lexicon script runs, and the record's CID is checked against its body. A record that fails the check is skipped and logged.
 
-The job page shows `seq {n} of {tip}` while it runs, along with the bytes downloaded and any failed blocks. A block that can't be downloaded or decoded after retries is recorded as an `replay_block` error. `POST /admin/backfill/{id}/retry-failed` starts a new job that fetches only those blocks. See [Retry failed](../api-reference/admin/backfill.md#retry-failed).
+The job page shows `seq {n} of {tip}` while it runs, along with the bytes downloaded and any failed blocks. A block that can't be downloaded or decoded after retries is recorded as a `replay_block` error. `POST /admin/backfill/{id}/retry-failed` starts a new job that fetches only those blocks, then applies the account events of every account those blocks wrote records for, so a later takedown still removes them. See [Retry failed](../api-reference/admin/backfill.md#retry-failed).
+
+A replay job stops and fails rather than run on through an archive outage. It stops after 16 failed blocks in a row, with the error `the archive failed 16 blocks in a row; stopping (resume to continue)`, and when a failed block can't be recorded, for example once the job has stored its 10,000 failures, since a block that isn't recorded could never be retried. Either way it stops before it moves past the blocks in question. A failed replay job can be resumed like a paused one: it carries on from where it stopped, without downloading again what it had finished.
 
 Replay needs a Jetstream that serves the v2 archive. If `JETSTREAM_API_KEY` is set, it is sent to the archive and nowhere else. Replay jobs spool each segment to `BACKFILL_REPLAY_DIR` while they decode it, up to 1 GiB per segment.
 
@@ -46,7 +48,7 @@ Crawl stays available. It is what runs when the Jetstream has no archive, and `B
 
 ### Gaps in the live stream
 
-When the live stream falls further behind than Jetstream keeps, Jetstream refuses the saved cursor (`CursorTooOld`). HappyView now replays the gap from the archive instead of skipping it. It resumes the live stream at the archive's newest sealed segment right away, and a replay job fills in the records between. The `jetstream.gap` event names that job in `replay_job_id`. If the archive can't be asked, HappyView resumes as before and a [backfill](#when-backfill-runs) is the way to recover what was missed. With `BACKFILL_SOURCE=crawl`, gaps are never replayed.
+When the live stream falls further behind than Jetstream keeps, Jetstream refuses the saved cursor (`CursorTooOld`). HappyView now replays the gap from the archive instead of skipping it. It resumes the live stream at the archive's newest sealed segment right away, and a replay job fills in the records between. The `jetstream.gap` event names that job in `replay_job_id`. If the archive can't be asked, or doesn't plan the gap within 30 seconds, HappyView resumes as before and a [backfill](#when-backfill-runs) is the way to recover what was missed. With `BACKFILL_SOURCE=crawl`, gaps are never replayed.
 
 ### Rate limiting
 
