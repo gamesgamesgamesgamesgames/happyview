@@ -33,6 +33,18 @@ pub fn plugin(language: &str) -> LoadedPlugin {
     }
 }
 
+/// The fixture, claiming `language` and the project file `extensions` that
+/// select it.
+pub fn plugin_with_extensions(language: &str, extensions: &[&str]) -> LoadedPlugin {
+    let mut plugin = plugin(language);
+    let manifest = plugin
+        .manifest
+        .as_mut()
+        .expect("the fixture has a manifest");
+    manifest.extensions = extensions.iter().map(|e| e.to_string()).collect();
+    plugin
+}
+
 /// An interpreter claiming `language` with no module behind it, for a caller
 /// that only needs the registry to answer which languages are installed.
 /// Reading a stored row is such a caller, and making it read a built module
