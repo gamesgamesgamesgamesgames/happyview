@@ -4215,17 +4215,25 @@ pub(super) async fn resume_backfill(
         }
         Some(_) => {
             // A failed job has a `completed_at`; a paused one has none.
+            // Conditional, so of two resumes at once only one runs the job.
             let sql = adapt_sql(
-                "UPDATE happyview_backfill_jobs SET status = 'running', error = NULL, completed_at = NULL WHERE id = ?",
+                "UPDATE happyview_backfill_jobs SET status = 'running', error = NULL, completed_at = NULL \
+                 WHERE id = ? AND (status = 'paused' OR (status = 'failed' AND source = 'replay'))",
                 state.db_backend,
             );
-            crate::db::retry_on_busy(|| {
+            let resumed = crate::db::retry_on_busy(|| {
                 crate::db::query(&sql)
                     .bind(&job_id)
                     .execute(&state.backfill_db)
             })
             .await
-            .map_err(|e| AppError::Internal(format!("failed to resume backfill job: {e}")))?;
+            .map_err(|e| AppError::Internal(format!("failed to resume backfill job: {e}")))?
+            .rows_affected();
+            if resumed == 0 {
+                return Err(AppError::BadRequest(
+                    "job is not paused (it was resumed or changed meanwhile)".into(),
+                ));
+            }
 
             let spawn_state = state.clone();
             let spawn_job_id = job_id.clone();

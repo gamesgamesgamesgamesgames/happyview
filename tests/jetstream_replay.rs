@@ -1183,6 +1183,40 @@ async fn an_account_replay_without_dids_fails_instead_of_widening() {
 
 #[tokio::test]
 #[serial]
+async fn two_resumes_at_once_run_the_job_once() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(games(1..=4, "did:plc:tworesumes"), 4);
+    mock.seal(games(5..=8, "did:plc:tworesumes"), 4);
+    mock.set_plan_page_entries(1);
+    mock.hold_segment(&segment);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    wait_until!(
+        "the download to start",
+        mock.segment_downloads().contains(&segment)
+    );
+    let (status, _) = app
+        .post_json_status(&format!("/admin/backfill/{id}/pause"), json!({}))
+        .await;
+    assert_eq!(status, 200);
+    mock.release_segment(&segment);
+    assert_eq!(finished(&app, &id).await["status"], "paused");
+
+    let path = format!("/admin/backfill/{id}/resume");
+    let (first, second) = tokio::join!(
+        app.post_json_status(&path, json!({})),
+        app.post_json_status(&path, json!({}))
+    );
+    let mut statuses = [first.0, second.0];
+    statuses.sort();
+    assert_eq!(statuses, [200, 400], "{first:?} {second:?}");
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+}
+
+#[tokio::test]
+#[serial]
 async fn a_failed_crawl_job_cannot_be_resumed() {
     let mock = MockJetstream::start().await;
     let Some(app) = app(&mock, None).await else {
