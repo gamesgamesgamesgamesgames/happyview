@@ -6,7 +6,7 @@ use crate::event_log::{EventLog, Severity, log_event};
 use crate::lua::scripts;
 use crate::plugin::ScriptExecuteOutput;
 use crate::repo;
-use crate::script::{Invocation, dispatch};
+use crate::script::{Invocation, ScriptOrigin, dispatch};
 
 use super::db;
 
@@ -213,6 +213,7 @@ async fn execute_job(state: &AppState, job: &super::Job) {
             params: None,
             delegate_did: None,
             space: None,
+            origin: ScriptOrigin::of(&script),
         },
         caller_session,
     )

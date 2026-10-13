@@ -667,6 +667,31 @@ impl PluginExecutor {
         self.prepare_loaded(&plugin, source, chunk_name, role).await
     }
 
+    /// As [`prepare_script`](Self::prepare_script), keeping the result in the
+    /// prepared cache against `source`. The module that prepares is the one
+    /// the entry is stored for, so a re-registration landing in between
+    /// stores nothing rather than filing one build's artifact under the next.
+    /// The output's artifact is what the cache now holds: `None` when the
+    /// interpreter returned none, the script is not valid, or the module was
+    /// superseded.
+    pub async fn prepare_and_store(
+        &self,
+        plugin_id: &str,
+        source: &str,
+        chunk_name: &str,
+        role: ChunkRole,
+    ) -> Result<ScriptValidateOutput, ExecutionError> {
+        let plugin = self.interpreter(plugin_id).await?;
+        let mut out = self
+            .prepare_loaded(&plugin, source, chunk_name, role)
+            .await?;
+        let stored = self
+            .registry
+            .store_prepared(&plugin, source, out.artifact.take());
+        out.artifact = stored.as_deref().cloned();
+        Ok(out)
+    }
+
     /// Prepare on this exact module and stamp the result for it alone.
     async fn prepare_loaded(
         &self,

@@ -58,6 +58,10 @@ impl From<ExecutionError> for DispatchError {
 /// Run one invocation through the interpreter that claims its language,
 /// lending it `caller`'s credentials where the runner has them.
 ///
+/// The artifact attached here is a candidate: `execute_script_in` decides
+/// against the build it actually instantiates whether the run loads it or the
+/// source.
+///
 /// The wall clock is not set here. `execute_script_as` arms it per run and
 /// lifts it for a job, so a budget cannot be set once and then outlive the run
 /// it was meant for.
@@ -73,9 +77,11 @@ pub async fn dispatch(
         .ok_or_else(|| DispatchError::NoInterpreter {
             language: inv.language.to_string(),
         })?;
-    let input = build_input(state, inv).await;
+    let mut input = build_input(state, inv).await;
+    let modules =
+        super::prepared::attach_prepared(state, &interpreter.info.id, inv, &mut input).await;
     Ok(state
         .plugin_executor()
-        .execute_script_as(&interpreter.info.id, &input, caller)
+        .execute_script_in(&interpreter.info.id, &input, caller, modules)
         .await?)
 }

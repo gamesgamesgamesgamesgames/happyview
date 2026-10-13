@@ -74,6 +74,10 @@ impl PreparedCache {
             .cloned()
     }
 
+    /// Store without checking which build prepared `artifact`. A caller
+    /// holding a prepared result wants `PluginRegistry::store_prepared`, or
+    /// `PluginExecutor::prepare_and_store`, which refuse a superseded module
+    /// and stamp what they keep.
     pub fn store(
         &self,
         interpreter: &str,

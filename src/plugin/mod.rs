@@ -177,13 +177,13 @@ impl PluginRegistry {
     /// the `plugins` write lock, so the stamp always describes the module
     /// that lock leaves registered, however registrations interleave.
     fn interpreter_changed(&self, id: &str, incoming: Option<&Arc<LoadedPlugin>>) {
+        // Hashed before the lock is taken: every run's stamp read waits on
+        // it, and a module is megabytes.
+        let incoming = incoming.map(|plugin| (plugin.clone(), prepared::ArtifactStamp::of(plugin)));
         let mut stamps = self.stamps.write().unwrap_or_else(|e| e.into_inner());
         match incoming {
-            Some(plugin) => {
-                stamps.insert(
-                    id.to_string(),
-                    (plugin.clone(), prepared::ArtifactStamp::of(plugin)),
-                );
+            Some(entry) => {
+                stamps.insert(id.to_string(), entry);
             }
             None => {
                 stamps.remove(id);

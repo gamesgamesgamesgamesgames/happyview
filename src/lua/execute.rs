@@ -12,7 +12,7 @@ use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::ParsedLexicon;
 use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptSpace};
 use crate::repo;
-use crate::script::{DispatchError, Invocation, dispatch};
+use crate::script::{DispatchError, Invocation, ScriptOrigin, dispatch};
 use crate::telemetry::counters::Counters;
 
 use super::context;
@@ -247,6 +247,7 @@ pub async fn execute_procedure_script(
             params: Some(params),
             delegate_did,
             space: space.as_ref(),
+            origin: ScriptOrigin::of(script),
         },
         caller_session,
     )
@@ -368,6 +369,7 @@ pub async fn execute_query_script(
             params: None,
             delegate_did: None,
             space: space.as_ref(),
+            origin: ScriptOrigin::of(script),
         },
         None,
     )

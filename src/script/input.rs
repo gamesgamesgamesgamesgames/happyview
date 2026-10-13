@@ -1,16 +1,20 @@
 //! What a runner knows about one invocation, and the input it becomes.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::AppState;
+use crate::catalog::Layer;
 use crate::db::adapt_sql;
 use crate::lua::TriggerKind;
+use crate::lua::scripts::ResolvedScript;
 use crate::plugin::{
-    DEFAULT_SCRIPT_MEMORY_BYTES, ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits,
-    ScriptJob, ScriptKind, ScriptLibraryRef, ScriptSpace,
+    DEFAULT_CHUNK_NAME, DEFAULT_SCRIPT_MEMORY_BYTES, ScriptExecuteContext, ScriptExecuteInput,
+    ScriptExecuteLimits, ScriptJob, ScriptKind, ScriptLibraryRef, ScriptSpace,
 };
+use crate::project::snapshot::{ProjectScript, ProjectSnapshot};
 
 /// Which runner is dispatching. A job run carries the job it reports to,
 /// because [`ScriptKind::Job`] and `context.job` are independent fields on the
@@ -62,6 +66,46 @@ impl<'a> Trigger<'a> {
     }
 }
 
+/// Where the script being run came from, which decides its chunk name, the
+/// artifact it may load, and what a relative import resolves against.
+#[derive(Clone, Copy)]
+pub enum ScriptOrigin<'a> {
+    /// A dashboard row: chunk `script`, no local modules.
+    Dashboard,
+    /// A project file, read from the snapshot its run pinned.
+    Project {
+        snapshot: &'a Arc<ProjectSnapshot>,
+        script: &'a ProjectScript,
+    },
+}
+
+impl<'a> ScriptOrigin<'a> {
+    /// The origin of a resolved script. A project-layer script is looked up
+    /// in the snapshot it was resolved in rather than the live one, so the
+    /// handler and every import come from one build.
+    pub fn of(script: &'a ResolvedScript) -> Self {
+        if !matches!(script.layer, Layer::Project) {
+            return Self::Dashboard;
+        }
+        match script.snapshot.scripts.get(&script.id) {
+            Some(project) => Self::Project {
+                snapshot: &script.snapshot,
+                script: project,
+            },
+            None => Self::Dashboard,
+        }
+    }
+}
+
+impl std::fmt::Debug for ScriptOrigin<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dashboard => f.write_str("Dashboard"),
+            Self::Project { script, .. } => write!(f, "Project({})", script.path.display()),
+        }
+    }
+}
+
 /// One invocation, as the runner that fired it sees it. The three fields a
 /// script row supplies are its id (the trigger string), its `script_type` and
 /// its body; the rest is the event.
@@ -81,6 +125,7 @@ pub struct Invocation<'a> {
     pub params: Option<&'a HashMap<String, Value>>,
     pub delegate_did: Option<&'a str>,
     pub space: Option<&'a ScriptSpace>,
+    pub origin: ScriptOrigin<'a>,
 }
 
 /// Build the input for one invocation: the kind from the trigger, the context
@@ -137,7 +182,9 @@ pub async fn build_input(state: &AppState, inv: &Invocation<'_>) -> ScriptExecut
         // `execute_script_as` overrides the guard list with the host's own,
         // so sending one here would only mislead a reader.
         removed_globals: Vec::new(),
-        chunk_name: crate::plugin::DEFAULT_CHUNK_NAME.to_string(),
+        // `dispatch` attaches the artifact and the project chunk name once
+        // it knows which interpreter runs this.
+        chunk_name: DEFAULT_CHUNK_NAME.to_string(),
         artifact: None,
     }
 }
@@ -237,6 +284,7 @@ mod tests {
             params: None,
             delegate_did: None,
             space: None,
+            origin: ScriptOrigin::Dashboard,
         }
     }
 

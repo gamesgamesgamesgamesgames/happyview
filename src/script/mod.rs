@@ -10,9 +10,10 @@ pub mod checks;
 pub mod dispatch;
 pub mod encoding;
 pub mod input;
+pub mod prepared;
 pub mod response;
 
 pub use dispatch::{DispatchError, dispatch, no_interpreter_message};
 pub use encoding::Encoding;
-pub use input::{Invocation, Trigger, build_input};
+pub use input::{Invocation, ScriptOrigin, Trigger, build_input};
 pub use response::ScriptResponse;

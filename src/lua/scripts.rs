@@ -44,7 +44,7 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::plugin::{ScriptExecuteOutput, ScriptValueKind};
 use crate::project::ProjectSnapshot;
-use crate::script::{Invocation, Trigger, dispatch};
+use crate::script::{Invocation, ScriptOrigin, Trigger, dispatch};
 
 /// Number of attempts (1 initial + 3 retries) before dead-lettering.
 const MAX_ATTEMPTS: u32 = 4;
@@ -386,6 +386,7 @@ pub async fn run_record_event_once(
             params: None,
             delegate_did: None,
             space: None,
+            origin: ScriptOrigin::of(script),
         },
         None,
     )
@@ -563,6 +564,7 @@ async fn run_label_once(
             params: None,
             delegate_did: None,
             space: None,
+            origin: ScriptOrigin::of(script),
         },
         None,
     )

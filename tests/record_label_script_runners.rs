@@ -219,7 +219,7 @@ async fn a_record_event_hands_the_interpreter_its_event_and_its_context() {
         .await,
     );
 
-    assert_eq!(sent["source"], "echo");
+    assert_eq!(echo_interpreter::script_text(&sent), "echo");
     assert_eq!(sent["kind"], "record_event");
     assert_eq!(
         sent["input"],
@@ -311,7 +311,7 @@ async fn a_label_hands_the_interpreter_its_event_and_its_context() {
     assert_eq!(logged.len(), 1, "{logged:?}");
     let sent = &logged[0].2["fields"];
 
-    assert_eq!(sent["source"], "host:log_input");
+    assert_eq!(echo_interpreter::script_text(sent), "host:log_input");
     assert_eq!(sent["kind"], "label");
     assert_eq!(
         sent["input"],
