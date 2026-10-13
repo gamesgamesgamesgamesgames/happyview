@@ -105,7 +105,14 @@ pub fn resolve_module<'s>(
 ) -> Result<&'s ProjectModule, ModuleError> {
     let base = join(specifier, referrer)?;
     let tried = candidates(&base, extensions);
-    if let Some(module) = tried.iter().find_map(|path| snapshot.modules.get(path)) {
+    // The extensions are the caller's today, but a file was claimed by the
+    // build that made this snapshot. If an interpreter has since changed what
+    // it claims and the rebuild failed, the old snapshot keeps serving, and a
+    // path match alone would hand one language's source to another.
+    let found = tried.iter().find_map(|path| snapshot.modules.get(path));
+    if let Some(module) = found
+        && module.language_id == language
+    {
         return Ok(module);
     }
     Err(ModuleError::NotFound(not_found(
@@ -124,6 +131,18 @@ fn not_found(
 ) -> String {
     let looked = tried.join(", ");
     let mut message = format!("no module '{specifier}' from {referrer}: looked for {looked}");
+
+    if let Some(other) = tried
+        .iter()
+        .find_map(|path| snapshot.modules.get(path))
+        .filter(|module| module.language_id != language)
+    {
+        message.push_str(&format!(
+            "; {} exists, but it is a {} module, and {language} scripts can only import {language} files",
+            other.id, other.language_id
+        ));
+        return message;
+    }
 
     if let Some(handler) = snapshot
         .scripts
@@ -233,6 +252,22 @@ mod tests {
                 "lua"
             )),
             "src/jobs/util.lua"
+        );
+    }
+
+    #[test]
+    fn a_module_another_language_claimed_is_not_resolved() {
+        let snap = snapshot(&[("src/lib/format.lua", "teal")]);
+        let err =
+            resolve_module(&snap, "../lib/format", "src/jobs/tick.lua", &lua(), "lua").unwrap_err();
+        let ModuleError::NotFound(message) = &err else {
+            panic!("expected not found, got {err}");
+        };
+        assert!(
+            message.ends_with(
+                "; src/lib/format.lua exists, but it is a teal module, and lua scripts can only import lua files"
+            ),
+            "{message}"
         );
     }
 
