@@ -10,7 +10,10 @@ use std::sync::Arc;
 use common::app::TestApp;
 use common::echo_interpreter;
 use happyview::project::build::{BuildEnv, BuildOptions, build_snapshot, install};
-use happyview::project::prepare::{prepare_snapshot, spawn_rebuild_on_interpreter_change};
+use happyview::project::diagnostic::{Diagnostic, has_errors};
+use happyview::project::prepare::{
+    check_imports, prepare_files, spawn_rebuild_on_interpreter_change,
+};
 use happyview::project::snapshot::{ProjectModule, ProjectScript, ProjectSnapshot, ScriptBody};
 
 async fn app() -> Option<TestApp> {
@@ -68,6 +71,17 @@ fn snapshot(scripts: Vec<ProjectScript>, modules: Vec<ProjectModule>) -> Project
     snap
 }
 
+/// Prepare every file in `snap` and check its literal imports, in the order
+/// and on the condition `build_snapshot_with` does.
+async fn prepare_snapshot(app: &TestApp, snap: &mut ProjectSnapshot) -> Vec<Diagnostic> {
+    let env = BuildEnv::from_state(&app.state);
+    let (mut diagnostics, found) = prepare_files(&env, snap).await;
+    if !has_errors(&diagnostics) {
+        diagnostics.extend(check_imports(&env, snap, &found).await);
+    }
+    diagnostics
+}
+
 #[tokio::test]
 async fn every_handler_and_module_gets_a_stamped_artifact() {
     let Some(app) = app().await else { return };
@@ -79,7 +93,7 @@ async fn every_handler_and_module_gets_a_stamped_artifact() {
         // A module needs no handle: `no-handle` would refuse a handler.
         vec![module("src/lib/format.echo", "no-handle, and a module")],
     );
-    let diagnostics = prepare_snapshot(&BuildEnv::from_state(&app.state), &mut snap).await;
+    let diagnostics = prepare_snapshot(&app, &mut snap).await;
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
     let stamp = app
@@ -113,7 +127,7 @@ async fn a_literal_import_of_nothing_is_reported_at_its_line() {
         )],
         vec![],
     );
-    let diagnostics = prepare_snapshot(&BuildEnv::from_state(&app.state), &mut snap).await;
+    let diagnostics = prepare_snapshot(&app, &mut snap).await;
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0].path, PathBuf::from("src/jobs/tick.echo"));
     assert_eq!(diagnostics[0].line, Some(3));
@@ -132,11 +146,7 @@ async fn a_bare_import_is_not_checked() {
         vec![script("src/jobs/tick.echo", "import happyview.record")],
         vec![],
     );
-    assert!(
-        prepare_snapshot(&BuildEnv::from_state(&app.state), &mut snap)
-            .await
-            .is_empty()
-    );
+    assert!(prepare_snapshot(&app, &mut snap).await.is_empty());
 }
 
 /// A module in another language is not one this file can import, even at
@@ -155,7 +165,7 @@ async fn an_import_of_another_language_s_module_is_refused() {
         vec![script("src/jobs/tick.echo", "import ../lib/format")],
         vec![format],
     );
-    let diagnostics = prepare_snapshot(&BuildEnv::from_state(&app.state), &mut snap).await;
+    let diagnostics = prepare_snapshot(&app, &mut snap).await;
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0].path, PathBuf::from("src/jobs/tick.echo"));
     assert_eq!(diagnostics[0].line, Some(1));
@@ -175,7 +185,7 @@ async fn an_invalid_module_is_not_also_reported_as_missing() {
         vec![script("src/jobs/tick.echo", "import ../lib/format")],
         vec![module("src/lib/format.echo", "invalid")],
     );
-    let diagnostics = prepare_snapshot(&BuildEnv::from_state(&app.state), &mut snap).await;
+    let diagnostics = prepare_snapshot(&app, &mut snap).await;
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0].path, PathBuf::from("src/lib/format.echo"));
 }
@@ -184,7 +194,7 @@ async fn an_invalid_module_is_not_also_reported_as_missing() {
 async fn an_invalid_file_is_reported_with_its_path_and_line() {
     let Some(app) = app().await else { return };
     let mut snap = snapshot(vec![script("src/jobs/tick.echo", "invalid syntax")], vec![]);
-    let diagnostics = prepare_snapshot(&BuildEnv::from_state(&app.state), &mut snap).await;
+    let diagnostics = prepare_snapshot(&app, &mut snap).await;
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert_eq!(diagnostics[0].path, PathBuf::from("src/jobs/tick.echo"));
     assert_eq!(diagnostics[0].line, Some(1));
@@ -200,7 +210,7 @@ async fn an_interpreter_that_predates_roles_still_builds_a_module() {
         vec![script("src/jobs/tick.echo", "value:none")],
         vec![module("src/lib/format.echo", "old-sdk module")],
     );
-    let diagnostics = prepare_snapshot(&BuildEnv::from_state(&app.state), &mut snap).await;
+    let diagnostics = prepare_snapshot(&app, &mut snap).await;
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     assert!(snap.modules["src/lib/format.echo"].artifact.is_none());
 
@@ -208,7 +218,7 @@ async fn an_interpreter_that_predates_roles_still_builds_a_module() {
         vec![script("src/jobs/tick.echo", "old-sdk handler")],
         vec![],
     );
-    let diagnostics = prepare_snapshot(&BuildEnv::from_state(&app.state), &mut snap).await;
+    let diagnostics = prepare_snapshot(&app, &mut snap).await;
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert!(
         diagnostics[0].message.contains("handle"),

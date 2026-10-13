@@ -199,18 +199,6 @@ pub async fn check_imports(
     out
 }
 
-/// Prepare every file in `snapshot` and check its literal imports. Empty
-/// means the snapshot is ready to install.
-pub async fn prepare_snapshot(env: &BuildEnv, snapshot: &mut ProjectSnapshot) -> Vec<Diagnostic> {
-    let (mut diagnostics, found) = prepare_files(env, snapshot).await;
-    // A file that did not validate has no reliable import list, and its own
-    // error is the one worth reading first.
-    if diagnostics.is_empty() {
-        diagnostics.extend(check_imports(env, snapshot, &found).await);
-    }
-    diagnostics
-}
-
 /// Held for the length of a rebuild. Boot, the interpreter watcher and a
 /// dev-mode file watcher may each ask for one, and `install` numbers a
 /// generation by reading the last, so two rebuilds must not interleave.

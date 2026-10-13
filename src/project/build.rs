@@ -319,8 +319,8 @@ fn config_diagnostic(e: ProjectConfigError) -> Diagnostic {
 
 /// The admin API's checks that read the text alone: removed globals. The
 /// interpreter's check runs once the snapshot is assembled, in
-/// `prepare::prepare_snapshot`, where every module exists for imports to
-/// resolve against.
+/// `prepare::prepare_files` and then `prepare::check_imports`, where every
+/// module exists for imports to resolve against.
 fn passes_checks(
     item: &Pending<'_>,
     trigger_id: &str,
