@@ -77,6 +77,39 @@ pub struct ScriptListing {
     pub outbound_xrpcs: Option<Vec<String>>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    /// Set for a compiled module's handler, which has no body to show or edit.
+    pub module: Option<ModuleRow>,
+}
+
+/// A compiled module's handler, which the dashboard shows instead of a body.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ModuleRow {
+    pub module: String,
+    /// The module's crate, project-relative, with `/` separators.
+    pub path: String,
+    /// The Rust function that handles the trigger.
+    pub handler: String,
+    pub hash: String,
+}
+
+/// The function name lives in the module's own section rather than in the
+/// script, so saying which function handles a trigger needs the snapshot.
+pub fn module_row(script: &ProjectScript, snap: &ProjectSnapshot) -> Option<ModuleRow> {
+    let ScriptBody::Module { module, hash } = &script.body else {
+        return None;
+    };
+    let handler = snap
+        .script_modules
+        .get(hash)
+        .and_then(|m| m.handlers.iter().find(|h| h.trigger == script.trigger))
+        .and_then(|h| h.function.clone())
+        .unwrap_or_default();
+    Some(ModuleRow {
+        module: module.clone(),
+        path: path_string(&script.path),
+        handler,
+        hash: hash.clone(),
+    })
 }
 
 impl ScriptListing {
@@ -92,10 +125,11 @@ impl ScriptListing {
             outbound_xrpcs: row.outbound_xrpcs,
             created_at: Some(row.created_at),
             updated_at: Some(row.updated_at),
+            module: None,
         }
     }
 
-    fn from_project(script: &ProjectScript, shadows_stored: bool) -> Self {
+    fn from_project(script: &ProjectScript, snap: &ProjectSnapshot, shadows_stored: bool) -> Self {
         Self {
             id: script.trigger.clone(),
             layer: Layer::Project,
@@ -107,6 +141,7 @@ impl ScriptListing {
             outbound_xrpcs: Some(script.outbound_xrpcs.clone()).filter(|v| !v.is_empty()),
             created_at: None,
             updated_at: None,
+            module: module_row(script, snap),
         }
     }
 }
@@ -284,7 +319,7 @@ impl ScriptCatalog {
         let project = self.project.load_full();
         let row = self.get_manual(id).await?;
         Ok(match project.scripts.get(id) {
-            Some(script) => Some(ScriptListing::from_project(script, row.is_some())),
+            Some(script) => Some(ScriptListing::from_project(script, &project, row.is_some())),
             None => row.map(ScriptListing::from_manual),
         })
     }
@@ -306,7 +341,7 @@ impl ScriptCatalog {
             let shadows_stored = out.contains_key(id);
             out.insert(
                 id.clone(),
-                ScriptListing::from_project(script, shadows_stored),
+                ScriptListing::from_project(script, &project, shadows_stored),
             );
         }
         Ok(out.into_values().collect())
@@ -662,5 +697,58 @@ mod tests {
             );
             catalog.remove(&db, backend, &id).await.unwrap();
         }
+    }
+
+    #[test]
+    fn a_module_handler_lists_its_module_path_function_and_hash() {
+        use crate::project::script_module::{ModuleHandler, ScriptModule};
+
+        let mut snap = ProjectSnapshot::empty();
+        let manifest: crate::plugin::PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "module:registry", "name": "registry", "version": "0.0.0",
+            "api_version": "2", "plugin_type": "interpreter", "language_id": "rust",
+        }))
+        .unwrap();
+        let plugin = crate::plugin::LoadedPlugin {
+            info: manifest.clone().into(),
+            source: crate::plugin::PluginSource::File { path: "x".into() },
+            wasm_bytes: Vec::new(),
+            manifest: Some(manifest),
+        };
+        snap.script_modules.insert(
+            "abc123".into(),
+            Arc::new(ScriptModule {
+                name: "registry".into(),
+                source_path: "modules/registry".into(),
+                artifact_path: ".happyview/build/registry.wasm".into(),
+                hash: "abc123".into(),
+                handlers: vec![ModuleHandler {
+                    trigger: "xrpc.query:app.test.echo".into(),
+                    function: Some("echo".into()),
+                }],
+                plugin: Arc::new(plugin),
+            }),
+        );
+        let script = ProjectScript {
+            trigger: "xrpc.query:app.test.echo".into(),
+            path: "modules/registry".into(),
+            language_id: "rust".into(),
+            body: ScriptBody::Module {
+                module: "registry".into(),
+                hash: "abc123".into(),
+            },
+            description: None,
+            outbound_xrpcs: vec![],
+        };
+        let expected = ModuleRow {
+            module: "registry".into(),
+            path: "modules/registry".into(),
+            handler: "echo".into(),
+            hash: "abc123".into(),
+        };
+        assert_eq!(module_row(&script, &snap), Some(expected.clone()));
+        let listing = ScriptListing::from_project(&script, &snap, false);
+        assert_eq!(listing.module, Some(expected));
+        assert_eq!(listing.body, "");
     }
 }

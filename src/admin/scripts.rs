@@ -78,6 +78,10 @@ pub(super) struct ScriptResponse {
     /// the row as broken: the row is intact and installing the interpreter is
     /// the whole fix.
     pub runnable: bool,
+    /// Set for a compiled module's handler, which has no body to show or
+    /// edit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<crate::catalog::scripts::ModuleRow>,
 }
 
 impl ScriptResponse {
@@ -100,7 +104,9 @@ impl ScriptResponse {
             Vec::new()
         };
         Self {
-            runnable: installed.contains(&l.script_type),
+            // A module is its own interpreter; no installed plugin claims
+            // its language, and none needs to.
+            runnable: l.module.is_some() || installed.contains(&l.script_type),
             path: l.path.as_deref().map(crate::catalog::path_string),
             layer: l.layer,
             shadows_stored: l.shadows_stored,
@@ -113,6 +119,7 @@ impl ScriptResponse {
             updated_at: l.updated_at,
             recreatable,
             needs_migration,
+            module: l.module,
         }
     }
 }
@@ -698,6 +705,7 @@ mod tests {
             outbound_xrpcs: None,
             created_at: Some("2026-01-01T00:00:00+00:00".into()),
             updated_at: Some("2026-01-01T00:00:00+00:00".into()),
+            module: None,
         }
     }
 
@@ -973,5 +981,30 @@ mod tests {
             refusal_message(&[]),
             "the interpreter refused the script without saying why"
         );
+    }
+
+    #[test]
+    fn a_module_listing_is_runnable_without_an_interpreter_for_its_language() {
+        let listing = crate::catalog::ScriptListing {
+            id: "xrpc.query:app.test.echo".into(),
+            layer: crate::catalog::Layer::Project,
+            path: Some("modules/registry".into()),
+            shadows_stored: false,
+            script_type: "rust".into(),
+            body: String::new(),
+            description: None,
+            outbound_xrpcs: None,
+            created_at: None,
+            updated_at: None,
+            module: Some(crate::catalog::scripts::ModuleRow {
+                module: "registry".into(),
+                path: "modules/registry".into(),
+                handler: "echo".into(),
+                hash: "abc123".into(),
+            }),
+        };
+        let response = ScriptResponse::from_listing(listing, &HashSet::new());
+        assert!(response.runnable, "a module is its own interpreter");
+        assert_eq!(response.module.as_ref().unwrap().handler, "echo");
     }
 }
