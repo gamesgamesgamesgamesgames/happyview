@@ -33,6 +33,9 @@ use super::types::{
     BackfillErrorCount, BackfillErrorEntry, BackfillErrorsResponse, BackfillJob, CreateBackfillBody,
 };
 
+#[allow(dead_code)] // consumed by the replay driver in a later task
+mod replay_fold;
+
 // ---------------------------------------------------------------------------
 // Response types
 // ---------------------------------------------------------------------------
