@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+pub mod segment;
+
 pub const DEFAULT_CONCURRENCY: usize = 8;
 pub const MAX_CONCURRENCY: usize = 64;
 
