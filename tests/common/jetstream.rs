@@ -347,6 +347,8 @@ struct Inner {
     throttles: usize,
     block_failures: HashMap<(String, u32), usize>,
     corrupt_blocks: HashSet<(String, u32)>,
+    /// Segments whose `getSegment` answers 500.
+    failed_segments: HashSet<String>,
     plan_requests: Vec<Value>,
     segment_downloads: Vec<String>,
     block_fetches: Vec<(String, u32)>,
@@ -529,6 +531,15 @@ impl MockJetstream {
             .lock()
             .corrupt_blocks
             .insert((segment.to_string(), index));
+    }
+
+    /// Every `getSegment` for `name` answers 500 until this is called again
+    /// with the same name, which toggles it off.
+    pub fn fail_segment(&self, name: &str) {
+        let mut inner = self.shared.lock();
+        if !inner.failed_segments.remove(name) {
+            inner.failed_segments.insert(name.to_string());
+        }
     }
 
     /// `getSegment` for `name` records the download, then waits for
@@ -979,6 +990,9 @@ fn segment_response(
         return (None, response);
     }
     let name = query.get("name").cloned().unwrap_or_default();
+    if inner.failed_segments.contains(&name) {
+        return (None, StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
     let Some((_, written, _)) = inner.segments.iter().find(|(n, _, _)| *n == name) else {
         return (None, not_found("SegmentNotFound"));
     };

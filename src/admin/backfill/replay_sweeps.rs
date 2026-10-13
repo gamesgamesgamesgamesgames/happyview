@@ -393,6 +393,30 @@ pub(super) async fn retries(
     .await
 }
 
+/// Record the blocks a retry job refetches (`block_index` -1: a whole
+/// segment), before the job is spawned.
+pub(super) async fn insert_retries(
+    state: &AppState,
+    job_id: &str,
+    blocks: &[(String, i32)],
+) -> Result<(), sqlx::Error> {
+    let sql = adapt_sql(
+        "INSERT INTO happyview_backfill_replay_retries (job_id, segment, block_index, done) VALUES (?, ?, ?, 0)",
+        state.db_backend,
+    );
+    for (segment, block) in blocks {
+        crate::db::retry_on_busy(|| {
+            crate::db::query(&sql)
+                .bind(job_id)
+                .bind(segment.as_str())
+                .bind(*block)
+                .execute(&state.backfill_db)
+        })
+        .await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn has_retries(state: &AppState, job_id: &str) -> Result<bool, sqlx::Error> {
     let n: i64 = crate::db::query_scalar(&adapt_sql(
         "SELECT COUNT(*) FROM happyview_backfill_replay_retries WHERE job_id = ?",

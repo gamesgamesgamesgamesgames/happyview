@@ -53,6 +53,11 @@ impl ReplayFold {
         self.written
     }
 
+    /// Whether a record of `did` waits in the buffer, not yet written.
+    pub(super) fn buffers(&self, did: &str) -> bool {
+        self.pending_dids.contains(did)
+    }
+
     pub(super) async fn apply(&mut self, event: Event) -> Result<(), FoldError> {
         let Event { did, cursor, kind } = event;
         match kind {

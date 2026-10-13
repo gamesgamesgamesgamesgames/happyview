@@ -50,6 +50,9 @@ struct Run<'a> {
     records_counted: u64,
     probing: bool,
     download_dir: PathBuf,
+    /// In a network retry job, the collections a marker's DID must hold
+    /// network records in for the marker to apply. `None` otherwise.
+    held_only: Option<Vec<String>>,
 }
 
 pub(super) async fn run(
@@ -70,6 +73,7 @@ pub(super) async fn run(
         records_counted: 0,
         probing: source == "auto",
         download_dir: state.archive.download_dir.clone(),
+        held_only: None,
     };
     sweep_downloads(&run.download_dir, job_id).await;
     let result = run.drive(collections, scope_dids).await;
@@ -490,6 +494,20 @@ impl Run<'_> {
             if !filter.keep(&row) {
                 continue;
             }
+            // A DID whose records still wait in the fold's buffer holds
+            // records too; the fold flushes them before the marker.
+            if rows::is_marker(row.kind)
+                && let Some(collections) = &self.held_only
+                && !self.fold.buffers(&row.did)
+                && !self
+                    .state
+                    .records
+                    .holds_network_records(&row.did, Some(collections.as_slice()))
+                    .await
+                    .map_err(db)?
+            {
+                continue;
+            }
             match rows::row_to_event(row) {
                 Ok(Some(event)) => self
                     .fold
@@ -546,6 +564,9 @@ impl Run<'_> {
         collections: &[String],
         scope_dids: Option<Vec<String>>,
     ) -> Result<(), Halt> {
+        if scope_dids.is_none() {
+            self.held_only = Some(collections.to_vec());
+        }
         let filter = RowFilter {
             kinds: RowKinds::Both,
             collections: collections.iter().cloned().collect(),

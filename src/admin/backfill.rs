@@ -4812,18 +4812,111 @@ pub(super) async fn retry_failed_backfill(
     let backend = state.db_backend;
 
     let sql = adapt_sql(
-        "SELECT collection FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT collection, source, scope FROM happyview_backfill_jobs WHERE id = ?",
         backend,
     );
-    let row: Option<(Option<String>,)> = crate::db::query_as(&sql)
+    let row: Option<(Option<String>, String, String)> = crate::db::query_as(&sql)
         .bind(&job_id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| AppError::Internal(format!("failed to query backfill job: {e}")))?;
 
-    let Some((collection,)) = row else {
+    let Some((collection, source, scope)) = row else {
         return Err(AppError::NotFound("backfill job not found".into()));
     };
+
+    if source == "replay" {
+        if let Some(requested) = &body.kinds
+            && !requested.is_empty()
+            && !requested.iter().any(|k| k == "replay_block")
+        {
+            return Err(AppError::BadRequest(
+                "no retryable failures for this job".into(),
+            ));
+        }
+        let rows: Vec<(String, String)> = crate::db::query_as(&adapt_sql(
+            "SELECT did, phase FROM happyview_backfill_errors WHERE job_id = ? AND kind = 'replay_block'",
+            backend,
+        ))
+        .bind(&job_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read block failures: {e}")))?;
+        let blocks: Vec<(String, i32)> = rows
+            .into_iter()
+            .filter_map(|(segment, phase)| match phase.as_str() {
+                "replay_segment" => Some((segment, -1)),
+                other => other
+                    .strip_prefix("replay_block:")
+                    .and_then(|i| i.parse().ok())
+                    .map(|i| (segment, i)),
+            })
+            .collect();
+        if blocks.is_empty() {
+            return Err(AppError::BadRequest(
+                "no retryable failures for this job".into(),
+            ));
+        }
+        let dids = if scope == "dids" {
+            let dids = replay_sweeps::job_dids(&state, &job_id)
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("failed to read the job's accounts: {e}"))
+                })?;
+            // A finished job's queue rows go with a detail flush or the
+            // retention sweep. Never widen an account job to the network.
+            if dids.is_empty() {
+                return Err(AppError::BadRequest(
+                    "the job's DID list is no longer available; start a new backfill".into(),
+                ));
+            }
+            dids
+        } else {
+            Vec::new()
+        };
+        let new_job_id = create_backfill_job_with(
+            &state,
+            collection.as_deref(),
+            &dids,
+            crate::jetstream::archive::SourceChoice::Replay,
+        )
+        .await?;
+        replay_sweeps::insert_retries(&state, &new_job_id, &blocks)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("failed to record the blocks to retry: {e}"))
+            })?;
+
+        log_event(
+            &state.db,
+            EventLog {
+                event_type: "backfill.retry_started".to_string(),
+                severity: Severity::Info,
+                actor_did: Some(admin.did.clone()),
+                subject: collection.clone(),
+                detail: serde_json::json!({
+                    "job_id": new_job_id,
+                    "source_job_id": job_id,
+                    "source": "replay",
+                    "blocks": blocks.len(),
+                }),
+            },
+            backend,
+        )
+        .await;
+
+        // Spawned only now, so the driver finds the retries.
+        let spawn_state = state.clone();
+        let spawn_job_id = new_job_id.clone();
+        tokio::spawn(async move {
+            run_backfill_job(spawn_state, spawn_job_id).await;
+        });
+
+        return Ok((
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": new_job_id })),
+        ));
+    }
 
     let kinds: Vec<&'static str> = match &body.kinds {
         Some(requested) if !requested.is_empty() => requested

@@ -657,3 +657,311 @@ async fn a_resumed_job_does_not_refetch_finished_entries() {
     );
     assert_eq!(dump(&app).await.len(), 8);
 }
+
+/// 16 events in 4 blocks of which only block 2 holds GAME records, so the
+/// plan asks for that one block (`mode: "blocks"`).
+fn one_game_block(did: &str) -> Vec<common::segment_writer::ArchiveEvent> {
+    (1..=16)
+        .map(|s| {
+            if (9..=12).contains(&s) {
+                js::archive_create(s, did, GAME, &format!("g{s:04}"), game("t"))
+            } else {
+                js::archive_create(
+                    s,
+                    "did:plc:noise",
+                    "app.other.thing",
+                    &format!("o{s}"),
+                    json!({ "$type": "app.other.thing" }),
+                )
+            }
+        })
+        .collect()
+}
+
+async fn errors(app: &TestApp, job: &str) -> Vec<(String, String, String)> {
+    happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT did, phase, kind FROM happyview_backfill_errors WHERE job_id = ? ORDER BY did, phase",
+        app.state.db_backend,
+    ))
+    .bind(job)
+    .fetch_all(&app.state.db)
+    .await
+    .expect("errors")
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failed_block_is_recorded_and_retry_failed_refetches_just_it() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(one_game_block("did:plc:retry"), 4);
+    mock.fail_block(&segment, 2, usize::MAX);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(
+        job["status"], "completed",
+        "a failed block doesn't fail the job"
+    );
+    assert_eq!(job["replay"]["blocks_failed"], 1);
+    assert_eq!(
+        errors(&app, &id).await,
+        vec![(
+            segment.clone(),
+            "replay_block:2".into(),
+            "replay_block".into()
+        )]
+    );
+    assert!(dump(&app).await.is_empty());
+
+    mock.fail_block(&segment, 2, 0);
+    let plans_before = mock.plan_requests().len();
+    let block_2 = |mock: &MockJetstream| {
+        mock.block_fetches()
+            .iter()
+            .filter(|(s, i)| *s == segment && *i == 2)
+            .count()
+    };
+    let fetches_before = block_2(&mock);
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let retry = body["id"].as_str().unwrap().to_string();
+    let job = finished(&app, &retry).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["source"], "replay");
+    assert_eq!(dump(&app).await.len(), 4);
+    assert_eq!(
+        mock.plan_requests().len(),
+        plans_before,
+        "a retry plans nothing"
+    );
+    assert_eq!(
+        block_2(&mock),
+        fetches_before + 1,
+        "exactly one more fetch of block 2"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_corrupt_block_is_recorded_as_a_failed_block() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(one_game_block("did:plc:corrupt"), 4);
+    mock.corrupt_block(&segment, 2);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["replay"]["blocks_failed"], 1);
+    assert_eq!(errors(&app, &id).await[0].1, "replay_block:2");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_segment_that_fails_to_download_is_retried_whole() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(games(1..=8, "did:plc:wholeseg"), 4);
+    mock.fail_segment(&segment);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(
+        errors(&app, &id).await,
+        vec![(
+            segment.clone(),
+            "replay_segment".into(),
+            "replay_block".into()
+        )]
+    );
+    mock.fail_segment(&segment);
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(
+        finished(&app, body["id"].as_str().unwrap()).await["status"],
+        "completed"
+    );
+    assert_eq!(dump(&app).await.len(), 8);
+}
+
+#[tokio::test]
+#[serial]
+async fn retry_failed_without_block_failures_is_refused() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:clean"), 4);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn retrying_an_account_job_whose_dids_are_gone_is_refused() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let did = "did:plc:gonedids";
+    let segment = mock.seal(one_game_block(did), 4);
+    mock.fail_block(&segment, 2, usize::MAX);
+    let id = start_job(
+        &app,
+        json!({ "collection": GAME, "source": "replay", "dids": [did] }),
+    )
+    .await;
+    assert_eq!(finished(&app, &id).await["replay"]["blocks_failed"], 1);
+    // What a detail flush or the retention sweep does to a finished job.
+    happyview::db::query(&happyview::db::adapt_sql(
+        "DELETE FROM happyview_backfill_queue WHERE job_id = ?",
+        app.state.db_backend,
+    ))
+    .bind(&id)
+    .execute(&app.state.db)
+    .await
+    .expect("clear the job's queue rows");
+    let jobs_before = app
+        .get_json("/admin/backfill/status")
+        .await
+        .as_array()
+        .unwrap()
+        .len();
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("the job's DID list is no longer available"),
+        "{body}"
+    );
+    let jobs_after = app
+        .get_json("/admin/backfill/status")
+        .await
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(jobs_after, jobs_before, "no network job in its place");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_retried_block_applies_markers_only_for_dids_with_records() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let (held, stranger) = ("did:plc:heldretry", "did:plc:strangerretry");
+    let mut events = games(1..=4, held);
+    events.extend([
+        js::archive_create(
+            5,
+            "did:plc:noise",
+            "app.other.thing",
+            "o5",
+            json!({ "$type": "app.other.thing" }),
+        ),
+        js::archive_account(6, held, false, Some("takendown")),
+        js::archive_account(7, stranger, false, Some("deleted")),
+        js::archive_create(
+            8,
+            "did:plc:noise",
+            "app.other.thing",
+            "o8",
+            json!({ "$type": "app.other.thing" }),
+        ),
+    ]);
+    let segment = mock.seal(events, 4);
+    // Block 1 (seqs 5-8) holds both markers; fail it in the marker sweep.
+    mock.fail_block(&segment, 1, usize::MAX);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(
+        dump(&app).await.len(),
+        4,
+        "the takedown was in the failed block"
+    );
+    mock.fail_block(&segment, 1, 0);
+    let (_, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(
+        finished(&app, body["id"].as_str().unwrap()).await["status"],
+        "completed"
+    );
+    assert!(dump(&app).await.is_empty(), "the takedown applied on retry");
+    let tombstones: Vec<(String,)> = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT did FROM happyview_did_tombstones WHERE did = ?",
+        app.state.db_backend,
+    ))
+    .bind(stranger)
+    .fetch_all(&app.state.db)
+    .await
+    .unwrap();
+    assert!(
+        tombstones.is_empty(),
+        "no tombstone for a DID this instance holds nothing for"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_plan_that_stops_advancing_fails_the_job() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:stall"), 4);
+    mock.stall_plan(5);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed");
+    assert_eq!(job["error"], "the archive plan stopped advancing at seq 0");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_throttled_archive_is_waited_out() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:throttle"), 4);
+    mock.throttle_archive(3);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(dump(&app).await.len(), 4);
+}
+
+#[tokio::test]
+#[serial]
+async fn cancelling_a_replay_stops_it() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(games(1..=4, "did:plc:cancel"), 4);
+    mock.hold_segment(&segment);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    wait_until!(
+        "the download to start",
+        mock.segment_downloads().contains(&segment)
+    );
+    let (status, _) = app
+        .post_json_status(&format!("/admin/backfill/{id}/cancel"), json!({}))
+        .await;
+    assert_eq!(status, 200);
+    mock.release_segment(&segment);
+    assert_eq!(finished(&app, &id).await["status"], "cancelled");
+}
