@@ -90,6 +90,15 @@ extern "C" {
     fn host_module_resolve(req_ptr: i32, req_len: i32) -> i64;
 }
 
+// The test runner's imports, defined only for a test file's run.
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn host_test_calls(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_pds_writes(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_report(req_ptr: i32, req_len: i32) -> i64;
+}
+
 #[no_mangle]
 pub extern "C" fn alloc(size: u32) -> u32 {
     #[cfg(target_arch = "wasm32")]
@@ -252,6 +261,16 @@ mod imports {
             host_call_library_wait_any(request.as_ptr() as i32, request.len() as i32)
         })
     }
+
+    pub fn test_import(name: &str, request: &Value) -> Value {
+        let import: unsafe extern "C" fn(i32, i32) -> i64 = match name {
+            "calls" => host_test_calls,
+            "pds_writes" => host_test_pds_writes,
+            "report" => host_test_report,
+            _ => return err("BAD_INPUT", "unknown test import"),
+        };
+        send(import, request)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -287,6 +306,10 @@ mod imports {
         0
     }
     pub fn call_library_wait_any(_request: &str) -> Value {
+        unavailable()
+    }
+
+    pub fn test_import(_name: &str, _request: &Value) -> Value {
         unavailable()
     }
 }
@@ -438,6 +461,44 @@ fn raised(message: &str, chunk: &str) -> Value {
     failure("runtime", message, chunk)
 }
 
+/// A test file for the host's own tests: each step calls one test import, or
+/// checks a JSON pointer into an earlier answer and reports the result, which
+/// is enough for a host test to see triggers, mocks and reports end to end
+/// without an assertion library.
+fn run_test_steps(steps: &Value) -> Value {
+    let mut answers: alloc::vec::Vec<Value> = alloc::vec::Vec::new();
+    for step in steps.as_array().into_iter().flatten() {
+        let answer = if let Some(check) = step.get("check") {
+            let index = check["answer"].as_u64().unwrap_or(0) as usize;
+            let earlier = answers.get(index).cloned().unwrap_or(Value::Null);
+            let actual = earlier
+                .pointer(check["pointer"].as_str().unwrap_or(""))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let passed = actual == check["equals"];
+            imports::test_import(
+                "report",
+                &json!({
+                    "path": "",
+                    "name": check["name"],
+                    "status": if passed { "pass" } else { "fail" },
+                    "message": if passed {
+                        Value::Null
+                    } else {
+                        json!(format!("expected {}, got {}", check["equals"], actual))
+                    },
+                    "line": check["line"],
+                    "duration_ms": 0,
+                }),
+            )
+        } else {
+            imports::test_import(step["import"].as_str().unwrap_or(""), &step["request"])
+        };
+        answers.push(answer);
+    }
+    json!({ "answers": answers })
+}
+
 #[no_mangle]
 pub extern "C" fn plugin_info() -> i64 {
     return_json(&json!({"ok": {
@@ -483,6 +544,11 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
     // Falls through to the echo below, so the run returns a value.
     if let Some(iterations) = source.strip_prefix("burn:") {
         burn(iterations.parse().unwrap_or(0));
+    }
+
+    if let Some(steps) = source.strip_prefix("test:") {
+        let steps: Value = serde_json::from_str(steps).unwrap_or(Value::Null);
+        return return_json(&json!({"ok": returned(run_test_steps(&steps), "object")}));
     }
 
     let out = if let Some(kind) = source.strip_prefix("error:") {

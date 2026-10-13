@@ -1122,6 +1122,63 @@ pub(crate) fn define_host_functions(
         },
     )?;
 
+    // The test runner's imports. Each answers only inside a test file's run
+    // on a state the test command built.
+    imports.define(
+        "host_test_report",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_test_impl(
+                    caller,
+                    "host_test_report",
+                    req_ptr,
+                    req_len,
+                    |_state, harness, report: crate::plugin::TestReport| async move {
+                        harness.report(report);
+                        Ok(())
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_test_calls",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_test_impl(
+                    caller,
+                    "host_test_calls",
+                    req_ptr,
+                    req_len,
+                    |_state, harness, spec: crate::plugin::TestCalls| async move {
+                        Ok(harness.calls(&spec.namespace))
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
+    imports.define(
+        "host_test_pds_writes",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_test_impl(
+                    caller,
+                    "host_test_pds_writes",
+                    req_ptr,
+                    req_len,
+                    |_state, harness, _spec: crate::plugin::TestPdsWritesRequest| async move {
+                        Ok(harness.pds().writes())
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
     Ok(imports.wrapped)
 }
 
@@ -1233,6 +1290,58 @@ where
         Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
     };
     let response = match run(app_state, script_run, spec).await {
+        Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
+        Err(e) => error_envelope(e.code(), e),
+    };
+    write_guest_response(caller, &response).await
+}
+
+/// One entry point for the test runner's imports. Both the run and the state
+/// have to say "test": a test-kind input reaching a serving instance's state,
+/// or a handler's run on a test state, is refused alike.
+async fn host_test_impl<S, R, F, Fut>(
+    caller: &mut wasmtime::Caller<'_, PluginState>,
+    import: &'static str,
+    req_ptr: i32,
+    req_len: i32,
+    run: F,
+) -> i64
+where
+    S: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+    F: FnOnce(crate::AppState, Arc<crate::testing::TestHarness>, S) -> Fut,
+    Fut: std::future::Future<Output = Result<R, crate::testing::TestHostError>>,
+{
+    if let Err(envelope) =
+        require_capability(caller.data(), requirement_for_import(import).unwrap())
+    {
+        return write_guest_response(caller, &envelope).await;
+    }
+    let in_test_file = caller
+        .data()
+        .script_run
+        .as_ref()
+        .is_some_and(|run| run.test);
+    let app_state = caller.data().app_state.clone();
+    let harness = app_state.as_ref().and_then(|state| state.test.clone());
+    let (true, Some(app_state), Some(harness)) = (in_test_file, app_state, harness) else {
+        return write_guest_response(
+            caller,
+            &error_envelope(
+                "UNSUPPORTED",
+                format!("{import} is available only to a test file run by `happyview test`"),
+            ),
+        )
+        .await;
+    };
+    let Some(bytes) = read_guest_bytes(caller, req_ptr, req_len) else {
+        return 0;
+    };
+    let spec: S = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => return write_guest_response(caller, &error_envelope("BAD_INPUT", e)).await,
+    };
+    let response = match run(app_state, harness, spec).await {
         Ok(value) => serde_json::to_vec(&serde_json::json!({"ok": value})).unwrap_or_default(),
         Err(e) => error_envelope(e.code(), e),
     };
