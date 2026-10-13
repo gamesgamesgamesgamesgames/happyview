@@ -1497,7 +1497,7 @@ fn default_chunk_name() -> String {
 }
 
 /// What `execute` receives. Every field is data: nothing in it is a handle
-/// or a credential, and the host holds the identity the four `script:host`
+/// or a credential, and the host holds the identity the five `script:host`
 /// imports act on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecuteInput {
@@ -1673,6 +1673,9 @@ pub enum ExecuteOutput {
         kind: ScriptErrorKind,
         /// What a caller is shown. A `timeout` is the host's cue to write its
         /// own sentence, and an `AUTH_ERROR:` prefix passes through untouched.
+        /// It carries no `chunk:line:` prefix: `chunk` and `line` say where,
+        /// and the host prints them beside the message, so a prefix would
+        /// read twice.
         message: String,
         /// Omitted rather than null when the interpreter could not place the
         /// error on a line, the same spelling [`ValidateError`] uses.
@@ -1680,10 +1683,9 @@ pub enum ExecuteOutput {
         line: Option<u32>,
         /// The interpreter's unparsed text, for the event log.
         raw: String,
-        /// The chunk the error was raised in, as the interpreter named it:
-        /// a module's id or the run's `chunk_name`. Read from the
-        /// interpreter's own debug information rather than the message,
-        /// whose chunk text a language may truncate.
+        /// The chunk the interpreter reports `line` in, as it named it: a
+        /// module's id or the run's `chunk_name`, in full, since the chunk
+        /// text inside a message may be truncated.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chunk: Option<String>,
     },
@@ -1783,8 +1785,10 @@ pub struct PreparedArtifact {
     pub engine: String,
     /// What `bytes` holds, e.g. `lua-bytecode`.
     pub format: String,
-    /// Base64 on the wire: bytecode is binary, and a JSON array of numbers
-    /// would be several times its size on every run.
+    /// Base64 on the wire, standard alphabet (RFC 4648 §4), padded, with no
+    /// whitespace: bytecode is binary, and a JSON array of numbers would be
+    /// several times its size on every run. Any other dialect is refused
+    /// when the JSON is parsed.
     #[serde(with = "base64_bytes")]
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1809,6 +1813,10 @@ pub struct ModuleResolve {
 /// A resolved local module. `id` is canonical — two specifiers naming one
 /// file answer the same `id` — so an interpreter de-duplicates by it and
 /// names the module's chunk with it.
+///
+/// `source` is always present. `artifact` is present only when the host holds
+/// one this interpreter build prepared from that same source; load it when it
+/// is there, and fall back to `source` when it is absent or will not load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedModule {
     pub id: String,
@@ -1843,6 +1851,8 @@ pub struct ValidateError {
     pub kind: ScriptErrorKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    /// The reason alone, with no `chunk:line:` prefix: `line` says where,
+    /// and the host names the file beside the message.
     pub message: String,
 }
 

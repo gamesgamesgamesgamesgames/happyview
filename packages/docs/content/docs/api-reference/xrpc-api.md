@@ -615,10 +615,10 @@ All error responses return JSON with an `error` field:
 When a Lua script fails, the response is a `script_error` body:
 
 ```json
-{ "error": "script_error", "errorType": "runtime", "message": "attempt to index a nil value (local 't')", "method": "xyz.statusphere.getStatus", "line": 3 }
+{ "error": "script_error", "errorType": "runtime", "message": "attempt to index a nil value (local 't')", "method": "xyz.statusphere.getStatus", "line": 3, "file": "src/lib/format.lua" }
 ```
 
-`errorType` is `syntax`, `runtime` or `missing_handle` with status `500`, or `timeout` with status `408` when the script hit the instruction limit or the wall clock, both set in Settings → General. `line` is the script line that raised, or `null`.
+`errorType` is `syntax`, `runtime` or `missing_handle` with status `500`, or `timeout` with status `408` when the script hit the instruction limit or the wall clock, both set in Settings → General. `line` is the script line that raised, or `null`. `file` is the project file `line` is in, relative to the project root: the handler itself, or a local module it imported. It is `null` for a script saved through the dashboard, which has no file.
 
 The same error is logged server-side with the script source and the caller's input. See [Lua Scripting - Debugging](../guides/lua-scripting.md#debugging) for how to diagnose script issues.
 

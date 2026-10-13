@@ -89,6 +89,52 @@ An `interpreter` manifest names its language and the file extensions it runs:
 
 A file in a project's `src/` with one of these extensions belongs to this interpreter, which checks it when the project builds and runs it when it is a script. Two installed interpreters cannot claim the same extension: installing the second is refused with `files ending in .<ext> are already run by interpreter '<id>'`. A manifest with no `extensions` claims its older `file_extension` field instead, if it has one.
 
+#### Prepared artifacts and local modules
+
+An interpreter can hand HappyView a prepared form of a script, typically bytecode, so a run skips the parse. It can also let a project script import files that sit beside it in `src/`. Both are optional: an interpreter that does neither still runs every script from source.
+
+**Preparing.** HappyView calls `validate` when a script is saved and for every file when a project builds. Three fields of its input matter here:
+
+| Field | Meaning |
+| --- | --- |
+| `prepare` | `true` asks for an `artifact` beside the verdict. Absent means a plain check |
+| `chunk_name` | The name to give the chunk. For a project file it is the path from the project root, such as `src/lib/format.lua`. Absent means `script` |
+| `role` | `handler`, `module` or `test`. Only a `handler` must define `handle`. Absent means `handler` |
+
+`validate` answers with `valid` and `errors`, and may add `artifact` and `imports`:
+
+```json
+{
+  "valid": true,
+  "artifact": { "interpreter": "", "version": "", "engine": "puc-lua-5.4.7", "format": "lua-bytecode", "bytes": "G0x1YVQAGZMNChoKBAgIeFYAAAA=" },
+  "imports": [{ "specifier": "../lib/format", "line": 2 }]
+}
+```
+
+- Set `engine` and `format` yourself. HappyView overwrites `interpreter` and `version` with the build that answered, so an artifact can only be handed back to that build.
+- `bytes` is standard base64 (RFC 4648 §4), padded, with no whitespace.
+- `imports` lists every import whose specifier is a literal. HappyView checks each relative one when the project builds, and reports a missing file at its line.
+- A dashboard script that imports a relative path is refused when it is saved, because it has no files beside it.
+- An error's `message` carries no `chunk:line:` prefix. `line` says where, and HappyView names the file beside it.
+
+**Running.** `execute` receives `chunk_name` and, when HappyView holds an artifact this build prepared from that exact source, `artifact`. When `artifact` is present, `source` is empty: load the artifact and name its chunk `chunk_name`. An `error` result may set `chunk` to the chunk `line` is in, in full, since a language may truncate the chunk name inside its own message. HappyView reports it to the caller as the error's `file`.
+
+**Local modules.** For a specifier that starts with `./` or `../`, call `host_module_resolve` (`host::module_resolve` in the SDK, under `script:host`) with the `specifier` and a `referrer`: the importing chunk's name. It answers `{id, source, artifact?}`.
+
+- `id` is the module's path from the project root. Two specifiers naming one file answer the same `id`, so de-duplicate by it, and name the module's chunk with it.
+- `source` is always present. `artifact` is present only when it matches this build and that source. Load it when you have it, and the source otherwise.
+- Only files in your own language resolve, and only from inside `src/`.
+
+The import fails with one of these codes:
+
+| Code | When |
+| --- | --- |
+| `NOT_FOUND` | No such file. The message names the specifier, the importer and where HappyView looked, and a same-named file in another language if there is one. Raise it as the script's error |
+| `BAD_INPUT` | The specifier is not relative, uses `\`, or climbs out of `src/` |
+| `UNSUPPORTED` | The script is a dashboard script, which has no files to import |
+
+Keep a script-facing `load` text-only. Bytecode reaches the interpreter only from HappyView.
+
 ### Dependencies
 
 A `library` plugin may declare other libraries it calls through `host_call_library`:
