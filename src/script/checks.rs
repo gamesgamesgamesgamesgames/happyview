@@ -4,7 +4,11 @@
 
 use crate::codemod::{self, ScriptKind};
 use crate::lua::NATIVE_LANGUAGE;
-use crate::plugin::{PluginExecutor, PluginRegistry, ScriptValidateError};
+use crate::plugin::{
+    ChunkRole, DEFAULT_CHUNK_NAME, ExecutionError, ImportRef, PluginExecutor, PluginRegistry,
+    PreparedArtifact, ScriptValidateError, ScriptValidateOutput,
+};
+use crate::project::modules::is_relative;
 
 /// The longest description a script may carry, from either source.
 pub const MAX_DESCRIPTION_LEN: usize = 300;
@@ -35,10 +39,20 @@ pub fn unmigrated_message(globals: &[String]) -> String {
     )
 }
 
+/// What a body that passed was prepared into.
+#[derive(Debug)]
+pub struct Prepared {
+    /// The interpreter that checked it, which is the one whose build the
+    /// artifact is stamped with.
+    pub interpreter_id: String,
+    pub artifact: Option<PreparedArtifact>,
+    pub imports: Vec<ImportRef>,
+}
+
 /// What the interpreter said about a body it could check.
 #[derive(Debug)]
 pub enum InterpreterCheck {
-    Valid,
+    Valid(Prepared),
     Refused(Vec<ScriptValidateError>),
 }
 
@@ -55,31 +69,106 @@ pub enum CheckError {
     InterpreterFailed { plugin_id: String, message: String },
 }
 
-/// Ask the interpreter that claims `language` whether it can run `body`.
+/// Ask the interpreter that claims `language` whether it can run `body` as
+/// `chunk_name`, and hand back what it prepared. Preparing costs the parse
+/// the check already does, and whoever asks is about to store or serve the
+/// body.
 pub async fn check_with_interpreter(
     registry: &PluginRegistry,
     executor: &PluginExecutor,
     language: &str,
     body: &str,
+    chunk_name: &str,
+    role: ChunkRole,
 ) -> Result<InterpreterCheck, CheckError> {
-    let interpreter = registry
+    let interpreter_id = claimant(registry, language).await?;
+    let validated = executor
+        .prepare_script(&interpreter_id, body, chunk_name, role)
+        .await
+        .map_err(|e| interpreter_failed(&interpreter_id, e))?;
+    Ok(verdict(interpreter_id, validated))
+}
+
+/// [`check_with_interpreter`] for a body the dashboard is about to store,
+/// keeping what was prepared in the prepared cache so the body's first run
+/// parses nothing. Prepare and store are one executor call, so the entry
+/// belongs to the build that prepared it even if the interpreter is replaced
+/// in between. A body the save will refuse, for the interpreter's reasons or
+/// for [`dashboard_import_refusal`]'s, leaves no entry.
+pub async fn check_dashboard_body(
+    registry: &PluginRegistry,
+    executor: &PluginExecutor,
+    language: &str,
+    body: &str,
+) -> Result<InterpreterCheck, CheckError> {
+    let interpreter_id = claimant(registry, language).await?;
+    let validated = executor
+        .prepare_and_store_if(
+            &interpreter_id,
+            body,
+            DEFAULT_CHUNK_NAME,
+            ChunkRole::Handler,
+            |out| out.valid && dashboard_import_refusal(&out.imports).is_none(),
+        )
+        .await
+        .map_err(|e| interpreter_failed(&interpreter_id, e))?;
+    Ok(verdict(interpreter_id, validated))
+}
+
+/// Drop the prepared cache's entry for a body no stored row runs any more,
+/// after a save replaced it or a delete removed it. A language nothing claims
+/// any more has nothing cached under a live interpreter to drop.
+pub async fn forget_dashboard_body(registry: &PluginRegistry, language: &str, body: &str) {
+    if let Ok(interpreter_id) = claimant(registry, language).await {
+        registry.prepared().forget(&interpreter_id, body);
+    }
+}
+
+/// Why a dashboard script may not import what it does: a relative specifier
+/// names a file, and only a project has files for one to name. `None` when
+/// every import is a library, which resolves the same wherever the script
+/// lives.
+pub fn dashboard_import_refusal(imports: &[ImportRef]) -> Option<String> {
+    let files: Vec<String> = imports
+        .iter()
+        .filter(|import| is_relative(&import.specifier))
+        .map(|import| format!("{} (line {})", import.specifier, import.line))
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "dashboard scripts can't import files, only project scripts can: {}",
+        files.join(", ")
+    ))
+}
+
+/// The interpreter that claims `language`.
+async fn claimant(registry: &PluginRegistry, language: &str) -> Result<String, CheckError> {
+    registry
         .get_interpreter_by_language(language)
         .await
-        .ok_or_else(|| {
-            CheckError::NoInterpreter(crate::script::no_interpreter_message(language))
-        })?;
-    let validated = executor
-        .validate_script(&interpreter.info.id, body)
-        .await
-        .map_err(|e| CheckError::InterpreterFailed {
-            plugin_id: interpreter.info.id.clone(),
-            message: e.to_string(),
-        })?;
-    Ok(if validated.valid {
-        InterpreterCheck::Valid
+        .map(|interpreter| interpreter.info.id.clone())
+        .ok_or_else(|| CheckError::NoInterpreter(crate::script::no_interpreter_message(language)))
+}
+
+fn interpreter_failed(plugin_id: &str, e: ExecutionError) -> CheckError {
+    CheckError::InterpreterFailed {
+        plugin_id: plugin_id.to_string(),
+        message: e.to_string(),
+    }
+}
+
+fn verdict(interpreter_id: String, validated: ScriptValidateOutput) -> InterpreterCheck {
+    if validated.valid {
+        InterpreterCheck::Valid(Prepared {
+            interpreter_id,
+            artifact: validated.artifact,
+            imports: validated.imports,
+        })
     } else {
         InterpreterCheck::Refused(validated.errors)
-    })
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +216,8 @@ mod tests {
             &state.plugin_executor(),
             "cobol",
             "x",
+            crate::plugin::DEFAULT_CHUNK_NAME,
+            crate::plugin::ChunkRole::Handler,
         )
         .await
         .unwrap_err();
@@ -147,14 +238,28 @@ mod tests {
             .await;
         let executor = state.plugin_executor();
 
-        let ok = check_with_interpreter(&state.plugin_registry, &executor, "echo", "fine")
-            .await
-            .unwrap();
-        assert!(matches!(ok, InterpreterCheck::Valid));
+        let ok = check_with_interpreter(
+            &state.plugin_registry,
+            &executor,
+            "echo",
+            "fine",
+            crate::plugin::DEFAULT_CHUNK_NAME,
+            crate::plugin::ChunkRole::Handler,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(ok, InterpreterCheck::Valid(_)));
 
-        let refused = check_with_interpreter(&state.plugin_registry, &executor, "echo", "invalid")
-            .await
-            .unwrap();
+        let refused = check_with_interpreter(
+            &state.plugin_registry,
+            &executor,
+            "echo",
+            "invalid",
+            crate::plugin::DEFAULT_CHUNK_NAME,
+            crate::plugin::ChunkRole::Handler,
+        )
+        .await
+        .unwrap();
         let InterpreterCheck::Refused(errors) = refused else {
             panic!("expected a refusal")
         };

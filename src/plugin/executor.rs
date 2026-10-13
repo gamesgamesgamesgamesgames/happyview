@@ -13,14 +13,16 @@ use crate::plugin::library::{
 use crate::plugin::memory::{
     PluginEnvelopeError, PluginResponse, dealloc_guest, read_from_guest, write_to_guest,
 };
+use crate::plugin::prepared::ArtifactStamp;
 use crate::plugin::runtime::{
     GuestDeadline, MemoryLimiter, UNBOUNDED_TICKS, WasmRuntime, fuel_for, memory_ceiling,
     script_memory_ceiling,
 };
 use crate::plugin::secrets::load_plugin_secrets;
 use crate::plugin::{
-    ExternalProfile, LoadedPlugin, PluginInfo, PluginRegistry, ScriptExecuteInput,
-    ScriptExecuteOutput, ScriptKind, ScriptValidateInput, ScriptValidateOutput, TokenSet,
+    ChunkRole, ExternalProfile, LoadedPlugin, ModuleScope, PluginInfo, PluginRegistry,
+    ScriptExecuteInput, ScriptExecuteOutput, ScriptKind, ScriptValidateInput, ScriptValidateOutput,
+    TokenSet,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -418,6 +420,21 @@ fn host_removed_globals() -> Vec<String> {
         .collect()
 }
 
+/// Hand the run its artifact only when the build about to load it made it,
+/// and then without the source: an interpreter is given one or the other,
+/// never both. An artifact from any other build, or a run with no stamp
+/// because its module was replaced mid-flight, runs from source.
+fn settle_artifact(input: &mut ScriptExecuteInput, stamp: Option<&ArtifactStamp>) {
+    let Some(artifact) = &input.artifact else {
+        return;
+    };
+    if stamp.is_some_and(|stamp| stamp.matches(artifact)) {
+        input.source.clear();
+    } else {
+        input.artifact = None;
+    }
+}
+
 /// Classify a wasmtime error as Timeout, MemoryLimit or Trap. A refused
 /// memory growth is read off the store rather than the error, because the
 /// guest's reaction to it is an ordinary trap; an interrupt is read first,
@@ -552,15 +569,50 @@ impl PluginExecutor {
         input: &ScriptExecuteInput,
         caller: Option<Arc<CallerSession>>,
     ) -> Result<ScriptExecuteOutput, ExecutionError> {
+        self.execute_script_in(plugin_id, input, caller, ModuleScope::Dashboard)
+            .await
+    }
+
+    /// As [`execute_script_as`](Self::execute_script_as), with the scope a
+    /// relative import resolves in. A project run passes the snapshot it
+    /// pinned, so a rebuild mid-run cannot change what its imports see.
+    pub async fn execute_script_in(
+        &self,
+        plugin_id: &str,
+        input: &ScriptExecuteInput,
+        caller: Option<Arc<CallerSession>>,
+        modules: ModuleScope,
+    ) -> Result<ScriptExecuteOutput, ExecutionError> {
+        let plugin = self.interpreter(plugin_id).await?;
+        self.execute_loaded(&plugin, input, caller, modules).await
+    }
+
+    /// Run on this exact module, which is what every stamp the run reads
+    /// describes.
+    async fn execute_loaded(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        input: &ScriptExecuteInput,
+        caller: Option<Arc<CallerSession>>,
+        modules: ModuleScope,
+    ) -> Result<ScriptExecuteOutput, ExecutionError> {
+        let mut inst = self
+            .instantiate_interpreter(plugin, Some(input), caller, modules)
+            .await?;
         // The guard list is the host's, whatever the caller sent: see
         // `host_removed_globals`.
-        let input = &ScriptExecuteInput {
+        let mut input = ScriptExecuteInput {
             removed_globals: host_removed_globals(),
             ..input.clone()
         };
-        let mut inst = self
-            .instantiate_interpreter(plugin_id, Some(input), caller)
-            .await?;
+        let stamp = inst
+            .store
+            .data()
+            .script_run
+            .as_ref()
+            .and_then(|run| run.stamp.clone());
+        settle_artifact(&mut input, stamp.as_ref());
+        let input = &input;
         inst.set_script_memory_limit(
             usize::try_from(input.limits.memory_bytes).unwrap_or(usize::MAX),
         );
@@ -586,12 +638,109 @@ impl PluginExecutor {
         plugin_id: &str,
         source: &str,
     ) -> Result<ScriptValidateOutput, ExecutionError> {
-        let mut inst = self.instantiate_interpreter(plugin_id, None, None).await?;
+        let plugin = self.interpreter(plugin_id).await?;
+        let mut inst = self
+            .instantiate_interpreter(&plugin, None, None, ModuleScope::Dashboard)
+            .await?;
         inst.call_validate(&ScriptValidateInput {
             source: source.to_string(),
             removed_globals: host_removed_globals(),
+            ..ScriptValidateInput::default()
         })
         .await
+    }
+
+    /// Validate `source` as `chunk_name` and keep what the interpreter
+    /// prepared from it. The artifact comes back stamped with this
+    /// interpreter's build, and is dropped when the script is not valid: an
+    /// artifact of a script that cannot run is nothing a run should load.
+    /// Stamped from the module that prepared it, so one replaced mid-flight
+    /// yields no artifact rather than one labelled as its successor's.
+    pub async fn prepare_script(
+        &self,
+        plugin_id: &str,
+        source: &str,
+        chunk_name: &str,
+        role: ChunkRole,
+    ) -> Result<ScriptValidateOutput, ExecutionError> {
+        let plugin = self.interpreter(plugin_id).await?;
+        self.prepare_loaded(&plugin, source, chunk_name, role).await
+    }
+
+    /// As [`prepare_script`](Self::prepare_script), keeping the result in the
+    /// prepared cache against `source`. The module that prepares is the one
+    /// the entry is stored for, so a re-registration landing in between
+    /// stores nothing rather than filing one build's artifact under the next.
+    /// The output's artifact is what the cache now holds: `None` when the
+    /// interpreter returned none, the script is not valid, or the module was
+    /// superseded.
+    pub async fn prepare_and_store(
+        &self,
+        plugin_id: &str,
+        source: &str,
+        chunk_name: &str,
+        role: ChunkRole,
+    ) -> Result<ScriptValidateOutput, ExecutionError> {
+        self.prepare_and_store_if(plugin_id, source, chunk_name, role, |_| true)
+            .await
+    }
+
+    /// As [`prepare_and_store`](Self::prepare_and_store), storing only when
+    /// `keep` accepts what the interpreter answered, for a caller that will
+    /// refuse some valid bodies and must not leave an entry for one. When
+    /// nothing is stored the output's artifact is `None`.
+    pub async fn prepare_and_store_if(
+        &self,
+        plugin_id: &str,
+        source: &str,
+        chunk_name: &str,
+        role: ChunkRole,
+        keep: impl FnOnce(&ScriptValidateOutput) -> bool,
+    ) -> Result<ScriptValidateOutput, ExecutionError> {
+        let plugin = self.interpreter(plugin_id).await?;
+        let mut out = self
+            .prepare_loaded(&plugin, source, chunk_name, role)
+            .await?;
+        out.artifact = if keep(&out) {
+            self.registry
+                .store_prepared(&plugin, source, out.artifact.take())
+                .as_deref()
+                .cloned()
+        } else {
+            None
+        };
+        Ok(out)
+    }
+
+    /// Prepare on this exact module and stamp the result for it alone.
+    async fn prepare_loaded(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        source: &str,
+        chunk_name: &str,
+        role: ChunkRole,
+    ) -> Result<ScriptValidateOutput, ExecutionError> {
+        let mut inst = self
+            .instantiate_interpreter(plugin, None, None, ModuleScope::Dashboard)
+            .await?;
+        let mut out = inst
+            .call_validate(&ScriptValidateInput {
+                source: source.to_string(),
+                removed_globals: host_removed_globals(),
+                chunk_name: Some(chunk_name.to_string()),
+                prepare: true,
+                role,
+            })
+            .await?;
+        let stamp = self.registry.artifact_stamp_for(plugin);
+        out.artifact = match (out.valid, out.artifact.take(), stamp) {
+            (true, Some(mut artifact), Some(stamp)) => {
+                stamp.apply(&mut artifact);
+                Some(artifact)
+            }
+            _ => None,
+        };
+        Ok(out)
     }
 
     /// A library's API surface, computed once per registration.
@@ -670,25 +819,23 @@ impl PluginExecutor {
     /// Sibling of [`instantiate_library`](Self::instantiate_library) for an
     /// interpreter: the same call context, session and depth, so
     /// `host_call_library` forwards the same identity from a script as from
-    /// anywhere else, plus the run the four `script:host` imports act on.
+    /// anywhere else, plus the run the five `script:host` imports act on.
     ///
     /// No plugin secrets are loaded. An interpreter has no configuration of
     /// its own — `ctx.env` is the script's and travels in the input — and a
     /// secrets query per script run would be on the hottest path there is.
+    ///
+    /// Takes the module rather than its id, and the scope its relative
+    /// imports resolve in: the run is stamped from the very module it
+    /// instantiates, so a re-registration landing in between cannot pair one
+    /// build's stamp with another's code.
     async fn instantiate_interpreter(
         &self,
-        plugin_id: &str,
+        plugin: &Arc<LoadedPlugin>,
         input: Option<&ScriptExecuteInput>,
         caller: Option<Arc<CallerSession>>,
+        modules: ModuleScope,
     ) -> Result<PluginInstance, ExecutionError> {
-        let plugin = self
-            .registry
-            .get(plugin_id)
-            .await
-            .ok_or_else(|| ExecutionError::PluginNotFound(plugin_id.to_string()))?;
-        if plugin.plugin_type() != PluginType::Interpreter {
-            return Err(ExecutionError::NotAnInterpreter(plugin_id.to_string()));
-        }
         let ctx = input
             .map(|input| LibraryCallContext {
                 caller_did: input.context.caller_did.clone(),
@@ -700,8 +847,15 @@ impl PluginExecutor {
             .caller_did
             .clone()
             .unwrap_or_else(|| "script".to_string());
+        let language_id = plugin.language_id().unwrap_or_default().to_string();
+        let extensions: Vec<String> = plugin
+            .extensions()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let stamp = self.registry.artifact_stamp_for(plugin);
         let mut inst = self
-            .instantiate(plugin_id, &scope, HashMap::new(), serde_json::Value::Null)
+            .instantiate_loaded(plugin, &scope, HashMap::new(), serde_json::Value::Null)
             .await?;
         let state = inst.store.data_mut();
         state.call_ctx = ctx;
@@ -716,8 +870,27 @@ impl PluginExecutor {
             trigger_id: input.context.trigger.clone(),
             caller_did: input.context.caller_did.clone(),
             job_id: input.context.job.as_ref().map(|job| job.id.clone()),
+            language_id,
+            extensions,
+            stamp,
+            modules,
         });
         Ok(inst)
+    }
+
+    /// The interpreter registered as `plugin_id`, fetched once so everything
+    /// a run derives from it — its stamp, its claims, its code — describes
+    /// one build.
+    async fn interpreter(&self, plugin_id: &str) -> Result<Arc<LoadedPlugin>, ExecutionError> {
+        let plugin = self
+            .registry
+            .get(plugin_id)
+            .await
+            .ok_or_else(|| ExecutionError::PluginNotFound(plugin_id.to_string()))?;
+        if plugin.plugin_type() != PluginType::Interpreter {
+            return Err(ExecutionError::NotAnInterpreter(plugin_id.to_string()));
+        }
+        Ok(plugin)
     }
 
     /// The per-run execution budget an interpreter store is armed with. The
@@ -824,20 +997,31 @@ impl PluginExecutor {
         secrets: HashMap<String, String>,
         config: serde_json::Value,
     ) -> Result<PluginInstance, ExecutionError> {
-        // Get plugin from registry
         let plugin = self
             .registry
             .get(plugin_id)
             .await
             .ok_or_else(|| ExecutionError::PluginNotFound(plugin_id.to_string()))?;
+        self.instantiate_loaded(&plugin, scope, secrets, config)
+            .await
+    }
 
+    /// Instantiate this exact module, for a caller that has already read
+    /// something from it and must run the build it read.
+    async fn instantiate_loaded(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        scope: &str,
+        secrets: HashMap<String, String>,
+        config: serde_json::Value,
+    ) -> Result<PluginInstance, ExecutionError> {
         let module = self
             .runtime
-            .module_for(&plugin)
+            .module_for(plugin)
             .map_err(ExecutionError::Instantiation)?;
 
         let linker = self.build_linker(&module)?;
-        let state = self.build_state(&plugin, scope, secrets, config).await?;
+        let state = self.build_state(plugin, scope, secrets, config).await?;
 
         let mut store = Store::new(self.runtime.engine(), state);
         store.limiter(|state| &mut state.limiter);
@@ -985,6 +1169,53 @@ mod tests {
                 _lexicons,
             )
         }
+    }
+
+    fn stamped_input(source: &str, version: &str) -> ScriptExecuteInput {
+        ScriptExecuteInput {
+            source: source.to_string(),
+            artifact: Some(crate::plugin::PreparedArtifact {
+                interpreter: "lua".into(),
+                version: version.into(),
+                engine: "puc-lua-5.4.7".into(),
+                format: "lua-bytecode".into(),
+                bytes: vec![1, 2, 3],
+                source_map: None,
+            }),
+            kind: ScriptKind::XrpcQuery,
+            input: serde_json::Value::Null,
+            context: Default::default(),
+            libraries: Vec::new(),
+            limits: crate::plugin::ScriptExecuteLimits {
+                instructions: None,
+                memory_bytes: 8 * 1024 * 1024,
+            },
+            removed_globals: Vec::new(),
+            chunk_name: crate::plugin::DEFAULT_CHUNK_NAME.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_matching_artifact_replaces_the_source_and_any_other_is_dropped() {
+        let stamp = ArtifactStamp {
+            interpreter: "lua".into(),
+            version: "1.0.0+abc".into(),
+        };
+
+        let mut ours = stamped_input("return 1", "1.0.0+abc");
+        settle_artifact(&mut ours, Some(&stamp));
+        assert_eq!(ours.source, "");
+        assert!(ours.artifact.is_some());
+
+        let mut theirs = stamped_input("return 1", "1.0.0+def");
+        settle_artifact(&mut theirs, Some(&stamp));
+        assert_eq!(theirs.source, "return 1");
+        assert_eq!(theirs.artifact, None);
+
+        let mut unstamped = stamped_input("return 1", "1.0.0+abc");
+        settle_artifact(&mut unstamped, None);
+        assert_eq!(unstamped.source, "return 1");
+        assert_eq!(unstamped.artifact, None);
     }
 
     #[test]
@@ -1810,7 +2041,7 @@ mod deadline {
 
 /// The interpreter path against the `interpreter_echo` fixture, for the two
 /// properties that need the instance itself rather than `execute_script`:
-/// what `instantiate` bounds on its own, and what the four `script:host`
+/// what `instantiate` bounds on its own, and what the five `script:host`
 /// imports answer with no run in progress.
 #[cfg(test)]
 mod interpreter {
@@ -1875,6 +2106,109 @@ mod interpreter {
         .unwrap()
     }
 
+    /// An executor over a registry holding the echo interpreter, and that
+    /// interpreter's module as it was before the same id was registered
+    /// again: a module a run or a prepare may still hold when it is replaced.
+    async fn superseded() -> (PluginExecutor, Arc<LoadedPlugin>, Arc<LoadedPlugin>) {
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register(fixture("interpreter")).await;
+        let stale = registry.get("echo").await.unwrap();
+        registry.register(fixture("interpreter")).await;
+        let current = registry.get("echo").await.unwrap();
+        assert!(!Arc::ptr_eq(&stale, &current));
+        let db = state.db.clone();
+        let executor = PluginExecutor::new(
+            Arc::new(WasmRuntime::new().unwrap()),
+            registry,
+            db,
+            DatabaseBackend::Sqlite,
+            reqwest::Client::new(),
+            Arc::new(LexiconCatalog::detached()),
+        )
+        .with_app_state(state);
+        (executor, stale, current)
+    }
+
+    fn run_input(source: &str) -> ScriptExecuteInput {
+        serde_json::from_value(directive(source)).unwrap()
+    }
+
+    /// The same bytes registered twice stamp alike, so only identity tells
+    /// the outgoing module from its successor: a stamp read by id would hand
+    /// the outgoing one a stamp that is not its own.
+    #[tokio::test]
+    async fn a_superseded_module_prepares_no_artifact() {
+        if !fixture_is_built() {
+            return;
+        }
+        let (executor, stale, current) = superseded().await;
+
+        let out = executor
+            .prepare_loaded(&stale, "returns:1", "script", ChunkRole::Handler)
+            .await
+            .unwrap();
+        assert!(out.valid);
+        assert_eq!(out.artifact, None);
+
+        let out = executor
+            .prepare_loaded(&current, "returns:1", "script", ChunkRole::Handler)
+            .await
+            .unwrap();
+        assert!(out.artifact.is_some());
+    }
+
+    /// A run on a superseded module carries no stamp, so even an artifact
+    /// stamped exactly as its successor would stamp it is dropped and the
+    /// source runs.
+    #[tokio::test]
+    async fn a_run_on_a_superseded_module_runs_from_source() {
+        if !fixture_is_built() {
+            return;
+        }
+        let (executor, stale, current) = superseded().await;
+
+        let inst = executor
+            .instantiate_interpreter(
+                &stale,
+                Some(&run_input("returns:1")),
+                None,
+                ModuleScope::Dashboard,
+            )
+            .await
+            .unwrap();
+        assert_eq!(inst.store.data().script_run.as_ref().unwrap().stamp, None);
+
+        let mut artifact = crate::plugin::PreparedArtifact {
+            interpreter: String::new(),
+            version: String::new(),
+            engine: "echo-1".into(),
+            format: "echo-source".into(),
+            bytes: b"returns:\"artifact\"".to_vec(),
+            source_map: None,
+        };
+        ArtifactStamp::of(&current).apply(&mut artifact);
+        let mut input = run_input("returns:\"source\"");
+        input.artifact = Some(artifact);
+
+        let ran = |output| match output {
+            ScriptExecuteOutput::Returned { value, .. } => value,
+            other => panic!("expected a returned value, got {other:?}"),
+        };
+        let on_stale = executor
+            .execute_loaded(&stale, &input, None, ModuleScope::Dashboard)
+            .await
+            .unwrap();
+        assert_eq!(ran(on_stale), "source");
+        let on_current = executor
+            .execute_loaded(&current, &input, None, ModuleScope::Dashboard)
+            .await
+            .unwrap();
+        assert_eq!(ran(on_current), "artifact");
+    }
+
     fn directive(source: &str) -> serde_json::Value {
         serde_json::to_value(ScriptExecuteInput {
             source: source.to_string(),
@@ -1887,6 +2221,8 @@ mod interpreter {
                 memory_bytes: 8 * 1024 * 1024,
             },
             removed_globals: Vec::new(),
+            chunk_name: crate::plugin::DEFAULT_CHUNK_NAME.to_string(),
+            artifact: None,
         })
         .unwrap()
     }
@@ -1908,7 +2244,7 @@ mod interpreter {
         assert!(started.elapsed() < Duration::from_secs(4));
     }
 
-    /// The same four imports on an instance with no run refuse rather than
+    /// The same five imports on an instance with no run refuse rather than
     /// acting on a job they were never given.
     #[tokio::test]
     async fn the_script_imports_are_unsupported_with_no_run_in_progress() {
@@ -1921,6 +2257,7 @@ mod interpreter {
             "host:job_progress",
             "host:job_should_stop",
             "host:job_wait",
+            "host:module_resolve",
         ] {
             let out: serde_json::Value = inst
                 .call_plugin_function("execute", &directive(source))

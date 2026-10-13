@@ -232,7 +232,7 @@ async fn a_job_hands_the_interpreter_its_input_its_job_and_no_instruction_budget
     let sent = result_of(&row);
 
     assert_eq!(sent["kind"], "job");
-    assert_eq!(sent["source"], "probe");
+    assert_eq!(echo_interpreter::script_text(&sent), "probe");
     assert_eq!(sent["input"], input);
     assert_eq!(sent["context"]["trigger"], format!("job.run:{TYPE}"));
     assert_eq!(sent["context"]["caller_did"], app.admin_did);
@@ -249,6 +249,74 @@ async fn a_job_hands_the_interpreter_its_input_its_job_and_no_instruction_budget
             "a job run has no {absent}: {sent}"
         );
     }
+}
+
+/// A job whose script is a project file runs as that file: its chunk is the
+/// path, and its imports resolve in the snapshot the run pinned.
+#[tokio::test]
+#[serial]
+async fn a_project_job_runs_as_its_file() {
+    common::require_db!();
+    require_echo!();
+    let app = app().await;
+    let mut snap = happyview::project::snapshot::ProjectSnapshot::empty();
+    snap.scripts.insert(
+        format!("job.run:{TYPE}"),
+        happyview::project::snapshot::ProjectScript {
+            trigger: format!("job.run:{TYPE}"),
+            path: format!("src/jobs/{TYPE}.lua").into(),
+            language_id: "lua".into(),
+            body: happyview::project::snapshot::ScriptBody::Source {
+                source: std::sync::Arc::from("probe"),
+                artifact: None,
+            },
+            description: None,
+            outbound_xrpcs: Vec::new(),
+        },
+    );
+    happyview::project::build::install(&app.state, snap).await;
+    let id = seed_job(&app, TYPE, &json!({})).await;
+
+    let row = run_to_completion(&app, &id).await;
+    assert_eq!(row.status, "completed", "job error: {:?}", row.error);
+    let sent = result_of(&row);
+    assert_eq!(sent["chunk_name"], format!("src/jobs/{TYPE}.lua"), "{sent}");
+    assert_eq!(sent["source"], "probe");
+}
+
+/// The `error` column is where an operator reads why a job failed, so a
+/// project job's failure names the file that raised it.
+#[tokio::test]
+#[serial]
+async fn a_failed_project_job_names_its_file() {
+    common::require_db!();
+    require_echo!();
+    let app = app().await;
+    let mut snap = happyview::project::snapshot::ProjectSnapshot::empty();
+    snap.scripts.insert(
+        format!("job.run:{TYPE}"),
+        happyview::project::snapshot::ProjectScript {
+            trigger: format!("job.run:{TYPE}"),
+            path: format!("src/jobs/{TYPE}.lua").into(),
+            language_id: "lua".into(),
+            body: happyview::project::snapshot::ScriptBody::Source {
+                source: std::sync::Arc::from("error:runtime"),
+                artifact: None,
+            },
+            description: None,
+            outbound_xrpcs: Vec::new(),
+        },
+    );
+    happyview::project::build::install(&app.state, snap).await;
+    let id = seed_job(&app, TYPE, &json!({})).await;
+
+    let row = run_to_completion(&app, &id).await;
+    assert_eq!(row.status, "failed");
+    let error = row.error.expect("no error persisted");
+    assert!(
+        error.starts_with(&format!("runtime in src/jobs/{TYPE}.lua: ")),
+        "{error}"
+    );
 }
 
 // ---------------------------------------------------------------------------

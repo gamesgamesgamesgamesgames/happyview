@@ -385,6 +385,8 @@ fn input(name: &str, source: &str, job_id: Option<&str>) -> ScriptExecuteInput {
             .collect(),
         limits,
         removed_globals: Vec::new(),
+        chunk_name: happyview::plugin::DEFAULT_CHUNK_NAME.to_string(),
+        artifact: None,
     }
 }
 

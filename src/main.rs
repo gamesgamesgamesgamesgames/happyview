@@ -964,7 +964,12 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
     // would answer its routes with nothing.
     if let Some(root) = state.config.project_root.clone() {
         let started = std::time::Instant::now();
-        match happyview::project::boot::build_and_install(&state, &root).await {
+        let mode = if dev.is_some() {
+            happyview::project::boot::Mode::Dev
+        } else {
+            happyview::project::boot::Mode::Serve
+        };
+        match happyview::project::boot::start(&state, &root, mode).await {
             Ok(installed) if dev.is_some() => {
                 println!(
                     "{}",

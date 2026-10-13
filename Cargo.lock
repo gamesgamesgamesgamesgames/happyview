@@ -2009,8 +2009,9 @@ dependencies = [
 
 [[package]]
 name = "happyview-plugin-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "wasmparser 0.236.1",

@@ -18,11 +18,37 @@ pub struct Installed {
 /// measures its changes against the snapshot installed when it starts, and
 /// `install` bumps the generation by reading the current one, so two builds
 /// that overlapped would both report the same changes and could install the
-/// older files last.
+/// older files last. It is the only lock over a rebuild: boot, the
+/// interpreter-change listener and the dev watcher all take it here.
 static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Which listener rebuilds the project when an interpreter changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// `spawn_rebuild_on_interpreter_change`, which logs each rebuild.
+    Serve,
+    /// None from here: `dev::watch` listens in its own loop and prints each
+    /// rebuild, and a second listener would build every change twice.
+    Dev,
+}
+
+/// The project's boot build, then the interpreter-change listener `mode`
+/// calls for. Answers the boot build's outcome for the caller to report.
+pub async fn start(
+    state: &AppState,
+    root: &Path,
+    mode: Mode,
+) -> Result<Installed, Vec<Diagnostic>> {
+    let built = super::prepare::rebuild(state, root).await;
+    if mode == Mode::Serve {
+        super::prepare::spawn_rebuild_on_interpreter_change(state.clone());
+    }
+    built
+}
 
 /// Build the project at `root` and serve it. On failure nothing is installed
 /// and every diagnostic comes back, so the caller can refuse to start.
+/// Everything that rebuilds reaches this through `prepare::rebuild`.
 pub async fn build_and_install(
     state: &AppState,
     root: &Path,

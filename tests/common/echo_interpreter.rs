@@ -69,3 +69,20 @@ pub fn claiming(language: &str) -> LoadedPlugin {
         manifest: Some(manifest),
     }
 }
+
+/// The script text a run delivered, whether as source or as the echo
+/// fixture's artifact, which is the source's own bytes.
+#[allow(dead_code)]
+pub fn script_text(sent: &serde_json::Value) -> String {
+    use base64::Engine as _;
+    match sent["source"].as_str() {
+        Some(source) if !source.is_empty() => source.to_string(),
+        _ => {
+            let bytes = sent["artifact"]["bytes"].as_str().unwrap_or("");
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(bytes)
+                .expect("the echo artifact is base64");
+            String::from_utf8(decoded).expect("the echo artifact is the source's own bytes")
+        }
+    }
+}

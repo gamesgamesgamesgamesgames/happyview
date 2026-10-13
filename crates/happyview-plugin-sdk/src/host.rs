@@ -43,6 +43,7 @@ use crate::wire::{
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::wire::{LibraryCallSettled, Response};
+use crate::wire::{ModuleResolve, ResolvedModule};
 
 /// The wire types these wrappers send and receive. Defined in [`crate::wire`],
 /// which the host imports too; re-exported here as the import path plugins use.
@@ -107,6 +108,7 @@ extern "C" {
     fn host_job_progress(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_should_stop(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_wait(req_ptr: i32, req_len: i32) -> i64;
+    fn host_module_resolve(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repos_list(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repo_create_record(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repo_put_record(req_ptr: i32, req_len: i32) -> i64;
@@ -1262,6 +1264,23 @@ pub fn job_wait(seconds: f64) -> Result<(), PluginError> {
     }
 }
 
+/// Resolve a relative import against the project the running script belongs
+/// to. A miss is an error whose code is `NOT_FOUND` and whose message names
+/// the specifier, the importer, and a same-named file in another language if
+/// one exists; a dashboard script hears that local modules come from a
+/// project. Needs `script:host`.
+pub fn module_resolve(request: &ModuleResolve) -> Result<ResolvedModule, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_module_resolve, request)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = request;
+        Err(HostError::NotWasm.into())
+    }
+}
+
 /// Run a read-only SQL query. Placeholders are backend-native: `?` on SQLite,
 /// `$1` on Postgres. Needs `database:read` or `database:write`.
 pub fn db_query(sql: &str, params: &[Value]) -> Result<Vec<Map<String, Value>>, PluginError> {
@@ -1390,6 +1409,13 @@ mod tests {
             Err(not_wasm.clone())
         );
         assert_eq!(job_should_stop(), Err(not_wasm.clone()));
+        assert_eq!(
+            module_resolve(&ModuleResolve {
+                specifier: String::from("./lib/format"),
+                referrer: String::from("src/jobs/tick.lua"),
+            }),
+            Err(not_wasm.clone())
+        );
         assert_eq!(job_wait(1.5), Err(not_wasm));
     }
 

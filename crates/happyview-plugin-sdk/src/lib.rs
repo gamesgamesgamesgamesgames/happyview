@@ -55,19 +55,21 @@ pub use types::{
     ApiExport, ApiMethod, ApiSurface, AtprotoBlobDownload, AtprotoResolveService, AttestSign,
     AttestVerify, AuthorizeUrlInput, BacklinksQuery, BlobData, CallContext, CallInput,
     CallbackInput, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
-    CallerXrpcProcedure, CallerXrpcQuery, Condition, ExecuteContext, ExecuteInput, ExecuteLimits,
-    ExecuteOutput, ExternalProfile, Filter, IndexDelete, IndexPut, JobCreate, JobGet, JobListAny,
-    JobProgressRequest, JobShouldStopRequest, JobView, JobWaitRequest, Label, LabelsGet,
-    LexiconGet, LibraryRef, LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoInfo,
-    LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut, MethodCall, ObjectCall,
-    Patch, PluginInfo, RecordEnvelope, RecordRef, RecordsCount, RecordsPage, RecordsQuery,
-    RecordsSearch, RefreshInput, ScriptErrorKind, ScriptJob, ScriptKind, ScriptLogRequest,
-    ScriptSpace, ScriptValueKind, Sort, SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo,
+    CallerXrpcProcedure, CallerXrpcQuery, ChunkRole, Condition, ExecuteContext, ExecuteInput,
+    ExecuteLimits, ExecuteOutput, ExternalProfile, Filter, ImportRef, IndexDelete, IndexPut,
+    JobCreate, JobGet, JobListAny, JobProgressRequest, JobShouldStopRequest, JobView,
+    JobWaitRequest, Label, LabelsGet, LexiconGet, LibraryRef, LinkedRepoBlobUpload, LinkedRepoCall,
+    LinkedRepoInfo, LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut,
+    MethodCall, ModuleResolve, ObjectCall, Patch, PluginInfo, PreparedArtifact, RecordEnvelope,
+    RecordRef, RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, RefreshInput,
+    ResolvedModule, ScriptErrorKind, ScriptJob, ScriptKind, ScriptLogRequest, ScriptSpace,
+    ScriptValueKind, Sort, SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo,
     SpaceMemberAdd, SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete, SpaceRecordInfo,
     SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite,
     SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers, SpacesQuery, Step, StrongRef,
     TableQuery, TokenInput, TokenSet, ValidateError, ValidateInput, ValidateOutput,
 };
+pub use wire::DEFAULT_CHUNK_NAME;
 
 /// Items the macros name in their expansion. Not a public API: a plugin crate
 /// compiles with `no_std`, so the macros cannot assume `String` is in scope

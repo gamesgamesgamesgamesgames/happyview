@@ -6,7 +6,7 @@ use crate::event_log::{EventLog, Severity, log_event};
 use crate::lua::scripts;
 use crate::plugin::ScriptExecuteOutput;
 use crate::repo;
-use crate::script::{Invocation, dispatch};
+use crate::script::{Invocation, ScriptOrigin, dispatch};
 
 use super::db;
 
@@ -213,6 +213,7 @@ async fn execute_job(state: &AppState, job: &super::Job) {
             params: None,
             delegate_did: None,
             space: None,
+            origin: ScriptOrigin::of(&script),
         },
         caller_session,
     )
@@ -223,9 +224,13 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     // outcome by the shape of its value.
     let outcome = match run {
         Ok(ScriptExecuteOutput::Returned { value, .. }) => JobOutcome::Completed(value),
-        Ok(ScriptExecuteOutput::Error { kind, raw, .. }) => {
-            JobOutcome::Failed(scripts::failure_text(kind, &raw))
-        }
+        Ok(ScriptExecuteOutput::Error {
+            kind, raw, chunk, ..
+        }) => JobOutcome::Failed(scripts::failure_text(
+            kind,
+            crate::error::file_of(chunk).as_deref(),
+            &raw,
+        )),
         Err(e) => JobOutcome::Failed(e.to_string()),
     };
     finalize(state, job, outcome).await;

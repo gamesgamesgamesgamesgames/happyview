@@ -10,12 +10,14 @@ pub mod library;
 pub mod loader;
 pub mod memory;
 pub mod official_registry;
+pub mod prepared;
 pub mod registry_source;
 mod runtime;
 pub mod secrets;
 mod types;
 
 pub use executor::{ExecutionError, PluginExecutor, PluginInstance};
+pub use host::script::ModuleScope;
 pub use memory::{MemoryError, PluginEnvelopeError, PluginResponse};
 pub use runtime::{
     DEFAULT_SCRIPT_MEMORY_BYTES, EPOCH_TICK, GuestDeadline, LIBRARY_MEMORY_CEILING, MemoryLimiter,
@@ -24,15 +26,16 @@ pub use runtime::{
 pub use types::*;
 
 /// The interpreter contract, under the host's names: what `execute` and
-/// `validate` take and return, and what the four `script:host` imports
+/// `validate` take and return, and what the five `script:host` imports
 /// receive. Defined in the SDK the interpreter builds against, so the two
 /// sides cannot drift.
 pub use happyview_plugin_sdk::wire::{
-    ExecuteContext as ScriptExecuteContext, ExecuteInput as ScriptExecuteInput,
-    ExecuteLimits as ScriptExecuteLimits, ExecuteOutput as ScriptExecuteOutput, JobProgressRequest,
-    JobShouldStopRequest, JobWaitRequest, LibraryRef as ScriptLibraryRef, ScriptErrorKind,
-    ScriptJob, ScriptKind, ScriptLogRequest, ScriptSpace, ScriptValueKind,
-    ValidateError as ScriptValidateError, ValidateInput as ScriptValidateInput,
+    ChunkRole, DEFAULT_CHUNK_NAME, ExecuteContext as ScriptExecuteContext,
+    ExecuteInput as ScriptExecuteInput, ExecuteLimits as ScriptExecuteLimits,
+    ExecuteOutput as ScriptExecuteOutput, ImportRef, JobProgressRequest, JobShouldStopRequest,
+    JobWaitRequest, LibraryRef as ScriptLibraryRef, ModuleResolve, PreparedArtifact,
+    ResolvedModule, ScriptErrorKind, ScriptJob, ScriptKind, ScriptLogRequest, ScriptSpace,
+    ScriptValueKind, ValidateError as ScriptValidateError, ValidateInput as ScriptValidateInput,
     ValidateOutput as ScriptValidateOutput,
 };
 
@@ -52,6 +55,18 @@ pub struct PluginRegistry {
     /// registry hands out, so a registration that replaces an id also drops
     /// the module compiled for the outgoing one.
     runtime: Option<Arc<WasmRuntime>>,
+    /// One stamp per installed interpreter, computed when it registers so a
+    /// run never hashes a module. Each is held beside the exact module it
+    /// describes, so a run that instantiated a build since replaced is told
+    /// it has no stamp rather than handed its successor's.
+    stamps: std::sync::RwLock<HashMap<String, (Arc<LoadedPlugin>, prepared::ArtifactStamp)>>,
+    /// Dashboard scripts' artifacts. Here rather than with the scripts
+    /// because what invalidates an entry is an interpreter changing, and
+    /// that happens only in `register` and `remove`.
+    prepared: prepared::PreparedCache,
+    /// Bumped whenever an interpreter registers or leaves, so a project
+    /// snapshot whose artifacts it made can be rebuilt.
+    interpreter_generation: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for PluginRegistry {
@@ -62,6 +77,9 @@ impl Default for PluginRegistry {
             db_backend: DatabaseBackend::Sqlite,
             api_surfaces: RwLock::new(HashMap::new()),
             runtime: None,
+            stamps: std::sync::RwLock::new(HashMap::new()),
+            prepared: prepared::PreparedCache::default(),
+            interpreter_generation: tokio::sync::watch::channel(0).0,
         }
     }
 }
@@ -79,6 +97,9 @@ impl PluginRegistry {
             db_backend,
             api_surfaces: RwLock::new(HashMap::new()),
             runtime: None,
+            stamps: std::sync::RwLock::new(HashMap::new()),
+            prepared: prepared::PreparedCache::default(),
+            interpreter_generation: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -93,6 +114,86 @@ impl PluginRegistry {
         if let Some(runtime) = &self.runtime {
             runtime.evict(id);
         }
+    }
+
+    pub fn prepared(&self) -> &prepared::PreparedCache {
+        &self.prepared
+    }
+
+    /// The stamp of whichever build is registered under `id` now. A run
+    /// stamping or checking an artifact wants `artifact_stamp_for`, which
+    /// answers for the module it actually instantiated.
+    pub fn artifact_stamp(&self, id: &str) -> Option<prepared::ArtifactStamp> {
+        self.stamps
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|(_, stamp)| stamp.clone())
+    }
+
+    /// The stamp for this exact module, or `None` once it has been replaced
+    /// or removed. Compared by identity, as the module cache is, so an
+    /// artifact one build returned can never be labelled as another's.
+    pub fn artifact_stamp_for(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+    ) -> Option<prepared::ArtifactStamp> {
+        self.stamps
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&plugin.info.id)
+            .filter(|(current, _)| Arc::ptr_eq(current, plugin))
+            .map(|(_, stamp)| stamp.clone())
+    }
+
+    /// Stamp `artifact` for `plugin` and cache it against `source`, unless
+    /// `plugin` has been superseded since it prepared, in which case nothing
+    /// is stored and `None` comes back. The check and the store happen under
+    /// the lock a re-registration evicts under, so an entry from an outgoing
+    /// build cannot land after its eviction and outlive it.
+    pub fn store_prepared(
+        &self,
+        plugin: &Arc<LoadedPlugin>,
+        source: &str,
+        artifact: Option<PreparedArtifact>,
+    ) -> prepared::Cached {
+        let stamps = self.stamps.read().unwrap_or_else(|e| e.into_inner());
+        let (_, stamp) = stamps
+            .get(&plugin.info.id)
+            .filter(|(current, _)| Arc::ptr_eq(current, plugin))?;
+        let artifact = artifact.map(|mut artifact| {
+            stamp.apply(&mut artifact);
+            artifact
+        });
+        self.prepared.store(&plugin.info.id, source, artifact)
+    }
+
+    pub fn interpreter_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.interpreter_generation.subscribe()
+    }
+
+    /// Every artifact an outgoing build made is now unusable: drop the
+    /// cached ones, restamp, and tell whoever holds the rest. Callers hold
+    /// the `plugins` write lock, so the stamp always describes the module
+    /// that lock leaves registered, however registrations interleave.
+    fn interpreter_changed(&self, id: &str, incoming: Option<&Arc<LoadedPlugin>>) {
+        // Hashed before the lock is taken: every run's stamp read waits on
+        // it, and a module is megabytes.
+        let incoming = incoming.map(|plugin| (plugin.clone(), prepared::ArtifactStamp::of(plugin)));
+        let mut stamps = self.stamps.write().unwrap_or_else(|e| e.into_inner());
+        match incoming {
+            Some(entry) => {
+                stamps.insert(id.to_string(), entry);
+            }
+            None => {
+                stamps.remove(id);
+            }
+        }
+        self.prepared.evict_interpreter(id);
+        drop(stamps);
+        // `send_modify` rather than `send`: a registry nobody is watching
+        // must still count the change, and `send` refuses with no receivers.
+        self.interpreter_generation.send_modify(|g| *g += 1);
     }
 
     /// The wasm hashes of every installed plugin, as the module cache keys
@@ -119,7 +220,17 @@ impl PluginRegistry {
             tracing::error!(plugin_id = %id, error = %e, "Failed to persist plugin to database");
         }
 
-        self.plugins.write().await.insert(id, Arc::new(plugin));
+        // Insert before restamping, so whoever the signal wakes finds the
+        // new build registered; an interpreter replaced by something else
+        // leaves exactly as a removed one does.
+        let plugin = Arc::new(plugin);
+        let mut plugins = self.plugins.write().await;
+        let previous = plugins.insert(id.clone(), plugin.clone());
+        if plugin.plugin_type() == PluginType::Interpreter {
+            self.interpreter_changed(&id, Some(&plugin));
+        } else if previous.is_some_and(|p| p.plugin_type() == PluginType::Interpreter) {
+            self.interpreter_changed(&id, None);
+        }
     }
 
     pub async fn cached_api_surface(&self, id: &str) -> Option<Arc<library::ApiSurface>> {
@@ -192,7 +303,15 @@ impl PluginRegistry {
     pub async fn remove(&self, id: &str) -> Option<Arc<LoadedPlugin>> {
         self.invalidate_api_surface(id).await;
         self.evict_module(id);
-        self.plugins.write().await.remove(id)
+        let mut plugins = self.plugins.write().await;
+        let removed = plugins.remove(id);
+        if removed
+            .as_ref()
+            .is_some_and(|p| p.plugin_type() == PluginType::Interpreter)
+        {
+            self.interpreter_changed(id, None);
+        }
+        removed
     }
 
     /// Load all plugins from the database
@@ -458,6 +577,158 @@ impl PluginRegistry {
 mod tests {
     use super::*;
     use crate::test_support::memory_pool;
+
+    fn echo_like_interpreter(version: &str) -> LoadedPlugin {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "interp", "name": "interp", "version": version, "api_version": "2",
+            "plugin_type": "interpreter", "language_id": "interp", "capabilities": [],
+        }))
+        .unwrap();
+        LoadedPlugin {
+            info: manifest.clone().into(),
+            source: PluginSource::File {
+                path: "interp".into(),
+            },
+            wasm_bytes: version.as_bytes().to_vec(),
+            manifest: Some(manifest),
+        }
+    }
+
+    fn library_named(id: &str) -> LoadedPlugin {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "version": "1.0.0", "api_version": "2",
+            "plugin_type": "library", "capabilities": [],
+        }))
+        .unwrap();
+        LoadedPlugin {
+            info: manifest.clone().into(),
+            source: PluginSource::File { path: id.into() },
+            wasm_bytes: vec![],
+            manifest: Some(manifest),
+        }
+    }
+
+    fn some_artifact() -> PreparedArtifact {
+        PreparedArtifact {
+            interpreter: "forged".into(),
+            version: "forged".into(),
+            engine: "e".into(),
+            format: "f".into(),
+            bytes: vec![1],
+            source_map: None,
+        }
+    }
+
+    /// Registering an interpreter is what changes the build its artifacts
+    /// must match, so the stamp, the cache and the change signal all move
+    /// together there and nowhere else.
+    #[tokio::test]
+    async fn registering_an_interpreter_restamps_evicts_and_signals() {
+        let registry = PluginRegistry::new();
+        let mut changes = registry.interpreter_changes();
+        assert_eq!(registry.artifact_stamp("interp"), None);
+
+        registry.register(echo_like_interpreter("1.0.0")).await;
+        let first = registry
+            .artifact_stamp("interp")
+            .expect("stamped on register");
+        assert!(changes.has_changed().unwrap());
+        changes.mark_unchanged();
+
+        registry.prepared().store("interp", "src", None);
+        registry.register(echo_like_interpreter("1.0.1")).await;
+        let second = registry.artifact_stamp("interp").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(registry.prepared().lookup("interp", "src"), None);
+        assert!(changes.has_changed().unwrap());
+        changes.mark_unchanged();
+
+        registry.prepared().store("interp", "src", None);
+        registry.remove("interp").await;
+        assert_eq!(registry.artifact_stamp("interp"), None);
+        assert_eq!(registry.prepared().lookup("interp", "src"), None);
+        assert!(changes.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_library_registration_is_not_an_interpreter_change() {
+        let registry = PluginRegistry::new();
+        let changes = registry.interpreter_changes();
+        registry.register(library_named("lib")).await;
+        assert!(!changes.has_changed().unwrap());
+        assert_eq!(registry.artifact_stamp("lib"), None);
+    }
+
+    /// A run holds the module it instantiated, and a re-registration can
+    /// land while it is in flight. Its stamp has to be the one for that
+    /// module or nothing, never the successor's, or one build's bytecode
+    /// would be labelled as loadable by another.
+    #[tokio::test]
+    async fn a_superseded_module_has_no_stamp() {
+        let registry = PluginRegistry::new();
+        registry.register(echo_like_interpreter("1.0.0")).await;
+        let old = registry.get("interp").await.unwrap();
+        assert_eq!(
+            registry.artifact_stamp_for(&old),
+            registry.artifact_stamp("interp")
+        );
+
+        registry.register(echo_like_interpreter("1.0.1")).await;
+        let new = registry.get("interp").await.unwrap();
+        assert_eq!(registry.artifact_stamp_for(&old), None);
+        assert_eq!(
+            registry.artifact_stamp_for(&new),
+            Some(prepared::ArtifactStamp::of(&new))
+        );
+
+        registry.remove("interp").await;
+        assert_eq!(registry.artifact_stamp_for(&new), None);
+    }
+
+    /// A prepare that finishes after its interpreter was replaced must not
+    /// fill the cache: the eviction has already run, so an entry stored now
+    /// would outlive the build that made it.
+    #[tokio::test]
+    async fn a_superseded_module_cannot_fill_the_cache() {
+        let registry = PluginRegistry::new();
+        registry.register(echo_like_interpreter("1.0.0")).await;
+        let old = registry.get("interp").await.unwrap();
+        registry.register(echo_like_interpreter("1.0.1")).await;
+
+        assert_eq!(
+            registry.store_prepared(&old, "src", Some(some_artifact())),
+            None
+        );
+        assert_eq!(registry.store_prepared(&old, "none", None), None);
+        assert_eq!(registry.prepared().lookup("interp", "src"), None);
+        assert_eq!(registry.prepared().lookup("interp", "none"), None);
+
+        let new = registry.get("interp").await.unwrap();
+        let stored = registry
+            .store_prepared(&new, "src", Some(some_artifact()))
+            .expect("the current build stores");
+        assert!(prepared::ArtifactStamp::of(&new).matches(&stored));
+        assert_eq!(
+            registry.prepared().lookup("interp", "src"),
+            Some(Some(stored))
+        );
+    }
+
+    /// An interpreter id taken over by a library leaves the same way a
+    /// removed interpreter does, or its stamp would outlive it.
+    #[tokio::test]
+    async fn an_interpreter_replaced_by_a_library_leaves_as_if_removed() {
+        let registry = PluginRegistry::new();
+        registry.register(echo_like_interpreter("1.0.0")).await;
+        let mut changes = registry.interpreter_changes();
+        changes.mark_unchanged();
+        registry.prepared().store("interp", "src", None);
+
+        registry.register(library_named("interp")).await;
+        assert_eq!(registry.artifact_stamp("interp"), None);
+        assert_eq!(registry.prepared().lookup("interp", "src"), None);
+        assert!(changes.has_changed().unwrap());
+    }
 
     /// Re-registering an id, or removing it, drops the module the runtime
     /// compiled for it; the next instantiation compiles the new bytes.

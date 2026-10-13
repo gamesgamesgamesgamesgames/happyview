@@ -95,21 +95,18 @@ async fn next_batch(rx: &mut UnboundedReceiver<Change>) -> Option<Batch> {
     Some(batch)
 }
 
-/// One build of the project at `root`, installed if it succeeds, and one
-/// report either way.
-pub async fn rebuild(state: &AppState, root: &Path) {
+/// One build of the project at `root`, installed if it succeeds, and the
+/// line that reports it either way.
+pub async fn rebuild(state: &AppState, root: &Path) -> String {
     let started = Instant::now();
-    match crate::project::boot::build_and_install(state, root).await {
+    match crate::project::prepare::rebuild(state, root).await {
         Ok(installed) => {
-            println!(
-                "{}",
-                report::built(&installed.changes, &installed.warnings, started.elapsed())
-            );
             // Idempotent per collection, and a no-op unless [dev] backfill
             // is on, so a lexicon declared since boot gets its backfill now.
             crate::project::boot::start_declared_backfills(state).await;
+            report::built(&installed.changes, &installed.warnings, started.elapsed())
         }
-        Err(diagnostics) => println!("{}", report::failed(&diagnostics)),
+        Err(diagnostics) => report::failed(&diagnostics),
     }
 }
 
@@ -220,6 +217,15 @@ impl WatchHandle {
 }
 
 pub fn spawn(state: AppState, session: DevSession) -> Result<WatchHandle, String> {
+    spawn_with(state, session, |line| println!("{line}"))
+}
+
+/// `spawn`, with each build's line handed to `out` rather than printed.
+pub fn spawn_with(
+    state: AppState,
+    session: DevSession,
+    out: impl Fn(String) + Send + 'static,
+) -> Result<WatchHandle, String> {
     let root = session.root.clone();
     let mode = session.watch_mode;
     // A project scaffolded without src/ yet would otherwise have nothing to
@@ -229,13 +235,15 @@ pub fn spawn(state: AppState, session: DevSession) -> Result<WatchHandle, String
         .map_err(|e| format!("could not create {}: {e}", root.join("src").display()))?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
+    spawn_interpreter_listener(&state, &tx);
     let debouncer = start_watcher(&root, mode, tx)?;
 
     let rewatch: Weak<Mutex<AnyDebouncer>> = Arc::downgrade(&debouncer);
     let mut declared = state.config.project.clone();
     tokio::spawn(async move {
         while let Some(batch) = next_batch(&mut rx).await {
-            handle_batch(&state, &session, &rewatch, &mut declared, batch).await;
+            let line = handle_batch(&state, &session, &rewatch, &mut declared, batch).await;
+            out(line);
         }
     });
     Ok(WatchHandle {
@@ -244,15 +252,32 @@ pub fn spawn(state: AppState, session: DevSession) -> Result<WatchHandle, String
     })
 }
 
+/// An interpreter installed or removed changes which files are scripts and
+/// what their prepared artifacts are, so it is a project input like a save.
+/// The sender is held weakly, so dropping the watch still ends the loop.
+fn spawn_interpreter_listener(state: &AppState, tx: &UnboundedSender<Change>) {
+    let mut changes = state.plugin_registry.interpreter_changes();
+    changes.mark_unchanged();
+    let tx = tx.downgrade();
+    tokio::spawn(async move {
+        while changes.changed().await.is_ok() {
+            let Some(tx) = tx.upgrade() else { break };
+            if tx.send(Change::Source).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 /// One batch's work: watch again any directory that was recreated, reload
-/// the config if it changed, then build.
+/// the config if it changed, then build. Answers the build's line.
 async fn handle_batch<W: Watch>(
     state: &AppState,
     session: &DevSession,
     rewatch: &Weak<Mutex<W>>,
     declared: &mut Option<Arc<crate::config::project::ProjectConfig>>,
     batch: Batch,
-) {
+) -> String {
     let recreated = [
         (
             batch.src_dir,
@@ -282,7 +307,7 @@ async fn handle_batch<W: Watch>(
         // error with the standing line.
         tracing::debug!("happyview.toml did not load: {e}");
     }
-    rebuild(state, &session.root).await;
+    rebuild(state, &session.root).await
 }
 
 #[cfg(test)]
