@@ -14,10 +14,12 @@ use common::app::TestApp;
 
 use happyview::error::ScriptErrorType;
 use happyview::plugin::{
-    ChunkRole, ExecutionError, LoadedPlugin, PluginInfo, PluginManifest, PluginSource,
-    ScriptErrorKind, ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits,
-    ScriptExecuteOutput, ScriptJob, ScriptKind, ScriptLibraryRef, ScriptValueKind,
+    ChunkRole, ExecutionError, LoadedPlugin, ModuleScope, PluginInfo, PluginManifest, PluginSource,
+    PreparedArtifact, ScriptErrorKind, ScriptExecuteContext, ScriptExecuteInput,
+    ScriptExecuteLimits, ScriptExecuteOutput, ScriptJob, ScriptKind, ScriptLibraryRef,
+    ScriptValueKind,
 };
+use happyview::project::snapshot::{ProjectModule, ProjectSnapshot};
 
 const FIXTURE: &str =
     "tests/fixtures/interpreter_echo/target/wasm32-unknown-unknown/release/interpreter_echo.wasm";
@@ -1030,4 +1032,232 @@ async fn a_dashboard_run_has_no_modules_to_resolve() {
     let message = value["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("./lib/format"), "{message}");
     assert!(message.contains("dashboard"), "{message}");
+    assert!(message.contains("project"), "{message}");
+}
+
+fn module(
+    path: &str,
+    language: &str,
+    source: &str,
+    artifact: Option<PreparedArtifact>,
+) -> ProjectModule {
+    ProjectModule {
+        id: path.to_string(),
+        path: path.into(),
+        language_id: language.to_string(),
+        source: Arc::from(source),
+        artifact,
+    }
+}
+
+fn project(modules: Vec<ProjectModule>) -> ModuleScope {
+    let mut snap = ProjectSnapshot::empty();
+    for m in modules {
+        snap.modules.insert(m.id.clone(), m);
+    }
+    ModuleScope::Project(Arc::new(snap))
+}
+
+fn resolving(specifier: &str, chunk: &str) -> ScriptExecuteInput {
+    let mut sent = input("host:module_resolve", ScriptKind::Job);
+    sent.context.trigger = "job.run:tick".into();
+    sent.chunk_name = chunk.to_string();
+    sent.input = json!({"specifier": specifier});
+    sent
+}
+
+#[tokio::test]
+async fn a_project_run_resolves_a_module_against_its_chunk() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+    let executor = app.state.plugin_executor();
+    let artifact = executor
+        .prepare_script(id, "fmt", "src/lib/format.echo", ChunkRole::Module)
+        .await
+        .unwrap()
+        .artifact;
+    assert!(artifact.is_some(), "the fixture prepares a module");
+
+    let scope = project(vec![module(
+        "src/lib/format.echo",
+        "echo",
+        "fmt",
+        artifact.clone(),
+    )]);
+    let (value, _) = returned(
+        executor
+            .execute_script_in(
+                id,
+                &resolving("../lib/format", "src/jobs/tick.echo"),
+                None,
+                scope,
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(value["ok"]["id"], "src/lib/format.echo", "{value}");
+    assert_eq!(value["ok"]["source"], "fmt");
+    assert_eq!(
+        value["ok"]["artifact"],
+        serde_json::to_value(artifact.unwrap()).unwrap()
+    );
+}
+
+/// What the run pinned is what it reads, whatever the instance now serves.
+#[tokio::test]
+async fn resolution_reads_the_pinned_snapshot_not_the_live_one() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+
+    let scope = project(vec![module("src/lib/format.echo", "echo", "pinned", None)]);
+
+    let mut live = ProjectSnapshot::empty();
+    let live_module = module("src/lib/format.echo", "echo", "live", None);
+    live.modules.insert(live_module.id.clone(), live_module);
+    happyview::project::build::install(&app.state, live).await;
+
+    let (value, _) = returned(
+        app.state
+            .plugin_executor()
+            .execute_script_in(
+                id,
+                &resolving("../lib/format", "src/jobs/tick.echo"),
+                None,
+                scope,
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(value["ok"]["source"], "pinned", "{value}");
+}
+
+/// The interpreter's manifest decides which files are its own.
+#[tokio::test]
+async fn the_interpreters_extensions_decide_which_files_resolve() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+
+    let mut claiming_two = plugin("interpreter_echo", "interpreter", &["script:host"]);
+    claiming_two.manifest.as_mut().unwrap().extensions = vec!["echo".into(), "ech".into()];
+    app.state.plugin_registry.register(claiming_two).await;
+
+    let executor = app.state.plugin_executor();
+    let sent = resolving("../lib/format", "src/jobs/tick.echo");
+    let scope = || project(vec![module("src/lib/format.ech", "echo", "short", None)]);
+
+    let (value, _) = returned(
+        executor
+            .execute_script_in("interpreter_echo", &sent, None, scope())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(value["ok"]["id"], "src/lib/format.ech", "{value}");
+
+    // The same files, an interpreter that claims only `echo`.
+    app.state
+        .plugin_registry
+        .register(plugin("interpreter_echo", "interpreter", &["script:host"]))
+        .await;
+    let (value, _) = returned(
+        executor
+            .execute_script_in("interpreter_echo", &sent, None, scope())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(value["error"]["code"], "NOT_FOUND", "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("src/lib/format.ech"), "{message}");
+    assert!(
+        message.contains("echo scripts can only import .echo files"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn a_module_prepared_by_another_build_answers_its_source_only() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+
+    let stale = PreparedArtifact {
+        interpreter: "interpreter_echo".into(),
+        version: "0.9.0+ffffffffffffffff".into(),
+        engine: "echo-1".into(),
+        format: "echo-source".into(),
+        bytes: b"old".to_vec(),
+        source_map: None,
+    };
+    let scope = project(vec![module(
+        "src/lib/format.echo",
+        "echo",
+        "fmt",
+        Some(stale),
+    )]);
+    let (value, _) = returned(
+        app.state
+            .plugin_executor()
+            .execute_script_in(
+                id,
+                &resolving("../lib/format", "src/jobs/tick.echo"),
+                None,
+                scope,
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(value["ok"]["source"], "fmt", "{value}");
+    assert!(value["ok"].get("artifact").is_none(), "{value}");
+}
+
+#[tokio::test]
+async fn a_miss_is_not_found_and_names_the_file_in_another_language() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+
+    let scope = project(vec![module("src/lib/format.lua", "lua", "return {}", None)]);
+    let (value, _) = returned(
+        app.state
+            .plugin_executor()
+            .execute_script_in(
+                id,
+                &resolving("../lib/format", "src/jobs/tick.echo"),
+                None,
+                scope,
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(value["error"]["code"], "NOT_FOUND", "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("src/lib/format.lua"), "{message}");
+    assert!(message.contains("src/jobs/tick.echo"), "{message}");
+    assert!(
+        message.contains("echo scripts can only import .echo files"),
+        "{message}"
+    );
+}
+
+/// Validation reads no run, so it has no snapshot to resolve in either.
+#[tokio::test]
+async fn validation_cannot_resolve_a_module() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+
+    let out = app
+        .state
+        .plugin_executor()
+        .validate_script(id, "probe-module")
+        .await
+        .unwrap();
+    assert_eq!(out.errors[0].message, "UNSUPPORTED", "{:?}", out.errors);
 }

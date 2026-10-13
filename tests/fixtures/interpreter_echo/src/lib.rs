@@ -609,6 +609,15 @@ pub extern "C" fn validate(ptr: u32, len: u32) -> i64 {
         }));
         let code = envelope["error"]["code"].as_str().unwrap_or("ok");
         json!({"valid": false, "errors": [{"kind": "runtime", "message": code}]})
+    } else if source.starts_with("probe-module") {
+        // Reports what `host_module_resolve` answered, so the host can assert
+        // that validation has no run whose snapshot an import could read.
+        let envelope = imports::module_resolve(&json!({
+            "specifier": "./probe",
+            "referrer": "src/probe.echo",
+        }));
+        let code = envelope["error"]["code"].as_str().unwrap_or("ok");
+        json!({"valid": false, "errors": [{"kind": "runtime", "message": code}]})
     } else if source.starts_with("invalid") {
         json!({"valid": false, "errors": [
             {"kind": "syntax", "line": 1, "message": "echo: the source says it is invalid"}
