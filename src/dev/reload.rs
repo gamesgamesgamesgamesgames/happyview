@@ -12,10 +12,13 @@ use crate::dev::DevSession;
 ///
 /// Not listed because a reload does reach them: `APP_NAME`, `LOGO_URI`,
 /// `TOS_URI`, `POLICY_URI` and `EVENT_LOG_RETENTION_DAYS` are read through
-/// `vars::var` per request (the instance-settings fallback), `JETSTREAM_*`
-/// protocol and compression are read at each connect, and `SUPERADMIN_DID`
-/// and the declarations are applied by the reload itself. `USER_AGENT` is
-/// derived from `PUBLIC_URL`, which is listed.
+/// `vars::var` per request (the instance-settings fallback), and
+/// `SUPERADMIN_DID` and the declarations are applied by the reload itself.
+/// `USER_AGENT` is derived from `PUBLIC_URL`, which is listed.
+///
+/// `JETSTREAM_PROTOCOL` and `JETSTREAM_COMPRESSION` are not `Config` fields:
+/// the consumer reads them through `vars::var` once, when it is spawned, so
+/// they are judged by [`jetstream_changed`] against the boot file instead.
 pub fn restart_required(running: &Config, edited: &Config) -> Vec<&'static str> {
     let checks = [
         ("HOST", running.host != edited.host),
@@ -79,11 +82,35 @@ pub fn restart_required(running: &Config, edited: &Config) -> Vec<&'static str> 
             running.auto_backfill != edited.auto_backfill,
         ),
         ("PLUGIN_DIR", running.plugin_dir != edited.plugin_dir),
+        (
+            "JETSTREAM_PROTOCOL",
+            jetstream_changed("JETSTREAM_PROTOCOL", running, edited),
+        ),
+        (
+            "JETSTREAM_COMPRESSION",
+            jetstream_changed("JETSTREAM_COMPRESSION", running, edited),
+        ),
     ];
     checks
         .into_iter()
         .filter_map(|(name, changed)| changed.then_some(name))
         .collect()
+}
+
+/// Whether the file's value for `name` differs between the boot project and
+/// the edited one. A variable set in the environment wins on both sides, so
+/// an edit beneath it changes nothing and reports nothing.
+fn jetstream_changed(name: &str, running: &Config, edited: &Config) -> bool {
+    if std::env::var(name).is_ok() {
+        return false;
+    }
+    let file_value = |config: &Config| {
+        config
+            .project
+            .as_ref()
+            .and_then(|p| p.env_layer(crate::config::ConfigMode::Dev).remove(name))
+    };
+    file_value(running) != file_value(edited)
 }
 
 pub fn dropped_declarations(before: &ProjectConfig, after: &ProjectConfig) -> Vec<String> {
@@ -191,6 +218,48 @@ mod tests {
                 "PLUGIN_DIR"
             ]
         );
+    }
+
+    fn with_jetstream(
+        protocol: Option<crate::config::project::JetstreamProtocol>,
+        compression: Option<bool>,
+    ) -> Config {
+        let mut config = base();
+        let mut project = ProjectConfig::default();
+        project.jetstream.protocol = protocol;
+        project.jetstream.compression = compression;
+        config.project = Some(Arc::new(project));
+        config
+    }
+
+    /// The consumer reads both once, at spawn, so an edit cannot reach it.
+    #[test]
+    #[serial_test::serial]
+    fn a_jetstream_edit_needs_a_restart() {
+        use crate::config::project::JetstreamProtocol;
+        for key in ["JETSTREAM_PROTOCOL", "JETSTREAM_COMPRESSION"] {
+            unsafe { std::env::remove_var(key) };
+        }
+        let running = with_jetstream(Some(JetstreamProtocol::V1), None);
+        assert!(restart_required(&running, &running.clone()).is_empty());
+        let edited = with_jetstream(Some(JetstreamProtocol::V2), Some(false));
+        assert_eq!(
+            restart_required(&running, &edited),
+            vec!["JETSTREAM_PROTOCOL", "JETSTREAM_COMPRESSION"]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_jetstream_edit_beneath_the_environment_reports_nothing() {
+        use crate::config::project::JetstreamProtocol;
+        unsafe { std::env::set_var("JETSTREAM_PROTOCOL", "v1") };
+        unsafe { std::env::remove_var("JETSTREAM_COMPRESSION") };
+        let running = with_jetstream(Some(JetstreamProtocol::V1), None);
+        let edited = with_jetstream(Some(JetstreamProtocol::V2), None);
+        let reported = restart_required(&running, &edited);
+        unsafe { std::env::remove_var("JETSTREAM_PROTOCOL") };
+        assert!(reported.is_empty(), "got: {reported:?}");
     }
 
     #[test]
