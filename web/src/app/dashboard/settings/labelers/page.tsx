@@ -161,15 +161,25 @@ export default function LabelersPage() {
                     </div>
                   </TableCell>
                   <TableCell>
-                    <Badge
-                      className={
-                        l.status === "active"
-                          ? "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200"
-                          : "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200"
-                      }
-                    >
-                      {l.status}
-                    </Badge>
+                    <div className="flex items-center gap-2">
+                      <Badge
+                        className={
+                          l.status === "active"
+                            ? "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200"
+                            : "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200"
+                        }
+                      >
+                        {l.status}
+                      </Badge>
+                      {l.declared && (
+                        <Badge
+                          variant="outline"
+                          title="Declared in happyview.toml. Remove it from the file to unsubscribe."
+                        >
+                          happyview.toml
+                        </Badge>
+                      )}
+                    </div>
                   </TableCell>
                   <TableCell className="font-mono text-sm">
                     {l.cursor ?? "—"}
@@ -198,7 +208,7 @@ export default function LabelersPage() {
                           )}
                         </Button>
                       )}
-                      {hasPermission("labelers:delete") && (
+                      {hasPermission("labelers:delete") && !l.declared && (
                         <Button
                           variant="destructive"
                           size="icon"

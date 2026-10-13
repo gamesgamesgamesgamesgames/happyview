@@ -29,36 +29,20 @@ use std::collections::HashSet;
 
 use crate::AppState;
 use crate::codemod::{self, ScriptKind};
-use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lua::{NATIVE_LANGUAGE, ParsedTrigger};
 use crate::plugin::{ScriptErrorKind, ScriptValidateError};
+use crate::script::checks::{self, CheckError, InterpreterCheck, MAX_DESCRIPTION_LEN};
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
-
-const MAX_DESCRIPTION_LEN: usize = 300;
 
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
 
-/// The columns a script read selects, in the order both reads select them:
-/// `(id, script_type, body, description, outbound_xrpcs, created_at,
-/// updated_at)`. Named so the two queries and
-/// [`ScriptResponse::from_row`] cannot disagree about the order.
-type ScriptColumns = (
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    String,
-    String,
-);
-
-/// One row from the `scripts` table — what GET endpoints return.
+/// One script as the catalog answers for it — what GET endpoints return.
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct ScriptResponse {
     /// The trigger id; identifies the row.
@@ -67,8 +51,16 @@ pub(super) struct ScriptResponse {
     pub body: String,
     pub description: Option<String>,
     pub outbound_xrpcs: Option<Vec<String>>,
-    pub created_at: String,
-    pub updated_at: String,
+    /// `None` for a project script, which has no row.
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    /// The layer answering for this trigger.
+    pub layer: crate::catalog::Layer,
+    /// Project-relative file path, for a project script only.
+    pub path: Option<String>,
+    /// A dashboard row sits under this project file and answers again when
+    /// the file goes.
+    pub shadows_stored: bool,
     /// `false` when this row's own trigger id would be refused if submitted
     /// today — the NSID rules tightened after it was created. Such a script
     /// still fires and can still be edited, but it cannot be recreated with
@@ -89,7 +81,7 @@ pub(super) struct ScriptResponse {
 }
 
 impl ScriptResponse {
-    /// Builds a response from a fetched row.
+    /// Builds a response from a listing.
     ///
     /// `recreatable` and `outbound_xrpcs` are derived here rather than passed
     /// in, so a new call site cannot forget them. `recreatable` is `false`
@@ -97,13 +89,10 @@ impl ScriptResponse {
     ///
     /// `installed` is passed in because it is one read of the plugin registry
     /// for a whole listing rather than one per row.
-    fn from_row(row: ScriptColumns, installed: &HashSet<String>) -> Self {
-        let (id, script_type, body, description, outbound_xrpcs_json, created_at, updated_at) = row;
-        let outbound_xrpcs: Option<Vec<String>> =
-            outbound_xrpcs_json.and_then(|j| serde_json::from_str(&j).ok());
-        let recreatable = ParsedTrigger::parse(&id).is_ok();
-        let needs_migration = if script_type == NATIVE_LANGUAGE {
-            codemod::needs_migration(&body, ScriptKind::from_trigger_id(&id))
+    fn from_listing(l: crate::catalog::ScriptListing, installed: &HashSet<String>) -> Self {
+        let recreatable = ParsedTrigger::parse(&l.id).is_ok();
+        let needs_migration = if l.script_type == NATIVE_LANGUAGE {
+            codemod::needs_migration(&l.body, ScriptKind::from_trigger_id(&l.id))
                 .into_iter()
                 .map(str::to_string)
                 .collect()
@@ -111,14 +100,17 @@ impl ScriptResponse {
             Vec::new()
         };
         Self {
-            runnable: installed.contains(&script_type),
-            id,
-            script_type,
-            body,
-            description,
-            outbound_xrpcs,
-            created_at,
-            updated_at,
+            runnable: installed.contains(&l.script_type),
+            path: l.path.as_deref().map(crate::catalog::path_string),
+            layer: l.layer,
+            shadows_stored: l.shadows_stored,
+            id: l.id,
+            script_type: l.script_type,
+            body: l.body,
+            description: l.description,
+            outbound_xrpcs: l.outbound_xrpcs,
+            created_at: l.created_at,
+            updated_at: l.updated_at,
             recreatable,
             needs_migration,
         }
@@ -215,32 +207,14 @@ pub(super) async fn list(
 ) -> Result<Json<Vec<ScriptResponse>>, AppError> {
     auth.require(Permission::ScriptsRead).await?;
 
-    let backend = state.db_backend;
-    let mut sql = String::from(
-        "SELECT id, script_type, body, description, outbound_xrpcs, created_at, updated_at
-         FROM happyview_scripts",
-    );
-    if query.suffix.is_some() {
-        sql.push_str(" WHERE id LIKE ?");
-    }
-    sql.push_str(" ORDER BY id");
-
-    let sql = adapt_sql(&sql, backend);
-    let mut q = crate::db::query_as::<ScriptColumns>(&sql);
-    if let Some(ref suffix) = query.suffix {
-        q = q.bind(format!("%:{suffix}"));
-    }
-    let rows = q
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list scripts: {e}")))?;
-
     let installed = installed_languages(&state).await;
-    let scripts: Vec<ScriptResponse> = rows
+    let scripts = state
+        .scripts
+        .list(query.suffix.as_deref())
+        .await?
         .into_iter()
-        .map(|row| ScriptResponse::from_row(row, &installed))
+        .map(|l| ScriptResponse::from_listing(l, &installed))
         .collect();
-
     Ok(Json(scripts))
 }
 
@@ -263,6 +237,7 @@ pub(super) async fn upsert(
     Json(body): Json<UpsertBody>,
 ) -> Result<(StatusCode, Json<ScriptResponse>), AppError> {
     auth.require(Permission::ScriptsManage).await?;
+    state.scripts.check_writable(&body.id)?;
 
     // Validate the trigger id grammar up-front (400 with a clear message).
     let _trigger = ParsedTrigger::parse(&body.id).map_err(AppError::BadRequest)?;
@@ -281,55 +256,21 @@ pub(super) async fn upsert(
     refuse_unmigrated(&body.id, &script_type, &body.body)?;
     validate_body_for_type(&state, &body.body, &script_type).await?;
 
-    let outbound_xrpcs = crate::lua_analysis::extract_outbound_xrpcs(&body.body);
-    let outbound_json =
-        if outbound_xrpcs.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&outbound_xrpcs).map_err(|e| {
-                AppError::Internal(format!("failed to serialize outbound xrpcs: {e}"))
-            })?)
-        };
-
     let backend = state.db_backend;
-    let now = now_rfc3339();
     let description = body.description.as_deref().filter(|s| !s.is_empty());
-
-    // Distinguish create vs update so we can return 201 vs 200.
-    let pre_exists: Option<(String,)> = crate::db::query_as(&adapt_sql(
-        "SELECT id FROM happyview_scripts WHERE id = ?",
-        backend,
-    ))
-    .bind(&body.id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Internal(format!("failed to check script existence: {e}")))?;
-    let was_new = pre_exists.is_none();
-
-    let sql = adapt_sql(
-        r#"
-        INSERT INTO happyview_scripts (id, script_type, body, description, outbound_xrpcs, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (id) DO UPDATE SET
-            script_type    = EXCLUDED.script_type,
-            body           = EXCLUDED.body,
-            description    = EXCLUDED.description,
-            outbound_xrpcs = EXCLUDED.outbound_xrpcs,
-            updated_at     = EXCLUDED.updated_at
-        "#,
-        backend,
-    );
-    crate::db::query(&sql)
-        .bind(&body.id)
-        .bind(script_type.as_str())
-        .bind(&body.body)
-        .bind(description)
-        .bind(&outbound_json)
-        .bind(&now)
-        .bind(&now)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to upsert script: {e}")))?;
+    let was_new = state
+        .scripts
+        .put_manual(
+            &state.db,
+            backend,
+            crate::catalog::ScriptWrite {
+                id: body.id.clone(),
+                script_type: script_type.clone(),
+                body: body.body.clone(),
+                description: description.map(str::to_string),
+            },
+        )
+        .await?;
 
     log_event(
         &state.db,
@@ -368,6 +309,7 @@ pub(super) async fn patch(
     Json(body): Json<PatchBody>,
 ) -> Result<Json<ScriptResponse>, AppError> {
     auth.require(Permission::ScriptsManage).await?;
+    state.scripts.check_writable(&id)?;
 
     if body.script_type.is_none() && body.body.is_none() && body.description.is_none() {
         return Err(AppError::BadRequest(
@@ -403,7 +345,6 @@ pub(super) async fn patch(
     }
 
     let backend = state.db_backend;
-    let now = now_rfc3339();
     let new_script_type = body.script_type.unwrap_or(existing.script_type);
     let new_body = body.body.unwrap_or(existing.body);
     let new_description = match body.description {
@@ -411,38 +352,19 @@ pub(super) async fn patch(
         None => existing.description,
     };
 
-    let outbound_xrpcs = crate::lua_analysis::extract_outbound_xrpcs(&new_body);
-    let outbound_json: Option<String> =
-        if outbound_xrpcs.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&outbound_xrpcs).map_err(|e| {
-                AppError::Internal(format!("failed to serialize outbound xrpcs: {e}"))
-            })?)
-        };
-
-    let sql = adapt_sql(
-        r#"
-        UPDATE happyview_scripts
-           SET script_type    = ?,
-               body           = ?,
-               description    = ?,
-               outbound_xrpcs = ?,
-               updated_at     = ?
-         WHERE id = ?
-        "#,
-        backend,
-    );
-    crate::db::query(&sql)
-        .bind(&new_script_type)
-        .bind(&new_body)
-        .bind(new_description.as_deref())
-        .bind(&outbound_json)
-        .bind(&now)
-        .bind(&id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to patch script: {e}")))?;
+    state
+        .scripts
+        .put_manual(
+            &state.db,
+            backend,
+            crate::catalog::ScriptWrite {
+                id: id.clone(),
+                script_type: new_script_type.clone(),
+                body: new_body,
+                description: new_description,
+            },
+        )
+        .await?;
 
     log_event(
         &state.db,
@@ -473,13 +395,7 @@ pub(super) async fn delete(
     auth.require(Permission::ScriptsManage).await?;
 
     let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM happyview_scripts WHERE id = ?", backend);
-    let result = crate::db::query(&sql)
-        .bind(&id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to delete script: {e}")))?;
-    if result.rows_affected() == 0 {
+    if !state.scripts.remove(&state.db, backend, &id).await? {
         return Err(AppError::NotFound(format!("script '{id}' not found")));
     }
 
@@ -541,15 +457,18 @@ pub(super) async fn codemod_apply(
         }));
     }
 
+    // Ahead of the fetch and the language check: a project-owned script is
+    // refused as such whatever its language, not as "not Lua".
+    if apply {
+        auth.require(Permission::ScriptsManage).await?;
+        state.scripts.check_writable(&id)?;
+    }
+
     let existing = fetch_one(&state, &id).await?;
     if existing.script_type != NATIVE_LANGUAGE {
         return Err(AppError::BadRequest(
             "codemod applies to Lua scripts".to_string(),
         ));
-    }
-
-    if apply {
-        auth.require(Permission::ScriptsManage).await?;
     }
 
     let rewrite = rewrite_lua(&existing.body, kind)?;
@@ -567,28 +486,19 @@ pub(super) async fn codemod_apply(
 
     if apply && changed {
         let backend = state.db_backend;
-        let outbound_xrpcs = crate::lua_analysis::extract_outbound_xrpcs(&rewrite.source);
-        let outbound_json = if outbound_xrpcs.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(&outbound_xrpcs).map_err(|e| {
-                AppError::Internal(format!("failed to serialize outbound xrpcs: {e}"))
-            })?)
-        };
-        let now = now_rfc3339();
-
-        let sql = adapt_sql(
-            "UPDATE happyview_scripts SET body = ?, outbound_xrpcs = ?, updated_at = ? WHERE id = ?",
-            backend,
-        );
-        crate::db::query(&sql)
-            .bind(&rewrite.source)
-            .bind(&outbound_json)
-            .bind(&now)
-            .bind(&id)
-            .execute(&state.db)
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to apply codemod: {e}")))?;
+        state
+            .scripts
+            .put_manual(
+                &state.db,
+                backend,
+                crate::catalog::ScriptWrite {
+                    id: id.clone(),
+                    script_type: existing.script_type.clone(),
+                    body: rewrite.source.clone(),
+                    description: existing.description.clone(),
+                },
+            )
+            .await?;
 
         log_event(
             &state.db,
@@ -618,22 +528,15 @@ pub(super) async fn codemod_apply(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Look up a single script row; 404 if missing.
+/// The script answering for `id`; 404 if none.
 async fn fetch_one(state: &AppState, id: &str) -> Result<ScriptResponse, AppError> {
-    let backend = state.db_backend;
-    let sql = adapt_sql(
-        "SELECT id, script_type, body, description, outbound_xrpcs, created_at, updated_at
-         FROM happyview_scripts WHERE id = ?",
-        backend,
-    );
-    let row: Option<ScriptColumns> = crate::db::query_as(&sql)
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to fetch script: {e}")))?;
-    let row = row.ok_or_else(|| AppError::NotFound(format!("script '{id}' not found")))?;
-    Ok(ScriptResponse::from_row(
-        row,
+    let listing = state
+        .scripts
+        .get(id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("script '{id}' not found")))?;
+    Ok(ScriptResponse::from_listing(
+        listing,
         &installed_languages(state).await,
     ))
 }
@@ -658,16 +561,11 @@ fn rewrite_lua(source: &str, kind: ScriptKind) -> Result<codemod::Rewrite, AppEr
 /// A body the scanner cannot read is left to the compile check, which owns
 /// the message for a script that does not parse.
 fn refuse_unmigrated(id: &str, script_type: &str, body: &str) -> Result<(), AppError> {
-    if script_type != NATIVE_LANGUAGE {
+    let remaining = checks::unmigrated_globals(id, script_type, body);
+    if remaining.is_empty() {
         return Ok(());
     }
-    let remaining = codemod::needs_migration(body, ScriptKind::from_trigger_id(id));
-    if remaining.is_empty() || remaining == [codemod::UNPARSEABLE] {
-        return Ok(());
-    }
-    Err(AppError::UnmigratedScript(
-        remaining.into_iter().map(str::to_string).collect(),
-    ))
+    Err(AppError::UnmigratedScript(remaining))
 }
 
 /// Validate the script body against its declared language, rejecting an
@@ -689,25 +587,21 @@ async fn validate_body_for_type(
     body: &str,
     language: &str,
 ) -> Result<(), AppError> {
-    let interpreter = state
-        .plugin_registry
-        .get_interpreter_by_language(language)
-        .await
-        .ok_or_else(|| AppError::BadRequest(crate::script::no_interpreter_message(language)))?;
-    let validated = state
-        .plugin_executor()
-        .validate_script(&interpreter.info.id, body)
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "interpreter '{}' could not check the script: {e}",
-                interpreter.info.id
-            ))
-        })?;
-    if validated.valid {
-        return Ok(());
+    match checks::check_with_interpreter(
+        &state.plugin_registry,
+        &state.plugin_executor(),
+        language,
+        body,
+    )
+    .await
+    {
+        Ok(InterpreterCheck::Valid) => Ok(()),
+        Ok(InterpreterCheck::Refused(errors)) => {
+            Err(AppError::BadRequest(refusal_message(&errors)))
+        }
+        Err(CheckError::NoInterpreter(message)) => Err(AppError::BadRequest(message)),
+        Err(e @ CheckError::InterpreterFailed { .. }) => Err(AppError::Internal(e.to_string())),
     }
-    Err(AppError::BadRequest(refusal_message(&validated.errors)))
 }
 
 /// What a refusal says, from what the interpreter reported.
@@ -753,8 +647,8 @@ async fn installed_languages(state: &AppState) -> HashSet<String> {
 mod tests {
     use super::*;
 
-    // `ScriptResponse::from_row` is the only place `recreatable` and
-    // `outbound_xrpcs` are derived — both HTTP construction sites (`list`
+    // `ScriptResponse::from_listing` is the only place `recreatable` and
+    // `needs_migration` are derived — both HTTP construction sites (`list`
     // and `fetch_one`) go through it. These exercise it directly, since
     // exercising the full HTTP handlers needs a database (see
     // `tests/e2e_scripts.rs`, which is `#[ignore]`-gated).
@@ -763,20 +657,31 @@ mod tests {
         HashSet::from([NATIVE_LANGUAGE.to_string()])
     }
 
+    fn listing(id: &str, script_type: &str, body: &str) -> crate::catalog::ScriptListing {
+        crate::catalog::ScriptListing {
+            id: id.into(),
+            layer: crate::catalog::Layer::Manual,
+            path: None,
+            shadows_stored: false,
+            script_type: script_type.into(),
+            body: body.into(),
+            description: None,
+            outbound_xrpcs: None,
+            created_at: Some("2026-01-01T00:00:00+00:00".into()),
+            updated_at: Some("2026-01-01T00:00:00+00:00".into()),
+        }
+    }
+
     /// `runnable` answers for the instance, not for the row: the same stored
     /// script is runnable or inert depending only on what is installed.
     #[test]
-    fn from_row_reads_runnable_off_the_installed_interpreters() {
+    fn from_listing_reads_runnable_off_the_installed_interpreters() {
         let row = |installed: &HashSet<String>| {
-            ScriptResponse::from_row(
-                (
-                    "xrpc.query:com.example.list".into(),
-                    "typescript".into(),
-                    "function handle() {}".into(),
-                    None,
-                    None,
-                    "2026-01-01T00:00:00+00:00".into(),
-                    "2026-01-01T00:00:00+00:00".into(),
+            ScriptResponse::from_listing(
+                listing(
+                    "xrpc.query:com.example.list",
+                    "typescript",
+                    "function handle() {}",
                 ),
                 installed,
             )
@@ -790,16 +695,12 @@ mod tests {
     }
 
     #[test]
-    fn from_row_marks_a_valid_trigger_id_recreatable() {
-        let r = ScriptResponse::from_row(
-            (
-                "record.create:com.example.thing".into(),
-                "lua".into(),
-                "function handle() end".into(),
-                None,
-                None,
-                "2026-01-01T00:00:00+00:00".into(),
-                "2026-01-01T00:00:00+00:00".into(),
+    fn from_listing_marks_a_valid_trigger_id_recreatable() {
+        let r = ScriptResponse::from_listing(
+            listing(
+                "record.create:com.example.thing",
+                "lua",
+                "function handle() end",
             ),
             &lua_installed(),
         );
@@ -807,69 +708,75 @@ mod tests {
     }
 
     #[test]
-    fn from_row_marks_a_legacy_trigger_id_not_recreatable() {
+    fn from_listing_marks_a_legacy_trigger_id_not_recreatable() {
         // Hyphen in the name segment: accepted before the NSID consolidation,
         // refused now. The script still fires, but cannot be recreated.
-        let r = ScriptResponse::from_row(
-            (
-                "xrpc.query:com.example.get-photos".into(),
-                "lua".into(),
-                "function handle() end".into(),
-                None,
-                None,
-                "2026-01-01T00:00:00+00:00".into(),
-                "2026-01-01T00:00:00+00:00".into(),
+        let r = ScriptResponse::from_listing(
+            listing(
+                "xrpc.query:com.example.get-photos",
+                "lua",
+                "function handle() end",
             ),
             &lua_installed(),
         );
         assert!(!r.recreatable);
     }
 
+    /// A job saved before `.test` was refused keeps its row: it still
+    /// resolves by exact id and still lists, it just can't be recreated.
     #[test]
-    fn from_row_parses_outbound_xrpcs_and_tolerates_garbage() {
-        let ok = ScriptResponse::from_row(
-            (
-                "record.create:com.example.thing".into(),
-                "lua".into(),
-                String::new(),
-                None,
-                Some(r#"["com.example.foo"]"#.into()),
-                "2026-01-01T00:00:00+00:00".into(),
-                "2026-01-01T00:00:00+00:00".into(),
-            ),
+    fn from_listing_marks_a_job_ending_in_test_not_recreatable() {
+        let r = ScriptResponse::from_listing(
+            listing("job.run:nightly.test", "lua", "function handle() end"),
             &lua_installed(),
         );
+        assert!(!r.recreatable);
+        assert!(r.runnable);
+    }
+
+    /// The outbound list reaches the response as the catalog parsed it. The
+    /// corrupt-column case is pinned where the parse lives, by
+    /// `a_corrupt_outbound_column_reads_as_none_rather_than_failing`.
+    #[test]
+    fn from_listing_carries_outbound_xrpcs_through() {
+        let mut l = listing("record.create:com.example.thing", "lua", "");
+        l.outbound_xrpcs = Some(vec!["com.example.foo".into()]);
+        let r = ScriptResponse::from_listing(l, &lua_installed());
         assert_eq!(
-            ok.outbound_xrpcs.as_deref(),
+            r.outbound_xrpcs.as_deref(),
             Some(&["com.example.foo".to_string()][..])
         );
-
-        let garbage = ScriptResponse::from_row(
-            (
-                "record.create:com.example.thing".into(),
-                "lua".into(),
-                String::new(),
-                None,
-                Some("not json".into()),
-                "2026-01-01T00:00:00+00:00".into(),
-                "2026-01-01T00:00:00+00:00".into(),
-            ),
-            &lua_installed(),
-        );
-        assert_eq!(garbage.outbound_xrpcs, None);
     }
 
     #[test]
-    fn from_row_reports_needs_migration_for_a_lua_script() {
-        let r = ScriptResponse::from_row(
-            (
-                "xrpc.query:com.example.list".into(),
-                "lua".into(),
-                "function handle()\n  return params.q\nend\n".into(),
-                None,
-                None,
-                "2026-01-01T00:00:00+00:00".into(),
-                "2026-01-01T00:00:00+00:00".into(),
+    fn from_listing_carries_the_layer_through() {
+        let mut l = listing(
+            "xrpc.query:com.example.list",
+            "lua",
+            "function handle() end",
+        );
+        l.layer = crate::catalog::Layer::Project;
+        l.path = Some(std::path::PathBuf::from(
+            "src/lexicons/com/example/list.lua",
+        ));
+        l.shadows_stored = true;
+        l.created_at = None;
+        l.updated_at = None;
+        let r = ScriptResponse::from_listing(l, &lua_installed());
+        assert_eq!(r.layer, crate::catalog::Layer::Project);
+        assert_eq!(r.path.as_deref(), Some("src/lexicons/com/example/list.lua"));
+        assert!(r.shadows_stored);
+        assert_eq!(r.created_at, None);
+        assert_eq!(r.updated_at, None);
+    }
+
+    #[test]
+    fn from_listing_reports_needs_migration_for_a_lua_script() {
+        let r = ScriptResponse::from_listing(
+            listing(
+                "xrpc.query:com.example.list",
+                "lua",
+                "function handle()\n  return params.q\nend\n",
             ),
             &lua_installed(),
         );
@@ -877,16 +784,12 @@ mod tests {
     }
 
     #[test]
-    fn from_row_needs_migration_is_empty_for_a_non_lua_script() {
-        let r = ScriptResponse::from_row(
-            (
-                "xrpc.query:com.example.list".into(),
-                "javascript".into(),
-                "function handle() { return params.q; }".into(),
-                None,
-                None,
-                "2026-01-01T00:00:00+00:00".into(),
-                "2026-01-01T00:00:00+00:00".into(),
+    fn from_listing_needs_migration_is_empty_for_a_non_lua_script() {
+        let r = ScriptResponse::from_listing(
+            listing(
+                "xrpc.query:com.example.list",
+                "javascript",
+                "function handle() { return params.q; }",
             ),
             &lua_installed(),
         );

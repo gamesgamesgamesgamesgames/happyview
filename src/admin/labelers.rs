@@ -32,6 +32,7 @@ pub(super) async fn list(
         .into_iter()
         .map(
             |(did, status, cursor, created_at, updated_at)| LabelerSummary {
+                declared: state.config.declares_labeler(&did),
                 did,
                 status,
                 cursor,
@@ -145,6 +146,12 @@ pub(super) async fn delete(
     Path(did): Path<String>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::LabelersDelete).await?;
+
+    if state.config.declares_labeler(&did) {
+        return Err(AppError::Conflict(format!(
+            "labeler {did} is declared in happyview.toml; remove it from the file instead"
+        )));
+    }
 
     let backend = state.db_backend;
     let delete_sql = adapt_sql(

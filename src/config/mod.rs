@@ -1,8 +1,18 @@
-use std::env;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::db::DatabaseBackend;
+
+pub mod declarations;
+pub mod project;
+pub mod vars;
+
+pub use project::ConfigMode;
+use project::ProjectConfig;
+use std::collections::BTreeMap;
+use std::env;
+use vars::var;
 
 /// Placeholder session secrets that have shipped in this repo's docs/examples.
 /// Booting with any of them is refused — the cookie signing key is derived from
@@ -118,6 +128,27 @@ pub fn parse_job_worker_concurrency(raw: Option<&str>) -> usize {
         .unwrap_or(1)
 }
 
+/// Parse `SUPERADMIN_DID`, the account seeded as a super user at boot.
+/// Unset or blank seeds nobody and leaves the first-login bootstrap in
+/// charge.
+pub fn parse_superadmin_did(raw: Option<&str>) -> Result<Option<String>, String> {
+    let trimmed = match raw.map(str::trim) {
+        None | Some("") => return Ok(None),
+        Some(s) => s,
+    };
+    atrium_api::types::string::Did::new(trimmed.to_string())
+        .map(|did| Some(did.as_str().to_string()))
+        .map_err(|e| format!("SUPERADMIN_DID is not a valid DID ('{trimmed}'): {e}"))
+}
+
+/// Environment entries whose name and value are both UTF-8; the rest cannot
+/// name a configuration variable and must not abort boot.
+pub fn utf8_env(
+    entries: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> impl Iterator<Item = (String, String)> {
+    entries.filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub host: String,
@@ -132,7 +163,7 @@ pub struct Config {
     pub telemetry_collector_url: String,
     pub relay_url: String,
     pub plc_url: String,
-    pub static_dir: String,
+    pub static_dir: Option<String>,
     pub base_path: Option<String>,
     pub event_log_retention_days: u32,
     pub app_name: Option<String>,
@@ -151,6 +182,13 @@ pub struct Config {
     /// Number of background job workers. 1 unless `JOB_WORKER_CONCURRENCY` says
     /// otherwise.
     pub job_worker_concurrency: usize,
+    /// The account seeded as a super user at boot, from `SUPERADMIN_DID` or
+    /// the project's `[instance] superadmin`.
+    pub superadmin_did: Option<String>,
+    /// The project directory, when this instance serves one.
+    pub project_root: Option<PathBuf>,
+    /// The project's `happyview.toml`, when it has one.
+    pub project: Option<Arc<ProjectConfig>>,
 }
 
 /// `PLUGIN_CACHE_DIR` when set; otherwise a `plugin-cache` directory beside
@@ -169,39 +207,105 @@ pub fn plugin_cache_dir(override_dir: Option<String>, database_url: &str) -> Opt
 }
 
 impl Config {
+    /// Build the configuration for this process. `HAPPYVIEW_PROJECT` names
+    /// a project root; without it the instance runs from the environment
+    /// alone, as it always has.
+    pub fn load() -> Result<Self, project::ProjectConfigError> {
+        let root = env::var_os("HAPPYVIEW_PROJECT")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        Self::load_from(root.as_deref(), ConfigMode::Serve)
+    }
+
+    pub fn load_from(
+        root: Option<&Path>,
+        mode: ConfigMode,
+    ) -> Result<Self, project::ProjectConfigError> {
+        Self::load_from_with(root, mode, |_| Vec::new())
+    }
+
+    /// Install the project's settings as the layer beneath the environment,
+    /// then read the configuration through it. `defaults` sees the merged
+    /// environment-and-file view and answers values to place beneath both:
+    /// they live in the layer, never in the process environment, so
+    /// environment > file > defaults holds for every reader.
+    pub fn load_from_with(
+        root: Option<&Path>,
+        mode: ConfigMode,
+        defaults: impl FnOnce(&BTreeMap<String, String>) -> Vec<(String, String)>,
+    ) -> Result<Self, project::ProjectConfigError> {
+        let project = match root {
+            Some(root) => project::load_project_config(root)?,
+            None => None,
+        };
+        let mut layer = project
+            .as_ref()
+            .map(|p| p.env_layer(mode))
+            .unwrap_or_default();
+        let mut view: BTreeMap<String, String> = layer.clone();
+        view.extend(utf8_env(env::vars_os()));
+        for (name, value) in defaults(&view) {
+            layer.entry(name).or_insert(value);
+        }
+        vars::set_project_layer(layer);
+        // An unusable superadmin must not read as "none configured": that
+        // would hand the first login the admin role.
+        if let Err(message) = parse_superadmin_did(var("SUPERADMIN_DID").as_deref()) {
+            return Err(project::ProjectConfigError::InvalidSetting { message });
+        }
+        if let Some(message) = project
+            .as_ref()
+            .and_then(|p| p.version_mismatch(crate::version::version()))
+        {
+            tracing::warn!("{message}");
+        }
+        let mut config = Self::from_env();
+        config.project_root = root.map(Path::to_path_buf);
+        config.project = project.map(Arc::new);
+        Ok(config)
+    }
+
+    pub fn declares_labeler(&self, did: &str) -> bool {
+        self.project
+            .as_deref()
+            .is_some_and(|p| p.declares_labeler(did))
+    }
+
+    pub fn declares_network_lexicon(&self, nsid: &str) -> bool {
+        self.project
+            .as_deref()
+            .is_some_and(|p| p.declares_network_lexicon(nsid))
+    }
+
     pub fn from_env() -> Self {
-        let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-        let database_backend = env::var("DATABASE_BACKEND")
-            .ok()
+        let database_url = var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let database_backend = var("DATABASE_BACKEND")
             .and_then(|s| DatabaseBackend::from_str(&s))
             .unwrap_or_else(|| DatabaseBackend::from_url(&database_url));
 
-        let public_url = env::var("PUBLIC_URL").expect("PUBLIC_URL must be set");
+        let public_url = var("PUBLIC_URL").expect("PUBLIC_URL must be set");
 
         Self {
-            host: env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into()),
-            port: env::var("PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(3000),
-            plugin_cache_dir: plugin_cache_dir(env::var("PLUGIN_CACHE_DIR").ok(), &database_url),
+            host: var("HOST").unwrap_or_else(|| "0.0.0.0".into()),
+            port: var("PORT").and_then(|p| p.parse().ok()).unwrap_or(3000),
+            plugin_cache_dir: plugin_cache_dir(var("PLUGIN_CACHE_DIR"), &database_url),
             database_url,
             database_backend,
             sqlite_journal_size_limit: crate::db::journal_size_limit_bytes(),
-            user_agent: build_user_agent(env::var("HAPPYVIEW_USER_AGENT").ok(), &public_url),
+            user_agent: build_user_agent(var("HAPPYVIEW_USER_AGENT"), &public_url),
             public_url,
             // Not required and never defaulted to a placeholder: an unset,
             // insecure, or too-short value is surfaced via `config_errors()` and
             // disables cookie auth rather than aborting boot. See C3.
-            session_secret: env::var("SESSION_SECRET").unwrap_or_default(),
-            jetstream_url: env::var("JETSTREAM_URL")
-                .unwrap_or_else(|_| "wss://jetstream1.us-east.bsky.network".into()),
-            telemetry_collector_url: env::var("TELEMETRY_COLLECTOR_URL")
-                .unwrap_or_else(|_| "https://telemetry.happyview.dev/v1/snapshot".to_string()),
-            relay_url: env::var("RELAY_URL").unwrap_or_else(|_| "https://bsky.network".into()),
-            plc_url: env::var("PLC_URL").unwrap_or_else(|_| "https://plc.directory".into()),
-            static_dir: env::var("STATIC_DIR").unwrap_or_else(|_| "./web/out".into()),
-            base_path: env::var("BASE_PATH").ok().and_then(|s| {
+            session_secret: var("SESSION_SECRET").unwrap_or_default(),
+            jetstream_url: var("JETSTREAM_URL")
+                .unwrap_or_else(|| "wss://jetstream1.us-east.bsky.network".into()),
+            telemetry_collector_url: var("TELEMETRY_COLLECTOR_URL")
+                .unwrap_or_else(|| "https://telemetry.happyview.dev/v1/snapshot".to_string()),
+            relay_url: var("RELAY_URL").unwrap_or_else(|| "https://bsky.network".into()),
+            plc_url: var("PLC_URL").unwrap_or_else(|| "https://plc.directory".into()),
+            static_dir: var("STATIC_DIR").filter(|s| !s.is_empty()),
+            base_path: var("BASE_PATH").and_then(|s| {
                 let s = s.trim_end_matches('/').to_string();
                 if s.is_empty() {
                     None
@@ -211,16 +315,15 @@ impl Config {
                     Some(s)
                 }
             }),
-            event_log_retention_days: std::env::var("EVENT_LOG_RETENTION_DAYS")
-                .ok()
+            event_log_retention_days: var("EVENT_LOG_RETENTION_DAYS")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
-            app_name: env::var("APP_NAME").ok(),
-            logo_uri: env::var("LOGO_URI").ok(),
-            tos_uri: env::var("TOS_URI").ok(),
-            policy_uri: env::var("POLICY_URI").ok(),
+            app_name: var("APP_NAME"),
+            logo_uri: var("LOGO_URI"),
+            tos_uri: var("TOS_URI"),
+            policy_uri: var("POLICY_URI"),
             token_encryption_key: match parse_token_encryption_key(
-                env::var("TOKEN_ENCRYPTION_KEY").ok().as_deref(),
+                var("TOKEN_ENCRYPTION_KEY").as_deref(),
             ) {
                 Ok(key) => key,
                 Err(reason) => {
@@ -233,16 +336,14 @@ impl Config {
                     None
                 }
             },
-            default_rate_limit_capacity: env::var("DEFAULT_RATE_LIMIT_CAPACITY")
-                .ok()
+            default_rate_limit_capacity: var("DEFAULT_RATE_LIMIT_CAPACITY")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100),
-            default_rate_limit_refill_rate: env::var("DEFAULT_RATE_LIMIT_REFILL_RATE")
-                .ok()
+            default_rate_limit_refill_rate: var("DEFAULT_RATE_LIMIT_REFILL_RATE")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2.0),
             platform_api_key_hash: match parse_platform_api_key_hash(
-                env::var("PLATFORM_API_KEY_HASH").ok().as_deref(),
+                var("PLATFORM_API_KEY_HASH").as_deref(),
             ) {
                 Ok(hash) => hash,
                 Err(reason) => {
@@ -253,8 +354,17 @@ impl Config {
                 }
             },
             job_worker_concurrency: parse_job_worker_concurrency(
-                env::var("JOB_WORKER_CONCURRENCY").ok().as_deref(),
+                var("JOB_WORKER_CONCURRENCY").as_deref(),
             ),
+            superadmin_did: match parse_superadmin_did(var("SUPERADMIN_DID").as_deref()) {
+                Ok(did) => did,
+                Err(reason) => {
+                    tracing::error!("{reason}. No superadmin is seeded until it is fixed.");
+                    None
+                }
+            },
+            project_root: None,
+            project: None,
         }
     }
 
@@ -309,6 +419,14 @@ impl Config {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::env;
+
+    struct EnvGuard(&'static str);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe { env::remove_var(self.0) };
+        }
+    }
 
     unsafe fn clear_env() {
         for key in [
@@ -329,11 +447,14 @@ mod tests {
             "BASE_PATH",
             "PLATFORM_API_KEY_HASH",
             "JOB_WORKER_CONCURRENCY",
+            "SUPERADMIN_DID",
+            "HAPPYVIEW_PROJECT",
         ] {
             unsafe {
                 env::remove_var(key);
             }
         }
+        vars::set_project_layer(std::collections::BTreeMap::new());
     }
 
     unsafe fn set_required_env() {
@@ -388,7 +509,7 @@ mod tests {
             jetstream_url: String::new(),
             relay_url: String::new(),
             plc_url: String::new(),
-            static_dir: String::new(),
+            static_dir: None,
             base_path: None,
             event_log_retention_days: 30,
             app_name: None,
@@ -402,11 +523,142 @@ mod tests {
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
+            superadmin_did: None,
+            project_root: None,
+            project: None,
         };
         assert_eq!(
             config.listen_addr(),
             "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    #[serial]
+    fn load_from_a_missing_root_refuses() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let root = env::temp_dir().join(format!("hv-missing-{}", uuid::Uuid::new_v4()));
+        let err = Config::load_from(Some(&root), ConfigMode::Serve).unwrap_err();
+        assert!(
+            matches!(err, project::ProjectConfigError::RootNotFound { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn load_from_a_root_without_the_file_has_no_project_config() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let dir = project::TempProject::new(None);
+        let config = Config::load_from(Some(dir.path()), ConfigMode::Serve).unwrap();
+        assert_eq!(config.project_root.as_deref(), Some(dir.path()));
+        assert!(config.project.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn load_from_applies_the_file_and_keeps_it() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let dir = project::TempProject::new(Some(
+            "[instance]\napp_name = \"Loaded\"\n[labels]\nsubscribe = [\"did:plc:lab1\"]\n",
+        ));
+        let config = Config::load_from(Some(dir.path()), ConfigMode::Serve).unwrap();
+        assert_eq!(config.app_name.as_deref(), Some("Loaded"));
+        assert!(config.declares_labeler("did:plc:lab1"));
+        assert!(!config.declares_network_lexicon("app.bsky.actor.profile"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_reads_the_root_from_happyview_project() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let dir = project::TempProject::new(Some("[instance]\napp_name = \"Via Env\"\n"));
+        let _unset = EnvGuard("HAPPYVIEW_PROJECT");
+        unsafe { env::set_var("HAPPYVIEW_PROJECT", dir.path()) };
+        let config = Config::load().unwrap();
+        assert_eq!(config.app_name.as_deref(), Some("Via Env"));
+    }
+
+    #[test]
+    #[serial]
+    fn load_without_a_project_is_from_env() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::remove_var("HAPPYVIEW_PROJECT");
+        }
+        let _reset = vars::LayerReset;
+        let config = Config::load().unwrap();
+        assert!(config.project_root.is_none() && config.project.is_none());
+        assert!(!config.declares_labeler("did:plc:anything"));
+    }
+
+    #[test]
+    #[serial]
+    fn defaults_sit_beneath_the_file_and_the_environment() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let _unset = EnvGuard("APP_NAME");
+        let dir = project::TempProject::new(Some("[instance]\napp_name = \"File\"\n"));
+        let defaults = |_: &BTreeMap<String, String>| {
+            vec![
+                ("APP_NAME".to_string(), "Default".to_string()),
+                ("BASE_PATH".to_string(), "/from-default".to_string()),
+            ]
+        };
+
+        // A default is used when neither the environment nor the file sets it.
+        let config = Config::load_from_with(Some(dir.path()), ConfigMode::Serve, defaults).unwrap();
+        assert_eq!(config.base_path.as_deref(), Some("/from-default"));
+        // The file beats a default.
+        assert_eq!(config.app_name.as_deref(), Some("File"));
+        // The environment beats both, and defaults never reach it.
+        unsafe { env::set_var("APP_NAME", "Env") };
+        let config = Config::load_from_with(Some(dir.path()), ConfigMode::Serve, defaults).unwrap();
+        assert_eq!(config.app_name.as_deref(), Some("Env"));
+        assert!(env::var("BASE_PATH").is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn defaults_see_the_merged_view() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let dir = project::TempProject::new(Some("[instance]\napp_name = \"File\"\n"));
+        let mut seen = None;
+        Config::load_from_with(Some(dir.path()), ConfigMode::Serve, |view| {
+            seen = Some((
+                view.get("APP_NAME").cloned(),
+                view.get("DATABASE_URL").cloned(),
+            ));
+            Vec::new()
+        })
+        .unwrap();
+        let (app, db) = seen.unwrap();
+        assert_eq!(app.as_deref(), Some("File"));
+        assert!(db.is_some(), "the process environment is part of the view");
     }
 
     #[test]
@@ -721,7 +973,7 @@ mod tests {
             jetstream_url: String::new(),
             relay_url: String::new(),
             plc_url: String::new(),
-            static_dir: String::new(),
+            static_dir: None,
             base_path: None,
             event_log_retention_days: 30,
             app_name: None,
@@ -735,6 +987,9 @@ mod tests {
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
+            superadmin_did: None,
+            project_root: None,
+            project: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com");
     }
@@ -753,7 +1008,7 @@ mod tests {
             jetstream_url: String::new(),
             relay_url: String::new(),
             plc_url: String::new(),
-            static_dir: String::new(),
+            static_dir: None,
             base_path: Some("/hv".into()),
             event_log_retention_days: 30,
             app_name: None,
@@ -767,6 +1022,9 @@ mod tests {
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
+            superadmin_did: None,
+            project_root: None,
+            project: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -785,7 +1043,7 @@ mod tests {
             jetstream_url: String::new(),
             relay_url: String::new(),
             plc_url: String::new(),
-            static_dir: String::new(),
+            static_dir: None,
             base_path: Some("/hv".into()),
             event_log_retention_days: 30,
             app_name: None,
@@ -799,6 +1057,9 @@ mod tests {
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
+            superadmin_did: None,
+            project_root: None,
+            project: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -817,7 +1078,7 @@ mod tests {
             jetstream_url: String::new(),
             relay_url: String::new(),
             plc_url: String::new(),
-            static_dir: String::new(),
+            static_dir: None,
             base_path: Some("/hv".into()),
             event_log_retention_days: 30,
             app_name: None,
@@ -831,6 +1092,9 @@ mod tests {
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
+            superadmin_did: None,
+            project_root: None,
+            project: None,
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),
@@ -879,7 +1143,7 @@ mod tests {
             jetstream_url: String::new(),
             relay_url: String::new(),
             plc_url: String::new(),
-            static_dir: String::new(),
+            static_dir: None,
             base_path: None,
             event_log_retention_days: 30,
             app_name: None,
@@ -893,6 +1157,9 @@ mod tests {
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
+            superadmin_did: None,
+            project_root: None,
+            project: None,
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),
@@ -959,5 +1226,181 @@ mod tests {
         let config = Config::from_env();
         assert_eq!(config.platform_api_key_hash, None);
         assert_eq!(config.job_worker_concurrency, 1);
+    }
+
+    /// `Config::from_env` with `toml` installed as the project layer, then
+    /// the layer cleared again.
+    fn from_project(toml: &str, mode: project::ConfigMode) -> Config {
+        let _reset = vars::LayerReset;
+        let parsed = project::parse_project_config(toml, Path::new(project::PROJECT_FILE)).unwrap();
+        vars::set_project_layer(parsed.env_layer(mode));
+        Config::from_env()
+    }
+
+    const APP_NAME_TOML: &str = "[instance]\napp_name = \"From The File\"\n";
+    const SUPERADMIN_TOML: &str = "[instance]\nsuperadmin = \"did:plc:fromthefile\"\n";
+    const PORT_TOML: &str = "[dev]\nport = 4100\n";
+
+    #[test]
+    #[serial]
+    fn app_name_comes_from_the_file_when_the_env_is_unset() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let config = from_project(APP_NAME_TOML, project::ConfigMode::Serve);
+        assert_eq!(config.app_name.as_deref(), Some("From The File"));
+    }
+
+    #[test]
+    #[serial]
+    fn app_name_env_wins_over_the_file() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("APP_NAME", "From Env");
+        }
+        let config = from_project(APP_NAME_TOML, project::ConfigMode::Serve);
+        assert_eq!(config.app_name.as_deref(), Some("From Env"));
+    }
+
+    #[test]
+    #[serial]
+    fn an_empty_app_name_env_still_wins_over_the_file() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("APP_NAME", "");
+        }
+        let config = from_project(APP_NAME_TOML, project::ConfigMode::Serve);
+        assert_eq!(config.app_name.as_deref(), Some(""));
+    }
+
+    #[test]
+    #[serial]
+    fn superadmin_comes_from_the_file_when_the_env_is_unset() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let config = from_project(SUPERADMIN_TOML, project::ConfigMode::Serve);
+        assert_eq!(
+            config.superadmin_did.as_deref(),
+            Some("did:plc:fromthefile")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn superadmin_env_wins_over_the_file() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("SUPERADMIN_DID", "did:plc:fromenv");
+        }
+        let config = from_project(SUPERADMIN_TOML, project::ConfigMode::Serve);
+        assert_eq!(config.superadmin_did.as_deref(), Some("did:plc:fromenv"));
+    }
+
+    #[test]
+    #[serial]
+    fn an_invalid_superadmin_env_refuses_boot() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("SUPERADMIN_DID", "alice.bsky.social");
+        }
+        let _reset = vars::LayerReset;
+        let err = Config::load_from(None, ConfigMode::Serve).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("SUPERADMIN_DID"), "{message}");
+        assert!(message.contains("alice.bsky.social"), "{message}");
+    }
+
+    #[test]
+    #[serial]
+    fn an_invalid_superadmin_in_the_file_refuses_boot() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let root = env::temp_dir().join(format!("hv-sa-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(project::PROJECT_FILE),
+            "[instance]\nsuperadmin = \"not-a-did\"\n",
+        )
+        .unwrap();
+        let result = Config::load_from(Some(&root), ConfigMode::Serve);
+        std::fs::remove_dir_all(&root).ok();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn a_blank_superadmin_env_is_unset() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("SUPERADMIN_DID", "  ");
+        }
+        let _reset = vars::LayerReset;
+        let config = Config::load_from(None, ConfigMode::Serve).unwrap();
+        assert_eq!(config.superadmin_did, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_environment_entries_are_skipped() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![0x66, 0xff, 0x6f]);
+        let kept: Vec<_> = utf8_env(
+            vec![
+                ("GOOD".into(), "yes".into()),
+                (bad.clone(), "v".into()),
+                ("BADVAL".into(), bad),
+            ]
+            .into_iter(),
+        )
+        .collect();
+        assert_eq!(kept, vec![("GOOD".to_string(), "yes".to_string())]);
+    }
+
+    #[test]
+    #[serial]
+    fn port_comes_from_the_dev_section_only_in_dev() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        assert_eq!(from_project(PORT_TOML, project::ConfigMode::Dev).port, 4100);
+        assert_eq!(
+            from_project(PORT_TOML, project::ConfigMode::Serve).port,
+            3000
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn port_env_wins_over_the_dev_section() {
+        unsafe {
+            clear_env();
+            set_required_env();
+            env::set_var("PORT", "5000");
+        }
+        assert_eq!(from_project(PORT_TOML, project::ConfigMode::Dev).port, 5000);
+    }
+
+    #[test]
+    fn superadmin_did_parsing() {
+        assert_eq!(parse_superadmin_did(None), Ok(None));
+        assert_eq!(parse_superadmin_did(Some("  ")), Ok(None));
+        assert_eq!(
+            parse_superadmin_did(Some(" did:plc:abc ")),
+            Ok(Some("did:plc:abc".to_string()))
+        );
+        assert!(parse_superadmin_did(Some("alice.bsky.social")).is_err());
     }
 }

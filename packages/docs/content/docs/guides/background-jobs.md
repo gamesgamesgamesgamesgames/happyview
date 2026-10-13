@@ -16,6 +16,8 @@ Job scripts are created from the [dashboard](../getting-started/dashboard.md) (S
 
 In the dashboard, select **Job** as the trigger source, then type a job type name. The type name is a free-form string that must match `/^[a-z0-9][a-z0-9._-]*$/` (max 128 characters). The resulting trigger id is `job.run:<type>`; for example, `job.run:export` or `job.run:data.migrate`.
 
+A job type may not end in `.test`, because in a project a file such as `src/jobs/<type>.test.lua` is a test, not a job script. A job script saved under such a type before this rule existed keeps running, but no new script can be created under such a type.
+
 ### Trigger grammar
 
 | Trigger          | Fires when                                              |

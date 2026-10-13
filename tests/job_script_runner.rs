@@ -534,3 +534,25 @@ async fn a_job_with_inherited_auth_acts_as_its_creator() {
     );
     assert!(error.contains("DPoP session"), "{error}");
 }
+
+#[tokio::test]
+#[serial]
+async fn a_project_script_runs_a_job_ahead_of_its_row() {
+    common::require_db!();
+    require_echo!();
+    let app = app().await;
+    seed_script(&app, TYPE, "row").await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        &format!("job.run:{TYPE}"),
+        "project",
+        "src/jobs/test.probe.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let id = seed_job(&app, TYPE, &json!({})).await;
+    let row = run_to_completion(&app, &id).await;
+    assert_eq!(row.status, "completed", "job error: {:?}", row.error);
+    assert_eq!(result_of(&row)["source"], "project");
+}

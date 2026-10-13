@@ -75,7 +75,7 @@ pub async fn load_plugin_secrets(
 
     // Fall back to environment variables
     let prefix = secret_env_prefix(plugin_id);
-    std::env::vars()
+    crate::config::utf8_env(std::env::vars_os())
         .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|name| (name.to_string(), v)))
         .collect()
 }

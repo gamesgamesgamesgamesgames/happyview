@@ -1,7 +1,7 @@
 // tests/plugin_executor.rs
 
+use happyview::catalog::LexiconCatalog;
 use happyview::db::DatabaseBackend;
-use happyview::lexicon::LexiconRegistry;
 use happyview::plugin::{
     ExecutionError, LoadedPlugin, PluginExecutor, PluginInfo, PluginManifest, PluginRegistry,
     PluginSource, WasmRuntime,
@@ -20,7 +20,7 @@ async fn create_test_executor() -> (PluginExecutor, Arc<PluginRegistry>) {
 
     let runtime = Arc::new(WasmRuntime::new().expect("Failed to create runtime"));
     let registry = Arc::new(PluginRegistry::new());
-    let lexicons = Arc::new(LexiconRegistry::new());
+    let lexicons = Arc::new(LexiconCatalog::detached());
     let http_client = reqwest::Client::new();
 
     let executor = PluginExecutor::new(

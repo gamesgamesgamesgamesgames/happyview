@@ -9,8 +9,8 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::AppState;
+use crate::catalog::LexiconCatalog;
 use crate::config::Config;
-use crate::lexicon::LexiconRegistry;
 
 /// An in-memory SQLite pool. `max_connections(1)` is required: every
 /// connection to `sqlite::memory:` gets its own private database, so a larger
@@ -246,7 +246,7 @@ pub fn test_state_with_pool_on(
         jetstream_url: String::new(),
         relay_url: String::new(),
         plc_url: String::new(),
-        static_dir: String::new(),
+        static_dir: None,
         base_path: None,
         event_log_retention_days: 30,
         app_name: None,
@@ -262,6 +262,9 @@ pub fn test_state_with_pool_on(
         plugin_cache_dir: None,
         platform_api_key_hash: None,
         job_worker_concurrency: 1,
+        superadmin_did: None,
+        project_root: None,
+        project: None,
     };
     let (tx, _) = watch::channel(vec![]);
     let (labeler_tx, _) = watch::channel(());
@@ -298,6 +301,7 @@ pub fn test_state_with_pool_on(
         http_client: crate::http_retry::HappyViewHttpClient::default(),
     })
     .expect("test OAuth client");
+    let project = crate::project::shared_empty();
     AppState {
         config,
         http: reqwest::Client::new(),
@@ -306,7 +310,9 @@ pub fn test_state_with_pool_on(
         db_backend: backend,
         records: crate::record_store::RecordStore::new(pool.clone(), backend),
         domain_cache: crate::domain::DomainCache::new(),
-        lexicons: LexiconRegistry::new(),
+        lexicons: LexiconCatalog::new(project.clone()),
+        scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
+        project,
         collections_tx: tx,
         labeler_subscriptions_tx: labeler_tx,
         labeler_subscription_cache: Arc::new(crate::labeler::SubscriptionCache::default()),

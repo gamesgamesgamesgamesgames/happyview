@@ -89,7 +89,7 @@ mod tests {
     use super::*;
     use crate::lexicon::{ParsedLexicon, ProcedureAction};
     use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
-    use crate::test_support::{memory_pool, test_state_with_pool};
+    use crate::test_support::test_state_with_pool;
     use http_body_util::BodyExt;
     use serde_json::json;
 
@@ -127,30 +127,20 @@ mod tests {
     }
 
     async fn seed_script(state: &AppState, trigger: &str, body: &str) {
-        crate::db::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS happyview_scripts (
-                id          TEXT PRIMARY KEY,
-                body        TEXT NOT NULL,
-                description TEXT,
-                script_type TEXT NOT NULL DEFAULT 'lua',
-                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        state
+            .scripts
+            .put_manual(
+                &state.db,
+                state.db_backend,
+                crate::catalog::ScriptWrite {
+                    id: trigger.to_string(),
+                    script_type: "lua".to_string(),
+                    body: body.to_string(),
+                    description: None,
+                },
             )
-            "#,
-        )
-        .execute(&state.db)
-        .await
-        .unwrap();
-        crate::db::query(
-            "INSERT OR REPLACE INTO happyview_scripts (id, body, script_type, created_at, updated_at)
-             VALUES (?, ?, 'lua', datetime('now'), datetime('now'))",
-        )
-        .bind(trigger)
-        .bind(body)
-        .execute(&state.db)
-        .await
-        .unwrap();
+            .await
+            .expect("seed script");
     }
 
     fn lexicon(id: &str, lexicon_type: LexiconType) -> ParsedLexicon {
@@ -205,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_local_script_returns_json() {
-        let state = test_state_with_pool(memory_pool().await);
+        let state = test_state_with_pool(crate::test_support::migrated_memory_pool().await);
         if !echo_interpreter(&state).await {
             return;
         }
@@ -226,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_local_script_receives_params_as_input() {
-        let state = test_state_with_pool(memory_pool().await);
+        let state = test_state_with_pool(crate::test_support::migrated_memory_pool().await);
         if !echo_interpreter(&state).await {
             return;
         }
@@ -246,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_local_script_receives_the_caller_in_ctx() {
-        let state = test_state_with_pool(memory_pool().await);
+        let state = test_state_with_pool(crate::test_support::migrated_memory_pool().await);
         if !echo_interpreter(&state).await {
             return;
         }
@@ -280,7 +270,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_rejects_procedure_lexicon() {
-        let state = test_state_with_pool(memory_pool().await);
+        let state = test_state_with_pool(crate::test_support::migrated_memory_pool().await);
         state
             .lexicons
             .upsert(lexicon("test.create", LexiconType::Procedure))
@@ -298,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn procedure_rejects_query_lexicon() {
-        let state = test_state_with_pool(memory_pool().await);
+        let state = test_state_with_pool(crate::test_support::migrated_memory_pool().await);
         state
             .lexicons
             .upsert(lexicon("test.echo", LexiconType::Query))

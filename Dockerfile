@@ -34,6 +34,7 @@ ENV SQLX_OFFLINE=true
 RUN cargo build --release && rm -rf src target/release/.fingerprint/happyview-*
 
 # Build application code
+COPY build.rs ./
 COPY src/ src/
 COPY crates/ crates/
 COPY migrations/ migrations/
@@ -45,18 +46,8 @@ ENV HAPPYVIEW_VERSION=$HAPPYVIEW_VERSION
 # compiling so crate metadata matches the tag this image is built from --
 # telemetry reported 0.1.0 fleet-wide for exactly this reason. Local builds
 # pass no build-arg and keep the repo version. See src/version.rs.
-RUN set -eu; \
-    v="${HAPPYVIEW_VERSION#v}"; \
-    if [ -n "$v" ]; then \
-      test "$(grep -c '^version = ' Cargo.toml)" = 1 \
-        || { echo "Cargo.toml: expected exactly one top-level 'version =' line" >&2; exit 1; }; \
-      sed -i "s|^version = .*|version = \"$v\"|" Cargo.toml; \
-      grep -qx "version = \"$v\"" Cargo.toml \
-        || { echo "Cargo.toml: version stamp failed" >&2; exit 1; }; \
-      echo "stamped Cargo.toml version = $v"; \
-    else \
-      echo "no HAPPYVIEW_VERSION build-arg; keeping repo version"; \
-    fi
+COPY scripts/stamp-version.sh scripts/stamp-version.sh
+RUN bash scripts/stamp-version.sh "${HAPPYVIEW_VERSION}"
 
 RUN cargo build --release
 
@@ -81,7 +72,6 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/happyview /usr/local/bin/happyview
 RUN chmod +x /usr/local/bin/happyview
-COPY migrations/ /app/migrations
 COPY --from=frontend /app/web/out /srv/static
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && touch /srv/static/.base-path-pending

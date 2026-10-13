@@ -52,11 +52,7 @@ pub fn parse_retention_hours(raw: Option<&str>) -> u32 {
 }
 
 pub fn retention_hours() -> u32 {
-    parse_retention_hours(
-        std::env::var("RECORD_TOMBSTONE_RETENTION_HOURS")
-            .ok()
-            .as_deref(),
-    )
+    parse_retention_hours(crate::config::vars::var("RECORD_TOMBSTONE_RETENTION_HOURS").as_deref())
 }
 
 /// A pending network write, as the tombstone check needs it.

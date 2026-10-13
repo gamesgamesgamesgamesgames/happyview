@@ -1,0 +1,193 @@
+//! What the configuration declares that has to exist as rows before any
+//! worker or request reads the tables involved. Every step here is
+//! idempotent and runs on every boot; failures are logged, not fatal,
+//! because an unreachable network or a database hiccup at boot should not
+//! keep the rest of the instance down.
+
+use sqlx::AnyPool;
+use tracing::{error, info};
+
+use super::Config;
+use crate::admin::auth::{SuperadminSeed, ensure_configured_superadmin};
+use crate::catalog::LexiconCatalog;
+use crate::db::DatabaseBackend;
+
+pub async fn apply_at_boot(
+    config: &Config,
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    http: &reqwest::Client,
+    lexicons: &LexiconCatalog,
+) {
+    apply_with(config, db, backend, lexicons, |nsid| async move {
+        crate::admin::network_lexicons::track_network_lexicon(
+            http,
+            &config.plc_url,
+            db,
+            backend,
+            lexicons,
+            &nsid,
+            None,
+            false,
+        )
+        .await
+    })
+    .await;
+}
+
+/// `apply_at_boot` with the per-NSID network-lexicon tracker injected, since
+/// the real one resolves over DNS.
+async fn apply_with<T, Fut>(
+    config: &Config,
+    db: &AnyPool,
+    backend: DatabaseBackend,
+    lexicons: &LexiconCatalog,
+    track: T,
+) where
+    T: Fn(String) -> Fut,
+    Fut: std::future::Future<
+            Output = Result<
+                crate::admin::network_lexicons::TrackedNetworkLexicon,
+                crate::error::AppError,
+            >,
+        >,
+{
+    if let Some(did) = config.superadmin_did.as_deref() {
+        match ensure_configured_superadmin(db, backend, did).await {
+            Ok(SuperadminSeed::Created) => info!(did, "created the configured superadmin"),
+            Ok(SuperadminSeed::Promoted) => info!(did, "promoted the configured superadmin"),
+            Ok(SuperadminSeed::Unchanged) => {}
+            Err(e) => error!(
+                did,
+                "could not seed the configured superadmin: {e}; no one can be bootstrapped as admin until seeding succeeds, restart to retry"
+            ),
+        }
+    }
+
+    let Some(project) = config.project.as_deref() else {
+        return;
+    };
+
+    match crate::labeler::ensure_declared_subscriptions(db, backend, &project.labels.subscribe)
+        .await
+    {
+        Ok(0) => {}
+        Ok(added) => info!(added, "subscribed to labelers declared in happyview.toml"),
+        Err(e) => error!("could not subscribe to the labelers declared in happyview.toml: {e}"),
+    }
+
+    if let Err(e) = crate::admin::network_lexicons::track_declared(
+        lexicons,
+        db,
+        backend,
+        &project.network_lexicons.include,
+        track,
+    )
+    .await
+    {
+        error!("could not read lexicons to apply happyview.toml's [network_lexicons]: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DatabaseBackend;
+    use crate::test_support::migrated_memory_pool;
+
+    /// The test state's `Config`, which is a complete literal; the state's
+    /// own pool is not used.
+    async fn config_with(superadmin: Option<&str>) -> Config {
+        let mut config = crate::test_support::test_state_with_pool_on(
+            crate::test_support::memory_pool().await,
+            DatabaseBackend::Sqlite,
+        )
+        .config;
+        config.superadmin_did = superadmin.map(str::to_string);
+        config
+    }
+
+    #[tokio::test]
+    async fn boot_subscribes_the_declared_labelers() {
+        let db = migrated_memory_pool().await;
+        let mut config = config_with(None).await;
+        config.project = Some(std::sync::Arc::new(
+            crate::config::project::parse_project_config(
+                "[labels]\nsubscribe = [\"did:plc:declared\"]\n",
+                std::path::Path::new("happyview.toml"),
+            )
+            .unwrap(),
+        ));
+        apply_at_boot(
+            &config,
+            &db,
+            DatabaseBackend::Sqlite,
+            &reqwest::Client::new(),
+            &crate::catalog::LexiconCatalog::detached(),
+        )
+        .await;
+        let row: Option<(String,)> =
+            crate::db::query_as("SELECT did FROM happyview_labeler_subscriptions WHERE did = ?")
+                .bind("did:plc:declared")
+                .fetch_optional(&db)
+                .await
+                .unwrap();
+        assert!(row.is_some());
+    }
+
+    #[tokio::test]
+    async fn boot_seeds_the_configured_superadmin() {
+        let db = migrated_memory_pool().await;
+        let config = config_with(Some("did:plc:boss")).await;
+        apply_at_boot(
+            &config,
+            &db,
+            DatabaseBackend::Sqlite,
+            &reqwest::Client::new(),
+            &crate::catalog::LexiconCatalog::detached(),
+        )
+        .await;
+        let row: Option<(i32,)> =
+            crate::db::query_as("SELECT is_super FROM happyview_users WHERE did = ?")
+                .bind("did:plc:boss")
+                .fetch_optional(&db)
+                .await
+                .unwrap();
+        assert_eq!(row, Some((1,)));
+    }
+
+    #[tokio::test]
+    async fn boot_hands_the_declared_network_lexicons_to_the_tracker() {
+        let db = migrated_memory_pool().await;
+        let mut config = config_with(None).await;
+        config.project = Some(std::sync::Arc::new(
+            crate::config::project::parse_project_config(
+                "[network_lexicons]\ninclude = [\"at.example.declared\"]\n",
+                std::path::Path::new("happyview.toml"),
+            )
+            .unwrap(),
+        ));
+        let seen = std::sync::Mutex::new(Vec::new());
+        apply_with(
+            &config,
+            &db,
+            DatabaseBackend::Sqlite,
+            &crate::catalog::LexiconCatalog::detached(),
+            |nsid| {
+                seen.lock().unwrap().push(nsid);
+                async {
+                    Ok(crate::admin::network_lexicons::TrackedNetworkLexicon {
+                        authority_did: "did:plc:x".into(),
+                        revision: 1,
+                        is_record: true,
+                    })
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["at.example.declared".to_string()]
+        );
+    }
+}

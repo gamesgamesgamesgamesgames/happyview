@@ -628,7 +628,9 @@ async fn postgres_records_survive_the_compact_upgrade() {
 /// The last migration before Phase 2a's tombstones.
 const PRE_TOMBSTONES_CUTOFF: &str = "20261009000003";
 
-/// The last migration of the tombstone release, the one the rollback leaves.
+/// The tombstone release's last migration. The rollback starts from that
+/// release rather than from the current set, so a later migration does not
+/// leave a row the previous release cannot account for.
 const TOMBSTONES_CUTOFF: &str = "20261010000001";
 
 /// The documented rollback from the tombstone release, then an upgrade again:
@@ -689,6 +691,7 @@ async fn assert_rollback_then_upgrade(pool: &AnyPool, migrations_dir: &str, sqli
         .expect("rev is back");
 
     let _ = std::fs::remove_dir_all(&previous_dir);
+    let _ = std::fs::remove_dir_all(&tombstones_dir);
 }
 
 #[tokio::test]

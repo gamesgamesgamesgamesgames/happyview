@@ -54,6 +54,8 @@ pub enum GraphError {
     NamespaceTaken { namespace: String, by: String },
     #[error("language '{language_id}' is already served by interpreter '{by}'")]
     LanguageIdTaken { language_id: String, by: String },
+    #[error("files ending in .{extension} are already run by interpreter '{by}'")]
+    ExtensionTaken { extension: String, by: String },
 }
 
 fn check_edge(

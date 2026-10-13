@@ -30,8 +30,21 @@ export interface Script {
   script_type: ScriptLanguage
   body: string
   description?: string | null
-  created_at: string
-  updated_at: string
+  /** `null` for a project script, which has no stored row. */
+  created_at: string | null
+  updated_at: string | null
+  /**
+   * `"project"` when a file in the instance's project defines this script.
+   * Such a script is read-only here: it changes by editing the file.
+   */
+  layer: "project" | "manual"
+  /** Project-relative file path, for a project script only. */
+  path: string | null
+  /**
+   * A dashboard script sits under this project file. It is kept untouched and
+   * runs again if the file is removed.
+   */
+  shadows_stored: boolean
   /**
    * `false` when this script's own trigger id would be refused if submitted
    * today — the NSID rules tightened after it was created. It still fires and

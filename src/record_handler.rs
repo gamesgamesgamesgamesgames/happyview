@@ -4,9 +4,9 @@ use std::sync::atomic::Ordering;
 use serde_json::Value;
 
 use crate::AppState;
-use crate::db::{adapt_sql, now_rfc3339};
+use crate::db::now_rfc3339;
 use crate::event_log::{EventLog, Severity, log_event};
-use crate::lexicon::{LexiconType, ParsedLexicon, ProcedureAction};
+use crate::lexicon::LexiconType;
 use crate::lua::RecordHookOutcome;
 
 /// The static collection we always include for lexicon schema updates.
@@ -356,122 +356,67 @@ pub async fn handle_lexicon_schema_event(
     did: &str,
     record: &RecordEvent,
 ) -> RecordOutcome {
-    let db = &state.db;
     let lexicons = &state.lexicons;
-    let collections_tx = &state.collections_tx;
     let nsid = &record.rkey;
 
-    let backend = state.db_backend;
-
-    // Check if this NSID is one we're tracking and the DID matches the authority.
-    let select_sql = adapt_sql(
-        "SELECT target_collection FROM happyview_lexicons WHERE id = ? AND source = 'network' AND authority_did = ?",
-        backend,
-    );
-    let tracked: Option<(Option<String>,)> = match crate::db::query_as(&select_sql)
-        .bind(nsid)
-        .bind(did)
-        .fetch_optional(db)
-        .await
-    {
-        Ok(tracked) => tracked,
-        Err(e) => {
-            tracing::warn!(nsid, error = %e, "failed to look up a network lexicon for its event");
-            return failed_write_outcome(&e);
-        }
+    // Only a tracked network lexicon, and only from the authority it resolved to.
+    let Some(tracked) = lexicons.get_network(nsid).await else {
+        return RecordOutcome::SchemaEvent;
     };
+    if tracked.authority_did.as_deref() != Some(did) {
+        return RecordOutcome::SchemaEvent;
+    }
 
-    let target_collection = match tracked {
-        Some((tc,)) => tc,
-        None => return RecordOutcome::SchemaEvent, // Not a tracked network lexicon.
+    let failed = |e: crate::catalog::NetworkWriteError| match e {
+        crate::catalog::NetworkWriteError::Invalid(message) => {
+            tracing::warn!(nsid, "failed to parse lexicon schema event: {message}");
+            RecordOutcome::Invalid
+        }
+        // Memory is left alone too, so it and the table still agree. The
+        // outcome says whether the caller should retry this event (the
+        // Jetstream worker does); nothing else will.
+        crate::catalog::NetworkWriteError::Db(e) => {
+            tracing::warn!(nsid, error = %e, "failed to apply lexicon schema event");
+            failed_write_outcome(&e)
+        }
     };
 
     match record.action.as_str() {
         "create" | "update" => {
-            let rec = match &record.record {
-                Some(r) => r,
-                None => return RecordOutcome::Invalid,
+            let Some(rec) = &record.record else {
+                return RecordOutcome::Invalid;
             };
-
-            let parsed = match ParsedLexicon::parse(
-                rec.clone(),
-                1,
-                target_collection.clone(),
-                ProcedureAction::Upsert,
-                None,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(nsid, "failed to parse lexicon schema event: {e}");
-                    return RecordOutcome::Invalid;
+            match lexicons
+                .refresh_network(&state.db, state.db_backend, nsid, rec.clone())
+                .await
+            {
+                Ok(Some(_)) => {
+                    tracing::info!(nsid, "updated network lexicon from network event");
+                    if lexicons.get_network(nsid).await.is_some_and(|l| {
+                        l.parsed.lexicon_type == crate::lexicon::LexiconType::Record
+                    }) {
+                        let _ = state
+                            .collections_tx
+                            .send(lexicons.get_record_collections().await);
+                    }
                 }
-            };
-
-            let is_record = parsed.lexicon_type == crate::lexicon::LexiconType::Record;
-
-            // Upsert into lexicons table with last_fetched_at.
-            let now = now_rfc3339();
-            let upsert_sql = adapt_sql(
-                r#"
-                INSERT INTO happyview_lexicons (id, lexicon_json, backfill, target_collection, source, authority_did, last_fetched_at, created_at)
-                VALUES (?, ?, 0, ?, 'network', ?, ?, ?)
-                ON CONFLICT (id) DO UPDATE SET
-                    lexicon_json = EXCLUDED.lexicon_json,
-                    target_collection = EXCLUDED.target_collection,
-                    last_fetched_at = ?,
-                    revision = happyview_lexicons.revision + 1,
-                    updated_at = ?
-                "#,
-                backend,
-            );
-            let lexicon_json = serde_json::to_string(rec).unwrap_or_default();
-            if let Err(e) = crate::db::retry_on_busy(|| {
-                crate::db::query(&upsert_sql)
-                    .bind(nsid)
-                    .bind(&lexicon_json)
-                    .bind(&target_collection)
-                    .bind(did)
-                    .bind(&now)
-                    .bind(&now)
-                    .bind(&now)
-                    .bind(&now)
-                    .execute(db)
-            })
+                Ok(None) => {}
+                Err(e) => return failed(e),
+            }
+        }
+        "delete" => match lexicons
+            .remove_network(&state.db, state.db_backend, nsid)
             .await
-            {
-                tracing::warn!(nsid, "failed to upsert lexicon from event: {e}");
-                return failed_write_outcome(&e);
-            }
-
-            lexicons.upsert(parsed).await;
-            tracing::info!(nsid, "updated network lexicon from network event");
-
-            if is_record {
-                let collections = lexicons.get_record_collections().await;
-                let _ = collections_tx.send(collections);
-            }
-        }
-        "delete" => {
-            // Remove from lexicons table and registry.
-            let delete_sql = adapt_sql("DELETE FROM happyview_lexicons WHERE id = ?", backend);
-            if let Err(e) =
-                crate::db::retry_on_busy(|| crate::db::query(&delete_sql).bind(nsid).execute(db))
-                    .await
-            {
-                // Leave the registry alone too, so it and the table still
-                // agree. The outcome says whether the caller should retry
-                // this event (the Jetstream worker does); nothing else will.
-                tracing::error!(nsid, error = %e, "failed to delete network lexicon from event");
-                return failed_write_outcome(&e);
-            }
-
-            let was_present = lexicons.remove(nsid).await;
-            if was_present {
+        {
+            Ok(true) => {
                 tracing::info!(nsid, "removed network lexicon from network delete event");
-                let collections = lexicons.get_record_collections().await;
-                let _ = collections_tx.send(collections);
+                let _ = state
+                    .collections_tx
+                    .send(lexicons.get_record_collections().await);
             }
-        }
+            Ok(false) => {}
+            Err(e) => return failed(e),
+        },
         _ => return RecordOutcome::Invalid,
     }
     RecordOutcome::SchemaEvent
@@ -481,8 +426,12 @@ pub async fn handle_lexicon_schema_event(
 mod tests {
     use super::*;
 
+    use crate::catalog::LexiconWrite;
+    use crate::db::adapt_sql;
+    use crate::lexicon::ParsedLexicon;
     use crate::lexicon::ProcedureAction;
     use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
+    use crate::project::{ProjectLexicon, ProjectSnapshot};
     use crate::test_support::test_state_with_pool;
 
     const NSID: &str = "com.example.thing";
@@ -530,8 +479,8 @@ mod tests {
         echo_interpreter(&state).await.then_some(state)
     }
 
-    /// A state with the record/script/event-log tables and `NSID` registered as
-    /// a record-type lexicon, so `handle_record_event` treats it as tracked.
+    /// A migrated state with `NSID` registered as a record-type lexicon, so
+    /// `handle_record_event` treats it as tracked.
     async fn tracked_state() -> AppState {
         let state = test_state_with_pool(crate::test_support::migrated_memory_pool().await);
         register_tracked_lexicon(&state).await;
@@ -878,14 +827,20 @@ mod tests {
     }
 
     async fn install_script(state: &AppState, trigger: &str, body: &str) {
-        crate::db::query(
-            "INSERT INTO happyview_scripts (id, body, script_type) VALUES (?, ?, 'lua')",
-        )
-        .bind(trigger)
-        .bind(body)
-        .execute(&state.db)
-        .await
-        .expect("install script");
+        state
+            .scripts
+            .put_manual(
+                &state.db,
+                state.db_backend,
+                crate::catalog::ScriptWrite {
+                    id: trigger.to_string(),
+                    script_type: "lua".to_string(),
+                    body: body.to_string(),
+                    description: None,
+                },
+            )
+            .await
+            .expect("install script");
     }
 
     /// Regression test for #80: a Jetstream delete for a tracked collection with
@@ -1586,11 +1541,184 @@ mod tests {
         }
     }
 
+    const NET: &str = "com.example.net";
+    const AUTHORITY: &str = "did:plc:authority";
+
+    fn net_json(description: &str) -> serde_json::Value {
+        serde_json::json!({
+            "lexicon": 1, "id": NET, "description": description,
+            "defs": { "main": { "type": "record", "key": "tid" } },
+        })
+    }
+
+    // Not `schema_event`: the module already has one, for an untracked NSID.
+    fn net_event(action: &str, record: Option<serde_json::Value>) -> RecordEvent {
+        RecordEvent {
+            did: AUTHORITY.to_string(),
+            collection: LEXICON_SCHEMA_COLLECTION.to_string(),
+            rkey: NET.to_string(),
+            action: action.to_string(),
+            record,
+            cid: None,
+            rev: None,
+        }
+    }
+
+    async fn network_state() -> AppState {
+        let state = test_state_with_pool(crate::test_support::migrated_memory_pool().await);
+        state
+            .lexicons
+            .put_network(
+                &state.db,
+                state.db_backend,
+                LexiconWrite {
+                    lexicon_json: net_json("v1"),
+                    backfill: false,
+                    target_collection: None,
+                    action: ProcedureAction::Upsert,
+                    token_cost: None,
+                    authority_did: Some(AUTHORITY.to_string()),
+                },
+            )
+            .await
+            .expect("seed a network lexicon");
+        state
+    }
+
+    #[tokio::test]
+    async fn a_schema_event_from_the_authority_refreshes_the_row_and_memory() {
+        let state = network_state().await;
+        assert_eq!(
+            handle_lexicon_schema_event(
+                &state,
+                AUTHORITY,
+                &net_event("update", Some(net_json("v2")))
+            )
+            .await,
+            RecordOutcome::SchemaEvent
+        );
+
+        let net = state.lexicons.get_network(NET).await.unwrap();
+        assert_eq!(
+            (net.parsed.revision, net.parsed.raw["description"].clone()),
+            (2, "v2".into())
+        );
+        let fresh = crate::catalog::LexiconCatalog::detached();
+        fresh.load_from_db(&state.db).await.unwrap();
+        assert_eq!(
+            fresh.get(NET).await.unwrap().revision,
+            2,
+            "the row moved too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schema_event_from_another_did_changes_nothing() {
+        let state = network_state().await;
+        let outcome = handle_lexicon_schema_event(
+            &state,
+            "did:plc:someone",
+            &net_event("update", Some(net_json("v2"))),
+        )
+        .await;
+        assert_eq!(outcome, RecordOutcome::SchemaEvent);
+        assert_eq!(
+            state
+                .lexicons
+                .get_network(NET)
+                .await
+                .unwrap()
+                .parsed
+                .revision,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schema_delete_from_the_authority_drops_the_row_and_memory() {
+        let state = network_state().await;
+        let outcome =
+            handle_lexicon_schema_event(&state, AUTHORITY, &net_event("delete", None)).await;
+        assert_eq!(outcome, RecordOutcome::SchemaEvent);
+        assert!(state.lexicons.get(NET).await.is_none());
+        let fresh = crate::catalog::LexiconCatalog::detached();
+        fresh.load_from_db(&state.db).await.unwrap();
+        assert!(fresh.get(NET).await.is_none());
+    }
+
+    /// The network row keeps refreshing under a file, so it is current when
+    /// the file goes; every read meanwhile answers the file.
+    #[tokio::test]
+    async fn a_schema_event_for_a_shadowed_network_lexicon_refreshes_the_row_only() {
+        let state = network_state().await;
+        let mut snap = ProjectSnapshot::empty();
+        snap.lexicons.insert(
+            NET.to_string(),
+            ProjectLexicon {
+                parsed: crate::lexicon::ParsedLexicon::parse(
+                    net_json("file"),
+                    0,
+                    None,
+                    ProcedureAction::Upsert,
+                    None,
+                )
+                .unwrap(),
+                path: "src/lexicons/com/example/net.json".into(),
+                backfill: false,
+            },
+        );
+        state.project.store(std::sync::Arc::new(snap));
+
+        let outcome = handle_lexicon_schema_event(
+            &state,
+            AUTHORITY,
+            &net_event("update", Some(net_json("v2"))),
+        )
+        .await;
+        assert_eq!(outcome, RecordOutcome::SchemaEvent);
+        assert_eq!(
+            state
+                .lexicons
+                .get_network(NET)
+                .await
+                .unwrap()
+                .parsed
+                .revision,
+            2
+        );
+        assert_eq!(
+            state.lexicons.get(NET).await.unwrap().raw["description"],
+            "file"
+        );
+    }
+
+    /// Tracks `schema_event`'s NSID as a network lexicon from its DID, so the
+    /// event reaches the database.
+    async fn track_schema_nsid(state: &AppState) {
+        state
+            .lexicons
+            .put_network(
+                &state.db,
+                state.db_backend,
+                crate::catalog::LexiconWrite {
+                    lexicon_json: schema_event("create").record.unwrap(),
+                    backfill: false,
+                    target_collection: None,
+                    action: ProcedureAction::Upsert,
+                    token_cost: None,
+                    authority_did: Some("did:plc:abc".to_string()),
+                },
+            )
+            .await
+            .expect("track the schema NSID");
+    }
+
     /// A schema event cannot be dropped because the database was down: the
     /// caller is told to retry it.
     #[tokio::test]
     async fn a_schema_event_during_an_outage_is_unavailable() {
         let state = tracked_state().await;
+        track_schema_nsid(&state).await;
         state.db.close().await;
         for action in ["create", "update", "delete"] {
             assert_eq!(
@@ -1604,10 +1732,14 @@ mod tests {
     #[tokio::test]
     async fn a_schema_event_whose_query_fails_is_errored() {
         let state = tracked_state().await;
-        crate::db::query("DROP TABLE happyview_lexicons")
-            .execute(&state.db)
-            .await
-            .expect("drop lexicons table");
+        track_schema_nsid(&state).await;
+        crate::db::query(&format!(
+            "DROP TABLE {}",
+            crate::catalog::lexicon_rows::TABLE
+        ))
+        .execute(&state.db)
+        .await
+        .expect("drop lexicons table");
         assert_eq!(
             handle_record_event(&state, &schema_event("create")).await,
             RecordOutcome::Errored

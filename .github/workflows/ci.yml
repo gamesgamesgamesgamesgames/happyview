@@ -70,11 +70,14 @@ jobs:
               - 'migrations/**'
               - 'tests/**'
               - 'Cargo.*'
+              - 'build.rs'
               - 'crates/**'
               - 'Dockerfile'
               - 'docker-compose*'
               - 'entrypoint.sh'
               - '.releaserc.json'
+              - 'dist-workspace.toml'
+              - '.github/build-setup.yml'
               # The guard scripts the jobs below run, and the jobs themselves:
               # a change that weakens a check has to face the suite it guards.
               - 'scripts/**'
@@ -394,7 +397,31 @@ jobs:
 
       - name: Build frontend
         working-directory: web
+        env:
+          NEXT_PUBLIC_BASE_PATH: /__HAPPYVIEW_BP__
         run: npm ci && npm run build
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: frontend
+
+      # Release builds compile the export into the binary, so the test binary
+      # must pass with the directory gone; otherwise it could be reading it
+      # from disk. The binary is run directly because cargo would rebuild (and
+      # fail) once the directory is missing.
+      - name: Test the embedded dashboard
+        run: |
+          set -euo pipefail
+          bin=$(cargo test --release --features embedded-dashboard --lib --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.kind[0] == "lib") | .executable' | tail -1)
+          if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+            echo "no lib test binary was built (got '$bin')" >&2
+            exit 1
+          fi
+          mv web/out web/out.aside
+          "$bin" dashboard::
+          mv web/out.aside web/out
 
   lint:
     needs: changes
@@ -415,11 +442,71 @@ jobs:
       - name: Check that a default build links no Lua interpreter
         run: bash scripts/check-no-native-lua.sh
 
+      - name: Check that nothing links OpenSSL
+        run: bash scripts/check-no-openssl.sh
+
+      - name: Version stamp
+        run: bash scripts/stamp-version.test.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Clippy (native Lua reference)
         run: cargo clippy --features lua-reference --all-targets -- -D warnings
+
+  # The release targets that no other job compiles. Windows proves the code
+  # builds without unix-only APIs; the musl binary is booted from an empty
+  # directory, which is what proves it carries its migrations and needs no
+  # system OpenSSL.
+  portability:
+    needs: changes
+    if: always() && (needs.changes.outputs.server == 'true' || (github.event_name == 'workflow_dispatch' && inputs.server))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: depot-windows-2022
+            target: x86_64-pc-windows-msvc
+          - runs-on: depot-ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: portability-${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --locked --bin happyview --target ${{ matrix.target }}
+
+      - name: Boot the static binary from an empty directory
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          bin="$PWD/target/${{ matrix.target }}/debug/happyview"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          dir="$(mktemp -d)"
+          cd "$dir"
+          DATABASE_URL="sqlite://$dir/hv.db?mode=rwc" \
+            PUBLIC_URL=http://127.0.0.1:3999 PORT=3999 HOST=127.0.0.1 \
+            JETSTREAM_URL=ws://127.0.0.1:9 PLUGIN_REGISTRY_URL=off \
+            "$bin" > "$dir/boot.log" 2>&1 &
+          for _ in $(seq 120); do
+            if curl -fsS http://127.0.0.1:3999/health; then exit 0; fi
+            sleep 1
+          done
+          cat "$dir/boot.log"
+          exit 1
 
   audit:
     needs: changes
@@ -642,7 +729,8 @@ jobs:
       && needs.frontend.result == 'success'
       && needs.playwright.result == 'success'
       && needs.lint.result == 'success'
-    needs: [changes, unit-tests, e2e-tests, frontend, playwright, lint]
+      && needs.portability.result == 'success'
+    needs: [changes, unit-tests, e2e-tests, frontend, playwright, lint, portability]
     runs-on: depot-ubuntu-24.04
     outputs:
       version: ${{ steps.semantic.outputs.version }}
@@ -665,15 +753,33 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
         run: npx -p semantic-release -p semantic-release-gha-output semantic-release
 
+  # Starts release.yml for the tag semantic-release just created. A job of its
+  # own so a failed dispatch is a visible red job that can be re-run, rather
+  # than a failure in `release` that would skip the image build for a version
+  # whose tag and GitHub release already exist. The PAT needs actions:write.
+  dispatch-native-release:
+    needs: release
+    if: needs.release.outputs.version != ''
+    runs-on: depot-ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Build native binaries
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
+        run: >-
+          gh workflow run release.yml
+          --repo "${{ github.repository }}"
+          --ref "v${{ needs.release.outputs.version }}"
+          -f tag="v${{ needs.release.outputs.version }}"
+
   # ---------------------------------------------------------------------------
-  # Build + Docker — compile per-platform, upload to GitHub release, push image
+  # Build + Docker — compile per-platform, push image
   # ---------------------------------------------------------------------------
   build:
     needs: release
     if: needs.release.outputs.version != ''
     runs-on: ${{ matrix.runs-on }}
     permissions:
-      contents: write
       packages: write
       id-token: write
     strategy:
@@ -707,15 +813,6 @@ jobs:
           cache-from: type=gha,scope=builder-${{ matrix.platform }}
           cache-to: type=gha,scope=builder-${{ matrix.platform }},mode=max,ignore-error=true
           outputs: type=local,dest=.
-
-      - name: Upload binary to release
-        env:
-          GH_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-        run: |
-          cp target/release/happyview happyview-linux-${{ matrix.arch }}
-          gh release upload "v${{ needs.release.outputs.version }}" \
-            happyview-linux-${{ matrix.arch }} \
-            --clobber
 
       - name: Prepare binary override
         run: |

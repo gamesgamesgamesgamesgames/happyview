@@ -9,7 +9,6 @@ use sqlx::pool::PoolOptions;
 use sqlx::query::{Query, QueryAs, QueryScalar};
 use sqlx::{Any, AssertSqlSafe, FromRow};
 use sqlx::{query as sqlx_query, query_as as sqlx_query_as, query_scalar as sqlx_query_scalar};
-use std::path::Path;
 use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
@@ -531,7 +530,7 @@ pub fn parse_journal_size_limit(raw: Option<&str>) -> u64 {
 
 /// Resolve the configured journal size limit from the environment.
 pub fn journal_size_limit_bytes() -> u64 {
-    parse_journal_size_limit(std::env::var("SQLITE_JOURNAL_SIZE_LIMIT").ok().as_deref())
+    parse_journal_size_limit(crate::config::vars::var("SQLITE_JOURNAL_SIZE_LIMIT").as_deref())
 }
 
 /// Parse `SQLITE_SYNCHRONOUS`. `NORMAL` is the default: in WAL mode a crash
@@ -556,7 +555,7 @@ pub fn parse_sqlite_synchronous(raw: Option<&str>) -> &'static str {
 
 /// Resolve the configured `synchronous` level from the environment.
 pub fn sqlite_synchronous() -> &'static str {
-    parse_sqlite_synchronous(std::env::var("SQLITE_SYNCHRONOUS").ok().as_deref())
+    parse_sqlite_synchronous(crate::config::vars::var("SQLITE_SYNCHRONOUS").as_deref())
 }
 
 /// Rows `ANALYZE` samples per index when `PRAGMA optimize` decides to run it.
@@ -622,6 +621,12 @@ fn with_sqlite_pragmas(
     })
 }
 
+/// Compiled in rather than read from `./migrations` at boot, so the binary
+/// migrates the same wherever it is run from. `build.rs` makes cargo rebuild
+/// when a migration file is added.
+pub(crate) static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
+pub(crate) static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
+
 /// Install sqlx's `Any` drivers and register the record store's SQLite
 /// functions (`record_store::sqlite_functions`), which must happen before
 /// the first SQLite connection opens. Call this, not
@@ -646,8 +651,7 @@ pub enum MigrateFailure {
 /// tables into the compact format if they are not yet
 /// (`record_store::upgrade::run`).
 pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
-    let max_connections = std::env::var("DATABASE_MAX_CONNECTIONS")
-        .ok()
+    let max_connections = crate::config::vars::var("DATABASE_MAX_CONNECTIONS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(match backend {
             DatabaseBackend::Sqlite => 16,
@@ -712,15 +716,10 @@ pub(crate) async fn connect_with(
             .expect("Failed to set busy timeout");
     }
 
-    // Run migrations from the appropriate directory
-    let migration_dir = match backend {
-        DatabaseBackend::Sqlite => "./migrations/sqlite",
-        DatabaseBackend::Postgres => "./migrations/postgres",
+    let migrator = match backend {
+        DatabaseBackend::Sqlite => &SQLITE_MIGRATIONS,
+        DatabaseBackend::Postgres => &POSTGRES_MIGRATIONS,
     };
-
-    let migrator = Migrator::new(Path::new(migration_dir))
-        .await
-        .unwrap_or_else(|e| panic!("Failed to load migrations from {migration_dir}: {e}"));
 
     let migrated: Result<(), MigrateFailure> = match backend {
         DatabaseBackend::Sqlite => {
@@ -731,7 +730,7 @@ pub(crate) async fn connect_with(
             }
             .await
         }
-        DatabaseBackend::Postgres => migrate_postgres(&pool, &migrator).await,
+        DatabaseBackend::Postgres => migrate_postgres(&pool, migrator).await,
     };
     migrated.unwrap_or_else(|e| panic!("Failed to run migrations: {e}"));
 
@@ -879,8 +878,7 @@ pub fn compute_backfill_pool_size(
     dids_per_pds: u32,
     resolution: u32,
 ) -> u32 {
-    std::env::var("BACKFILL_DATABASE_MAX_CONNECTIONS")
-        .ok()
+    crate::config::vars::var("BACKFILL_DATABASE_MAX_CONNECTIONS")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or_else(|| {
             needed_backfill_connections(pds, dids_per_pds, resolution)
@@ -892,16 +890,13 @@ pub fn compute_backfill_pool_size(
 pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPool {
     install_drivers();
 
-    let pds: u32 = std::env::var("BACKFILL_CONCURRENT_PDS")
-        .ok()
+    let pds: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_PDS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
-    let dids: u32 = std::env::var("BACKFILL_CONCURRENT_DIDS_PER_PDS")
-        .ok()
+    let dids: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_DIDS_PER_PDS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let resolution: u32 = std::env::var("BACKFILL_CONCURRENT_RESOLUTION")
-        .ok()
+    let resolution: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_RESOLUTION")
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
     let max_connections = compute_backfill_pool_size(backend, pds, dids, resolution);
@@ -939,6 +934,25 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use serial_test::serial;
+
+    /// Every migration file in the tree is compiled into the binary, so a
+    /// binary run outside its checkout migrates exactly as one run inside it.
+    #[test]
+    fn embedded_migrations_cover_every_file() {
+        for (dir, migrator) in [
+            ("migrations/sqlite", &super::SQLITE_MIGRATIONS),
+            ("migrations/postgres", &super::POSTGRES_MIGRATIONS),
+        ] {
+            let on_disk =
+                std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "sql"))
+                    .count();
+            assert!(on_disk > 0, "{dir} holds no migrations");
+            assert_eq!(migrator.iter().count(), on_disk, "{dir}");
+        }
+    }
 
     #[test]
     fn json_field_paths() {

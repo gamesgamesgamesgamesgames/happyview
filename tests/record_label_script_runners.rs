@@ -795,3 +795,128 @@ async fn a_missing_interpreter_dead_letters_once_and_does_not_wait() {
         "the run waited out a backoff: {elapsed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The project layer
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_project_script_answers_a_record_event_ahead_of_its_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    seed_script(&app, &format!("record.create:{NSID}"), "value:none").await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        &format!("record.create:{NSID}"),
+        "echo",
+        "src/lexicons/thing.create.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let body = json!({ "title": "Hello" });
+    let sent = replaced(
+        run_record_event_script(
+            &app.state,
+            RecordEventPayload {
+                record: Some(&body),
+                ..record_payload("create")
+            },
+        )
+        .await,
+    );
+    assert_eq!(sent["source"], "echo");
+}
+
+#[tokio::test]
+async fn a_project_script_answers_a_label_ahead_of_its_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    seed_script(&app, "labeler.apply:app.bsky.feed.post", "value:none").await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        "labeler.apply:app.bsky.feed.post",
+        "value:other",
+        "src/labels/app.bsky.feed.post.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    // The row would skip the label; the file waves it through.
+    let kept = continued(run_label_applied_script(&app.state, label_event()).await);
+    assert_eq!(kept.uri, LABEL_URI);
+}
+
+/// The only script bound after the failure is a project file, so a retry that
+/// still read the table would find nothing and answer 404.
+#[tokio::test]
+async fn retrying_a_dead_letter_runs_a_project_script() {
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    let trigger = format!("record.delete:{NSID}");
+    seed_script(&app, &trigger, "error:runtime").await;
+    let outcome = run_record_event_script(&app.state, record_payload("delete")).await;
+    assert_eq!(outcome, RecordHookOutcome::Proceed);
+
+    let sql = happyview::db::adapt_sql(
+        "DELETE FROM happyview_scripts WHERE id = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(&trigger)
+        .execute(&app.state.db)
+        .await
+        .expect("drop the row");
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        &trigger,
+        "value:none",
+        "src/lexicons/thing.delete.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let cookie = app.admin_cookie();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/dead-letters")
+                .header(cookie.0.clone(), cookie.1.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let list: Value = serde_json::from_slice(&bytes).unwrap();
+    let id = list["dead_letters"][0]["id"]
+        .as_str()
+        .expect("dead letter listed")
+        .to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/admin/dead-letters/{id}/retry"))
+                .header(cookie.0, cookie.1)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

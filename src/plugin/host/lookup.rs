@@ -109,7 +109,7 @@ mod tests {
             db,
             db_backend,
             http_client: reqwest::Client::new(),
-            lexicons: std::sync::Arc::new(crate::lexicon::LexiconRegistry::new()),
+            lexicons: std::sync::Arc::new(crate::catalog::LexiconCatalog::detached()),
         }
     }
 

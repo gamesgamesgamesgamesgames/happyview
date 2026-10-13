@@ -153,10 +153,7 @@ pub enum AppError {
 }
 
 fn unmigrated_script_message(globals: &[String]) -> String {
-    format!(
-        "script references removed globals: {} -- run the codemod first",
-        globals.join(", ")
-    )
+    crate::script::checks::unmigrated_message(globals)
 }
 
 impl std::fmt::Display for AppError {

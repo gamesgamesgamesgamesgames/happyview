@@ -151,6 +151,7 @@ export default function LexiconsPage() {
           options: [
             { label: "Manual", value: "manual" },
             { label: "Network", value: "network" },
+            { label: "Project", value: "project" },
           ],
         },
       },
@@ -222,7 +223,8 @@ export default function LexiconsPage() {
               </Link>
             </Button>
 
-            {hasPermission("lexicons:delete") && (
+            {hasPermission("lexicons:delete") &&
+              row.original.layer !== "project" && (
               <AlertDialog>
                 <AlertDialogTrigger asChild>
                   <Button

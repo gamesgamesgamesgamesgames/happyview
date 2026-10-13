@@ -122,14 +122,20 @@ export default function ScriptsPage() {
         header: ({ column }) => (
           <DataTableColumnHeader column={column} label="Kind" />
         ),
-        cell: ({ row }) =>
-          row.original.kind ? (
-            <Badge variant="outline">
-              {TRIGGER_KIND_LABELS[row.original.kind]}
-            </Badge>
-          ) : (
-            <Badge variant="destructive">malformed</Badge>
-          ),
+        cell: ({ row }) => (
+          <div className="flex gap-1">
+            {row.original.kind ? (
+              <Badge variant="outline">
+                {TRIGGER_KIND_LABELS[row.original.kind]}
+              </Badge>
+            ) : (
+              <Badge variant="destructive">malformed</Badge>
+            )}
+            {row.original.layer === "project" && (
+              <Badge variant="secondary">Project file</Badge>
+            )}
+          </div>
+        ),
         filterFn: (row, columnId, filterValue) => {
           if (!Array.isArray(filterValue) || filterValue.length === 0)
             return true;
@@ -235,7 +241,9 @@ export default function ScriptsPage() {
         ),
         cell: ({ row }) => (
           <span className="text-muted-foreground text-sm">
-            {new Date(row.original.updated_at).toLocaleString()}
+            {row.original.updated_at
+              ? new Date(row.original.updated_at).toLocaleString()
+              : null}
           </span>
         ),
         enableSorting: true,
@@ -277,7 +285,8 @@ export default function ScriptsPage() {
                 <Eye className="size-4" />
               </Link>
             </Button>
-            {hasPermission("scripts:manage") && (
+            {hasPermission("scripts:manage") &&
+              row.original.layer !== "project" && (
               <AlertDialog>
                 <AlertDialogTrigger asChild>
                   <Button

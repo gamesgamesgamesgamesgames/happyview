@@ -14,8 +14,8 @@ type Probe = (&'static str, &'static str, &'static str, i64);
 const PROBES: &[Probe] = &[
     (
         "lexicons",
-        "SELECT COUNT(*) FROM happyview_lexicons",
-        "SELECT COUNT(*) FROM happyview_lexicons WHERE created_at >= ?",
+        crate::catalog::lexicon_rows::COUNT_ALL_SQL,
+        crate::catalog::lexicon_rows::COUNT_CREATED_SINCE_SQL,
         1,
     ),
     (
@@ -26,8 +26,8 @@ const PROBES: &[Probe] = &[
     ),
     (
         "scripts",
-        "SELECT COUNT(*) FROM happyview_scripts",
-        "SELECT COUNT(*) FROM happyview_scripts WHERE updated_at >= ?",
+        crate::catalog::script_rows::COUNT_ALL_SQL,
+        crate::catalog::script_rows::COUNT_UPDATED_SINCE_SQL,
         1,
     ),
     (
@@ -121,34 +121,12 @@ mod tests {
 
     async fn pool_with_lexicons() -> sqlx::AnyPool {
         let pool = memory_pool().await;
-        crate::db::query(
-            "CREATE TABLE happyview_lexicons (
-                id TEXT PRIMARY KEY,
-                revision INTEGER NOT NULL DEFAULT 1,
-                lexicon_json TEXT NOT NULL,
-                backfill INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create lexicons");
+        crate::catalog::testing::create_bare_lexicons_table(&pool).await;
         pool
     }
 
     async fn add_lexicon(pool: &sqlx::AnyPool, nsid: &str, created_at: &str) {
-        let sql = crate::db::adapt_sql(
-            "INSERT INTO happyview_lexicons (id, lexicon_json, backfill, created_at)
-             VALUES (?, '{}', 0, ?)",
-            DatabaseBackend::Sqlite,
-        );
-        crate::db::query(&sql)
-            .bind(nsid)
-            .bind(created_at)
-            .execute(pool)
-            .await
-            .unwrap();
+        crate::catalog::testing::insert_bare_lexicon(pool, nsid, created_at).await;
     }
 
     #[tokio::test]

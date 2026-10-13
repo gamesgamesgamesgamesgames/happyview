@@ -505,9 +505,9 @@ pub async fn create_invite(
 mod tests {
     use super::*;
     use crate::AppState;
+    use crate::catalog::LexiconCatalog;
     use crate::config::Config;
     use crate::db::DatabaseBackend;
-    use crate::lexicon::LexiconRegistry;
     use serial_test::serial;
     use tokio::sync::watch;
 
@@ -541,7 +541,7 @@ mod tests {
             jetstream_url: String::new(),
             relay_url: String::new(),
             plc_url: String::new(),
-            static_dir: String::new(),
+            static_dir: None,
             base_path: None,
             event_log_retention_days: 30,
             app_name: None,
@@ -557,6 +557,9 @@ mod tests {
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
+            superadmin_did: None,
+            project_root: None,
+            project: None,
         };
         let (collections_tx, _) = watch::channel(vec![]);
         let (labeler_subscriptions_tx, _) = watch::channel(());
@@ -594,6 +597,8 @@ mod tests {
         })
         .expect("Failed to create test OAuth client");
 
+        let project = crate::project::shared_empty();
+
         let state = AppState {
             config,
             http: reqwest::Client::new(),
@@ -602,7 +607,9 @@ mod tests {
             db_backend: backend,
             records: crate::record_store::RecordStore::new(pool.clone(), backend),
             domain_cache: crate::domain::DomainCache::new(),
-            lexicons: LexiconRegistry::new(),
+            lexicons: LexiconCatalog::new(project.clone()),
+            scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
+            project,
             collections_tx,
             labeler_subscriptions_tx,
             labeler_subscription_cache: std::sync::Arc::new(
