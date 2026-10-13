@@ -25,7 +25,7 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `JETSTREAM_PROTOCOL` | no | `auto` | `auto` subscribes to the v2 stream (`/xrpc/network.bsky.jetstream.subscribeEvents`) and falls back to v1 (`/subscribe`) when the host answers 404. A fallback lasts until HappyView restarts. `v2` or `v1` uses only that one. Set `v1` for a v1-only host behind a proxy that answers the v2 path with something other than 404 (a 400, 403 or 502, say): `auto` does not fall back on those |
 | `JETSTREAM_COMPRESSION` | no | `true` | Receive v2 events zstd-compressed with the host's dictionary. When the dictionary cannot be fetched, or the host keeps refusing it, HappyView subscribes uncompressed instead. `false` always subscribes uncompressed. v1 is always uncompressed |
 | `JETSTREAM_WORKERS` | no | `8` | Workers applying events in parallel, 1 to 64. Larger values are capped at 64, and 0 or an invalid value uses 8 with a warning. A repo's events always go to the same worker, in order. A worker waits for each event's [record script](../guides/record-scripts.md), so slow scripts limit throughput; on Postgres, raise this to apply more repos at once. On SQLite writes take turns, so more workers help less. See [Real-time indexing](../reference/architecture.md#real-time-indexing) |
-| `JETSTREAM_API_KEY` | no | _(none)_ | Key for the Jetstream archive (`planSnapshot`, `getSegment`, `getBlock`), sent as `Authorization: Bearer`. Never sent to the live stream. Bluesky's hosted archive requires one: without it, `auto` backfills crawl instead of replaying |
+| `JETSTREAM_API_KEY` | no | _(none)_ | Key for the Jetstream archive (`planSnapshot`, `getSegment`, `getBlock`), sent as `Authorization: Bearer`. Never sent to the live stream. Bluesky's hosted archive requires one: without it, `auto` backfills crawl instead of replaying. Only used when `BACKFILL_SOURCE` or a job asks for replay |
 | `RELAY_URL` | no | `https://bsky.network` | Relay URL for [backfill](../guides/backfill.md) repo discovery |
 | `PLC_URL` | no | `https://plc.directory` | [PLC directory](https://github.com/did-method-plc/did-method-plc) URL for DID resolution |
 | `STATIC_DIR` | no | `./web/out` | Directory containing the built dashboard static assets |
@@ -47,7 +47,7 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `BACKFILL_CONCURRENT_RESOLUTION` | no | `100` | How many DID document lookups to run in parallel during PDS resolution. Overridden by database setting if set via admin API |
 | `BACKFILL_RETENTION_DAYS` | no | `28` | Days to keep per-repo detail data from completed backfill jobs. `0` to keep indefinitely. Overridden by database setting if set via admin API |
 | `BACKFILL_DISCOVERY_WINDOW` | no | `50000` | Most work units a backfill keeps queued at once. A unit is one repo under one collection it was discovered in (a repo found under two collections is two units). Discovery pauses while the queue is full and resumes as units finish, so a network backfill never stores the whole network's repo list |
-| `BACKFILL_SOURCE` | no | `auto` | Where backfill jobs read records: `auto` replays the Jetstream archive when `JETSTREAM_URL` has one it may use and otherwise crawls PDSes (an archive that requires a key, like Bluesky's, counts only when `JETSTREAM_API_KEY` is set); `replay`; `crawl`. A job can override it. See [Replay and crawl](../guides/backfill.md#replay-and-crawl) |
+| `BACKFILL_SOURCE` | no | `crawl` | Where collection backfills read records: `crawl` fetches each PDS; `replay` reads the Jetstream archive; `auto` replays when `JETSTREAM_URL` has an archive it may use and otherwise crawls (an archive that requires a key, like Bluesky's, counts only when `JETSTREAM_API_KEY` is set). Replay can only return what the archive holds, and some repos' history in Bluesky's archive starts later than their first record. Account backfills always crawl. `auto` or `replay` also turns on gap replay. A job can override it. See [Replay and crawl](../guides/backfill.md#replay-and-crawl) |
 | `BACKFILL_REPLAY_CONCURRENCY` | no | `8` | Archive blocks a replay job downloads at once, 1 to 64 |
 | `BACKFILL_REPLAY_DIR` | no | system temp dir + `/happyview-replay` | Where replay jobs spool archive segments, one at a time per job. A segment is capped at 1 GiB. Files older than 24 hours are removed when a replay job starts |
 | `BACKFILL_DATABASE_MAX_CONNECTIONS` | no | auto-calculated | Override the backfill connection pool size. Auto-calculated from concurrency settings if not set, capped at 16 on SQLite and 256 on Postgres |
@@ -88,7 +88,7 @@ SESSION_SECRET=change-me-in-production
 # JETSTREAM_COMPRESSION=true
 # JETSTREAM_WORKERS=8
 # JETSTREAM_API_KEY=
-# BACKFILL_SOURCE=auto
+# BACKFILL_SOURCE=crawl
 # BACKFILL_REPLAY_CONCURRENCY=8
 # BACKFILL_REPLAY_DIR=/var/tmp/happyview-replay
 # RELAY_URL=https://bsky.network

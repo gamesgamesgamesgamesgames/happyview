@@ -24,14 +24,18 @@ Progress counters (`total_repos`, `resolved_repos`, `processed_repos`, `total_re
 
 A backfill job reads records from one of two sources:
 
-- **Replay** reads the Jetstream archive. One read of the archive replaces a crawl of every PDS.
-- **Crawl** is the process described above: list repos from the relay, then fetch each one from its PDS.
+- **Crawl** is the process described above: list repos from the relay, then fetch each one from its PDS. It is the default.
+- **Replay** reads the Jetstream archive. It is an opt-in for collection backfills: one read of the archive replaces a crawl of every PDS.
 
-`BACKFILL_SOURCE` sets the default, and `POST /admin/backfill` takes a `source` that overrides it for one job. The values are `auto`, `replay` and `crawl`. `auto` is the default: a job replays when `JETSTREAM_URL` points at a Jetstream with an archive, and crawls when the archive answers 404 or 501 or can't be reached. It also crawls when the archive asks for a key (401 or 403) and `JETSTREAM_API_KEY` isn't set, and logs once that a key would let it replay. When a key is set and the archive refuses it, the job fails instead. A job created as `replay` fails instead of falling back to a crawl.
+Replay can only return what the archive holds. In Bluesky's archive, some repos' history starts later than their first record, so a replay can miss older records that a crawl finds. Use crawl when a backfill must be complete.
+
+Account backfills (a job with `dids`) always crawl. Planning works in whole archive blocks, so replaying a few accounts downloads far more than crawling their PDSes. A job with accounts and `source: "auto"`, or with no `source` while the default is `replay`, runs as a crawl. One with `source: "replay"` is refused with `400`.
+
+`BACKFILL_SOURCE` sets the default, and `POST /admin/backfill` takes a `source` that overrides it for one job. The values are `crawl` (the default), `auto` and `replay`. Unset or unrecognised, it means `crawl`. With `auto`, a collection backfill replays when `JETSTREAM_URL` points at a Jetstream with an archive, and crawls when the archive answers 404 or 501 or can't be reached. It also crawls when the archive asks for a key (401 or 403) and `JETSTREAM_API_KEY` isn't set, and logs once that a key would let it replay. When a key is set and the archive refuses it, the job fails instead. A job created as `replay` fails instead of falling back to a crawl.
 
 A replay job downloads in two sweeps:
 
-1. **Records.** The archive's commits for the job's collections, from the start of the archive to its newest sealed segment. A job with accounts only asks for those accounts.
+1. **Records.** The archive's commits for the job's collections, from the start of the archive to its newest sealed segment.
 2. **Accounts.** The account and sync events for the accounts that hold records in those collections.
 
 Account takedowns, deletions and repo resyncs are applied as of when they happened. A takedown from three days ago removes only what the account had at that time, so records it wrote since stay.
@@ -42,15 +46,15 @@ The job page shows `seq {n} of {tip}` while it runs, along with the bytes downlo
 
 A replay job stops and fails rather than run on through an archive outage. It stops after 16 blocks in a row that the archive didn't answer or answered with an HTTP error, with the error `the archive failed 16 blocks in a row; stopping (resume to continue)`. A block that arrives but doesn't decode, or is over a size cap, is recorded and skipped instead, and doesn't count towards the 16. A job also stops when a failed block can't be recorded, since a block that isn't recorded could never be retried. Either way it stops before it moves past the blocks in question.
 
-A failed replay job can be resumed like a paused one: it carries on from where it stopped, without downloading again what it had finished. Two exceptions need a new backfill instead. A job that stopped because its error log is full (10,000 failures) stops again on every resume. A job of specific accounts can't be resumed once its account list is gone, which happens when its details are cleared.
+A failed replay job can be resumed like a paused one: it carries on from where it stopped, without downloading again what it had finished. Two exceptions need a new backfill instead. A job that stopped because its error log is full (10,000 failures) stops again on every resume. An account replay job created before account backfills always crawled can't be resumed once its account list is gone, which happens when its details are cleared.
 
-Replay needs a Jetstream that serves the v2 archive. Bluesky's hosted archive, which the default `JETSTREAM_URL` points at, requires a key: without `JETSTREAM_API_KEY`, `auto` jobs crawl. If `JETSTREAM_API_KEY` is set, it is sent to the archive and nowhere else. Replay jobs spool each segment to `BACKFILL_REPLAY_DIR` while they decode it, up to 1 GiB per segment.
+Replay needs a Jetstream that serves the v2 archive. Bluesky's hosted archive, which the default `JETSTREAM_URL` points at, requires a key: without `JETSTREAM_API_KEY`, `auto` jobs crawl and `replay` jobs fail. If `JETSTREAM_API_KEY` is set, it is sent to the archive and nowhere else. Replay jobs spool each segment to `BACKFILL_REPLAY_DIR` while they decode it, up to 1 GiB per segment.
 
-Crawl stays available. It is what runs when the Jetstream has no archive, and `BACKFILL_SOURCE=crawl` keeps every job on it.
+Crawl is what runs by default, for every account backfill, and for `auto` jobs when the Jetstream has no archive HappyView may use.
 
 ### Gaps in the live stream
 
-When the live stream falls further behind than Jetstream keeps, Jetstream refuses the saved cursor (`CursorTooOld`). HappyView now replays the gap from the archive instead of skipping it. It resumes the live stream at the archive's newest sealed segment right away, and a replay job fills in the records between. The `jetstream.gap` event names that job in `replay_job_id`. If the archive can't be asked, or doesn't plan the gap within 30 seconds, HappyView resumes as before and a [backfill](#when-backfill-runs) is the way to recover what was missed. With `BACKFILL_SOURCE=crawl`, gaps are never replayed.
+When the live stream falls further behind than Jetstream keeps, Jetstream refuses the saved cursor (`CursorTooOld`). With `BACKFILL_SOURCE` set to `auto` or `replay`, HappyView replays the gap from the archive instead of skipping it. It resumes the live stream at the archive's newest sealed segment right away, and a replay job fills in the records between. The `jetstream.gap` event names that job in `replay_job_id`. If the archive can't be asked, or doesn't plan the gap within 30 seconds, HappyView resumes as before and a [backfill](#when-backfill-runs) is the way to recover what was missed. With `BACKFILL_SOURCE=crawl`, the default, gaps are never replayed.
 
 ### Rate limiting
 

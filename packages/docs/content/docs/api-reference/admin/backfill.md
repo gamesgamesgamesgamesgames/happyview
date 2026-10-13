@@ -91,9 +91,9 @@ curl -X POST http://127.0.0.1:3000/admin/backfill \
 | `collection` | string   | no       | Limit to a single collection (backfills all if omitted)                     |
 | `dids`       | string[] | no       | Accounts to backfill, as DIDs or handles (discovers all via relay if omitted) |
 | `did`        | string   | no       | A single account; kept for compatibility and added to `dids`                |
-| `source`     | string   | no       | `auto`, `replay` or `crawl`. Defaults to `BACKFILL_SOURCE`. See [Replay and crawl](../../guides/backfill.md#replay-and-crawl) |
+| `source`     | string   | no       | `crawl`, `replay` or `auto`. Defaults to `BACKFILL_SOURCE` (`crawl` unless set). A job with `dids` always crawls, and `replay` with `dids` is refused. See [Replay and crawl](../../guides/backfill.md#replay-and-crawl) |
 
-Every entry in `dids` must resolve, or the request fails with `400` listing each entry that did not and no job is created. Duplicates are ignored. A request can name at most 500 accounts. Any other `source` fails with `400` and the message `source must be one of auto, replay, crawl`.
+Every entry in `dids` must resolve, or the request fails with `400` listing each entry that did not and no job is created. Duplicates are ignored. A request can name at most 500 accounts. Any other `source` fails with `400` and the message `source must be one of auto, replay, crawl`. `source: "replay"` with `dids` fails with `400` and the message `replay is only available for collection backfills; account backfills always crawl`; account backfills crawl even when `BACKFILL_SOURCE` is `replay` or `auto`. A replay can only return what the archive holds: some repos' history in Bluesky's archive starts later than their first record. See [Replay and crawl](../../guides/backfill.md#replay-and-crawl).
 
 **Response**: `201 Created`
 
@@ -184,7 +184,7 @@ Returns `400` if the job is not currently running, or `404` if the job ID is not
 POST /admin/backfill/{id}/resume
 ```
 
-Resume a paused backfill job, or a failed replay job. The job status transitions back to `running`, its `error` is cleared, and processing continues from where it left off. A replay job carries on from the last plan entry it finished, so a job that failed on an archive outage, or after 16 failed blocks in a row, doesn't start over. A failed crawl job can't be resumed and returns `400`. So does a failed replay job of specific accounts whose account list is gone (it goes when the job's details are cleared), and a job that another request resumed first. A replay job that failed because its error log is full (10,000 failures) fails again when resumed; start a new backfill instead.
+Resume a paused backfill job, or a failed replay job. The job status transitions back to `running`, its `error` is cleared, and processing continues from where it left off. A replay job carries on from the last plan entry it finished, so a job that failed on an archive outage, or after 16 failed blocks in a row, doesn't start over. A failed crawl job can't be resumed and returns `400`. So does a failed replay job of specific accounts (created before account backfills always crawled) whose account list is gone (it goes when the job's details are cleared), and a job that another request resumed first. A replay job that failed because its error log is full (10,000 failures) fails again when resumed; start a new backfill instead.
 
 ```sh tab="cURL" tab-group="language"
 curl -X POST "http://127.0.0.1:3000/admin/backfill/$JOB_ID/resume" -H "$AUTH"
@@ -319,7 +319,7 @@ A replay job looks like this:
 }
 ```
 
-`source` is the source the job was created with. `auto` stays until the job's first request to the archive, then becomes `replay` or, for a Jetstream with no archive, `crawl`. `replay` is `null` for a crawl job. For a replay job, `after_seq` is where it started (`0`, or the last applied seq of a gap replay), `through_seq` and `tip_seq` are the running sweep's position and the tip it is working towards, `bytes` is what it has downloaded from the archive, and `blocks_failed` counts blocks that failed after retries. `through_seq` and `tip_seq` are `null` until the first plan answers.
+`source` is the source the job was created with; a job with accounts is always `crawl`. `auto` stays until the job's first request to the archive, then becomes `replay` or, for a Jetstream with no archive, `crawl`. `replay` is `null` for a crawl job. For a replay job, `after_seq` is where it started (`0`, or the last applied seq of a gap replay), `through_seq` and `tip_seq` are the running sweep's position and the tip it is working towards, `bytes` is what it has downloaded from the archive, and `blocks_failed` counts blocks that failed after retries. `through_seq` and `tip_seq` are `null` until the first plan answers.
 
 The `status` field tracks the overall job state (`running`, `pausing`, `paused`, `cancelling`, `cancelled`, `completed`, `failed`). The `stage` field tracks the current processing phase (`pending`, `discovering_repos`, `resolving_and_fetching`, `replaying`, `replaying_accounts`, `retrying_blocks`, `completed`, `failed`, `cancelled`). A replay job has no repo counters: `total_records` counts the records it has written. The `resolved_repos` counter tracks PDS resolution progress during the pipelined phase, while `processed_repos` tracks record fetching progress.
 
