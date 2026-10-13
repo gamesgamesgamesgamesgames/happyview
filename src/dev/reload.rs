@@ -9,30 +9,81 @@ use crate::dev::DevSession;
 
 /// Settings read once at startup. `state.config` is the boot copy, so an
 /// edit to one of these cannot take effect under a running server.
+///
+/// Not listed because a reload does reach them: `APP_NAME`, `LOGO_URI`,
+/// `TOS_URI`, `POLICY_URI` and `EVENT_LOG_RETENTION_DAYS` are read through
+/// `vars::var` per request (the instance-settings fallback), `JETSTREAM_*`
+/// protocol and compression are read at each connect, and `SUPERADMIN_DID`
+/// and the declarations are applied by the reload itself. `USER_AGENT` is
+/// derived from `PUBLIC_URL`, which is listed.
 pub fn restart_required(running: &Config, edited: &Config) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if running.host != edited.host {
-        out.push("HOST");
-    }
-    if running.port != edited.port {
-        out.push("PORT");
-    }
-    if running.database_url != edited.database_url {
-        out.push("DATABASE_URL");
-    }
-    if running.public_url != edited.public_url {
-        out.push("PUBLIC_URL");
-    }
-    if running.base_path != edited.base_path {
-        out.push("BASE_PATH");
-    }
-    if running.auto_backfill != edited.auto_backfill {
-        out.push("HAPPYVIEW_DEV_BACKFILL");
-    }
-    if running.plugin_dir != edited.plugin_dir {
-        out.push("PLUGIN_DIR");
-    }
-    out
+    let checks = [
+        ("HOST", running.host != edited.host),
+        ("PORT", running.port != edited.port),
+        ("DATABASE_URL", running.database_url != edited.database_url),
+        (
+            "DATABASE_BACKEND",
+            running.database_backend != edited.database_backend,
+        ),
+        (
+            "SQLITE_JOURNAL_SIZE_LIMIT",
+            running.sqlite_journal_size_limit != edited.sqlite_journal_size_limit,
+        ),
+        ("PUBLIC_URL", running.public_url != edited.public_url),
+        ("BASE_PATH", running.base_path != edited.base_path),
+        (
+            "SESSION_SECRET",
+            running.session_secret != edited.session_secret,
+        ),
+        (
+            "TOKEN_ENCRYPTION_KEY",
+            running.token_encryption_key != edited.token_encryption_key,
+        ),
+        (
+            "JETSTREAM_URL",
+            running.jetstream_url != edited.jetstream_url,
+        ),
+        ("RELAY_URL", running.relay_url != edited.relay_url),
+        ("PLC_URL", running.plc_url != edited.plc_url),
+        ("STATIC_DIR", running.static_dir != edited.static_dir),
+        (
+            "TELEMETRY_COLLECTOR_URL",
+            running.telemetry_collector_url != edited.telemetry_collector_url,
+        ),
+        (
+            "DEFAULT_RATE_LIMIT_CAPACITY",
+            running.default_rate_limit_capacity != edited.default_rate_limit_capacity,
+        ),
+        (
+            "DEFAULT_RATE_LIMIT_REFILL_RATE",
+            running.default_rate_limit_refill_rate != edited.default_rate_limit_refill_rate,
+        ),
+        (
+            "PLUGIN_CACHE_DIR",
+            running.plugin_cache_dir != edited.plugin_cache_dir,
+        ),
+        (
+            "PLATFORM_API_KEY_HASH",
+            running.platform_api_key_hash != edited.platform_api_key_hash,
+        ),
+        (
+            "JOB_WORKER_CONCURRENCY",
+            running.job_worker_concurrency != edited.job_worker_concurrency,
+        ),
+        (
+            "HAPPYVIEW_SCRIPT_ENV_FILE",
+            running.script_env_file != edited.script_env_file,
+        ),
+        (
+            "HAPPYVIEW_DEV_BACKFILL",
+            running.auto_backfill != edited.auto_backfill,
+        ),
+        ("PLUGIN_DIR", running.plugin_dir != edited.plugin_dir),
+    ];
+    checks
+        .into_iter()
+        .filter_map(|(name, changed)| changed.then_some(name))
+        .collect()
 }
 
 pub fn dropped_declarations(before: &ProjectConfig, after: &ProjectConfig) -> Vec<String> {
@@ -51,6 +102,27 @@ pub fn dropped_declarations(before: &ProjectConfig, after: &ProjectConfig) -> Ve
     labelers.chain(lexicons).collect()
 }
 
+/// The lines an edit earns, in the order they print.
+fn notices(running: &Config, edited: &Config, before: Option<&ProjectConfig>) -> Vec<String> {
+    let mut out = Vec::new();
+    let restart = restart_required(running, edited);
+    if !restart.is_empty() {
+        out.push(format!("restart required to apply: {}", restart.join(", ")));
+    }
+    let empty = ProjectConfig::default();
+    let dropped = dropped_declarations(
+        before.unwrap_or(&empty),
+        edited.project.as_deref().unwrap_or(&empty),
+    );
+    if !dropped.is_empty() {
+        out.push(format!(
+            "no longer declared in happyview.toml: {}; they stay until you delete them in the dashboard, which a restart allows",
+            dropped.join(", ")
+        ));
+    }
+    out
+}
+
 /// Reloads the file and applies what it adds. Removals are only reported:
 /// a production redeploy leaves a de-declared row in place too, and the
 /// admin API keeps judging "declared" from the boot configuration.
@@ -62,21 +134,8 @@ pub async fn reload(
     let edited =
         crate::dev::load_config(&session.root, &session.secrets).map_err(|e| e.to_string())?;
 
-    let restart = restart_required(&state.config, &edited);
-    if !restart.is_empty() {
-        println!("restart required to apply: {}", restart.join(", "));
-    }
-
-    let empty = ProjectConfig::default();
-    let dropped = dropped_declarations(
-        before.as_deref().unwrap_or(&empty),
-        edited.project.as_deref().unwrap_or(&empty),
-    );
-    if !dropped.is_empty() {
-        println!(
-            "no longer declared in happyview.toml: {}; they stay until you delete them in the dashboard, which a restart allows",
-            dropped.join(", ")
-        );
+    for line in notices(&state.config, &edited, before.as_deref()) {
+        println!("{line}");
     }
 
     crate::config::declarations::apply_at_boot(
@@ -119,9 +178,18 @@ mod tests {
         let mut edited = running.clone();
         edited.auto_backfill = !edited.auto_backfill;
         edited.plugin_dir = "./elsewhere".into();
+        edited.relay_url = "http://relay.invalid".into();
+        edited.job_worker_concurrency += 1;
+        edited.session_secret = "another-secret".into();
         assert_eq!(
             restart_required(&running, &edited),
-            vec!["HAPPYVIEW_DEV_BACKFILL", "PLUGIN_DIR"]
+            vec![
+                "SESSION_SECRET",
+                "RELAY_URL",
+                "JOB_WORKER_CONCURRENCY",
+                "HAPPYVIEW_DEV_BACKFILL",
+                "PLUGIN_DIR"
+            ]
         );
     }
 
@@ -176,6 +244,79 @@ mod tests {
         assert_eq!(
             before.unwrap().labels.subscribe,
             vec!["did:plc:added".to_string()]
+        );
+    }
+
+    fn session(dir: &std::path::Path) -> DevSession {
+        let secrets = crate::dev::secrets::load_or_create(&dir.join(".happyview")).unwrap();
+        DevSession {
+            root: dir.to_path_buf(),
+            public_url: String::new(),
+            secrets,
+            watch_mode: crate::dev::watch::WatchMode::Native,
+        }
+    }
+
+    async fn subscribed(state: &AppState, did: &str) -> bool {
+        crate::db::query_as::<(String,)>(
+            "SELECT did FROM happyview_labeler_subscriptions WHERE did = ?",
+        )
+        .bind(did)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap()
+        .is_some()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_parse_error_names_the_line_and_changes_nothing() {
+        let _reset = crate::config::vars::LayerReset;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("happyview.toml"), "[labels\n").unwrap();
+        let session = session(dir.path());
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let port = state.config.port;
+        let mut before = None;
+
+        let err = reload(&state, &session, &mut before).await.unwrap_err();
+
+        assert!(err.contains("happyview.toml:1"), "got: {err}");
+        assert!(before.is_none());
+        assert_eq!(state.config.port, port);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_removed_declaration_deletes_nothing() {
+        let _reset = crate::config::vars::LayerReset;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("happyview.toml");
+        std::fs::write(&file, "[labels]\nsubscribe = [\"did:plc:gone\"]\n").unwrap();
+        let session = session(dir.path());
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let mut before = None;
+        reload(&state, &session, &mut before).await.unwrap();
+        assert!(subscribed(&state, "did:plc:gone").await);
+
+        std::fs::write(&file, "").unwrap();
+        reload(&state, &session, &mut before).await.unwrap();
+
+        assert!(subscribed(&state, "did:plc:gone").await);
+    }
+
+    #[test]
+    fn a_startup_only_change_prints_the_restart_line() {
+        let running = base();
+        let mut edited = running.clone();
+        edited.public_url = "http://127.0.0.1:9".into();
+        assert_eq!(
+            notices(&running, &edited, None),
+            vec!["restart required to apply: PUBLIC_URL".to_string()]
         );
     }
 }

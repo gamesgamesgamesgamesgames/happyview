@@ -271,7 +271,25 @@ impl Config {
         for (name, value) in defaults(&view) {
             layer.entry(name).or_insert(value);
         }
+        // The checks below read through the layer, so the candidate has to be
+        // installed to be validated. A refused load restores the previous
+        // layer: a failed dev reload must not leave the rejected edit live
+        // for request-time readers. Validating against a private copy would
+        // mean a second lookup path beside `var`.
+        let previous = vars::project_layer();
         vars::set_project_layer(layer);
+        let result = Self::finish_load(root, mode, project);
+        if result.is_err() {
+            vars::set_project_layer(previous);
+        }
+        result
+    }
+
+    fn finish_load(
+        root: Option<&Path>,
+        mode: ConfigMode,
+        project: Option<project::ProjectConfig>,
+    ) -> Result<Self, project::ProjectConfigError> {
         // An unusable superadmin must not read as "none configured": that
         // would hand the first login the admin role.
         if let Err(message) = parse_superadmin_did(var("SUPERADMIN_DID").as_deref()) {
@@ -740,6 +758,29 @@ mod tests {
         let config = Config::load().unwrap();
         assert!(config.project_root.is_none() && config.project.is_none());
         assert!(!config.declares_labeler("did:plc:anything"));
+    }
+
+    /// A refused load must not leave its layer installed: request-time
+    /// readers would otherwise follow an edit the server rejected.
+    #[test]
+    #[serial]
+    fn a_refused_load_leaves_the_previous_layer() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let _unset = EnvGuard("APP_NAME");
+        let good = project::TempProject::new(Some("[instance]\napp_name = \"Before\"\n"));
+        Config::load_from(Some(good.path()), ConfigMode::Serve).unwrap();
+        assert_eq!(var("APP_NAME").as_deref(), Some("Before"));
+
+        // Refused only once the layer is installed, since `var` is what reads it.
+        let _superadmin = EnvGuard("SUPERADMIN_DID");
+        unsafe { env::set_var("SUPERADMIN_DID", "alice.bsky.social") };
+        let bad = project::TempProject::new(Some("[instance]\napp_name = \"After\"\n"));
+        assert!(Config::load_from(Some(bad.path()), ConfigMode::Serve).is_err());
+        assert_eq!(var("APP_NAME").as_deref(), Some("Before"));
     }
 
     #[test]
