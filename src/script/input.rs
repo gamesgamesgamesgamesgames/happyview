@@ -156,14 +156,29 @@ async fn load_env(state: &AppState) -> BTreeMap<String, String> {
     if let Some(path) = &state.config.script_env_file {
         match tokio::fs::read_to_string(path).await {
             Ok(text) => {
+                // A Windows editor's byte-order mark would otherwise become
+                // part of the first key, which a script then reads as nil.
+                let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+                let mut searched = 0;
                 for entry in dotenvy::from_read_iter(text.as_bytes()) {
                     match entry {
                         Ok((key, value)) => {
                             env.insert(key, value);
                         }
-                        Err(e) => tracing::warn!(
+                        // The error's text quotes the line, which is usually
+                        // a secret, so only its position is logged.
+                        Err(dotenvy::Error::LineParse(line, _)) => tracing::warn!(
                             path = %path.display(),
-                            error = %e,
+                            line = line_number(text, &line, &mut searched),
+                            "skipping an unparsable line in the script env file"
+                        ),
+                        Err(dotenvy::Error::Io(e)) => tracing::warn!(
+                            path = %path.display(),
+                            kind = %e.kind(),
+                            "could not read the script env file"
+                        ),
+                        Err(_) => tracing::warn!(
+                            path = %path.display(),
                             "skipping an unreadable line in the script env file"
                         ),
                     }
@@ -178,6 +193,27 @@ async fn load_env(state: &AppState) -> BTreeMap<String, String> {
         }
     }
     env
+}
+
+/// The 1-based line on which `logical` starts, searching line starts from
+/// `searched` onwards so a repeated bad line is not reported twice at the
+/// first one's position. dotenvy's parse error carries the line's text but
+/// not its number, and a quoted value can span several lines, so the text is
+/// matched rather than the entries counted. `None` when nothing matches.
+fn line_number(text: &str, logical: &str, searched: &mut usize) -> Option<usize> {
+    let mut start = *searched;
+    while start <= text.len() {
+        let at_line_start = start == 0 || text.as_bytes()[start - 1] == b'\n';
+        if at_line_start && text[start..].starts_with(logical) {
+            *searched = start + 1;
+            return Some(text[..start].matches('\n').count() + 1);
+        }
+        match text[start..].find('\n') {
+            Some(offset) => start += offset + 1,
+            None => break,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -229,6 +265,76 @@ mod tests {
         let mut state = state_with_one_variable().await;
         state.config.script_env_file = Some(std::path::PathBuf::from("/nonexistent/.env"));
         assert_eq!(load_env(&state).await["API_KEY"], "k");
+    }
+
+    /// A Windows editor's byte-order mark is not part of the first key.
+    #[tokio::test]
+    async fn a_byte_order_mark_does_not_rename_the_first_key() {
+        let mut state = state_with_one_variable().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".env");
+        std::fs::write(&file, "\u{feff}FIRST=one\nSECOND=two\n").unwrap();
+        state.config.script_env_file = Some(file);
+
+        let env = load_env(&state).await;
+        assert_eq!(env.get("FIRST").map(String::as_str), Some("one"));
+        assert_eq!(env["SECOND"], "two");
+        assert!(!env.keys().any(|k| k.contains('\u{feff}')));
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A malformed line is usually a secret with a typo in it, so the
+    /// warning names its file and line and never its text.
+    #[tokio::test]
+    async fn a_malformed_line_is_logged_by_number_not_by_text() {
+        let mut state = state_with_one_variable().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".env");
+        std::fs::write(
+            &file,
+            "# comment\nGOOD=1\nBAD KEY=sk-live-spaced\nLATER=2\nSECRET=\"sk-live-unterminated\n",
+        )
+        .unwrap();
+        state.config.script_env_file = Some(file);
+
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let env = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            load_env(&state).await
+        };
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+
+        assert_eq!(env["GOOD"], "1");
+        assert_eq!(env["LATER"], "2");
+        assert!(!log.contains("sk-live"), "a value reached the log: {log}");
+        assert!(log.contains("line=3"), "got: {log}");
+        assert!(log.contains("line=5"), "got: {log}");
+    }
+
+    #[test]
+    fn a_repeated_bad_line_is_numbered_where_it_occurs() {
+        let text = "A B=1\nOK=1\nA B=1\n";
+        let mut searched = 0;
+        assert_eq!(line_number(text, "A B=1", &mut searched), Some(1));
+        assert_eq!(line_number(text, "A B=1", &mut searched), Some(3));
+        assert_eq!(line_number(text, "A B=1", &mut searched), None);
     }
 
     /// Install a library under `id` and `namespace`. Its surface is seeded into
