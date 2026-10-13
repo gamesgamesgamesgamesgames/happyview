@@ -75,6 +75,8 @@ pub use types::{
 #[doc(hidden)]
 pub mod __private {
     pub use alloc::string::String;
+    #[cfg(target_arch = "wasm32")]
+    pub use dlmalloc::GlobalDlmalloc;
 }
 
 pub use serde_json;
