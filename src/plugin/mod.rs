@@ -319,6 +319,25 @@ impl PluginRegistry {
             }
         }
 
+        // A project file's extension is the only thing that picks its
+        // interpreter, so a second claim would make the choice depend on
+        // which plugin happened to load first. The loader cannot see the
+        // other installed plugins, which is why the check is here.
+        {
+            let existing = self.plugins.read().await;
+            for extension in plugin.extensions() {
+                if let Some(other) = existing
+                    .values()
+                    .find(|p| p.info.id != plugin.info.id && p.extensions().contains(&extension))
+                {
+                    return Err(GraphError::ExtensionTaken {
+                        extension: extension.to_string(),
+                        by: other.info.id.clone(),
+                    });
+                }
+            }
+        }
+
         let candidate = PluginNode::from(&plugin);
         let installed = self.nodes().await;
         graph::validate_install(&installed, &candidate)?;
@@ -607,6 +626,77 @@ mod tests {
                 wasm_bytes: vec![],
                 manifest: Some(manifest),
             })
+            .await
+            .unwrap();
+    }
+
+    /// A project file's extension picks the interpreter that runs it, so two
+    /// installed interpreters claiming one extension would make a file's
+    /// language a matter of install order.
+    #[tokio::test]
+    async fn installing_a_second_interpreter_for_one_extension_is_refused() {
+        let interpreter = |id: &str, language_id: &str, extra: serde_json::Value| {
+            let mut json = serde_json::json!({
+                "id": id, "name": id, "version": "1.0.0", "api_version": "2",
+                "plugin_type": "interpreter", "language_id": language_id,
+                "capabilities": [],
+            });
+            json.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let manifest: PluginManifest = serde_json::from_value(json).unwrap();
+            LoadedPlugin {
+                info: manifest.clone().into(),
+                source: PluginSource::File { path: id.into() },
+                wasm_bytes: vec![],
+                manifest: Some(manifest),
+            }
+        };
+
+        let registry = PluginRegistry::new();
+        registry
+            .install(interpreter(
+                "lua",
+                "lua",
+                serde_json::json!({"file_extension": "lua"}),
+            ))
+            .await
+            .unwrap();
+
+        // The incumbent claims `lua` only through its legacy field, which is
+        // still a claim.
+        let err = registry
+            .install(interpreter(
+                "moon",
+                "moon",
+                serde_json::json!({"extensions": ["moon", "lua"]}),
+            ))
+            .await
+            .expect_err("two interpreters claimed one extension");
+        assert_eq!(
+            err,
+            GraphError::ExtensionTaken {
+                extension: "lua".into(),
+                by: "lua".into(),
+            }
+        );
+        assert!(err.to_string().contains(".lua"), "{err}");
+
+        registry
+            .install(interpreter(
+                "moon",
+                "moon",
+                serde_json::json!({"extensions": ["moon"]}),
+            ))
+            .await
+            .unwrap();
+        // Reinstalling the incumbent with a wider claim is an upgrade.
+        registry
+            .install(interpreter(
+                "lua",
+                "lua",
+                serde_json::json!({"extensions": ["lua", "luau"]}),
+            ))
             .await
             .unwrap();
     }
