@@ -19,6 +19,9 @@ use crate::jetstream::archive::rows::{self, RowFilter, RowKinds};
 use crate::jetstream::archive::segment::{self, Row};
 
 const STALLED_PAGES: u32 = 5;
+/// Failed blocks in a row, across entries, after which the job stops rather
+/// than run on through an archive outage.
+const MAX_CONSECUTIVE_FAILURES: u32 = 16;
 
 pub(super) enum ReplayOutcome {
     Completed {
@@ -53,6 +56,12 @@ struct Run<'a> {
     /// In a network retry job, the collections a marker's DID must hold
     /// network records in for the marker to apply. `None` otherwise.
     held_only: Option<Vec<String>>,
+    /// The current entry's failed blocks (segment, block, message), recorded
+    /// once the entry is folded and before its cursor is saved. An entry the
+    /// job stops inside is redone on resume, so its failures are not.
+    entry_failures: Vec<(String, Option<u32>, String)>,
+    /// Blocks that failed since the last one that didn't.
+    consecutive_failures: u32,
 }
 
 pub(super) async fn run(
@@ -74,6 +83,8 @@ pub(super) async fn run(
         probing: source == "auto",
         download_dir: state.archive.download_dir.clone(),
         held_only: None,
+        entry_failures: Vec::new(),
+        consecutive_failures: 0,
     };
     sweep_downloads(&run.download_dir, job_id).await;
     let result = run.drive(collections, scope_dids).await;
@@ -384,10 +395,10 @@ impl Run<'_> {
     /// failed (recorded as `replay_block` errors). The fold is flushed before
     /// returning, so the caller can save the cursor past the entry.
     async fn entry(&mut self, entry: &PlanEntry, filter: &RowFilter) -> Result<i32, Halt> {
-        let mut failed = 0;
+        self.entry_failures.clear();
         match entry.mode {
             PlanMode::Segment => {
-                failed += self.whole_segment(&entry.name, filter).await?;
+                self.whole_segment(&entry.name, filter).await?;
             }
             PlanMode::Blocks => {
                 let indexes: Vec<u32> =
@@ -413,19 +424,18 @@ impl Run<'_> {
                     };
                     match rows {
                         Ok(rows) => self.fold_rows(rows, filter, &entry.name).await?,
-                        Err(e) => {
-                            self.block_failed(&entry.name, Some(i), &e).await;
-                            failed += 1;
-                        }
+                        Err(e) => self.block_failed(&entry.name, Some(i), &e)?,
                     }
                 }
             }
         }
         self.fold.flush().await.map_err(|e| Halt::Failed(e.0))?;
-        Ok(failed)
+        self.record_failures().await
     }
 
-    async fn whole_segment(&mut self, name: &str, filter: &RowFilter) -> Result<i32, Halt> {
+    /// Download and fold a whole segment. Its failures go to
+    /// `entry_failures`.
+    async fn whole_segment(&mut self, name: &str, filter: &RowFilter) -> Result<(), Halt> {
         if let Err(e) = tokio::fs::create_dir_all(&self.download_dir).await {
             return Err(Halt::Failed(format!(
                 "cannot create {}: {e}",
@@ -434,9 +444,8 @@ impl Run<'_> {
         }
         let path = self.download_dir.join(format!("{}-{name}", self.job_id));
         if let Err(e) = self.client.segment(name, &path).await {
-            self.block_failed(name, None, &e.to_string()).await;
             let _ = tokio::fs::remove_file(&path).await;
-            return Ok(1);
+            return self.block_failed(name, None, &e.to_string());
         }
         let opened = {
             let path = path.clone();
@@ -453,12 +462,10 @@ impl Run<'_> {
         let (mut file, index) = match opened {
             Ok(opened) => opened,
             Err(e) => {
-                self.block_failed(name, None, &e).await;
                 let _ = tokio::fs::remove_file(&path).await;
-                return Ok(1);
+                return self.block_failed(name, None, &e);
             }
         };
-        let mut failed = 0;
         for (i, entry) in index.into_iter().enumerate() {
             let (back, rows) = tokio::task::spawn_blocking(move || {
                 let rows = segment::read_block_frame(&mut file, &entry)
@@ -472,14 +479,17 @@ impl Run<'_> {
             match rows {
                 Ok(rows) => self.fold_rows(rows, filter, name).await?,
                 Err(e) => {
-                    self.block_failed(name, Some(i as u32), &e).await;
-                    failed += 1;
+                    if let Err(halt) = self.block_failed(name, Some(i as u32), &e) {
+                        drop(file);
+                        let _ = tokio::fs::remove_file(&path).await;
+                        return Err(halt);
+                    }
                 }
             }
         }
         drop(file);
         let _ = tokio::fs::remove_file(&path).await;
-        Ok(failed)
+        Ok(())
     }
 
     async fn fold_rows(
@@ -488,6 +498,8 @@ impl Run<'_> {
         filter: &RowFilter,
         segment: &str,
     ) -> Result<(), Halt> {
+        // The block arrived and decoded.
+        self.consecutive_failures = 0;
         let mut undecodable = 0u32;
         let mut first_error = None;
         for row in decoded {
@@ -533,26 +545,58 @@ impl Run<'_> {
         Ok(())
     }
 
-    async fn block_failed(&self, segment: &str, block: Option<u32>, message: &str) {
-        let phase = match block {
-            Some(i) => format!("replay_block:{i}"),
-            None => "replay_segment".to_string(),
-        };
+    /// Note a block (or, with no index, a whole segment) that failed, to be
+    /// recorded with its entry. Stops the job after
+    /// `MAX_CONSECUTIVE_FAILURES` in a row, inside the entry, so its cursor
+    /// is not saved and a resume refetches it.
+    fn block_failed(
+        &mut self,
+        segment: &str,
+        block: Option<u32>,
+        message: &str,
+    ) -> Result<(), Halt> {
         tracing::warn!(
             job_id = self.job_id,
             segment,
-            phase,
+            phase = phase(block),
             message,
             "replay block failed"
         );
-        let failure = BackfillFailure {
-            kind: BackfillErrorKind::ReplayBlock,
-            message: message.to_string(),
-            retry_after: None,
-        };
-        self.errors
-            .record(self.state, self.job_id, segment, None, &phase, &failure, 1)
-            .await;
+        self.entry_failures
+            .push((segment.to_string(), block, message.to_string()));
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            return Err(Halt::Failed(format!(
+                "the archive failed {MAX_CONSECUTIVE_FAILURES} blocks in a row; stopping (resume to continue)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record the current entry's failed blocks as `replay_block` errors and
+    /// return how many there were. A block whose row can't be stored would
+    /// never be retried, so that stops the job before its cursor moves past
+    /// the entry.
+    async fn record_failures(&mut self) -> Result<i32, Halt> {
+        let failures = std::mem::take(&mut self.entry_failures);
+        for (segment, block, message) in &failures {
+            let phase = phase(*block);
+            let failure = BackfillFailure {
+                kind: BackfillErrorKind::ReplayBlock,
+                message: message.clone(),
+                retry_after: None,
+            };
+            let stored = self
+                .errors
+                .record(self.state, self.job_id, segment, None, &phase, &failure, 1)
+                .await;
+            if !stored {
+                return Err(Halt::Failed(format!(
+                    "could not record the failed block {phase} of {segment} (the job's error log is full or can't be written); stopping so it is not skipped"
+                )));
+            }
+        }
+        Ok(failures.len() as i32)
     }
 
     /// A `retry-failed` job: refetch exactly the recorded blocks (or whole
@@ -583,32 +627,21 @@ impl Run<'_> {
             if self.stop_requested().await {
                 return Err(Halt::Stopped);
             }
-            let failed = if block < 0 {
-                self.whole_segment(&segment, &filter).await?
+            self.entry_failures.clear();
+            if block < 0 {
+                self.whole_segment(&segment, &filter).await?;
             } else {
-                match self
-                    .client
-                    .block(&segment, block as u32)
-                    .await
-                    .map_err(|e| e.to_string())
-                {
-                    Ok(frame) => match decode(frame).await {
-                        Ok(rows) => {
-                            self.fold_rows(rows, &filter, &segment).await?;
-                            0
-                        }
-                        Err(e) => {
-                            self.block_failed(&segment, Some(block as u32), &e).await;
-                            1
-                        }
-                    },
-                    Err(e) => {
-                        self.block_failed(&segment, Some(block as u32), &e).await;
-                        1
-                    }
+                let rows = match self.client.block(&segment, block as u32).await {
+                    Ok(frame) => decode(frame).await,
+                    Err(e) => Err(e.to_string()),
+                };
+                match rows {
+                    Ok(rows) => self.fold_rows(rows, &filter, &segment).await?,
+                    Err(e) => self.block_failed(&segment, Some(block as u32), &e)?,
                 }
-            };
+            }
             self.fold.flush().await.map_err(|e| Halt::Failed(e.0))?;
+            let failed = self.record_failures().await?;
             // Saved before the block is marked done, so a resumed run still
             // replays the markers of what it wrote.
             let wrote = self.fold.take_written_dids();
@@ -685,6 +718,13 @@ impl Run<'_> {
             }
         }
         Ok(())
+    }
+}
+
+fn phase(block: Option<u32>) -> String {
+    match block {
+        Some(i) => format!("replay_block:{i}"),
+        None => "replay_segment".to_string(),
     }
 }
 

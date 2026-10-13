@@ -964,6 +964,113 @@ async fn a_retry_replays_the_markers_of_the_dids_it_wrote() {
     );
 }
 
+/// `GAME` records at seqs `games`, noise elsewhere in `seqs`, one event a
+/// block.
+fn games_among_noise(
+    seqs: std::ops::RangeInclusive<i64>,
+    games: std::ops::RangeInclusive<i64>,
+    did: &str,
+) -> Vec<common::segment_writer::ArchiveEvent> {
+    seqs.map(|s| {
+        if games.contains(&s) {
+            js::archive_create(s, did, GAME, &format!("g{s:04}"), game("t"))
+        } else {
+            js::archive_create(
+                s,
+                "did:plc:noise",
+                "app.other.thing",
+                &format!("o{s}"),
+                json!({ "$type": "app.other.thing" }),
+            )
+        }
+    })
+    .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn sixteen_failed_blocks_in_a_row_stop_the_job_inside_the_entry() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    // 32 blocks, 20 with records: planned as one run of blocks 0-19.
+    let segment = mock.seal(games_among_noise(1..=32, 1..=20, "did:plc:outage"), 1);
+    for index in 2..=17 {
+        // Three answers: every attempt of the first fetch fails.
+        mock.fail_block(&segment, index, 3);
+    }
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert_eq!(
+        job["error"],
+        "the archive failed 16 blocks in a row; stopping (resume to continue)"
+    );
+    assert_eq!(
+        job["replay"]["through_seq"], 0,
+        "the cursor stays before the entry: {job}"
+    );
+    assert!(
+        errors(&app, &id).await.is_empty(),
+        "the entry is redone on resume, so its blocks are not recorded"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failed_block_whose_error_row_cannot_be_stored_stops_the_job() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let did = "did:plc:fulllog";
+    mock.set_plan_page_entries(1);
+    let first = mock.seal(games(1..=4, did), 4);
+    // Blocks of 4 (seqs 5-8, ... 17-20); only block 2 holds records.
+    let second = mock.seal(games_among_noise(5..=20, 13..=16, did), 4);
+    mock.fail_block(&second, 2, usize::MAX);
+    mock.hold_segment(&first);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    wait_until!(
+        "the first download to start",
+        mock.segment_downloads().contains(&first)
+    );
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/pause"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    mock.release_segment(&first);
+    assert_eq!(finished(&app, &id).await["status"], "paused");
+    // Fill the job's error log to its cap.
+    happyview::db::query(&happyview::db::adapt_sql(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000) \
+         INSERT INTO happyview_backfill_errors (job_id, did, phase, kind, message, attempts, last_at) \
+         SELECT ?, 'filler', 'filler:' || i, 'replay_block', 'filler', 1, '2026-10-12T00:00:00+00:00' FROM n",
+        app.state.db_backend,
+    ))
+    .bind(&id)
+    .execute(&app.state.db)
+    .await
+    .expect("fill the error log");
+
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    let error = job["error"].as_str().unwrap();
+    assert!(
+        error.contains("could not record the failed block replay_block:2"),
+        "{error}"
+    );
+    assert_eq!(
+        job["replay"]["through_seq"], 4,
+        "the cursor stays before the entry: {job}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn a_plan_that_stops_advancing_fails_the_job() {
