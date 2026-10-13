@@ -3757,6 +3757,16 @@ pub(super) async fn create_backfill(
 
     let mut inputs = body.dids.unwrap_or_default();
     inputs.extend(body.did);
+    // An account backfill crawls: block-granular planning downloads far more
+    // than a crawl of a few repos, and the archive may not hold a repo's
+    // oldest records.
+    // An explicit `replay` is refused; a default of `replay` crawls them.
+    if body.source.is_some() && source == SourceChoice::Replay && !inputs.is_empty() {
+        return Err(AppError::BadRequest(
+            "replay is only available for collection backfills; account backfills always crawl"
+                .into(),
+        ));
+    }
     let dids = resolve_backfill_accounts(inputs, |input| async move {
         crate::identity::resolve_identifier(&input)
             .await
@@ -4025,6 +4035,13 @@ pub(crate) async fn start_backfill_with(
     actor_did: &str,
     source: SourceChoice,
 ) -> Result<String, AppError> {
+    // Account backfills always crawl, whatever the default (see
+    // `create_backfill`).
+    let source = if dids.is_empty() {
+        source
+    } else {
+        SourceChoice::Crawl
+    };
     let job_id = create_backfill_job_with(state, collection.as_deref(), &dids, source).await?;
     let scope = if dids.is_empty() { "network" } else { "dids" };
 

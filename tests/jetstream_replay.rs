@@ -548,39 +548,116 @@ async fn an_unknown_source_is_refused() {
 
 #[tokio::test]
 #[serial]
-async fn an_account_job_filters_by_did_and_replays_its_markers() {
+async fn a_replayed_sync_supersedes_only_what_came_before_it() {
     let mock = MockJetstream::start().await;
     let Some(app) = app(&mock, None).await else {
         return;
     };
-    let (wanted, other) = ("did:plc:wanted", "did:plc:other");
-    let mut events = games(1..=4, wanted);
+    let (synced, other) = ("did:plc:synced", "did:plc:other");
+    let mut events = games(1..=4, synced);
     events.extend(games(5..=8, other));
-    events.push(js::archive_sync(9, wanted));
+    events.push(js::archive_sync(9, synced));
     events.push(js::archive_create(
         10,
-        wanted,
+        synced,
         GAME,
         "g0010",
         game("replacement"),
     ));
     mock.seal(events, 4);
-    // `dids` must already be DIDs: the TestApp's identity resolver accepts them.
-    let id = start_job(
-        &app,
-        json!({ "collection": GAME, "source": "replay", "dids": [wanted] }),
-    )
-    .await;
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
     assert_eq!(finished(&app, &id).await["status"], "completed");
     let uris: Vec<String> = dump(&app).await.into_iter().map(|r| r.0).collect();
+    let mut expected: Vec<String> = (5..=8)
+        .map(|s| format!("at://{other}/{GAME}/g{s:04}"))
+        .collect();
+    expected.push(format!("at://{synced}/{GAME}/g0010"));
+    expected.sort();
     assert_eq!(
-        uris,
-        vec![format!("at://{wanted}/{GAME}/g0010")],
-        "the sync superseded g1-g4"
+        uris, expected,
+        "the sync superseded g1-g4 and nothing written after it"
     );
-    for plan in mock.plan_requests() {
-        assert_eq!(plan["dids"], json!([wanted]), "{plan}");
-    }
+}
+
+/// The `source` a job was stored with.
+async fn job_source(app: &TestApp, id: &str) -> String {
+    job(app, id).await["source"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+#[serial]
+async fn an_account_job_on_auto_crawls() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=4, "did:plc:autoaccount"), 4);
+    let id = start_job(
+        &app,
+        json!({ "collection": GAME, "source": "auto", "dids": ["did:plc:autoaccount"] }),
+    )
+    .await;
+    assert_eq!(job_source(&app, &id).await, "crawl");
+    assert!(
+        mock.plan_requests().is_empty(),
+        "the archive was never asked"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn an_account_job_asking_for_replay_is_refused() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let jobs_before = app
+        .get_json("/admin/backfill/status")
+        .await
+        .as_array()
+        .unwrap()
+        .len();
+    let (status, body) = app
+        .post_json_status(
+            "/admin/backfill",
+            json!({ "collection": GAME, "source": "replay", "dids": ["did:plc:replayaccount"] }),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["error"],
+        "replay is only available for collection backfills; account backfills always crawl",
+        "{body}"
+    );
+    let jobs_after = app
+        .get_json("/admin/backfill/status")
+        .await
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(jobs_after, jobs_before, "no job created");
+}
+
+#[tokio::test]
+#[serial]
+async fn an_account_job_crawls_when_the_default_is_replay() {
+    let mock = MockJetstream::start().await;
+    let Some(mut app) = app(&mock, None).await else {
+        return;
+    };
+    app.state.archive.default_source = SourceChoice::Replay;
+    app.rebuild_router();
+    mock.seal(games(1..=4, "did:plc:defaultreplay"), 4);
+    let id = start_job(
+        &app,
+        json!({ "collection": GAME, "dids": ["did:plc:defaultreplay"] }),
+    )
+    .await;
+    assert_eq!(job_source(&app, &id).await, "crawl");
+    assert!(
+        mock.plan_requests().is_empty(),
+        "the archive was never asked"
+    );
 }
 
 #[tokio::test]
@@ -894,24 +971,18 @@ async fn retrying_an_account_job_whose_dids_are_gone_is_refused() {
     let Some(app) = app(&mock, None).await else {
         return;
     };
-    let did = "did:plc:gonedids";
-    let segment = mock.seal(one_game_block(did), 4);
-    mock.fail_block(&segment, 2, usize::MAX);
-    let id = start_job(
-        &app,
-        json!({ "collection": GAME, "source": "replay", "dids": [did] }),
-    )
-    .await;
-    assert_eq!(finished(&app, &id).await["replay"]["blocks_failed"], 1);
-    // What a detail flush or the retention sweep does to a finished job.
+    // An account replay from before account backfills always crawled, whose
+    // queue rows went with a detail flush or the retention sweep.
+    let id = old_account_replay(&app, "completed").await;
     happyview::db::query(&happyview::db::adapt_sql(
-        "DELETE FROM happyview_backfill_queue WHERE job_id = ?",
+        "INSERT INTO happyview_backfill_errors (job_id, did, phase, kind, message, attempts, last_at) \
+         VALUES (?, 'seg_0000000001.jss', 'replay_block:2', 'replay_block', 'HTTP 502', 1, '2026-10-12T00:00:00+00:00')",
         app.state.db_backend,
     ))
     .bind(&id)
     .execute(&app.state.db)
     .await
-    .expect("clear the job's queue rows");
+    .expect("a failed block");
     let jobs_before = app
         .get_json("/admin/backfill/status")
         .await
@@ -1149,16 +1220,26 @@ async fn a_failed_replay_job_resumes_where_it_stopped() {
     );
 }
 
-async fn clear_queue(app: &TestApp, id: &str) {
-    // What a detail flush or the retention sweep does to a finished job.
+/// An account (`dids`) replay job as one created before account backfills
+/// always crawled, in `status`, with no queue rows: its DID list is gone, as
+/// after a detail flush or the retention sweep.
+async fn old_account_replay(app: &TestApp, status: &str) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
     happyview::db::query(&happyview::db::adapt_sql(
-        "DELETE FROM happyview_backfill_queue WHERE job_id = ?",
+        "INSERT INTO happyview_backfill_jobs \
+         (id, collection, did, scope, status, stage, total_repos, queue_version, discovery_complete, \
+          started_at, created_at, source, error) \
+         VALUES (?, ?, 'did:plc:oldaccount', 'dids', ?, 'replaying', 1, 2, 1, \
+          '2026-10-12T00:00:00+00:00', '2026-10-12T00:00:00+00:00', 'replay', NULL)",
         app.state.db_backend,
     ))
-    .bind(id)
+    .bind(&id)
+    .bind(GAME)
+    .bind(status)
     .execute(&app.state.db)
     .await
-    .expect("clear the job's queue rows");
+    .expect("an old account replay job");
+    id
 }
 
 #[tokio::test]
@@ -1168,19 +1249,8 @@ async fn a_failed_account_replay_whose_dids_are_gone_is_not_resumed() {
     let Some(app) = app(&mock, None).await else {
         return;
     };
-    let did = "did:plc:goneresume";
-    let segment = mock.seal(games_among_noise(1..=32, 1..=20, did), 1);
-    for index in 2..=17 {
-        mock.fail_block(&segment, index, 3);
-    }
-    let id = start_job(
-        &app,
-        json!({ "collection": GAME, "source": "replay", "dids": [did] }),
-    )
-    .await;
-    assert_eq!(finished(&app, &id).await["status"], "failed");
-    clear_queue(&app, &id).await;
-    let fetches = mock.block_fetches().len();
+    mock.seal(games(1..=4, "did:plc:oldaccount"), 4);
+    let id = old_account_replay(&app, "failed").await;
     let (status, body) = app
         .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
         .await;
@@ -1192,7 +1262,7 @@ async fn a_failed_account_replay_whose_dids_are_gone_is_not_resumed() {
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(job(&app, &id).await["status"], "failed");
-    assert_eq!(mock.block_fetches().len(), fetches, "nothing was fetched");
+    assert!(mock.plan_requests().is_empty(), "nothing was planned");
 }
 
 #[tokio::test]
@@ -1202,26 +1272,8 @@ async fn an_account_replay_without_dids_fails_instead_of_widening() {
     let Some(app) = app(&mock, None).await else {
         return;
     };
-    let did = "did:plc:nodids";
-    let segment = mock.seal(games(1..=4, did), 4);
-    mock.hold_segment(&segment);
-    let id = start_job(
-        &app,
-        json!({ "collection": GAME, "source": "replay", "dids": [did] }),
-    )
-    .await;
-    wait_until!(
-        "the download to start",
-        mock.segment_downloads().contains(&segment)
-    );
-    let (status, body) = app
-        .post_json_status(&format!("/admin/backfill/{id}/pause"), json!({}))
-        .await;
-    assert_eq!(status, 200, "{body}");
-    mock.release_segment(&segment);
-    assert_eq!(finished(&app, &id).await["status"], "paused");
-    clear_queue(&app, &id).await;
-    let plans = mock.plan_requests().len();
+    mock.seal(games(1..=4, "did:plc:oldaccount"), 4);
+    let id = old_account_replay(&app, "paused").await;
     let (status, body) = app
         .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
         .await;
@@ -1235,7 +1287,7 @@ async fn an_account_replay_without_dids_fails_instead_of_widening() {
             .contains("the job's DID list is no longer available"),
         "{job}"
     );
-    assert_eq!(mock.plan_requests().len(), plans, "nothing was planned");
+    assert!(mock.plan_requests().is_empty(), "nothing was planned");
 }
 
 #[tokio::test]
