@@ -38,6 +38,29 @@ pub fn fuel_for(plugin_type: PluginType) -> u64 {
     }
 }
 
+/// Fuel per unit of a script's instruction budget, for a compiled module.
+///
+/// The budget is an operator setting written for interpreters, where a unit
+/// is one VM instruction (tens of wasm instructions) and decoding the run's
+/// JSON is the interpreter's own uncounted work. A compiled module pays for
+/// that decoding in fuel: a 1 KB input round-trip costs about 100,000 under
+/// wasmtime 49, which at one fuel per unit would be a tenth of the default
+/// budget spent before a handler runs.
+pub const FUEL_PER_INSTRUCTION: u64 = 100; // provisional until measured against the Lua interpreter
+
+/// The fuel each call into a compiled module gets. `None` is a job, which
+/// has no budget and stops through `should_stop`.
+///
+/// Fuel can bound a compiled module where it cannot bound an interpreter
+/// (see [`fuel_for`]) because nothing here catches a wasm `throw`: stable
+/// Rust on wasm32-wasip1 aborts on panic and emits no exception-handling
+/// instructions, and a module that defines a tag is refused before it runs.
+pub fn module_fuel(instructions: Option<u32>) -> u64 {
+    instructions.map_or(u64::MAX, |n| {
+        u64::from(n).saturating_mul(FUEL_PER_INSTRUCTION)
+    })
+}
+
 /// How often the epoch advances. Against a budget whose floor is one second
 /// this is a one-percent granularity, for a few hundred atomic increments a
 /// second.
@@ -631,6 +654,16 @@ impl GuestDeadline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_fuel_scales_the_budget_and_leaves_none_unbounded() {
+        assert_eq!(module_fuel(Some(1_000)), 1_000 * FUEL_PER_INSTRUCTION);
+        assert_eq!(module_fuel(None), u64::MAX);
+        assert_eq!(
+            module_fuel(Some(u32::MAX)),
+            u64::from(u32::MAX) * FUEL_PER_INSTRUCTION
+        );
+    }
 
     #[test]
     fn test_fuel_constant_value() {

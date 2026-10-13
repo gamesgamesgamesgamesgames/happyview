@@ -139,6 +139,11 @@ impl PluginInstance {
         self.store.data_mut().panic.take()
     }
 
+    /// Charge every later call `fuel`, replacing the plugin type's default.
+    pub fn set_call_fuel(&mut self, fuel: u64) {
+        self.store.data_mut().call_fuel = fuel;
+    }
+
     /// Size the store's memory ceiling from the Lua-level limit a script
     /// runs under.
     pub fn set_script_memory_limit(&mut self, script_memory_bytes: usize) {
@@ -268,7 +273,7 @@ impl PluginInstance {
 
         self.store.data_mut().limiter.clear_refusal();
         self.store
-            .set_fuel(fuel_for(self.store.data().plugin_type))
+            .set_fuel(self.store.data().call_fuel)
             .map_err(ExecutionError::Trap)?;
 
         let packed = func
@@ -381,7 +386,7 @@ impl PluginInstance {
 
         self.store.data_mut().limiter.clear_refusal();
         self.store
-            .set_fuel(fuel_for(self.store.data().plugin_type))
+            .set_fuel(self.store.data().call_fuel)
             .map_err(ExecutionError::Trap)?;
 
         let (input_ptr, input_len) = write_to_guest(&mut self.store, &input_bytes)
@@ -423,6 +428,16 @@ fn host_removed_globals() -> Vec<String> {
         .iter()
         .map(|name| name.to_string())
         .collect()
+}
+
+/// What differs between running an installed interpreter and a compiled
+/// module. An interpreter runs under its plugin type's defaults.
+#[derive(Default)]
+struct RunOptions {
+    /// Fuel for each call into the guest, replacing the plugin type's.
+    call_fuel: Option<u64>,
+    /// The crate a relative panic location is placed under.
+    source_root: Option<std::path::PathBuf>,
 }
 
 /// Hand the run its artifact only when the build about to load it made it,
@@ -617,7 +632,38 @@ impl PluginExecutor {
         modules: ModuleScope,
     ) -> Result<ScriptExecuteOutput, ExecutionError> {
         let plugin = self.interpreter(plugin_id).await?;
-        self.execute_loaded(&plugin, input, caller, modules).await
+        self.execute_loaded(&plugin, input, caller, modules, RunOptions::default())
+            .await
+    }
+
+    /// Run a compiled script module. It belongs to the project snapshot that
+    /// resolved it rather than to the plugin registry, so it arrives as a
+    /// plugin instead of an id, and it runs through the same path an
+    /// interpreter does. No interpreter counts instructions inside compiled
+    /// code, so the run's budget becomes fuel; `source_root` is the module's
+    /// crate, where its panics are placed.
+    pub async fn execute_compiled_as(
+        &self,
+        module: Arc<LoadedPlugin>,
+        source_root: &std::path::Path,
+        input: &ScriptExecuteInput,
+        caller: Option<Arc<CallerSession>>,
+    ) -> Result<ScriptExecuteOutput, ExecutionError> {
+        let options = RunOptions {
+            call_fuel: Some(crate::plugin::runtime::module_fuel(
+                input.limits.instructions,
+            )),
+            source_root: Some(source_root.to_path_buf()),
+        };
+        // A module's imports are its own crate's, resolved by the compiler;
+        // it has nothing to resolve at run time.
+        self.execute_loaded(&module, input, caller, ModuleScope::Dashboard, options)
+            .await
+    }
+
+    /// The runtime this executor compiles and instantiates with.
+    pub fn runtime(&self) -> &Arc<WasmRuntime> {
+        &self.runtime
     }
 
     /// Run on this exact module, which is what every stamp the run reads
@@ -628,6 +674,7 @@ impl PluginExecutor {
         input: &ScriptExecuteInput,
         caller: Option<Arc<CallerSession>>,
         modules: ModuleScope,
+        options: RunOptions,
     ) -> Result<ScriptExecuteOutput, ExecutionError> {
         let mut inst = self
             .instantiate_interpreter(plugin, Some(input), caller, modules)
@@ -649,6 +696,9 @@ impl PluginExecutor {
         inst.set_script_memory_limit(
             usize::try_from(input.limits.memory_bytes).unwrap_or(usize::MAX),
         );
+        if let Some(fuel) = options.call_fuel {
+            inst.set_call_fuel(fuel);
+        }
         // Running long is what a job is for, and `should_stop` is its stop;
         // every other kind is bounded by the operator's wall clock, re-armed
         // here so a run starts with a whole budget rather than what
@@ -665,7 +715,7 @@ impl PluginExecutor {
             // how an aborting guest stops.
             Err(e) => {
                 return match inst.take_panic() {
-                    Some(report) => Ok(panic_output(report, None)),
+                    Some(report) => Ok(panic_output(report, options.source_root.as_deref())),
                     None => Err(e),
                 };
             }
@@ -1030,6 +1080,7 @@ impl PluginExecutor {
             limiter: MemoryLimiter::new(memory_ceiling(plugin.plugin_type())),
             pending_calls: Default::default(),
             panic: None,
+            call_fuel: fuel_for(plugin.plugin_type()),
         })
     }
 
@@ -2080,6 +2131,7 @@ mod deadline {
             limiter: MemoryLimiter::new(memory_ceiling(PluginType::Library)),
             pending_calls: Default::default(),
             panic: None,
+            call_fuel: u64::MAX,
         }
     }
 }
@@ -2243,12 +2295,24 @@ mod interpreter {
             other => panic!("expected a returned value, got {other:?}"),
         };
         let on_stale = executor
-            .execute_loaded(&stale, &input, None, ModuleScope::Dashboard)
+            .execute_loaded(
+                &stale,
+                &input,
+                None,
+                ModuleScope::Dashboard,
+                RunOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(ran(on_stale), "source");
         let on_current = executor
-            .execute_loaded(&current, &input, None, ModuleScope::Dashboard)
+            .execute_loaded(
+                &current,
+                &input,
+                None,
+                ModuleScope::Dashboard,
+                RunOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(ran(on_current), "artifact");
@@ -2926,7 +2990,7 @@ mod panics {
 
     /// An interpreter whose `execute` reports a panic at `src/lib.rs:7:5`
     /// and then traps, as a Rust guest's hook and abort do.
-    const PANICKING: &str = r#"(module
+    pub(super) const PANICKING: &str = r#"(module
         (import "env" "host_script_panic" (func $panic (param i32 i32)))
         (memory (export "memory") 1)
         (data (i32.const 32768) "{\"message\":\"boom\",\"file\":\"src/lib.rs\",\"line\":7,\"column\":5}")
@@ -3066,5 +3130,123 @@ mod panics {
             chunk.as_deref(),
             Some("/home/u/.cargo/registry/src/serde/lib.rs")
         );
+    }
+}
+
+#[cfg(test)]
+mod compiled {
+    use super::panics::{executor_with, input, interpreter};
+    use super::*;
+
+    /// `execute` counts to two million, then answers `null`. Roughly ten
+    /// million fuel: far past a thousand-instruction budget, well inside a
+    /// million-instruction one.
+    const COUNTING: &str = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 32768) "{\"ok\":{\"status\":\"returned\",\"value\":null,\"value_kind\":\"other\"}}")
+        (func (export "alloc") (param i32) (result i32) i32.const 1024)
+        (func (export "dealloc") (param i32 i32))
+        (func (export "execute") (param i32 i32) (result i64) (local i32)
+            (loop
+                local.get 2
+                i32.const 1
+                i32.add
+                local.tee 2
+                i32.const 2000000
+                i32.lt_u
+                br_if 0)
+            i64.const 32768
+            i64.const 32
+            i64.shl
+            i64.const 62
+            i64.or)
+    )"#;
+
+    fn returned_null() -> ScriptExecuteOutput {
+        ScriptExecuteOutput::Returned {
+            value: serde_json::Value::Null,
+            value_kind: crate::plugin::ScriptValueKind::Other,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_module_spending_past_its_instruction_budget_times_out() {
+        let executor = executor_with(interpreter(COUNTING)).await;
+        let module = Arc::new(interpreter(COUNTING));
+        let err = executor
+            .execute_compiled_as(module, std::path::Path::new("m"), &input(Some(1_000)), None)
+            .await
+            .expect_err("100,000 fuel cannot count to two million");
+        assert!(matches!(err, ExecutionError::Timeout), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_module_inside_its_budget_answers() {
+        let executor = executor_with(interpreter(COUNTING)).await;
+        let module = Arc::new(interpreter(COUNTING));
+        let output = executor
+            .execute_compiled_as(
+                module,
+                std::path::Path::new("m"),
+                &input(Some(1_000_000)),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, returned_null());
+    }
+
+    #[tokio::test]
+    async fn a_job_module_has_no_fuel_budget() {
+        let executor = executor_with(interpreter(COUNTING)).await;
+        let module = Arc::new(interpreter(COUNTING));
+        let mut job = input(None);
+        job.kind = ScriptKind::Job;
+        let output = executor
+            .execute_compiled_as(module, std::path::Path::new("m"), &job, None)
+            .await
+            .unwrap();
+        assert_eq!(output, returned_null());
+    }
+
+    /// The instruction budget is the interpreter's own to enforce; fuel stays
+    /// out of an interpreter store whatever the budget says.
+    #[tokio::test]
+    async fn an_interpreter_is_not_charged_fuel_for_its_budget() {
+        let executor = executor_with(interpreter(COUNTING)).await;
+        let output = executor
+            .execute_script("guest", &input(Some(1_000)))
+            .await
+            .unwrap();
+        assert_eq!(output, returned_null());
+    }
+
+    #[tokio::test]
+    async fn a_module_panic_is_placed_in_its_source_tree() {
+        let executor = executor_with(interpreter(super::panics::PANICKING)).await;
+        let module = Arc::new(interpreter(super::panics::PANICKING));
+        let output = executor
+            .execute_compiled_as(
+                module,
+                std::path::Path::new("modules/registry"),
+                &input(Some(1_000_000)),
+                None,
+            )
+            .await
+            .unwrap();
+        let ScriptExecuteOutput::Error {
+            message,
+            line,
+            chunk,
+            raw,
+            ..
+        } = output
+        else {
+            panic!("expected an error, got {output:?}");
+        };
+        assert_eq!(message, "boom");
+        assert_eq!(line, Some(7));
+        assert_eq!(chunk.as_deref(), Some("modules/registry/src/lib.rs"));
+        assert_eq!(raw, "panicked at modules/registry/src/lib.rs:7:5: boom");
     }
 }

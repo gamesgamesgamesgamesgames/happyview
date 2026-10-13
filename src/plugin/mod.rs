@@ -20,8 +20,9 @@ pub use executor::{ExecutionError, PluginExecutor, PluginInstance};
 pub use host::script::ModuleScope;
 pub use memory::{MemoryError, PluginEnvelopeError, PluginResponse};
 pub use runtime::{
-    DEFAULT_SCRIPT_MEMORY_BYTES, EPOCH_TICK, GuestDeadline, LIBRARY_MEMORY_CEILING, MemoryLimiter,
-    UNBOUNDED_TICKS, WasmRuntime, fuel_for, memory_ceiling, script_memory_ceiling,
+    DEFAULT_SCRIPT_MEMORY_BYTES, EPOCH_TICK, FUEL_PER_INSTRUCTION, GuestDeadline,
+    LIBRARY_MEMORY_CEILING, MemoryLimiter, UNBOUNDED_TICKS, WasmRuntime, fuel_for, memory_ceiling,
+    module_fuel, script_memory_ceiling,
 };
 pub use types::*;
 

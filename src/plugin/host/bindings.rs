@@ -56,6 +56,9 @@ pub struct PluginState {
     /// The panic a guest reported before trapping, which the script runner
     /// answers the run with instead of the trap.
     pub panic: Option<happyview_plugin_sdk::wire::PanicReport>,
+    /// The fuel each call into this instance starts with. The plugin type's
+    /// default, except a compiled module's, which is its run's budget.
+    pub call_fuel: u64,
 }
 
 /// Check that a memory access is within bounds
@@ -2795,6 +2798,7 @@ mod tests {
             ),
             pending_calls: Default::default(),
             panic: None,
+            call_fuel: u64::MAX,
         }
     }
 
