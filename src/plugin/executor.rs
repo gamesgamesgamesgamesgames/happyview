@@ -590,6 +590,7 @@ impl PluginExecutor {
         inst.call_validate(&ScriptValidateInput {
             source: source.to_string(),
             removed_globals: host_removed_globals(),
+            ..ScriptValidateInput::default()
         })
         .await
     }
@@ -1887,6 +1888,8 @@ mod interpreter {
                 memory_bytes: 8 * 1024 * 1024,
             },
             removed_globals: Vec::new(),
+            chunk_name: crate::plugin::DEFAULT_CHUNK_NAME.to_string(),
+            artifact: None,
         })
         .unwrap()
     }

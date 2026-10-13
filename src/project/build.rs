@@ -397,6 +397,7 @@ async fn test_names_a_lexicon(
 fn source_body(source: String) -> ScriptBody {
     ScriptBody::Source {
         source: source.into(),
+        artifact: None,
     }
 }
 
@@ -407,6 +408,7 @@ fn project_module(id: String, path: PathBuf, language_id: String, source: String
         path,
         language_id,
         source: source.into(),
+        artifact: None,
     }
 }
 

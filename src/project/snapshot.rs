@@ -55,7 +55,13 @@ pub struct ProjectScript {
 
 #[derive(Debug, Clone)]
 pub enum ScriptBody {
-    Source { source: Arc<str> },
+    Source {
+        source: Arc<str>,
+        /// What the file's interpreter prepared from `source`, stamped with
+        /// that interpreter's build. `None` until the build prepares it, and
+        /// for an interpreter that cannot.
+        artifact: Option<crate::plugin::PreparedArtifact>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +70,7 @@ pub struct ProjectModule {
     pub path: PathBuf,
     pub language_id: String,
     pub source: Arc<str>,
+    pub artifact: Option<crate::plugin::PreparedArtifact>,
 }
 
 /// How `AppState` and the catalogs hold the current snapshot. A reader that

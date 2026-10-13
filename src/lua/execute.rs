@@ -101,6 +101,7 @@ fn returned_value(
             message,
             line,
             raw,
+            chunk: _,
         }) => {
             let error = auth_error(&[&message, &raw])
                 .unwrap_or_else(|| script_error(method, kind.into(), message, line));
@@ -489,6 +490,7 @@ mod tests {
             message: message.to_string(),
             line: Some(7),
             raw: format!("[string \"script\"]:7: {message}"),
+            chunk: None,
         })
     }
 
@@ -614,6 +616,7 @@ mod tests {
                 raw: format!(
                     "[string \"script\"]:4: {LUA_AUTH_ERROR_PREFIX}DPoP session not found"
                 ),
+                chunk: None,
             }),
         )
         .expect_err("a failed run has no value");

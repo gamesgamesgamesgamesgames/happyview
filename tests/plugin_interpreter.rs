@@ -150,6 +150,8 @@ fn input(source: &str, kind: ScriptKind) -> ScriptExecuteInput {
             memory_bytes: 16 * 1024 * 1024,
         },
         removed_globals: Vec::new(),
+        chunk_name: happyview::plugin::DEFAULT_CHUNK_NAME.to_string(),
+        artifact: None,
     }
 }
 
@@ -281,6 +283,7 @@ async fn every_error_kind_maps_onto_its_script_error_type_and_only_timeout_is_40
             message,
             line,
             raw,
+            chunk: _,
         } = output
         else {
             panic!("expected an error output for {kind:?}");

@@ -12,8 +12,9 @@ use crate::db::DatabaseBackend;
 use crate::lua::scripts::{ParsedTrigger, ResolvedScript, TriggerKind};
 use crate::project::{ProjectScript, ProjectSnapshot, ScriptBody, SharedSnapshot, shared_empty};
 
-/// The chunk name a dashboard script runs under.
-pub const DASHBOARD_CHUNK_NAME: &str = "script";
+/// The chunk name of a script with no file. The wire's own default, so a row
+/// resolved here and an input built without a chunk name agree.
+pub const DASHBOARD_CHUNK_NAME: &str = crate::plugin::DEFAULT_CHUNK_NAME;
 
 /// What the dashboard asks to store. `outbound_xrpcs` is derived from `body`
 /// on every write, so no caller can store a stale list.
@@ -112,7 +113,7 @@ impl ScriptListing {
 
 fn source_of(script: &ProjectScript) -> String {
     match &script.body {
-        ScriptBody::Source { source } => source.to_string(),
+        ScriptBody::Source { source, .. } => source.to_string(),
     }
 }
 
@@ -345,6 +346,7 @@ mod tests {
                     language_id: "lua".to_string(),
                     body: ScriptBody::Source {
                         source: Arc::from(*body),
+                        artifact: None,
                     },
                     description: None,
                     outbound_xrpcs: vec!["com.example.other".to_string()],

@@ -28,11 +28,12 @@ pub use types::*;
 /// receive. Defined in the SDK the interpreter builds against, so the two
 /// sides cannot drift.
 pub use happyview_plugin_sdk::wire::{
-    ExecuteContext as ScriptExecuteContext, ExecuteInput as ScriptExecuteInput,
-    ExecuteLimits as ScriptExecuteLimits, ExecuteOutput as ScriptExecuteOutput, JobProgressRequest,
-    JobShouldStopRequest, JobWaitRequest, LibraryRef as ScriptLibraryRef, ScriptErrorKind,
-    ScriptJob, ScriptKind, ScriptLogRequest, ScriptSpace, ScriptValueKind,
-    ValidateError as ScriptValidateError, ValidateInput as ScriptValidateInput,
+    ChunkRole, DEFAULT_CHUNK_NAME, ExecuteContext as ScriptExecuteContext,
+    ExecuteInput as ScriptExecuteInput, ExecuteLimits as ScriptExecuteLimits,
+    ExecuteOutput as ScriptExecuteOutput, ImportRef, JobProgressRequest, JobShouldStopRequest,
+    JobWaitRequest, LibraryRef as ScriptLibraryRef, ModuleResolve, PreparedArtifact,
+    ResolvedModule, ScriptErrorKind, ScriptJob, ScriptKind, ScriptLogRequest, ScriptSpace,
+    ScriptValueKind, ValidateError as ScriptValidateError, ValidateInput as ScriptValidateInput,
     ValidateOutput as ScriptValidateOutput,
 };
 

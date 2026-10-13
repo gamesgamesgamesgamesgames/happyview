@@ -99,6 +99,7 @@ pub async fn run_for_differential(
             message: "script must define a handle() function".into(),
             line: None,
             raw: "script must define a handle() function".into(),
+            chunk: None,
         };
     };
 
@@ -193,5 +194,6 @@ fn failed(
         message,
         line,
         raw: raw.to_string(),
+        chunk: None,
     }
 }

@@ -137,6 +137,8 @@ pub async fn build_input(state: &AppState, inv: &Invocation<'_>) -> ScriptExecut
         // `execute_script_as` overrides the guard list with the host's own,
         // so sending one here would only mislead a reader.
         removed_globals: Vec::new(),
+        chunk_name: crate::plugin::DEFAULT_CHUNK_NAME.to_string(),
+        artifact: None,
     }
 }
 
