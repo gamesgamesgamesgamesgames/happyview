@@ -11,6 +11,9 @@
 //! `echo-source` artifact, unless the source starts `no-artifact`, and an
 //! import for each line reading `import <specifier>`. `execute` handed an
 //! empty `source` and such an artifact runs the decoded text.
+//!
+//! A source starting `old-sdk` is refused for a missing `handle` whatever
+//! its role, as an interpreter that predates roles refuses it.
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![allow(static_mut_refs)]
 
@@ -621,6 +624,12 @@ pub extern "C" fn validate(ptr: u32, len: u32) -> i64 {
     } else if source.starts_with("invalid") {
         json!({"valid": false, "errors": [
             {"kind": "syntax", "line": 1, "message": "echo: the source says it is invalid"}
+        ]})
+    } else if source.starts_with("old-sdk") {
+        // An interpreter built before `role` existed: it demands `handle`
+        // of every chunk, module or not.
+        json!({"valid": false, "errors": [
+            {"kind": "missing_handle", "message": "script must define a handle() function"}
         ]})
     } else if source.starts_with("no-handle") && role == "handler" {
         json!({"valid": false, "errors": [

@@ -934,7 +934,7 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
     // would run against no project at all, and serving without the project
     // would answer its routes with nothing.
     if let Some(root) = state.config.project_root.clone() {
-        match happyview::project::boot::build_and_install(&state, &root).await {
+        match happyview::project::prepare::rebuild(&state, &root).await {
             Ok(installed) => {
                 for warning in &installed.warnings {
                     eprintln!("{warning}");
@@ -951,6 +951,7 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
                 return std::process::ExitCode::from(1);
             }
         }
+        happyview::project::prepare::spawn_rebuild_on_interpreter_change(state.clone());
     }
 
     tokio::spawn(happyview::lua::limits::run_refresh_loop(

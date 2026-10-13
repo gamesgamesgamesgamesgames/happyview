@@ -9,13 +9,14 @@ use crate::AppState;
 use crate::catalog::{Layer, LexiconCatalog};
 use crate::config::project::{PROJECT_FILE, ProjectConfigError, load_project_config};
 use crate::lua::ParsedTrigger;
-use crate::plugin::{ChunkRole, PluginExecutor, PluginRegistry};
-use crate::script::checks::{self, InterpreterCheck};
+use crate::plugin::{PluginExecutor, PluginRegistry};
+use crate::script::checks;
 
 use super::describe;
 use super::diagnostic;
 use super::layout::{self, Claim, ExtensionClaims, LexiconIndex, Role};
 use super::lexicons;
+use super::prepare;
 use super::snapshot::{ProjectLexicon, ProjectModule, ProjectScript, ProjectSnapshot, ScriptBody};
 use super::walk::{self, SrcFile};
 
@@ -196,7 +197,7 @@ pub async fn build_snapshot_with(
             Unit::Handler(trigger) => trigger.id(),
             Unit::Module | Unit::Test => String::new(),
         };
-        if !passes_checks(env, &item, &trigger_id, &source, &mut diagnostics).await {
+        if !passes_checks(&item, &trigger_id, &source, &mut diagnostics) {
             continue;
         }
         let language_id = item.claim.language_id;
@@ -250,11 +251,7 @@ pub async fn build_snapshot_with(
     let handled: BTreeSet<String> = handled_by.into_keys().collect();
     diagnostics.extend(describe::stale_overrides(&config.scripts, &handled));
 
-    diagnostic::sort(&mut diagnostics);
-    if diagnostic::has_errors(&diagnostics) {
-        return Err(diagnostics);
-    }
-    let snapshot = ProjectSnapshot {
+    let mut snapshot = ProjectSnapshot {
         root: Some(root.to_path_buf()),
         generation: 0,
         lexicons: project_lexicons,
@@ -262,6 +259,21 @@ pub async fn build_snapshot_with(
         modules,
         tests,
     };
+    // The interpreters see the files only now that every module exists, so
+    // an import can be checked in the same pass that prepares it. Every file
+    // is prepared whatever else failed, so one run reports every error; the
+    // imports wait for a clean build, because a module dropped for its own
+    // error would read as missing.
+    let (prepared, imports) = prepare::prepare_files(env, &mut snapshot).await;
+    diagnostics.extend(prepared);
+    if !diagnostic::has_errors(&diagnostics) {
+        diagnostics.extend(prepare::check_imports(env, &snapshot, &imports).await);
+    }
+
+    diagnostic::sort(&mut diagnostics);
+    if diagnostic::has_errors(&diagnostics) {
+        return Err(diagnostics);
+    }
     let changes = changes(&env.current, &snapshot);
     Ok(BuildReport {
         snapshot,
@@ -305,60 +317,25 @@ fn config_diagnostic(e: ProjectConfigError) -> Diagnostic {
     }
 }
 
-/// The admin API's checks, in its order: removed globals, then the
-/// interpreter. Only a handler reaches the interpreter: `validate` checks for
-/// `handle`, which a module or a test never defines, and it has no way yet
-/// to be told which kind of chunk it is reading. Until it does, modules and
-/// tests are stored after the removed-globals scan alone.
-async fn passes_checks(
-    env: &BuildEnv,
+/// The admin API's checks that read the text alone: removed globals. The
+/// interpreter's check runs once the snapshot is assembled, in
+/// `prepare::prepare_snapshot`, where every module exists for imports to
+/// resolve against.
+fn passes_checks(
     item: &Pending<'_>,
     trigger_id: &str,
     source: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> bool {
-    let path = item.file.rel_path();
     let globals = checks::unmigrated_globals(trigger_id, &item.claim.language_id, source);
     if !globals.is_empty() {
         diagnostics.push(Diagnostic::error(
-            path,
+            item.file.rel_path(),
             checks::unmigrated_message(&globals),
         ));
         return false;
     }
-    if !matches!(item.unit, Unit::Handler(_)) {
-        return true;
-    }
-    // The build's one call into an interpreter.
-    match checks::check_with_interpreter(
-        &env.plugins,
-        &env.executor,
-        &item.claim.language_id,
-        source,
-        &item.file.id(),
-        ChunkRole::Handler,
-    )
-    .await
-    {
-        Ok(InterpreterCheck::Valid(_)) => true,
-        Ok(InterpreterCheck::Refused(errors)) => {
-            if errors.is_empty() {
-                diagnostics.push(Diagnostic::error(
-                    path,
-                    "the interpreter refused the script without saying why",
-                ));
-                return false;
-            }
-            for error in errors {
-                diagnostics.push(Diagnostic::error(&path, error.message).at_line(error.line));
-            }
-            false
-        }
-        Err(e) => {
-            diagnostics.push(Diagnostic::error(path, e.to_string()));
-            false
-        }
-    }
+    true
 }
 
 /// A test file whose name, without its extension, is a lexicon the instance
@@ -498,7 +475,7 @@ mod tests {
     /// The echo fixture twice: as `echo` for `.echo` files, and as `lua` for
     /// `.lua` files, which is the language the removed-globals check reads.
     /// The fixture's `validate` accepts any source except one starting
-    /// `invalid` (a syntax error at line 1) or `no-handle`.
+    /// `invalid` (a syntax error at line 1), or `no-handle` in a handler.
     async fn env() -> Option<crate::AppState> {
         let dir = built_fixture("interpreter_echo", "wasm32-unknown-unknown")?;
         let state = test_state_with_pool(memory_pool().await);
@@ -662,8 +639,9 @@ mod tests {
         );
     }
 
-    /// Modules aren't sent to `validate` until it can be told they are
-    /// modules, so one the interpreter would call invalid still builds.
+    /// A module needs no `handle`, but it must still parse: both files are
+    /// reported, the handler for its missing `handle` and the module for its
+    /// syntax.
     #[tokio::test]
     async fn a_handler_needs_handle_and_a_module_does_not() {
         let Some(state) = env().await else { return };
@@ -680,8 +658,10 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(errors.len(), 1, "{:?}", shown(&errors));
+        assert_eq!(errors.len(), 2, "{:?}", shown(&errors));
         assert!(errors[0].path.ends_with("getThing.echo"));
+        assert_eq!(errors[1].path, PathBuf::from("src/lib/broken.echo"));
+        assert_eq!(errors[1].line, Some(1));
     }
 
     #[tokio::test]
