@@ -119,6 +119,7 @@ subtle = "2"
 mime_guess = "2"
 rust-embed = { version = "8", optional = true }
 sfv = "0.15"
+notify-debouncer-mini = "0.7"
 
 [features]
 # The native Lua runtime under `src/lua/`, kept to be compared against the

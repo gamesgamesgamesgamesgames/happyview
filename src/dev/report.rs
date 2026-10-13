@@ -150,6 +150,7 @@ mod tests {
                 session_secret: String::new(),
                 token_encryption_key: String::new(),
             },
+            watch_mode: crate::dev::watch::WatchMode::Native,
         };
         assert_eq!(
             banner(&session),

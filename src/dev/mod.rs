@@ -5,6 +5,7 @@ pub mod instance;
 pub mod reload;
 pub mod report;
 pub mod secrets;
+pub mod watch;
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,7 @@ pub struct DevSession {
     pub root: PathBuf,
     pub public_url: String,
     pub secrets: secrets::Secrets,
+    pub watch_mode: watch::WatchMode,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,10 +47,16 @@ pub fn prepare(root: &Path) -> Result<(DevSession, Config), DevError> {
     }
     let secrets = secrets::load_or_create(&root.join(".happyview")).map_err(DevError::Secrets)?;
     let config = load_config(&root, &secrets)?;
+    // Checked here rather than when the watcher starts, so a bad value
+    // stops dev before the database is touched.
+    let watch_mode =
+        watch::parse_poll_ms(crate::config::vars::var("HAPPYVIEW_WATCH_POLL_MS").as_deref())
+            .map_err(DevError::Config)?;
     let session = DevSession {
         public_url: config.public_url.clone(),
         root,
         secrets,
+        watch_mode,
     };
     Ok((session, config))
 }
@@ -80,6 +88,7 @@ mod tests {
             "DATABASE_URL",
             "PUBLIC_URL",
             "SESSION_SECRET",
+            "HAPPYVIEW_WATCH_POLL_MS",
         ] {
             unsafe { std::env::remove_var(key) };
         }
@@ -103,5 +112,20 @@ mod tests {
             err.to_string()
                 .starts_with("/definitely/not/here is not a project directory")
         );
+    }
+
+    #[test]
+    #[serial]
+    fn a_bad_poll_interval_stops_dev_before_it_starts() {
+        let _reset = vars::LayerReset;
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HAPPYVIEW_WATCH_POLL_MS", "1s") };
+        let result = prepare(dir.path());
+        unsafe { std::env::remove_var("HAPPYVIEW_WATCH_POLL_MS") };
+        let err = result.err().unwrap().to_string();
+        assert!(err.starts_with("HAPPYVIEW_WATCH_POLL_MS must be"), "{err}");
+
+        let (session, _) = prepare(dir.path()).unwrap();
+        assert_eq!(session.watch_mode, watch::WatchMode::Native);
     }
 }

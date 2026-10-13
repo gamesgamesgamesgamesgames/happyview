@@ -158,6 +158,7 @@ mod tests {
             root: dir.path().to_path_buf(),
             public_url: String::new(),
             secrets,
+            watch_mode: crate::dev::watch::WatchMode::Native,
         };
         let pool = crate::test_support::migrated_memory_pool().await;
         let state = crate::test_support::test_state_with_pool(pool);
