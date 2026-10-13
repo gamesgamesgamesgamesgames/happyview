@@ -97,6 +97,12 @@ pub async fn upload_blob(
         crate::repo::PdsAuth::OAuth(session) => {
             pds_post_blob(&state, session, content_type, body).await?
         }
+        crate::repo::PdsAuth::Fake(pds) => {
+            crate::repo::forward_pds_response(crate::testing::fake_pds::to_response(
+                pds.upload_blob(content_type, &body),
+            ))
+            .await?
+        }
     };
 
     if let Some(CheckResult::Allowed {
@@ -194,5 +200,35 @@ pub(crate) async fn upload_blob_to_pds(
             serde_json::from_slice(&body)
                 .map_err(|e| AppError::Internal(format!("invalid uploadBlob response: {e}")))
         }
+        PdsAuth::Fake(pds) => pds.upload_blob(content_type, &blob_bytes).map_err(|e| {
+            AppError::PdsError(
+                axum::http::StatusCode::from_u16(e.status)
+                    .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+                Bytes::from(e.body().to_string()),
+            )
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_test_runs_blob_upload_is_answered_by_the_in_process_pds() {
+        let state = AppState {
+            test: Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+                "a.test.lua",
+            ))),
+            ..crate::test_support::test_state_with_pool(
+                crate::test_support::migrated_memory_pool().await,
+            )
+        };
+        let auth = crate::repo::test_pds_auth(&state).unwrap();
+        let blob = upload_blob_to_pds(&state, "did:plc:a", &auth, "image/png", Bytes::from("png"))
+            .await
+            .unwrap();
+        let cid = crate::cid_verify::raw_cid(b"png").unwrap().to_string();
+        assert_eq!(blob["blob"]["ref"]["$link"], cid);
     }
 }

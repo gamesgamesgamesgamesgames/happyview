@@ -603,6 +603,48 @@ async fn a_job_with_inherited_auth_acts_as_its_creator() {
     assert!(error.contains("DPoP session"), "{error}");
 }
 
+/// In a test run an inheriting job carries no DPoP ids and acts through the
+/// in-process PDS.
+#[tokio::test]
+#[serial]
+async fn a_test_runs_inheriting_job_writes_through_the_in_process_pds() {
+    common::require_db!();
+    require_echo!();
+    let mut app = app().await;
+    if !install_caller_library(&app).await {
+        return;
+    }
+    let harness = std::sync::Arc::new(happyview::testing::TestHarness::new("a.test.lua"));
+    app.state.test = Some(harness.clone());
+    seed_script(&app, TYPE, "host:require").await;
+    let id = seed_job_as(&app, TYPE, &create_record_call(), true, None, None).await;
+
+    let row = run_to_completion(&app, &id).await;
+    assert_eq!(row.status, "completed", "job error: {:?}", row.error);
+    let writes = harness.pds().writes();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].repo, app.admin_did);
+}
+
+/// Outside a test run the same job looks for its creator's OAuth session.
+#[tokio::test]
+#[serial]
+async fn an_inheriting_job_without_dpop_ids_looks_up_an_oauth_session() {
+    common::require_db!();
+    require_echo!();
+    let app = app().await;
+    if !install_caller_library(&app).await {
+        return;
+    }
+    seed_script(&app, TYPE, "host:require").await;
+    let id = seed_job_as(&app, TYPE, &create_record_call(), true, None, None).await;
+
+    let row = run_to_completion(&app, &id).await;
+    assert_eq!(row.status, "failed");
+    let error = row.error.expect("no error persisted");
+    assert!(error.contains("failed to obtain PDS auth"), "{error}");
+}
+
 #[tokio::test]
 #[serial]
 async fn a_project_script_runs_a_job_ahead_of_its_row() {

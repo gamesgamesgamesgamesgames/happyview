@@ -169,9 +169,14 @@ pub(crate) async fn handle_procedure(
         AppError::BadRequest(format!("{method} has no target_collection configured"))
     })?;
 
+    // A test run writes through its in-process PDS whatever the caller holds.
+    let test_auth = repo::test_pds_auth(state);
+
     // If the user authenticated via a DPoP session (has a client_key from DPoP auth),
     // use the DPoP PDS write path. Otherwise, fall back to the atrium OAuth session.
-    if let Some(client_key) = claims.client_key() {
+    if test_auth.is_none()
+        && let Some(client_key) = claims.client_key()
+    {
         let encryption_key = state
             .config
             .token_encryption_key
@@ -198,7 +203,12 @@ pub(crate) async fn handle_procedure(
         .await;
     }
 
-    let session = repo::get_oauth_session(state, claims.did()).await?;
+    let session = match test_auth {
+        Some(auth) => auth,
+        None => repo::PdsAuth::OAuth(std::sync::Arc::new(
+            repo::get_oauth_session(state, claims.did()).await?,
+        )),
+    };
 
     match &lexicon.action {
         ProcedureAction::Create => {
@@ -227,7 +237,7 @@ async fn handle_create_record(
     claims: &Claims,
     input: &Value,
     collection: &str,
-    session: &crate::HappyViewOAuthSession,
+    session: &repo::PdsAuth,
 ) -> Result<Response, AppError> {
     // Build record from input, adding $type
     let mut record = input.clone();
@@ -243,8 +253,14 @@ async fn handle_create_record(
         "record": record,
     });
 
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.createRecord", &pds_body).await?;
+    let resp = session
+        .post_json(
+            state,
+            claims.did(),
+            "com.atproto.repo.createRecord",
+            &pds_body,
+        )
+        .await?;
 
     if resp.status().is_success() {
         let bytes = resp
@@ -296,7 +312,7 @@ async fn handle_put_record(
     claims: &Claims,
     input: &Value,
     collection: &str,
-    session: &crate::HappyViewOAuthSession,
+    session: &repo::PdsAuth,
 ) -> Result<Response, AppError> {
     let client_uri = input
         .get("uri")
@@ -322,8 +338,9 @@ async fn handle_put_record(
         "record": record,
     });
 
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.putRecord", &pds_body).await?;
+    let resp = session
+        .post_json(state, claims.did(), "com.atproto.repo.putRecord", &pds_body)
+        .await?;
 
     if resp.status().is_success() {
         let bytes = resp
@@ -371,7 +388,7 @@ async fn handle_delete_record(
     claims: &Claims,
     input: &Value,
     collection: &str,
-    session: &crate::HappyViewOAuthSession,
+    session: &repo::PdsAuth,
 ) -> Result<Response, AppError> {
     let client_uri = input
         .get("uri")
@@ -388,8 +405,14 @@ async fn handle_delete_record(
         "rkey": rkey,
     });
 
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.deleteRecord", &pds_body).await?;
+    let resp = session
+        .post_json(
+            state,
+            claims.did(),
+            "com.atproto.repo.deleteRecord",
+            &pds_body,
+        )
+        .await?;
 
     if resp.status().is_success() {
         let bytes = resp

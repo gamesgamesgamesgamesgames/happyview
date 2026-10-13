@@ -639,4 +639,44 @@ mod tests {
         assert!(err.to_string().contains("did:plc:other"), "{err}");
         assert!(err.to_string().contains("linked_repos"), "{err}");
     }
+
+    /// The path `happyview.record` takes: a write answered by the in-process PDS
+    /// is mirrored into the index with the CID the fake computed.
+    #[tokio::test]
+    async fn a_test_runs_write_reaches_the_fake_and_is_mirrored() {
+        let harness = std::sync::Arc::new(crate::testing::TestHarness::new("a.test.lua"));
+        let state = crate::AppState {
+            test: Some(harness.clone()),
+            ..crate::test_support::test_state_with_pool(
+                crate::test_support::migrated_memory_pool().await,
+            )
+        };
+        let caller = CallerSession {
+            did: "did:plc:alice".into(),
+            delegate_did: None,
+            claims: std::sync::Arc::new(Claims::internal("did:plc:alice".into())),
+            pds_auth: std::sync::Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
+            app_state: state.clone(),
+        };
+        let reference = create_record(
+            &caller,
+            serde_json::from_value(json!({
+                "collection": "app.test.rec", "rkey": "1", "record": {"text": "hi"}, "validate": false,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            harness.pds().writes()[0].cid.as_deref(),
+            Some(reference.cid.as_str())
+        );
+        let (cid,): (String,) =
+            crate::db::query_as("SELECT cid FROM happyview_records WHERE uri = ?")
+                .bind(&reference.uri)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(cid, reference.cid);
+    }
 }
