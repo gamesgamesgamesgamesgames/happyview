@@ -424,6 +424,63 @@ async fn auto_falls_back_to_crawl_when_the_archive_answers_404() {
 
 #[tokio::test]
 #[serial]
+async fn auto_without_a_key_crawls_when_the_archive_wants_one() {
+    for status in [401, 403] {
+        let mock = MockJetstream::start().await;
+        mock.disable_archive(status);
+        let Some(app) = app(&mock, None).await else {
+            return;
+        };
+        empty_relay(&app).await;
+        let id = start_job(&app, json!({ "collection": GAME, "source": "auto" })).await;
+        let job = finished(&app, &id).await;
+        assert_eq!(job["source"], "crawl", "{status}: {job}");
+        assert_eq!(job["status"], "completed", "{status}: {job}");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn auto_with_a_refused_key_fails() {
+    let mock = MockJetstream::start().await;
+    mock.disable_archive(401);
+    let Some(app) = app(&mock, Some("wrong")).await else {
+        return;
+    };
+    let id = start_job(&app, json!({ "collection": GAME, "source": "auto" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert_eq!(
+        job["error"],
+        format!(
+            "the jetstream at {} refused the replay key (HTTP 401)",
+            mock.host()
+        )
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_replay_job_without_a_key_names_the_setting() {
+    let mock = MockJetstream::start().await;
+    mock.disable_archive(403);
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert_eq!(
+        job["error"],
+        format!(
+            "the jetstream at {} needs a key to replay its archive (HTTP 403); set JETSTREAM_API_KEY",
+            mock.host()
+        )
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn auto_falls_back_to_crawl_when_nothing_listens() {
     let mock = MockJetstream::start().await;
     let Some(mut app) = app(&mock, None).await else {
@@ -1520,6 +1577,31 @@ async fn cursor_too_old_without_an_archive_resumes_as_before() {
     assert!(
         jobs.as_array().unwrap().is_empty(),
         "no replay job without an archive"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn cursor_too_old_with_a_keyed_archive_and_no_key_resumes_as_before() {
+    let mock = MockJetstream::start().await;
+    mock.disable_archive(401);
+    let Some(app) = auto_app(&mock).await else {
+        return;
+    };
+    mock.push(
+        (51..=55).map(|s| js::create(s, "did:plc:keyless", GAME, &format!("g{s:04}"), game("t"))),
+    );
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(400, "CursorTooOld", "too old");
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!("live events applied", dump(&app).await.len() == 5);
+    consumer.abort();
+    assert_eq!(mock.plan_requests().len(), 1, "the archive was asked once");
+    let jobs = app.get_json("/admin/backfill/status").await;
+    assert!(
+        jobs.as_array().unwrap().is_empty(),
+        "no gap job without a key: {jobs}"
     );
 }
 

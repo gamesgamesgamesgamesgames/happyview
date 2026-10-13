@@ -119,6 +119,18 @@ pub(super) async fn run(
         }
         (Err(Halt::Stopped), _) => ReplayOutcome::Stopped,
         (Err(Halt::NoArchive(e)), _) if run.probing => {
+            if matches!(e, ArchiveError::Unauthorized(_)) {
+                // Bluesky's hosted archive wants a key; say so once, not on
+                // every job.
+                static KEY_HINT: std::sync::Once = std::sync::Once::new();
+                KEY_HINT.call_once(|| {
+                    tracing::warn!(
+                        host = run.client.host(),
+                        error = %e,
+                        "the jetstream archive needs a key; set JETSTREAM_API_KEY to replay. Backfilling by crawl"
+                    );
+                });
+            }
             tracing::info!(job_id, error = %e, "no jetstream archive; backfilling by crawl");
             match (
                 sweeps::clear(state, job_id).await,
@@ -129,6 +141,12 @@ pub(super) async fn run(
                     ReplayOutcome::Failed(format!("failed to switch the job to crawl: {e}"))
                 }
             }
+        }
+        (Err(Halt::NoArchive(ArchiveError::Unauthorized(status))), _) => {
+            ReplayOutcome::Failed(format!(
+                "the jetstream at {} needs a key to replay its archive (HTTP {status}); set JETSTREAM_API_KEY",
+                run.client.host()
+            ))
         }
         (Err(Halt::NoArchive(ArchiveError::NoArchive(status))), _) => {
             ReplayOutcome::Failed(format!(
@@ -321,6 +339,19 @@ impl Run<'_> {
                 Err(e @ (ArchiveError::NoArchive(_) | ArchiveError::Unreachable(_)))
                     if sweep.tip_seq.is_none() =>
                 {
+                    return Err(Halt::NoArchive(e));
+                }
+                // A configured key the archive refuses is a mistake to fix,
+                // not a reason to crawl.
+                Err(ArchiveError::Unauthorized(status)) if self.state.archive.api_key.is_some() => {
+                    return Err(Halt::Failed(format!(
+                        "the jetstream at {} refused the replay key (HTTP {status})",
+                        self.client.host()
+                    )));
+                }
+                // Without a key, a first page that wants one is no archive
+                // to this instance: `auto` crawls.
+                Err(e @ ArchiveError::Unauthorized(_)) if sweep.tip_seq.is_none() => {
                     return Err(Halt::NoArchive(e));
                 }
                 Err(e) => return Err(Halt::Failed(format!("planSnapshot failed: {e}"))),
@@ -865,6 +896,7 @@ mod tests {
         assert!(!is_outage(&ArchiveError::GenerationChurn("churn".into())));
         assert!(!is_outage(&ArchiveError::Io("disk full".into())));
         assert!(!is_outage(&ArchiveError::NoArchive(404)));
+        assert!(!is_outage(&ArchiveError::Unauthorized(401)));
     }
 
     #[tokio::test]

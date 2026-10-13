@@ -88,6 +88,9 @@ pub struct BlockRange {
 pub enum ArchiveError {
     /// `planSnapshot` answered 404 or 501: this Jetstream has no archive.
     NoArchive(u16),
+    /// `planSnapshot` answered 401 or 403: the archive wants a key (or
+    /// refused the one sent).
+    Unauthorized(u16),
     /// Nothing answered at all, after retries.
     Unreachable(String),
     Status {
@@ -104,6 +107,9 @@ impl std::fmt::Display for ArchiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoArchive(status) => write!(f, "no replay archive (HTTP {status})"),
+            Self::Unauthorized(status) => {
+                write!(f, "the archive refused the request (HTTP {status})")
+            }
             Self::Unreachable(e) => write!(f, "the archive is unreachable: {e}"),
             Self::Status { status, message } if message.is_empty() => write!(f, "HTTP {status}"),
             Self::Status { status, message } => write!(f, "HTTP {status}: {message}"),
@@ -231,7 +237,8 @@ impl ArchiveClient {
 
     /// A whole small response: send it, check its status, read its body, and
     /// retry the lot under the transport policy when the body fails to
-    /// arrive. `probe` makes a 404 or 501 mean `NoArchive`.
+    /// arrive. `probe` makes a 404 or 501 mean `NoArchive`, and a 401 or 403
+    /// `Unauthorized`.
     async fn fetch(
         &self,
         probe: bool,
@@ -244,6 +251,9 @@ impl ArchiveClient {
             let status = response.status();
             if probe && matches!(status, StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED) {
                 return Err(ArchiveError::NoArchive(status.as_u16()));
+            }
+            if probe && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                return Err(ArchiveError::Unauthorized(status.as_u16()));
             }
             if !status.is_success() {
                 return Err(status_error(response).await);
@@ -631,6 +641,23 @@ mod tests {
             assert_eq!(
                 client(&server, None).plan(&PlanRequest::default()).await,
                 Err(ArchiveError::NoArchive(status))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_or_403_plan_is_unauthorized() {
+        for status in [401, 403] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(PLAN_PATH))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(
+                client(&server, None).plan(&PlanRequest::default()).await,
+                Err(ArchiveError::Unauthorized(status))
             );
         }
     }
