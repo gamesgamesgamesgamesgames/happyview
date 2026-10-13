@@ -181,17 +181,24 @@ fn its_imports_need_exactly_library_call_and_stdio() {
     assert_eq!(needed, capabilities());
 }
 
-#[tokio::test]
-async fn dropping_a_capability_it_needs_fails_the_build() {
+fn manifest() -> happyview::plugin::PluginManifest {
+    serde_json::from_value(json!({
+        "id": "module:fixture", "name": "fixture", "version": "0.0.0", "api_version": "2",
+        "plugin_type": "interpreter", "language_id": "rust",
+        "capabilities": capabilities(),
+    }))
+    .unwrap()
+}
+
+#[test]
+fn dropping_a_capability_it_needs_fails_the_build() {
     require_module!();
     let wasm = std::fs::read(MODULE).unwrap();
+    // Without this, a manifest refused for some other reason would satisfy
+    // every drop below.
+    loader::validate_capabilities(&manifest(), &wasm).unwrap();
     for dropped in capabilities() {
-        let mut manifest: happyview::plugin::PluginManifest = serde_json::from_value(json!({
-            "id": "module:fixture", "name": "fixture", "version": "0.0.0", "api_version": "2",
-            "plugin_type": "interpreter", "language_id": "rust",
-            "capabilities": capabilities(),
-        }))
-        .unwrap();
+        let mut manifest = manifest();
         manifest.capabilities.retain(|c| *c != dropped);
         let err = loader::validate_capabilities(&manifest, &wasm).unwrap_err();
         assert!(
@@ -246,12 +253,16 @@ async fn a_record_handler_returning_nothing_reads_as_none() {
 #[tokio::test]
 async fn a_panic_is_a_runtime_error_at_the_authors_line() {
     require_module!();
-    let line = std::fs::read_to_string(SOURCE)
-        .unwrap()
+    let source = std::fs::read_to_string(SOURCE).unwrap();
+    let lines: Vec<u32> = source
         .lines()
-        .position(|l| l.contains("panic!(\"the fixture panicked on purpose\")"))
-        .map(|i| i as u32 + 1)
-        .unwrap();
+        .enumerate()
+        .filter(|(_, l)| l.trim() == "panic!(\"the fixture panicked on purpose\")")
+        .map(|(i, _)| i as u32 + 1)
+        .collect();
+    let [line] = lines[..] else {
+        panic!("expected exactly one panic! line in {SOURCE}, found {lines:?}");
+    };
     let state = state().await;
     let module = module(&state);
     let output = run(
@@ -302,12 +313,12 @@ async fn spending_the_instruction_budget_is_a_timeout_not_a_crash() {
 }
 
 #[tokio::test]
-async fn the_default_budget_leaves_a_trivial_handler_most_of_its_fuel() {
+async fn a_trivial_handler_fits_a_tenth_of_the_default_budget_and_not_one_instruction() {
     require_module!();
     let state = state().await;
     let module = module(&state);
-    // A tenth of the default budget is still ten million fuel; the echo
-    // handler's whole run (decoding its input included) has to fit in it.
+    // The echo handler's whole run, decoding its input included, has to fit
+    // in a tenth of the default budget.
     let output = run(
         &state,
         &module,
@@ -319,10 +330,23 @@ async fn the_default_budget_leaves_a_trivial_handler_most_of_its_fuel() {
     )
     .await
     .unwrap();
-    assert!(
-        matches!(output, ScriptExecuteOutput::Returned { .. }),
-        "{output:?}"
+    assert_eq!(
+        output,
+        ScriptExecuteOutput::Returned {
+            value: json!({"q": "hi", "trigger": "xrpc.query:app.test.echo", "caller": "did:plc:caller"}),
+            value_kind: ScriptValueKind::Object,
+        }
     );
+    // Without this, a budget that never reached the guest would pass the
+    // check above.
+    let err = run(
+        &state,
+        &module,
+        &input("xrpc.query:app.test.echo", json!({"q": "hi"}), Some(1)),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ExecutionError::Timeout), "{err}");
 }
 
 #[tokio::test]
@@ -337,16 +361,15 @@ async fn an_unknown_trigger_is_a_missing_handler() {
     )
     .await
     .unwrap();
-    assert!(
-        matches!(
-            output,
-            ScriptExecuteOutput::Error {
-                kind: ScriptErrorKind::MissingHandle,
-                ..
-            }
-        ),
-        "{output:?}"
-    );
+    let ScriptExecuteOutput::Error {
+        kind: ScriptErrorKind::MissingHandle,
+        message,
+        ..
+    } = &output
+    else {
+        panic!("expected a missing handler, got {output:?}");
+    };
+    assert!(message.contains("xrpc.query:app.test.other"), "{message}");
 }
 
 /// `/slow?ms=N` holds the request for `N` ms and counts how many are in
@@ -399,20 +422,6 @@ async fn joined_library_calls_overlap() {
     state.plugin_registry.install(http).await.unwrap();
     let module = module(&state);
 
-    // Compile the library before anything is timed.
-    run(
-        &state,
-        &module,
-        &input(
-            "xrpc.query:app.test.pair",
-            json!({"url": format!("{base}/slow?ms=0")}),
-            None,
-        ),
-    )
-    .await
-    .unwrap();
-
-    let started = Instant::now();
     let output = run(
         &state,
         &module,
@@ -424,15 +433,13 @@ async fn joined_library_calls_overlap() {
     )
     .await
     .unwrap();
-    let elapsed = started.elapsed();
 
     let ScriptExecuteOutput::Returned { value, .. } = output else {
         panic!("{output:?}")
     };
     assert_eq!(value[0]["body"], "slow", "{value}");
     assert_eq!(value[1]["body"], "slow", "{value}");
-    // One after the other is at least 600 ms.
-    assert!(elapsed < Duration::from_millis(550), "{elapsed:?}");
+    // Each request is held for 300 ms, so two in flight at once is overlap.
     assert_eq!(peak.load(Ordering::SeqCst), 2);
 }
 
