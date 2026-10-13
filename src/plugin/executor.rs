@@ -134,6 +134,11 @@ impl PluginInstance {
         self.store.set_epoch_deadline(delta);
     }
 
+    /// The panic the guest reported during the last call, if it reported one.
+    pub fn take_panic(&mut self) -> Option<happyview_plugin_sdk::wire::PanicReport> {
+        self.store.data_mut().panic.take()
+    }
+
     /// Size the store's memory ceiling from the Lua-level limit a script
     /// runs under.
     pub fn set_script_memory_limit(&mut self, script_memory_bytes: usize) {
@@ -457,6 +462,34 @@ fn classify_error(state: &PluginState, e: wasmtime::Error) -> ExecutionError {
     ExecutionError::Trap(e)
 }
 
+/// The `execute` answer for a run whose guest panicked: a runtime error at
+/// the panic's line, in the shape an interpreter gives a script error. A
+/// relative location is relative to the module's own crate, so it is placed
+/// under `source_root` for a terminal to open; an absolute one (a dependency
+/// in the cargo registry) already says where it is.
+pub(crate) fn panic_output(
+    report: happyview_plugin_sdk::wire::PanicReport,
+    source_root: Option<&std::path::Path>,
+) -> ScriptExecuteOutput {
+    let file = std::path::Path::new(&report.file);
+    let file = match source_root {
+        Some(root) if file.is_relative() && !file.starts_with(root) => {
+            root.join(file).to_string_lossy().replace('\\', "/")
+        }
+        _ => report.file.clone(),
+    };
+    ScriptExecuteOutput::Error {
+        kind: crate::plugin::ScriptErrorKind::Runtime,
+        raw: format!(
+            "panicked at {file}:{}:{}: {}",
+            report.line, report.column, report.message
+        ),
+        message: report.message,
+        line: Some(report.line),
+        chunk: Some(file),
+    }
+}
+
 /// Factory for creating plugin instances
 #[derive(Clone)]
 pub struct PluginExecutor {
@@ -626,7 +659,17 @@ impl PluginExecutor {
         }
         // A run that failed takes its outstanding calls down with it when
         // `inst` drops; only one that answered waits for them.
-        let output = inst.call_execute(input).await?;
+        let output = match inst.call_execute(input).await {
+            Ok(output) => output,
+            // A guest that reported a panic answered the run; the trap is only
+            // how an aborting guest stops.
+            Err(e) => {
+                return match inst.take_panic() {
+                    Some(report) => Ok(panic_output(report, None)),
+                    None => Err(e),
+                };
+            }
+        };
         inst.settle_pending_calls(self.script_wall_clock()).await;
         Ok(output)
     }
@@ -986,6 +1029,7 @@ impl PluginExecutor {
             deadline: GuestDeadline::unbounded(self.runtime.epoch()),
             limiter: MemoryLimiter::new(memory_ceiling(plugin.plugin_type())),
             pending_calls: Default::default(),
+            panic: None,
         })
     }
 
@@ -1975,8 +2019,8 @@ mod deadline {
     }
 
     /// Every async `env` import is defined through the wrapper: the names
-    /// the linker holds are the names the wrapper recorded, `host_log`
-    /// excepted.
+    /// the linker holds are the names the wrapper recorded, `host_log` and
+    /// `host_script_panic` excepted.
     #[test]
     fn every_async_import_goes_through_the_deadline_wrapper() {
         let runtime = WasmRuntime::without_ticker().unwrap();
@@ -1997,7 +2041,7 @@ mod deadline {
             .collect();
         assert!(registered.len() > 50, "{registered:?}");
         for name in &registered {
-            if name == "host_log" {
+            if name == "host_log" || name == "host_script_panic" {
                 continue;
             }
             assert!(
@@ -2035,6 +2079,7 @@ mod deadline {
             deadline: GuestDeadline::unbounded(runtime.epoch()),
             limiter: MemoryLimiter::new(memory_ceiling(PluginType::Library)),
             pending_calls: Default::default(),
+            panic: None,
         }
     }
 }
@@ -2870,5 +2915,156 @@ mod baseline {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod panics {
+    use super::*;
+    use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, ScriptErrorKind};
+    use happyview_plugin_sdk::wire::PanicReport;
+
+    /// An interpreter whose `execute` reports a panic at `src/lib.rs:7:5`
+    /// and then traps, as a Rust guest's hook and abort do.
+    const PANICKING: &str = r#"(module
+        (import "env" "host_script_panic" (func $panic (param i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 32768) "{\"message\":\"boom\",\"file\":\"src/lib.rs\",\"line\":7,\"column\":5}")
+        (func (export "alloc") (param i32) (result i32) i32.const 1024)
+        (func (export "dealloc") (param i32 i32))
+        (func (export "execute") (param i32 i32) (result i64)
+            i32.const 32768
+            i32.const 58
+            call $panic
+            unreachable)
+    )"#;
+
+    /// The same trap with no report first: an ordinary crash.
+    const TRAPPING: &str = r#"(module
+        (memory (export "memory") 1)
+        (func (export "alloc") (param i32) (result i32) i32.const 1024)
+        (func (export "dealloc") (param i32 i32))
+        (func (export "execute") (param i32 i32) (result i64) unreachable)
+    )"#;
+
+    pub(super) fn interpreter(wat: &str) -> LoadedPlugin {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "guest", "name": "guest", "version": "1.0.0", "api_version": "2",
+            "plugin_type": "interpreter", "language_id": "guest", "capabilities": [],
+        }))
+        .unwrap();
+        LoadedPlugin {
+            info: manifest.clone().into(),
+            source: PluginSource::File {
+                path: "guest".into(),
+            },
+            wasm_bytes: wat::parse_str(wat).unwrap(),
+            manifest: Some(manifest),
+        }
+    }
+
+    pub(super) async fn executor_with(plugin: LoadedPlugin) -> PluginExecutor {
+        let registry = Arc::new(PluginRegistry::new());
+        registry.register(plugin).await;
+        PluginExecutor::new(
+            Arc::new(WasmRuntime::new().unwrap()),
+            registry,
+            crate::test_support::memory_pool().await,
+            DatabaseBackend::Sqlite,
+            reqwest::Client::new(),
+            Arc::new(LexiconCatalog::detached()),
+        )
+    }
+
+    pub(super) fn input(instructions: Option<u32>) -> ScriptExecuteInput {
+        ScriptExecuteInput {
+            source: String::new(),
+            kind: ScriptKind::XrpcQuery,
+            input: serde_json::json!({}),
+            context: crate::plugin::ScriptExecuteContext {
+                trigger: "xrpc.query:app.test.q".into(),
+                ..Default::default()
+            },
+            libraries: Vec::new(),
+            limits: crate::plugin::ScriptExecuteLimits {
+                instructions,
+                memory_bytes: 16 * 1024 * 1024,
+            },
+            removed_globals: Vec::new(),
+            chunk_name: crate::plugin::DEFAULT_CHUNK_NAME.to_string(),
+            artifact: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reported_panic_is_a_runtime_error_at_its_line() {
+        let executor = executor_with(interpreter(PANICKING)).await;
+        let output = executor
+            .execute_script("guest", &input(Some(1_000_000)))
+            .await
+            .expect("a reported panic is an answer, not a dispatch failure");
+        assert_eq!(
+            output,
+            ScriptExecuteOutput::Error {
+                kind: ScriptErrorKind::Runtime,
+                message: "boom".into(),
+                line: Some(7),
+                raw: "panicked at src/lib.rs:7:5: boom".into(),
+                chunk: Some("src/lib.rs".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trap_without_a_report_stays_a_trap() {
+        let executor = executor_with(interpreter(TRAPPING)).await;
+        let err = executor
+            .execute_script("guest", &input(Some(1_000_000)))
+            .await
+            .expect_err("a bare trap is the interpreter failing");
+        assert!(matches!(err, ExecutionError::Trap(_)), "{err}");
+    }
+
+    #[test]
+    fn a_relative_location_is_placed_under_the_source_root() {
+        let report = PanicReport {
+            message: "boom".into(),
+            file: "src/lib.rs".into(),
+            line: 3,
+            column: 1,
+        };
+        let ScriptExecuteOutput::Error {
+            message,
+            line,
+            chunk,
+            raw,
+            ..
+        } = panic_output(
+            report.clone(),
+            Some(std::path::Path::new("modules/registry")),
+        )
+        else {
+            panic!("expected an error");
+        };
+        assert_eq!(message, "boom");
+        assert_eq!(line, Some(3));
+        assert_eq!(chunk.as_deref(), Some("modules/registry/src/lib.rs"));
+        assert_eq!(raw, "panicked at modules/registry/src/lib.rs:3:1: boom");
+
+        // A dependency's location is absolute, and already says where it is.
+        let absolute = PanicReport {
+            file: "/home/u/.cargo/registry/src/serde/lib.rs".into(),
+            ..report
+        };
+        let ScriptExecuteOutput::Error { message, chunk, .. } =
+            panic_output(absolute, Some(std::path::Path::new("modules/registry")))
+        else {
+            panic!("expected an error");
+        };
+        assert_eq!(message, "boom");
+        assert_eq!(
+            chunk.as_deref(),
+            Some("/home/u/.cargo/registry/src/serde/lib.rs")
+        );
     }
 }

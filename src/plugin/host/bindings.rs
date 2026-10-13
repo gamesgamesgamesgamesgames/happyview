@@ -53,6 +53,9 @@ pub struct PluginState {
     /// Library calls started through `host_call_library_start` and not yet
     /// waited on. Dropped with the store, which aborts whatever is left.
     pub pending_calls: super::PendingCalls,
+    /// The panic a guest reported before trapping, which the script runner
+    /// answers the run with instead of the trap.
+    pub panic: Option<happyview_plugin_sdk::wire::PanicReport>,
 }
 
 /// Check that a memory access is within bounds
@@ -100,13 +103,14 @@ pub fn register_host_functions(linker: &mut Linker<PluginState>) -> Result<(), w
 
 /// Registers every async import through [`HostImports::define`], so none
 /// can be added without the guest-deadline accounting, and returns the
-/// names that went through it. `host_log` is synchronous and copies a few
-/// bytes; it is registered bare.
+/// names that went through it. `host_log` and `host_script_panic` are
+/// synchronous and copy a few bytes; they are registered bare.
 pub(crate) fn define_host_functions(
     linker: &mut Linker<PluginState>,
 ) -> Result<Vec<&'static str>, wasmtime::Error> {
     // Sync functions
     linker.func_wrap("env", "host_log", host_log)?;
+    linker.func_wrap("env", "host_script_panic", host_script_panic)?;
     let mut imports = HostImports::new(linker);
 
     // host_get_secret must be async because it calls alloc on an async store
@@ -1329,6 +1333,22 @@ fn host_log(
     let db_backend = caller.data().db_backend;
     let log_level: super::LogLevel = level.parse().unwrap_or_default();
     super::log(&plugin_id, log_level, msg, db, db_backend);
+}
+
+/// Host function: record the panic a guest is about to trap on. A report
+/// that cannot be read is dropped, and the run then ends as the plain trap it
+/// would have been anyway.
+fn host_script_panic(mut caller: wasmtime::Caller<'_, PluginState>, ptr: i32, len: i32) {
+    let Some(memory) = caller.data().memory else {
+        return;
+    };
+    let data = memory.data(&caller);
+    let Ok((start, end)) = check_bounds(ptr as usize, len as usize, data.len()) else {
+        return;
+    };
+    if let Ok(report) = serde_json::from_slice(&data[start..end]) {
+        caller.data_mut().panic = Some(report);
+    }
 }
 
 /// Host function: get a secret value by name
@@ -2774,6 +2794,7 @@ mod tests {
                 crate::plugin::runtime::LIBRARY_MEMORY_CEILING,
             ),
             pending_calls: Default::default(),
+            panic: None,
         }
     }
 

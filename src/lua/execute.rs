@@ -905,6 +905,39 @@ mod tests {
         }
     }
 
+    /// A panic's location travels as `chunk` and `line`, so the caller reads
+    /// the file once: in the sentence, and once more in the body's own field.
+    #[tokio::test]
+    async fn a_panic_names_its_file_once() {
+        const PLACED: &str = "modules/registry/src/lib.rs";
+        let report = happyview_plugin_sdk::wire::PanicReport {
+            message: "boom".into(),
+            file: "src/lib.rs".into(),
+            line: 3,
+            column: 1,
+        };
+        let outcome = Ok(crate::plugin::executor::panic_output(
+            report,
+            Some(std::path::Path::new("modules/registry")),
+        ));
+        let (_, error) = returned_value("com.example.probe", outcome).unwrap_err();
+        let sentence = error.to_string();
+        assert_eq!(
+            sentence,
+            format!("script runtime error in com.example.probe at {PLACED}:3: boom")
+        );
+
+        let response = error.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let body: Value = serde_json::from_slice(&body).expect("a JSON body");
+        assert_eq!(body["message"], "boom");
+        assert_eq!(body["file"], PLACED);
+        assert_eq!(body["line"], 3);
+        assert_eq!(body.to_string().matches(PLACED).count(), 1, "{body}");
+    }
+
     /// A dashboard script is chunk `script`, which names no file anyone can
     /// open; its error must read exactly as it did before chunks had paths.
     #[test]

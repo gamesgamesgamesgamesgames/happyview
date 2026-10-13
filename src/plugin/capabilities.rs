@@ -597,8 +597,14 @@ pub fn requirement_for_wasi_import(name: &str) -> Option<Requirement> {
 /// lexicon (published schema rather than anybody's data), and reading back
 /// the plugin's own effective allowed-hosts list, which a plugin needs to
 /// behave sensibly regardless of which of the three network capabilities (or
-/// none) it holds, and which carries nothing secret.
-const FREE_IMPORTS: &[&str] = &["host_log", "host_lexicon_get", "host_allowed_hosts"];
+/// none) it holds, and which carries nothing secret. `host_script_panic` only
+/// describes the run already in progress, so it costs nothing either.
+const FREE_IMPORTS: &[&str] = &[
+    "host_log",
+    "host_lexicon_get",
+    "host_allowed_hosts",
+    "host_script_panic",
+];
 
 pub fn is_free_import(name: &str) -> bool {
     FREE_IMPORTS.contains(&name)
@@ -842,6 +848,7 @@ mod tests {
             "host_job_progress",
             "host_job_should_stop",
             "host_job_wait",
+            "host_script_panic",
             "host_module_resolve",
         ] {
             // `None` is only right for the free imports.
@@ -1302,6 +1309,13 @@ mod tests {
         .unwrap();
         let err = analyze_imports(&wasm).unwrap_err();
         assert!(err.contains("wasi_snapshot_preview2"), "{err}");
+    }
+
+    #[test]
+    fn a_panic_report_needs_no_capability() {
+        assert!(is_free_import("host_script_panic"));
+        let reqs = analyze_imports(&module_importing(&["host_script_panic"])).unwrap();
+        assert!(reqs.is_empty());
     }
 
     /// The five `env` imports only an interpreter reaches share one Low

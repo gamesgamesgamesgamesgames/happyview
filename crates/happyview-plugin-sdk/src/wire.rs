@@ -1866,6 +1866,18 @@ pub struct ScriptLogRequest {
     pub fields: Option<Value>,
 }
 
+/// What `host_script_panic` receives: where a guest panicked and what it
+/// said. A guest built with `panic = "abort"` cannot return an `execute`
+/// answer once it panics, so its hook sends this just before it traps and the
+/// host answers the run with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanicReport {
+    pub message: String,
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
 /// What `host_job_progress` receives: the value stored on the job row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobProgressRequest {
@@ -4672,5 +4684,21 @@ mod interpreter_tests {
             serde_json::from_value::<JobWaitRequest>(value).unwrap(),
             wait
         );
+    }
+
+    #[test]
+    fn a_panic_report_round_trips_with_its_location() {
+        let report = PanicReport {
+            message: "boom".into(),
+            file: "src/lib.rs".into(),
+            line: 7,
+            column: 5,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"message": "boom", "file": "src/lib.rs", "line": 7, "column": 5})
+        );
+        assert_eq!(serde_json::from_value::<PanicReport>(json).unwrap(), report);
     }
 }

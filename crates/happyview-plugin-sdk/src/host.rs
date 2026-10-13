@@ -29,12 +29,12 @@ use crate::wire::{
     CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
     CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, JobGet, JobListAny, JobProgressRequest,
     JobView, Label, LabelsGet, LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoInfo,
-    LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut, PluginError, RecordRef,
-    RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, ResolvedIdentity, ScriptLogRequest,
-    SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo,
-    SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage,
-    SpaceUpdate, SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers,
-    SpacesQuery, StrongRef, TableQuery,
+    LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut, PanicReport, PluginError,
+    RecordRef, RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, ResolvedIdentity,
+    ScriptLogRequest, SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd,
+    SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite,
+    SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo,
+    SpacesMembers, SpacesQuery, StrongRef, TableQuery,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::wire::{
@@ -105,6 +105,7 @@ extern "C" {
     fn host_attest_sign(req_ptr: i32, req_len: i32) -> i64;
     fn host_attest_verify(req_ptr: i32, req_len: i32) -> i64;
     fn host_script_log(req_ptr: i32, req_len: i32) -> i64;
+    fn host_script_panic(req_ptr: i32, req_len: i32);
     fn host_job_progress(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_should_stop(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_wait(req_ptr: i32, req_len: i32) -> i64;
@@ -1218,6 +1219,24 @@ pub fn script_log(request: &ScriptLogRequest) -> Result<(), PluginError> {
     {
         let _ = request;
         Err(HostError::NotWasm.into())
+    }
+}
+
+/// Tell the host this run panicked, and where. Meant for a panic hook: it
+/// returns nothing because a hook has nothing to do with a failure, and the
+/// guest traps straight afterwards. Needs no capability, since it only
+/// describes the run already in progress.
+pub fn script_panic(report: &PanicReport) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Ok(bytes) = serde_json::to_vec(report) {
+            // SAFETY: `bytes` is live for the duration of the call.
+            unsafe { host_script_panic(bytes.as_ptr() as i32, bytes.len() as i32) };
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = report;
     }
 }
 
