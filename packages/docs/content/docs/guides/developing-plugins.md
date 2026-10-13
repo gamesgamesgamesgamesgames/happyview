@@ -429,6 +429,12 @@ Errors reaching the guest: linked repos imports use `NOT_LINKED` (no grant for t
 
 `host_linked_repo_call` has no scope pre-check; the PDS enforces the token's actual scope.
 
+#### How bytes travel
+
+Wherever an import's spec or answer carries bytes — a blob, an upload, an HTTP body — they're a JSON string when they're valid UTF-8, and the atproto data model's `{"$bytes": "<base64>"}` when they aren't. Scripts see the same two forms, and pass them on as they are. The SDK's `Bytes` type reads and writes both, so a library function that takes or returns content can use it for its own arguments too: `Bytes::from_value(&args[0])` reads one without copying it.
+
+Data the host hands a plugin brings its own fuel, so a library plugin can move a payload as large as the host allows — a multi-megabyte blob, say — without running out of the budget that bounds its computation.
+
 ### Spaces
 
 A plugin declaring `spaces:read` or `spaces:write` can import the matching function below. Each takes one JSON spec and returns the usual `{ok}`/`{error}` envelope. A space is `{uri, id, did, authority_did, creator_did, spaceType, skey, display_name, description, read_policy, write_policy, app_access, config, revision, created_at, updated_at}`; a member is `{did, access}`, where `access` is one of `read`, `write`, `read_self`, or `none`; an invite is `{invite_id, token, access, max_uses, expires_at}`; a record is `{uri, collection, rkey, record, cid, author_did}`.
