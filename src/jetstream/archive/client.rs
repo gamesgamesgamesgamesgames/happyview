@@ -229,22 +229,47 @@ impl ArchiveClient {
         }
     }
 
+    /// A whole small response: send it, check its status, read its body, and
+    /// retry the lot under the transport policy when the body fails to
+    /// arrive. `probe` makes a 404 or 501 mean `NoArchive`.
+    async fn fetch(
+        &self,
+        probe: bool,
+        cap: usize,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<Vec<u8>, ArchiveError> {
+        let mut failed = 0u32;
+        loop {
+            let response = self.send(true, &build).await?;
+            let status = response.status();
+            if probe && matches!(status, StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED) {
+                return Err(ArchiveError::NoArchive(status.as_u16()));
+            }
+            if !status.is_success() {
+                return Err(status_error(response).await);
+            }
+            match read_body(response, cap).await {
+                Ok(body) => {
+                    self.count(body.len());
+                    return Ok(body);
+                }
+                Err(e @ ArchiveError::Transport(_)) => {
+                    failed += 1;
+                    if failed >= FAILED_ATTEMPTS {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(self.retry_unit * 2u32.pow(failed - 1)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     pub async fn plan(&self, request: &PlanRequest) -> Result<PlanPage, ArchiveError> {
         let url = format!("{}{PLAN_PATH}", self.base);
-        let response = self
-            .send(true, || self.http.post(&url).json(request))
+        let body = self
+            .fetch(true, MAX_PLAN_BYTES, || self.http.post(&url).json(request))
             .await?;
-        let status = response.status();
-        if matches!(status, StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED) {
-            return Err(ArchiveError::NoArchive(status.as_u16()));
-        }
-        if !status.is_success() {
-            return Err(status_error(response).await);
-        }
-        let body = crate::jetstream::compression::read_capped(response, MAX_PLAN_BYTES)
-            .await
-            .map_err(ArchiveError::Transport)?;
-        self.count(body.len());
         serde_json::from_slice(&body).map_err(|e| {
             ArchiveError::Transport(format!("planSnapshot answered unreadable JSON: {e}"))
         })
@@ -254,21 +279,12 @@ impl ArchiveClient {
     pub async fn block(&self, segment: &str, index: u32) -> Result<Vec<u8>, ArchiveError> {
         let url = format!("{}{BLOCK_PATH}", self.base);
         let index = index.to_string();
-        let response = self
-            .send(true, || {
-                self.http
-                    .get(&url)
-                    .query(&[("segment", segment), ("blockIndex", index.as_str())])
-            })
-            .await?;
-        if !response.status().is_success() {
-            return Err(status_error(response).await);
-        }
-        let body = crate::jetstream::compression::read_capped(response, MAX_BLOCK_BYTES)
-            .await
-            .map_err(ArchiveError::TooLarge)?;
-        self.count(body.len());
-        Ok(body)
+        self.fetch(false, MAX_BLOCK_BYTES, || {
+            self.http
+                .get(&url)
+                .query(&[("segment", segment), ("blockIndex", index.as_str())])
+        })
+        .await
     }
 
     /// Download segment `name` into `dest` (created or truncated) in
@@ -276,23 +292,28 @@ impl ArchiveClient {
     /// to a ranged request means the server ignores ranges or the segment was
     /// compacted to a new generation: either way the whole body follows, and
     /// replaces what was written. More than `MAX_GENERATION_RESTARTS` of those
-    /// mid-download fails. Returns the segment's size.
+    /// mid-download fails. A first part with no ETag can't be pinned, so the
+    /// segment is fetched whole instead. A body that breaks mid-part is
+    /// re-requested from the last byte written, within the transport retry
+    /// budget. Returns the segment's size.
     pub async fn segment(&self, name: &str, dest: &Path) -> Result<u64, ArchiveError> {
         let url = format!("{}{SEGMENT_PATH}", self.base);
         let mut file = tokio::fs::File::create(dest).await.map_err(io)?;
         let mut restarts = 0u32;
+        let mut body_failures = 0u32;
         let mut etag: Option<String> = None;
         let mut written = 0u64;
+        let mut unranged = false;
         loop {
             let range = format!("bytes={written}-{}", written + self.part_size - 1);
             let pinned = etag.clone();
             let response = self
                 .send(false, || {
-                    let request = self
-                        .http
-                        .get(&url)
-                        .query(&[("name", name)])
-                        .header(RANGE, &range);
+                    let request = self.http.get(&url).query(&[("name", name)]);
+                    if unranged {
+                        return request;
+                    }
+                    let request = request.header(RANGE, &range);
                     match &pinned {
                         Some(tag) => request.header(IF_RANGE, tag),
                         None => request,
@@ -304,7 +325,8 @@ impl ArchiveClient {
                 .get(ETAG)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            match response.status() {
+            let mut progress = 0u64;
+            let outcome = match response.status() {
                 StatusCode::OK => {
                     if written > 0 {
                         restarts += 1;
@@ -319,13 +341,32 @@ impl ArchiveClient {
                     }
                     // `File::create` truncates what the earlier parts wrote.
                     file = tokio::fs::File::create(dest).await.map_err(io)?;
-                    let n = self
-                        .stream(response, &mut file, MAX_SEGMENT_BYTES, name)
-                        .await?;
-                    file.flush().await.map_err(io)?;
-                    return Ok(n);
+                    written = 0;
+                    etag = None;
+                    match self
+                        .stream(response, &mut file, MAX_SEGMENT_BYTES, name, &mut progress)
+                        .await
+                    {
+                        Ok(()) => {
+                            file.flush().await.map_err(io)?;
+                            return Ok(progress);
+                        }
+                        Err(e) => e,
+                    }
+                }
+                StatusCode::PARTIAL_CONTENT if unranged => {
+                    return Err(ArchiveError::Status {
+                        status: 206,
+                        message: format!("getSegment {name} answered 206 to an unranged request"),
+                    });
                 }
                 StatusCode::PARTIAL_CONTENT => {
+                    if etag.is_none() && tag.is_none() {
+                        // Nothing to pin the parts to: a compaction mid-way
+                        // would splice generations. Take it whole.
+                        unranged = true;
+                        continue;
+                    }
                     if etag.is_some() && tag != etag {
                         restarts += 1;
                         if restarts > MAX_GENERATION_RESTARTS {
@@ -336,7 +377,7 @@ impl ArchiveClient {
                         etag = None;
                         continue;
                     }
-                    let (start, total) =
+                    let (start, end, total) =
                         content_range(&response).ok_or_else(|| ArchiveError::Status {
                             status: 206,
                             message: format!("getSegment {name} sent no usable Content-Range"),
@@ -344,36 +385,70 @@ impl ArchiveClient {
                     if total > MAX_SEGMENT_BYTES {
                         return Err(too_large(name, total));
                     }
-                    if start != written {
+                    if start != written || end < start || end >= total {
                         return Err(ArchiveError::Status {
                             status: 206,
                             message: format!(
-                                "getSegment {name} answered from byte {start}, not {written}"
+                                "getSegment {name} answered bytes {start}-{end}/{total}, wanted from {written}"
                             ),
                         });
                     }
                     etag = tag;
-                    written += self
-                        .stream(response, &mut file, MAX_SEGMENT_BYTES - written, name)
-                        .await?;
-                    if written >= total {
-                        file.flush().await.map_err(io)?;
-                        return Ok(written);
+                    let result = self
+                        .stream(
+                            response,
+                            &mut file,
+                            MAX_SEGMENT_BYTES - written,
+                            name,
+                            &mut progress,
+                        )
+                        .await;
+                    written += progress;
+                    match result {
+                        Ok(()) if progress == end - start + 1 => {
+                            if written >= total {
+                                file.flush().await.map_err(io)?;
+                                return Ok(written);
+                            }
+                            continue;
+                        }
+                        // A clean end that delivered other than the promised
+                        // span would otherwise re-request forever.
+                        Ok(()) => {
+                            return Err(ArchiveError::Status {
+                                status: 206,
+                                message: format!(
+                                    "getSegment {name} sent {progress} bytes for bytes {start}-{end}"
+                                ),
+                            });
+                        }
+                        Err(e) => e,
                     }
                 }
                 _ => return Err(status_error(response).await),
+            };
+            // The body broke. Only transport failures are worth another try.
+            if !matches!(outcome, ArchiveError::Transport(_)) {
+                return Err(outcome);
             }
+            body_failures += 1;
+            if body_failures >= FAILED_ATTEMPTS {
+                return Err(outcome);
+            }
+            tokio::time::sleep(self.retry_unit * 2u32.pow(body_failures - 1)).await;
         }
     }
 
+    /// Append `response`'s body to `file`, counting bytes in `progress` as
+    /// they land so a failure still says how far it got.
     async fn stream(
         &self,
         mut response: reqwest::Response,
         file: &mut tokio::fs::File,
         cap: u64,
         name: &str,
-    ) -> Result<u64, ArchiveError> {
-        let mut n = 0u64;
+        progress: &mut u64,
+    ) -> Result<(), ArchiveError> {
         loop {
             let chunk = match tokio::time::timeout(SEGMENT_IDLE_TIMEOUT, response.chunk()).await {
                 Ok(chunk) => chunk.map_err(|e| ArchiveError::Transport(e.to_string()))?,
@@ -385,15 +460,40 @@ impl ArchiveClient {
                 }
             };
             let Some(chunk) = chunk else { break };
-            n += chunk.len() as u64;
-            if n > cap {
-                return Err(too_large(name, n));
+            if *progress + chunk.len() as u64 > cap {
+                return Err(too_large(name, *progress + chunk.len() as u64));
             }
             self.count(chunk.len());
             file.write_all(&chunk).await.map_err(io)?;
+            *progress += chunk.len() as u64;
         }
-        Ok(n)
+        Ok(())
     }
+}
+
+/// `response`'s body, refused once it passes `cap` bytes. A broken body is
+/// `Transport` (retryable); only an over-cap one is `TooLarge`.
+async fn read_body(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, ArchiveError> {
+    let too_large = |len: u64| {
+        ArchiveError::TooLarge(format!("the response is over {cap} bytes ({len} or more)"))
+    };
+    if let Some(len) = response.content_length()
+        && len > cap as u64
+    {
+        return Err(too_large(len));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| ArchiveError::Transport(e.to_string()))?
+    {
+        if bytes.len() + chunk.len() > cap {
+            return Err(too_large((bytes.len() + chunk.len()) as u64));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn churn(name: &str) -> ArchiveError {
@@ -409,11 +509,11 @@ fn too_large(name: &str, len: u64) -> ArchiveError {
 }
 
 /// `bytes <start>-<end>/<total>`.
-fn content_range(response: &reqwest::Response) -> Option<(u64, u64)> {
+fn content_range(response: &reqwest::Response) -> Option<(u64, u64, u64)> {
     let value = response.headers().get(CONTENT_RANGE)?.to_str().ok()?;
     let (span, total) = value.strip_prefix("bytes ")?.split_once('/')?;
-    let (start, _) = span.split_once('-')?;
-    Some((start.parse().ok()?, total.parse().ok()?))
+    let (start, end) = span.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
 }
 
 async fn status_error(response: reqwest::Response) -> ArchiveError {
@@ -868,6 +968,125 @@ mod tests {
             .await;
         assert!(
             matches!(result, Err(ArchiveError::TooLarge(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_part_fails_instead_of_looping() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(SEGMENT_PATH))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("ETag", "\"aaaa\"")
+                    .insert_header("Content-Range", "bytes 0-1023/3000")
+                    .set_body_bytes(Vec::<u8>::new()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dest = temp_file("seg");
+        let result = client(&server, None)
+            .with_part_size(1024)
+            .segment("seg_0000000001.jss", &dest)
+            .await;
+        assert!(
+            matches!(result, Err(ArchiveError::Status { status: 206, .. })),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_part_without_an_etag_is_fetched_whole() {
+        let data = body(3000, 6);
+        let server = MockServer::start().await;
+        let seen = std::sync::Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let log = seen.clone();
+        let whole = data.clone();
+        Mock::given(method("GET"))
+            .and(path(SEGMENT_PATH))
+            .respond_with(move |request: &Request| {
+                let range = request
+                    .headers
+                    .get("range")
+                    .map(|v| v.to_str().unwrap().to_string());
+                log.lock().unwrap().push(range.clone());
+                match range {
+                    Some(_) => ResponseTemplate::new(206)
+                        .insert_header("Content-Range", "bytes 0-1023/3000")
+                        .set_body_bytes(whole[..1024].to_vec()),
+                    None => ResponseTemplate::new(200).set_body_bytes(whole.clone()),
+                }
+            })
+            .mount(&server)
+            .await;
+        let dest = temp_file("seg");
+        let n = client(&server, None)
+            .with_part_size(1024)
+            .segment("seg_0000000001.jss", &dest)
+            .await
+            .unwrap();
+        assert_eq!(n, 3000);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Some("bytes=0-1023".to_string()), None]
+        );
+    }
+
+    /// A raw HTTP server: the first `drops` connections promise 1000 body
+    /// bytes, send 10 and hang up; later ones send all 1000.
+    async fn flaky_block_server(drops: usize) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut connections = 0;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let mut seen = Vec::new();
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(head.as_bytes()).await;
+                let sent = if connections < drops { 10 } else { 1000 };
+                let _ = socket.write_all(&vec![7u8; sent]).await;
+                let _ = socket.shutdown().await;
+                connections += 1;
+            }
+        });
+        addr
+    }
+
+    fn client_at(addr: std::net::SocketAddr) -> ArchiveClient {
+        let endpoint = crate::jetstream::config::parse_endpoint(&format!("http://{addr}"));
+        let config = ArchiveConfig {
+            retry_unit: Duration::from_millis(1),
+            ..ArchiveConfig::default()
+        };
+        ArchiveClient::new(reqwest::Client::new(), &endpoint, &config)
+    }
+
+    #[tokio::test]
+    async fn a_block_whose_body_drops_is_retried() {
+        let client = client_at(flaky_block_server(1).await);
+        assert_eq!(client.block("seg", 0).await.unwrap(), vec![7u8; 1000]);
+    }
+
+    #[tokio::test]
+    async fn a_body_failure_is_a_transport_error_not_too_large() {
+        let client = client_at(flaky_block_server(usize::MAX).await);
+        let result = client.block("seg", 0).await;
+        assert!(
+            matches!(result, Err(ArchiveError::Transport(_))),
             "{result:?}"
         );
     }
