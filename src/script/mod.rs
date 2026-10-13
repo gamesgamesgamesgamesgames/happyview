@@ -6,6 +6,7 @@
 //! wire struct has a field for every kind and a call site that assembles it
 //! itself is a call site that can forget one.
 
+pub mod checks;
 pub mod dispatch;
 pub mod encoding;
 pub mod input;

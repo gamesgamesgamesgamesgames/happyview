@@ -33,11 +33,10 @@ use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lua::{NATIVE_LANGUAGE, ParsedTrigger};
 use crate::plugin::{ScriptErrorKind, ScriptValidateError};
+use crate::script::checks::{self, CheckError, InterpreterCheck, MAX_DESCRIPTION_LEN};
 
 use super::auth::UserAuth;
 use super::permissions::Permission;
-
-const MAX_DESCRIPTION_LEN: usize = 300;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -562,16 +561,11 @@ fn rewrite_lua(source: &str, kind: ScriptKind) -> Result<codemod::Rewrite, AppEr
 /// A body the scanner cannot read is left to the compile check, which owns
 /// the message for a script that does not parse.
 fn refuse_unmigrated(id: &str, script_type: &str, body: &str) -> Result<(), AppError> {
-    if script_type != NATIVE_LANGUAGE {
+    let remaining = checks::unmigrated_globals(id, script_type, body);
+    if remaining.is_empty() {
         return Ok(());
     }
-    let remaining = codemod::needs_migration(body, ScriptKind::from_trigger_id(id));
-    if remaining.is_empty() || remaining == [codemod::UNPARSEABLE] {
-        return Ok(());
-    }
-    Err(AppError::UnmigratedScript(
-        remaining.into_iter().map(str::to_string).collect(),
-    ))
+    Err(AppError::UnmigratedScript(remaining))
 }
 
 /// Validate the script body against its declared language, rejecting an
@@ -593,25 +587,21 @@ async fn validate_body_for_type(
     body: &str,
     language: &str,
 ) -> Result<(), AppError> {
-    let interpreter = state
-        .plugin_registry
-        .get_interpreter_by_language(language)
-        .await
-        .ok_or_else(|| AppError::BadRequest(crate::script::no_interpreter_message(language)))?;
-    let validated = state
-        .plugin_executor()
-        .validate_script(&interpreter.info.id, body)
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!(
-                "interpreter '{}' could not check the script: {e}",
-                interpreter.info.id
-            ))
-        })?;
-    if validated.valid {
-        return Ok(());
+    match checks::check_with_interpreter(
+        &state.plugin_registry,
+        &state.plugin_executor(),
+        language,
+        body,
+    )
+    .await
+    {
+        Ok(InterpreterCheck::Valid) => Ok(()),
+        Ok(InterpreterCheck::Refused(errors)) => {
+            Err(AppError::BadRequest(refusal_message(&errors)))
+        }
+        Err(CheckError::NoInterpreter(message)) => Err(AppError::BadRequest(message)),
+        Err(e @ CheckError::InterpreterFailed { .. }) => Err(AppError::Internal(e.to_string())),
     }
-    Err(AppError::BadRequest(refusal_message(&validated.errors)))
 }
 
 /// What a refusal says, from what the interpreter reported.
