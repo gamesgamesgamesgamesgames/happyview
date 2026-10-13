@@ -410,6 +410,9 @@ impl ArchiveClient {
                                 file.flush().await.map_err(io)?;
                                 return Ok(written);
                             }
+                            // The retry budget is per part: a long download
+                            // over a flaky link must not spend it all.
+                            body_failures = 0;
                             continue;
                         }
                         // A clean end that delivered other than the promised
@@ -1089,6 +1092,65 @@ mod tests {
             matches!(result, Err(ArchiveError::Transport(_))),
             "{result:?}"
         );
+    }
+
+    /// A raw HTTP server for a `total`-byte segment: every other request
+    /// (the first, third, ...) promises its range but hangs up halfway.
+    async fn flaky_segment_server(total: usize) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut requests = 0;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let mut seen = Vec::new();
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&seen).to_ascii_lowercase();
+                let (start, end) = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("range: bytes="))
+                    .and_then(|r| r.trim().split_once('-'))
+                    .map(|(a, b)| {
+                        let start: usize = a.parse().unwrap();
+                        (start, b.parse::<usize>().unwrap().min(total - 1))
+                    })
+                    .unwrap();
+                let len = end - start + 1;
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nETag: \"aaaa\"\r\n\
+                     Content-Range: bytes {start}-{end}/{total}\r\n\
+                     Content-Length: {len}\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let sent = if requests % 2 == 0 { len / 2 } else { len };
+                let _ = socket.write_all(&vec![7u8; sent]).await;
+                let _ = socket.shutdown().await;
+                requests += 1;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn each_part_of_a_segment_gets_its_own_retry_budget() {
+        // Three parts each break once: more breaks than one budget allows,
+        // never two in a row.
+        let client = client_at(flaky_segment_server(5000).await).with_part_size(1024);
+        let dest = temp_file("seg");
+        assert_eq!(
+            client.segment("seg_0000000001.jss", &dest).await.unwrap(),
+            5000
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), vec![7u8; 5000]);
     }
 
     #[tokio::test]
