@@ -19,14 +19,18 @@ const DEBOUNCE: Duration = Duration::from_millis(100);
 pub enum Change {
     Source,
     Config,
+    /// `src/` itself appeared or was replaced, so its watch has to be added
+    /// again: inotify drops a watch whose directory is deleted.
+    SrcDir,
     /// `.happyview/build` itself appeared or was replaced, so its watch has
     /// to be added again.
     BuildDir,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Batch {
     config: bool,
+    src_dir: bool,
     build_dir: bool,
 }
 
@@ -56,6 +60,9 @@ pub fn classify(root: &Path, path: &Path) -> Option<Change> {
     if rel == Path::new("happyview.toml") {
         return Some(Change::Config);
     }
+    if rel == Path::new("src") {
+        return Some(Change::SrcDir);
+    }
     if rel.starts_with("src") {
         return Some(Change::Source);
     }
@@ -74,12 +81,10 @@ pub fn classify(root: &Path, path: &Path) -> Option<Change> {
 /// Wait for a signal, then take every other one already queued. `None` when
 /// every sender is gone.
 async fn next_batch(rx: &mut UnboundedReceiver<Change>) -> Option<Batch> {
-    let mut batch = Batch {
-        config: false,
-        build_dir: false,
-    };
+    let mut batch = Batch::default();
     let mut note = |change: Change| match change {
         Change::Config => batch.config = true,
+        Change::SrcDir => batch.src_dir = true,
         Change::BuildDir => batch.build_dir = true,
         Change::Source => {}
     };
@@ -140,7 +145,13 @@ enum AnyDebouncer {
     Poll(Debouncer<PollWatcher>),
 }
 
-impl AnyDebouncer {
+/// Adding a watch is all the rebuild loop does with its debouncer, so a test
+/// can stand in for one.
+trait Watch {
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()>;
+}
+
+impl Watch for AnyDebouncer {
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
         match self {
             Self::Native(d) => d.watcher().watch(path, mode),
@@ -224,31 +235,54 @@ pub fn spawn(state: AppState, session: DevSession) -> Result<WatchHandle, String
     let mut declared = state.config.project.clone();
     tokio::spawn(async move {
         while let Some(batch) = next_batch(&mut rx).await {
-            if batch.build_dir
-                && build_dir(&session.root).is_dir()
-                && let Some(debouncer) = rewatch.upgrade()
-            {
-                // Watching a path twice is harmless; a failure means the
-                // directory went away again, and its reappearance retries.
-                let _ = debouncer
-                    .lock()
-                    .unwrap()
-                    .watch(&build_dir(&session.root), RecursiveMode::NonRecursive);
-            }
-            if batch.config
-                && let Err(e) = crate::dev::reload::reload(&state, &session, &mut declared).await
-            {
-                // The snapshot build below reads the same file and reports
-                // the same error with the standing line.
-                tracing::debug!("happyview.toml did not load: {e}");
-            }
-            rebuild(&state, &session.root).await;
+            handle_batch(&state, &session, &rewatch, &mut declared, batch).await;
         }
     });
     Ok(WatchHandle {
         _debouncer: debouncer,
         mode,
     })
+}
+
+/// One batch's work: watch again any directory that was recreated, reload
+/// the config if it changed, then build.
+async fn handle_batch<W: Watch>(
+    state: &AppState,
+    session: &DevSession,
+    rewatch: &Weak<Mutex<W>>,
+    declared: &mut Option<Arc<crate::config::project::ProjectConfig>>,
+    batch: Batch,
+) {
+    let recreated = [
+        (
+            batch.src_dir,
+            session.root.join("src"),
+            RecursiveMode::Recursive,
+        ),
+        (
+            batch.build_dir,
+            build_dir(&session.root),
+            RecursiveMode::NonRecursive,
+        ),
+    ];
+    for (changed, path, recursive) in recreated {
+        if changed
+            && path.is_dir()
+            && let Some(debouncer) = rewatch.upgrade()
+        {
+            // Watching a path twice is harmless; a failure means the
+            // directory went away again, and its reappearance retries.
+            let _ = debouncer.lock().unwrap().watch(&path, recursive);
+        }
+    }
+    if batch.config
+        && let Err(e) = crate::dev::reload::reload(state, session, declared).await
+    {
+        // The snapshot build below reads the same file and reports the same
+        // error with the standing line.
+        tracing::debug!("happyview.toml did not load: {e}");
+    }
+    rebuild(state, &session.root).await;
 }
 
 #[cfg(test)]
@@ -263,7 +297,7 @@ mod tests {
             classify(root, Path::new("/p/src/lexicons/a.json")),
             Some(Change::Source)
         );
-        assert_eq!(classify(root, Path::new("/p/src")), Some(Change::Source));
+        assert_eq!(classify(root, Path::new("/p/src")), Some(Change::SrcDir));
         assert_eq!(
             classify(root, Path::new("/p/happyview.toml")),
             Some(Change::Config)
@@ -368,11 +402,13 @@ mod tests {
             tx.send(Change::Source).unwrap();
         }
         tx.send(Change::Config).unwrap();
+        tx.send(Change::SrcDir).unwrap();
         tx.send(Change::BuildDir).unwrap();
         assert_eq!(
             next_batch(&mut rx).await,
             Some(Batch {
                 config: true,
+                src_dir: true,
                 build_dir: true
             })
         );
@@ -381,14 +417,56 @@ mod tests {
             "the batch drained everything queued"
         );
         tx.send(Change::Source).unwrap();
-        assert_eq!(
-            next_batch(&mut rx).await,
-            Some(Batch {
-                config: false,
-                build_dir: false
-            })
-        );
+        assert_eq!(next_batch(&mut rx).await, Some(Batch::default()));
         drop(tx);
         assert_eq!(next_batch(&mut rx).await, None);
+    }
+
+    #[derive(Default)]
+    struct Recorded(Vec<(PathBuf, RecursiveMode)>);
+
+    impl Watch for Recorded {
+        fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+            self.0.push((path.to_path_buf(), mode));
+            Ok(())
+        }
+    }
+
+    /// A deleted and recreated `src/` or `.happyview/build` is watched again,
+    /// so a branch switch that empties `src/` does not end rebuilds for the
+    /// rest of the session. A directory still missing is not.
+    #[tokio::test]
+    async fn a_recreated_directory_is_watched_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        let session = DevSession {
+            root: root.to_path_buf(),
+            public_url: String::new(),
+            secrets: crate::dev::secrets::load_or_create(&root.join(".happyview")).unwrap(),
+            watch_mode: WatchMode::Native,
+        };
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let rewatch = Arc::downgrade(&recorded);
+        let mut declared = None;
+
+        let src_and_build = Batch {
+            src_dir: true,
+            build_dir: true,
+            ..Batch::default()
+        };
+        handle_batch(&state, &session, &rewatch, &mut declared, src_and_build).await;
+        assert_eq!(
+            recorded.lock().unwrap().0,
+            vec![(root.join("src"), RecursiveMode::Recursive)],
+            "build/ does not exist, so only src/ is watched again"
+        );
+
+        recorded.lock().unwrap().0.clear();
+        handle_batch(&state, &session, &rewatch, &mut declared, Batch::default()).await;
+        assert!(recorded.lock().unwrap().0.is_empty());
     }
 }
