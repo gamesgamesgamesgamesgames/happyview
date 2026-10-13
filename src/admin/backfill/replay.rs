@@ -422,13 +422,9 @@ impl Run<'_> {
                     })
                     .buffered(self.state.archive.concurrency);
                 while let Some((i, result)) = fetched.next().await {
-                    let rows = match result {
-                        Ok(frame) => decode(frame).await,
-                        Err(e) => Err(e.to_string()),
-                    };
-                    match rows {
+                    match fetched_rows(result).await {
                         Ok(rows) => self.fold_rows(rows, filter, &entry.name).await?,
-                        Err(e) => self.block_failed(&entry.name, Some(i), &e)?,
+                        Err((e, outage)) => self.block_failed(&entry.name, Some(i), &e, outage)?,
                     }
                 }
             }
@@ -449,7 +445,7 @@ impl Run<'_> {
         let path = self.download_dir.join(format!("{}-{name}", self.job_id));
         if let Err(e) = self.client.segment(name, &path).await {
             let _ = tokio::fs::remove_file(&path).await;
-            return self.block_failed(name, None, &e.to_string());
+            return self.block_failed(name, None, &e.to_string(), is_outage(&e));
         }
         let opened = {
             let path = path.clone();
@@ -467,7 +463,7 @@ impl Run<'_> {
             Ok(opened) => opened,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&path).await;
-                return self.block_failed(name, None, &e);
+                return self.block_failed(name, None, &e, false);
             }
         };
         for (i, entry) in index.into_iter().enumerate() {
@@ -483,7 +479,7 @@ impl Run<'_> {
             match rows {
                 Ok(rows) => self.fold_rows(rows, filter, name).await?,
                 Err(e) => {
-                    if let Err(halt) = self.block_failed(name, Some(i as u32), &e) {
+                    if let Err(halt) = self.block_failed(name, Some(i as u32), &e, false) {
                         drop(file);
                         let _ = tokio::fs::remove_file(&path).await;
                         return Err(halt);
@@ -550,14 +546,18 @@ impl Run<'_> {
     }
 
     /// Note a block (or, with no index, a whole segment) that failed, to be
-    /// recorded with its entry. Stops the job after
-    /// `MAX_CONSECUTIVE_FAILURES` in a row, inside the entry, so its cursor
-    /// is not saved and a resume refetches it.
+    /// recorded with its entry. An `outage` failure (the archive didn't
+    /// answer, or answered an HTTP error) counts towards
+    /// `MAX_CONSECUTIVE_FAILURES`; after that many in a row the job stops
+    /// inside the entry, so its cursor is not saved and a resume refetches
+    /// it. A block that arrived but doesn't decode or is over a cap is only
+    /// recorded: it would fail the same way on every resume.
     fn block_failed(
         &mut self,
         segment: &str,
         block: Option<u32>,
         message: &str,
+        outage: bool,
     ) -> Result<(), Halt> {
         tracing::warn!(
             job_id = self.job_id,
@@ -568,6 +568,9 @@ impl Run<'_> {
         );
         self.entry_failures
             .push((segment.to_string(), block, message.to_string()));
+        if !outage {
+            return Ok(());
+        }
         self.consecutive_failures += 1;
         if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
             return Err(Halt::Failed(format!(
@@ -636,13 +639,12 @@ impl Run<'_> {
             if block < 0 {
                 self.whole_segment(&segment, &filter).await?;
             } else {
-                let rows = match self.client.block(&segment, block as u32).await {
-                    Ok(frame) => decode(frame).await,
-                    Err(e) => Err(e.to_string()),
-                };
-                match rows {
+                let fetched = self.client.block(&segment, block as u32).await;
+                match fetched_rows(fetched).await {
                     Ok(rows) => self.fold_rows(rows, &filter, &segment).await?,
-                    Err(e) => self.block_failed(&segment, Some(block as u32), &e)?,
+                    Err((e, outage)) => {
+                        self.block_failed(&segment, Some(block as u32), &e, outage)?
+                    }
                 }
             }
             self.fold.flush().await.map_err(|e| Halt::Failed(e.0))?;
@@ -723,6 +725,23 @@ impl Run<'_> {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether a failed request means the archive is down or refusing, rather
+/// than that it answered with something unusable.
+fn is_outage(error: &ArchiveError) -> bool {
+    matches!(
+        error,
+        ArchiveError::Unreachable(_) | ArchiveError::Transport(_) | ArchiveError::Status { .. }
+    )
+}
+
+/// A fetched block's rows, or why not and whether that is an outage.
+async fn fetched_rows(fetched: Result<Vec<u8>, ArchiveError>) -> Result<Vec<Row>, (String, bool)> {
+    match fetched {
+        Ok(frame) => decode(frame).await.map_err(|e| (e, false)),
+        Err(e) => Err((e.to_string(), is_outage(&e))),
     }
 }
 
@@ -828,4 +847,39 @@ pub(crate) async fn start_gap_replay(
     let spawn_id = job_id.clone();
     tokio::spawn(async move { super::run_backfill_job(spawn_state, spawn_id).await });
     Ok((job_id, tip))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_unanswered_or_refused_request_is_an_outage() {
+        assert!(is_outage(&ArchiveError::Unreachable("refused".into())));
+        assert!(is_outage(&ArchiveError::Transport("reset".into())));
+        assert!(is_outage(&ArchiveError::Status {
+            status: 502,
+            message: String::new(),
+        }));
+        assert!(!is_outage(&ArchiveError::TooLarge("over the cap".into())));
+        assert!(!is_outage(&ArchiveError::GenerationChurn("churn".into())));
+        assert!(!is_outage(&ArchiveError::Io("disk full".into())));
+        assert!(!is_outage(&ArchiveError::NoArchive(404)));
+    }
+
+    #[tokio::test]
+    async fn a_block_that_arrives_but_does_not_decode_is_no_outage() {
+        let (_, outage) = fetched_rows(Ok(b"not a zstd frame".to_vec()))
+            .await
+            .unwrap_err();
+        assert!(!outage);
+        let (_, outage) = fetched_rows(Err(ArchiveError::TooLarge("big".into())))
+            .await
+            .unwrap_err();
+        assert!(!outage);
+        let (_, outage) = fetched_rows(Err(ArchiveError::Transport("reset".into())))
+            .await
+            .unwrap_err();
+        assert!(outage);
+    }
 }

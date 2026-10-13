@@ -1035,6 +1035,27 @@ async fn sixteen_failed_blocks_in_a_row_stop_the_job_inside_the_entry() {
 
 #[tokio::test]
 #[serial]
+async fn blocks_that_do_not_decode_never_stop_the_job() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let segment = mock.seal(games_among_noise(1..=32, 1..=20, "did:plc:baddata"), 1);
+    // More bad blocks in a row than an outage may fail; the archive answers
+    // every one of them.
+    for index in 2..=19 {
+        mock.corrupt_block(&segment, index);
+    }
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(job["replay"]["blocks_failed"], 18, "{job}");
+    assert_eq!(errors(&app, &id).await.len(), 18);
+    assert_eq!(dump(&app).await.len(), 2);
+}
+
+#[tokio::test]
+#[serial]
 async fn a_failed_replay_job_resumes_where_it_stopped() {
     let mock = MockJetstream::start().await;
     let Some(app) = app(&mock, None).await else {
