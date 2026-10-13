@@ -1,6 +1,7 @@
 //! `happyview dev`: the production binary with local defaults.
 
 pub mod env;
+pub mod instance;
 pub mod secrets;
 
 use std::path::{Path, PathBuf};
