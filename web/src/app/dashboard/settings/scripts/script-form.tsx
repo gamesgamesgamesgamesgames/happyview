@@ -299,6 +299,7 @@ function TriggerComposer({
   );
 
   const isJob = state.source === JOB_SOURCE;
+  const jobProblem = state.suffix.length > 0 ? jobTypeProblem(state.suffix) : null;
 
   const stateRef = useRef(state);
   useEffect(() => {
@@ -403,16 +404,10 @@ function TriggerComposer({
                 onChange={(e) => onChange({ ...state, suffix: e.target.value })}
                 placeholder="e.g. export, migrate, sync"
                 className="h-8 text-sm font-mono"
-                aria-invalid={
-                  state.suffix.length > 0 &&
-                  jobTypeProblem(state.suffix) !== null
-                }
+                aria-invalid={jobProblem !== null}
               />
-              {state.suffix.length > 0 &&
-              jobTypeProblem(state.suffix) !== null ? (
-                <p className="text-xs text-destructive">
-                  {jobTypeProblem(state.suffix)}
-                </p>
+              {jobProblem !== null ? (
+                <p className="text-xs text-destructive">{jobProblem}</p>
               ) : (
                 <p className="text-xs text-muted-foreground">
                   Must match the type passed to{" "}
