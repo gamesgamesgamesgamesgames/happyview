@@ -76,6 +76,8 @@ jobs:
               - 'docker-compose*'
               - 'entrypoint.sh'
               - '.releaserc.json'
+              - 'dist-workspace.toml'
+              - '.github/build-setup.yml'
               # The guard scripts the jobs below run, and the jobs themselves:
               # a change that weakens a check has to face the suite it guards.
               - 'scripts/**'
@@ -746,15 +748,33 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
         run: npx -p semantic-release -p semantic-release-gha-output semantic-release
 
+  # Starts release.yml for the tag semantic-release just created. A job of its
+  # own so a failed dispatch is a visible red job that can be re-run, rather
+  # than a failure in `release` that would skip the image build for a version
+  # whose tag and GitHub release already exist. The PAT needs actions:write.
+  dispatch-native-release:
+    needs: release
+    if: needs.release.outputs.version != ''
+    runs-on: depot-ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Build native binaries
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
+        run: >-
+          gh workflow run release.yml
+          --repo "${{ github.repository }}"
+          --ref "v${{ needs.release.outputs.version }}"
+          -f tag="v${{ needs.release.outputs.version }}"
+
   # ---------------------------------------------------------------------------
-  # Build + Docker — compile per-platform, upload to GitHub release, push image
+  # Build + Docker — compile per-platform, push image
   # ---------------------------------------------------------------------------
   build:
     needs: release
     if: needs.release.outputs.version != ''
     runs-on: ${{ matrix.runs-on }}
     permissions:
-      contents: write
       packages: write
       id-token: write
     strategy:
@@ -788,15 +808,6 @@ jobs:
           cache-from: type=gha,scope=builder-${{ matrix.platform }}
           cache-to: type=gha,scope=builder-${{ matrix.platform }},mode=max,ignore-error=true
           outputs: type=local,dest=.
-
-      - name: Upload binary to release
-        env:
-          GH_TOKEN: ${{ secrets.DISPATCH_GH_TOKEN }}
-        run: |
-          cp target/release/happyview happyview-linux-${{ matrix.arch }}
-          gh release upload "v${{ needs.release.outputs.version }}" \
-            happyview-linux-${{ matrix.arch }} \
-            --clobber
 
       - name: Prepare binary override
         run: |

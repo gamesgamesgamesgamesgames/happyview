@@ -1,0 +1,13 @@
+- name: Stamp the release version
+  if: ${{ inputs.tag && inputs.tag != 'dry-run' }}
+  shell: bash
+  run: bash scripts/stamp-version.sh "${{ inputs.tag }}"
+- name: Setup Node.js
+  uses: actions/setup-node@v7
+  with:
+    node-version: 24
+- name: Build the dashboard
+  shell: bash
+  env:
+    NEXT_PUBLIC_BASE_PATH: /__HAPPYVIEW_BP__
+  run: cd web && npm ci && npm run build

@@ -29,6 +29,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 default-run = "happyview"
+repository = "https://github.com/gamesgamesgamesgamesgames/happyview"
 
 # Debug info dominates both codegen and link time on this workspace, and full
 # DWARF buys little for day-to-day work: `line-tables-only` still yields file
@@ -37,6 +38,11 @@ default-run = "happyview"
 # inherits dev.
 [profile.dev]
 debug = "line-tables-only"
+
+# The profile cargo-dist builds release archives with.
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [dependencies]
 aes-gcm = "0.11"
