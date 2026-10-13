@@ -37,6 +37,26 @@ impl ExtensionClaims {
             });
     }
 
+    /// Every extension an installed interpreter claims. Sorted by plugin id
+    /// so the rare duplicate an unchecked `register` allows resolves the
+    /// same way on every build.
+    pub async fn from_registry(registry: &crate::plugin::PluginRegistry) -> Self {
+        let mut interpreters = registry
+            .list_by_type(crate::plugin::PluginType::Interpreter)
+            .await;
+        interpreters.sort_by(|a, b| a.info.id.cmp(&b.info.id));
+        let mut claims = Self::default();
+        for plugin in &interpreters {
+            let Some(language_id) = plugin.language_id() else {
+                continue;
+            };
+            for extension in plugin.extensions() {
+                claims.insert(extension, &plugin.info.id, language_id);
+            }
+        }
+        claims
+    }
+
     pub fn get(&self, extension: &str) -> Option<&Claim> {
         self.by_extension.get(extension)
     }
@@ -149,8 +169,47 @@ pub fn classify(
     match file.segments[0].as_str() {
         "lexicons" if nested && extension == "json" => Ok(Role::Lexicon),
         "lexicons" if nested => beside_lexicons(file, base, extension, claim, claims, lexicons),
+        "jobs" if nested => flat(file, Flat::Jobs, base, extension, claim, claims),
+        "labels" if nested => flat(file, Flat::Labels, base, extension, claim, claims),
         _ => Ok(module_or_ignored(claim)),
     }
+}
+
+enum Flat {
+    Jobs,
+    Labels,
+}
+
+/// `src/jobs/` and `src/labels/` hold handlers named by their whole job type
+/// or NSID. The name goes through the trigger grammar itself, so a file can
+/// name exactly what the dashboard can.
+fn flat(
+    file: &SrcFile,
+    which: Flat,
+    base: &str,
+    extension: &str,
+    claim: Option<Claim>,
+    claims: &ExtensionClaims,
+) -> Result<Role, Diagnostic> {
+    let (dir, prefix, what) = match which {
+        Flat::Jobs => ("jobs", "job.run", "job type"),
+        Flat::Labels => ("labels", "labeler.apply", "NSID or _actor"),
+    };
+    if file.segments.len() > 2 {
+        return Err(Diagnostic::error(
+            file.rel_path(),
+            format!(
+                "src/{dir}/ is flat: a file's name is its whole {what}, so it cannot sit in a subdirectory"
+            ),
+        ));
+    }
+    if claim.is_none() && is_document(extension) {
+        return Ok(Role::Ignored);
+    }
+    let claim = require_claim(file, extension, claim, claims)?;
+    let trigger = ParsedTrigger::parse(&format!("{prefix}:{base}"))
+        .map_err(|e| Diagnostic::error(file.rel_path(), e))?;
+    Ok(Role::Handler { trigger, claim })
 }
 
 fn module_or_ignored(claim: Option<Claim>) -> Role {
@@ -468,6 +527,79 @@ mod tests {
         assert!(
             matches!(role, Role::Handler { ref trigger, .. } if trigger.id() == "xrpc.query:com.example.test"),
             "{role:?}"
+        );
+    }
+
+    #[test]
+    fn a_job_file_is_named_by_its_type() {
+        assert_eq!(
+            trigger("jobs/instance.operation.lua"),
+            "job.run:instance.operation"
+        );
+        assert_eq!(trigger("jobs/test.lua"), "job.run:test");
+    }
+
+    #[test]
+    fn a_label_file_is_named_by_its_collection_or_actor() {
+        assert_eq!(
+            trigger("labels/app.bsky.feed.post.lua"),
+            "labeler.apply:app.bsky.feed.post"
+        );
+        assert_eq!(trigger("labels/_actor.ts"), "labeler.apply:_actor");
+    }
+
+    #[test]
+    fn a_name_the_grammar_refuses_is_an_error() {
+        assert!(error("jobs/Nightly.lua").contains("must match"));
+        assert!(error("jobs/happyview.purge.lua").contains("reserved"));
+        assert!(error("labels/not-an-nsid.lua").contains("not-an-nsid"));
+    }
+
+    #[test]
+    fn jobs_and_labels_are_flat() {
+        let message = error("jobs/nightly/run.lua");
+        assert!(message.contains("src/jobs/ is flat"), "{message}");
+        let message = error("labels/app/bsky.lua");
+        assert!(message.contains("src/labels/ is flat"), "{message}");
+    }
+
+    #[test]
+    fn jobs_and_labels_hold_handlers_and_documentation_only() {
+        assert!(matches!(role("jobs/README.md"), Ok(Role::Ignored)));
+        assert!(error("jobs/nightly.py").contains(".py"));
+    }
+
+    #[tokio::test]
+    async fn claims_come_from_the_installed_interpreters() {
+        let registry = crate::plugin::PluginRegistry::new();
+        for (id, language, extensions) in [
+            ("lua", "lua", vec!["lua"]),
+            ("ts", "typescript", vec!["ts", "mts"]),
+        ] {
+            let manifest: crate::plugin::PluginManifest =
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "name": id, "version": "1.0.0", "api_version": "2",
+                    "plugin_type": "interpreter", "language_id": language,
+                    "extensions": extensions, "capabilities": [],
+                }))
+                .unwrap();
+            registry
+                .install(crate::plugin::LoadedPlugin {
+                    info: manifest.clone().into(),
+                    source: crate::plugin::PluginSource::File { path: id.into() },
+                    wasm_bytes: vec![],
+                    manifest: Some(manifest),
+                })
+                .await
+                .unwrap();
+        }
+        let claims = ExtensionClaims::from_registry(&registry).await;
+        assert_eq!(claims.get("mts").unwrap().language_id, "typescript");
+        assert_eq!(claims.get("lua").unwrap().plugin_id, "lua");
+        assert!(claims.get("py").is_none());
+        assert_eq!(
+            claims.describe(),
+            "installed: .lua (lua), .mts (ts), .ts (ts)"
         );
     }
 }
