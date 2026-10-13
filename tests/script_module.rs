@@ -93,6 +93,9 @@ fn module(state: &happyview::AppState) -> Arc<ScriptModule> {
         lexicon("app.test.boom", "query"),
         lexicon("app.test.spin", "query"),
         lexicon("app.test.thing", "record"),
+        lexicon("app.test.calibration.shape", "query"),
+        lexicon("app.test.calibration.aggregate", "query"),
+        lexicon("app.test.calibration.render", "query"),
     ]
     .into_iter()
     .collect();
@@ -155,6 +158,15 @@ fn the_linker_concatenates_every_handler_line_into_one_readable_section() {
     let expected: Vec<ModuleHandler> = [
         ("record.index:app.test.thing", "index_thing"),
         ("xrpc.query:app.test.boom", "boom"),
+        (
+            "xrpc.query:app.test.calibration.aggregate",
+            "calibration_aggregate",
+        ),
+        (
+            "xrpc.query:app.test.calibration.render",
+            "calibration_render",
+        ),
+        ("xrpc.query:app.test.calibration.shape", "calibration_shape"),
         ("xrpc.query:app.test.echo", "echo"),
         ("xrpc.query:app.test.pair", "pair"),
         ("xrpc.query:app.test.spin", "spin"),
@@ -464,6 +476,15 @@ async fn a_query_reaches_the_module_through_the_xrpc_router() {
         std::fs::write(
             root.join(format!("src/lexicons/app/test/{id}.json")),
             json!({"lexicon": 1, "id": format!("app.test.{id}"), "defs": {"main": main}})
+                .to_string(),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir_all(root.join("src/lexicons/app/test/calibration")).unwrap();
+    for id in ["shape", "aggregate", "render"] {
+        std::fs::write(
+            root.join(format!("src/lexicons/app/test/calibration/{id}.json")),
+            json!({"lexicon": 1, "id": format!("app.test.calibration.{id}"), "defs": {"main": {"type": "query"}}})
                 .to_string(),
         )
         .unwrap();

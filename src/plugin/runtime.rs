@@ -40,13 +40,51 @@ pub fn fuel_for(plugin_type: PluginType) -> u64 {
 
 /// Fuel per unit of a script's instruction budget, for a compiled module.
 ///
-/// The budget is an operator setting written for interpreters, where a unit
-/// is one VM instruction (tens of wasm instructions) and decoding the run's
-/// JSON is the interpreter's own uncounted work. A compiled module pays for
-/// that decoding in fuel: a 1 KB input round-trip costs about 100,000 under
-/// wasmtime 49, which at one fuel per unit would be a tenth of the default
-/// budget spent before a handler runs.
-pub const FUEL_PER_INSTRUCTION: u64 = 100; // provisional until measured against the Lua interpreter
+/// The budget is an operator setting written for the Lua interpreter, where a
+/// unit is one bytecode instruction and everything a script does in a C
+/// builtin is free: decoding the run's JSON input, encoding its result,
+/// `table.sort`, `string.format`, `table.concat`. A compiled module does all
+/// of that in wasm and pays fuel for it, input decoding included, which is
+/// most of what a typical handler spends. The value therefore sits above the
+/// top of the measured range, so that every measured workload that fits a Lua
+/// budget also fits as a module under the same setting; the wall clock
+/// remains the hard CPU bound for both.
+///
+/// That does not hold for every handler. A module pays roughly 97 fuel per
+/// byte to decode its input (the slope of a handler that only decodes, from
+/// 22,852 to 91,886 bytes of records), which a Lua script does not pay at
+/// all, so a handler that does little with a large input gets far less from
+/// one setting as a module: at the setting's floor of 1,000, about 40 KB of
+/// input exhausts the budget before the handler runs.
+///
+/// Measured by `tests/fuel_calibration.rs` on 2026-10-13: the smallest budget
+/// at which each handler returns, as a Lua script under happyview-lua 1.0.0
+/// (sha256 `9496eb497590e44c5c8a66441156499c63dd6f9c8b9ec01bf59c9b8a5e11382b`)
+/// and as a release wasm32-wasip1 module in raw fuel, under wasmtime 49.0.2
+/// and rustc 1.96.1, with module fuel resolved to 100. Three runs of each
+/// input agreed exactly.
+///
+/// | handler   | records | Lua instructions | module fuel | fuel per instruction |
+/// |-----------|---------|------------------|-------------|----------------------|
+/// | shape     | 50      | 1,575            | 2,798,400   | 1,777                |
+/// | aggregate | 50      | 2,321            | 2,461,700   | 1,061                |
+/// | render    | 50      | 852              | 2,748,900   | 3,226                |
+/// | shape     | 200     | 6,429            | 9,899,300   | 1,540                |
+/// | aggregate | 200     | 7,445            | 9,486,600   | 1,274                |
+/// | render    | 200     | 3,252            | 10,797,700  | 3,320                |
+/// | echo      | -       | 37               | 67,700      | 1,830                |
+///
+/// `shape` filters, sorts and reshapes post envelopes, `aggregate` counts and
+/// ranks their tags, and `render` formats one line per post. The value is the
+/// largest ratio, 3,320, plus about a fifth for toolchain drift: a rustc,
+/// wasmtime or serde upgrade moves these figures by a few percent, and the
+/// calibration test should fail only on a real shift. That test is ignored
+/// and needs the plugin, so it runs only by hand: re-run it after upgrading
+/// rustc, wasmtime, serde or the SDK's input decoding, or happyview-lua. A
+/// trivial handler needs 17 units under this value, far inside the setting's
+/// floor of 1,000, and the setting's ceiling of 1,000,000,000 is 4 × 10^12
+/// fuel, nowhere near overflowing.
+pub const FUEL_PER_INSTRUCTION: u64 = 4_000;
 
 /// The fuel each call into a compiled module gets. `None` is a job, which
 /// has no budget and stops through `should_stop`.
