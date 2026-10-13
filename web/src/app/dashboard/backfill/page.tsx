@@ -1597,6 +1597,9 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
   const [source, setSource] = useState<BackfillSource | "default">("default");
   const [open, setOpen] = useState(false);
   const [recordLexicons, setRecordLexicons] = useState<string[]>([]);
+  // Account backfills always crawl; the server refuses replay for them.
+  const accountJob = dids.length > 0;
+  const chosenSource = accountJob && source === "replay" ? "default" : source;
 
   useEffect(() => {
     if (open) {
@@ -1618,7 +1621,7 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
       await createBackfillJob({
         collection: collection || undefined,
         dids: dids.length > 0 ? dids : undefined,
-        source: source === "default" ? undefined : source,
+        source: chosenSource === "default" ? undefined : chosenSource,
       });
       toast.success("Backfill job created");
       setCollection(null);
@@ -1696,7 +1699,7 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
           <div className="flex flex-col gap-2">
             <Label htmlFor="bf-source">Source</Label>
             <Select
-              value={source}
+              value={chosenSource}
               onValueChange={(v) => setSource(v as BackfillSource | "default")}
             >
               <SelectTrigger id="bf-source" className="w-full">
@@ -1704,16 +1707,20 @@ function CreateDialog({ onSuccess }: { onSuccess: () => void }) {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="default">Default</SelectItem>
-                <SelectItem value="replay">Replay from Jetstream</SelectItem>
+                <SelectItem value="replay" disabled={accountJob}>
+                  Replay from Jetstream
+                </SelectItem>
                 <SelectItem value="crawl">Crawl PDSes</SelectItem>
               </SelectContent>
             </Select>
             <p className="text-muted-foreground text-xs">
-              {source === "replay"
-                ? "Reads the Jetstream archive. Needs a v2 Jetstream."
-                : source === "crawl"
-                  ? "Lists repos from the relay and fetches each PDS."
-                  : "Uses the server's BACKFILL_SOURCE."}
+              {accountJob
+                ? "Account backfills always crawl each account's PDS."
+                : chosenSource === "replay"
+                  ? "Reads the Jetstream archive. Needs a v2 Jetstream, and can only return what the archive holds: it may miss a repo's oldest records."
+                  : chosenSource === "crawl"
+                    ? "Lists repos from the relay and fetches each PDS."
+                    : "Uses the server's BACKFILL_SOURCE (crawl unless set)."}
             </p>
           </div>
         </ResponsiveDialogBody>
