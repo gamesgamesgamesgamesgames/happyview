@@ -281,20 +281,15 @@ fn prepare_cache_dir(dir: &Path) -> Result<(), String> {
 /// corruption; this guards them against an author.
 #[cfg(unix)]
 fn directory_is_private(metadata: &std::fs::Metadata, euid: u32) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    if metadata.uid() != euid {
-        return Err(format!(
-            "the plugin module cache directory is owned by uid {} rather than this process's uid {euid}",
-            metadata.uid()
-        ));
-    }
-    let mode = metadata.mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(format!(
+    use crate::fs_private::{NotPrivate, private_to};
+    private_to(metadata, euid).map_err(|reason| match reason {
+        NotPrivate::OtherOwner { uid, euid } => format!(
+            "the plugin module cache directory is owned by uid {uid} rather than this process's uid {euid}"
+        ),
+        NotPrivate::OpenMode { mode } => format!(
             "the plugin module cache directory has mode {mode:o}; it must grant nothing to group or other"
-        ));
-    }
-    Ok(())
+        ),
+    })
 }
 
 struct CachedModule {

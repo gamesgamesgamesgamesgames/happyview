@@ -10,6 +10,7 @@ pub mod constant_time;
 pub mod dashboard;
 pub mod db;
 pub mod delegation;
+pub mod dev;
 pub mod dev_happyview;
 pub mod dns;
 pub mod domain;
@@ -19,6 +20,8 @@ pub mod event_log;
 pub mod external_auth;
 pub mod feature_flags;
 pub mod feature_middleware;
+#[cfg(unix)]
+pub(crate) mod fs_private;
 pub mod http_retry;
 pub mod identity;
 pub mod jetstream;

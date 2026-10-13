@@ -30,7 +30,7 @@ const MIN_SESSION_SECRET_BYTES: usize = 32;
 
 /// Validate a session secret, rejecting known placeholder values and anything
 /// too short to be secure. Returns a human-readable reason on failure.
-fn validate_session_secret(secret: &str) -> Result<(), String> {
+pub(crate) fn validate_session_secret(secret: &str) -> Result<(), String> {
     if secret.is_empty() {
         return Err(
             "SESSION_SECRET is not set. Generate a random value of at least 32 bytes \
