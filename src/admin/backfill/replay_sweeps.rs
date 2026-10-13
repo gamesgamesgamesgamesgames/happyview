@@ -97,8 +97,7 @@ pub(super) async fn load(state: &AppState, job_id: &str) -> Result<Vec<Sweep>, s
     .bind(job_id)
     .fetch_all(&state.backfill_db)
     .await?;
-    Ok(rows
-        .into_iter()
+    rows.into_iter()
         .map(
             |(
                 sweep,
@@ -110,23 +109,47 @@ pub(super) async fn load(state: &AppState, job_id: &str) -> Result<Vec<Sweep>, s
                 tip_seq,
                 last_did_id,
                 done,
-            )| Sweep {
-                sweep,
-                kind: if kind == "markers" {
-                    SweepKind::Markers
-                } else {
-                    SweepKind::Commits
-                },
-                collections: serde_json::from_str(&collections).unwrap_or_default(),
-                dids: dids.and_then(|d| serde_json::from_str(&d).ok()),
-                after_seq,
-                cursor_seq,
-                tip_seq,
-                last_did_id,
-                done: done != 0,
+            )| {
+                // A row that does not parse must stop the job: read as empty,
+                // `collections` would plan every commit in the archive and
+                // `dids` would widen an account sweep to the network (P1).
+                let corrupt = |what: &str, e: String| {
+                    sqlx::Error::Decode(
+                        format!("replay sweep {sweep} of job {job_id} has unreadable {what}: {e}")
+                            .into(),
+                    )
+                };
+                let kind = match kind.as_str() {
+                    "commits" => SweepKind::Commits,
+                    "markers" => SweepKind::Markers,
+                    other => return Err(corrupt("kind", format!("{other:?}"))),
+                };
+                let collections: Vec<String> = serde_json::from_str(&collections)
+                    .map_err(|e| corrupt("collections", e.to_string()))?;
+                let dids: Option<Vec<String>> = dids
+                    .map(|d| serde_json::from_str(&d))
+                    .transpose()
+                    .map_err(|e| corrupt("dids", e.to_string()))?;
+                if kind == SweepKind::Commits && collections.is_empty() {
+                    return Err(corrupt("collections", "a commit sweep has none".into()));
+                }
+                if kind == SweepKind::Markers && dids.as_ref().is_none_or(Vec::is_empty) {
+                    return Err(corrupt("dids", "a marker sweep has none".into()));
+                }
+                Ok(Sweep {
+                    sweep,
+                    kind,
+                    collections,
+                    dids,
+                    after_seq,
+                    cursor_seq,
+                    tip_seq,
+                    last_did_id,
+                    done: done != 0,
+                })
             },
         )
-        .collect())
+        .collect()
 }
 
 pub(super) async fn insert(
@@ -226,6 +249,38 @@ pub(super) async fn set_source(
     })
     .await?;
     Ok(())
+}
+
+/// Add `n` replayed records to the job's `total_records`, which spans every
+/// run of the job (a resumed run starts a fresh fold).
+pub(super) async fn add_records(state: &AppState, job_id: &str, n: i64) -> Result<(), sqlx::Error> {
+    let sql = adapt_sql(
+        &format!(
+            "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
+            super::saturating_counter("total_records", "?", state.db_backend)
+        ),
+        state.db_backend,
+    );
+    crate::db::retry_on_busy(|| {
+        crate::db::query(&sql)
+            .bind(n)
+            .bind(job_id)
+            .execute(&state.backfill_db)
+    })
+    .await?;
+    Ok(())
+}
+
+/// The job's `total_records`, across all its runs.
+pub(super) async fn records(state: &AppState, job_id: &str) -> Result<i32, sqlx::Error> {
+    let (n,): (Option<i32>,) = crate::db::query_as(&adapt_sql(
+        "SELECT total_records FROM happyview_backfill_jobs WHERE id = ?",
+        state.db_backend,
+    ))
+    .bind(job_id)
+    .fetch_one(&state.backfill_db)
+    .await?;
+    Ok(n.unwrap_or(0))
 }
 
 /// Add to the job's replay counters; returns the new totals.
@@ -455,6 +510,55 @@ mod tests {
                 ((1 << 40) + 10, 3),
                 "a read changes nothing"
             );
+            add_records(&state, &job, 4).await.unwrap();
+            add_records(&state, &job, 4).await.unwrap();
+            assert_eq!(records(&state, &job).await.unwrap(), 8);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_sweep_row_is_an_error_not_an_empty_list() {
+        let mut states = vec![crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        )];
+        if let Some(state) = crate::test_support::test_state_from_env().await {
+            states.push(state);
+        }
+        let cases = [
+            ("commits", "not json", None),
+            ("commits", "[]", None),
+            ("markers", "[]", Some("{oops")),
+            ("markers", "[]", None),
+            ("bogus", "[\"app.test.c\"]", None),
+        ];
+        for state in states {
+            for (kind, collections, dids) in cases {
+                let job = format!("corrupt-{}", uuid::Uuid::new_v4());
+                crate::db::query(&adapt_sql(
+                    "INSERT INTO happyview_backfill_jobs (id, scope, status, stage, created_at) \
+                     VALUES (?, 'network', 'running', 'pending', '2026-10-12T00:00:00+00:00')",
+                    state.db_backend,
+                ))
+                .bind(&job)
+                .execute(&state.db)
+                .await
+                .unwrap();
+                crate::db::query(&adapt_sql(
+                    "INSERT INTO happyview_backfill_replay_sweeps \
+                     (job_id, sweep, kind, collections, dids, after_seq, cursor_seq) \
+                     VALUES (?, 0, ?, ?, ?, 0, 0)",
+                    state.db_backend,
+                ))
+                .bind(&job)
+                .bind(kind)
+                .bind(collections)
+                .bind(dids)
+                .execute(&state.db)
+                .await
+                .unwrap();
+                let error = load(&state, &job).await.expect_err(kind).to_string();
+                assert!(error.contains("replay sweep 0"), "{error}");
+            }
         }
     }
 }

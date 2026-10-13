@@ -46,6 +46,8 @@ struct Run<'a> {
     errors: ErrorRecorder,
     /// Bytes already added to the job's counter.
     counted: u64,
+    /// Records of this run's fold already added to `total_records`.
+    records_counted: u64,
     probing: bool,
     download_dir: PathBuf,
 }
@@ -65,22 +67,37 @@ pub(super) async fn run(
         fold: ReplayFold::new(state.clone(), collections.to_vec()),
         errors: ErrorRecorder::new(state, job_id).await,
         counted: 0,
+        records_counted: 0,
         probing: source == "auto",
         download_dir: state.archive.download_dir.clone(),
     };
     sweep_downloads(&run.download_dir, job_id).await;
     let result = run.drive(collections, scope_dids).await;
     let flushed = run.fold.flush().await;
-    let _ = run.count_bytes(0).await;
+    let counted = run.count_bytes(0).await;
     // Persist the error counts (`error_counts`) before the caller completes,
     // fails or pauses the job; `record` only writes the detail rows.
     run.errors.flush(state, job_id).await;
     remove_own_downloads(&run.download_dir, job_id).await;
     match (result, flushed) {
-        (Ok(()), Ok(())) => ReplayOutcome::Completed {
-            records: run.fold.written(),
-            bytes: run.client.bytes_downloaded(),
-        },
+        (Ok(()), Ok(())) => {
+            // `total_records` spans every run of the job; this run's fold
+            // only knows its own writes.
+            let records = match counted {
+                Ok(()) => sweeps::records(state, job_id)
+                    .await
+                    .map_err(|e| format!("replay bookkeeping failed: {e}")),
+                Err(Halt::Failed(e)) => Err(e),
+                Err(_) => Err("replay bookkeeping failed: the record count was not saved".into()),
+            };
+            match records {
+                Ok(records) => ReplayOutcome::Completed {
+                    records: u64::try_from(records).unwrap_or(0),
+                    bytes: run.client.bytes_downloaded(),
+                },
+                Err(e) => ReplayOutcome::Failed(e),
+            }
+        }
         (Err(Halt::Stopped), _) => ReplayOutcome::Stopped,
         (Err(Halt::NoArchive(e)), _) if run.probing => {
             tracing::info!(job_id, error = %e, "no jetstream archive; backfilling by crawl");
@@ -233,9 +250,18 @@ impl Run<'_> {
         super::should_stop(self.state, self.job_id).await.is_some()
     }
 
-    /// Add what the client downloaded since the last call to the job's
-    /// counter, plus `failed` blocks, and publish progress.
+    /// Add what the client downloaded and the fold wrote since the last call
+    /// to the job's counters, plus `failed` blocks. Called once an entry's
+    /// writes have committed.
     async fn count_bytes(&mut self, failed: i32) -> Result<(), Halt> {
+        let written = self.fold.written();
+        let new_records = written - self.records_counted;
+        if new_records > 0 {
+            sweeps::add_records(self.state, self.job_id, new_records as i64)
+                .await
+                .map_err(db)?;
+            self.records_counted = written;
+        }
         let total = self.client.bytes_downloaded();
         let delta = (total - self.counted) as i64;
         self.counted = total;

@@ -638,7 +638,12 @@ async fn a_resumed_job_does_not_refetch_finished_entries() {
         .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
         .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(finished(&app, &id).await["status"], "completed");
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "completed");
+    assert_eq!(
+        job["total_records"], 8,
+        "records from before the pause still count: {job}"
+    );
     let downloads = mock.segment_downloads();
     assert_eq!(
         downloads.iter().filter(|n| **n == first).count(),
