@@ -33,8 +33,11 @@ pub(super) struct ReplayFold {
     pending_uris: HashSet<String>,
     pending_dids: HashSet<String>,
     written: u64,
-    /// DIDs with a record written or changed since `take_written_dids`.
+    /// DIDs with a record written or changed since `take_written_dids`,
+    /// kept only once `collect_written_dids` is called: a retry job needs
+    /// them, and an ordinary job would hold every DID it wrote.
     written_dids: HashSet<String>,
+    collect_dids: bool,
 }
 
 impl ReplayFold {
@@ -48,12 +51,18 @@ impl ReplayFold {
             pending_dids: HashSet::new(),
             written: 0,
             written_dids: HashSet::new(),
+            collect_dids: false,
         }
     }
 
     /// Records written or changed so far.
     pub(super) fn written(&self) -> u64 {
         self.written
+    }
+
+    /// Keep the DIDs of flushed writes for `take_written_dids` (retry runs).
+    pub(super) fn collect_written_dids(&mut self) {
+        self.collect_dids = true;
     }
 
     /// The DIDs whose records were written or changed since the last call,
@@ -173,11 +182,13 @@ impl ReplayFold {
                 })?;
         self.written += changed.len() as u64;
         let uris: Vec<String> = changed.into_iter().map(|c| c.uri).collect();
-        self.written_dids.extend(uris.iter().filter_map(|uri| {
-            uri.strip_prefix("at://")
-                .and_then(|rest| rest.split('/').next())
-                .map(str::to_string)
-        }));
+        if self.collect_dids {
+            self.written_dids.extend(uris.iter().filter_map(|uri| {
+                uri.strip_prefix("at://")
+                    .and_then(|rest| rest.split('/').next())
+                    .map(str::to_string)
+            }));
+        }
         super::queue_label_backfill(state, &uris).await;
         Ok(())
     }
@@ -291,6 +302,34 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(stored.0, Some(rev(8)));
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_retry_fold_collects_the_dids_it_wrote() {
+        for state in states().await {
+            let did = did();
+            let mut ordinary = fresh(&state);
+            ordinary
+                .apply(commit(&did, 1, "r1", "create", "x"))
+                .await
+                .unwrap();
+            ordinary.flush().await.unwrap();
+            assert_eq!(ordinary.written(), 1);
+            assert!(
+                ordinary.written_dids.is_empty(),
+                "an ordinary job holds no DIDs"
+            );
+
+            let mut retry = fresh(&state);
+            retry.collect_written_dids();
+            retry
+                .apply(commit(&did, 2, "r2", "create", "y"))
+                .await
+                .unwrap();
+            retry.flush().await.unwrap();
+            assert_eq!(retry.take_written_dids(), HashSet::from([did.clone()]));
+            assert!(retry.take_written_dids().is_empty());
         }
     }
 

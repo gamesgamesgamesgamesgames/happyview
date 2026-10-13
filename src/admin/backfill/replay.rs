@@ -618,6 +618,7 @@ impl Run<'_> {
         if scope_dids.is_none() {
             self.held_only = Some(collections.to_vec());
         }
+        self.fold.collect_written_dids();
         let filter = RowFilter {
             kinds: RowKinds::Both,
             collections: collections.iter().cloned().collect(),
