@@ -304,6 +304,7 @@ async fn every_error_kind_maps_onto_its_script_error_type_and_only_timeout_is_40
                 message,
                 method: "app.test.q".into(),
                 line,
+                file: None,
             })
             .status();
         let expected = if kind == ScriptErrorKind::Timeout {

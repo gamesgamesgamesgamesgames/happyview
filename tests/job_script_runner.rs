@@ -284,6 +284,41 @@ async fn a_project_job_runs_as_its_file() {
     assert_eq!(sent["source"], "probe");
 }
 
+/// The `error` column is where an operator reads why a job failed, so a
+/// project job's failure names the file that raised it.
+#[tokio::test]
+#[serial]
+async fn a_failed_project_job_names_its_file() {
+    common::require_db!();
+    require_echo!();
+    let app = app().await;
+    let mut snap = happyview::project::snapshot::ProjectSnapshot::empty();
+    snap.scripts.insert(
+        format!("job.run:{TYPE}"),
+        happyview::project::snapshot::ProjectScript {
+            trigger: format!("job.run:{TYPE}"),
+            path: format!("src/jobs/{TYPE}.lua").into(),
+            language_id: "lua".into(),
+            body: happyview::project::snapshot::ScriptBody::Source {
+                source: std::sync::Arc::from("error:runtime"),
+                artifact: None,
+            },
+            description: None,
+            outbound_xrpcs: Vec::new(),
+        },
+    );
+    happyview::project::build::install(&app.state, snap).await;
+    let id = seed_job(&app, TYPE, &json!({})).await;
+
+    let row = run_to_completion(&app, &id).await;
+    assert_eq!(row.status, "failed");
+    let error = row.error.expect("no error persisted");
+    assert!(
+        error.starts_with(&format!("runtime in src/jobs/{TYPE}.lua: ")),
+        "{error}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // What becomes of the row
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use crate::AppState;
 use crate::auth::Claims;
-use crate::error::{AppError, LUA_AUTH_ERROR_PREFIX, ScriptErrorType};
+use crate::error::{AppError, LUA_AUTH_ERROR_PREFIX, ScriptErrorType, file_of};
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::ParsedLexicon;
 use crate::plugin::{ExecutionError, ScriptExecuteOutput, ScriptSpace};
@@ -72,6 +72,7 @@ fn script_error(
     error_type: ScriptErrorType,
     message: String,
     line: Option<u32>,
+    file: Option<String>,
 ) -> AppError {
     AppError::ScriptError {
         error_type,
@@ -81,6 +82,7 @@ fn script_error(
         },
         method: method.to_string(),
         line,
+        file,
     }
 }
 
@@ -101,10 +103,11 @@ fn returned_value(
             message,
             line,
             raw,
-            chunk: _,
+            chunk,
         }) => {
-            let error = auth_error(&[&message, &raw])
-                .unwrap_or_else(|| script_error(method, kind.into(), message, line));
+            let error = auth_error(&[&message, &raw]).unwrap_or_else(|| {
+                script_error(method, kind.into(), message, line, file_of(chunk))
+            });
             Err((raw, error))
         }
         // An endpoint whose interpreter is absent cannot answer until an
@@ -127,10 +130,10 @@ fn returned_value(
             let raw = e.to_string();
             let error = auth_error(&[&raw]).unwrap_or_else(|| match &e {
                 DispatchError::Execution(ExecutionError::Timeout) => {
-                    script_error(method, ScriptErrorType::Timeout, raw.clone(), None)
+                    script_error(method, ScriptErrorType::Timeout, raw.clone(), None, None)
                 }
                 DispatchError::Execution(ExecutionError::MemoryLimit { .. }) => {
-                    script_error(method, ScriptErrorType::Memory, raw.clone(), None)
+                    script_error(method, ScriptErrorType::Memory, raw.clone(), None, None)
                 }
                 _ => AppError::Internal(raw.clone()),
             });
@@ -564,6 +567,7 @@ mod tests {
                     message,
                     method,
                     line,
+                    ..
                 } => {
                     assert_eq!(error_type, expected, "{kind:?}");
                     assert_eq!(message, "attempt to index a nil value (local 't')");
@@ -832,5 +836,47 @@ mod tests {
             1,
             "script.executed must still be logged when verbose event logging is on"
         );
+    }
+
+    #[test]
+    fn a_failure_in_a_project_file_names_the_file() {
+        let outcome = Ok(ScriptExecuteOutput::Error {
+            kind: ScriptErrorKind::Runtime,
+            message: "boom".into(),
+            line: Some(12),
+            raw: "src/lib/format.lua:12: boom".into(),
+            chunk: Some("src/lib/format.lua".into()),
+        });
+        let (_, error) = returned_value("com.example.probe", outcome).unwrap_err();
+        match error {
+            AppError::ScriptError { file, line, .. } => {
+                assert_eq!(file.as_deref(), Some("src/lib/format.lua"));
+                assert_eq!(line, Some(12));
+            }
+            other => panic!("expected a script error, got {other:?}"),
+        }
+    }
+
+    /// A dashboard script is chunk `script`, which names no file anyone can
+    /// open; its error must read exactly as it did before chunks had paths.
+    #[test]
+    fn a_dashboard_failure_names_no_file() {
+        assert_eq!(file_of(Some("script".into())), None);
+        assert_eq!(file_of(None), None);
+        assert_eq!(file_of(Some("src/a.lua".into())), Some("src/a.lua".into()));
+
+        let outcome = Ok(ScriptExecuteOutput::Error {
+            kind: ScriptErrorKind::Runtime,
+            message: "boom".into(),
+            line: Some(7),
+            raw: "[string \"script\"]:7: boom".into(),
+            chunk: Some("script".into()),
+        });
+        let (_, error) = returned_value("com.example.probe", outcome).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "script runtime error in com.example.probe at line 7: boom"
+        );
+        assert!(matches!(error, AppError::ScriptError { file: None, .. }));
     }
 }

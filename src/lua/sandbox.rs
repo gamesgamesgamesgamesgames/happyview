@@ -8,8 +8,8 @@ use mlua::{Lua, Result as LuaResult};
 
 use super::limits::DEFAULT_INSTRUCTION_LIMIT;
 
-/// The name every script chunk is loaded under. Lua renders an error in a
-/// named chunk as `[string "script"]:12: message`, which is the form
+/// The name of a chunk with no file behind it: a dashboard script. Lua renders
+/// an error in a named chunk as `[string "script"]:12: message`, which is the form
 /// `error::parse_lua_line` reads the line out of; a chunk left unnamed is
 /// named after the Rust source location that loaded it and yields no line.
 const CHUNK_NAME: &str = "script";
@@ -206,9 +206,24 @@ pub fn create_sandbox_with_limit(instruction_limit: u32) -> LuaResult<Lua> {
     Ok(lua)
 }
 
-/// Load a script body as the chunk every runner loads it as.
+/// Load `source` as the chunk `chunk_name`. A dashboard script keeps the
+/// name `script`, which Lua renders as `[string "script"]:12:`. A project
+/// file is named `@<path>`, the form Lua reserves for files: it renders as
+/// `src/jobs/tick.lua:12:`, which a terminal opens, and a path too long for
+/// Lua's buffer loses its front rather than its file name. `[string ...]`
+/// would cut the end, so two deep files in one directory could read the
+/// same. The Lua plugin names chunks the same way, so both runners agree.
+pub fn load_named<'a>(lua: &'a Lua, source: &'a str, chunk_name: &str) -> mlua::chunk::Chunk<'a> {
+    if chunk_name == CHUNK_NAME {
+        lua.load(source).set_name(CHUNK_NAME)
+    } else {
+        lua.load(source).set_name(format!("@{chunk_name}"))
+    }
+}
+
+/// Load a script body as the chunk every dashboard runner loads it as.
 pub fn load_script<'a>(lua: &'a Lua, source: &'a str) -> mlua::chunk::Chunk<'a> {
-    lua.load(source).set_name(CHUNK_NAME)
+    load_named(lua, source, CHUNK_NAME)
 }
 
 /// Take the instruction budget off a VM, for the runner whose scripts are

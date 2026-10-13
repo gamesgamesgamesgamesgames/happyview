@@ -224,9 +224,13 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     // outcome by the shape of its value.
     let outcome = match run {
         Ok(ScriptExecuteOutput::Returned { value, .. }) => JobOutcome::Completed(value),
-        Ok(ScriptExecuteOutput::Error { kind, raw, .. }) => {
-            JobOutcome::Failed(scripts::failure_text(kind, &raw))
-        }
+        Ok(ScriptExecuteOutput::Error {
+            kind, raw, chunk, ..
+        }) => JobOutcome::Failed(scripts::failure_text(
+            kind,
+            crate::error::file_of(chunk).as_deref(),
+            &raw,
+        )),
         Err(e) => JobOutcome::Failed(e.to_string()),
     };
     finalize(state, job, outcome).await;

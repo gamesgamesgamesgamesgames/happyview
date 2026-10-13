@@ -398,7 +398,13 @@ pub async fn run_record_event_once(
             ScriptValueKind::Object => RecordHookOutcome::Replace(value),
             ScriptValueKind::Other => RecordHookOutcome::Proceed,
         }),
-        ScriptExecuteOutput::Error { kind, raw, .. } => Err(failure_text(kind, &raw)),
+        ScriptExecuteOutput::Error {
+            kind, raw, chunk, ..
+        } => Err(failure_text(
+            kind,
+            crate::error::file_of(chunk).as_deref(),
+            &raw,
+        )),
     }
 }
 
@@ -586,7 +592,13 @@ async fn run_label_once(
             }),
             ScriptValueKind::Other => LabelHookOutcome::Continue(event.clone()),
         }),
-        ScriptExecuteOutput::Error { kind, raw, .. } => Err(failure_text(kind, &raw)),
+        ScriptExecuteOutput::Error {
+            kind, raw, chunk, ..
+        } => Err(failure_text(
+            kind,
+            crate::error::file_of(chunk).as_deref(),
+            &raw,
+        )),
     }
 }
 
@@ -599,8 +611,15 @@ async fn run_label_once(
 /// other. The text carries the line that points at the script and no category;
 /// a spent budget and an exhausted heap describe themselves in no text at all,
 /// so without the category they read as any other runtime failure.
-pub(crate) fn failure_text(kind: crate::plugin::ScriptErrorKind, raw: &str) -> String {
-    format!("{}: {raw}", kind.as_str())
+pub(crate) fn failure_text(
+    kind: crate::plugin::ScriptErrorKind,
+    file: Option<&str>,
+    raw: &str,
+) -> String {
+    match file {
+        Some(file) => format!("{} in {file}: {raw}", kind.as_str()),
+        None => format!("{}: {raw}", kind.as_str()),
+    }
 }
 
 fn extract_string(v: &Value, key: &str) -> Option<String> {
@@ -716,6 +735,22 @@ async fn write_dead_letter(state: &AppState, entry: &DeadLetterEntry<'_>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failure_text_leads_with_its_file() {
+        assert_eq!(
+            failure_text(
+                crate::plugin::ScriptErrorKind::Runtime,
+                Some("src/jobs/tick.lua"),
+                "src/jobs/tick.lua:4: boom"
+            ),
+            "runtime in src/jobs/tick.lua: src/jobs/tick.lua:4: boom"
+        );
+        assert_eq!(
+            failure_text(crate::plugin::ScriptErrorKind::Runtime, None, "x"),
+            "runtime: x"
+        );
+    }
+
     use super::*;
 
     #[test]
