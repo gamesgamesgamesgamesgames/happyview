@@ -331,17 +331,19 @@ pub(super) async fn patch(
     // interpreter's body to another.
     let existing = fetch_one(&state, &id).await?;
 
-    if let Some(ref new_body) = body.body {
-        let lang = body.script_type.as_deref().unwrap_or(&existing.script_type);
-        refuse_unmigrated(&id, lang, new_body)?;
-        validate_body_for_type(&state, new_body, lang).await?;
-    }
+    // Ahead of the body check, which keeps what it prepares: a patch refused
+    // for its description should leave nothing behind for its body.
     if let Some(Some(ref desc)) = body.description
         && desc.len() > MAX_DESCRIPTION_LEN
     {
         return Err(AppError::BadRequest(format!(
             "description must be at most {MAX_DESCRIPTION_LEN} characters"
         )));
+    }
+    if let Some(ref new_body) = body.body {
+        let lang = body.script_type.as_deref().unwrap_or(&existing.script_type);
+        refuse_unmigrated(&id, lang, new_body)?;
+        validate_body_for_type(&state, new_body, lang).await?;
     }
 
     let backend = state.db_backend;
@@ -582,12 +584,17 @@ fn refuse_unmigrated(id: &str, script_type: &str, body: &str) -> Result<(), AppE
 /// An interpreter that cannot answer at all is a 500: the body may be
 /// perfectly good, and refusing it would blame the operator for a broken
 /// plugin.
+///
+/// The check keeps what the interpreter prepared, since the body is about to
+/// be stored and every run of it would otherwise parse it again. A body that
+/// imports a file is refused here rather than at its first run, because a
+/// dashboard script has no files beside it for the import to find.
 async fn validate_body_for_type(
     state: &AppState,
     body: &str,
     language: &str,
 ) -> Result<(), AppError> {
-    match checks::check_with_interpreter(
+    match checks::check_dashboard_body(
         &state.plugin_registry,
         &state.plugin_executor(),
         language,
@@ -595,7 +602,12 @@ async fn validate_body_for_type(
     )
     .await
     {
-        Ok(InterpreterCheck::Valid) => Ok(()),
+        Ok(InterpreterCheck::Valid(prepared)) => {
+            match checks::dashboard_import_refusal(&prepared.imports) {
+                Some(message) => Err(AppError::BadRequest(message)),
+                None => Ok(()),
+            }
+        }
         Ok(InterpreterCheck::Refused(errors)) => {
             Err(AppError::BadRequest(refusal_message(&errors)))
         }

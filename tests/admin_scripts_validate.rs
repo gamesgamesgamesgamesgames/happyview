@@ -413,3 +413,109 @@ async fn a_body_only_patch_is_checked_against_the_rows_own_language() {
     assert_eq!(body["body"], "echo two {{{");
     assert_eq!(body["script_type"], "echo");
 }
+
+// ---------------------------------------------------------------------------
+// What a save keeps
+// ---------------------------------------------------------------------------
+
+/// A save prepares the body it stores, so the first run after it parses
+/// nothing; a refused save stores nothing to load.
+#[tokio::test]
+#[serial]
+async fn a_save_leaves_the_bodys_artifact_for_its_runs() {
+    common::require_db!();
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("echo"))
+        .await;
+
+    let body = "returns:{\"saved\":true}";
+    let resp = post_script(
+        &app,
+        &json!({"id": ECHO_ID, "script_type": "echo", "body": body}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let cached = app
+        .state
+        .plugin_registry
+        .prepared()
+        .lookup("interpreter_echo", body)
+        .expect("the save prepared the body")
+        .expect("and kept its artifact");
+    assert_eq!(cached.bytes, body.as_bytes());
+
+    let refused = "invalid syntax";
+    let resp = patch_script(&app, ECHO_ID, &json!({"body": refused})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        app.state
+            .plugin_registry
+            .prepared()
+            .lookup("interpreter_echo", refused),
+        None
+    );
+}
+
+/// A dashboard script has no files beside it, so a relative import could
+/// only ever fail at run time. The save says so, names what was imported,
+/// and keeps nothing for the body. A library name is not a file and saves.
+#[tokio::test]
+#[serial]
+async fn a_dashboard_script_that_imports_a_file_is_refused() {
+    common::require_db!();
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("echo"))
+        .await;
+
+    let body = "echo\nimport ./lib/format\nimport happyview.record\nimport ../up";
+    let error = refusal(
+        post_script(
+            &app,
+            &json!({"id": ECHO_ID, "script_type": "echo", "body": body}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        error,
+        "dashboard scripts can't import files, only project scripts can: \
+         ./lib/format (line 2), ../up (line 4)"
+    );
+    assert_eq!(
+        app.state
+            .plugin_registry
+            .prepared()
+            .lookup("interpreter_echo", body),
+        None
+    );
+    assert_eq!(
+        get_script(&app, ECHO_ID).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let library_only = "echo\nimport happyview.record";
+    let resp = post_script(
+        &app,
+        &json!({"id": ECHO_ID, "script_type": "echo", "body": library_only}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let error = refusal(patch_script(&app, ECHO_ID, &json!({"body": "import ./util"})).await).await;
+    assert_eq!(
+        error,
+        "dashboard scripts can't import files, only project scripts can: ./util (line 1)"
+    );
+}

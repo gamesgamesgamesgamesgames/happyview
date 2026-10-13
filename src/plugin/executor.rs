@@ -681,14 +681,34 @@ impl PluginExecutor {
         chunk_name: &str,
         role: ChunkRole,
     ) -> Result<ScriptValidateOutput, ExecutionError> {
+        self.prepare_and_store_if(plugin_id, source, chunk_name, role, |_| true)
+            .await
+    }
+
+    /// As [`prepare_and_store`](Self::prepare_and_store), storing only when
+    /// `keep` accepts what the interpreter answered, for a caller that will
+    /// refuse some valid bodies and must not leave an entry for one. When
+    /// nothing is stored the output's artifact is `None`.
+    pub async fn prepare_and_store_if(
+        &self,
+        plugin_id: &str,
+        source: &str,
+        chunk_name: &str,
+        role: ChunkRole,
+        keep: impl FnOnce(&ScriptValidateOutput) -> bool,
+    ) -> Result<ScriptValidateOutput, ExecutionError> {
         let plugin = self.interpreter(plugin_id).await?;
         let mut out = self
             .prepare_loaded(&plugin, source, chunk_name, role)
             .await?;
-        let stored = self
-            .registry
-            .store_prepared(&plugin, source, out.artifact.take());
-        out.artifact = stored.as_deref().cloned();
+        out.artifact = if keep(&out) {
+            self.registry
+                .store_prepared(&plugin, source, out.artifact.take())
+                .as_deref()
+                .cloned()
+        } else {
+            None
+        };
         Ok(out)
     }
 

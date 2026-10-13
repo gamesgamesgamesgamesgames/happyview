@@ -9,7 +9,7 @@ use crate::AppState;
 use crate::catalog::{Layer, LexiconCatalog};
 use crate::config::project::{PROJECT_FILE, ProjectConfigError, load_project_config};
 use crate::lua::ParsedTrigger;
-use crate::plugin::{PluginExecutor, PluginRegistry};
+use crate::plugin::{ChunkRole, PluginExecutor, PluginRegistry};
 use crate::script::checks::{self, InterpreterCheck};
 
 use super::describe;
@@ -335,10 +335,12 @@ async fn passes_checks(
         &env.executor,
         &item.claim.language_id,
         source,
+        &item.file.id(),
+        ChunkRole::Handler,
     )
     .await
     {
-        Ok(InterpreterCheck::Valid) => true,
+        Ok(InterpreterCheck::Valid(_)) => true,
         Ok(InterpreterCheck::Refused(errors)) => {
             if errors.is_empty() {
                 diagnostics.push(Diagnostic::error(
