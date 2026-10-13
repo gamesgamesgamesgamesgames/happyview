@@ -129,6 +129,43 @@ async fn bytes_survive_the_boundary_and_come_back_whole() {
     assert_eq!(call(&app, "sdk_blobs", "exists", &[json!(cid)]).await, true);
 }
 
+/// A blob the size of a real plugin module — megabytes, and not UTF-8 —
+/// crosses into a library plugin and back whole. Two things used to stop it:
+/// a fixed 512 KiB guest heap that never freed, and an envelope decoded
+/// through serde's buffered `Content`, at about 32 bytes per byte of blob.
+#[tokio::test]
+async fn a_module_sized_blob_crosses_the_boundary_whole() {
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(blobs_plugin("sdk_blobs", &["blobs:read", "blobs:write"]))
+        .await;
+
+    let mut artifact: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    artifact[0] = 0xff; // never valid UTF-8
+    let cid = call(
+        &app,
+        "sdk_blobs",
+        "put",
+        &[wire_bytes(&artifact), json!("application/wasm")],
+    )
+    .await;
+    let cid = cid.as_str().expect("put answers a cid").to_string();
+    assert_eq!(
+        cid,
+        happyview::cid_verify::raw_cid(&artifact)
+            .expect("cid")
+            .to_string()
+    );
+
+    let got = call(&app, "sdk_blobs", "get", &[json!(cid)]).await;
+    assert!(
+        got["bytes"] == wire_bytes(&artifact),
+        "the bytes came back changed"
+    );
+    assert_eq!(got["size"], artifact.len());
+}
+
 /// Absent is an ordinary answer on both reads, which is what lets a caller
 /// ask whether a blob is held without transferring it.
 #[tokio::test]

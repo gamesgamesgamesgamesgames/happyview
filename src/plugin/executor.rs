@@ -377,6 +377,7 @@ impl PluginInstance {
             .set_fuel(fuel_for(self.store.data().plugin_type))
             .map_err(ExecutionError::Trap)?;
 
+        crate::plugin::runtime::grant_fuel_for_bytes(&mut self.store, input_bytes.len());
         let (input_ptr, input_len) = write_to_guest(&mut self.store, &input_bytes)
             .await
             .map_err(|_| ExecutionError::MemoryAllocation)?;
