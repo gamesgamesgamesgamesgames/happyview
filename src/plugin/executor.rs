@@ -385,13 +385,20 @@ impl PluginInstance {
             .map_err(|_| ExecutionError::MissingExport(name.into()))?;
 
         self.store.data_mut().limiter.clear_refusal();
+        // Placing the input is the host's work, not the call's: it runs on the
+        // plugin type's own bound (an interpreter's is the epoch deadline), and
+        // the call's fuel is armed once the input is in place. A small budget
+        // spent inside the guest's `alloc` would otherwise surface as an
+        // allocation failure rather than a timeout.
         self.store
-            .set_fuel(self.store.data().call_fuel)
+            .set_fuel(fuel_for(self.store.data().plugin_type))
             .map_err(ExecutionError::Trap)?;
-
         let (input_ptr, input_len) = write_to_guest(&mut self.store, &input_bytes)
             .await
             .map_err(|_| ExecutionError::MemoryAllocation)?;
+        self.store
+            .set_fuel(self.store.data().call_fuel)
+            .map_err(ExecutionError::Trap)?;
 
         let packed = func
             .call_async(&mut self.store, (input_ptr, input_len))
@@ -3216,6 +3223,43 @@ mod compiled {
         let executor = executor_with(interpreter(COUNTING)).await;
         let output = executor
             .execute_script("guest", &input(Some(1_000)))
+            .await
+            .unwrap();
+        assert_eq!(output, returned_null());
+    }
+
+    /// `alloc` counts to two million before answering, roughly ten million
+    /// fuel; `execute` answers `null` at once.
+    const COSTLY_ALLOC: &str = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 32768) "{\"ok\":{\"status\":\"returned\",\"value\":null,\"value_kind\":\"other\"}}")
+        (func (export "alloc") (param i32) (result i32) (local i32)
+            (loop
+                local.get 1
+                i32.const 1
+                i32.add
+                local.tee 1
+                i32.const 2000000
+                i32.lt_u
+                br_if 0)
+            i32.const 1024)
+        (func (export "dealloc") (param i32 i32))
+        (func (export "execute") (param i32 i32) (result i64)
+            i64.const 32768
+            i64.const 32
+            i64.shl
+            i64.const 62
+            i64.or)
+    )"#;
+
+    /// Placing the input is the host's work: a budget far smaller than what
+    /// the guest's `alloc` spends still reaches `execute`.
+    #[tokio::test]
+    async fn placing_the_input_is_not_charged_to_the_budget() {
+        let executor = executor_with(interpreter(COSTLY_ALLOC)).await;
+        let module = Arc::new(interpreter(COSTLY_ALLOC));
+        let output = executor
+            .execute_compiled_as(module, std::path::Path::new("m"), &input(Some(1_000)), None)
             .await
             .unwrap();
         assert_eq!(output, returned_null());
