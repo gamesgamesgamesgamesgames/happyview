@@ -140,18 +140,44 @@ pub async fn build_input(state: &AppState, inv: &Invocation<'_>) -> ScriptExecut
     }
 }
 
-/// Script variables, which every kind of run reads as `ctx.env`.
+/// Script variables, which every kind of run reads as `ctx.env`: the
+/// database's, then the env file's over them.
 async fn load_env(state: &AppState) -> BTreeMap<String, String> {
     let sql = adapt_sql(
         "SELECT key, value FROM happyview_script_variables",
         state.db_backend,
     );
-    crate::db::query_as::<(String, String)>(&sql)
+    let mut env: BTreeMap<String, String> = crate::db::query_as::<(String, String)>(&sql)
         .fetch_all(&state.db)
         .await
         .unwrap_or_default()
         .into_iter()
-        .collect()
+        .collect();
+    if let Some(path) = &state.config.script_env_file {
+        match tokio::fs::read_to_string(path).await {
+            Ok(text) => {
+                for entry in dotenvy::from_read_iter(text.as_bytes()) {
+                    match entry {
+                        Ok((key, value)) => {
+                            env.insert(key, value);
+                        }
+                        Err(e) => tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "skipping an unreadable line in the script env file"
+                        ),
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read the script env file"
+            ),
+        }
+    }
+    env
 }
 
 #[cfg(test)]
@@ -169,6 +195,40 @@ mod tests {
         .await
         .expect("seed a script variable");
         state
+    }
+
+    /// The env file overlays the database's variables: its keys win, the
+    /// rest come through, and an edit is seen on the next run.
+    #[tokio::test]
+    async fn the_script_env_file_overlays_the_database() {
+        let mut state = state_with_one_variable().await;
+        crate::db::query(
+            "INSERT INTO happyview_script_variables (key, value) VALUES ('ONLY_DB', 'db')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".env");
+        std::fs::write(&file, "API_KEY=from-file\nONLY_FILE=file\n").unwrap();
+        state.config.script_env_file = Some(file.clone());
+
+        let env = load_env(&state).await;
+        assert_eq!(env["API_KEY"], "from-file");
+        assert_eq!(env["ONLY_DB"], "db");
+        assert_eq!(env["ONLY_FILE"], "file");
+
+        std::fs::write(&file, "API_KEY=edited\n").unwrap();
+        assert_eq!(load_env(&state).await["API_KEY"], "edited");
+    }
+
+    /// A configured file that does not exist yet is not an error: a project
+    /// starts without one.
+    #[tokio::test]
+    async fn a_missing_script_env_file_is_empty() {
+        let mut state = state_with_one_variable().await;
+        state.config.script_env_file = Some(std::path::PathBuf::from("/nonexistent/.env"));
+        assert_eq!(load_env(&state).await["API_KEY"], "k");
     }
 
     /// Install a library under `id` and `namespace`. Its surface is seeded into

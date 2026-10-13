@@ -562,6 +562,7 @@ mod tests {
             project: None,
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
+            script_env_file: None,
         };
         let (collections_tx, _) = watch::channel(vec![]);
         let (labeler_subscriptions_tx, _) = watch::channel(());

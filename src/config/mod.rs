@@ -210,6 +210,9 @@ pub struct Config {
     /// declared backfill. A backfill created directly (`POST /admin/backfill`,
     /// the dashboard's Backfill page) always runs.
     pub auto_backfill: bool,
+    /// A dotenv file whose variables reach scripts as `ctx.env`, over the
+    /// database's. Read on every run, so an edit needs no restart.
+    pub script_env_file: Option<PathBuf>,
 }
 
 /// `PLUGIN_CACHE_DIR` when set; otherwise a `plugin-cache` directory beside
@@ -398,6 +401,9 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("./plugins")),
             auto_backfill: true,
+            script_env_file: var("HAPPYVIEW_SCRIPT_ENV_FILE")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
         }
     }
 
@@ -483,6 +489,7 @@ mod tests {
             "SUPERADMIN_DID",
             "HAPPYVIEW_PROJECT",
             "PLUGIN_DIR",
+            "HAPPYVIEW_SCRIPT_ENV_FILE",
             "HAPPYVIEW_DEV_BACKFILL",
         ] {
             unsafe {
@@ -518,6 +525,24 @@ mod tests {
         assert_eq!(
             Config::from_env().plugin_dir,
             PathBuf::from("/srv/project/.happyview/plugins")
+        );
+        unsafe { clear_env() };
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_the_script_env_file() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        assert_eq!(Config::from_env().script_env_file, None);
+        unsafe { env::set_var("HAPPYVIEW_SCRIPT_ENV_FILE", "") };
+        assert_eq!(Config::from_env().script_env_file, None);
+        unsafe { env::set_var("HAPPYVIEW_SCRIPT_ENV_FILE", "/srv/project/.env") };
+        assert_eq!(
+            Config::from_env().script_env_file,
+            Some(PathBuf::from("/srv/project/.env"))
         );
         unsafe { clear_env() };
     }
@@ -633,6 +658,7 @@ mod tests {
             project: None,
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(
             config.listen_addr(),
@@ -1099,6 +1125,7 @@ mod tests {
             project: None,
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com");
     }
@@ -1136,6 +1163,7 @@ mod tests {
             project: None,
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -1173,6 +1201,7 @@ mod tests {
             project: None,
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -1210,6 +1239,7 @@ mod tests {
             project: None,
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),
@@ -1277,6 +1307,7 @@ mod tests {
             project: None,
             plugin_dir: std::path::PathBuf::from("./plugins"),
             auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),
