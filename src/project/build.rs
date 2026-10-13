@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::AppState;
-use crate::catalog::LexiconCatalog;
+use crate::catalog::{Layer, LexiconCatalog};
 use crate::config::project::{PROJECT_FILE, ProjectConfigError, load_project_config};
 use crate::lua::ParsedTrigger;
 use crate::plugin::{PluginExecutor, PluginRegistry};
@@ -117,6 +117,7 @@ pub async fn build_snapshot_with(
     let mut pending = Vec::new();
     let mut handled_by: BTreeMap<String, PathBuf> = BTreeMap::new();
     for file in files.iter().filter(|f| !layout::is_lexicon(f)) {
+        diagnostics.extend(layout::wrong_case_extension(file, &claims));
         let role = match layout::classify(file, &claims, &index) {
             Ok(role) => role,
             Err(d) => {
@@ -366,10 +367,19 @@ async fn test_names_a_lexicon(
     project: &BTreeMap<String, ProjectLexicon>,
     catalog: Option<&LexiconCatalog>,
 ) -> Option<Diagnostic> {
-    let (meant, _) = layout::split_name(file.name())?;
+    let (meant, extension) = layout::split_name(file.name())?;
+    if layout::is_document(extension) {
+        return None;
+    }
+    // The project layer is answered by `project`, which is this build's;
+    // the catalog's copy is the previous snapshot's and would keep a deleted
+    // lexicon alive for one more rebuild.
     let known = project.contains_key(meant)
         || match catalog {
-            Some(catalog) => catalog.get(meant).await.is_some(),
+            Some(catalog) => catalog
+                .get_entry(meant)
+                .await
+                .is_some_and(|entry| entry.layer != Layer::Project),
             None => false,
         };
     known.then(|| {
@@ -498,6 +508,12 @@ mod tests {
         state.plugin_registry.register(echo).await;
         state.plugin_registry.register(as_lua).await;
         Some(state)
+    }
+
+    /// No interpreter at all, so a test using it runs wherever the unit
+    /// tests do.
+    async fn bare_state() -> crate::AppState {
+        test_state_with_pool(memory_pool().await)
     }
 
     fn shown(diagnostics: &[Diagnostic]) -> Vec<String> {
@@ -777,7 +793,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_project_without_happyview_toml_builds() {
-        let Some(state) = env().await else { return };
+        let state = bare_state().await;
         let root = project(&[("src/.gitkeep", "")]);
         assert!(!root.path().join("happyview.toml").exists());
         let report = build_snapshot(&state, root.path(), BuildOptions::default())
@@ -788,7 +804,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_src_builds_an_empty_snapshot() {
-        let Some(state) = env().await else { return };
+        let state = bare_state().await;
         let root = project(&[("happyview.toml", "# nothing configured yet\n")]);
         std::fs::create_dir(root.path().join("src")).unwrap();
         let report = build_snapshot(&state, root.path(), BuildOptions::default())
@@ -1089,6 +1105,57 @@ mod tests {
                 .to_string()
                 .contains("com.example.remote.test is a lexicon")
         );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_case_extension_warns_through_the_build() {
+        let state = bare_state().await;
+        let root = project(&[("src/lexicons/com/example/getThing.JSON", "{}")]);
+        let report = build_snapshot(&state, root.path(), BuildOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.warnings.len(), 1, "{:?}", shown(&report.warnings));
+        assert!(
+            report.warnings[0]
+                .to_string()
+                .contains("rename it to use .json")
+        );
+    }
+
+    const NOTE_TEST: &str = "src/lexicons/com/example/note/test.json";
+
+    #[tokio::test]
+    async fn a_document_beside_a_test_named_lexicon_does_not_warn() {
+        let state = bare_state().await;
+        let root = project(&[
+            (NOTE_TEST, &lexicon("com.example.note.test", "record")),
+            ("src/labels/com.example.note.test.md", "a note"),
+            ("src/labels/com.example.note.test.py", "x"),
+        ]);
+        let report = build_snapshot(&state, root.path(), BuildOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.warnings.len(), 1, "{:?}", shown(&report.warnings));
+        assert!(report.warnings[0].to_string().contains(".test.py"));
+    }
+
+    /// The catalog answers from the snapshot being replaced first, so a
+    /// lexicon deleted from the project would otherwise keep warning once.
+    #[tokio::test]
+    async fn a_test_does_not_warn_for_a_lexicon_only_the_old_snapshot_had() {
+        let state = bare_state().await;
+        let old = project(&[(NOTE_TEST, &lexicon("com.example.note.test", "record"))]);
+        let report = build_snapshot(&state, old.path(), BuildOptions::default())
+            .await
+            .unwrap();
+        install(&state, report.snapshot).await;
+        assert!(state.lexicons.get("com.example.note.test").await.is_some());
+
+        let new = project(&[("src/labels/com.example.note.test.py", "x")]);
+        let report = build_snapshot(&state, new.path(), BuildOptions::default())
+            .await
+            .unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", shown(&report.warnings));
     }
 
     #[tokio::test]

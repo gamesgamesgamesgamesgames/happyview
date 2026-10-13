@@ -86,6 +86,27 @@ pub fn walk_src(root: &Path) -> (Vec<SrcFile>, Vec<Diagnostic>) {
     (files, diagnostics)
 }
 
+/// The entries that could be read. One that could not is an error, because a
+/// build is all-or-nothing and a file it could not see must not read as a
+/// file that is absent.
+fn readable_entries<T>(
+    entries: impl IntoIterator<Item = std::io::Result<T>>,
+    segments: &[String],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<T> {
+    let mut readable = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => readable.push(entry),
+            Err(e) => diagnostics.push(Diagnostic::error(
+                rel_path(segments),
+                format!("could not read an entry of the directory: {e}"),
+            )),
+        }
+    }
+    readable
+}
+
 fn walk_dir(
     dir: &Path,
     segments: &mut Vec<String>,
@@ -102,7 +123,7 @@ fn walk_dir(
             return;
         }
     };
-    let mut entries: Vec<_> = entries.flatten().collect();
+    let mut entries = readable_entries(entries, segments, diagnostics);
     entries.sort_by_key(|entry| entry.file_name());
 
     for entry in entries {
@@ -116,8 +137,17 @@ fn walk_dir(
         if is_skipped(&name) {
             continue;
         }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) => {
+                segments.push(name);
+                diagnostics.push(Diagnostic::error(
+                    rel_path(segments),
+                    format!("could not read the file type: {e}"),
+                ));
+                segments.pop();
+                continue;
+            }
         };
         let path = entry.path();
         segments.push(name);
@@ -163,6 +193,18 @@ mod tests {
 
     fn ids(files: &[SrcFile]) -> Vec<String> {
         files.iter().map(SrcFile::id).collect()
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_read_is_an_error() {
+        let mut diagnostics = Vec::new();
+        let entries = vec![Ok(1), Err(std::io::Error::other("boom")), Ok(2)];
+        let segments = vec!["jobs".to_string()];
+        let readable = readable_entries(entries, &segments, &mut diagnostics);
+        assert_eq!(readable, [1, 2]);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].path, PathBuf::from("src/jobs"));
+        assert!(diagnostics[0].message.contains("boom"));
     }
 
     #[test]

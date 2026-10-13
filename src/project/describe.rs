@@ -18,13 +18,25 @@ pub struct ScriptMeta {
 /// The first paragraph of the comment block a file opens with, which is
 /// where a reader looks for what a file is for.
 pub fn leading_description(source: &str) -> Option<String> {
+    leading_comment(source).map(|(description, _)| description)
+}
+
+/// `leading_description` and the 1-based line its comment starts on.
+fn leading_comment(source: &str) -> Option<(String, u32)> {
     let mut text = source;
+    let mut line = 1u32;
     if text.starts_with("#!") {
         text = text.split_once('\n').map_or("", |(_, rest)| rest);
+        line += 1;
     }
-    let text = text.trim_start();
-    let lines: Vec<String> = if let Some(rest) = text.strip_prefix("--[[") {
-        let body = rest.split_once("]]").map_or(rest, |(body, _)| body);
+    let trimmed = text.trim_start();
+    line += text[..text.len() - trimmed.len()].matches('\n').count() as u32;
+    let text = trimmed;
+    let lines: Vec<String> = if let Some((level, rest)) = long_bracket(text) {
+        let close = format!("]{}]", "=".repeat(level));
+        let body = rest
+            .split_once(close.as_str())
+            .map_or(rest, |(body, _)| body);
         body.lines().map(block_line).collect()
     } else if let Some(rest) = text.strip_prefix("/*") {
         let body = rest.split_once("*/").map_or(rest, |(body, _)| body);
@@ -45,7 +57,16 @@ pub fn leading_description(source: &str) -> Option<String> {
         .skip_while(|line| line.is_empty())
         .take_while(|line| !line.is_empty())
         .collect();
-    (!paragraph.is_empty()).then(|| paragraph.join(" "))
+    (!paragraph.is_empty()).then(|| (paragraph.join(" "), line))
+}
+
+/// `--[[`, `--[=[`, `--[==[`...: the number of `=` and the text after the
+/// opening bracket.
+fn long_bracket(text: &str) -> Option<(usize, &str)> {
+    let rest = text.strip_prefix("--[")?;
+    let level = rest.len() - rest.trim_start_matches('=').len();
+    let rest = rest[level..].strip_prefix('[')?;
+    Some((level, rest))
 }
 
 fn block_line(line: &str) -> String {
@@ -60,8 +81,10 @@ pub fn script_meta(
 ) -> Result<ScriptMeta, Diagnostic> {
     let configured = overrides.and_then(|o| o.description.clone());
     let from_config = configured.is_some();
+    let leading = leading_comment(source);
+    let comment_line = leading.as_ref().map(|(_, line)| *line);
     let description = configured
-        .or_else(|| leading_description(source))
+        .or_else(|| leading.map(|(description, _)| description))
         .filter(|d| !d.is_empty());
 
     // The admin API's limit, so a description reads the same wherever the
@@ -84,7 +107,7 @@ pub fn script_meta(
                      {MAX_DESCRIPTION_LEN} characters; shorten it, or set [scripts.\"{trigger_id}\"] description in {PROJECT_FILE}"
                 ),
             )
-            .at_line(Some(1))
+            .at_line(comment_line)
         });
     }
 
@@ -152,6 +175,12 @@ mod tests {
                 "\n\n  -- Indented, after blank lines.\n",
                 Some("Indented, after blank lines."),
             ),
+            ("--[[ One line. ]]\nreturn {}", Some("One line.")),
+            (
+                "--[==[\n  Long bracket ]] with a decoy.\n]==]\nreturn {}",
+                Some("Long bracket ]] with a decoy."),
+            ),
+            ("--[=[ Level one. ]=]\nreturn {}", Some("Level one.")),
             ("function handle() end\n-- Too late.\n", None),
             ("--\n--\nfunction handle() end", None),
             ("", None),
@@ -163,6 +192,14 @@ mod tests {
                 "{source:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_overlong_description_points_at_the_comment_not_line_one() {
+        let long = "x".repeat(MAX_DESCRIPTION_LEN + 1);
+        let source = format!("#!/usr/bin/env lua\n\n-- {long}\n");
+        let err = script_meta("job.run:a", Path::new("src/jobs/a.lua"), &source, None).unwrap_err();
+        assert_eq!(err.line, Some(3), "{err}");
     }
 
     #[test]

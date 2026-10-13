@@ -99,20 +99,30 @@ pub fn stale_overrides(
 /// first, because keeping whichever is read last would make the build depend
 /// on directory order.
 pub fn duplicate_ids(files: &[&SrcFile]) -> Vec<Diagnostic> {
-    let mut first: BTreeMap<String, &SrcFile> = BTreeMap::new();
+    let mut first: BTreeMap<String, (&SrcFile, String)> = BTreeMap::new();
     let mut found = Vec::new();
     for file in files {
         let id = expected_id(file);
-        match first.get(&id) {
-            Some(earlier) => found.push(Diagnostic::error(
-                file.rel_path(),
-                format!(
-                    "{} also names the lexicon '{id}'; keep one of the two files",
-                    earlier.rel_path().display()
-                ),
-            )),
+        // atproto forbids two NSIDs that differ only by casing, so the
+        // comparison folds case even though the id-versus-path one does not.
+        match first.get(&id.to_ascii_lowercase()) {
+            Some((earlier, earlier_id)) => {
+                let message = if *earlier_id == id {
+                    format!(
+                        "{} also names the lexicon '{id}'; keep one of the two files",
+                        earlier.rel_path().display()
+                    )
+                } else {
+                    format!(
+                        "{} names '{earlier_id}', which differs from '{id}' only by case; \
+                         atproto allows only one of them",
+                        earlier.rel_path().display()
+                    )
+                };
+                found.push(Diagnostic::error(file.rel_path(), message));
+            }
             None => {
-                first.insert(id, file);
+                first.insert(id.to_ascii_lowercase(), (file, id));
             }
         }
     }
@@ -210,6 +220,23 @@ mod tests {
         );
         let err = load_lexicon(&file, &BTreeMap::new()).unwrap_err();
         assert!(err.message.contains("'com.example.getthing'"), "{err}");
+        assert!(err.message.contains("'com.example.getThing'"), "{err}");
+    }
+
+    #[test]
+    fn ids_differing_only_by_case_are_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = write(&dir, "lexicons/com/Example/thing.json", "{}");
+        let lower = write(&dir, "lexicons/com/example/thing.json", "{}");
+        let found = duplicate_ids(&[&upper, &lower]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].path,
+            PathBuf::from("src/lexicons/com/example/thing.json")
+        );
+        assert!(found[0].message.contains("only by case"), "{:?}", found[0]);
+        assert!(found[0].message.contains("'com.Example.thing'"));
+        assert!(found[0].message.contains("'com.example.thing'"));
     }
 
     #[test]

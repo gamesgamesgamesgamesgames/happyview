@@ -142,6 +142,24 @@ pub fn is_lexicon(file: &SrcFile) -> bool {
         && !is_test_name(file.name())
 }
 
+/// A file whose extension is a claimed one, or `json`, in another case
+/// (`getThing.JSON`, `format.LUA`). Extensions match exactly, so the file is
+/// ignored; that is a missing lexicon or module, which deserves a word.
+pub fn wrong_case_extension(file: &SrcFile, claims: &ExtensionClaims) -> Option<Diagnostic> {
+    let (_, extension) = split_name(file.name())?;
+    let lowered = extension.to_ascii_lowercase();
+    if lowered == extension || !(lowered == "json" || claims.get(&lowered).is_some()) {
+        return None;
+    }
+    Some(Diagnostic::warning(
+        file.rel_path(),
+        format!(
+            "the extension .{extension} is not recognised, so this file is ignored; \
+             rename it to use .{lowered}"
+        ),
+    ))
+}
+
 pub fn unclaimed(file: &SrcFile, extension: &str, claims: &ExtensionClaims) -> Diagnostic {
     Diagnostic::error(
         file.rel_path(),
@@ -167,7 +185,7 @@ pub fn classify(
     }
     let nested = file.segments.len() > 1;
     match file.segments[0].as_str() {
-        "lexicons" if nested && extension == "json" => Ok(Role::Lexicon),
+        "lexicons" if is_lexicon(file) => Ok(Role::Lexicon),
         "lexicons" if nested => beside_lexicons(file, base, extension, claim, claims, lexicons),
         "jobs" if nested => flat(file, Flat::Jobs, base, extension, claim, claims),
         "labels" if nested => flat(file, Flat::Labels, base, extension, claim, claims),
@@ -378,6 +396,20 @@ mod tests {
             }
             other => panic!("{path}: expected an error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_wrong_case_extension_is_a_warning_naming_the_spelling() {
+        let claims = claims();
+        let warn = wrong_case_extension(&file("lexicons/com/example/getThing.JSON"), &claims)
+            .expect("json");
+        assert!(!warn.is_error());
+        assert!(warn.message.contains(".json"), "{warn}");
+        let warn = wrong_case_extension(&file("lib/format.LUA"), &claims).expect("lua");
+        assert!(warn.message.contains(".lua"), "{warn}");
+        assert!(wrong_case_extension(&file("lib/format.lua"), &claims).is_none());
+        assert!(wrong_case_extension(&file("README.MD"), &claims).is_none());
+        assert!(matches!(role("lib/format.LUA"), Ok(Role::Ignored)));
     }
 
     #[test]
