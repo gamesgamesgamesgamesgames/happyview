@@ -736,11 +736,16 @@ async fn a_failed_block_is_recorded_and_retry_failed_refetches_just_it() {
     assert_eq!(job["status"], "completed", "{job}");
     assert_eq!(job["source"], "replay");
     assert_eq!(dump(&app).await.len(), 4);
-    assert_eq!(
-        mock.plan_requests().len(),
-        plans_before,
-        "a retry plans nothing"
-    );
+    let plans = mock.plan_requests();
+    assert!(plans.len() > plans_before, "the retry replays markers");
+    for plan in &plans[plans_before..] {
+        assert_eq!(
+            plan["kinds"],
+            json!(["account", "sync"]),
+            "a retry plans only the markers of what it wrote: {plan}"
+        );
+        assert_eq!(plan["dids"], json!(["did:plc:retry"]), "{plan}");
+    }
     assert_eq!(
         block_2(&mock),
         fetches_before + 1,
@@ -915,6 +920,47 @@ async fn a_retried_block_applies_markers_only_for_dids_with_records() {
     assert!(
         tombstones.is_empty(),
         "no tombstone for a DID this instance holds nothing for"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_retry_replays_the_markers_of_the_dids_it_wrote() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let did = "did:plc:retrytakedown";
+    let segment = mock.seal(one_game_block(did), 4);
+    // The account is taken down after the records the failed block holds.
+    mock.seal(
+        vec![js::archive_account(17, did, false, Some("takendown"))],
+        4,
+    );
+    mock.fail_block(&segment, 2, usize::MAX);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert!(dump(&app).await.is_empty());
+    // Whatever tombstone the takedown left has expired.
+    happyview::db::query(&happyview::db::adapt_sql(
+        "DELETE FROM happyview_did_tombstones WHERE did = ?",
+        app.state.db_backend,
+    ))
+    .bind(did)
+    .execute(&app.state.db)
+    .await
+    .expect("expire the tombstone");
+
+    mock.fail_block(&segment, 2, 0);
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/retry-failed"), json!({}))
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let retry = finished(&app, body["id"].as_str().unwrap()).await;
+    assert_eq!(retry["status"], "completed", "{retry}");
+    assert!(
+        dump(&app).await.is_empty(),
+        "the later takedown purged what the retry wrote"
     );
 }
 

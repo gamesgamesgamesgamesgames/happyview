@@ -219,6 +219,31 @@ pub(super) async fn save(state: &AppState, job_id: &str, sweep: &Sweep) -> Resul
     Ok(())
 }
 
+/// Replace the DIDs of a marker sweep that has not planned yet (a retry
+/// job adds the DIDs each refetched block wrote).
+pub(super) async fn set_dids(
+    state: &AppState,
+    job_id: &str,
+    sweep: &Sweep,
+) -> Result<(), sqlx::Error> {
+    let dids = sweep
+        .dids
+        .as_ref()
+        .map(|d| serde_json::to_string(d).expect("strings serialize"));
+    crate::db::retry_on_busy(|| {
+        crate::db::query(&adapt_sql(
+            "UPDATE happyview_backfill_replay_sweeps SET dids = ? WHERE job_id = ? AND sweep = ?",
+            state.db_backend,
+        ))
+        .bind(&dids)
+        .bind(job_id)
+        .bind(sweep.sweep)
+        .execute(&state.backfill_db)
+    })
+    .await?;
+    Ok(())
+}
+
 /// Forget a job's sweeps (an `auto` job that fell back to crawling).
 pub(super) async fn clear(state: &AppState, job_id: &str) -> Result<(), sqlx::Error> {
     crate::db::retry_on_busy(|| {

@@ -558,7 +558,10 @@ impl Run<'_> {
     /// A `retry-failed` job: refetch exactly the recorded blocks (or whole
     /// segments) and fold what they hold for the job's collections and, for
     /// markers, for DIDs this instance holds records for (P2 makes the order
-    /// irrelevant).
+    /// irrelevant). Then replay the account and sync markers of every DID the
+    /// refetched blocks wrote, as an ordinary job's marker sweeps do: a
+    /// takedown later in the archive must purge what the retry wrote, even
+    /// once its DID tombstone has expired.
     async fn retry_blocks(
         &mut self,
         collections: &[String],
@@ -574,6 +577,8 @@ impl Run<'_> {
             after_seq: 0,
             through_seq: u64::MAX,
         };
+        // Marker sweeps an earlier run of this job already recorded.
+        let mut markers = sweeps::load(self.state, self.job_id).await.map_err(db)?;
         for (segment, block) in sweeps::retries(self.state, self.job_id).await.map_err(db)? {
             if self.stop_requested().await {
                 return Err(Halt::Stopped);
@@ -604,10 +609,80 @@ impl Run<'_> {
                 }
             };
             self.fold.flush().await.map_err(|e| Halt::Failed(e.0))?;
+            // Saved before the block is marked done, so a resumed run still
+            // replays the markers of what it wrote.
+            let wrote = self.fold.take_written_dids();
+            self.add_marker_dids(&mut markers, wrote).await?;
             sweeps::retry_done(self.state, self.job_id, &segment, block)
                 .await
                 .map_err(db)?;
             self.count_bytes(failed).await?;
+        }
+        // The DID lists already name only DIDs with records.
+        self.held_only = None;
+        super::set_stage(self.state, self.job_id, "replaying_accounts").await;
+        for sweep in markers.iter_mut().filter(|s| !s.done) {
+            self.sweep(sweep).await?;
+        }
+        Ok(())
+    }
+
+    /// Add `dids` to the retry job's marker sweeps, at most `MAX_PLAN_DIDS`
+    /// a sweep, persisting each change. Only a sweep that has not planned
+    /// yet takes more DIDs.
+    async fn add_marker_dids(
+        &self,
+        markers: &mut Vec<Sweep>,
+        dids: HashSet<String>,
+    ) -> Result<(), Halt> {
+        let known: HashSet<&String> = markers
+            .iter()
+            .flat_map(|s| s.dids.iter().flatten())
+            .collect();
+        let mut fresh: Vec<String> = dids.into_iter().filter(|d| !known.contains(d)).collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        fresh.sort();
+        let after = sweeps::after_seq(self.state, self.job_id)
+            .await
+            .map_err(db)?;
+        let mut fresh = fresh.into_iter().peekable();
+        while fresh.peek().is_some() {
+            let open = markers.last_mut().filter(|s| {
+                s.tip_seq.is_none()
+                    && !s.done
+                    && s.dids
+                        .as_ref()
+                        .is_some_and(|d| d.len() < sweeps::MAX_PLAN_DIDS)
+            });
+            match open {
+                Some(sweep) => {
+                    let dids = sweep.dids.get_or_insert_with(Vec::new);
+                    let room = sweeps::MAX_PLAN_DIDS - dids.len();
+                    dids.extend(fresh.by_ref().take(room));
+                    sweeps::set_dids(self.state, self.job_id, sweep)
+                        .await
+                        .map_err(db)?;
+                }
+                None => {
+                    let sweep = Sweep {
+                        sweep: markers.iter().map(|s| s.sweep + 1).max().unwrap_or(0),
+                        kind: SweepKind::Markers,
+                        collections: Vec::new(),
+                        dids: Some(fresh.by_ref().take(sweeps::MAX_PLAN_DIDS).collect()),
+                        after_seq: after,
+                        cursor_seq: after,
+                        tip_seq: None,
+                        last_did_id: None,
+                        done: false,
+                    };
+                    sweeps::insert(self.state, self.job_id, std::slice::from_ref(&sweep))
+                        .await
+                        .map_err(db)?;
+                    markers.push(sweep);
+                }
+            }
         }
         Ok(())
     }

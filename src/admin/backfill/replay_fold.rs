@@ -33,6 +33,8 @@ pub(super) struct ReplayFold {
     pending_uris: HashSet<String>,
     pending_dids: HashSet<String>,
     written: u64,
+    /// DIDs with a record written or changed since `take_written_dids`.
+    written_dids: HashSet<String>,
 }
 
 impl ReplayFold {
@@ -45,12 +47,19 @@ impl ReplayFold {
             pending_uris: HashSet::new(),
             pending_dids: HashSet::new(),
             written: 0,
+            written_dids: HashSet::new(),
         }
     }
 
     /// Records written or changed so far.
     pub(super) fn written(&self) -> u64 {
         self.written
+    }
+
+    /// The DIDs whose records were written or changed since the last call,
+    /// flushed writes only.
+    pub(super) fn take_written_dids(&mut self) -> HashSet<String> {
+        std::mem::take(&mut self.written_dids)
     }
 
     /// Whether a record of `did` waits in the buffer, not yet written.
@@ -164,6 +173,11 @@ impl ReplayFold {
                 })?;
         self.written += changed.len() as u64;
         let uris: Vec<String> = changed.into_iter().map(|c| c.uri).collect();
+        self.written_dids.extend(uris.iter().filter_map(|uri| {
+            uri.strip_prefix("at://")
+                .and_then(|rest| rest.split('/').next())
+                .map(str::to_string)
+        }));
         super::queue_label_backfill(state, &uris).await;
         Ok(())
     }
