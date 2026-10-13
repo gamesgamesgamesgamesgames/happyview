@@ -234,22 +234,43 @@ pub fn decode_block(frame: &[u8]) -> Result<Vec<Row>, SegmentError> {
     Ok(rows)
 }
 
-/// Decompress one zstd frame into a buffer that grows with the content and
-/// stops one byte past `MAX_DECODED_BLOCK`. `zstd::bulk::decompress(frame,
-/// cap)` would reserve the whole cap up front for every block, 64 MiB each
-/// even for a block of a few KiB, times `BACKFILL_REPLAY_CONCURRENCY`.
+/// Decompress one zstd frame, refusing anything over `MAX_DECODED_BLOCK`.
+/// `zstd::bulk::decompress(frame, cap)` would reserve the whole cap for every
+/// block, 64 MiB each even for a few KiB, times `BACKFILL_REPLAY_CONCURRENCY`.
 fn decompress_capped(frame: &[u8]) -> Result<Vec<u8>, SegmentError> {
-    let decoder = zstd::stream::read::Decoder::with_buffer(frame)
-        .map_err(|e| err(format!("block is not a zstd frame: {e}")))?;
-    let mut block = Vec::new();
-    decoder
-        .take(MAX_DECODED_BLOCK as u64 + 1)
-        .read_to_end(&mut block)
-        .map_err(|e| err(format!("block does not decompress: {e}")))?;
+    let block = read_capped(frame, MAX_DECODED_BLOCK)?;
     if block.len() > MAX_DECODED_BLOCK {
         return Err(err(format!(
             "block decompresses to more than {MAX_DECODED_BLOCK} bytes"
         )));
+    }
+    Ok(block)
+}
+
+/// Decode `frame` in fixed chunks, stopping one byte past `cap`. The buffer
+/// doubles but is clamped to `cap + 1`, so the capacity never exceeds it
+/// (a plain doubling `read_to_end` would reach twice that before refusing).
+fn read_capped(frame: &[u8], cap: usize) -> Result<Vec<u8>, SegmentError> {
+    const CHUNK: usize = 64 << 10;
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(frame)
+        .map_err(|e| err(format!("block is not a zstd frame: {e}")))?;
+    let limit = cap + 1;
+    let mut block: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; CHUNK];
+    while block.len() < limit {
+        let want = CHUNK.min(limit - block.len());
+        let read = decoder
+            .read(&mut chunk[..want])
+            .map_err(|e| err(format!("block does not decompress: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        if block.capacity() - block.len() < read {
+            // Double, but never past the limit.
+            let step = block.len().max(CHUNK).min(limit - block.len());
+            block.reserve_exact(step);
+        }
+        block.extend_from_slice(&chunk[..read]);
     }
     Ok(block)
 }
@@ -458,9 +479,24 @@ mod tests {
     }
 
     #[test]
-    fn a_block_over_the_decoded_cap_is_refused_without_allocating_it() {
-        let huge = vec![0u8; MAX_DECODED_BLOCK + 1];
-        assert!(decode_block(&frame(&huge)).is_err());
+    fn decoding_never_reserves_more_than_the_cap_plus_one() {
+        let over = read_capped(&frame(&vec![0u8; MAX_DECODED_BLOCK + 1]), MAX_DECODED_BLOCK)
+            .expect("reads up to the limit");
+        assert_eq!(over.len(), MAX_DECODED_BLOCK + 1);
+        assert!(
+            over.capacity() <= MAX_DECODED_BLOCK + 1,
+            "capacity {}",
+            over.capacity()
+        );
+        assert!(decode_block(&frame(&vec![0u8; MAX_DECODED_BLOCK + 1])).is_err());
+
+        let small = read_capped(&frame(&[7u8; 1000]), MAX_DECODED_BLOCK).unwrap();
+        assert_eq!(small.len(), 1000);
+        assert!(
+            small.capacity() <= 64 << 10,
+            "capacity {}",
+            small.capacity()
+        );
     }
 
     #[test]
