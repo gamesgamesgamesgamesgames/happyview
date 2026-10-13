@@ -619,3 +619,103 @@ async fn decode(frame: Vec<u8>) -> Result<Vec<Row>, String> {
         .map_err(|e| e.to_string())
         .and_then(|r| r)
 }
+
+/// Close a gap in the live stream from the archive (plan ruling P7): start a
+/// network replay job for everything after `after_seq`, and return its id and
+/// the archive's sealed tip, where the live stream can resume at once.
+pub(crate) async fn start_gap_replay(
+    state: &AppState,
+    after_seq: i64,
+) -> Result<(String, i64), String> {
+    let collections = super::record_collections(state)
+        .await
+        .map_err(|e| e.to_string())?;
+    if collections.is_empty() {
+        return Err("there are no record collections to replay".into());
+    }
+    let endpoint = crate::jetstream::config::parse_endpoint(&state.config.jetstream_url);
+    let client = ArchiveClient::new(state.http.clone(), &endpoint, &state.archive);
+    let page = client
+        .plan(&PlanRequest {
+            kinds: vec!["commit".into()],
+            collections: collections
+                .iter()
+                .take(sweeps::MAX_PLAN_COLLECTIONS)
+                .cloned()
+                .collect(),
+            after_seq: after_seq.max(0) as u64,
+            ..PlanRequest::default()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let tip = page.sealed_tip_seq as i64;
+    if tip <= after_seq {
+        return Err(format!(
+            "the archive's sealed tip {tip} is not past seq {after_seq}"
+        ));
+    }
+    // A repeated CursorTooOld before anything new is applied asks for the
+    // same gap again. Reuse the job already filling it instead of stacking
+    // another one.
+    let existing: Option<(String,)> = crate::db::query_as(&crate::db::adapt_sql(
+        "SELECT id FROM happyview_backfill_jobs \
+         WHERE source = 'replay' AND replay_after_seq = ? AND status IN ('running', 'pausing', 'paused') \
+         ORDER BY created_at DESC LIMIT 1",
+        state.db_backend,
+    ))
+    .bind(after_seq)
+    .fetch_optional(&state.backfill_db)
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some((job_id,)) = existing {
+        tracing::info!(
+            job_id,
+            after_seq,
+            "a gap replay for this seq is already running; reusing it"
+        );
+        return Ok((job_id, tip));
+    }
+    let job_id = super::create_backfill_job_with(
+        state,
+        None,
+        &[],
+        crate::jetstream::archive::SourceChoice::Replay,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let sql = crate::db::adapt_sql(
+        "UPDATE happyview_backfill_jobs SET replay_after_seq = ? WHERE id = ?",
+        state.db_backend,
+    );
+    crate::db::retry_on_busy(|| {
+        crate::db::query(&sql)
+            .bind(after_seq)
+            .bind(&job_id)
+            .execute(&state.backfill_db)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    super::log_event(
+        &state.db,
+        super::EventLog {
+            event_type: "backfill.started".to_string(),
+            severity: super::Severity::Info,
+            actor_did: None,
+            subject: None,
+            detail: serde_json::json!({
+                "job_id": job_id,
+                "scope": "network",
+                "source": "replay",
+                "reason": "jetstream_gap",
+                "after_seq": after_seq,
+                "tip_seq": tip,
+            }),
+        },
+        state.db_backend,
+    )
+    .await;
+    let spawn_state = state.clone();
+    let spawn_id = job_id.clone();
+    tokio::spawn(async move { super::run_backfill_job(spawn_state, spawn_id).await });
+    Ok((job_id, tip))
+}

@@ -3390,6 +3390,21 @@ async fn fetch_records_page_loop(
 // Background backfill worker
 // ---------------------------------------------------------------------------
 
+/// Every collection with a record-type lexicon: what a network backfill
+/// without a collection covers.
+pub(crate) async fn record_collections(state: &AppState) -> Result<Vec<String>, sqlx::Error> {
+    let sql = adapt_sql(
+        "SELECT id FROM happyview_lexicons WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record'",
+        state.db_backend,
+    );
+    Ok(crate::db::query_as::<(String,)>(&sql)
+        .fetch_all(&state.backfill_db)
+        .await?
+        .into_iter()
+        .map(|(id,)| id)
+        .collect())
+}
+
 async fn run_backfill_job(state: AppState, job_id: String) {
     let window = parse_discovery_window(std::env::var("BACKFILL_DISCOVERY_WINDOW").ok().as_deref());
     run_backfill_job_with(state, job_id, window).await;
@@ -3439,22 +3454,14 @@ async fn run_backfill_job_with(state: AppState, job_id: String, window: i64) {
         }
         vec![col.clone()]
     } else {
-        let sql = adapt_sql(
-            "SELECT id FROM happyview_lexicons WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record'",
-            backend,
-        );
-        let rows: Vec<(String,)> = match crate::db::query_as(&sql)
-            .fetch_all(&state.backfill_db)
-            .await
-        {
-            Ok(rows) => rows,
+        match record_collections(&state).await {
+            Ok(collections) => collections,
             Err(e) => {
                 let error = format!("failed to query backfill-eligible lexicons: {e}");
                 fail_job(&state, &job_id, &error).await;
                 return;
             }
-        };
-        rows.into_iter().map(|(id,)| id).collect()
+        }
     };
 
     if collections.is_empty() {

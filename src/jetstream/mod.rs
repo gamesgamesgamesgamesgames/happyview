@@ -222,6 +222,48 @@ async fn handle_rejection(
             Some(Duration::ZERO)
         }
         Rejection::CursorTooOld(message) => {
+            // P8: under BACKFILL_SOURCE=crawl the archive is never asked.
+            if session.protocol == Protocol::V2
+                && state.archive.default_source != crate::jetstream::archive::SourceChoice::Crawl
+                && let Some(after_seq) = gap_floor(state, settings).await
+            {
+                match crate::admin::backfill::replay::start_gap_replay(state, after_seq).await {
+                    Ok((job_id, tip)) => {
+                        tracing::warn!(
+                            %message,
+                            after_seq,
+                            tip,
+                            job_id,
+                            "jetstream refused the cursor; replaying the gap from its archive and resuming live at the sealed tip"
+                        );
+                        session.stale_seq = Some(after_seq);
+                        session.from_tip = false;
+                        session.pending_gap = None;
+                        *last_dispatched = Some(tip);
+                        let sent = session.sent_cursor;
+                        log_gap(
+                            state,
+                            session,
+                            GAP_CURSOR_TOO_OLD,
+                            sent,
+                            serde_json::json!({
+                                "message": message,
+                                "after_seq": after_seq,
+                                "resumed_at_seq": tip,
+                                "replay_job_id": job_id,
+                            }),
+                        )
+                        .await;
+                        return Some(Duration::ZERO);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error,
+                            "could not replay the jetstream gap from its archive"
+                        );
+                    }
+                }
+            }
             resume_without_seq(state, session, last_dispatched, message, true).await;
             Some(Duration::ZERO)
         }
@@ -298,6 +340,16 @@ async fn handle_rejection(
             None
         }
     }
+}
+
+/// The saved applied seq, when it was saved for this host: where a gap
+/// replay starts. Seqs are local to one Jetstream instance.
+async fn gap_floor(state: &AppState, settings: &Settings) -> Option<i64> {
+    let stored = cursor::load(&state.db, state.db_backend).await.ok()?;
+    if stored.host.as_deref() != Some(settings.endpoint.host.as_str()) {
+        return None;
+    }
+    stored.seq
 }
 
 /// Stop resuming by seq: the refused one, the saved one and the last one

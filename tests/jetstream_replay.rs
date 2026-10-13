@@ -6,8 +6,11 @@ mod common;
 use common::app::TestApp;
 use common::jetstream::{self as js, MockJetstream};
 use common::segment_writer::write_segment;
+use happyview::jetstream::archive::SourceChoice;
 use happyview::jetstream::archive::client::{ArchiveClient, PlanMode, PlanRequest};
 use happyview::jetstream::archive::{ArchiveConfig, rows, segment};
+use happyview::jetstream::config::{DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint};
+use happyview::jetstream::workers::RetryPolicy;
 use serde_json::json;
 use serial_test::serial;
 use std::io::Cursor;
@@ -964,4 +967,257 @@ async fn cancelling_a_replay_stops_it() {
     assert_eq!(status, 200);
     mock.release_segment(&segment);
     assert_eq!(finished(&app, &id).await["status"], "cancelled");
+}
+
+fn settings(mock: &MockJetstream) -> Settings {
+    Settings {
+        endpoint: parse_endpoint(&mock.url()),
+        protocol: ProtocolChoice::Auto,
+        compression: true,
+        workers: 8,
+        invalid_request_retry: Duration::from_millis(100),
+        drain_timeout: DRAIN_TIMEOUT,
+    }
+}
+
+/// Retries in milliseconds, so a test never waits on the production backoff.
+fn fast_retries() -> RetryPolicy {
+    RetryPolicy {
+        delays: vec![Duration::from_millis(10); 3],
+        max_unavailable_delay: Duration::from_millis(50),
+    }
+}
+
+/// Seed a setting. Every seeded row shares one `updated_at`, as `cursor::save`
+/// writes the seq and the time together (copied from tests/jetstream_live.rs).
+async fn save_setting(app: &TestApp, key: &str, value: &str) {
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?)",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(key)
+        .bind(value)
+        .bind("2026-01-01T00:00:00+00:00")
+        .execute(&app.state.db)
+        .await
+        .expect("seed setting");
+}
+
+/// Run the live consumer on GAME against `mock`; abort it by dropping the
+/// handle's task (`.abort()`), keeping the sender alive until then.
+fn consume(
+    app: &TestApp,
+    mock: &MockJetstream,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::watch::Sender<Vec<String>>,
+) {
+    let (tx, rx) = tokio::sync::watch::channel(vec![GAME.to_string()]);
+    let handle = happyview::jetstream::spawn_with(
+        app.state.clone(),
+        rx,
+        settings(mock),
+        Some(fast_retries()),
+    );
+    (handle, tx)
+}
+
+/// `app` with `BACKFILL_SOURCE=auto`, the production default. The TestApp
+/// default crawls, and under `crawl` gap replay is off (P8).
+async fn auto_app(mock: &MockJetstream) -> Option<TestApp> {
+    let mut app = app(mock, None).await?;
+    app.state.archive.default_source = SourceChoice::Auto;
+    app.rebuild_router();
+    Some(app)
+}
+
+/// The details of every `jetstream.gap` event, oldest first.
+async fn gap_events(app: &TestApp) -> Vec<serde_json::Value> {
+    happyview::db::query_as::<(String,)>(&happyview::db::adapt_sql(
+        "SELECT detail FROM happyview_event_logs WHERE event_type = 'jetstream.gap' ORDER BY created_at",
+        app.state.db_backend,
+    ))
+    .fetch_all(&app.state.db)
+    .await
+    .expect("gap events")
+    .into_iter()
+    .map(|(detail,)| serde_json::from_str(&detail).expect("detail is JSON"))
+    .collect()
+}
+
+fn replay_jobs(jobs: &serde_json::Value) -> Vec<serde_json::Value> {
+    jobs.as_array()
+        .unwrap()
+        .iter()
+        .filter(|j| j["source"] == "replay")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn cursor_too_old_replays_the_gap_and_resumes_live_at_the_sealed_tip() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = auto_app(&mock).await else {
+        return;
+    };
+    let did = "did:plc:gap";
+    mock.seal(games(1..=50, did), 10);
+    // Live events after the sealed tip.
+    mock.push(
+        (51..=55).map(|s| js::create(s, did, GAME, &format!("g{s:04}"), game(&format!("t{s}")))),
+    );
+    // The consumer last applied seq 20 on this host, long enough ago that the
+    // server refuses it.
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(
+        400,
+        "CursorTooOld",
+        "cursor is older than the retention floor",
+    );
+
+    let (consumer, _collections) = consume(&app, &mock);
+
+    wait_until!(
+        "seq 51-55 applied live",
+        dump(&app)
+            .await
+            .iter()
+            .filter(|r| r.0.ends_with("g0055"))
+            .count()
+            == 1
+    );
+    let jobs = app.get_json("/admin/backfill/status").await;
+    let gap = jobs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["source"] == "replay")
+        .expect("a gap replay job")
+        .clone();
+    let gap = finished(&app, gap["id"].as_str().unwrap()).await;
+    assert_eq!(gap["status"], "completed", "{gap}");
+    assert_eq!(gap["replay"]["after_seq"], 20);
+    consumer.abort();
+
+    let uris: Vec<String> = dump(&app).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(
+        uris.len(),
+        35,
+        "21-50 replayed, 51-55 live, 1-20 not refetched: {uris:?}"
+    );
+    let connections = mock.connections();
+    let resumed = connections.last().unwrap();
+    assert_eq!(
+        resumed.param("cursor").as_deref(),
+        Some("50"),
+        "resumed at the sealed tip"
+    );
+    let gaps = gap_events(&app).await;
+    let detail = &gaps[0];
+    assert_eq!(detail["reason"], "cursor_too_old");
+    assert_eq!(detail["after_seq"], 20);
+    assert_eq!(detail["resumed_at_seq"], 50);
+    assert_eq!(detail["replay_job_id"], gap["id"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn cursor_too_old_without_an_archive_resumes_as_before() {
+    let mock = MockJetstream::start().await;
+    mock.disable_archive(404);
+    let Some(app) = auto_app(&mock).await else {
+        return;
+    };
+    mock.push(
+        (51..=55).map(|s| js::create(s, "did:plc:noarchive", GAME, &format!("g{s:04}"), game("t"))),
+    );
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(400, "CursorTooOld", "too old");
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!("live events applied", dump(&app).await.len() == 5);
+    consumer.abort();
+    let jobs = app.get_json("/admin/backfill/status").await;
+    assert!(
+        jobs.as_array().unwrap().is_empty(),
+        "no replay job without an archive"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn cursor_too_old_under_crawl_never_asks_the_archive() {
+    // P8: with BACKFILL_SOURCE=crawl (the TestApp default), CursorTooOld is
+    // handled exactly as before, even though this host has an archive.
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.seal(games(1..=50, "did:plc:crawlgap"), 10);
+    mock.push(
+        (51..=55).map(|s| js::create(s, "did:plc:crawlgap", GAME, &format!("g{s:04}"), game("t"))),
+    );
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    mock.reject_next(400, "CursorTooOld", "too old");
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!("live events applied", dump(&app).await.len() == 5);
+    consumer.abort();
+    assert!(
+        mock.plan_requests().is_empty(),
+        "the archive was never asked"
+    );
+    let jobs = app.get_json("/admin/backfill/status").await;
+    assert!(
+        jobs.as_array().unwrap().is_empty(),
+        "no replay job under crawl"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_repeated_cursor_too_old_reuses_the_running_gap_job() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = auto_app(&mock).await else {
+        return;
+    };
+    let did = "did:plc:gaptwice";
+    // 25 events a block: (20, 50] touches both blocks, so the plan answers
+    // in segment mode and `hold_segment` can keep the job running.
+    let segment = mock.seal(games(1..=50, did), 25);
+    mock.hold_segment(&segment);
+    mock.push((51..=55).map(|s| js::create(s, did, GAME, &format!("g{s:04}"), game("t"))));
+    save_setting(&app, "jetstream_seq", "20").await;
+    save_setting(&app, "jetstream_host", &mock.host()).await;
+    // Refused twice: at the saved seq 20, then again at the sealed tip 50,
+    // before anything is applied, so the saved seq is still 20.
+    mock.reject_next(400, "CursorTooOld", "too old");
+    mock.reject_next(400, "CursorTooOld", "still too old");
+    let (consumer, _collections) = consume(&app, &mock);
+    wait_until!(
+        "the live stream to resume",
+        dump(&app).await.iter().any(|r| r.0.ends_with("g0055"))
+    );
+    let jobs = replay_jobs(&app.get_json("/admin/backfill/status").await);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "one gap job for seq 20, however often it is refused: {jobs:?}"
+    );
+    mock.release_segment(&segment);
+    assert_eq!(
+        finished(&app, jobs[0]["id"].as_str().unwrap()).await["status"],
+        "completed"
+    );
+    consumer.abort();
+    let gaps = gap_events(&app).await;
+    assert_eq!(gaps.len(), 2, "{gaps:?}");
+    assert!(
+        gaps.iter().all(|g| g["replay_job_id"] == jobs[0]["id"]),
+        "{gaps:?}"
+    );
+    assert_eq!(dump(&app).await.len(), 35);
 }
