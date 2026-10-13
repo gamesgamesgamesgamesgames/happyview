@@ -9,6 +9,8 @@
 
 mod common;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use serde_json::{Value, json};
 
 use common::app::TestApp;
@@ -72,9 +74,15 @@ async fn call(app: &TestApp, plugin: &str, function: &str, args: &[Value]) -> Va
         .unwrap_or_else(|e| panic!("{function}: {e:?}"))
 }
 
-/// Bytes that are not valid UTF-8, so the wire's byte-array branch is the one
+/// Bytes that are not valid UTF-8, so the wire's `$bytes` branch is the one
 /// exercised. A string payload would only ever prove the other branch.
 const ARTIFACT: [u8; 5] = [0x00, 0x61, 0xff, 0x73, 0x6d];
+
+/// Bytes as the wire carries them when they are not valid UTF-8: the atproto
+/// data model's `{"$bytes": "<base64>"}`.
+fn wire_bytes(bytes: &[u8]) -> Value {
+    json!({ "$bytes": STANDARD_NO_PAD.encode(bytes) })
+}
 
 #[tokio::test]
 async fn bytes_survive_the_boundary_and_come_back_whole() {
@@ -88,7 +96,7 @@ async fn bytes_survive_the_boundary_and_come_back_whole() {
         &app,
         "sdk_blobs",
         "put",
-        &[json!(ARTIFACT.to_vec()), json!("application/wasm")],
+        &[wire_bytes(&ARTIFACT), json!("application/wasm")],
     )
     .await;
     let cid = cid.as_str().expect("put answers a cid").to_string();
@@ -101,8 +109,11 @@ async fn bytes_survive_the_boundary_and_come_back_whole() {
     );
 
     let got = call(&app, "sdk_blobs", "get", &[json!(cid)]).await;
-    let bytes: Vec<u8> = serde_json::from_value(got["bytes"].clone()).expect("bytes");
-    assert_eq!(bytes, ARTIFACT, "the bytes came back changed");
+    assert_eq!(
+        got["bytes"],
+        wire_bytes(&ARTIFACT),
+        "the bytes came back changed"
+    );
     assert_eq!(got["mime_type"], "application/wasm");
     assert_eq!(got["size"], ARTIFACT.len());
 
@@ -168,7 +179,7 @@ async fn each_import_refuses_without_its_capability() {
         .call_library(
             "read_only",
             "put",
-            &[json!(ARTIFACT.to_vec()), json!("application/wasm")],
+            &[wire_bytes(&ARTIFACT), json!("application/wasm")],
             &caller(),
             0,
         )
@@ -185,7 +196,7 @@ async fn each_import_refuses_without_its_capability() {
         &app,
         "write_only",
         "put",
-        &[json!(ARTIFACT.to_vec()), json!("application/wasm")],
+        &[wire_bytes(&ARTIFACT), json!("application/wasm")],
     )
     .await;
     let cid = cid.as_str().expect("cid").to_string();

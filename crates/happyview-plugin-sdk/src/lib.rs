@@ -53,7 +53,7 @@ pub mod wire;
 pub use envelope::{PluginError, Response};
 pub use types::{
     ApiExport, ApiMethod, ApiSurface, AtprotoBlobDownload, AtprotoResolveService, AttestSign,
-    AttestVerify, AuthorizeUrlInput, BacklinksQuery, BlobData, CallContext, CallInput,
+    AttestVerify, AuthorizeUrlInput, BacklinksQuery, BlobData, Bytes, CallContext, CallInput,
     CallbackInput, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
     CallerXrpcProcedure, CallerXrpcQuery, Condition, ExecuteContext, ExecuteInput, ExecuteLimits,
     ExecuteOutput, ExternalProfile, Filter, IndexDelete, IndexPut, JobCreate, JobGet, JobListAny,

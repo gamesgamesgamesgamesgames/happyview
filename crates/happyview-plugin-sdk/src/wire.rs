@@ -14,6 +14,11 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+use base64::engine::DecodePaddingMode;
+use base64::Engine as _;
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
@@ -25,17 +30,66 @@ use serde_json::{Map, Value};
 /// shape a plugin's own exports return; the host parses it as
 /// `PluginResponse`.
 ///
-/// `Err` is declared first and that order is load-bearing: `untagged` keeps
-/// the first variant that fits, and an absent `Option<_>` field deserialises
-/// as `None`, so `Ok { ok: Option<_> }` fits an `{"error": ...}` envelope as
-/// well as a real one. `PluginError`'s fields are all required, so `Err` fits
-/// only a genuine error envelope, and trying it first is what lets an
-/// `Option`-returning wrapper report an error at all.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Read by its top-level key rather than `untagged`: an untagged enum buffers
+/// the whole envelope into serde's `Content` before choosing a variant, which
+/// costs a second copy of every answer — a blob's included — inside a guest's
+/// memory. An `error` key makes it an error even beside an `ok`, and keys it
+/// does not know are skipped, so it reads flattened beside a `handle` too.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Response<T> {
     Err { error: PluginError },
     Ok { ok: T },
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Response<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "lowercase")]
+        enum Key {
+            Ok,
+            Error,
+            #[serde(other)]
+            Other,
+        }
+
+        struct EnvelopeVisitor<T>(core::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for EnvelopeVisitor<T> {
+            type Value = Response<T>;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("an {\"ok\"} or {\"error\"} envelope")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut ok = None;
+                let mut error = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Key::Ok if ok.is_some() => return Err(de::Error::duplicate_field("ok")),
+                        Key::Ok => ok = Some(map.next_value()?),
+                        Key::Error if error.is_some() => {
+                            return Err(de::Error::duplicate_field("error"))
+                        }
+                        Key::Error => error = Some(map.next_value()?),
+                        Key::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                match (error, ok) {
+                    (Some(error), _) => Ok(Response::Err { error }),
+                    (None, Some(ok)) => Ok(Response::Ok { ok }),
+                    (None, None) => Err(de::Error::custom(
+                        "an envelope needs an \"ok\" or an \"error\" key",
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_map(EnvelopeVisitor(core::marker::PhantomData))
+    }
 }
 
 impl<T> Response<T> {
@@ -678,13 +732,13 @@ pub struct CallerRecordDelete {
 
 /// A blob upload issued as the calling script's user. Needs `caller:write`.
 ///
-/// `bytes` travels the same way an [`HttpRequest`] body does: a JSON string
-/// when it is valid UTF-8, a byte array otherwise.
+/// `bytes` travels as [`Bytes`] does: a JSON string when it is valid UTF-8,
+/// `{"$bytes": "<base64>"}` otherwise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallerBlobUpload {
     #[serde(
         serialize_with = "serialize_body",
-        deserialize_with = "deserialize_body_flexible_required"
+        deserialize_with = "deserialize_body"
     )]
     pub bytes: Vec<u8>,
     pub mime_type: String,
@@ -779,13 +833,13 @@ pub struct AtprotoBlobDownload {
     pub cid: String,
 }
 
-/// A downloaded blob. `bytes` travels the same way an [`HttpResponse`] body
-/// does: a JSON string when it is valid UTF-8, a byte array otherwise.
+/// A downloaded blob. `bytes` travels as [`Bytes`] does: a JSON string when
+/// it is valid UTF-8, `{"$bytes": "<base64>"}` otherwise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BlobData {
     #[serde(
         serialize_with = "serialize_body",
-        deserialize_with = "deserialize_body_flexible_required"
+        deserialize_with = "deserialize_body"
     )]
     pub bytes: Vec<u8>,
     pub mime_type: String,
@@ -798,7 +852,7 @@ pub struct BlobData {
 pub struct BlobPut {
     #[serde(
         serialize_with = "serialize_body",
-        deserialize_with = "deserialize_body_flexible_required"
+        deserialize_with = "deserialize_body"
     )]
     pub bytes: Vec<u8>,
     pub mime_type: String,
@@ -913,7 +967,7 @@ pub struct LinkedRepoBlobUpload {
     pub did: String,
     #[serde(
         serialize_with = "serialize_body",
-        deserialize_with = "deserialize_body_flexible_required"
+        deserialize_with = "deserialize_body"
     )]
     pub bytes: Vec<u8>,
     pub mime_type: String,
@@ -1744,9 +1798,9 @@ pub struct JobWaitRequest {
 /// An outbound HTTP request. `headers` are sent as the host expects them,
 /// `[[name, value], ...]`.
 ///
-/// The body is bytes, because an HTTP body is bytes; it travels as a JSON
-/// string whenever it is valid UTF-8, which is what every deployed plugin
-/// sends, and as a byte array otherwise.
+/// The body is bytes, because an HTTP body is bytes; it travels as [`Bytes`]
+/// does: a JSON string whenever it is valid UTF-8, and
+/// `{"$bytes": "<base64>"}` otherwise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HttpRequest {
     pub method: String,
@@ -1756,7 +1810,7 @@ pub struct HttpRequest {
     #[serde(
         default,
         serialize_with = "serialize_optional_body",
-        deserialize_with = "deserialize_body_flexible"
+        deserialize_with = "deserialize_optional_body"
     )]
     pub body: Option<Vec<u8>>,
 }
@@ -1783,8 +1837,8 @@ impl HttpRequest {
         self
     }
 
-    /// A body that is not text — an image, say. The wire form is a byte array
-    /// unless the bytes happen to be valid UTF-8.
+    /// A body that is not text — an image, say. The wire form is
+    /// `{"$bytes": "<base64>"}` unless the bytes happen to be valid UTF-8.
     pub fn body_bytes(mut self, body: Vec<u8>) -> Self {
         self.body = Some(body);
         self
@@ -1797,12 +1851,12 @@ pub struct HttpResponse {
     pub status: u16,
     #[serde(default)]
     pub headers: Vec<(String, String)>,
-    /// Sent as a string when the body is valid UTF-8 and as a byte array when
-    /// it is not, so a plugin that declares a string body still decodes it.
+    /// Sent as a string when the body is valid UTF-8 and as
+    /// `{"$bytes": "<base64>"}` when it is not, as [`Bytes`] travel.
     #[serde(
         default,
         serialize_with = "serialize_body",
-        deserialize_with = "deserialize_body_flexible_required"
+        deserialize_with = "deserialize_body"
     )]
     pub body: Vec<u8>,
 }
@@ -1824,21 +1878,58 @@ impl HttpResponse {
     }
 }
 
-/// A body as the wire carries it: a string when it is valid UTF-8, a byte array
-/// when it is not.
-struct BodyRepr<'a>(&'a [u8]);
+/// The key the atproto data model's JSON form puts bytes under:
+/// `{"$bytes": "<base64>"}`.
+const BYTES_KEY: &str = "$bytes";
 
-impl Serialize for BodyRepr<'_> {
+/// Standard base64, written without padding as atproto writes it, and read
+/// with or without.
+const BASE64: GeneralPurpose = GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_encode_padding(false)
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
+/// Bytes as the wire carries them, for a plugin's own arguments and results.
+///
+/// A JSON string when they are valid UTF-8, so text stays readable on both
+/// sides, and otherwise the atproto data model's `{"$bytes": "<base64>"}`.
+/// Base64 rather than an array of numbers: an array costs four or so bytes of
+/// JSON per byte, and many times that once parsed, where base64 costs a third
+/// more and nothing once decoded.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Bytes(pub Vec<u8>);
+
+impl Bytes {
+    /// Read bytes out of an argument without copying the JSON first, which
+    /// for a blob is megabytes of base64.
+    pub fn from_value(value: &Value) -> Result<Self, serde_json::Error> {
+        Self::deserialize(value)
+    }
+}
+
+impl Serialize for Bytes {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match core::str::from_utf8(self.0) {
-            Ok(text) => serializer.serialize_str(text),
-            Err(_) => serializer.serialize_bytes(self.0),
-        }
+        serialize_body(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_body(deserializer).map(Bytes)
     }
 }
 
 fn serialize_body<S: Serializer>(body: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-    BodyRepr(body).serialize(serializer)
+    match core::str::from_utf8(body) {
+        Ok(text) => serializer.serialize_str(text),
+        Err(_) => {
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(BYTES_KEY, &BASE64.encode(body))?;
+            map.end()
+        }
+    }
 }
 
 fn serialize_optional_body<S: Serializer>(
@@ -1846,72 +1937,108 @@ fn serialize_optional_body<S: Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     match body {
-        Some(body) => serializer.serialize_some(&BodyRepr(body)),
+        Some(body) => serializer.serialize_some(&BodyRef(body)),
         None => serializer.serialize_none(),
     }
 }
 
-/// Accepts a JSON string, a byte array, or null, so either side can send
-/// `"body": "text"` or `"body": [1,2,3]`.
-fn deserialize_body_flexible<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de;
+struct BodyRef<'a>(&'a [u8]);
 
-    struct BodyVisitor;
+impl Serialize for BodyRef<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serialize_body(self.0, serializer)
+    }
+}
 
-    impl<'de> de::Visitor<'de> for BodyVisitor {
-        type Value = Option<Vec<u8>>;
+/// Reads a string as its UTF-8 bytes and `{"$bytes": "<base64>"}` as the bytes
+/// it encodes. `null` is `None`.
+struct BodyVisitor;
 
-        fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-            f.write_str("a string, a byte array, or null")
-        }
+impl<'de> Visitor<'de> for BodyVisitor {
+    type Value = Option<Vec<u8>>;
 
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            Ok(Some(v.as_bytes().to_vec()))
-        }
-
-        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-            Ok(Some(v.into_bytes()))
-        }
-
-        fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-            Ok(Some(v.to_vec()))
-        }
-
-        fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-            let bytes: Vec<u8> =
-                de::Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
-            Ok(Some(bytes))
-        }
-
-        fn visit_some<D2: serde::Deserializer<'de>>(
-            self,
-            deserializer: D2,
-        ) -> Result<Self::Value, D2::Error> {
-            deserializer.deserialize_any(BodyVisitor)
-        }
+    fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.write_str("a string, {\"$bytes\": \"<base64>\"}, or null")
     }
 
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(BodyVisitor)
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(Some(v.as_bytes().to_vec()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(Some(v.into_bytes()))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let key: Cow<'de, str> = map
+            .next_key()?
+            .ok_or_else(|| de::Error::custom("bytes as an object need a \"$bytes\" key"))?;
+        if key != BYTES_KEY {
+            return Err(de::Error::unknown_field(&key, &[BYTES_KEY]));
+        }
+        let bytes = map.next_value_seed(Base64Seed)?;
+        if map.next_key::<IgnoredAny>()?.is_some() {
+            return Err(de::Error::custom(
+                "bytes as an object carry only \"$bytes\"",
+            ));
+        }
+        Ok(Some(bytes))
+    }
+}
+
+/// Decodes a base64 string straight to bytes, without keeping the string.
+struct Base64Seed;
+
+impl<'de> de::DeserializeSeed<'de> for Base64Seed {
+    type Value = Vec<u8>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct Base64Visitor;
+
+        impl Visitor<'_> for Base64Visitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("a base64 string")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
+                BASE64
+                    .decode(v)
+                    .map_err(|e| E::custom(format!("\"$bytes\" is not base64: {e}")))
+            }
+        }
+
+        deserializer.deserialize_str(Base64Visitor)
+    }
+}
+
+fn deserialize_optional_body<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
     deserializer.deserialize_any(BodyVisitor)
 }
 
-/// As [`deserialize_body_flexible`], where an absent or null body is empty
+/// As [`deserialize_optional_body`], where an absent or null body is empty
 /// rather than missing.
-fn deserialize_body_flexible_required<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+fn deserialize_body<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
-    D: serde::Deserializer<'de>,
+    D: Deserializer<'de>,
 {
-    Ok(deserialize_body_flexible(deserializer)?.unwrap_or_default())
+    Ok(deserialize_optional_body(deserializer)?.unwrap_or_default())
 }
 
 /// Which indexed record to look for, by a value nested inside it.
@@ -2145,6 +2272,61 @@ mod tests {
     }
 
     #[test]
+    fn an_envelope_with_an_error_is_an_error_even_beside_an_ok() {
+        let parsed: Response<Value> =
+            serde_json::from_str(r#"{"ok":1,"error":{"code":"X","message":"y"}}"#).unwrap();
+        assert_eq!(parsed.into_result().unwrap_err().code, "X");
+    }
+
+    #[test]
+    fn an_envelope_skips_keys_it_does_not_know_and_needs_one_it_does() {
+        let parsed: Response<Value> = serde_json::from_str(r#"{"handle":3,"ok":true}"#).unwrap();
+        assert_eq!(parsed.into_result().unwrap(), Value::Bool(true));
+
+        let neither = serde_json::from_str::<Response<Option<Value>>>(r#"{"handle":3}"#);
+        assert!(neither
+            .unwrap_err()
+            .to_string()
+            .contains("\"ok\" or an \"error\""));
+        assert!(serde_json::from_str::<Response<Value>>(r#"{"ok":1,"ok":2}"#).is_err());
+        assert!(serde_json::from_str::<Response<Value>>("[]").is_err());
+    }
+
+    #[test]
+    fn bytes_are_a_string_when_they_are_text_and_base64_when_not() {
+        assert_eq!(serde_json::to_value(Bytes(b"hi".to_vec())).unwrap(), "hi");
+        let binary = Bytes(vec![0x00, 0xff, 0xfe, 0x80]);
+        let value = serde_json::to_value(&binary).unwrap();
+        assert_eq!(value, serde_json::json!({"$bytes": "AP/+gA"}));
+        assert_eq!(serde_json::from_value::<Bytes>(value).unwrap(), binary);
+        assert_eq!(
+            serde_json::from_str::<Bytes>(r#""hi""#).unwrap(),
+            Bytes(b"hi".to_vec())
+        );
+    }
+
+    #[test]
+    fn bytes_read_from_a_borrowed_value_as_from_text() {
+        let value = serde_json::json!({"$bytes": "AP8"});
+        assert_eq!(Bytes::from_value(&value).unwrap(), Bytes(vec![0x00, 0xff]));
+        assert_eq!(
+            Bytes::from_value(&Value::from("hi")).unwrap(),
+            Bytes(b"hi".to_vec())
+        );
+        assert!(Bytes::from_value(&serde_json::json!([0, 255])).is_err());
+    }
+
+    #[test]
+    fn malformed_bytes_are_refused_saying_why() {
+        let err = |json: &str| serde_json::from_str::<Bytes>(json).unwrap_err().to_string();
+        assert!(err(r#"{"$bytes":"not base64!"}"#).contains("not base64"));
+        assert!(err(r#"{"bytes":"AA"}"#).contains("$bytes"));
+        assert!(err(r#"{"$bytes":"AA","extra":1}"#).contains("only"));
+        assert!(err(r#"{}"#).contains("$bytes"));
+        assert!(err("[0,1]").contains("a string"));
+    }
+
+    #[test]
     fn call_input_defaults_every_field_but_function() {
         let input: CallInput = serde_json::from_str(r#"{"function":"get"}"#).unwrap();
         assert_eq!(input.function, "get");
@@ -2359,15 +2541,22 @@ mod tests {
     }
 
     #[test]
-    fn response_body_accepts_a_string_or_a_byte_array() {
+    fn response_body_accepts_a_string_or_bytes_and_refuses_a_number_array() {
         let text: HttpResponse =
             serde_json::from_str(r#"{"status":200,"headers":[],"body":"hi"}"#).unwrap();
         assert_eq!(text.body, b"hi");
         assert_eq!(text.text(), "hi");
 
         let bytes: HttpResponse =
-            serde_json::from_str(r#"{"status":204,"headers":[],"body":[104,105]}"#).unwrap();
+            serde_json::from_str(r#"{"status":204,"headers":[],"body":{"$bytes":"aGk"}}"#).unwrap();
         assert_eq!(bytes.body, b"hi");
+
+        // Bytes travel as base64 only: an array of numbers costs many times
+        // the payload once parsed, which is what this encoding replaced.
+        assert!(serde_json::from_str::<HttpResponse>(
+            r#"{"status":204,"headers":[],"body":[104,105]}"#
+        )
+        .is_err());
 
         let missing: HttpResponse = serde_json::from_str(r#"{"status":204,"headers":[]}"#).unwrap();
         assert!(missing.body.is_empty());
@@ -2401,7 +2590,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&binary).unwrap(),
-            r#"{"status":200,"headers":[],"body":[255,254]}"#
+            r#"{"status":200,"headers":[],"body":{"$bytes":"//4"}}"#
         );
         assert_eq!(
             serde_json::from_str::<HttpResponse>(&serde_json::to_string(&binary).unwrap()).unwrap(),
@@ -2433,7 +2622,7 @@ mod tests {
         let binary = HttpRequest::new("POST", "https://example.test").body_bytes(vec![0xff, 0xfe]);
         assert_eq!(
             serde_json::to_value(&binary).unwrap()["body"],
-            serde_json::json!([255, 254])
+            serde_json::json!({"$bytes": "//4"})
         );
         assert_eq!(
             serde_json::from_value::<HttpRequest>(serde_json::to_value(&binary).unwrap()).unwrap(),
@@ -2738,25 +2927,25 @@ mod caller_tests {
             text
         );
 
-        // ...and a non-UTF-8 payload serializes as a byte array, both ways.
+        // ...and a non-UTF-8 payload serializes as `$bytes`, both ways.
         let binary = CallerBlobUpload {
             bytes: vec![0xff, 0xfe],
             mime_type: "image/png".to_string(),
         };
         let value = serde_json::to_value(&binary).unwrap();
-        assert_eq!(value["bytes"], json!([255, 254]));
+        assert_eq!(value["bytes"], json!({"$bytes": "//4"}));
         assert_eq!(
             serde_json::from_value::<CallerBlobUpload>(value).unwrap(),
             binary
         );
 
-        // A caller may also send a byte array for text content.
-        let from_array: CallerBlobUpload = serde_json::from_value(json!({
-            "bytes": [104, 105],
+        // `$bytes` reads with its padding as well as without.
+        let padded: CallerBlobUpload = serde_json::from_value(json!({
+            "bytes": {"$bytes": "//4="},
             "mime_type": "text/plain",
         }))
         .unwrap();
-        assert_eq!(from_array.bytes, b"hi");
+        assert_eq!(padded.bytes, [0xff, 0xfe]);
     }
 
     #[test]
@@ -2925,24 +3114,24 @@ mod atproto_tests {
         assert_eq!(value["size"], 5);
         assert_eq!(serde_json::from_value::<BlobData>(value).unwrap(), text);
 
-        // ...and a non-UTF-8 payload serializes as a byte array, both ways.
+        // ...and a non-UTF-8 payload serializes as `$bytes`, both ways.
         let binary = BlobData {
             bytes: vec![0xff, 0xfe],
             mime_type: "image/png".to_string(),
             size: 2,
         };
         let value = serde_json::to_value(&binary).unwrap();
-        assert_eq!(value["bytes"], json!([255, 254]));
+        assert_eq!(value["bytes"], json!({"$bytes": "//4"}));
         assert_eq!(serde_json::from_value::<BlobData>(value).unwrap(), binary);
 
-        // A caller may also send a byte array for text content.
-        let from_array: BlobData = serde_json::from_value(json!({
-            "bytes": [104, 105],
+        // `$bytes` reads with its padding as well as without.
+        let padded: BlobData = serde_json::from_value(json!({
+            "bytes": {"$bytes": "//4="},
             "mime_type": "text/plain",
             "size": 2,
         }))
         .unwrap();
-        assert_eq!(from_array.bytes, b"hi");
+        assert_eq!(padded.bytes, [0xff, 0xfe]);
     }
 
     #[test]
@@ -3149,27 +3338,27 @@ mod linked_repos_tests {
             text
         );
 
-        // ...and a non-UTF-8 payload serializes as a byte array, both ways.
+        // ...and a non-UTF-8 payload serializes as `$bytes`, both ways.
         let binary = LinkedRepoBlobUpload {
             did: "did:plc:abc".to_string(),
             bytes: vec![0xff, 0xfe],
             mime_type: "image/png".to_string(),
         };
         let value = serde_json::to_value(&binary).unwrap();
-        assert_eq!(value["bytes"], json!([255, 254]));
+        assert_eq!(value["bytes"], json!({"$bytes": "//4"}));
         assert_eq!(
             serde_json::from_value::<LinkedRepoBlobUpload>(value).unwrap(),
             binary
         );
 
-        // A caller may also send a byte array for text content.
-        let from_array: LinkedRepoBlobUpload = serde_json::from_value(json!({
+        // `$bytes` reads with its padding as well as without.
+        let padded: LinkedRepoBlobUpload = serde_json::from_value(json!({
             "did": "did:plc:abc",
-            "bytes": [104, 105],
+            "bytes": {"$bytes": "//4="},
             "mime_type": "text/plain",
         }))
         .unwrap();
-        assert_eq!(from_array.bytes, b"hi");
+        assert_eq!(padded.bytes, [0xff, 0xfe]);
     }
 
     #[test]
