@@ -4041,6 +4041,13 @@ pub(crate) async fn start_automatic_backfill(
     collection: String,
     actor_did: &str,
 ) -> Result<Option<String>, AppError> {
+    if !state.config.auto_backfill {
+        tracing::info!(
+            collection = collection.as_str(),
+            "automatic backfill is off; not backfilling"
+        );
+        return Ok(None);
+    }
     start_backfill(state, Some(collection), Vec::new(), actor_did)
         .await
         .map(Some)
@@ -5150,6 +5157,24 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::lexicon::{ParsedLexicon, ProcedureAction};
+
+    /// With automatic backfill off, nothing is queued: no job row, no task.
+    #[tokio::test]
+    async fn automatic_backfill_is_refused_when_off() {
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        state.config.auto_backfill = false;
+        let started = start_automatic_backfill(&state, "com.example.thing".into(), "did:plc:dev")
+            .await
+            .unwrap();
+        assert!(started.is_none());
+        let (count,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_backfill_jobs")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 
     const POST: &str = "app.test.post";
     const LIKE: &str = "app.test.like";

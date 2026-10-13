@@ -412,6 +412,34 @@ async fn record_lexicon_with_backfill_starts_a_backfill_job() {
 
 #[tokio::test]
 #[serial]
+async fn record_lexicon_upload_does_not_backfill_when_automatic_backfill_is_off() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.state.config.auto_backfill = false;
+    app.rebuild_router();
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": true
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json = json_body(resp).await;
+    assert!(json["backfill_job_id"].is_null(), "{json}");
+    assert_eq!(
+        backfill_job_count(&app, "games.gamesgamesgamesgames.game").await,
+        0
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn re_uploading_a_lexicon_does_not_start_a_second_backfill_job() {
     common::require_db!();
     let app = TestApp::new().await;

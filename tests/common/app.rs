@@ -112,6 +112,8 @@ impl TestApp {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
         };
 
         let sql = adapt_sql(

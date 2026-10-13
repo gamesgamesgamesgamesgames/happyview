@@ -152,6 +152,8 @@ pub fn test_state_with_pool_on(
         superadmin_did: None,
         project_root: None,
         project: None,
+        plugin_dir: std::path::PathBuf::from("./plugins"),
+        auto_backfill: true,
     };
     let (tx, _) = watch::channel(vec![]);
     let (labeler_tx, _) = watch::channel(());
