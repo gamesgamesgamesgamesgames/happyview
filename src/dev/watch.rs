@@ -4,16 +4,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use notify_debouncer_mini::notify::{self, PollWatcher, RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer_opt};
+use notify::{Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::AppState;
 use crate::dev::{DevSession, report};
 
-/// Long enough to fold an editor's write-then-rename, or a formatter's
-/// second write, into one build; short enough that a save feels immediate.
+/// How long the inputs must stay quiet before a build. Long enough to fold
+/// an editor's write-then-rename, or a formatter's second write, into one
+/// build; short enough that a save feels immediate.
 const DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// The longest a batch may keep growing. Something that writes under `src/`
+/// without pause would otherwise never leave the inputs quiet, and no build
+/// would ever start.
+const MAX_BATCH: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Change {
@@ -78,8 +83,8 @@ pub fn classify(root: &Path, path: &Path) -> Option<Change> {
     None
 }
 
-/// Wait for a signal, then take every other one already queued. `None` when
-/// every sender is gone.
+/// Wait for a signal, then take every other one until none has arrived for
+/// `DEBOUNCE`, or `MAX_BATCH` has passed. `None` when every sender is gone.
 async fn next_batch(rx: &mut UnboundedReceiver<Change>) -> Option<Batch> {
     let mut batch = Batch::default();
     let mut note = |change: Change| match change {
@@ -89,8 +94,13 @@ async fn next_batch(rx: &mut UnboundedReceiver<Change>) -> Option<Batch> {
         Change::Source => {}
     };
     note(rx.recv().await?);
-    while let Ok(change) = rx.try_recv() {
-        note(change);
+    let cutoff = tokio::time::Instant::now() + MAX_BATCH;
+    loop {
+        let quiet = (tokio::time::Instant::now() + DEBOUNCE).min(cutoff);
+        match tokio::time::timeout_at(quiet, rx.recv()).await {
+            Ok(Some(change)) => note(change),
+            _ => break,
+        }
     }
     Some(batch)
 }
@@ -135,78 +145,86 @@ pub fn parse_poll_ms(raw: Option<&str>) -> Result<WatchMode, String> {
     }
 }
 
-/// The two watchers are different types behind one debouncer, and the loop
-/// only ever needs to add a watch.
-enum AnyDebouncer {
-    Native(Debouncer<RecommendedWatcher>),
-    Poll(Debouncer<PollWatcher>),
+/// The two watchers are different types, and the loop only ever needs to
+/// add a watch.
+enum AnyWatcher {
+    Native(RecommendedWatcher),
+    Poll(PollWatcher),
 }
 
-/// Adding a watch is all the rebuild loop does with its debouncer, so a test
+/// Adding a watch is all the rebuild loop does with its watcher, so a test
 /// can stand in for one.
 trait Watch {
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()>;
 }
 
-impl Watch for AnyDebouncer {
+impl Watch for AnyWatcher {
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
         match self {
-            Self::Native(d) => d.watcher().watch(path, mode),
-            Self::Poll(d) => d.watcher().watch(path, mode),
+            Self::Native(w) => Watcher::watch(w, path, mode),
+            Self::Poll(w) => Watcher::watch(w, path, mode),
         }
     }
 }
 
-type SharedDebouncer = Arc<Mutex<AnyDebouncer>>;
+type SharedWatcher = Arc<Mutex<AnyWatcher>>;
 
-/// A debouncer of the chosen kind, watching every path in `watched_paths`,
+/// The watcher's event handler: each classified change to `tx`, except for
+/// reads. inotify reports every open and close, and a build opens every
+/// directory under `src/`, so counting a read as a change would schedule the
+/// next build from the last one, forever. The kind is filtered here, before
+/// anything is collapsed, because it is gone once events become a `Change`.
+fn forward(
+    root: PathBuf,
+    tx: UnboundedSender<Change>,
+) -> impl FnMut(notify::Result<Event>) + Send + 'static {
+    move |result| match result {
+        Ok(event) if matches!(event.kind, EventKind::Access(_)) => {}
+        Ok(event) => {
+            for change in event.paths.iter().filter_map(|p| classify(&root, p)) {
+                let _ = tx.send(change);
+            }
+        }
+        Err(e) => eprintln!("file watcher: {e}"),
+    }
+}
+
+/// A watcher of the chosen kind, watching every path in `watched_paths`,
 /// that sends each classified change to `tx`.
 fn start_watcher(
     root: &Path,
     mode: WatchMode,
     tx: UnboundedSender<Change>,
-) -> Result<SharedDebouncer, String> {
-    let filter_root = root.to_path_buf();
-    let handler = move |result: DebounceEventResult| match result {
-        Ok(events) => {
-            for change in events
-                .iter()
-                .filter_map(|e| classify(&filter_root, &e.path))
-            {
-                let _ = tx.send(change);
-            }
-        }
-        Err(e) => eprintln!("file watcher: {e}"),
-    };
-    let config = notify_debouncer_mini::Config::default().with_timeout(DEBOUNCE);
-    let debouncer = match mode {
-        WatchMode::Native => AnyDebouncer::Native(
-            new_debouncer_opt::<_, RecommendedWatcher>(config, handler)
+) -> Result<SharedWatcher, String> {
+    let handler = forward(root.to_path_buf(), tx);
+    let watcher = match mode {
+        WatchMode::Native => AnyWatcher::Native(
+            RecommendedWatcher::new(handler, notify::Config::default())
                 .map_err(|e| format!("could not start the file watcher: {e}"))?,
         ),
-        WatchMode::Poll(interval) => AnyDebouncer::Poll(
-            new_debouncer_opt::<_, PollWatcher>(
-                config.with_notify_config(notify::Config::default().with_poll_interval(interval)),
+        WatchMode::Poll(interval) => AnyWatcher::Poll(
+            PollWatcher::new(
                 handler,
+                notify::Config::default().with_poll_interval(interval),
             )
             .map_err(|e| format!("could not start the polling file watcher: {e}"))?,
         ),
     };
-    let debouncer = Arc::new(Mutex::new(debouncer));
+    let watcher = Arc::new(Mutex::new(watcher));
     for (path, recursive) in watched_paths(root) {
-        debouncer
+        watcher
             .lock()
             .unwrap()
             .watch(&path, recursive)
             .map_err(|e| format!("could not watch {}: {e}", path.display()))?;
     }
-    Ok(debouncer)
+    Ok(watcher)
 }
 
-/// The only strong reference to the debouncer: dropping it stops the watch,
+/// The only strong reference to the watcher: dropping it stops the watch,
 /// which drops the channel's sender and ends the rebuild loop.
 pub struct WatchHandle {
-    _debouncer: SharedDebouncer,
+    _watcher: SharedWatcher,
     mode: WatchMode,
 }
 
@@ -236,9 +254,9 @@ pub fn spawn_with(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
     spawn_interpreter_listener(&state, &tx);
-    let debouncer = start_watcher(&root, mode, tx)?;
+    let watcher = start_watcher(&root, mode, tx)?;
 
-    let rewatch: Weak<Mutex<AnyDebouncer>> = Arc::downgrade(&debouncer);
+    let rewatch: Weak<Mutex<AnyWatcher>> = Arc::downgrade(&watcher);
     let mut declared = state.config.project.clone();
     tokio::spawn(async move {
         while let Some(batch) = next_batch(&mut rx).await {
@@ -247,7 +265,7 @@ pub fn spawn_with(
         }
     });
     Ok(WatchHandle {
-        _debouncer: debouncer,
+        _watcher: watcher,
         mode,
     })
 }
@@ -293,11 +311,11 @@ async fn handle_batch<W: Watch>(
     for (changed, path, recursive) in recreated {
         if changed
             && path.is_dir()
-            && let Some(debouncer) = rewatch.upgrade()
+            && let Some(watcher) = rewatch.upgrade()
         {
             // Watching a path twice is harmless; a failure means the
             // directory went away again, and its reappearance retries.
-            let _ = debouncer.lock().unwrap().watch(&path, recursive);
+            let _ = watcher.lock().unwrap().watch(&path, recursive);
         }
     }
     if batch.config
@@ -404,7 +422,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".happyview")).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
         let watcher = start_watcher(&root, WatchMode::Poll(Duration::from_millis(50)), tx).unwrap();
-        assert!(matches!(&*watcher.lock().unwrap(), AnyDebouncer::Poll(_)));
+        assert!(matches!(&*watcher.lock().unwrap(), AnyWatcher::Poll(_)));
 
         std::fs::write(root.join("src/a.json"), "{}").unwrap();
         let change = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
@@ -415,7 +433,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
         let native = start_watcher(&root, WatchMode::Native, tx).unwrap();
-        assert!(matches!(&*native.lock().unwrap(), AnyDebouncer::Native(_)));
+        assert!(matches!(&*native.lock().unwrap(), AnyWatcher::Native(_)));
     }
 
     /// Everything queued while a build ran becomes one more build, which
@@ -445,6 +463,85 @@ mod tests {
         assert_eq!(next_batch(&mut rx).await, Some(Batch::default()));
         drop(tx);
         assert_eq!(next_batch(&mut rx).await, None);
+    }
+
+    fn event(kind: EventKind, path: &str) -> notify::Result<Event> {
+        Ok(Event::new(kind).add_path(PathBuf::from(path)))
+    }
+
+    /// What inotify reports for a build reading `src/`: opens and closes,
+    /// which a macOS host never produces. None of them is a build.
+    #[tokio::test]
+    async fn reads_are_not_changes() {
+        use notify::event::{AccessKind, AccessMode};
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
+        let mut handler = forward(PathBuf::from("/p"), tx);
+        for path in ["/p/src", "/p/src/lexicons", "/p/src/lexicons/a.json"] {
+            handler(event(
+                EventKind::Access(AccessKind::Open(AccessMode::Any)),
+                path,
+            ));
+            handler(event(
+                EventKind::Access(AccessKind::Close(AccessMode::Read)),
+                path,
+            ));
+            handler(event(EventKind::Access(AccessKind::Read), path));
+        }
+        let built = tokio::time::timeout(DEBOUNCE * 3, next_batch(&mut rx)).await;
+        assert!(built.is_err(), "a read was taken for a change: {built:?}");
+    }
+
+    /// A modify, a create, a remove and a rename, mixed with reads, are one
+    /// build.
+    #[tokio::test]
+    async fn changes_are_one_build() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
+        let mut handler = forward(PathBuf::from("/p"), tx);
+        let a = "/p/src/lexicons/a.json";
+        handler(event(
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            a,
+        ));
+        handler(event(
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            a,
+        ));
+        handler(event(EventKind::Create(CreateKind::File), "/p/src/b.lua"));
+        handler(event(EventKind::Remove(RemoveKind::File), "/p/src/c.lua"));
+        handler(event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            "/p/happyview.toml",
+        ));
+        handler(event(
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            a,
+        ));
+
+        assert_eq!(
+            next_batch(&mut rx).await,
+            Some(Batch {
+                config: true,
+                ..Batch::default()
+            })
+        );
+        let again = tokio::time::timeout(DEBOUNCE * 3, next_batch(&mut rx)).await;
+        assert!(again.is_err(), "a second build: {again:?}");
+    }
+
+    #[tokio::test]
+    async fn unending_changes_still_build() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
+        let writer = tokio::spawn(async move {
+            while tx.send(Change::Source).is_ok() {
+                tokio::time::sleep(DEBOUNCE / 4).await;
+            }
+        });
+        let built = tokio::time::timeout(MAX_BATCH * 2, next_batch(&mut rx)).await;
+        writer.abort();
+        assert!(built.is_ok(), "no build while changes kept arriving");
     }
 
     #[derive(Default)]
