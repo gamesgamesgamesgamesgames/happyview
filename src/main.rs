@@ -960,6 +960,7 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
         client_jwks,
         telemetry_counters,
         script_limits,
+        test: None,
     };
 
     // Before anything that runs a script starts: a worker that came first

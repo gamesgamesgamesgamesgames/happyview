@@ -1301,6 +1301,7 @@ mod tests {
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
             script_limits: std::sync::Arc::new(crate::lua::limits::ScriptLimits::default()),
+            test: None,
         };
 
         crate::test_support::provision_space_signing_key(&state).await;
