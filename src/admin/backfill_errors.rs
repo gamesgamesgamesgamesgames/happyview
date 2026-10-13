@@ -26,6 +26,8 @@ pub enum BackfillErrorKind {
     RepoDeactivated,
     RepoTakendown,
     Other,
+    /// An archive block or segment that failed to download or decode.
+    ReplayBlock,
 }
 
 impl BackfillErrorKind {
@@ -37,6 +39,7 @@ impl BackfillErrorKind {
                 | Self::Timeout
                 | Self::PdsServerError
                 | Self::RateLimited
+                | Self::ReplayBlock
         )
     }
 
@@ -54,6 +57,7 @@ impl BackfillErrorKind {
             Self::RepoDeactivated => "repo_deactivated",
             Self::RepoTakendown => "repo_takendown",
             Self::Other => "other",
+            Self::ReplayBlock => "replay_block",
         }
     }
 
@@ -71,12 +75,13 @@ impl BackfillErrorKind {
             "repo_deactivated" => Self::RepoDeactivated,
             "repo_takendown" => Self::RepoTakendown,
             "other" => Self::Other,
+            "replay_block" => Self::ReplayBlock,
             _ => return None,
         })
     }
 
     /// Every kind, for zero-filling count maps and driving the dashboard legend.
-    pub fn all() -> [Self; 12] {
+    pub fn all() -> [Self; 13] {
         [
             Self::DnsFailure,
             Self::ConnectionFailed,
@@ -90,6 +95,7 @@ impl BackfillErrorKind {
             Self::RepoDeactivated,
             Self::RepoTakendown,
             Self::Other,
+            Self::ReplayBlock,
         ]
     }
 }
@@ -441,6 +447,7 @@ mod tests {
             Timeout,
             PdsServerError,
             RateLimited,
+            ReplayBlock,
         ] {
             assert!(k.is_retryable(), "{k:?} should be retryable");
         }

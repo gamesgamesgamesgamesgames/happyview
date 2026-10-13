@@ -228,7 +228,8 @@ fn did_document_failure(did: &str, failure: &BackfillFailure) -> AppError {
         BackfillErrorKind::RepoNotFound
         | BackfillErrorKind::RepoDeactivated
         | BackfillErrorKind::RepoTakendown
-        | BackfillErrorKind::Other => format!("could not fetch DID document for {did}"),
+        | BackfillErrorKind::Other
+        | BackfillErrorKind::ReplayBlock => format!("could not fetch DID document for {did}"),
     };
     AppError::BadRequest(reason)
 }

@@ -63,6 +63,8 @@ pub(super) struct CreateBackfillBody {
     pub(super) collection: Option<String>,
     pub(super) did: Option<String>,
     pub(super) dids: Option<Vec<String>>,
+    /// `auto`, `replay` or `crawl`; `BACKFILL_SOURCE` when absent.
+    pub(super) source: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -88,6 +90,24 @@ pub(crate) struct BackfillJob {
     /// `repos?phase=fetched` lists. `None` for older jobs, which list every
     /// completed repo.
     pub(crate) recent_completions_limit: Option<i64>,
+    /// `auto` until an `auto` job has probed the archive, then `replay` or
+    /// `crawl`.
+    pub(crate) source: String,
+    /// Replay progress; `None` for a crawl.
+    pub(crate) replay: Option<ReplayProgress>,
+}
+
+/// Where a replay job's running sweep is, and what it has cost.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ReplayProgress {
+    /// Where the job started: 0, or the applied seq of a gap replay.
+    pub(crate) after_seq: i64,
+    /// The running sweep's cursor.
+    pub(crate) through_seq: Option<i64>,
+    /// The running sweep's pinned tip.
+    pub(crate) tip_seq: Option<i64>,
+    pub(crate) bytes: i64,
+    pub(crate) blocks_failed: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +147,13 @@ pub enum BackfillEvent {
         job_id: String,
         status: String,
         error: Option<String>,
+    },
+    ReplayProgress {
+        job_id: String,
+        through_seq: i64,
+        tip_seq: i64,
+        bytes: i64,
+        blocks_failed: i32,
     },
     /// Current job state, straight from the database.
     ///

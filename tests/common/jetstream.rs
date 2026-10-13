@@ -351,6 +351,8 @@ struct Inner {
     segment_downloads: Vec<String>,
     block_fetches: Vec<(String, u32)>,
     authorizations: Vec<(String, Option<String>)>,
+    /// Segments whose `getSegment` answer waits for `release_segment`.
+    held_segments: HashMap<String, Arc<tokio::sync::Notify>>,
 }
 
 struct Shared {
@@ -527,6 +529,24 @@ impl MockJetstream {
             .lock()
             .corrupt_blocks
             .insert((segment.to_string(), index));
+    }
+
+    /// `getSegment` for `name` records the download, then waits for
+    /// `release_segment` before answering.
+    pub fn hold_segment(&self, name: &str) {
+        self.shared
+            .lock()
+            .held_segments
+            .insert(name.to_string(), Arc::new(tokio::sync::Notify::new()));
+    }
+
+    pub fn release_segment(&self, name: &str) {
+        if let Some(notify) = self.shared.lock().held_segments.remove(name) {
+            notify.notify_waiters();
+            // A handler that recorded the download but had not started
+            // waiting yet takes this permit.
+            notify.notify_one();
+        }
     }
 
     pub fn plan_requests(&self) -> Vec<Value> {
@@ -937,16 +957,30 @@ async fn get_segment(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
+    // The answer is decided, and the download recorded, before a held
+    // segment waits; the lock is never held across the wait.
+    let (held, response) = segment_response(&shared, &query, &headers);
+    if let Some(held) = held {
+        held.notified().await;
+    }
+    response
+}
+
+fn segment_response(
+    shared: &Shared,
+    query: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> (Option<Arc<tokio::sync::Notify>>, Response) {
     let mut inner = shared.lock();
     inner
         .authorizations
-        .push(("segment".into(), authorization(&headers)));
+        .push(("segment".into(), authorization(headers)));
     if let Some(response) = throttled(&mut inner) {
-        return response;
+        return (None, response);
     }
     let name = query.get("name").cloned().unwrap_or_default();
     let Some((_, written, _)) = inner.segments.iter().find(|(n, _, _)| *n == name) else {
-        return not_found("SegmentNotFound");
+        return (None, not_found("SegmentNotFound"));
     };
     let (bytes, etag) = (written.bytes.clone(), format!("\"{}\"", written.checksum));
     let range = headers
@@ -960,13 +994,14 @@ async fn get_segment(
             Some((start, end))
         });
     if range.is_none_or(|(start, _)| start == 0) {
-        inner.segment_downloads.push(name);
+        inner.segment_downloads.push(name.clone());
     }
+    let held = inner.held_segments.get(&name).cloned();
     let if_range_differs = headers
         .get(header::IF_RANGE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|tag| tag != etag);
-    match range {
+    let response = match range {
         Some((start, end)) if !if_range_differs && start < bytes.len() => {
             let end = end.unwrap_or(usize::MAX).min(bytes.len() - 1);
             (
@@ -983,7 +1018,8 @@ async fn get_segment(
                 .into_response()
         }
         _ => (StatusCode::OK, [(header::ETAG, etag)], bytes).into_response(),
-    }
+    };
+    (held, response)
 }
 
 async fn get_block(
