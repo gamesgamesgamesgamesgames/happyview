@@ -186,6 +186,26 @@ impl ParsedLexicon {
     }
 }
 
+/// The structural checks every lexicon passes before it is stored or served:
+/// lexicon version 1 and a string `id` that is a valid NSID. Returns the id.
+/// The admin upload and the project build both call this, so a file cannot
+/// carry a lexicon the upload would refuse.
+pub fn check_document(raw: &Value) -> Result<String, String> {
+    let version = raw
+        .get("lexicon")
+        .and_then(|v| v.as_i64())
+        .ok_or("lexicon JSON must have a numeric 'lexicon' field")?;
+    if version != 1 {
+        return Err(format!("unsupported lexicon version: {version}"));
+    }
+    let id = raw
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("lexicon JSON must have a string 'id' field")?;
+    happyview_nsid::validate_nsid(id).map_err(|e| e.to_string())?;
+    Ok(id.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +232,31 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn check_document_returns_the_id_of_a_valid_lexicon() {
+        assert_eq!(
+            check_document(&record_lexicon_json()).unwrap(),
+            "games.gamesgamesgamesgames.game"
+        );
+    }
+
+    #[test]
+    fn check_document_says_what_is_wrong() {
+        let cases = [
+            (json!({"id": "com.example.x"}), "numeric 'lexicon'"),
+            (
+                json!({"lexicon": 2, "id": "com.example.x"}),
+                "unsupported lexicon version: 2",
+            ),
+            (json!({"lexicon": 1}), "string 'id'"),
+            (json!({"lexicon": 1, "id": "not an nsid"}), "invalid NSID"),
+        ];
+        for (raw, expected) in cases {
+            let err = check_document(&raw).unwrap_err();
+            assert!(err.contains(expected), "{raw}: {err}");
+        }
     }
 
     fn query_lexicon_json() -> Value {

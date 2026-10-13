@@ -37,22 +37,7 @@ pub(super) async fn upload_lexicon(
     // Before any other validation, so a project-owned id is always a 409.
     state.lexicons.check_writable(&id)?;
 
-    // Validate basic structure
-    let lexicon_version = body
-        .lexicon_json
-        .get("lexicon")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| {
-            AppError::BadRequest("lexicon JSON must have a numeric 'lexicon' field".into())
-        })?;
-
-    if lexicon_version != 1 {
-        return Err(AppError::BadRequest(format!(
-            "unsupported lexicon version: {lexicon_version}"
-        )));
-    }
-
-    happyview_nsid::validate_nsid(&id).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    crate::lexicon::check_document(&body.lexicon_json).map_err(AppError::BadRequest)?;
 
     // Validate action
     let action =
