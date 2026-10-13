@@ -187,15 +187,15 @@ State lives in `<project>/.happyview/`:
 
 Precedence is the same as everywhere: environment variables, then `happyview.toml`, then these defaults.
 
-**`.env` is for scripts, not the server.** The project's `.env` supplies `ctx.env` only, and is re-read on every script run. It never sets server configuration, so a `DATABASE_URL` or `PORT` in it is just a script variable. `$VAR` references in it are expanded from the process environment, which holds only what was exported in the shell that started HappyView, not the defaults dev supplies. So `X=$DATABASE_URL` gives `ctx.env` the `DATABASE_URL` you exported, or an empty value if you exported none.
+**`.env` is for scripts, not the server.** The project's `.env` supplies `ctx.env` only, and is re-read on every script run. It never sets server configuration, so a `DATABASE_URL` or `PORT` in it is just a script variable. `$VAR` references in it are expanded from the process environment first, then from lines above it in the same file. The process environment holds only what was exported in the shell that started HappyView, not the defaults dev supplies. So `X=$DATABASE_URL` gives `ctx.env` the `DATABASE_URL` you exported, else the value of a `DATABASE_URL=` line earlier in `.env`, else an empty value.
 
-**Saving rebuilds.** The watcher covers `src/`, `happyview.toml` and the modules in `.happyview/build/`. Each build prints one line listing what changed, followed by a line for each warning. A build that fails prints every error, then `build failed; still serving the previous build`, and the last good build keeps serving until you fix it. Dev also starts when the project is already broken, and waits for the fix. If file events don't arrive (a Docker Desktop bind mount, say), set `HAPPYVIEW_WATCH_POLL_MS`.
+**Saving rebuilds.** The watcher covers `src/`, `happyview.toml` and the modules in `.happyview/build/`. Each build prints one line listing what changed, followed by a line for each warning. A build that fails prints every error, then `build failed; still serving the previous build`, and the last good build keeps serving until you fix it. Dev also starts when the project's `src/` is already broken, and waits for the fix. A `happyview.toml` that does not parse at startup stops it; the same breakage while dev runs is reported and survived. If file events don't arrive (a Docker Desktop bind mount, say), set `HAPPYVIEW_WATCH_POLL_MS`.
 
 **Editing `happyview.toml` while dev runs:**
 
 - Added declarations apply at once.
 - Removed declarations are reported, not applied. They stay until you delete them from the dashboard after a restart.
-- A setting that is read only at startup prints `restart required to apply: <names>`, naming the variables, such as `PORT` or `DATABASE_URL`.
+- A setting that is read only at startup prints `restart required to apply: <names>`, naming the variables, such as `PORT` or `PUBLIC_URL`.
 - An edit that is rejected leaves the running configuration untouched.
 
 **Writes reach the real network.** Dev prints a warning once at startup: writes from the instance go to your real PDS and the live network, where any instance indexing the same collections, including your production one, will index them. Set `HAPPYVIEW_NETWORK=local`, or run `hpy happyview dev --network local`, to silence it.
