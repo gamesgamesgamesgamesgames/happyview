@@ -9,6 +9,7 @@ pub mod layout;
 pub mod lexicons;
 pub mod modules;
 pub mod prepare;
+pub mod script_module;
 pub mod snapshot;
 pub mod walk;
 
