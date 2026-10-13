@@ -164,6 +164,7 @@ impl TestApp {
             records: happyview::record_store::RecordStore::shared(pool.clone(), backend)
                 .await
                 .expect("load record dictionaries"),
+            archive: happyview::jetstream::archive::ArchiveConfig::default(),
             domain_cache,
             lexicons,
             collections_tx,

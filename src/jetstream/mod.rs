@@ -8,6 +8,7 @@
 //! dictionary (`compression`).
 
 pub mod apply;
+pub mod archive;
 pub mod compression;
 pub mod config;
 pub mod cursor;

@@ -5013,6 +5013,73 @@ mod tests {
         test_state_with_pool(crate::test_support::migrated_memory_pool().await)
     }
 
+    #[tokio::test]
+    async fn replay_columns_and_tables_exist_on_both_backends() {
+        let mut states = vec![migrated_state().await];
+        if let Some(state) = crate::test_support::test_state_from_env().await {
+            states.push(state);
+        }
+        for state in states {
+            seed_job(
+                &state,
+                "replay-schema",
+                None,
+                "network",
+                "pending",
+                2,
+                false,
+            )
+            .await;
+            let (source, bytes, failed): (String, i64, i32) = crate::db::query_as(&adapt_sql(
+                "SELECT source, replay_bytes, replay_blocks_failed FROM happyview_backfill_jobs WHERE id = ?",
+                state.db_backend,
+            ))
+            .bind("replay-schema")
+            .fetch_one(&state.db)
+            .await
+            .expect("replay columns");
+            assert_eq!((source.as_str(), bytes, failed), ("crawl", 0, 0));
+
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_backfill_replay_sweeps \
+                 (job_id, sweep, kind, collections, dids, after_seq, cursor_seq) \
+                 VALUES (?, 0, 'commits', '[]', NULL, ?, ?)",
+                state.db_backend,
+            ))
+            .bind("replay-schema")
+            .bind(40_000_000_000_i64)
+            .bind(40_000_000_000_i64)
+            .execute(&state.db)
+            .await
+            .expect("a seq past 2^31 fits");
+            crate::db::query(&adapt_sql(
+                "INSERT INTO happyview_backfill_replay_retries (job_id, segment, block_index) VALUES (?, 'seg_0000000001.jss', -1)",
+                state.db_backend,
+            ))
+            .bind("replay-schema")
+            .execute(&state.db)
+            .await
+            .expect("retries table");
+            crate::db::query(&adapt_sql(
+                "DELETE FROM happyview_backfill_jobs WHERE id = ?",
+                state.db_backend,
+            ))
+            .bind("replay-schema")
+            .execute(&state.db)
+            .await
+            .expect("delete job");
+            let left: i64 = crate::db::query_scalar(&adapt_sql(
+                "SELECT COUNT(*) FROM happyview_backfill_replay_sweeps WHERE job_id = ?",
+                state.db_backend,
+            ))
+            .bind("replay-schema")
+            .fetch_one(&state.db)
+            .await
+            .expect("count");
+            assert_eq!(left, 0, "sweeps cascade with their job");
+        }
+    }
+
     async fn seed_legacy_repo(
         state: &AppState,
         job_id: &str,

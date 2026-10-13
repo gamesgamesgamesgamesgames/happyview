@@ -1234,6 +1234,7 @@ mod tests {
             backfill_db: pool.clone(),
             db_backend: backend,
             records: crate::record_store::RecordStore::new(pool.clone(), backend),
+            archive: Default::default(),
             domain_cache: crate::domain::DomainCache::new(),
             lexicons: LexiconRegistry::new(),
             collections_tx,
