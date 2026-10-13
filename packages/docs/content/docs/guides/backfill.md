@@ -27,7 +27,7 @@ A backfill job reads records from one of two sources:
 - **Replay** reads the Jetstream archive. One read of the archive replaces a crawl of every PDS.
 - **Crawl** is the process described above: list repos from the relay, then fetch each one from its PDS.
 
-`BACKFILL_SOURCE` sets the default, and `POST /admin/backfill` takes a `source` that overrides it for one job. The values are `auto`, `replay` and `crawl`. `auto` is the default: a job replays when `JETSTREAM_URL` points at a Jetstream with an archive, and crawls when the archive answers 404 or 501 or can't be reached. A job created as `replay` fails instead of falling back to a crawl.
+`BACKFILL_SOURCE` sets the default, and `POST /admin/backfill` takes a `source` that overrides it for one job. The values are `auto`, `replay` and `crawl`. `auto` is the default: a job replays when `JETSTREAM_URL` points at a Jetstream with an archive, and crawls when the archive answers 404 or 501 or can't be reached. It also crawls when the archive asks for a key (401 or 403) and `JETSTREAM_API_KEY` isn't set, and logs once that a key would let it replay. When a key is set and the archive refuses it, the job fails instead. A job created as `replay` fails instead of falling back to a crawl.
 
 A replay job downloads in two sweeps:
 
@@ -44,7 +44,7 @@ A replay job stops and fails rather than run on through an archive outage. It st
 
 A failed replay job can be resumed like a paused one: it carries on from where it stopped, without downloading again what it had finished. Two exceptions need a new backfill instead. A job that stopped because its error log is full (10,000 failures) stops again on every resume. A job of specific accounts can't be resumed once its account list is gone, which happens when its details are cleared.
 
-Replay needs a Jetstream that serves the v2 archive. If `JETSTREAM_API_KEY` is set, it is sent to the archive and nowhere else. Replay jobs spool each segment to `BACKFILL_REPLAY_DIR` while they decode it, up to 1 GiB per segment.
+Replay needs a Jetstream that serves the v2 archive. Bluesky's hosted archive, which the default `JETSTREAM_URL` points at, requires a key: without `JETSTREAM_API_KEY`, `auto` jobs crawl. If `JETSTREAM_API_KEY` is set, it is sent to the archive and nowhere else. Replay jobs spool each segment to `BACKFILL_REPLAY_DIR` while they decode it, up to 1 GiB per segment.
 
 Crawl stays available. It is what runs when the Jetstream has no archive, and `BACKFILL_SOURCE=crawl` keeps every job on it.
 
