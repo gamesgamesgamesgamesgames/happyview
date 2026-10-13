@@ -4,10 +4,19 @@
 //!
 //! It interprets nothing: `source` is a directive. Anything it does not
 //! recognise echoes the whole `execute` input back as the returned value.
+//! `host:module_resolve` asks the host for `payload.specifier` imported from
+//! `payload.referrer`, the run's own chunk by default.
+//!
+//! `validate` with `prepare` returns the source's own bytes as an
+//! `echo-source` artifact, unless the source starts `no-artifact`, and an
+//! import for each line reading `import <specifier>`. `execute` handed an
+//! empty `source` and such an artifact runs the decoded text.
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![allow(static_mut_refs)]
 
 #[cfg(target_arch = "wasm32")]
+extern crate alloc;
+#[cfg(not(target_arch = "wasm32"))]
 extern crate alloc;
 
 #[cfg(target_arch = "wasm32")]
@@ -75,6 +84,7 @@ extern "C" {
     fn host_job_progress(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_should_stop(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_wait(req_ptr: i32, req_len: i32) -> i64;
+    fn host_module_resolve(req_ptr: i32, req_len: i32) -> i64;
 }
 
 #[no_mangle]
@@ -109,6 +119,43 @@ fn return_json(value: &Value) -> i64 {
 
 fn err(code: &str, message: &str) -> Value {
     json!({"error": {"code": code, "message": message, "retryable": false}})
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(bytes: &[u8]) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(B64[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn b64_decode(text: &str) -> Option<alloc::vec::Vec<u8>> {
+    let mut out = alloc::vec::Vec::new();
+    let digits: alloc::vec::Vec<u32> = text
+        .bytes()
+        .filter(|&c| c != b'=')
+        .map(|c| B64.iter().position(|&d| d == c).map(|p| p as u32))
+        .collect::<Option<_>>()?;
+    for group in digits.chunks(4) {
+        let n = group
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, d)| acc | (d << (18 - 6 * i)));
+        for i in 0..group.len().saturating_sub(1) {
+            out.push((n >> (16 - 8 * i)) as u8);
+        }
+    }
+    Some(out)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -158,6 +205,10 @@ mod imports {
 
     pub fn job_wait(request: &Value) -> Value {
         send(host_job_wait, request)
+    }
+
+    pub fn module_resolve(request: &Value) -> Value {
+        send(host_module_resolve, request)
     }
 
     pub fn api_surface_of(lib: &str) -> Value {
@@ -218,6 +269,9 @@ mod imports {
         unavailable()
     }
     pub fn job_wait(_request: &Value) -> Value {
+        unavailable()
+    }
+    pub fn module_resolve(_request: &Value) -> Value {
         unavailable()
     }
     pub fn api_surface_of(_lib: &str) -> Value {
@@ -353,24 +407,32 @@ fn returned(value: Value, value_kind: &str) -> Value {
     json!({"status": "returned", "value": value, "value_kind": value_kind})
 }
 
-fn failed(kind: &str) -> Value {
-    json!({
+fn failure(kind: &str, message: &str, chunk: &str) -> Value {
+    let mut out = json!({
         "status": "error",
         "kind": kind,
-        "message": format!("echo: {kind}"),
-        "line": 7,
-        "raw": format!("[string \"script\"]:7: echo: {kind}"),
-    })
-}
-
-fn raised(message: &str) -> Value {
-    json!({
-        "status": "error",
-        "kind": "runtime",
         "message": message,
         "line": 7,
-        "raw": format!("[string \"script\"]:7: {message}"),
-    })
+        // The shapes PUC Lua renders: a named chunk `[string "script"]`, a
+        // project file `@<path>` as the bare path.
+        "raw": if chunk == "script" {
+            format!("[string \"script\"]:7: {message}")
+        } else {
+            format!("{chunk}:7: {message}")
+        },
+    });
+    if chunk != "script" {
+        out["chunk"] = json!(chunk);
+    }
+    out
+}
+
+fn failed(kind: &str, chunk: &str) -> Value {
+    failure(kind, &format!("echo: {kind}"), chunk)
+}
+
+fn raised(message: &str, chunk: &str) -> Value {
+    failure("runtime", message, chunk)
 }
 
 #[no_mangle]
@@ -391,7 +453,22 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
     let Some(input) = read_input(ptr, len) else {
         return return_json(&err("BAD_INPUT", "invalid JSON"));
     };
-    let source = input["source"].as_str().unwrap_or("").to_string();
+    let chunk = input["chunk_name"].as_str().unwrap_or("script").to_string();
+    let source = match (input["source"].as_str(), input.get("artifact")) {
+        (Some(""), Some(artifact)) if artifact["format"] == "echo-source" => {
+            match artifact["bytes"].as_str().and_then(b64_decode) {
+                Some(bytes) => alloc::string::String::from_utf8(bytes).unwrap_or_default(),
+                None => return return_json(&err("BAD_INPUT", "echo: undecodable artifact")),
+            }
+        }
+        (Some(""), Some(artifact)) => {
+            return return_json(&json!({"ok": raised(
+                &format!("echo: cannot load a {} artifact", artifact["format"]),
+                &chunk,
+            )}));
+        }
+        (source, _) => source.unwrap_or("").to_string(),
+    };
     let payload = input["input"].clone();
 
     if source == "spin" {
@@ -406,7 +483,7 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
     }
 
     let out = if let Some(kind) = source.strip_prefix("error:") {
-        failed(kind)
+        failed(kind, &chunk)
     } else if let Some(literal) = source.strip_prefix("returns:") {
         // A value chosen by the caller, for a host branch that reads the
         // returned value's own fields rather than only its kind.
@@ -479,13 +556,25 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
                         let kind = if value.is_object() { "object" } else { "other" };
                         returned(value.clone(), kind)
                     }
-                    None => raised(&format!(
-                        "{} - {}",
-                        envelope["error"]["code"].as_str().unwrap_or("HOST_ERROR"),
-                        envelope["error"]["message"].as_str().unwrap_or(""),
-                    )),
+                    None => raised(
+                        &format!(
+                            "{} - {}",
+                            envelope["error"]["code"].as_str().unwrap_or("HOST_ERROR"),
+                            envelope["error"]["message"].as_str().unwrap_or(""),
+                        ),
+                        &chunk,
+                    ),
                 }
             }
+            // The referrer defaults to the run's own chunk, which is what an
+            // interpreter sends for an import made by the handler itself.
+            "host:module_resolve" => returned(
+                imports::module_resolve(&json!({
+                    "specifier": payload["specifier"].as_str().unwrap_or(""),
+                    "referrer": payload["referrer"].as_str().unwrap_or(&chunk),
+                })),
+                "object",
+            ),
             _ => returned(input, "object"),
         }
     };
@@ -498,6 +587,8 @@ pub extern "C" fn validate(ptr: u32, len: u32) -> i64 {
         return return_json(&err("BAD_INPUT", "invalid JSON"));
     };
     let source = input["source"].as_str().unwrap_or("");
+    let prepare = input["prepare"].as_bool().unwrap_or(false);
+    let role = input["role"].as_str().unwrap_or("handler");
     let out = if source.starts_with("probe-globals") {
         // Reports the guard list validation was handed, so the host can see
         // that it arrived rather than trusting that it was sent.
@@ -522,12 +613,36 @@ pub extern "C" fn validate(ptr: u32, len: u32) -> i64 {
         json!({"valid": false, "errors": [
             {"kind": "syntax", "line": 1, "message": "echo: the source says it is invalid"}
         ]})
-    } else if source.starts_with("no-handle") {
+    } else if source.starts_with("no-handle") && role == "handler" {
         json!({"valid": false, "errors": [
             {"kind": "missing_handle", "message": "script must define a handle() function"}
         ]})
     } else {
-        json!({"valid": true})
+        let mut out = json!({"valid": true});
+        if prepare && !source.starts_with("no-artifact") {
+            // Deliberately wrong: the host must overwrite both.
+            out["artifact"] = json!({
+                "interpreter": "forged",
+                "version": "0",
+                "engine": "echo-1",
+                "format": "echo-source",
+                "bytes": b64_encode(source.as_bytes()),
+            });
+        }
+        if prepare {
+            let imports: alloc::vec::Vec<Value> = source
+                .lines()
+                .enumerate()
+                .filter_map(|(i, line)| {
+                    line.strip_prefix("import ")
+                        .map(|spec| json!({"specifier": spec.trim(), "line": i + 1}))
+                })
+                .collect();
+            if !imports.is_empty() {
+                out["imports"] = Value::Array(imports);
+            }
+        }
+        out
     };
     return_json(&json!({"ok": out}))
 }

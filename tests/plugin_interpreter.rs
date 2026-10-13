@@ -1,5 +1,5 @@
 //! The interpreter ABI end to end: `execute_script`, `validate_script`, and
-//! the four `script:host` imports against the same job row and event log the
+//! the five `script:host` imports against the same job row and event log the
 //! native runner writes to. The `interpreter_echo` fixture interprets nothing
 //! — its `source` is a directive — so what this pins is the host's half of the
 //! contract, not any language.
@@ -14,9 +14,9 @@ use common::app::TestApp;
 
 use happyview::error::ScriptErrorType;
 use happyview::plugin::{
-    ExecutionError, LoadedPlugin, PluginInfo, PluginManifest, PluginSource, ScriptErrorKind,
-    ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits, ScriptExecuteOutput, ScriptJob,
-    ScriptKind, ScriptLibraryRef, ScriptValueKind,
+    ChunkRole, ExecutionError, LoadedPlugin, PluginInfo, PluginManifest, PluginSource,
+    ScriptErrorKind, ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits,
+    ScriptExecuteOutput, ScriptJob, ScriptKind, ScriptLibraryRef, ScriptValueKind,
 };
 
 const FIXTURE: &str =
@@ -68,6 +68,7 @@ fn plugin(id: &str, plugin_type: &str, capabilities: &[&str]) -> LoadedPlugin {
     });
     if plugin_type == "interpreter" {
         manifest["language_id"] = json!("echo");
+        manifest["extensions"] = json!(["echo"]);
     } else {
         manifest["namespace"] = json!(id);
     }
@@ -687,7 +688,7 @@ async fn validate_answers_both_shapes() {
     assert_eq!(handleless.errors[0].kind, ScriptErrorKind::MissingHandle);
 }
 
-/// Validation reads no run, so the four `script:host` imports refuse inside
+/// Validation reads no run, so the five `script:host` imports refuse inside
 /// it and nothing it does reaches the event log. The fixture reports what the
 /// import answered, which is what makes an input threaded through from the
 /// validate path visible here rather than silent.
@@ -820,4 +821,213 @@ async fn execute_script_as_accepts_an_absent_session() {
         .expect("execute should answer");
     let (value, _) = returned(output);
     assert_eq!(value["kind"], "label");
+}
+
+#[tokio::test]
+async fn prepare_returns_an_artifact_the_host_stamped() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+
+    let out = app
+        .state
+        .plugin_executor()
+        .prepare_script(
+            id,
+            "returns:{\"n\":1}",
+            "src/jobs/tick.echo",
+            ChunkRole::Handler,
+        )
+        .await
+        .expect("prepare should answer");
+    assert!(out.valid);
+    let artifact = out
+        .artifact
+        .expect("the fixture prepares every valid source");
+    // The fixture claims to be someone else; the host's stamp is what stands.
+    assert_eq!(artifact.interpreter, "interpreter_echo");
+    assert!(
+        artifact.version.starts_with("1.0.0+"),
+        "{}",
+        artifact.version
+    );
+    assert_eq!(
+        Some(artifact.version.clone()),
+        app.state
+            .plugin_registry
+            .artifact_stamp(id)
+            .map(|s| s.version)
+    );
+    assert_eq!(artifact.format, "echo-source");
+    assert_eq!(artifact.bytes, b"returns:{\"n\":1}");
+}
+
+#[tokio::test]
+async fn an_invalid_script_keeps_no_artifact() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+
+    let out = app
+        .state
+        .plugin_executor()
+        .prepare_script(id, "invalid syntax", "script", ChunkRole::Handler)
+        .await
+        .unwrap();
+    assert!(!out.valid);
+    assert_eq!(out.artifact, None);
+}
+
+#[tokio::test]
+async fn prepare_reports_literal_imports_with_their_lines() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+
+    let out = app
+        .state
+        .plugin_executor()
+        .prepare_script(
+            id,
+            "first\nimport ./lib/a\nimport ../b",
+            "src/x.echo",
+            ChunkRole::Handler,
+        )
+        .await
+        .unwrap();
+    let found: Vec<(String, u32)> = out
+        .imports
+        .into_iter()
+        .map(|i| (i.specifier, i.line))
+        .collect();
+    assert_eq!(
+        found,
+        vec![("./lib/a".to_string(), 2), ("../b".to_string(), 3)]
+    );
+}
+
+/// The role reaches the guest: a module needs no `handle`, a handler does.
+#[tokio::test]
+async fn a_module_validates_without_a_handle() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+    let executor = app.state.plugin_executor();
+
+    let as_module = executor
+        .prepare_script(id, "no-handle here", "src/lib/a.echo", ChunkRole::Module)
+        .await
+        .unwrap();
+    assert!(as_module.valid, "{:?}", as_module.errors);
+
+    let as_handler = executor
+        .prepare_script(id, "no-handle here", "src/jobs/a.echo", ChunkRole::Handler)
+        .await
+        .unwrap();
+    assert!(!as_handler.valid);
+    assert_eq!(as_handler.errors[0].kind, ScriptErrorKind::MissingHandle);
+}
+
+/// The editor's check is not a prepare: nothing is built that nobody keeps.
+#[tokio::test]
+async fn plain_validation_prepares_nothing() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+
+    let out = app
+        .state
+        .plugin_executor()
+        .validate_script(id, "return 1")
+        .await
+        .unwrap();
+    assert!(out.valid);
+    assert_eq!(out.artifact, None);
+}
+
+#[tokio::test]
+async fn a_run_handed_an_artifact_loads_it_instead_of_the_source() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+    let executor = app.state.plugin_executor();
+
+    let artifact = executor
+        .prepare_script(
+            id,
+            "returns:{\"from\":\"artifact\"}",
+            "script",
+            ChunkRole::Handler,
+        )
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+    let mut sent = input("", ScriptKind::XrpcQuery);
+    sent.artifact = Some(artifact);
+
+    let (value, _) = returned(executor.execute_script(id, &sent).await.unwrap());
+    assert_eq!(value, json!({"from": "artifact"}));
+}
+
+/// An interpreter is handed the artifact or the source, never both: the
+/// build that made the artifact gets the artifact alone, and any other build
+/// gets the source alone.
+#[tokio::test]
+async fn a_run_is_handed_its_artifact_only_by_the_build_that_made_it() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+    let executor = app.state.plugin_executor();
+
+    let artifact = executor
+        .prepare_script(id, "returns:\"artifact\"", "script", ChunkRole::Handler)
+        .await
+        .unwrap()
+        .artifact
+        .unwrap();
+
+    let mut ours = input("returns:\"source\"", ScriptKind::XrpcQuery);
+    ours.artifact = Some(artifact.clone());
+    let (value, _) = returned(executor.execute_script(id, &ours).await.unwrap());
+    assert_eq!(value, json!("artifact"));
+
+    let mut foreign = artifact;
+    foreign.version.push_str("-another-build");
+    let mut theirs = input("returns:\"source\"", ScriptKind::XrpcQuery);
+    theirs.artifact = Some(foreign);
+    let (value, _) = returned(executor.execute_script(id, &theirs).await.unwrap());
+    assert_eq!(value, json!("source"));
+}
+
+/// A dashboard run reaches `host_module_resolve` and is told it has no
+/// project to import from, which is the module scope's answer rather than
+/// the refusal every `script:host` import gives with no run at all.
+#[tokio::test]
+async fn a_dashboard_run_has_no_modules_to_resolve() {
+    common::require_db!();
+    require_fixture!("interpreter_echo", "wasm32-unknown-unknown");
+    let app = TestApp::new().await;
+    let id = interpreter(&app).await;
+
+    let mut sent = input("host:module_resolve", ScriptKind::XrpcQuery);
+    sent.input = json!({"specifier": "./lib/format"});
+    let (value, _) = returned(
+        app.state
+            .plugin_executor()
+            .execute_script(id, &sent)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(value["error"]["code"], "UNSUPPORTED", "{value}");
+    let message = value["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("./lib/format"), "{message}");
+    assert!(message.contains("dashboard"), "{message}");
 }
