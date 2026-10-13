@@ -412,8 +412,13 @@ jobs:
       # fail) once the directory is missing.
       - name: Test the embedded dashboard
         run: |
+          set -euo pipefail
           bin=$(cargo test --release --features embedded-dashboard --lib --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .target.kind[0] == "lib") | .executable' | tail -1)
+          if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+            echo "no lib test binary was built (got '$bin')" >&2
+            exit 1
+          fi
           mv web/out web/out.aside
           "$bin" dashboard::
           mv web/out.aside web/out
