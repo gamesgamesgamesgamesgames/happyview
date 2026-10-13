@@ -2,6 +2,7 @@
 
 pub mod diagnostic;
 pub mod layout;
+pub mod lexicons;
 pub mod snapshot;
 pub mod walk;
 
