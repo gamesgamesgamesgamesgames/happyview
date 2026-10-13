@@ -308,10 +308,39 @@ pub async fn purge_did_records(
     did: &str,
     collections: Option<&[String]>,
 ) -> Result<u64, sqlx::Error> {
+    purge(store, did, collections, None).await
+}
+
+/// [`purge_did_records`] as of `before_rev`: only rows older than it (or
+/// with no rev) go. A marker replayed from the archive purges this way, so
+/// records written after it, by live ingest or a later commit, stay.
+pub async fn purge_did_records_before(
+    store: &crate::record_store::RecordStore,
+    did: &str,
+    collections: Option<&[String]>,
+    before_rev: &str,
+) -> Result<u64, sqlx::Error> {
+    purge(store, did, collections, Some(before_rev)).await
+}
+
+async fn purge(
+    store: &crate::record_store::RecordStore,
+    did: &str,
+    collections: Option<&[String]>,
+    before_rev: Option<&str>,
+) -> Result<u64, sqlx::Error> {
     if collections.is_some_and(<[String]>::is_empty) {
         return Ok(0);
     }
-    if !store.holds_network_records(did, collections).await? {
+    let held = match before_rev {
+        None => store.holds_network_records(did, collections).await?,
+        Some(before) => {
+            store
+                .holds_network_records_before(did, collections, before)
+                .await?
+        }
+    };
+    if !held {
         return Ok(0);
     }
     let backend = store.backend();
@@ -320,9 +349,18 @@ pub async fn purge_did_records(
         let deleted = crate::db::retry_on_busy(|| async {
             let mut tx = begin_write(store.db(), backend).await?;
             lock_did(&mut tx, backend, did).await?;
-            let deleted = store
-                .purge_network_batch(&mut tx, did, collections, PURGE_BATCH)
-                .await?;
+            let deleted = match before_rev {
+                None => {
+                    store
+                        .purge_network_batch(&mut tx, did, collections, PURGE_BATCH)
+                        .await?
+                }
+                Some(before) => {
+                    store
+                        .purge_network_batch_before(&mut tx, did, collections, before, PURGE_BATCH)
+                        .await?
+                }
+            };
             tx.commit().await?;
             Ok(deleted)
         })
