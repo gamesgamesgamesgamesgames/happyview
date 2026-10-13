@@ -49,6 +49,9 @@ pub struct ScriptRun {
     /// Set for a job run, whose log lines also land in the job's own log and
     /// whose progress, stop flag and waits the three controls act on.
     pub job_id: Option<String>,
+    /// Whether this run is a test file. The five test imports answer only
+    /// when it is, whatever the plugin declared.
+    pub test: bool,
     /// The calling interpreter's language and the extensions it claims; a
     /// module resolves only to a file it could have written.
     pub language_id: String,

@@ -479,6 +479,12 @@ pub struct PluginExecutor {
     app_state: Option<crate::AppState>,
 }
 
+/// Guest time a test file may spend outside the triggers it fires. Each
+/// trigger's own run is bounded by the operator's wall clock, and the time
+/// spent inside one is host time for the file, so this bounds only the
+/// file's own code: assertions, loops, building inputs.
+pub const TEST_FILE_GUEST_SECONDS: u64 = 60;
+
 impl PluginExecutor {
     pub fn new(
         runtime: Arc<WasmRuntime>,
@@ -622,7 +628,13 @@ impl PluginExecutor {
         // instantiation left.
         match input.kind {
             ScriptKind::Job => inst.lift_guest_deadline(),
-            _ => inst.arm_guest_deadline(self.script_wall_clock()),
+            ScriptKind::Test => {
+                inst.arm_guest_deadline(std::time::Duration::from_secs(TEST_FILE_GUEST_SECONDS))
+            }
+            ScriptKind::XrpcQuery
+            | ScriptKind::XrpcProcedure
+            | ScriptKind::RecordEvent
+            | ScriptKind::Label => inst.arm_guest_deadline(self.script_wall_clock()),
         }
         // A run that failed takes its outstanding calls down with it when
         // `inst` drops; only one that answered waits for them.
@@ -870,6 +882,7 @@ impl PluginExecutor {
             trigger_id: input.context.trigger.clone(),
             caller_did: input.context.caller_did.clone(),
             job_id: input.context.job.as_ref().map(|job| job.id.clone()),
+            test: input.kind == ScriptKind::Test,
             language_id,
             extensions,
             stamp,
