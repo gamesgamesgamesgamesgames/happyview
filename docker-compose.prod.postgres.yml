@@ -154,7 +154,7 @@ services:
       JETSTREAM_COMPRESSION: ${JETSTREAM_COMPRESSION:-true}
       JETSTREAM_WORKERS: ${JETSTREAM_WORKERS:-8}
       JETSTREAM_API_KEY: ${JETSTREAM_API_KEY:-}
-      BACKFILL_SOURCE: ${BACKFILL_SOURCE:-auto}
+      BACKFILL_SOURCE: ${BACKFILL_SOURCE:-crawl}
       RELAY_URL: ${RELAY_URL:-https://bsky.network}
       PLC_URL: ${PLC_URL:-https://plc.directory}
 
