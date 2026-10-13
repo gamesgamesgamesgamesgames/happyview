@@ -142,13 +142,6 @@ impl Drop for LibraryCall {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the module entry point the handler macros expand to is its only caller"
-    )
-)]
 pub(crate) fn block_on<F: Future>(fut: F) -> Result<F::Output> {
     let mut fut = pin!(fut);
     let mut cx = Context::from_waker(Waker::noop());
@@ -170,7 +163,7 @@ pub(crate) fn block_on<F: Future>(fut: F) -> Result<F::Output> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Ctx;
     use happyview_plugin_sdk::{

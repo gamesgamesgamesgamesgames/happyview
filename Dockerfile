@@ -21,8 +21,9 @@ COPY crates/happyview-plc/Cargo.toml crates/happyview-plc/
 COPY crates/happyview-plugin-sdk/Cargo.toml crates/happyview-plugin-sdk/
 COPY crates/happyview-scopes/Cargo.toml crates/happyview-scopes/
 COPY crates/happyview-script/Cargo.toml crates/happyview-script/
-RUN mkdir -p crates/happyview-nsid/src crates/happyview-plc/src crates/happyview-plugin-sdk/src crates/happyview-scopes/src crates/happyview-script/src \
-    && touch crates/happyview-nsid/src/lib.rs crates/happyview-plc/src/lib.rs crates/happyview-plugin-sdk/src/lib.rs crates/happyview-scopes/src/lib.rs crates/happyview-script/src/lib.rs
+COPY crates/happyview-script-macros/Cargo.toml crates/happyview-script-macros/
+RUN mkdir -p crates/happyview-nsid/src crates/happyview-plc/src crates/happyview-plugin-sdk/src crates/happyview-scopes/src crates/happyview-script/src crates/happyview-script-macros/src \
+    && touch crates/happyview-nsid/src/lib.rs crates/happyview-plc/src/lib.rs crates/happyview-plugin-sdk/src/lib.rs crates/happyview-scopes/src/lib.rs crates/happyview-script/src/lib.rs crates/happyview-script-macros/src/lib.rs
 # Every target `Cargo.toml` declares needs a stub here, because cargo resolves
 # targets before it compiles anything: a declared `[[bin]]` with no file on disk
 # fails this layer with `can't find bin`, which surfaces as an image that never

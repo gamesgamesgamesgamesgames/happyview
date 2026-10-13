@@ -7,6 +7,10 @@ description = "Write HappyView script handlers in Rust, compiled to a wasm32-was
 
 [dependencies]
 happyview-plugin-sdk = { path = "../happyview-plugin-sdk" }
+happyview-script-macros = { path = "../happyview-script-macros" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = { version = "0.3", default-features = false, features = ["async-await-macro"] }
+
+[dev-dependencies]
+trybuild = "1"

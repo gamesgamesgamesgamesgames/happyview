@@ -25,13 +25,6 @@ struct Inner {
 }
 
 impl Ctx {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the module entry point the handler macros expand to is its only caller"
-        )
-    )]
     pub(crate) fn new(input: &ExecuteInput) -> Self {
         Self {
             inner: Rc::new(Inner {

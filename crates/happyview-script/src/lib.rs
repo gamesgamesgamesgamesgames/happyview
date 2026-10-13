@@ -41,6 +41,13 @@ mod error;
 mod executor;
 mod output;
 
+#[doc(hidden)]
+#[path = "private.rs"]
+pub mod __private;
+
+use std::future::Future;
+use std::pin::Pin;
+
 pub use ctx::{Ctx, LibraryCall};
 pub use error::{Error, Result};
 pub use output::{IntoOutput, Json, Output};
@@ -49,6 +56,19 @@ pub use futures_util::{join, try_join};
 pub use happyview_plugin_sdk::wire::Level;
 pub use happyview_plugin_sdk::{json, ExecuteContext, Map, ScriptKind, Value};
 pub use serde_json;
+
+pub use happyview_script_macros::{
+    export, job, label, procedure, query, record_create, record_delete, record_index, record_update,
+};
+
+/// One handler: the trigger it answers and the function that runs it. The
+/// handler attributes build these; `export!` lists them.
+pub struct Handler {
+    pub trigger: &'static str,
+    pub run: fn(Value, Ctx) -> HandlerFuture,
+}
+
+pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Output>>>>;
 
 /// The guest interface this crate builds modules against. HappyView refuses
 /// a module whose `happyview.interface` section names one it does not speak.
