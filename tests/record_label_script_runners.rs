@@ -827,6 +827,8 @@ async fn a_project_script_answers_a_record_event_ahead_of_its_row() {
         .await,
     );
     assert_eq!(sent["source"], "echo");
+    // It runs as its file, so its errors and imports are named from there.
+    assert_eq!(sent["chunk_name"], "src/lexicons/thing.create.lua");
 }
 
 #[tokio::test]
@@ -847,6 +849,32 @@ async fn a_project_script_answers_a_label_ahead_of_its_row() {
     // The row would skip the label; the file waves it through.
     let kept = continued(run_label_applied_script(&app.state, label_event()).await);
     assert_eq!(kept.uri, LABEL_URI);
+}
+
+/// A project label script runs as its file: the chunk the interpreter is
+/// handed is the file's path, read back off the run's own log line.
+#[tokio::test]
+async fn a_project_label_script_runs_as_its_file() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        "labeler.apply:app.bsky.feed.post",
+        "host:log_input",
+        "src/labels/app.bsky.feed.post.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    run_label_applied_script(&app.state, label_event()).await;
+
+    let logged = events(&app, "script.log").await;
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(
+        logged[0].2["fields"]["chunk_name"],
+        "src/labels/app.bsky.feed.post.lua"
+    );
 }
 
 /// The only script bound after the failure is a project file, so a retry that
