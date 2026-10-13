@@ -732,6 +732,18 @@ mod tests {
         assert!(!r.recreatable);
     }
 
+    /// A job saved before `.test` was refused keeps its row: it still
+    /// resolves by exact id and still lists, it just can't be recreated.
+    #[test]
+    fn from_listing_marks_a_job_ending_in_test_not_recreatable() {
+        let r = ScriptResponse::from_listing(
+            listing("job.run:nightly.test", "lua", "function handle() end"),
+            &lua_installed(),
+        );
+        assert!(!r.recreatable);
+        assert!(r.runnable);
+    }
+
     /// The outbound list reaches the response as the catalog parsed it. The
     /// corrupt-column case is pinned where the parse lives, by
     /// `a_corrupt_outbound_column_reads_as_none_rather_than_failing`.

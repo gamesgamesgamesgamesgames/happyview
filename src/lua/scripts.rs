@@ -140,7 +140,19 @@ impl ParsedTrigger {
         // Suffix validation: NSID for most triggers, but `labeler.apply:_actor`
         // and `job.run:<type>` have their own formats.
         match kind {
-            TriggerKind::JobRun => crate::jobs::validate_job_type(suffix)?,
+            TriggerKind::JobRun => {
+                crate::jobs::validate_job_type(suffix)?;
+                // A project names a job by its file, and `*.test.<ext>` is a
+                // test file before it is anything else. Only the grammar
+                // refuses: a job already saved under such a type is still
+                // enqueued and resolved by exact id, so it keeps running.
+                if suffix.ends_with(".test") {
+                    return Err(format!(
+                        "invalid job type '{suffix}': a final '.test' segment is reserved, \
+                         because src/jobs/{suffix}.<ext> would be read as a test file"
+                    ));
+                }
+            }
             TriggerKind::LabelerApply if suffix == "_actor" => {}
             _ => happyview_nsid::validate_nsid(suffix).map_err(|e| e.to_string())?,
         }

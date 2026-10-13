@@ -55,6 +55,33 @@ pub fn validate_job_type(job_type: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_job_trigger_grammar_refuses_a_final_test_segment() {
+        let err = crate::lua::ParsedTrigger::parse("job.run:instance.operation.test").unwrap_err();
+        assert!(err.contains(".test"), "{err}");
+        assert!(err.contains("test file"), "{err}");
+
+        for fine in [
+            "test",
+            "test.export",
+            "instance.testing",
+            "contest",
+            "a.tests",
+        ] {
+            assert!(
+                crate::lua::ParsedTrigger::parse(&format!("job.run:{fine}")).is_ok(),
+                "{fine}"
+            );
+        }
+    }
+
+    /// `happyview.jobs` create reaches this function, so a job saved before
+    /// the grammar refused `.test` stays enqueueable.
+    #[test]
+    fn validate_job_type_still_accepts_a_final_test_segment() {
+        assert!(validate_job_type("nightly.test").is_ok());
+    }
+
     use super::*;
 
     #[test]
