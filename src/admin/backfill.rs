@@ -3479,6 +3479,11 @@ async fn run_backfill_job_with(state: AppState, job_id: String, window: i64) {
     if source != "crawl" {
         let scope_dids = if scope == "dids" {
             match replay_sweeps::job_dids(&state, &job_id).await {
+                // Never plan an account job without its accounts.
+                Ok(dids) if dids.is_empty() => {
+                    fail_job(&state, &job_id, DIDS_GONE).await;
+                    return;
+                }
                 Ok(dids) => Some(dids),
                 Err(e) => {
                     fail_job(
@@ -4162,6 +4167,11 @@ pub(super) async fn pause_backfill(
     }
 }
 
+/// Why an account job's replay can't go on: its queue rows, which list its
+/// accounts, went with a detail flush or the retention sweep. Without them a
+/// replay would plan the whole network.
+const DIDS_GONE: &str = "the job's DID list is no longer available; start a new backfill";
+
 /// POST /admin/backfill/{id}/resume — resume a paused backfill job, or a
 /// failed replay job: its sweeps, cursors and retry rows say exactly where it
 /// stopped, so a transient failure doesn't throw away a long replay.
@@ -4173,10 +4183,10 @@ pub(super) async fn resume_backfill(
     admin.require(Permission::BackfillCreate).await?;
 
     let sql = adapt_sql(
-        "SELECT status, source FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT status, source, scope FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     );
-    let row: Option<(String, String)> = crate::db::query_as(&sql)
+    let row: Option<(String, String, String)> = crate::db::query_as(&sql)
         .bind(&job_id)
         .fetch_optional(&state.backfill_db)
         .await
@@ -4184,12 +4194,24 @@ pub(super) async fn resume_backfill(
 
     match row {
         None => Err(AppError::NotFound("backfill job not found".into())),
-        Some((status, source))
+        Some((status, source, _))
             if status != "paused" && !(status == "failed" && source == "replay") =>
         {
             Err(AppError::BadRequest(format!(
                 "job is not paused (status: {status})"
             )))
+        }
+        Some((status, _, scope))
+            if status == "failed"
+                && scope == "dids"
+                && replay_sweeps::job_dids(&state, &job_id)
+                    .await
+                    .map_err(|e| {
+                        AppError::Internal(format!("failed to read the job's accounts: {e}"))
+                    })?
+                    .is_empty() =>
+        {
+            Err(AppError::BadRequest(DIDS_GONE.into()))
         }
         Some(_) => {
             // A failed job has a `completed_at`; a paused one has none.
@@ -4914,9 +4936,7 @@ pub(super) async fn retry_failed_backfill(
             // A finished job's queue rows go with a detail flush or the
             // retention sweep. Never widen an account job to the network.
             if dids.is_empty() {
-                return Err(AppError::BadRequest(
-                    "the job's DID list is no longer available; start a new backfill".into(),
-                ));
+                return Err(AppError::BadRequest(DIDS_GONE.into()));
             }
             dids
         } else {

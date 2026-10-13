@@ -1071,6 +1071,95 @@ async fn a_failed_replay_job_resumes_where_it_stopped() {
     );
 }
 
+async fn clear_queue(app: &TestApp, id: &str) {
+    // What a detail flush or the retention sweep does to a finished job.
+    happyview::db::query(&happyview::db::adapt_sql(
+        "DELETE FROM happyview_backfill_queue WHERE job_id = ?",
+        app.state.db_backend,
+    ))
+    .bind(id)
+    .execute(&app.state.db)
+    .await
+    .expect("clear the job's queue rows");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failed_account_replay_whose_dids_are_gone_is_not_resumed() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let did = "did:plc:goneresume";
+    let segment = mock.seal(games_among_noise(1..=32, 1..=20, did), 1);
+    for index in 2..=17 {
+        mock.fail_block(&segment, index, 3);
+    }
+    let id = start_job(
+        &app,
+        json!({ "collection": GAME, "source": "replay", "dids": [did] }),
+    )
+    .await;
+    assert_eq!(finished(&app, &id).await["status"], "failed");
+    clear_queue(&app, &id).await;
+    let fetches = mock.block_fetches().len();
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("the job's DID list is no longer available"),
+        "{body}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(job(&app, &id).await["status"], "failed");
+    assert_eq!(mock.block_fetches().len(), fetches, "nothing was fetched");
+}
+
+#[tokio::test]
+#[serial]
+async fn an_account_replay_without_dids_fails_instead_of_widening() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    let did = "did:plc:nodids";
+    let segment = mock.seal(games(1..=4, did), 4);
+    mock.hold_segment(&segment);
+    let id = start_job(
+        &app,
+        json!({ "collection": GAME, "source": "replay", "dids": [did] }),
+    )
+    .await;
+    wait_until!(
+        "the download to start",
+        mock.segment_downloads().contains(&segment)
+    );
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/pause"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    mock.release_segment(&segment);
+    assert_eq!(finished(&app, &id).await["status"], "paused");
+    clear_queue(&app, &id).await;
+    let plans = mock.plan_requests().len();
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "failed", "{job}");
+    assert!(
+        job["error"]
+            .as_str()
+            .unwrap()
+            .contains("the job's DID list is no longer available"),
+        "{job}"
+    );
+    assert_eq!(mock.plan_requests().len(), plans, "nothing was planned");
+}
+
 #[tokio::test]
 #[serial]
 async fn a_failed_crawl_job_cannot_be_resumed() {
