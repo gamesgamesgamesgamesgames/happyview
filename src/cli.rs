@@ -8,12 +8,14 @@ use std::path::PathBuf;
 pub const USAGE: &str = "\
 usage:
   happyview                                   serve; HAPPYVIEW_PROJECT names a project to serve
-  happyview check <root> [--plugin <dir>]...  build the project at <root> without serving it";
+  happyview check <root> [--plugin <dir>]...  build the project at <root> without serving it
+  happyview dev <root>                        serve the project at <root> locally, rebuilding on save";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Serve,
     Check(CheckArgs),
+    Dev { root: PathBuf },
     Help,
 }
 
@@ -64,6 +66,24 @@ fn parse_inner(mut args: impl Iterator<Item = OsString>) -> Result<Command, Stri
             }
             check.root = root.ok_or("check needs a project root: happyview check <root>")?;
             Ok(Command::Check(check))
+        }
+        "dev" => {
+            let root = args
+                .next()
+                .ok_or("dev needs a project root: happyview dev <root>")?;
+            let text = root.to_string_lossy();
+            if text.starts_with('-') {
+                return Err(format!("unknown option '{text}' for dev"));
+            }
+            if let Some(extra) = args.next() {
+                return Err(format!(
+                    "dev takes one project root; '{}' is a second",
+                    extra.to_string_lossy()
+                ));
+            }
+            Ok(Command::Dev {
+                root: PathBuf::from(root),
+            })
         }
         "-h" | "--help" | "help" => Ok(Command::Help),
         other => Err(format!("unknown command '{other}'")),
@@ -116,5 +136,31 @@ mod tests {
         assert!(err.contains("'serve'"), "{err}");
         assert!(err.ends_with(USAGE), "the message carries the usage: {err}");
         assert_eq!(parse_args(&["--help"]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn parses_dev_with_a_root() {
+        assert_eq!(
+            parse_args(&["dev", "./app"]),
+            Ok(Command::Dev {
+                root: PathBuf::from("./app")
+            })
+        );
+    }
+
+    #[test]
+    fn dev_needs_exactly_one_root() {
+        let err = parse_args(&["dev"]).unwrap_err();
+        assert!(err.starts_with("dev needs a project root"), "{err}");
+        assert!(
+            err.ends_with(USAGE),
+            "the usage comes with the error: {err}"
+        );
+        assert!(parse_args(&["dev", "a", "b"]).unwrap_err().contains("'b'"));
+        assert!(
+            parse_args(&["dev", "--watch"])
+                .unwrap_err()
+                .contains("unknown option '--watch' for dev")
+        );
     }
 }
