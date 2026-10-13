@@ -6,6 +6,7 @@
   "plugin_type": "interpreter",
   "language_id": "echo",
   "file_extension": "echo",
+  "extensions": ["echo"],
   "monaco_language": "plaintext",
   "supports_libraries": ["*"],
   "capabilities": ["library:call", "script:host"],
