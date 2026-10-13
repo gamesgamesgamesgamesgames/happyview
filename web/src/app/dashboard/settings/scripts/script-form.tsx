@@ -129,11 +129,31 @@ const PROCEDURE_ACTIONS: ActionOption[] = [
 const JOB_ACTIONS: ActionOption[] = [{ kind: "job.run", label: "Job runner" }];
 
 const JOB_TYPE_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+const RESERVED_JOB_PREFIX = "happyview.";
+
+/**
+ * Why `value` cannot name a job, or `null` when it can. The same rules as the
+ * server's trigger grammar, so the form never offers a save the server
+ * refuses.
+ */
+export function jobTypeProblem(value: string): string | null {
+  if (value.length === 0 || value.length > 128) {
+    return "Between 1 and 128 characters.";
+  }
+  if (!JOB_TYPE_PATTERN.test(value)) {
+    return "Lowercase letters, numbers, dots, hyphens, and underscores only.";
+  }
+  if (value.startsWith(RESERVED_JOB_PREFIX)) {
+    return "The happyview. prefix is reserved for built-in jobs.";
+  }
+  if (value.endsWith(".test")) {
+    return "A final .test segment is reserved for test files.";
+  }
+  return null;
+}
 
 export function isValidJobType(value: string): boolean {
-  return (
-    value.length > 0 && value.length <= 128 && JOB_TYPE_PATTERN.test(value)
-  );
+  return jobTypeProblem(value) === null;
 }
 
 /**
@@ -384,13 +404,14 @@ function TriggerComposer({
                 placeholder="e.g. export, migrate, sync"
                 className="h-8 text-sm font-mono"
                 aria-invalid={
-                  state.suffix.length > 0 && !isValidJobType(state.suffix)
+                  state.suffix.length > 0 &&
+                  jobTypeProblem(state.suffix) !== null
                 }
               />
-              {state.suffix.length > 0 && !isValidJobType(state.suffix) ? (
+              {state.suffix.length > 0 &&
+              jobTypeProblem(state.suffix) !== null ? (
                 <p className="text-xs text-destructive">
-                  Lowercase letters, numbers, dots, hyphens, and underscores
-                  only.
+                  {jobTypeProblem(state.suffix)}
                 </p>
               ) : (
                 <p className="text-xs text-muted-foreground">
