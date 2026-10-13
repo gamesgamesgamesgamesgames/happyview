@@ -3,6 +3,7 @@ pub mod auth;
 pub mod blobs;
 pub mod catalog;
 pub mod cid_verify;
+pub mod cli;
 pub mod codemod;
 pub mod config;
 pub mod constant_time;

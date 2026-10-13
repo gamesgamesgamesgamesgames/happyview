@@ -19,12 +19,49 @@ use atrium_oauth::{
     OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 
-#[tokio::main]
-async fn main() {
+fn main() -> std::process::ExitCode {
+    // Before anything reads configuration: `check` has no database, and
+    // `Config::from_env` refuses to start without one.
+    let command = match happyview::cli::parse(std::env::args_os().skip(1)) {
+        Ok(command) => command,
+        Err(usage) => {
+            eprintln!("{usage}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    if command == happyview::cli::Command::Help {
+        println!("{}", happyview::cli::USAGE);
+        return std::process::ExitCode::SUCCESS;
+    }
     dotenvy::dotenv().ok();
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to start the tokio runtime")
+        .block_on(run(command))
+}
+
+async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
     // Install rustls crypto provider early so all TLS users (jetstream, labeler, etc.) can find it.
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    match command {
+        happyview::cli::Command::Check(args) => {
+            // Logs go to stderr, so stdout holds only what the build found.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "warn".parse().unwrap()),
+                )
+                .init();
+            let code = happyview::project::check::run(&args, &mut std::io::stdout()).await;
+            return std::process::ExitCode::from(code);
+        }
+        happyview::cli::Command::Help => unreachable!("main answers --help itself"),
+        happyview::cli::Command::Serve => {}
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -280,25 +317,14 @@ async fn main() {
     }
 
     // Load plugins from directory
-    let plugin_dir = std::path::Path::new("./plugins");
-    if plugin_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(plugin_dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if !path.join("manifest.json").exists() {
-                    continue;
-                }
-                match happyview::plugin::loader::load_from_file(&path).await {
-                    Ok(plugin) => {
-                        tracing::info!(id = %plugin.info.id, "Loaded plugin from file");
-                        boot_plugins.push(plugin);
-                    }
-                    Err(e) => {
-                        tracing::error!(path = %path.display(), error = %e, "Failed to load plugin");
-                    }
-                }
+    for path in happyview::plugin::loader::plugin_dirs_in(std::path::Path::new("./plugins")) {
+        match happyview::plugin::loader::load_from_file(&path).await {
+            Ok(plugin) => {
+                tracing::info!(id = %plugin.info.id, "Loaded plugin from file");
+                boot_plugins.push(plugin);
+            }
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "Failed to load plugin");
             }
         }
     }
@@ -1003,6 +1029,7 @@ async fn main() {
         .expect("failed to bind");
 
     axum::serve(listener, app).await.expect("server error");
+    std::process::ExitCode::SUCCESS
 }
 
 async fn seed_and_load_rate_limit_defaults(

@@ -1,0 +1,125 @@
+//! `happyview check <root>`: the boot-time build, without a database and
+//! without serving, for CI.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::cli::CheckArgs;
+use crate::plugin::{PluginExecutor, PluginRegistry, WasmRuntime, loader};
+
+use super::build::{BuildEnv, BuildOptions, build_snapshot_with};
+use super::diagnostic::Severity;
+use super::snapshot::ProjectSnapshot;
+
+/// The interpreters a check loads when none are named: `$PLUGIN_DIR`, else
+/// the project's own, where `hpy` puts the locked plugins.
+fn default_plugin_dirs(root: &Path) -> Vec<PathBuf> {
+    let dir = crate::config::vars::var("PLUGIN_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join(".happyview").join("plugins"));
+    loader::plugin_dirs_in(&dir)
+}
+
+/// An executor with no instance behind it. `validate` reads no database; the
+/// pool is there because every plugin instance's host state carries one. It is
+/// migrated so that what a plugin reads or writes through it (its log lines,
+/// its allowed hosts) behaves as it does on an instance.
+async fn standalone_executor(registry: Arc<PluginRegistry>) -> Result<PluginExecutor, String> {
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .map_err(|e| format!("could not open an in-memory database: {e}"))?;
+    crate::db::SQLITE_MIGRATIONS
+        .run(&pool)
+        .await
+        .map_err(|e| format!("could not prepare the in-memory database: {e}"))?;
+    let runtime =
+        Arc::new(WasmRuntime::new().map_err(|e| format!("could not start the wasm runtime: {e}"))?);
+    Ok(PluginExecutor::new(
+        runtime,
+        registry,
+        pool,
+        crate::db::DatabaseBackend::Sqlite,
+        reqwest::Client::new(),
+        Arc::new(crate::catalog::LexiconCatalog::detached()),
+    ))
+}
+
+/// 0 when the project builds, 1 when it doesn't, 2 when the check can't run.
+pub async fn run(args: &CheckArgs, out: &mut dyn Write) -> u8 {
+    let dirs = if args.plugin_dirs.is_empty() {
+        default_plugin_dirs(&args.root)
+    } else {
+        args.plugin_dirs.clone()
+    };
+    let registry = Arc::new(PluginRegistry::new());
+    let mut plugins = Vec::new();
+    for dir in &dirs {
+        match loader::load_from_file(dir).await {
+            Ok(plugin) => plugins.push(plugin),
+            Err(e) => {
+                let _ = writeln!(out, "{}: could not load the plugin: {e}", dir.display());
+                return 2;
+            }
+        }
+    }
+    let failures = registry.register_all(plugins).await;
+    if !failures.is_empty() {
+        for (id, err) in failures {
+            let _ = writeln!(out, "plugin {id}: {err}");
+        }
+        return 2;
+    }
+
+    let executor = match standalone_executor(registry.clone()).await {
+        Ok(executor) => executor,
+        Err(message) => {
+            let _ = writeln!(out, "{message}");
+            return 2;
+        }
+    };
+    let env = BuildEnv {
+        plugins: registry,
+        executor,
+        current: Arc::new(ProjectSnapshot::empty()),
+        catalog: None,
+    };
+    match build_snapshot_with(&env, &args.root, BuildOptions::default()).await {
+        Ok(report) => {
+            for warning in &report.warnings {
+                let _ = writeln!(out, "{warning}");
+            }
+            let snap = &report.snapshot;
+            let _ = writeln!(
+                out,
+                "ok: {} {}, {} {}, {} {}",
+                snap.lexicons.len(),
+                plural(snap.lexicons.len(), "lexicon", "lexicons"),
+                snap.scripts.len(),
+                plural(snap.scripts.len(), "script", "scripts"),
+                snap.modules.len(),
+                plural(snap.modules.len(), "module", "modules"),
+            );
+            0
+        }
+        Err(diagnostics) => {
+            for diagnostic in &diagnostics {
+                let _ = writeln!(out, "{diagnostic}");
+            }
+            let errors = diagnostics
+                .iter()
+                .filter(|d| d.severity == Severity::Error)
+                .count();
+            let _ = writeln!(out, "{errors} {}", plural(errors, "error", "errors"));
+            1
+        }
+    }
+}
+
+fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
+}

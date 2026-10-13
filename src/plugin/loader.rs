@@ -187,6 +187,22 @@ pub async fn load_from_file(path: &Path) -> Result<LoadedPlugin, LoadError> {
     })
 }
 
+/// The plugin directories inside `dir`: each immediate subdirectory holding
+/// a `manifest.json`, sorted so plugins load in the same order every time.
+/// A missing or unreadable `dir` has none.
+pub fn plugin_dirs_in(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("manifest.json").exists())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
 fn validate_api_version(info: &PluginInfo) -> Result<(), LoadError> {
     // Parse as integer for comparison
     let plugin_version: u32 = info.api_version.parse().unwrap_or(0);
