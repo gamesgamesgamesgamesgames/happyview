@@ -96,19 +96,23 @@ pub(super) async fn run(
     remove_own_downloads(&run.download_dir, job_id).await;
     match (result, flushed) {
         (Ok(()), Ok(())) => {
-            // `total_records` spans every run of the job; this run's fold
-            // only knows its own writes.
-            let records = match counted {
-                Ok(()) => sweeps::records(state, job_id)
-                    .await
-                    .map_err(|e| format!("replay bookkeeping failed: {e}")),
+            // `total_records` and `replay_bytes` span every run of the job;
+            // this run only knows its own.
+            let totals = match counted {
+                Ok(()) => match (
+                    sweeps::records(state, job_id).await,
+                    sweeps::counters(state, job_id).await,
+                ) {
+                    (Ok(records), Ok((bytes, _))) => Ok((records, bytes)),
+                    (Err(e), _) | (_, Err(e)) => Err(format!("replay bookkeeping failed: {e}")),
+                },
                 Err(Halt::Failed(e)) => Err(e),
                 Err(_) => Err("replay bookkeeping failed: the record count was not saved".into()),
             };
-            match records {
-                Ok(records) => ReplayOutcome::Completed {
+            match totals {
+                Ok((records, bytes)) => ReplayOutcome::Completed {
                     records: u64::try_from(records).unwrap_or(0),
-                    bytes: run.client.bytes_downloaded(),
+                    bytes: u64::try_from(bytes).unwrap_or(0),
                 },
                 Err(e) => ReplayOutcome::Failed(e),
             }

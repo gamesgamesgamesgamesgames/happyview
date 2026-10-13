@@ -647,6 +647,22 @@ async fn a_resumed_job_does_not_refetch_finished_entries() {
         job["total_records"], 8,
         "records from before the pause still count: {job}"
     );
+    let completed: Vec<(String,)> = happyview::db::query_as(&happyview::db::adapt_sql(
+        "SELECT detail FROM happyview_event_logs WHERE event_type = 'backfill.completed'",
+        app.state.db_backend,
+    ))
+    .fetch_all(&app.state.db)
+    .await
+    .expect("completion events");
+    let detail: serde_json::Value = completed
+        .iter()
+        .map(|(d,)| serde_json::from_str::<serde_json::Value>(d).unwrap())
+        .find(|d| d["job_id"] == id.as_str())
+        .expect("a backfill.completed event");
+    assert_eq!(
+        detail["bytes_downloaded"], job["replay"]["bytes"],
+        "the event reports every run's bytes: {detail}"
+    );
     let downloads = mock.segment_downloads();
     assert_eq!(
         downloads.iter().filter(|n| **n == first).count(),
