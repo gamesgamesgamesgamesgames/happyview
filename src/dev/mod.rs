@@ -2,6 +2,7 @@
 
 pub mod env;
 pub mod instance;
+pub mod report;
 pub mod secrets;
 
 use std::path::{Path, PathBuf};
