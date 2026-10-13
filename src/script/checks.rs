@@ -115,6 +115,15 @@ pub async fn check_dashboard_body(
     Ok(verdict(interpreter_id, validated))
 }
 
+/// Drop the prepared cache's entry for a body no stored row runs any more,
+/// after a save replaced it or a delete removed it. A language nothing claims
+/// any more has nothing cached under a live interpreter to drop.
+pub async fn forget_dashboard_body(registry: &PluginRegistry, language: &str, body: &str) {
+    if let Ok(interpreter_id) = claimant(registry, language).await {
+        registry.prepared().forget(&interpreter_id, body);
+    }
+}
+
 /// Why a dashboard script may not import what it does: a relative specifier
 /// names a file, and only a project has files for one to name. `None` when
 /// every import is a library, which resolves the same wherever the script

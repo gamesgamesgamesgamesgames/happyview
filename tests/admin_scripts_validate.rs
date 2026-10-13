@@ -519,3 +519,77 @@ async fn a_dashboard_script_that_imports_a_file_is_refused() {
         "dashboard scripts can't import files, only project scripts can: ./util (line 1)"
     );
 }
+
+async fn delete_script(app: &TestApp, id: &str) -> axum::response::Response {
+    let cookie = app.admin_cookie();
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/admin/scripts/{}", urlencoding::encode(id)))
+                .header(cookie.0, cookie.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// A body no row runs any more leaves the cache: replaced by a patch, or
+/// removed with its row. A patch refused for its description is refused
+/// before the body is prepared, so it leaves nothing for the body either.
+#[tokio::test]
+#[serial]
+async fn a_replaced_or_deleted_body_leaves_the_cache() {
+    common::require_db!();
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(echo_interpreter::plugin("echo"))
+        .await;
+    let cached = |body: &str| {
+        app.state
+            .plugin_registry
+            .prepared()
+            .lookup("interpreter_echo", body)
+    };
+
+    let first = "returns:{\"n\":1}";
+    let resp = post_script(
+        &app,
+        &json!({"id": ECHO_ID, "script_type": "echo", "body": first}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert!(cached(first).is_some());
+
+    let unsaved = "returns:{\"n\":2}";
+    let resp = patch_script(
+        &app,
+        ECHO_ID,
+        &json!({"body": unsaved, "description": "x".repeat(301)}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(cached(unsaved), None);
+
+    // A description-only patch keeps the body, so its entry stays.
+    let resp = patch_script(&app, ECHO_ID, &json!({"description": "kept"})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(cached(first).is_some());
+
+    let second = "returns:{\"n\":3}";
+    let resp = patch_script(&app, ECHO_ID, &json!({"body": second})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(cached(first), None);
+    assert!(cached(second).is_some());
+
+    let resp = delete_script(&app, ECHO_ID).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(cached(second), None);
+}

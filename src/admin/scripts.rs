@@ -347,8 +347,11 @@ pub(super) async fn patch(
     }
 
     let backend = state.db_backend;
+    let old_script_type = existing.script_type.clone();
+    let old_body = existing.body.clone();
     let new_script_type = body.script_type.unwrap_or(existing.script_type);
     let new_body = body.body.unwrap_or(existing.body);
+    let replaced = new_body != old_body || new_script_type != old_script_type;
     let new_description = match body.description {
         Some(desc_opt) => desc_opt,
         None => existing.description,
@@ -367,6 +370,9 @@ pub(super) async fn patch(
             },
         )
         .await?;
+    if replaced {
+        checks::forget_dashboard_body(&state.plugin_registry, &old_script_type, &old_body).await;
+    }
 
     log_event(
         &state.db,
@@ -397,8 +403,19 @@ pub(super) async fn delete(
     auth.require(Permission::ScriptsManage).await?;
 
     let backend = state.db_backend;
+    // Read ahead of the delete, which leaves nothing to say which body the
+    // prepared cache was holding for it.
+    let existing = state.scripts.get_manual(&id).await?;
     if !state.scripts.remove(&state.db, backend, &id).await? {
         return Err(AppError::NotFound(format!("script '{id}' not found")));
+    }
+    if let Some(existing) = existing {
+        checks::forget_dashboard_body(
+            &state.plugin_registry,
+            &existing.script_type,
+            &existing.body,
+        )
+        .await;
     }
 
     log_event(

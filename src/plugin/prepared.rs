@@ -51,12 +51,41 @@ pub type Cached = Option<Arc<PreparedArtifact>>;
 /// starting over when it fills costs one prepare per script.
 pub const PREPARED_CACHE_CAPACITY: usize = 1024;
 
+/// What the cache's artifacts may hold between them, counting each one's
+/// bytecode and source map. The entry count alone does not bound memory,
+/// since nothing caps how long a script body is.
+pub const PREPARED_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// Dashboard scripts' artifacts, keyed by interpreter and the SHA-256 of the
 /// source. Content-keyed, so a saved edit is a miss rather than a stale hit
 /// and nothing has to be told a row changed.
+///
+/// The key carries neither a chunk name nor a role, because every entry is a
+/// handler prepared as [`crate::plugin::DEFAULT_CHUNK_NAME`]; caching anything
+/// else here would need both in the key.
 #[derive(Default)]
 pub struct PreparedCache {
-    entries: RwLock<HashMap<(String, [u8; 32]), Cached>>,
+    inner: RwLock<Entries>,
+}
+
+#[derive(Default)]
+struct Entries {
+    map: HashMap<(String, [u8; 32]), Cached>,
+    bytes: usize,
+}
+
+impl Entries {
+    fn remove(&mut self, key: &(String, [u8; 32])) {
+        if let Some(old) = self.map.remove(key) {
+            self.bytes -= weight(&old);
+        }
+    }
+}
+
+fn weight(cached: &Cached) -> usize {
+    cached.as_deref().map_or(0, |artifact| {
+        artifact.bytes.len() + artifact.source_map.as_ref().map_or(0, String::len)
+    })
 }
 
 fn source_hash(source: &str) -> [u8; 32] {
@@ -66,10 +95,18 @@ fn source_hash(source: &str) -> [u8; 32] {
 }
 
 impl PreparedCache {
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Entries> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Entries> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `None` when this source was never prepared by this interpreter.
     pub fn lookup(&self, interpreter: &str, source: &str) -> Option<Cached> {
-        let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
-        entries
+        self.read()
+            .map
             .get(&(interpreter.to_string(), source_hash(source)))
             .cloned()
     }
@@ -78,6 +115,11 @@ impl PreparedCache {
     /// holding a prepared result wants `PluginRegistry::store_prepared`, or
     /// `PluginExecutor::prepare_and_store`, which refuse a superseded module
     /// and stamp what they keep.
+    ///
+    /// A new key that would take the cache past either bound starts it over.
+    /// Replacing a key already held never does: it adds no entry, and
+    /// clearing every other script to make room for one would cost them all
+    /// a prepare.
     pub fn store(
         &self,
         interpreter: &str,
@@ -85,28 +127,53 @@ impl PreparedCache {
         artifact: Option<PreparedArtifact>,
     ) -> Cached {
         let cached = artifact.map(Arc::new);
-        let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
-        if entries.len() >= PREPARED_CACHE_CAPACITY {
-            entries.clear();
+        let key = (interpreter.to_string(), source_hash(source));
+        let mut entries = self.write();
+        entries.remove(&key);
+        let added = weight(&cached);
+        if !entries.map.is_empty()
+            && (entries.map.len() >= PREPARED_CACHE_CAPACITY
+                || entries.bytes + added > PREPARED_CACHE_MAX_BYTES)
+        {
+            entries.map.clear();
+            entries.bytes = 0;
         }
-        entries.insert(
-            (interpreter.to_string(), source_hash(source)),
-            cached.clone(),
-        );
+        entries.bytes += added;
+        entries.map.insert(key, cached.clone());
         cached
     }
 
+    /// Drop what is held for `source`, once nothing stored runs it any more.
+    /// Another script with the same body only prepares again.
+    pub fn forget(&self, interpreter: &str, source: &str) {
+        self.write()
+            .remove(&(interpreter.to_string(), source_hash(source)));
+    }
+
     pub fn evict_interpreter(&self, interpreter: &str) {
-        let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
-        entries.retain(|(id, _), _| id != interpreter);
+        let mut entries = self.write();
+        let dropped: Vec<_> = entries
+            .map
+            .keys()
+            .filter(|(id, _)| id == interpreter)
+            .cloned()
+            .collect();
+        for key in &dropped {
+            entries.remove(key);
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.entries.read().unwrap_or_else(|e| e.into_inner()).len()
+        self.read().map.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// What the held artifacts weigh against [`PREPARED_CACHE_MAX_BYTES`].
+    pub fn bytes(&self) -> usize {
+        self.read().bytes
     }
 }
 
@@ -197,5 +264,53 @@ mod tests {
         cache.store("lua", "one more", None);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.lookup("lua", "one more"), Some(None));
+    }
+
+    fn sized(len: usize) -> PreparedArtifact {
+        PreparedArtifact {
+            bytes: vec![0; len],
+            ..artifact("1")
+        }
+    }
+
+    #[test]
+    fn an_insert_past_the_byte_budget_starts_over() {
+        let cache = PreparedCache::default();
+        let half = PREPARED_CACHE_MAX_BYTES / 2;
+        cache.store("lua", "a", Some(sized(half)));
+        cache.store("lua", "b", Some(sized(half)));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.bytes(), 2 * half);
+
+        cache.store("lua", "c", Some(sized(1)));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 1);
+        assert!(cache.lookup("lua", "c").is_some());
+    }
+
+    #[test]
+    fn an_overwrite_at_capacity_keeps_the_other_entries() {
+        let cache = PreparedCache::default();
+        for i in 0..PREPARED_CACHE_CAPACITY {
+            cache.store("lua", &i.to_string(), None);
+        }
+        cache.store("lua", "0", Some(sized(10)));
+        assert_eq!(cache.len(), PREPARED_CACHE_CAPACITY);
+        assert_eq!(cache.bytes(), 10);
+        assert_eq!(cache.lookup("lua", "1"), Some(None));
+    }
+
+    #[test]
+    fn forgetting_a_source_drops_its_entry_and_its_weight() {
+        let cache = PreparedCache::default();
+        cache.store("lua", "old", Some(sized(10)));
+        cache.store("lua", "kept", Some(sized(5)));
+        cache.forget("lua", "old");
+        assert_eq!(cache.lookup("lua", "old"), None);
+        assert!(cache.lookup("lua", "kept").is_some());
+        assert_eq!(cache.bytes(), 5);
+
+        cache.evict_interpreter("lua");
+        assert_eq!(cache.bytes(), 0);
     }
 }
