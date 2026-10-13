@@ -42,6 +42,7 @@ pub mod rate_limit;
 pub mod raw_sql_guard;
 pub mod record_handler;
 pub mod record_refs;
+pub mod record_store;
 pub mod repo;
 pub mod resolve;
 pub mod script;
@@ -95,6 +96,8 @@ pub struct AppState {
     pub db: sqlx::AnyPool,
     pub backfill_db: sqlx::AnyPool,
     pub db_backend: DatabaseBackend,
+    /// The record tables' one reader and writer (see `record_store`).
+    pub records: record_store::RecordStore,
     pub domain_cache: domain::DomainCache,
     /// The current project build. Readers that must not see a swap mid-run
     /// take `load_full()` once and keep it.

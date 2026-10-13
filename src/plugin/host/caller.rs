@@ -233,7 +233,7 @@ pub async fn delete_record(
     let body = delete_body(&repo, &collection, &rkey);
     post(caller, &repo, "com.atproto.repo.deleteRecord", &body).await?;
     let state = &caller.app_state;
-    if let Err(e) = super::mirror_network_delete(&state.db, state.db_backend, &spec.uri).await {
+    if let Err(e) = super::mirror_network_delete(&state.records, &spec.uri).await {
         tracing::warn!(uri = %spec.uri, "record deleted on the PDS but still in the index: {e}");
     }
     Ok(())
@@ -256,8 +256,7 @@ async fn mirror_write(caller: &CallerSession, reference: &RecordRef, record: &Va
         }
     };
     let mirrored = super::mirror_network_write(
-        &state.db,
-        state.db_backend,
+        &state.records,
         super::NetworkWrite {
             uri: &reference.uri,
             did: &did,

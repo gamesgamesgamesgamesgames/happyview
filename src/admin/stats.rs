@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::Json;
 use axum::extract::State;
 
@@ -14,20 +16,21 @@ pub(super) async fn stats(
     AllowPlatform(auth): AllowPlatform,
 ) -> Result<Json<StatsResponse>, AppError> {
     auth.require(Permission::StatsRead).await?;
-    let total: (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_records")
-        .fetch_one(&state.db)
+    let total = state
+        .records
+        .count_all()
         .await
         .map_err(|e| AppError::Internal(format!("failed to count records: {e}")))?;
 
     // Counted per collection and merged here rather than joined in SQL, so
     // the collection list is the catalog's: every layer, not only stored rows.
-    let counted: Vec<(String, i64)> = crate::db::query_as(
-        "SELECT collection, COUNT(*) FROM happyview_records GROUP BY collection",
-    )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|e| AppError::Internal(format!("failed to count by collection: {e}")))?;
-    let counts: std::collections::HashMap<String, i64> = counted.into_iter().collect();
+    let counts: HashMap<String, i64> = state
+        .records
+        .count_by_collection()
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to count by collection: {e}")))?
+        .into_iter()
+        .collect();
     let collections: Vec<CollectionStat> = state
         .lexicons
         .get_record_collections()
@@ -40,7 +43,7 @@ pub(super) async fn stats(
         .collect();
 
     Ok(Json(StatsResponse {
-        total_records: total.0,
+        total_records: total,
         collections,
     }))
 }

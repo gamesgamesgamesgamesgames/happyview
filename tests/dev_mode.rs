@@ -177,7 +177,7 @@ async fn wait_for_status(dev: &mut Dev, url: &str, status: u16, timeout: Duratio
 }
 
 async fn db(root: &Path) -> sqlx::AnyPool {
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
     sqlx::AnyPool::connect(&format!(
         "sqlite://{}?mode=ro",
         root.join(".happyview/happyview.db")

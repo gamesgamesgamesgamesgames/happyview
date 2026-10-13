@@ -213,45 +213,10 @@ mod tests {
     use crate::db::DatabaseBackend;
     use crate::telemetry::consent::{Consent, TelemetryMode};
     use crate::telemetry::counters::Counters;
-    use crate::test_support::memory_pool;
+    use crate::test_support::migrated_memory_pool;
 
     async fn pool_for_assembly() -> sqlx::AnyPool {
-        let pool = memory_pool().await;
-        crate::db::query(
-            "CREATE TABLE happyview_records (
-                uri TEXT PRIMARY KEY,
-                did TEXT NOT NULL,
-                collection TEXT NOT NULL,
-                rkey TEXT NOT NULL,
-                record TEXT NOT NULL,
-                cid TEXT NOT NULL,
-                indexed_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create records");
-        crate::db::query(
-            "CREATE TABLE happyview_spaces (
-                id TEXT PRIMARY KEY,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create spaces");
-        crate::db::query(
-            "CREATE TABLE happyview_instance_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create instance_settings");
-        pool
+        migrated_memory_pool().await
     }
 
     fn consent(mode: TelemetryMode) -> Consent {
@@ -410,20 +375,6 @@ mod tests {
     #[tokio::test]
     async fn job_runtime_seconds_round_trips_into_totals() {
         let pool = pool_for_assembly().await;
-        crate::db::query(
-            "CREATE TABLE happyview_jobs (
-                id TEXT PRIMARY KEY,
-                job_type TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_by TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create jobs");
         crate::db::query(
             "INSERT INTO happyview_jobs
                (id, job_type, status, created_by, started_at, completed_at, created_at)

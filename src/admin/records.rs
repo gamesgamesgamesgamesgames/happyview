@@ -76,17 +76,24 @@ pub(super) async fn list_records(
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
 
-    let sql = adapt_sql(
-        "SELECT uri, did, collection, rkey, cid, indexed_at, record FROM happyview_records WHERE collection = ? ORDER BY indexed_at DESC LIMIT ? OFFSET ?",
-        backend,
-    );
-    let rows: Vec<RecordRow> = crate::db::query_as(&sql)
-        .bind(&params.collection)
-        .bind(limit + 1)
-        .bind(offset)
-        .fetch_all(&state.db)
+    let rows: Vec<RecordRow> = state
+        .records
+        .list_recent(&params.collection, None, limit + 1, offset)
         .await
-        .map_err(|e| AppError::Internal(format!("failed to list records: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("failed to list records: {e}")))?
+        .into_iter()
+        .map(|r| {
+            (
+                r.uri,
+                r.did,
+                r.collection,
+                r.rkey,
+                r.cid.unwrap_or_default(),
+                r.indexed_at,
+                r.record,
+            )
+        })
+        .collect();
 
     let has_more = rows.len() as i64 > limit;
     let visible_rows: Vec<RecordRow> = rows.into_iter().take(limit as usize).collect();
@@ -219,18 +226,14 @@ pub(super) async fn delete_record(
     Query(params): Query<DeleteRecordParams>,
 ) -> Result<StatusCode, AppError> {
     auth.require(Permission::RecordsDelete).await?;
-    let backend = state.db_backend;
-    let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-    let result = crate::db::query(&sql)
-        .bind(&params.uri)
-        .execute(&state.db)
+    let deleted = state
+        .records
+        .delete(&params.uri)
         .await
         .map_err(|e| AppError::Internal(format!("failed to delete record: {e}")))?;
-
-    if result.rows_affected() == 0 {
+    if !deleted {
         return Err(AppError::NotFound("record not found".into()));
     }
-
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -25,7 +25,7 @@ fn default_plugin_dirs(root: &Path) -> Vec<PathBuf> {
 /// One connection that is never reaped: a connection closed for idling or age
 /// would reopen as a fresh, unmigrated `sqlite::memory:`.
 fn in_memory_pool() -> sqlx::pool::PoolOptions<sqlx::Any> {
-    sqlx::any::install_default_drivers();
+    crate::db::install_drivers();
     sqlx::pool::PoolOptions::<sqlx::Any>::new()
         .max_connections(1)
         .min_connections(1)
@@ -44,6 +44,9 @@ async fn standalone_executor(registry: Arc<PluginRegistry>) -> Result<PluginExec
         .map_err(|e| format!("could not open an in-memory database: {e}"))?;
     crate::db::SQLITE_MIGRATIONS
         .run(&pool)
+        .await
+        .map_err(|e| format!("could not prepare the in-memory database: {e}"))?;
+    crate::record_store::upgrade::run(&pool, crate::db::DatabaseBackend::Sqlite)
         .await
         .map_err(|e| format!("could not prepare the in-memory database: {e}"))?;
     let runtime =

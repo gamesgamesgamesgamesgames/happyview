@@ -66,7 +66,7 @@ fn library_plugin_without_capabilities(id: &str) -> LoadedPlugin {
 }
 
 async fn executor() -> (PluginExecutor, Arc<PluginRegistry>) {
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
     let db = sqlx::AnyPool::connect("sqlite::memory:").await.unwrap();
     let registry = Arc::new(PluginRegistry::new());
     let executor = PluginExecutor::new(
@@ -289,7 +289,7 @@ async fn api_surface_is_cached_and_indexed() {
 }
 
 async fn executor_with_table() -> (PluginExecutor, Arc<PluginRegistry>, sqlx::AnyPool) {
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
     let db = sqlx::pool::PoolOptions::<sqlx::Any>::new()
         .max_connections(1)
         .connect("sqlite::memory:")

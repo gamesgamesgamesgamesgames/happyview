@@ -13,6 +13,9 @@ HappyView is configured via environment variables. Every `happyview` command exc
 | `SQLITE_JOURNAL_SIZE_LIMIT` | no | `67108864` (64 MiB) | Bytes. Caps how large the SQLite write-ahead log is allowed to grow before it's truncated back down after a checkpoint, bounding disk usage from WAL growth. SQLite-only; ignored on Postgres |
 | `SQLITE_SYNCHRONOUS` | no | `NORMAL` | SQLite `synchronous` level for every connection: `NORMAL` or `FULL`. In WAL mode `NORMAL` cannot corrupt the database, but a crash or power loss can lose the last few transactions. `FULL` syncs the write-ahead log on every commit. SQLite-only; ignored on Postgres |
 | `SQLITE_CHECKPOINT_INTERVAL_SECS` | no | `60` | Seconds between `wal_checkpoint(TRUNCATE)` runs, which wait briefly for readers, then empty the write-ahead log. `0` disables them. The latest result is shown on **Settings > Database**. SQLite-only; ignored on Postgres |
+| `RECORD_COMPRESSION` | no | `zstd` | `zstd` compresses record bodies with a dictionary trained for each collection; `none` stores new bodies uncompressed and stops the background compression. Bodies already compressed stay readable either way. Any other value uses `zstd`, with a warning. See [the compact record format](../guides/database/database-setup.md#after-the-upgrade). SQLite-only; ignored on Postgres |
+| `ZSTD_DICT_TRAIN_AT` | no | `5000` | Records a collection needs before HappyView trains its compression dictionary. `0` or an invalid value uses `5000`. SQLite-only; ignored on Postgres |
+| `RECORD_COMPRESSION_INTERVAL_SECS` | no | `600` | Seconds between the background passes that train dictionaries and compress records stored uncompressed. The first pass runs within 30 seconds of startup. `0` or an invalid value uses `600`; to stop compressing, set `RECORD_COMPRESSION=none`. SQLite-only; ignored on Postgres |
 | `PUBLIC_URL` | yes | --- | Public-facing URL for HappyView (used for OAuth callbacks, e.g. `https://happyview.example.com`). **For local development, use `http://127.0.0.1:3000` — not `localhost`** (see note below). Do **not** include the base path — see `BASE_PATH` |
 | `BASE_PATH` | no | _(none)_ | Subpath prefix for mounting HappyView behind a reverse proxy (e.g. `/hv`). Must start with `/` and have no trailing slash. When set, all routes are served under this prefix and the dashboard is accessible at `https://example.com/hv/`. See [Reverse proxy subpath](deployment/production.md#reverse-proxy-subpath) |
 | `SESSION_SECRET` | no | dev default | Secret key for signing session cookies (at least 64 characters). **Must be set in production** |
@@ -82,6 +85,9 @@ SESSION_SECRET=change-me-in-production
 # SQLITE_JOURNAL_SIZE_LIMIT=67108864
 # SQLITE_SYNCHRONOUS=NORMAL
 # SQLITE_CHECKPOINT_INTERVAL_SECS=60
+# RECORD_COMPRESSION=zstd
+# ZSTD_DICT_TRAIN_AT=5000
+# RECORD_COMPRESSION_INTERVAL_SECS=600
 # JETSTREAM_URL=wss://jetstream1.us-east.bsky.network
 # JETSTREAM_PROTOCOL=auto
 # JETSTREAM_COMPRESSION=true

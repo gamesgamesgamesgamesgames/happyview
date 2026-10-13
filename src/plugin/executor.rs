@@ -2008,7 +2008,7 @@ mod deadline {
     }
 
     fn bindings_test_state(runtime: &WasmRuntime) -> PluginState {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         PluginState {
             plugin_id: "p".into(),
             scope: "s".into(),
@@ -2709,7 +2709,7 @@ mod baseline {
     }
 
     async fn executor(registry: Arc<PluginRegistry>) -> PluginExecutor {
-        sqlx::any::install_default_drivers();
+        crate::db::install_drivers();
         let db = sqlx::AnyPool::connect("sqlite::memory:").await.unwrap();
         PluginExecutor::new(
             Arc::new(WasmRuntime::new().unwrap()),

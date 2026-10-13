@@ -13,7 +13,7 @@ type Secrets = HashMap<String, String>;
 
 async fn create_test_executor() -> (PluginExecutor, Arc<PluginRegistry>) {
     // Create in-memory database
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
     let db = sqlx::AnyPool::connect("sqlite::memory:")
         .await
         .expect("Failed to create test database");

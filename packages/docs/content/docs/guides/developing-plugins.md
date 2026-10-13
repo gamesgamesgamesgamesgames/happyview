@@ -395,6 +395,8 @@ With the SDK, these are `host::call_library_start` and `host::call_library_wait_
 - `database:write` permits both imports for any statement, including `INSERT`, `UPDATE`, `DELETE`, and `DROP`.
 - Both share the same protected-table guard as `happyview.sql`: `happyview_*` tables (and `_sqlx_migrations`) are blocked by default, except the same allowlist of public AppView data — `happyview_records`, `happyview_record_refs`, `happyview_labels`, `happyview_lexicons`, `happyview_jobs`, and the space data tables (`happyview_spaces`, `happyview_space_members`, `happyview_space_records`, `happyview_space_record_oplog`, `happyview_space_notify_registrations`, `happyview_space_dids`). Secrets, tokens, auth/privilege state, trust config, and cryptographic key material stay blocked regardless of which database capability is declared.
 
+`happyview_records` and `happyview_record_refs` are views over HappyView's compact record tables. Reads behave as they did on the old tables, including `json_extract(record, '$.field')` on SQLite and `record::jsonb->>'field'` on Postgres. Writes have some differences: upserts with `INSERT … ON CONFLICT` don't work, `RETURNING` gives back the values you supplied rather than the stored row, writes on SQLite report 0 rows changed, and filtering on `uri` reads every row, so filter by `did`, `collection` and `rkey` instead. [Raw SQL on the record views](database/database-setup.md#raw-sql-on-the-record-views) lists them all.
+
 ### Capabilities
 
 Every host function except `host_log` is gated by a capability. The loader reads the compiled module's import section and refuses to install a plugin whose imports are not all covered by declared capabilities, whatever its `plugin_type`.

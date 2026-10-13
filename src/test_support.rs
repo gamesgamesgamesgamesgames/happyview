@@ -16,7 +16,7 @@ use crate::config::Config;
 /// connection to `sqlite::memory:` gets its own private database, so a larger
 /// pool would hand later queries an empty schema.
 pub async fn memory_pool() -> sqlx::AnyPool {
-    sqlx::any::install_default_drivers();
+    crate::db::install_drivers();
     sqlx::pool::PoolOptions::<sqlx::Any>::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -24,13 +24,24 @@ pub async fn memory_pool() -> sqlx::AnyPool {
         .expect("connect to in-memory sqlite")
 }
 
-/// A [`memory_pool`] with every SQLite migration applied. A hand-written
+/// A [`memory_pool`] with every SQLite migration applied and the record
+/// store upgraded, as `db::connect` leaves a database. A hand-written
 /// `CREATE TABLE` in a test drifts silently from the real schema — a
 /// migration can add a column the copy never gets, and a test against the
 /// stale copy keeps passing while the code it exercises breaks against a real
 /// database. The path is anchored to the crate manifest so the helper works
 /// from any working directory.
 pub async fn migrated_memory_pool() -> sqlx::AnyPool {
+    let pool = pre_upgrade_memory_pool().await;
+    crate::record_store::upgrade::run(&pool, crate::db::DatabaseBackend::Sqlite)
+        .await
+        .expect("upgrade the record store");
+    pool
+}
+
+/// Every SQLite migration applied, the record store upgrade not run: the
+/// legacy record tables are still tables and the v2 tables are empty.
+pub async fn pre_upgrade_memory_pool() -> sqlx::AnyPool {
     let pool = memory_pool().await;
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/sqlite");
     sqlx::migrate::Migrator::new(dir)
@@ -40,6 +51,108 @@ pub async fn migrated_memory_pool() -> sqlx::AnyPool {
         .await
         .expect("run migrations");
     pool
+}
+
+/// A pre-upgrade database (see [`pre_upgrade_memory_pool`]). The Postgres
+/// one is a scratch database on the `TEST_DATABASE_URL` server, so tests
+/// that copy or swap tables never touch the shared test schema.
+pub struct PreUpgradePool {
+    pub pool: sqlx::AnyPool,
+    pub backend: crate::db::DatabaseBackend,
+    scratch: Option<(sqlx::AnyPool, String)>,
+}
+
+impl PreUpgradePool {
+    /// Close the pool and drop the scratch database, if any.
+    pub async fn finish(self) {
+        self.pool.close().await;
+        if let Some((admin, name)) = self.scratch {
+            let _ = crate::db::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
+                .execute(&admin)
+                .await;
+            admin.close().await;
+        }
+    }
+}
+
+/// A pre-upgrade SQLite database, plus a Postgres one when
+/// `TEST_DATABASE_URL` names a Postgres server.
+pub async fn pre_upgrade_pools() -> Vec<PreUpgradePool> {
+    use crate::db::DatabaseBackend;
+    let mut out = vec![PreUpgradePool {
+        pool: pre_upgrade_memory_pool().await,
+        backend: DatabaseBackend::Sqlite,
+        scratch: None,
+    }];
+    if let Ok(url) = std::env::var("TEST_DATABASE_URL")
+        && DatabaseBackend::from_url(&url) == DatabaseBackend::Postgres
+    {
+        crate::db::install_drivers();
+        let admin = sqlx::AnyPool::connect(&url)
+            .await
+            .expect("connect to the test server");
+        let name = format!("hv_pre_{}", uuid::Uuid::new_v4().simple());
+        crate::db::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .expect("create a scratch database");
+        let (server, _) = url
+            .rsplit_once('/')
+            .expect("TEST_DATABASE_URL names a database");
+        let pool = sqlx::AnyPool::connect(&format!("{server}/{name}"))
+            .await
+            .expect("connect to the scratch database");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        sqlx::migrate::Migrator::new(dir)
+            .await
+            .expect("load postgres migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        out.push(PreUpgradePool {
+            pool,
+            backend: DatabaseBackend::Postgres,
+            scratch: Some((admin, name)),
+        });
+    }
+    out
+}
+
+/// Insert one record the way raw SQL would, with a URI that agrees with its
+/// identity (`at://{did}/{collection}/{rkey}`), and return the URI. Before the
+/// record store's cutover this writes the legacy table; afterwards the same
+/// statement goes through the compatibility view's trigger, which refuses a
+/// URI that does not match.
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_record(
+    pool: &sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    record: &str,
+    cid: &str,
+    indexed_at: Option<&str>,
+) -> String {
+    let uri = format!("at://{did}/{collection}/{rkey}");
+    let sql = crate::db::adapt_sql(
+        "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        backend,
+    );
+    crate::db::query(&sql)
+        .bind(&uri)
+        .bind(did)
+        .bind(collection)
+        .bind(rkey)
+        .bind(record)
+        .bind(cid)
+        .bind(indexed_at)
+        .bind(crate::db::now_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("seed {uri}: {e}"));
+    uri
 }
 
 /// The encryption key every test uses.
@@ -203,6 +316,7 @@ pub fn test_state_with_pool_on(
         db: pool.clone(),
         backfill_db: pool.clone(),
         db_backend: backend,
+        records: crate::record_store::RecordStore::new(pool.clone(), backend),
         domain_cache: crate::domain::DomainCache::new(),
         lexicons: LexiconCatalog::new(project.clone()),
         scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
@@ -286,6 +400,28 @@ pub fn inline_binds(sql: &str, literals: &[&str]) -> String {
     out
 }
 
+/// [`inline_binds`] for SQL already adapted to `backend`: on Postgres the
+/// literals replace `$1`, `$2`, … by number.
+pub fn inline_binds_on(
+    sql: &str,
+    backend: crate::db::DatabaseBackend,
+    literals: &[&str],
+) -> String {
+    match backend {
+        crate::db::DatabaseBackend::Sqlite => inline_binds(sql, literals),
+        crate::db::DatabaseBackend::Postgres => {
+            let mut out = sql.to_string();
+            // Highest first, so `$1` never eats the front of `$12`.
+            for (i, literal) in literals.iter().enumerate().rev() {
+                let placeholder = format!("${}", i + 1);
+                assert!(out.contains(&placeholder), "no {placeholder} in {sql}");
+                out = out.replace(&placeholder, literal);
+            }
+            out
+        }
+    }
+}
+
 /// The planner's plan for `sql`, written in SQLite's dialect, one line per
 /// step.
 ///
@@ -344,4 +480,67 @@ pub fn assert_index_without_sort(
         crate::db::DatabaseBackend::Postgres => plan.iter().any(|line| line.contains("Sort  (")),
     };
     assert!(!sorts, "{backend:?} plan sorts: {plan:#?}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A test's hand-written record tables drift from the real schema and,
+    /// after the record store's cutover, from what the store writes at all.
+    /// Tests use `migrated_memory_pool` instead.
+    #[test]
+    fn no_unit_test_hand_writes_the_record_tables() {
+        // Built from parts so this file does not match its own needles.
+        let needles = [
+            format!("CREATE {} happyview_records", "TABLE"),
+            format!("CREATE {} happyview_record_refs", "TABLE"),
+        ];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read file");
+                    for needle in &needles {
+                        if text.contains(needle.as_str()) {
+                            offenders.push(format!("{}: {needle}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "hand-written record tables:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_record_writes_a_canonical_uri() {
+        let pool = migrated_memory_pool().await;
+        let uri = seed_record(
+            &pool,
+            crate::db::DatabaseBackend::Sqlite,
+            "did:plc:a",
+            "c",
+            "1",
+            "{}",
+            "cid",
+            None,
+        )
+        .await;
+        assert_eq!(uri, "at://did:plc:a/c/1");
+        let row: (String,) = crate::db::query_as("SELECT did FROM happyview_records WHERE uri = ?")
+            .bind(&uri)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, "did:plc:a");
+    }
 }

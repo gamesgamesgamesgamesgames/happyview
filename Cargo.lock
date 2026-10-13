@@ -1942,6 +1942,8 @@ dependencies = [
  "jsonwebtoken",
  "k256",
  "libc",
+ "libsqlite3-sys",
+ "lru",
  "mime_guess",
  "mlua",
  "multibase",

@@ -185,7 +185,7 @@ fn resolve_kind(args: &Args) -> Result<ScriptKind, String> {
 /// `db::connect` panics on a bad URL or unreachable host, which would turn
 /// the documented "exit 1 on error" into an uncaught panic instead.
 async fn connect_cli_pool(url: &str) -> Result<sqlx::AnyPool, sqlx::Error> {
-    sqlx::any::install_default_drivers();
+    happyview::db::install_drivers();
     sqlx::any::AnyPoolOptions::new()
         .max_connections(4)
         .acquire_timeout(Duration::from_secs(10))

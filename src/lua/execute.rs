@@ -63,6 +63,21 @@ fn auth_error(texts: &[&str]) -> Option<AppError> {
         .map(|text| AppError::Auth(auth_message_after_prefix(text)))
 }
 
+/// The 400 a record page cursor the caller sent and the store refused
+/// (`record_store::query::INVALID_CURSOR`) recovers: the cursor is the
+/// caller's, so a script that passes the refusal on has not itself failed.
+fn invalid_cursor_error(texts: &[&str]) -> Option<AppError> {
+    let invalid = crate::record_store::query::INVALID_CURSOR;
+    texts
+        .iter()
+        .any(|text| text.contains(invalid))
+        .then(|| AppError::XrpcError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            code: "InvalidRequest",
+            message: invalid.to_string(),
+        })
+}
+
 /// A failure the script owns: its kind, its own text and its line reach the
 /// caller, which is what [`AppError::ScriptError`] exists to allow. A spent
 /// budget carries [`EXECUTION_LIMIT_MESSAGE`] instead, since the limit is the
@@ -105,9 +120,11 @@ fn returned_value(
             raw,
             chunk,
         }) => {
-            let error = auth_error(&[&message, &raw]).unwrap_or_else(|| {
-                script_error(method, kind.into(), message, line, file_of(chunk))
-            });
+            let error = auth_error(&[&message, &raw])
+                .or_else(|| invalid_cursor_error(&[&message, &raw]))
+                .unwrap_or_else(|| {
+                    script_error(method, kind.into(), message, line, file_of(chunk))
+                });
             Err((raw, error))
         }
         // An endpoint whose interpreter is absent cannot answer until an
@@ -593,6 +610,37 @@ mod tests {
                 ..
             } => assert_eq!(message, EXECUTION_LIMIT_MESSAGE),
             other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    /// A record page cursor the caller sent that does not parse (one from
+    /// before the compact format included) is the caller's error: 400
+    /// `InvalidRequest`, not the 500 of a script failure, however the script
+    /// passed the library's error on.
+    #[test]
+    fn an_invalid_record_cursor_is_the_callers_400() {
+        let message = format!(
+            "runtime error: db.records: Plugin returned error: INVALID_SPEC - {}",
+            crate::record_store::query::INVALID_CURSOR
+        );
+        let (_, error) = returned_value(
+            "com.example.probe",
+            failed(ScriptErrorKind::Runtime, &message),
+        )
+        .expect_err("a failed run has no value");
+        match error {
+            AppError::XrpcError {
+                status,
+                code,
+                message,
+            } => {
+                assert_eq!(
+                    (status, code),
+                    (axum::http::StatusCode::BAD_REQUEST, "InvalidRequest")
+                );
+                assert_eq!(message, crate::record_store::query::INVALID_CURSOR);
+            }
+            other => panic!("expected a 400, got {other:?}"),
         }
     }
 

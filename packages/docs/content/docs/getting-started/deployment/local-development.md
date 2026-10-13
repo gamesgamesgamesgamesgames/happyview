@@ -53,9 +53,15 @@ This exists because atproto OAuth needs a publicly reachable HTTPS URL. With a t
 `docker-compose.yml` sets `TUNNEL_URL_FILE` on the `happyview` service unconditionally, so the entrypoint always waits for a tunnel URL — up to 30 seconds — before starting the server. The `PUBLIC_URL` in your `.env` is only used as the fallback if no URL appears in that window, which is why a fresh stack reports a `trycloudflare.com` address.
 </Callout>
 
+The tunnel service picks its mode from your setup, in this order:
+
+1. `CLOUDFLARE_TUNNEL_TOKEN` is set: a [named tunnel](#named-tunnel-stable-hostname) routed from the Cloudflare dashboard.
+2. `.cloudflared/` holds a tunnel credentials file: a [locally-managed tunnel](#locally-managed-tunnel-stable-hostname-routed-from-the-repo) routed from your `.env`.
+3. Neither: a [quick tunnel](#quick-tunnel-default).
+
 ### Quick tunnel (default)
 
-Leave `CLOUDFLARE_TUNNEL_TOKEN` blank and you get a free ephemeral tunnel — no Cloudflare account needed. Find the URL in the logs:
+Leave `CLOUDFLARE_TUNNEL_TOKEN` blank and `.cloudflared/` empty, and you get a free ephemeral tunnel — no Cloudflare account needed. Find the URL in the logs:
 
 ```sh
 docker compose logs tunnel | grep trycloudflare
@@ -73,6 +79,38 @@ TUNNEL_HOSTNAME=happyview-dev.example.com
 ```
 
 The token starts the named tunnel, but `TUNNEL_HOSTNAME` is what actually gets written to the shared URL file. Set the token alone and nothing is written, so the server waits the full 30 seconds and then falls back to the `PUBLIC_URL` in your `.env`. That works, but only if you've already set it to match the tunnel's hostname.
+
+### Locally-managed tunnel (stable hostname, routed from the repo)
+
+A locally-managed tunnel keeps the hostname-to-service routing out of the Cloudflare dashboard. The tunnel service generates the `cloudflared` config from `TUNNEL_HOSTNAME` and points it at `caddy`. You need a Cloudflare account with a domain on it and [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) installed on your machine for the one-time setup.
+
+```sh
+# Authorize cloudflared for your domain (opens a browser).
+cloudflared tunnel login
+
+# Create the tunnel. This writes ~/.cloudflared/<tunnel-id>.json.
+cloudflared tunnel create happyview-dev
+
+# Point a hostname at the tunnel.
+cloudflared tunnel route dns happyview-dev happyview-dev.example.com
+
+# Hand the credentials to the stack.
+cp ~/.cloudflared/<tunnel-id>.json .cloudflared/
+```
+
+Then set the hostname in `.env`, and leave `CLOUDFLARE_TUNNEL_TOKEN` blank, since a token takes precedence:
+
+```sh
+TUNNEL_HOSTNAME=happyview-dev.example.com
+```
+
+Everything in `.cloudflared/` except its `.gitignore` is ignored by git. The credentials file can run only that one tunnel, but treat it as a secret.
+
+<Callout type="warn" title="One tunnel per person">
+Two machines running the same tunnel become connectors for it, and Cloudflare splits requests between them, so your browser reaches whichever machine it gets routed to. Everyone who works on HappyView needs their own tunnel and hostname. Don't share credentials files or tokens.
+</Callout>
+
+On a shared domain, give each person a single-level subdomain such as `happyview-alice.example.com`. Cloudflare's free certificate covers `*.example.com` but not `alice.dev.example.com`, so deeper hostnames fail TLS unless the zone has an advanced certificate.
 
 ### Running without a tunnel
 

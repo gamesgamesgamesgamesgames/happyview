@@ -3,11 +3,11 @@
 use sqlx::AnyPool;
 
 use crate::db::{DatabaseBackend, adapt_sql};
+use crate::record_store::RecordStore;
 use crate::telemetry::payload;
 
 /// Tables counted into `totals`, as (payload key, table name).
 const COUNTED_TABLES: &[(&str, &str)] = &[
-    ("records", "happyview_records"),
     ("space_records", "happyview_space_records"),
     ("event_logs", "happyview_event_logs"),
     ("space_record_oplog", "happyview_space_record_oplog"),
@@ -41,6 +41,14 @@ async fn count_table(pool: &AnyPool, backend: DatabaseBackend, table: &'static s
 
 pub async fn totals(pool: &AnyPool, backend: DatabaseBackend) -> payload::Counters {
     let mut out = payload::Counters::new();
+    match RecordStore::new(pool.clone(), backend).count_all().await {
+        Ok(n) => {
+            out.insert("records".to_string(), n);
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "telemetry could not count records");
+        }
+    }
     for (key, table) in COUNTED_TABLES {
         if let Some(n) = count_table(pool, backend, table).await {
             out.insert((*key).to_string(), n);
@@ -91,13 +99,8 @@ pub async fn job_runtime_seconds(pool: &AnyPool, backend: DatabaseBackend) -> Op
 }
 
 async fn collection_counts(pool: &AnyPool, backend: DatabaseBackend) -> Vec<(String, i64)> {
-    let sql = adapt_sql(
-        "SELECT collection, COUNT(*) AS cnt FROM happyview_records
-         GROUP BY collection ORDER BY cnt DESC",
-        backend,
-    );
-    crate::db::query_as::<(String, i64)>(&sql)
-        .fetch_all(pool)
+    RecordStore::new(pool.clone(), backend)
+        .count_by_collection()
         .await
         .unwrap_or_default()
 }
@@ -132,23 +135,7 @@ mod tests {
     use crate::test_support::memory_pool;
 
     async fn pool_with_records() -> sqlx::AnyPool {
-        let pool = memory_pool().await;
-        crate::db::query(
-            "CREATE TABLE happyview_records (
-                uri TEXT PRIMARY KEY,
-                did TEXT NOT NULL,
-                collection TEXT NOT NULL,
-                rkey TEXT NOT NULL,
-                record TEXT NOT NULL,
-                cid TEXT NOT NULL,
-                indexed_at TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create records");
-        pool
+        crate::test_support::migrated_memory_pool().await
     }
 
     async fn insert_record(pool: &sqlx::AnyPool, uri: &str, collection: &str) {

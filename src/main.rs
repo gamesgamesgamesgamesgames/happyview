@@ -930,6 +930,9 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
     let state = AppState {
         config: config.clone(),
         http,
+        records: happyview::record_store::RecordStore::shared(db_pool.clone(), db_backend)
+            .await
+            .expect("failed to load record compression dictionaries"),
         db: db_pool,
         backfill_db: backfill_db_pool,
         db_backend,
@@ -1043,6 +1046,12 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
             checkpoint_every,
         ));
     }
+
+    tokio::spawn(happyview::record_store::compression::run(
+        state.records.clone(),
+        happyview::record_store::compression::train_at_from_env(),
+        happyview::record_store::compression::interval_from_env(),
+    ));
 
     {
         let db = state.db.clone();

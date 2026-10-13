@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use serde_json::Value;
 
 use crate::AppState;
-use crate::db::{adapt_sql, now_rfc3339};
+use crate::db::now_rfc3339;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon::LexiconType;
 use crate::lua::RecordHookOutcome;
@@ -162,33 +162,22 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
                 RecordHookOutcome::Proceed => rec.clone(),
             };
 
-            let now = now_rfc3339();
             let backend = state.db_backend;
-            let record_json = serde_json::to_string(&rec_to_store).unwrap_or_default();
-            let upsert_sql = adapt_sql(
-                &format!(
-                    "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at, rev) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-                     ON CONFLICT (uri) DO UPDATE SET record = EXCLUDED.record, cid = EXCLUDED.cid, indexed_at = EXCLUDED.indexed_at, rev = COALESCE(EXCLUDED.rev, happyview_records.rev) \
-                     WHERE {}",
-                    crate::db::record_upsert_where(backend)
-                ),
-                backend,
-            );
+            let prepared = crate::record_store::PreparedRecord {
+                did: record.did.clone(),
+                collection: record.collection.clone(),
+                rkey: record.rkey.clone(),
+                record_json: serde_json::to_string(&rec_to_store).unwrap_or_default(),
+                cid: cid.to_string(),
+                rev: record.rev.clone(),
+            };
             let written = crate::db::retry_on_busy(|| {
-                upsert_record_and_refs(
-                    db,
-                    &upsert_sql,
-                    &uri,
-                    record,
-                    &record_json,
-                    cid,
-                    &now,
-                    &rec_to_store,
-                    backend,
-                )
+                state
+                    .records
+                    .write_network(db, std::slice::from_ref(&prepared))
             })
-            .await;
+            .await
+            .map(|changed| !changed.is_empty());
             match written {
                 Ok(changed) => {
                     // An identical redelivery changed nothing, so there is
@@ -288,9 +277,8 @@ pub async fn handle_record_event(state: &AppState, record: &RecordEvent) -> Reco
 
             let now = now_rfc3339();
             match crate::db::retry_on_busy(|| {
-                delete_record(
+                state.records.delete_network(
                     db,
-                    backend,
                     &uri,
                     &record.did,
                     &record.collection,
@@ -358,171 +346,6 @@ fn failed_write_outcome(e: &sqlx::Error) -> RecordOutcome {
     } else {
         RecordOutcome::Errored
     }
-}
-
-/// Upsert one record and, only when the stored row changed, its refs, in one
-/// transaction: one commit per record, and a refs failure cannot leave a
-/// record without them. A record a tombstone supersedes is not written.
-/// Returns whether the row was inserted or changed.
-#[allow(clippy::too_many_arguments)]
-async fn upsert_record_and_refs(
-    db: &sqlx::AnyPool,
-    upsert_sql: &str,
-    uri: &str,
-    event: &RecordEvent,
-    record_json: &str,
-    cid: &str,
-    now: &str,
-    rec_to_store: &Value,
-    backend: crate::db::DatabaseBackend,
-) -> Result<bool, sqlx::Error> {
-    let mut tx = crate::db::begin_write(db, backend).await?;
-    crate::tombstones::lock_dids(&mut tx, backend, &[&event.did]).await?;
-    crate::tombstones::lock_uris(&mut tx, backend, &[uri]).await?;
-    let blocked = crate::tombstones::blocked_writes(
-        &mut tx,
-        backend,
-        &[crate::tombstones::WriteCandidate {
-            uri,
-            did: &event.did,
-            rev: event.rev.as_deref(),
-        }],
-    )
-    .await?;
-    if !blocked.is_empty() {
-        tracing::debug!(uri, "skipping a record a tombstone supersedes");
-        tx.commit().await?;
-        return Ok(false);
-    }
-    let changed = crate::db::query(upsert_sql)
-        .bind(uri)
-        .bind(&event.did)
-        .bind(&event.collection)
-        .bind(&event.rkey)
-        .bind(record_json)
-        .bind(cid)
-        .bind(now)
-        .bind(now)
-        .bind(event.rev.as_deref())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-        > 0;
-    if changed {
-        crate::record_refs::sync_refs_in(&mut tx, uri, &event.collection, rec_to_store, backend)
-            .await?;
-    }
-    tx.commit().await?;
-    Ok(changed)
-}
-
-/// Delete one record. A delete that carries a rev deletes only a stored row
-/// whose rev is unknown or not newer, and, unless a newer row survives it,
-/// leaves a tombstone in the same transaction, so a reordered or replayed
-/// create cannot bring the record back. A delete that finds no row
-/// tombstones only when a create could still be on its way: the account
-/// holds network records in the collection, or a backfill still writing
-/// covers it.
-/// Otherwise it is a delete for a record this instance never held, and the
-/// network sends millions of those. A delete without a rev (a dead-letter
-/// retry) deletes the row whatever its rev and tombstones it at the rev it
-/// was stored at, if any, so a replay of that create cannot bring it back.
-async fn delete_record(
-    db: &sqlx::AnyPool,
-    backend: crate::db::DatabaseBackend,
-    uri: &str,
-    did: &str,
-    collection: &str,
-    rev: Option<&str>,
-    now: &str,
-) -> Result<(), sqlx::Error> {
-    let mut tx = crate::db::begin_write(db, backend).await?;
-    crate::tombstones::lock_dids(&mut tx, backend, &[did]).await?;
-    crate::tombstones::lock_uris(&mut tx, backend, &[uri]).await?;
-    match rev {
-        Some(rev) => {
-            let sql = adapt_sql(
-                &format!(
-                    "DELETE FROM happyview_records WHERE uri = ? AND (rev IS NULL OR {})",
-                    crate::db::rev_compare(backend, "rev", "<=", "CAST(? AS TEXT)")
-                ),
-                backend,
-            );
-            let deleted = crate::db::query(&sql)
-                .bind(uri)
-                .bind(rev)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected()
-                > 0;
-            let survived = !deleted && {
-                let sql = adapt_sql("SELECT 1 FROM happyview_records WHERE uri = ?", backend);
-                crate::db::query(&sql)
-                    .bind(uri)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .is_some()
-            };
-            let tombstone = deleted
-                || (!survived && create_may_follow(&mut tx, backend, did, collection).await?);
-            if tombstone {
-                crate::tombstones::write_record_tombstone(&mut tx, backend, uri, rev, now).await?;
-            }
-        }
-        None => {
-            let sql = adapt_sql(
-                "DELETE FROM happyview_records WHERE uri = ? RETURNING rev",
-                backend,
-            );
-            let deleted: Option<(Option<String>,)> = crate::db::query_as(&sql)
-                .bind(uri)
-                .fetch_optional(&mut *tx)
-                .await?;
-            if let Some((Some(stored_rev),)) = deleted {
-                crate::tombstones::write_record_tombstone(&mut tx, backend, uri, &stored_rev, now)
-                    .await?;
-            }
-        }
-    }
-    tx.commit().await
-}
-
-/// Whether a create for a record `did` holds no row for could still arrive
-/// out of order: the account holds network records in `collection` (live
-/// ingest or a past backfill reached it), or a backfill covering the
-/// collection may still write: running, or pausing or cancelling (both stop
-/// once in-flight pages are written).
-async fn create_may_follow(
-    conn: &mut sqlx::AnyConnection,
-    backend: crate::db::DatabaseBackend,
-    did: &str,
-    collection: &str,
-) -> Result<bool, sqlx::Error> {
-    let sql = adapt_sql(
-        "SELECT 1 FROM happyview_records \
-         WHERE did = ? AND collection = ? AND indexed_at IS NOT NULL LIMIT 1",
-        backend,
-    );
-    let held = crate::db::query(&sql)
-        .bind(did)
-        .bind(collection)
-        .fetch_optional(&mut *conn)
-        .await?
-        .is_some();
-    if held {
-        return Ok(true);
-    }
-    let sql = adapt_sql(
-        "SELECT 1 FROM happyview_backfill_jobs \
-         WHERE status IN ('running', 'pausing', 'cancelling') \
-         AND (collection IS NULL OR collection = ?) LIMIT 1",
-        backend,
-    );
-    Ok(crate::db::query(&sql)
-        .bind(collection)
-        .fetch_optional(&mut *conn)
-        .await?
-        .is_some())
 }
 
 /// Handle a `com.atproto.lexicon.schema` record event for tracked network
@@ -604,6 +427,7 @@ mod tests {
     use super::*;
 
     use crate::catalog::LexiconWrite;
+    use crate::db::adapt_sql;
     use crate::lexicon::ParsedLexicon;
     use crate::lexicon::ProcedureAction;
     use crate::plugin::{LoadedPlugin, PluginManifest, PluginSource, loader};
@@ -907,7 +731,9 @@ mod tests {
         set_indexed_at(state, &uri, Some(old)).await;
 
         let edited = serde_json::json!({"text": "v2"});
-        crate::linked_repos::pds::index_write(state, "did:plc:abc", NSID, &uri, "", &edited).await;
+        crate::linked_repos::pds::index_write(state, "did:plc:abc", NSID, &uri, "", &edited)
+            .await
+            .expect("index the edited record");
         assert_eq!(
             indexed_at(state, &uri).await,
             None,
@@ -952,7 +778,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_refs_write_rolls_back_the_record() {
         let state = tracked_state().await;
-        crate::db::query("DROP TABLE happyview_record_refs")
+        crate::db::query("DROP TABLE happyview_record_refs_v2")
             .execute(&state.db)
             .await
             .expect("drop refs table");
@@ -1628,10 +1454,9 @@ mod tests {
         clean_up_rkey(&state, &format!("{rkey}u")).await;
     }
 
-    /// The hand-written schema `tracked_state` builds still takes a
-    /// tombstoning delete.
+    /// A delete with a rev tombstones the record.
     #[tokio::test]
-    async fn a_delete_with_a_rev_works_on_the_minimal_schema() {
+    async fn a_delete_with_a_rev_tombstones_the_record() {
         let state = tracked_state().await;
         insert_record(&state).await;
         let mut event = delete_event();

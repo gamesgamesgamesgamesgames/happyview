@@ -1,38 +1,28 @@
-//! Record and table queries for plugins and the Lua `db` global. Every piece
-//! of SQL that touches `happyview_records` on a guest's behalf is generated
+//! Record and table queries for plugins and the Lua `db` global. The record
+//! queries are generated in `crate::record_store::query` and re-exported
 //! here, so a plugin never writes SQL for records and the schema can change
-//! in one place.
+//! in one place; the filter, sort and bind helpers they share with
+//! `table_query` stay here.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
 use super::db::row_to_json;
-use crate::db::{
-    DatabaseBackend, MAX_FIELD_PATH_LEN, adapt_sql, decode_cursor, encode_cursor,
-    is_valid_json_field_path, postgres_json_chain,
-};
+use crate::db::{DatabaseBackend, MAX_FIELD_PATH_LEN, adapt_sql};
 use crate::raw_sql_guard::check_raw_sql_tables;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use happyview_plugin_sdk::wire::{
-    BacklinksQuery, Filter, IndexPut, RecordEnvelope, RecordRef, RecordsCount, RecordsPage,
-    RecordsQuery, RecordsSearch, Sort, TableQuery,
-};
+use happyview_plugin_sdk::wire::{Filter, IndexPut, RecordRef, Sort, TableQuery};
 use sqlx::any::AnyTypeInfoKind;
 use sqlx::{AssertSqlSafe, Executor, SqlSafeStr};
+
+pub use crate::record_store::query::{
+    backlinks_query, record_text_field_sql, records_count, records_get, records_query,
+    records_query_sql, records_search,
+};
 
 pub const MAX_FILTER_DEPTH: u8 = 5;
 pub const DEFAULT_LIMIT: u32 = 20;
 pub const MAX_LIMIT: u32 = 100;
-
-/// Columns `records_query`'s sort accepts bare, as opposed to a JSON path
-/// evaluated inside `record`.
-const TOP_LEVEL_COLUMNS: [&str; 3] = ["indexed_at", "did", "uri"];
-
-/// Those of [`TOP_LEVEL_COLUMNS`] the schema lets be null, and so the only
-/// ones whose sort needs a null placement. `uri` and `did` are `NOT NULL` on
-/// both backends.
-const NULLABLE_TOP_LEVEL_COLUMNS: [&str; 1] = ["indexed_at"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecordsError {
@@ -42,7 +32,7 @@ pub enum RecordsError {
     Database(#[from] sqlx::Error),
 }
 
-fn invalid(msg: impl Into<String>) -> RecordsError {
+pub(crate) fn invalid(msg: impl Into<String>) -> RecordsError {
     RecordsError::InvalidSpec(msg.into())
 }
 
@@ -137,119 +127,17 @@ pub fn filter_sql(
     }
 }
 
-fn invalid_field(path: &str) -> RecordsError {
+pub(crate) fn invalid_field(path: &str) -> RecordsError {
     invalid(format!(
         "invalid field '{path}': use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]'), at most {MAX_FIELD_PATH_LEN} characters"
     ))
 }
 
-/// The JSON value at `path` inside the `record` column, in whatever type the
-/// stored JSON gives it.
-fn record_field_sql(path: &str) -> Result<String, RecordsError> {
-    if !is_valid_json_field_path(path) {
-        return Err(invalid_field(path));
-    }
-    Ok(format!("json_extract(record, '$.{path}')"))
-}
-
-/// The JSON value at `path` as text, which is what a pattern match compares.
-///
-/// The cast names on both backends the type only one of them would pick:
-/// SQLite's `json_extract` hands back the value's own JSON type, while
-/// Postgres's `->>` is already text.
-pub fn record_text_field_sql(path: &str) -> Result<String, RecordsError> {
-    Ok(format!("CAST({} AS TEXT)", record_field_sql(path)?))
-}
-
-/// A record filter's expression and bind.
-///
-/// The filter value's own JSON type is the comparison type: a number compares
-/// as a number and a string as a string, so `score > 100` answers the
-/// question it asks. Comparing as text instead would answer a different one —
-/// `'50' > '100'` is true — and a record body carries no schema to overrule
-/// the value with.
-///
-/// Each backend needs its own form to express that. SQLite's `json_extract`
-/// already yields the stored value's type, so a typed bind compares against
-/// it directly. Postgres's `->>` yields text, so the comparison is against
-/// the `jsonb` value from `->`, whose ordering is numeric within numbers; the
-/// bound value is its own JSON encoding, cast back to `jsonb`. The encoding
-/// comes from `serde_json`, so it is always valid JSON — a malformed literal
-/// would fail the cast. A `::numeric` cast on the column is the alternative
-/// and is unusable: it evaluates per row, so one row holding a string fails
-/// the whole query.
-///
-/// The two agree exactly for a field holding one JSON type per row. They
-/// disagree about a number against a string, which is the same ill-defined
-/// shape [`record_sort_sql`] documents for ordering.
-///
-/// A pattern match is textual by definition, so there both sides go to text.
-fn record_bind_on(
-    backend: DatabaseBackend,
-) -> impl Fn(&str, &str, Value) -> Result<(String, Value), RecordsError> {
-    move |path, op, value| record_field_bind(path, op, value, backend)
-}
-
-fn record_field_bind(
-    path: &str,
-    op: &str,
-    value: Value,
-    backend: DatabaseBackend,
-) -> Result<(String, Value), RecordsError> {
-    if value.is_null() {
-        return Err(invalid(format!(
-            "filter on '{path}' has a null value: compare against a string, number or boolean"
-        )));
-    }
-    if is_text_op(op) {
-        return Ok((
-            format!("{} {op} ?", record_text_field_sql(path)?),
-            Value::String(bind_as_text(value)),
-        ));
-    }
-    Ok(match backend {
-        DatabaseBackend::Sqlite => (format!("{} {op} ?", record_field_sql(path)?), value),
-        DatabaseBackend::Postgres => (
-            format!("{} {op} CAST(? AS jsonb)", postgres_jsonb_chain(path)?),
-            Value::String(value.to_string()),
-        ),
-    })
-}
-
-fn column_sql(name: &str) -> Result<String, RecordsError> {
+pub(crate) fn column_sql(name: &str) -> Result<String, RecordsError> {
     if !is_valid_identifier(name) {
         return Err(invalid(format!("invalid column name '{name}'")));
     }
     Ok(name.to_string())
-}
-
-/// The Postgres `jsonb` chain for a record field, validated here because
-/// this is where a caller's path becomes part of a statement.
-fn postgres_jsonb_chain(path: &str) -> Result<String, RecordsError> {
-    if !is_valid_json_field_path(path) {
-        return Err(invalid_field(path));
-    }
-    Ok(postgres_json_chain("record", path, "->"))
-}
-
-/// The sort key for a record field: the JSON value in the form each backend
-/// orders by the value's own type rather than as text.
-///
-/// Text ordering puts 100 before 2, so a numeric field has to sort as a
-/// number. SQLite's `json_extract` already yields one; Postgres's `->>`
-/// yields text, and `jsonb` from `->` is the form whose ordering is numeric
-/// within numbers. A `(… ->> …)::numeric` cast would also order numerically
-/// and is the wrong tool: it evaluates for every row, so a single row whose
-/// value is not a number fails the whole query.
-///
-/// The two orderings agree for a field that is numeric in every row. They do
-/// not agree when one field holds several JSON types across rows, which is a
-/// sort with no correct answer; both are at least deterministic.
-fn record_sort_sql(path: &str, backend: DatabaseBackend) -> Result<String, RecordsError> {
-    match backend {
-        DatabaseBackend::Sqlite => record_field_sql(path),
-        DatabaseBackend::Postgres => postgres_jsonb_chain(path),
-    }
 }
 
 /// An `ORDER BY` term, with a null placement only where the expression can
@@ -268,7 +156,7 @@ fn record_sort_sql(path: &str, backend: DatabaseBackend) -> Result<String, Recor
 /// the placement defeats that in both directions. It buys agreement between
 /// the backends about where a row with no arrival time sorts, which is worth
 /// more than the plan.
-fn order_by(expression: &str, direction: &str, nullable: bool) -> String {
+pub(crate) fn order_by(expression: &str, direction: &str, nullable: bool) -> String {
     if !nullable {
         return format!("{expression} {direction}");
     }
@@ -281,7 +169,7 @@ fn order_by(expression: &str, direction: &str, nullable: bool) -> String {
 
 /// Whether an operator compares its operands as text rather than by their own
 /// type.
-fn is_text_op(op: &str) -> bool {
+pub(crate) fn is_text_op(op: &str) -> bool {
     matches!(op, "LIKE" | "NOT LIKE" | "ILIKE")
 }
 
@@ -396,7 +284,7 @@ fn kind_name(kind: AnyTypeInfoKind) -> &'static str {
     }
 }
 
-fn direction_sql(direction: &str) -> Result<&'static str, RecordsError> {
+pub(crate) fn direction_sql(direction: &str) -> Result<&'static str, RecordsError> {
     match direction.to_ascii_lowercase().as_str() {
         "asc" => Ok("ASC"),
         "desc" => Ok("DESC"),
@@ -406,13 +294,13 @@ fn direction_sql(direction: &str) -> Result<&'static str, RecordsError> {
     }
 }
 
-fn clamp_limit(limit: Option<u32>) -> i64 {
+pub(crate) fn clamp_limit(limit: Option<u32>) -> i64 {
     i64::from(limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT))
 }
 
 /// A value as the text a pattern match compares against. A JSON string is
 /// its own contents; anything else is its JSON encoding.
-fn bind_as_text(value: Value) -> String {
+pub(crate) fn bind_as_text(value: Value) -> String {
     match value {
         Value::String(s) => s,
         other => other.to_string(),
@@ -428,7 +316,8 @@ type AnyQueryAs<'q, O> = sqlx::query::QueryAs<'q, sqlx::Any, O, sqlx::any::AnyAr
 /// Where a bound value has to be some *other* type — the column's, or a
 /// backend's JSON encoding — the caller has already converted it, so this
 /// stays a faithful mapping of JSON onto SQL rather than a second place
-/// deciding types. See [`table_field_bind`] and [`record_field_bind`].
+/// deciding types. See [`table_field_bind`] and `record_store::query`'s
+/// `record_field_bind`.
 fn bind_value<'q>(query: AnyQuery<'q>, value: &Value) -> AnyQuery<'q> {
     match value {
         Value::Number(n) if n.is_i64() => query.bind(n.as_i64().expect("checked is_i64")),
@@ -440,7 +329,7 @@ fn bind_value<'q>(query: AnyQuery<'q>, value: &Value) -> AnyQuery<'q> {
 }
 
 /// As [`bind_value`], for the query shapes that decode into a row type.
-fn bind_value_as<'q, O>(query: AnyQueryAs<'q, O>, value: &Value) -> AnyQueryAs<'q, O> {
+pub(crate) fn bind_value_as<'q, O>(query: AnyQueryAs<'q, O>, value: &Value) -> AnyQueryAs<'q, O> {
     match value {
         Value::Number(n) if n.is_i64() => query.bind(n.as_i64().expect("checked is_i64")),
         Value::Number(n) => query.bind(n.as_f64().unwrap_or_default()),
@@ -448,294 +337,6 @@ fn bind_value_as<'q, O>(query: AnyQueryAs<'q, O>, value: &Value) -> AnyQueryAs<'
         Value::String(s) => query.bind(s.clone()),
         other => query.bind(other.to_string()),
     }
-}
-
-/// The columns every record read selects, in the order [`RecordRow`] decodes
-/// them. `created_at` is there for the keyset cursor, not the envelope.
-fn record_columns(qualifier: &str) -> String {
-    [
-        "uri",
-        "did",
-        "collection",
-        "rkey",
-        "record",
-        "cid",
-        "indexed_at",
-        "created_at",
-    ]
-    .map(|column| format!("{qualifier}{column}"))
-    .join(", ")
-}
-
-type RecordRow = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    String,
-);
-
-fn created_at(row: &RecordRow) -> &str {
-    &row.7
-}
-
-/// The one place a read turns a row into the shape a guest sees. The
-/// rationale for the shape lives on [`RecordEnvelope`].
-fn envelope(row: RecordRow) -> Value {
-    let (uri, did, collection, rkey, record, cid, indexed_at, _created_at) = row;
-    serde_json::to_value(RecordEnvelope {
-        uri,
-        did,
-        collection,
-        rkey,
-        cid: cid.filter(|cid| !cid.is_empty()),
-        indexed_at,
-        record: serde_json::from_str(&record).unwrap_or(json!({})),
-    })
-    .expect("an envelope of strings and JSON serializes")
-}
-
-/// Builds the two SQL shapes `records_query` needs: a custom sort uses
-/// `OFFSET`/`LIMIT`; the default (no sort) uses a keyset cursor on
-/// `(created_at, uri)`. Bind values are returned in placeholder order; the
-/// `LIMIT`/`OFFSET` integers themselves are appended by `records_query`.
-pub fn records_query_sql(
-    spec: &RecordsQuery,
-    backend: DatabaseBackend,
-) -> Result<(String, Vec<Value>), RecordsError> {
-    let mut binds = vec![Value::String(spec.collection.clone())];
-    let mut where_clause = String::from("WHERE collection = ?");
-    if let Some(did) = &spec.did {
-        where_clause.push_str(" AND did = ?");
-        binds.push(Value::String(did.clone()));
-    }
-
-    let sql = if let Some(Sort { field, direction }) = &spec.sort {
-        // A JSON path is null wherever the field is absent, which no row of a
-        // schemaless body guarantees; a bare column is null only where the
-        // schema lets it be.
-        let (column, nullable) = if TOP_LEVEL_COLUMNS.contains(&field.as_str()) {
-            (
-                column_sql(field)?,
-                NULLABLE_TOP_LEVEL_COLUMNS.contains(&field.as_str()),
-            )
-        } else {
-            (record_sort_sql(field, backend)?, true)
-        };
-        let order = order_by(&column, direction_sql(direction)?, nullable);
-        if let Some(filter) = &spec.filter {
-            let clause = filter_sql(filter, backend, &record_bind_on(backend), 0, &mut binds)?;
-            where_clause.push_str(" AND ");
-            where_clause.push_str(&clause);
-        }
-        format!(
-            "SELECT {} FROM happyview_records {where_clause} ORDER BY {order} LIMIT ? OFFSET ?",
-            record_columns("")
-        )
-    } else {
-        let cursor_parts = spec.cursor.as_ref().and_then(|c| decode_cursor(c));
-        if let Some((cursor_ts, cursor_uri)) = &cursor_parts {
-            where_clause.push_str(" AND (created_at < ? OR (created_at = ? AND uri < ?))");
-            binds.push(Value::String(cursor_ts.clone()));
-            binds.push(Value::String(cursor_ts.clone()));
-            binds.push(Value::String(cursor_uri.clone()));
-        }
-        if let Some(filter) = &spec.filter {
-            let clause = filter_sql(filter, backend, &record_bind_on(backend), 0, &mut binds)?;
-            where_clause.push_str(" AND ");
-            where_clause.push_str(&clause);
-        }
-        format!(
-            "SELECT {} FROM happyview_records {where_clause} ORDER BY created_at DESC, uri DESC LIMIT ?",
-            record_columns("")
-        )
-    };
-
-    Ok((adapt_sql(&sql, backend), binds))
-}
-
-/// Paginated record listing: a custom sort walks pages with a base64-encoded
-/// decimal offset; the default sort walks a keyset cursor on
-/// `(created_at, uri)` so pages stay stable under concurrent inserts.
-pub async fn records_query(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-    spec: RecordsQuery,
-) -> Result<RecordsPage, RecordsError> {
-    let limit = clamp_limit(spec.limit);
-    let custom_sort = spec.sort.is_some();
-    let (sql, binds) = records_query_sql(&spec, backend)?;
-
-    let mut q = crate::db::query_as::<RecordRow>(&sql);
-    for bind in &binds {
-        q = bind_value_as(q, bind);
-    }
-
-    if custom_sort {
-        let offset: i64 = spec
-            .cursor
-            .as_ref()
-            .and_then(|c| BASE64.decode(c).ok())
-            .and_then(|b| String::from_utf8(b).ok())
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0);
-        let rows = q.bind(limit).bind(offset).fetch_all(db).await?;
-        let has_next = rows.len() as i64 == limit;
-        let cursor = has_next.then(|| BASE64.encode((offset + limit).to_string()));
-        let records = rows.into_iter().map(envelope).collect();
-        Ok(RecordsPage { records, cursor })
-    } else {
-        let rows = q.bind(limit).fetch_all(db).await?;
-        Ok(keyset_page(rows, limit))
-    }
-}
-
-/// A page walked by the `(created_at, uri)` keyset: the cursor is the last
-/// row's position, present only when the page came back full.
-fn keyset_page(rows: Vec<RecordRow>, limit: i64) -> RecordsPage {
-    let has_next = rows.len() as i64 == limit;
-    let cursor = has_next
-        .then(|| rows.last())
-        .flatten()
-        .map(|row| encode_cursor(created_at(row), &row.0));
-    let records = rows.into_iter().map(envelope).collect();
-    RecordsPage { records, cursor }
-}
-
-pub async fn records_count(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-    spec: RecordsCount,
-) -> Result<i64, RecordsError> {
-    let mut binds = vec![Value::String(spec.collection.clone())];
-    let mut sql = String::from("SELECT COUNT(*) FROM happyview_records WHERE collection = ?");
-    if let Some(did) = &spec.did {
-        sql.push_str(" AND did = ?");
-        binds.push(Value::String(did.clone()));
-    }
-    if let Some(filter) = &spec.filter {
-        let clause = filter_sql(filter, backend, &record_bind_on(backend), 0, &mut binds)?;
-        sql.push_str(" AND ");
-        sql.push_str(&clause);
-    }
-    let sql = adapt_sql(&sql, backend);
-    let mut q = crate::db::query_as::<(i64,)>(&sql);
-    for bind in &binds {
-        q = bind_value_as(q, bind);
-    }
-    let (count,) = q.fetch_one(db).await?;
-    Ok(count)
-}
-
-pub async fn records_get(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-    uri: &str,
-) -> Result<Option<Value>, RecordsError> {
-    let sql = adapt_sql(
-        &format!(
-            "SELECT {} FROM happyview_records WHERE uri = ?",
-            record_columns("")
-        ),
-        backend,
-    );
-    let row: Option<RecordRow> = crate::db::query_as(&sql)
-        .bind(uri)
-        .fetch_optional(db)
-        .await?;
-    Ok(row.map(envelope))
-}
-
-pub async fn records_search(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-    spec: RecordsSearch,
-) -> Result<Vec<Value>, RecordsError> {
-    if !is_valid_json_field_path(&spec.field) {
-        return Err(invalid(
-            "invalid search field: use alphanumeric names with optional dot notation and array indices (e.g. 'name', 'author.handle', 'tags[0]')",
-        ));
-    }
-    let limit = i64::from(spec.limit.unwrap_or(10).clamp(1, MAX_LIMIT));
-    let like_pattern = format!("%{}%", spec.query);
-    let columns = record_columns("");
-
-    // The field goes through `record_field_sql` so `adapt_sql` can rewrite it:
-    // a hand-written `record::jsonb->>'author.handle'` reads a top-level key
-    // of that literal name and matches nothing, where the rewriter builds the
-    // chain a dotted path means. `ilike` is the one token the two dialects
-    // spell differently, and `normalize_op` already knows which.
-    let field = record_field_sql(&spec.field)?;
-    let ilike = normalize_op("ilike", backend)?;
-    let sql = adapt_sql(
-        &format!(
-            "SELECT {columns} FROM happyview_records \
-             WHERE collection = ? \
-               AND {field} {ilike} ? \
-             ORDER BY \
-               CASE \
-                 WHEN LOWER({field}) = LOWER(?) THEN 0 \
-                 WHEN LOWER({field}) LIKE LOWER(?) || '%' THEN 1 \
-                 ELSE 2 \
-               END, \
-               {field} \
-             LIMIT ?"
-        ),
-        backend,
-    );
-    let rows: Vec<RecordRow> = crate::db::query_as(&sql)
-        .bind(&spec.collection)
-        .bind(&like_pattern)
-        .bind(&spec.query)
-        .bind(&spec.query)
-        .bind(limit)
-        .fetch_all(db)
-        .await?;
-
-    Ok(rows.into_iter().map(envelope).collect())
-}
-
-/// Records in `spec.collection` that reference `spec.uri` via
-/// `happyview_record_refs`, keyset-paginated the same way as `records_query`.
-pub async fn backlinks_query(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
-    spec: BacklinksQuery,
-) -> Result<RecordsPage, RecordsError> {
-    let limit = clamp_limit(spec.limit);
-    let mut binds = vec![spec.uri.clone(), spec.collection.clone()];
-    let mut where_clause = String::from("WHERE ref.target_uri = ? AND ref.collection = ?");
-    if let Some(did) = &spec.did {
-        where_clause.push_str(" AND r.did = ?");
-        binds.push(did.clone());
-    }
-    if let Some((cursor_ts, cursor_uri)) = spec.cursor.as_ref().and_then(|c| decode_cursor(c)) {
-        where_clause.push_str(" AND (r.created_at < ? OR (r.created_at = ? AND r.uri < ?))");
-        binds.push(cursor_ts.clone());
-        binds.push(cursor_ts);
-        binds.push(cursor_uri);
-    }
-    let sql = adapt_sql(
-        &format!(
-            "SELECT {} FROM happyview_records r \
-             INNER JOIN happyview_record_refs ref ON ref.source_uri = r.uri \
-             {where_clause} \
-             ORDER BY r.created_at DESC, r.uri DESC \
-             LIMIT ?",
-            record_columns("r.")
-        ),
-        backend,
-    );
-
-    let mut q = crate::db::query_as::<RecordRow>(&sql);
-    for bind in &binds {
-        q = q.bind(bind);
-    }
-    let rows = q.bind(limit).fetch_all(db).await?;
-    Ok(keyset_page(rows, limit))
 }
 
 /// Builds the SQL for `table_query`: a plain `SELECT * FROM <table>` (or
@@ -884,8 +485,7 @@ pub async fn table_query(
 /// NOT NULL on both backends, and `cid_verify` already reads an empty CID as
 /// "nothing to check".
 pub async fn index_put(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     spec: IndexPut,
 ) -> Result<RecordRef, RecordsError> {
     let IndexPut {
@@ -896,40 +496,30 @@ pub async fn index_put(
         cid,
     } = spec;
     let did = did.ok_or_else(|| invalid("index_put needs a did: pass the record's author"))?;
-    let uri = format!("at://{did}/{collection}/{rkey}");
-    let record_str = serde_json::to_string(&record).unwrap_or_default();
-    let now = crate::db::now_rfc3339();
-
-    let upsert_sql = adapt_sql(
-        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (uri) DO UPDATE
-               SET record = EXCLUDED.record"#,
-        backend,
-    );
-    crate::db::query(&upsert_sql)
-        .bind(&uri)
-        .bind(&did)
-        .bind(&collection)
-        .bind(&rkey)
-        .bind(&record_str)
-        .bind(cid.unwrap_or_default())
-        .bind(crate::db::NO_INDEXED_AT)
-        .bind(&now)
-        .execute(db)
-        .await?;
-
-    let _ = crate::record_refs::sync_refs(db, &uri, &collection, &record, backend).await;
+    let prepared = crate::record_store::PreparedRecord {
+        did,
+        collection,
+        rkey,
+        record_json: serde_json::to_string(&record).unwrap_or_default(),
+        cid: cid.unwrap_or_default(),
+        rev: None,
+    };
+    let uri = prepared.uri();
+    match store
+        .write_local(crate::record_store::WriteKind::IndexOnly, &prepared)
+        .await
+    {
+        Ok(()) => {}
+        Err(crate::record_store::LocalWriteError::Row(e)) => return Err(e.into()),
+        Err(e @ crate::record_store::LocalWriteError::Refs(_)) => {
+            tracing::warn!(uri = %uri, "index_put: {e}");
+        }
+    }
 
     // Read the CID back rather than assume one: an update leaves whatever the
     // network last stored, which is the value a caller building a strongRef
     // needs.
-    let cid_sql = adapt_sql("SELECT cid FROM happyview_records WHERE uri = ?", backend);
-    let row: Option<(Option<String>,)> = crate::db::query_as(&cid_sql)
-        .bind(&uri)
-        .fetch_optional(db)
-        .await?;
-    let cid = row.and_then(|(cid,)| cid).unwrap_or_default();
+    let cid = store.stored_cid(&uri).await?.unwrap_or_default();
 
     Ok(RecordRef { uri, cid })
 }
@@ -945,17 +535,8 @@ pub struct NetworkWrite<'a> {
     pub cid: &'a str,
 }
 
-/// Which step of a mirror failed. The row and its refs are separate
-/// statements, so the index can hold a correct row whose backlinks are empty
-/// until Jetstream re-syncs them; an operator reading the log needs to know
-/// whether the record is missing or merely unlinked.
-#[derive(Debug, thiserror::Error)]
-pub enum MirrorError {
-    #[error("row not written: {0}")]
-    Row(sqlx::Error),
-    #[error("row written but its refs not synced: {0}")]
-    Refs(sqlx::Error),
-}
+/// Which step of a mirror failed; see [`crate::record_store::LocalWriteError`].
+pub type MirrorError = crate::record_store::LocalWriteError;
 
 /// Reflect a write the caller just made to their PDS into the local index, so
 /// a script that writes and then reads its own record sees it before Jetstream
@@ -968,62 +549,41 @@ pub enum MirrorError {
 /// echo's to set: bound NULL on insert and cleared on update, so the
 /// identical echo re-stamps the row.
 pub async fn mirror_network_write(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     write: NetworkWrite<'_>,
 ) -> Result<(), MirrorError> {
-    let record_str = serde_json::to_string(write.record).unwrap_or_default();
-    let upsert_sql = adapt_sql(
-        r#"INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT (uri) DO UPDATE
-               SET record = EXCLUDED.record,
-                   cid = EXCLUDED.cid, indexed_at = NULL"#,
-        backend,
-    );
-    crate::db::query(&upsert_sql)
-        .bind(write.uri)
-        .bind(write.did)
-        .bind(write.collection)
-        .bind(write.rkey)
-        .bind(&record_str)
-        .bind(write.cid)
-        .bind(crate::db::NO_INDEXED_AT)
-        .bind(crate::db::now_rfc3339())
-        .execute(db)
+    store
+        .write_local(
+            crate::record_store::WriteKind::Echoed,
+            &crate::record_store::PreparedRecord {
+                did: write.did.to_string(),
+                collection: write.collection.to_string(),
+                rkey: write.rkey.to_string(),
+                record_json: serde_json::to_string(write.record).unwrap_or_default(),
+                cid: write.cid.to_string(),
+                rev: None,
+            },
+        )
         .await
-        .map_err(MirrorError::Row)?;
-    crate::record_refs::sync_refs(db, write.uri, write.collection, write.record, backend)
-        .await
-        .map_err(MirrorError::Refs)
 }
 
 /// Drop a record the caller just deleted from their PDS, and the references
 /// it made, so a read before the Jetstream echo does not resurrect it.
 pub async fn mirror_network_delete(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     uri: &str,
 ) -> Result<(), RecordsError> {
-    let refs_sql = adapt_sql(
-        "DELETE FROM happyview_record_refs WHERE source_uri = ?",
-        backend,
-    );
-    crate::db::query(&refs_sql).bind(uri).execute(db).await?;
-    index_delete(db, backend, uri).await?;
+    store.delete(uri).await?;
     Ok(())
 }
 
 /// Drop one record from the local index. Idempotent; the bool says whether a
 /// row was actually there.
 pub async fn index_delete(
-    db: &sqlx::AnyPool,
-    backend: DatabaseBackend,
+    store: &crate::record_store::RecordStore,
     uri: &str,
 ) -> Result<bool, RecordsError> {
-    let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-    let result = crate::db::query(&sql).bind(uri).execute(db).await?;
-    Ok(result.rows_affected() > 0)
+    Ok(store.delete(uri).await?)
 }
 
 /// The raw JSON of an uploaded lexicon, or `None` when this instance holds no
@@ -1086,12 +646,18 @@ mod tests {
             filter: Some(cond("status", "=", json!("active"))),
             sort: None,
             limit: Some(10),
-            cursor: Some(crate::db::encode_cursor("2026-01-01T00:00:00Z", "at://x")),
+            cursor: Some(crate::db::encode_cursor("1767225600000000", "42")),
         };
         let (sql, binds) = records_query_sql(&spec, Sqlite).unwrap();
-        assert!(sql.contains("WHERE collection = ? AND did = ?"), "{sql}");
         assert!(
-            sql.contains("(created_at < ? OR (created_at = ? AND uri < ?))"),
+            sql.contains(
+                "WHERE rec.collection_id = (SELECT id FROM happyview_collections WHERE nsid = ?) \
+                 AND rec.did_id = (SELECT id FROM happyview_dids WHERE did = ?)"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("(rec.created_at_us, rec.id) < (?, ?)"),
             "{sql}"
         );
         assert!(
@@ -1099,7 +665,7 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.ends_with("ORDER BY created_at DESC, uri DESC LIMIT ?"),
+            sql.ends_with("ORDER BY rec.created_at_us DESC, rec.id DESC LIMIT ?"),
             "{sql}"
         );
         assert_eq!(
@@ -1107,12 +673,22 @@ mod tests {
             vec![
                 json!("c"),
                 json!("did:plc:a"),
-                json!("2026-01-01T00:00:00Z"),
-                json!("2026-01-01T00:00:00Z"),
-                json!("at://x"),
+                json!(1_767_225_600_000_000_i64),
+                json!(42),
                 json!("active")
             ]
         );
+
+        // A cursor from before the compact format (`created_at|uri`) is
+        // refused, not read as the first page.
+        let old = RecordsQuery {
+            cursor: Some(crate::db::encode_cursor("2026-01-01T00:00:00Z", "at://x")),
+            ..spec
+        };
+        assert!(matches!(
+            records_query_sql(&old, Sqlite),
+            Err(RecordsError::InvalidSpec(_))
+        ));
     }
 
     #[test]
@@ -1166,12 +742,12 @@ mod tests {
         }
 
         assert!(
-            sorted("indexed_at", "asc").contains("ORDER BY indexed_at ASC NULLS FIRST"),
+            sorted("indexed_at", "asc").contains("ORDER BY rec.indexed_at_us ASC NULLS FIRST"),
             "{}",
             sorted("indexed_at", "asc")
         );
         assert!(
-            sorted("indexed_at", "desc").contains("ORDER BY indexed_at DESC NULLS LAST"),
+            sorted("indexed_at", "desc").contains("ORDER BY rec.indexed_at_us DESC NULLS LAST"),
             "{}",
             sorted("indexed_at", "desc")
         );
@@ -1197,7 +773,7 @@ mod tests {
             cursor: None,
         };
         let (sql, _) = records_query_sql(&spec, Sqlite).unwrap();
-        assert!(sql.contains("ORDER BY indexed_at DESC"), "{sql}");
+        assert!(sql.contains("ORDER BY rec.indexed_at_us DESC"), "{sql}");
     }
 
     #[test]
@@ -1353,14 +929,12 @@ mod tests {
     }
 
     async fn seeded_pool() -> sqlx::AnyPool {
-        let pool = crate::test_support::memory_pool().await;
+        let pool = crate::test_support::migrated_memory_pool().await;
         for sql in [
-            "CREATE TABLE happyview_records (uri TEXT PRIMARY KEY, did TEXT NOT NULL, collection TEXT NOT NULL, rkey TEXT, record TEXT NOT NULL, cid TEXT, indexed_at TEXT, created_at TEXT)",
-            "CREATE TABLE happyview_record_refs (source_uri TEXT NOT NULL, target_uri TEXT NOT NULL, collection TEXT NOT NULL)",
-            "INSERT INTO happyview_records VALUES ('at://a/c/1', 'did:plc:a', 'c', '1', '{\"n\":\"one\",\"score\":1}', 'cid1', NULL, '2026-01-01T00:00:01Z')",
-            "INSERT INTO happyview_records VALUES ('at://a/c/2', 'did:plc:a', 'c', '2', '{\"n\":\"two\",\"score\":2}', 'cid2', NULL, '2026-01-01T00:00:02Z')",
-            "INSERT INTO happyview_records VALUES ('at://b/c/3', 'did:plc:b', 'c', '3', '{\"n\":\"three\",\"score\":3}', 'cid3', NULL, '2026-01-01T00:00:03Z')",
-            "INSERT INTO happyview_record_refs VALUES ('at://a/c/2', 'at://a/c/1', 'c')",
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES ('at://did:plc:a/c/1', 'did:plc:a', 'c', '1', '{\"n\":\"one\",\"score\":1}', 'cid1', NULL, '2026-01-01T00:00:01Z')",
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES ('at://did:plc:a/c/2', 'did:plc:a', 'c', '2', '{\"n\":\"two\",\"score\":2}', 'cid2', NULL, '2026-01-01T00:00:02Z')",
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES ('at://did:plc:b/c/3', 'did:plc:b', 'c', '3', '{\"n\":\"three\",\"score\":3}', 'cid3', NULL, '2026-01-01T00:00:03Z')",
+            "INSERT INTO happyview_record_refs VALUES ('at://did:plc:a/c/2', 'at://did:plc:a/c/1', 'c')",
             "CREATE TABLE leaderboard (name TEXT, score INTEGER)",
             "INSERT INTO leaderboard VALUES ('x', 50), ('y', 150)",
             "CREATE TABLE flags (name TEXT, active INTEGER)",
@@ -1389,7 +963,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(page.records.len(), 2);
-        assert_eq!(page.records[0]["uri"], "at://b/c/3");
+        assert_eq!(page.records[0]["uri"], "at://did:plc:b/c/3");
         let cursor = page.cursor.expect("more pages");
         let next = records_query(
             &pool,
@@ -1406,7 +980,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(next.records.len(), 1);
-        assert_eq!(next.records[0]["uri"], "at://a/c/1");
+        assert_eq!(next.records[0]["uri"], "at://did:plc:a/c/1");
         assert!(next.cursor.is_none());
     }
 
@@ -1440,22 +1014,23 @@ mod tests {
     async fn every_read_returns_an_envelope_around_the_stored_body() {
         let pool = seeded_pool().await;
         for sql in [
-            "INSERT INTO happyview_records VALUES ('at://a/c/4', 'did:plc:a', 'c', '4', '{\"uri\":\"at://spoof\",\"n\":\"four\"}', '', '2026-02-02T00:00:00Z', '2026-01-01T00:00:04Z')",
-            "INSERT INTO happyview_record_refs VALUES ('at://a/c/4', 'at://b/c/3', 'c')",
+            "INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at) VALUES ('at://did:plc:a/c/4', 'did:plc:a', 'c', '4', '{\"uri\":\"at://spoof\",\"n\":\"four\"}', '', '2026-02-02T00:00:00Z', '2026-01-01T00:00:04Z')",
+            "INSERT INTO happyview_record_refs VALUES ('at://did:plc:a/c/4', 'at://did:plc:b/c/3', 'c')",
         ] {
             crate::db::query(sql).execute(&pool).await.unwrap();
         }
         let expected = json!({
-            "uri": "at://a/c/4",
+            "uri": "at://did:plc:a/c/4",
             "did": "did:plc:a",
             "collection": "c",
             "rkey": "4",
             "cid": null,
-            "indexed_at": "2026-02-02T00:00:00Z",
+            // The instance, rendered as every stored timestamp now is.
+            "indexed_at": "2026-02-02T00:00:00.000000+00:00",
             "record": {"uri": "at://spoof", "n": "four"},
         });
 
-        let got = records_get(&pool, Sqlite, "at://a/c/4")
+        let got = records_get(&pool, Sqlite, "at://did:plc:a/c/4")
             .await
             .unwrap()
             .unwrap();
@@ -1495,7 +1070,7 @@ mod tests {
             &pool,
             Sqlite,
             BacklinksQuery {
-                uri: "at://b/c/3".into(),
+                uri: "at://did:plc:b/c/3".into(),
                 collection: "c".into(),
                 did: None,
                 limit: None,
@@ -1512,7 +1087,7 @@ mod tests {
     #[tokio::test]
     async fn envelope_reports_a_cid_and_a_null_indexed_at() {
         let pool = seeded_pool().await;
-        let got = records_get(&pool, Sqlite, "at://a/c/1")
+        let got = records_get(&pool, Sqlite, "at://did:plc:a/c/1")
             .await
             .unwrap()
             .unwrap();
@@ -1536,12 +1111,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 2);
-        let got = records_get(&pool, Sqlite, "at://a/c/1")
+        let got = records_get(&pool, Sqlite, "at://did:plc:a/c/1")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(got["record"]["n"], "one");
-        assert_eq!(got["uri"], "at://a/c/1");
+        assert_eq!(got["uri"], "at://did:plc:a/c/1");
         assert!(
             records_get(&pool, Sqlite, "at://nope")
                 .await
@@ -1565,7 +1140,7 @@ mod tests {
             &pool,
             Sqlite,
             BacklinksQuery {
-                uri: "at://a/c/1".into(),
+                uri: "at://did:plc:a/c/1".into(),
                 collection: "c".into(),
                 did: None,
                 limit: None,
@@ -1575,7 +1150,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(back.records.len(), 1);
-        assert_eq!(back.records[0]["uri"], "at://a/c/2");
+        assert_eq!(back.records[0]["uri"], "at://did:plc:a/c/2");
     }
 
     #[tokio::test]
@@ -1667,8 +1242,7 @@ mod tests {
     async fn index_put_inserts_then_updates() {
         let pool = seeded_pool().await;
         let inserted = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             index_put_spec("did:plc:a", "new", json!({"n": "first"})),
         )
         .await
@@ -1677,8 +1251,7 @@ mod tests {
         assert_eq!(inserted.cid, "");
 
         let updated = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             index_put_spec("did:plc:a", "new", json!({"n": "second"})),
         )
         .await
@@ -1706,8 +1279,7 @@ mod tests {
     async fn index_put_records_a_supplied_cid_on_insert() {
         let pool = seeded_pool().await;
         let inserted = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             IndexPut {
                 collection: "c".into(),
                 rkey: "fresh".into(),
@@ -1728,12 +1300,11 @@ mod tests {
     async fn index_put_never_overwrites_an_existing_cid() {
         let pool = seeded_pool().await;
         let updated = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             IndexPut {
                 collection: "c".into(),
                 rkey: "1".into(),
-                did: Some("a".into()),
+                did: Some("did:plc:a".into()),
                 record: json!({"n": "edited"}),
                 cid: Some("bafysomethingelse".into()),
             },
@@ -1744,7 +1315,7 @@ mod tests {
 
         let row: (Option<String>,) =
             crate::db::query_as("SELECT cid FROM happyview_records WHERE uri = ?")
-                .bind("at://a/c/1")
+                .bind("at://did:plc:a/c/1")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -1757,7 +1328,7 @@ mod tests {
     async fn index_put_leaves_network_provenance_alone() {
         let pool = seeded_pool().await;
         crate::db::query(
-            "UPDATE happyview_records SET indexed_at = ?, cid = ? WHERE uri = 'at://a/c/1'",
+            "UPDATE happyview_records SET indexed_at = ?, cid = ? WHERE uri = 'at://did:plc:a/c/1'",
         )
         .bind("2026-01-01T00:00:00Z")
         .bind("bafyoriginal")
@@ -1766,12 +1337,11 @@ mod tests {
         .unwrap();
 
         let put = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             IndexPut {
                 collection: "c".into(),
                 rkey: "1".into(),
-                did: Some("a".into()),
+                did: Some("did:plc:a".into()),
                 record: json!({"n": "edited"}),
                 cid: None,
             },
@@ -1782,11 +1352,11 @@ mod tests {
 
         let row: (Option<String>, Option<String>) =
             crate::db::query_as("SELECT indexed_at, cid FROM happyview_records WHERE uri = ?")
-                .bind("at://a/c/1")
+                .bind("at://did:plc:a/c/1")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(row.0.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(row.0.as_deref(), Some("2026-01-01T00:00:00.000000+00:00"));
         assert_eq!(row.1.as_deref(), Some("bafyoriginal"));
     }
 
@@ -1794,8 +1364,7 @@ mod tests {
     async fn index_put_without_a_did_says_so() {
         let pool = seeded_pool().await;
         let err = index_put(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             IndexPut {
                 collection: "c".into(),
                 rkey: "1".into(),
@@ -1832,10 +1401,9 @@ mod tests {
     #[tokio::test]
     async fn mirrored_create_lands_with_the_pds_cid_and_no_indexed_at() {
         let pool = seeded_pool().await;
-        let record = json!({"n": "mine", "subject": "at://a/c/1"});
+        let record = json!({"n": "mine", "subject": "at://did:plc:a/c/1"});
         mirror_network_write(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             NetworkWrite {
                 uri: "at://did:plc:a/c/fresh",
                 did: "did:plc:a",
@@ -1858,24 +1426,25 @@ mod tests {
         assert_eq!(got["record"], record);
         assert_eq!(
             ref_targets(&pool, "at://did:plc:a/c/fresh").await,
-            vec!["at://a/c/1"]
+            vec!["at://did:plc:a/c/1"]
         );
     }
 
     #[tokio::test]
     async fn mirrored_put_replaces_the_cid_and_clears_indexed_at() {
         let pool = seeded_pool().await;
-        crate::db::query("UPDATE happyview_records SET indexed_at = ? WHERE uri = 'at://a/c/2'")
-            .bind("2026-01-01T00:00:00Z")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let record = json!({"n": "edited", "subject": "at://b/c/3"});
+        crate::db::query(
+            "UPDATE happyview_records SET indexed_at = ? WHERE uri = 'at://did:plc:a/c/2'",
+        )
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let record = json!({"n": "edited", "subject": "at://did:plc:b/c/3"});
         mirror_network_write(
-            &pool,
-            Sqlite,
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
             NetworkWrite {
-                uri: "at://a/c/2",
+                uri: "at://did:plc:a/c/2",
                 did: "did:plc:a",
                 collection: "c",
                 rkey: "2",
@@ -1886,69 +1455,90 @@ mod tests {
         .await
         .unwrap();
 
-        let (cid, indexed_at) = provenance(&pool, "at://a/c/2").await;
+        let (cid, indexed_at) = provenance(&pool, "at://did:plc:a/c/2").await;
         assert_eq!(cid.as_deref(), Some("bafyv2"));
         assert_eq!(indexed_at, None, "the identical echo must re-stamp the row");
-        let got = records_get(&pool, Sqlite, "at://a/c/2")
+        let got = records_get(&pool, Sqlite, "at://did:plc:a/c/2")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(got["record"], record);
-        assert_eq!(ref_targets(&pool, "at://a/c/2").await, vec!["at://b/c/3"]);
+        assert_eq!(
+            ref_targets(&pool, "at://did:plc:a/c/2").await,
+            vec!["at://did:plc:b/c/3"]
+        );
     }
 
     #[tokio::test]
     async fn mirrored_delete_removes_the_row_and_its_refs() {
         let pool = seeded_pool().await;
-        assert_eq!(ref_targets(&pool, "at://a/c/2").await, vec!["at://a/c/1"]);
-        mirror_network_delete(&pool, Sqlite, "at://a/c/2")
-            .await
-            .unwrap();
+        assert_eq!(
+            ref_targets(&pool, "at://did:plc:a/c/2").await,
+            vec!["at://did:plc:a/c/1"]
+        );
+        mirror_network_delete(
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+            "at://did:plc:a/c/2",
+        )
+        .await
+        .unwrap();
         assert!(
-            records_get(&pool, Sqlite, "at://a/c/2")
+            records_get(&pool, Sqlite, "at://did:plc:a/c/2")
                 .await
                 .unwrap()
                 .is_none()
         );
-        assert!(ref_targets(&pool, "at://a/c/2").await.is_empty());
-        mirror_network_delete(&pool, Sqlite, "at://a/c/2")
-            .await
-            .expect("a second delete is a no-op");
+        assert!(ref_targets(&pool, "at://did:plc:a/c/2").await.is_empty());
+        mirror_network_delete(
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+            "at://did:plc:a/c/2",
+        )
+        .await
+        .expect("a second delete is a no-op");
     }
 
     /// The caller decides what a failed mirror means; the function itself
     /// has to surface it, and say which step failed, rather than swallow it.
     #[tokio::test]
     async fn a_mirror_that_cannot_write_names_the_failed_step() {
-        let pool = crate::test_support::memory_pool().await;
-        let record = json!({"subject": "at://a/c/1"});
+        let pool = crate::test_support::migrated_memory_pool().await;
+        crate::db::query("DROP TABLE happyview_records_v2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let record = json!({"subject": "at://did:plc:a/c/1"});
         let write = NetworkWrite {
-            uri: "at://a/c/1",
+            uri: "at://did:plc:a/c/1",
             did: "did:plc:a",
             collection: "c",
             rkey: "1",
             record: &record,
             cid: "bafy",
         };
-        let err = mirror_network_write(&pool, Sqlite, write)
-            .await
-            .unwrap_err();
+        let err = mirror_network_write(
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+            write,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, MirrorError::Row(_)), "{err}");
         assert!(err.to_string().starts_with("row not written"), "{err}");
 
-        crate::db::query(
-            "CREATE TABLE happyview_records (uri TEXT PRIMARY KEY, did TEXT NOT NULL, collection TEXT NOT NULL, rkey TEXT, record TEXT NOT NULL, cid TEXT, indexed_at TEXT, created_at TEXT)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let err = mirror_network_write(&pool, Sqlite, write)
+        let pool = crate::test_support::migrated_memory_pool().await;
+        crate::db::query("DROP TABLE happyview_record_refs_v2")
+            .execute(&pool)
             .await
-            .unwrap_err();
+            .unwrap();
+        let err = mirror_network_write(
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+            write,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, MirrorError::Refs(_)), "{err}");
         assert!(err.to_string().starts_with("row written"), "{err}");
         assert!(
-            records_get(&pool, Sqlite, "at://a/c/1")
+            records_get(&pool, Sqlite, "at://did:plc:a/c/1")
                 .await
                 .unwrap()
                 .is_some(),
@@ -1959,19 +1549,36 @@ mod tests {
     #[tokio::test]
     async fn a_mirror_delete_that_cannot_write_reports_it() {
         let pool = crate::test_support::memory_pool().await;
-        let err = mirror_network_delete(&pool, Sqlite, "at://a/c/1")
-            .await
-            .unwrap_err();
+        let err = mirror_network_delete(
+            &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+            "at://did:plc:a/c/1",
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, RecordsError::Database(_)), "{err}");
     }
 
     #[tokio::test]
     async fn index_delete_reports_whether_a_row_went() {
         let pool = seeded_pool().await;
-        assert!(index_delete(&pool, Sqlite, "at://a/c/1").await.unwrap());
-        assert!(!index_delete(&pool, Sqlite, "at://a/c/1").await.unwrap());
         assert!(
-            records_get(&pool, Sqlite, "at://a/c/1")
+            index_delete(
+                &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+                "at://did:plc:a/c/1"
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !index_delete(
+                &crate::record_store::RecordStore::new(pool.clone(), Sqlite),
+                "at://did:plc:a/c/1"
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            records_get(&pool, Sqlite, "at://did:plc:a/c/1")
                 .await
                 .unwrap()
                 .is_none()
@@ -2587,73 +2194,47 @@ mod tests {
         }
     }
 
-    /// The default listing (no custom sort) reads
-    /// `idx_records_collection_created_at_uri` in order, on both backends.
     #[tokio::test]
-    async fn the_default_records_listing_walks_the_collection_created_at_index() {
-        let spec = RecordsQuery {
-            collection: "app.test.post".into(),
-            did: None,
-            filter: None,
-            sort: None,
-            limit: Some(50),
-            cursor: Some(crate::db::encode_cursor(
-                "2026-01-01T00:00:00+00:00",
-                "at://did:plc:a/app.test.post/1",
-            )),
-        };
-        let (sql, binds) = records_query_sql(&spec, Sqlite).unwrap();
-        assert_eq!(binds.len(), 4, "the collection and three cursor values");
-        let sql = crate::test_support::inline_binds(
-            &sql,
-            &[
-                "'app.test.post'",
-                "'2026-01-01T00:00:00+00:00'",
-                "'2026-01-01T00:00:00+00:00'",
-                "'at://did:plc:a/app.test.post/1'",
-                "50",
-            ],
-        );
+    async fn the_legacy_record_table_is_gone() {
+        const INDEXES: [&str; 4] = [
+            "idx_records_v2_identity",
+            "idx_records_v2_collection_indexed_at",
+            "idx_records_v2_collection_created_at_id",
+            "idx_record_refs_v2_target",
+        ];
         for (pool, backend) in crate::test_support::test_pools().await {
-            let plan = crate::test_support::query_plan(&pool, backend, &sql).await;
-            crate::test_support::assert_index_without_sort(
-                &plan,
-                "idx_records_collection_created_at_uri",
-                backend,
+            assert!(
+                !crate::record_store::upgrade::legacy_tables_present(&pool, backend)
+                    .await
+                    .expect("check"),
+                "{backend:?}"
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn the_superseded_record_indexes_are_gone() {
-        for (pool, backend) in crate::test_support::test_pools().await {
             let sql = match backend {
                 Sqlite => {
-                    "SELECT name FROM sqlite_master WHERE type = 'index' \
-                     AND name IN ('idx_records_collection', 'idx_records_created_at_uri')"
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_record%' AND name NOT LIKE 'idx_record_tombstones%'"
                 }
                 Postgres => {
-                    "SELECT indexname FROM pg_indexes \
-                     WHERE indexname IN ('idx_records_collection', 'idx_records_created_at_uri')"
+                    "SELECT CAST(indexname AS TEXT) FROM pg_indexes \
+                     WHERE schemaname = current_schema() AND indexname LIKE 'idx_record%' AND indexname NOT LIKE 'idx_record_tombstones%'"
                 }
             };
-            let left: Vec<(String,)> = crate::db::query_as(sql)
+            let present: Vec<String> = crate::db::query_as::<(String,)>(sql)
                 .fetch_all(&pool)
                 .await
-                .expect("list indexes");
-            assert!(left.is_empty(), "{backend:?} still has {left:?}");
-
-            if backend == Postgres {
-                // A failed CONCURRENTLY build leaves an index behind marked invalid.
-                let (valid,): (bool,) = crate::db::query_as(
-                    "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
-                     WHERE c.relname = 'idx_records_collection_created_at_uri'",
-                )
-                .fetch_one(&pool)
-                .await
-                .expect("new index exists");
-                assert!(valid);
+                .expect("list indexes")
+                .into_iter()
+                .map(|(name,)| name)
+                .collect();
+            for index in INDEXES {
+                assert!(
+                    present.iter().any(|p| p == index),
+                    "{backend:?} lacks {index}: {present:?}"
+                );
             }
+            assert!(
+                present.iter().all(|p| p.contains("_v2_")),
+                "{backend:?} still has a legacy index: {present:?}"
+            );
         }
     }
 }

@@ -293,7 +293,7 @@ async fn account_purged(
     })
     .await;
     let purged = match tombstoned {
-        Ok(()) => crate::tombstones::purge_did_records(&state.db, backend, did, None).await,
+        Ok(()) => crate::tombstones::purge_did_records(&state.records, did, None).await,
         Err(e) => Err(e),
     };
     match purged {
@@ -317,15 +317,7 @@ async fn account_purged(
 
 /// Whether this instance holds any network records for `did`.
 async fn holds_records(state: &AppState, did: &str) -> Result<bool, sqlx::Error> {
-    let sql = adapt_sql(
-        "SELECT uri FROM happyview_records WHERE did = ? AND indexed_at IS NOT NULL LIMIT 1",
-        state.db_backend,
-    );
-    let held: Option<(String,)> = crate::db::query_as(&sql)
-        .bind(did)
-        .fetch_optional(&state.db)
-        .await?;
-    Ok(held.is_some())
+    state.records.holds_network_records(did, None).await
 }
 
 #[derive(serde::Deserialize)]
@@ -461,13 +453,8 @@ async fn repo_resynced(
         .filter(|c| c.as_str() != LEXICON_SCHEMA_COLLECTION)
         .cloned()
         .collect();
-    match crate::tombstones::purge_did_records(
-        &state.db,
-        state.db_backend,
-        did,
-        Some(collections.as_slice()),
-    )
-    .await
+    match crate::tombstones::purge_did_records(&state.records, did, Some(collections.as_slice()))
+        .await
     {
         Ok(0) => ApplyOutcome::Applied,
         Ok(purged) => {
@@ -1133,8 +1120,9 @@ mod tests {
         let (create, drop): (Vec<String>, Vec<String>) = match state.db_backend {
             crate::db::DatabaseBackend::Sqlite => (
                 vec![format!(
-                    "CREATE TRIGGER {name} BEFORE DELETE ON happyview_records \
-                     WHEN OLD.did = '{did}' BEGIN SELECT RAISE(ABORT, 'refused'); END"
+                    "CREATE TRIGGER {name} BEFORE DELETE ON happyview_records_v2 \
+                     WHEN OLD.did_id = (SELECT id FROM happyview_dids WHERE did = '{did}') \
+                     BEGIN SELECT RAISE(ABORT, 'refused'); END"
                 )],
                 vec![format!("DROP TRIGGER {name}")],
             ),
@@ -1142,16 +1130,17 @@ mod tests {
                 vec![
                     format!(
                         "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
-                         BEGIN IF OLD.did = '{did}' THEN RAISE EXCEPTION 'refused'; END IF; \
+                         BEGIN IF OLD.did_id = (SELECT id FROM happyview_dids WHERE did = '{did}') \
+                         THEN RAISE EXCEPTION 'refused'; END IF; \
                          RETURN OLD; END $$"
                     ),
                     format!(
-                        "CREATE TRIGGER {name} BEFORE DELETE ON happyview_records \
+                        "CREATE TRIGGER {name} BEFORE DELETE ON happyview_records_v2 \
                          FOR EACH ROW EXECUTE FUNCTION {name}()"
                     ),
                 ],
                 vec![
-                    format!("DROP TRIGGER {name} ON happyview_records"),
+                    format!("DROP TRIGGER {name} ON happyview_records_v2"),
                     format!("DROP FUNCTION {name}()"),
                 ],
             ),

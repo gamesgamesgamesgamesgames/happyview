@@ -5,10 +5,8 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::auth::Claims;
 use crate::auth::ServiceAuthClaims;
-use crate::db::{adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::lexicon::ProcedureAction;
-use crate::record_refs::sync_refs;
 use crate::repo;
 
 /// Resolve where a put/delete writes in the local index.
@@ -261,33 +259,25 @@ async fn handle_create_record(
             pds_result.get("uri").and_then(|v| v.as_str()),
             pds_result.get("cid").and_then(|v| v.as_str()),
         ) {
-            let backend = state.db_backend;
             let rkey = uri.split('/').next_back().unwrap_or_default();
-            let record_str = serde_json::to_string(&record).unwrap_or_default();
-            let sql = adapt_sql(
-                r#"
-                INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (uri) DO UPDATE
-                    SET record = EXCLUDED.record,
-                        cid = EXCLUDED.cid, indexed_at = NULL
-                "#,
-                backend,
-            );
-            let now = now_rfc3339();
-            let _ = crate::db::query(&sql)
-                .bind(uri)
-                .bind(claims.did())
-                .bind(collection)
-                .bind(rkey)
-                .bind(&record_str)
-                .bind(cid)
-                .bind(crate::db::NO_INDEXED_AT)
-                .bind(&now)
-                .execute(&state.db)
-                .await;
-
-            let _ = sync_refs(&state.db, uri, collection, &record, backend).await;
+            let prepared = crate::record_store::PreparedRecord {
+                did: claims.did().to_string(),
+                collection: collection.to_string(),
+                rkey: rkey.to_string(),
+                record_json: serde_json::to_string(&record).unwrap_or_default(),
+                cid: cid.to_string(),
+                rev: None,
+            };
+            if let Err(e) = state
+                .records
+                .write_local(crate::record_store::WriteKind::Echoed, &prepared)
+                .await
+            {
+                state
+                    .records
+                    .report_index_failure(&prepared.uri(), &e)
+                    .await;
+            }
         }
 
         Ok((
@@ -349,32 +339,21 @@ async fn handle_put_record(
             .and_then(|v| v.as_str())
             .unwrap_or_default();
 
-        let backend = state.db_backend;
-        let record_str = serde_json::to_string(&record).unwrap_or_default();
-        let now = now_rfc3339();
-        let sql = adapt_sql(
-            r#"
-            INSERT INTO happyview_records (uri, did, collection, rkey, record, cid, indexed_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (uri) DO UPDATE
-                SET record = EXCLUDED.record,
-                    cid = EXCLUDED.cid, indexed_at = NULL
-            "#,
-            backend,
-        );
-        let _ = crate::db::query(&sql)
-            .bind(&uri)
-            .bind(claims.did())
-            .bind(collection)
-            .bind(&rkey)
-            .bind(&record_str)
-            .bind(cid)
-            .bind(crate::db::NO_INDEXED_AT)
-            .bind(&now)
-            .execute(&state.db)
-            .await;
-
-        let _ = sync_refs(&state.db, &uri, collection, &record, backend).await;
+        let prepared = crate::record_store::PreparedRecord {
+            did: claims.did().to_string(),
+            collection: collection.to_string(),
+            rkey: rkey.clone(),
+            record_json: serde_json::to_string(&record).unwrap_or_default(),
+            cid: cid.to_string(),
+            rev: None,
+        };
+        if let Err(e) = state
+            .records
+            .write_local(crate::record_store::WriteKind::Echoed, &prepared)
+            .await
+        {
+            state.records.report_index_failure(&uri, &e).await;
+        }
 
         Ok((
             StatusCode::OK,
@@ -418,9 +397,9 @@ async fn handle_delete_record(
             .await
             .map_err(|e| AppError::Internal(format!("failed to read PDS response: {e}")))?;
 
-        let backend = state.db_backend;
-        let sql = adapt_sql("DELETE FROM happyview_records WHERE uri = ?", backend);
-        let _ = crate::db::query(&sql).bind(&uri).execute(&state.db).await;
+        if let Err(e) = state.records.delete(&uri).await {
+            state.records.report_index_failure(&uri, &e).await;
+        }
 
         Ok((
             StatusCode::OK,
