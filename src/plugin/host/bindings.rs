@@ -32,7 +32,7 @@ pub struct PluginState {
     /// `host_caller_xrpc_query`, which a session-less query, record-event or
     /// label script can also reach.
     pub caller: Option<Arc<crate::plugin::caller::CallerSession>>,
-    /// The script run this instance is executing, for the four imports that
+    /// The script run this instance is executing, for the five imports that
     /// act on it. `None` for a library or auth instance, which is what makes
     /// those imports refuse rather than act on a run they are not inside.
     pub script_run: Option<super::script::ScriptRun>,
@@ -1096,6 +1096,24 @@ pub(crate) fn define_host_functions(
         })
     })?;
 
+    imports.define(
+        "host_module_resolve",
+        |caller, (req_ptr, req_len): (i32, i32)| {
+            Box::pin(async move {
+                host_script_impl(
+                    caller,
+                    "host_module_resolve",
+                    req_ptr,
+                    req_len,
+                    |_state, run, spec: happyview_plugin_sdk::wire::ModuleResolve| async move {
+                        super::script::module_resolve(&run, spec)
+                    },
+                )
+                .await
+            })
+        },
+    )?;
+
     Ok(imports.wrapped)
 }
 
@@ -1160,7 +1178,7 @@ fn resume_guest_deadline(caller: &mut wasmtime::Caller<'_, PluginState>) {
     caller.as_context_mut().set_epoch_deadline(remaining);
 }
 
-/// One entry point for the four imports that act on the script run in
+/// One entry point for the five imports that act on the script run in
 /// progress. The capability is checked before the run, so a plugin that never
 /// asked for `script:host` hears about the grant rather than about a run it
 /// could not have reached anyway.

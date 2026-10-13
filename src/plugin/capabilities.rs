@@ -255,7 +255,7 @@ impl PluginCapability {
             WasiRandom => "Read secure random numbers.",
             WasiStdio => "Write to this instance's plugin log.",
             ScriptHost => {
-                "Log, report progress, check for a stop request and wait on behalf of the script run it is inside; the host supplies the run's identity and job."
+                "Log, report progress, check for a stop request, wait, and load the project's own modules on behalf of the script run it is inside; the host supplies the run's identity, job and files."
             }
         }
     }
@@ -535,6 +535,10 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
     },
     Requirement {
         import: "host_job_wait",
+        any_of: &[PluginCapability::ScriptHost],
+    },
+    Requirement {
+        import: "host_module_resolve",
         any_of: &[PluginCapability::ScriptHost],
     },
 ];
@@ -838,6 +842,7 @@ mod tests {
             "host_job_progress",
             "host_job_should_stop",
             "host_job_wait",
+            "host_module_resolve",
         ] {
             // `None` is only right for the free imports.
             assert_eq!(
@@ -1299,7 +1304,7 @@ mod tests {
         assert!(err.contains("wasi_snapshot_preview2"), "{err}");
     }
 
-    /// The four `env` imports only an interpreter reaches share one Low
+    /// The five `env` imports only an interpreter reaches share one Low
     /// capability: each acts on the run it is inside, and the host supplies
     /// the identity and the job id.
     #[test]
@@ -1309,6 +1314,7 @@ mod tests {
             "host_job_progress",
             "host_job_should_stop",
             "host_job_wait",
+            "host_module_resolve",
         ] {
             let req = requirement_for_import(import).expect(import);
             assert_eq!(req.any_of, &[PluginCapability::ScriptHost], "{import}");

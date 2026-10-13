@@ -671,7 +671,7 @@ impl PluginExecutor {
     /// Sibling of [`instantiate_library`](Self::instantiate_library) for an
     /// interpreter: the same call context, session and depth, so
     /// `host_call_library` forwards the same identity from a script as from
-    /// anywhere else, plus the run the four `script:host` imports act on.
+    /// anywhere else, plus the run the five `script:host` imports act on.
     ///
     /// No plugin secrets are loaded. An interpreter has no configuration of
     /// its own — `ctx.env` is the script's and travels in the input — and a
@@ -717,6 +717,7 @@ impl PluginExecutor {
             trigger_id: input.context.trigger.clone(),
             caller_did: input.context.caller_did.clone(),
             job_id: input.context.job.as_ref().map(|job| job.id.clone()),
+            ..Default::default()
         });
         Ok(inst)
     }

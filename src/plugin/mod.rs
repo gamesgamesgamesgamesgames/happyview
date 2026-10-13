@@ -17,6 +17,7 @@ pub mod secrets;
 mod types;
 
 pub use executor::{ExecutionError, PluginExecutor, PluginInstance};
+pub use host::script::ModuleScope;
 pub use memory::{MemoryError, PluginEnvelopeError, PluginResponse};
 pub use runtime::{
     DEFAULT_SCRIPT_MEMORY_BYTES, EPOCH_TICK, GuestDeadline, LIBRARY_MEMORY_CEILING, MemoryLimiter,
@@ -25,7 +26,7 @@ pub use runtime::{
 pub use types::*;
 
 /// The interpreter contract, under the host's names: what `execute` and
-/// `validate` take and return, and what the four `script:host` imports
+/// `validate` take and return, and what the five `script:host` imports
 /// receive. Defined in the SDK the interpreter builds against, so the two
 /// sides cannot drift.
 pub use happyview_plugin_sdk::wire::{
