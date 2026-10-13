@@ -550,6 +550,32 @@ impl PluginExecutor {
         if depth >= MAX_LIBRARY_CALL_DEPTH {
             return Err(ExecutionError::DepthExceeded);
         }
+        // A test run sees every library call, and answers a mocked namespace
+        // from data without instantiating the library at all. This is the one
+        // dispatch path for a library call, so a mock cannot be bypassed.
+        if let Some(test) = self.app_state.as_ref().and_then(|state| state.test.clone())
+            && let Some(namespace) = self
+                .registry
+                .get(lib_id)
+                .await
+                .and_then(|plugin| plugin.namespace().map(str::to_string))
+        {
+            test.record_call(
+                &namespace,
+                crate::plugin::TestCall {
+                    method: function.to_string(),
+                    args: serde_json::Value::Array(args.to_vec()),
+                },
+            );
+            let answer = test.mocks().lock().unwrap().answer(&namespace, function);
+            if let Some(answer) = answer {
+                return answer.map_err(|e| ExecutionError::PluginError {
+                    code: e.code,
+                    message: e.message,
+                    retryable: false,
+                });
+            }
+        }
         let mut inst = self.instantiate_library(lib_id, ctx, caller, depth).await?;
         let value = inst.call_library_function(function, args, ctx).await?;
         inst.settle_pending_calls(self.script_wall_clock()).await;

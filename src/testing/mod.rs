@@ -5,6 +5,7 @@
 pub mod env;
 pub mod fake_pds;
 pub mod harness;
+pub mod mocks;
 
 pub use fake_pds::{FakePds, FakePdsError};
 pub use harness::{ForgedCaller, TestHarness, TestHostError};

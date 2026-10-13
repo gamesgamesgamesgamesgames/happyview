@@ -229,3 +229,98 @@ async fn a_spinning_test_file_times_out_at_its_own_budget() {
     );
     file.finish().await;
 }
+
+/// A library with no module: a mocked call never instantiates it, and any
+/// call that does fails, which is what tells the two apart.
+async fn install_library(registry: &PluginRegistry, id: &str, namespace: &str) {
+    let manifest: happyview::plugin::PluginManifest = serde_json::from_value(json!({
+        "id": id, "name": id, "version": "1.0.0", "api_version": "2",
+        "plugin_type": "library", "namespace": namespace, "capabilities": [],
+    }))
+    .unwrap();
+    registry
+        .install(happyview::plugin::LoadedPlugin {
+            info: manifest.clone().into(),
+            source: happyview::plugin::PluginSource::File { path: id.into() },
+            wasm_bytes: vec![],
+            manifest: Some(manifest),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_mocked_namespace_answers_from_data_and_records_the_call() {
+    let Some(env) = env().await else { return };
+    install_library(&env.base.plugin_registry, "fake-http", "http").await;
+    let file = env.file_state("src/lib/a.test.echo").await.unwrap();
+    let got = answers(
+        &file.state,
+        &input(
+            "test",
+            json!([
+                {"import": "mock", "request": {"namespace": "http", "responses": {"get": {"status": 200}}}},
+                {"import": "mock", "request": {"namespace": "nope", "responses": {}}},
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(got[0], json!({"ok": null}));
+    assert_eq!(got[1]["error"]["code"], "BAD_INPUT", "{got:?}");
+
+    let answer = file
+        .state
+        .plugin_executor()
+        .call_library(
+            "fake-http",
+            "get",
+            &[json!("https://x")],
+            &Default::default(),
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer, json!({"status": 200}));
+    assert_eq!(file.harness.calls("http")[0].args, json!(["https://x"]));
+    file.finish().await;
+}
+
+/// The mock lives on the file's harness, so a state without one dispatches
+/// to the real library even while a test file has the same namespace mocked.
+#[tokio::test]
+async fn a_production_state_runs_the_real_library_for_a_mocked_namespace() {
+    let Some(env) = env().await else { return };
+    install_library(&env.base.plugin_registry, "fake-http", "http").await;
+    let file = env.file_state("src/lib/a.test.echo").await.unwrap();
+    let got = answers(
+        &file.state,
+        &input(
+            "test",
+            json!([
+                {"import": "mock", "request": {"namespace": "http", "responses": {"get": {"status": 200}}}},
+            ]),
+        ),
+    )
+    .await;
+    assert_eq!(got[0], json!({"ok": null}));
+
+    assert!(env.base.test.is_none());
+    let err = env
+        .base
+        .plugin_executor()
+        .call_library(
+            "fake-http",
+            "get",
+            &[json!("https://x")],
+            &Default::default(),
+            0,
+        )
+        .await
+        .expect_err("a moduleless library cannot answer once it is instantiated");
+    assert!(
+        !matches!(err, ExecutionError::PluginError { .. }),
+        "expected an instantiation failure, got {err:?}"
+    );
+    assert!(file.harness.calls("http").is_empty());
+    file.finish().await;
+}

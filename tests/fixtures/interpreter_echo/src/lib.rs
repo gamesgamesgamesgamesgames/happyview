@@ -94,6 +94,7 @@ extern "C" {
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "env")]
 extern "C" {
+    fn host_test_mock(req_ptr: i32, req_len: i32) -> i64;
     fn host_test_calls(req_ptr: i32, req_len: i32) -> i64;
     fn host_test_pds_writes(req_ptr: i32, req_len: i32) -> i64;
     fn host_test_report(req_ptr: i32, req_len: i32) -> i64;
@@ -264,6 +265,7 @@ mod imports {
 
     pub fn test_import(name: &str, request: &Value) -> Value {
         let import: unsafe extern "C" fn(i32, i32) -> i64 = match name {
+            "mock" => host_test_mock,
             "calls" => host_test_calls,
             "pds_writes" => host_test_pds_writes,
             "report" => host_test_report,

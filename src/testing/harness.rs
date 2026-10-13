@@ -1,16 +1,18 @@
-//! What one test file's run carries: its identity, its PDS and everything it
-//! has observed and reported.
+//! What one test file's run carries: its identity, its PDS, its mocks and
+//! everything it has observed and reported.
 
 use std::sync::{Arc, Mutex};
 
 use crate::plugin::{TestCall, TestReport};
 
 use super::fake_pds::FakePds;
+use super::mocks::Mocks;
 
 #[derive(Debug)]
 pub struct TestHarness {
     file: String,
     pds: Arc<FakePds>,
+    mocks: Mutex<Mocks>,
     calls: Mutex<Vec<(String, TestCall)>>,
     reports: Mutex<Vec<TestReport>>,
     failures: Mutex<Vec<String>>,
@@ -21,6 +23,7 @@ impl TestHarness {
         Self {
             file: file.into(),
             pds: Arc::new(FakePds::new()),
+            mocks: Mutex::new(Mocks::default()),
             calls: Mutex::new(Vec::new()),
             reports: Mutex::new(Vec::new()),
             failures: Mutex::new(Vec::new()),
@@ -37,11 +40,16 @@ impl TestHarness {
         &self.pds
     }
 
+    pub(crate) fn mocks(&self) -> &Mutex<Mocks> {
+        &self.mocks
+    }
+
     /// File one test's outcome. The path is the file this harness runs, not
     /// what the guest said, so a report cannot land under another file.
     ///
     /// Calls and PDS writes are what a test observes, so each test starts
     /// with none: they are cleared here, at the end of the previous one.
+    /// Mocks are configuration and stay for the rest of the file.
     pub fn report(&self, mut report: TestReport) {
         report.path = self.file.clone();
         self.reports.lock().unwrap().push(report);
