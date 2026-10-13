@@ -184,7 +184,7 @@ Returns `400` if the job is not currently running, or `404` if the job ID is not
 POST /admin/backfill/{id}/resume
 ```
 
-Resume a paused backfill job, or a failed replay job. The job status transitions back to `running`, its `error` is cleared, and processing continues from where it left off. A replay job carries on from the last plan entry it finished, so a job that failed on an archive outage, or after 16 failed blocks in a row, doesn't start over. A failed crawl job can't be resumed and returns `400`.
+Resume a paused backfill job, or a failed replay job. The job status transitions back to `running`, its `error` is cleared, and processing continues from where it left off. A replay job carries on from the last plan entry it finished, so a job that failed on an archive outage, or after 16 failed blocks in a row, doesn't start over. A failed crawl job can't be resumed and returns `400`. So does a failed replay job of specific accounts whose account list is gone (it goes when the job's details are cleared), and a job that another request resumed first. A replay job that failed because its error log is full (10,000 failures) fails again when resumed; start a new backfill instead.
 
 ```sh tab="cURL" tab-group="language"
 curl -X POST "http://127.0.0.1:3000/admin/backfill/$JOB_ID/resume" -H "$AUTH"
