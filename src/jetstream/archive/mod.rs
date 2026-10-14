@@ -26,6 +26,12 @@ pub const MAX_THROTTLED_FOR: std::time::Duration = std::time::Duration::from_sec
 /// before resuming without it.
 pub const GAP_PLAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How far back from the archive's tip a network replay sweeps account and
+/// sync markers: three of Jetstream's default 4-hour compaction intervals.
+/// Below that, compaction has already removed what a deleted account or a
+/// `#sync` supersedes.
+pub const DEFAULT_MARKER_TAIL: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
 /// Where a backfill job's records come from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceChoice {
@@ -68,6 +74,26 @@ pub fn parse_concurrency(raw: Option<&str>) -> usize {
                 "BACKFILL_REPLAY_CONCURRENCY must be a positive integer; using the default"
             );
             DEFAULT_CONCURRENCY
+        }
+    }
+}
+
+/// `BACKFILL_REPLAY_MARKER_TAIL_HOURS`: whole hours, `0` for the whole
+/// range. Unset, blank or anything else (logged) means
+/// `DEFAULT_MARKER_TAIL`.
+pub fn parse_marker_tail(raw: Option<&str>) -> std::time::Duration {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_MARKER_TAIL;
+    };
+    match raw.parse::<u64>() {
+        Ok(hours) => std::time::Duration::from_secs(hours.saturating_mul(60 * 60)),
+        Err(_) => {
+            tracing::warn!(
+                value = raw,
+                default = DEFAULT_MARKER_TAIL.as_secs() / 3600,
+                "BACKFILL_REPLAY_MARKER_TAIL_HOURS must be a whole number of hours; using the default"
+            );
+            DEFAULT_MARKER_TAIL
         }
     }
 }
@@ -128,6 +154,10 @@ pub struct ArchiveConfig {
     /// before the live consumer resumes without it. `GAP_PLAN_TIMEOUT` in
     /// production; tests shorten it.
     pub gap_plan_timeout: std::time::Duration,
+    /// `BACKFILL_REPLAY_MARKER_TAIL_HOURS`: how far back from the archive's
+    /// tip a network replay sweeps account and sync markers; zero sweeps the
+    /// job's whole range. `DEFAULT_MARKER_TAIL` unless set.
+    pub marker_tail: std::time::Duration,
 }
 
 impl Default for ArchiveConfig {
@@ -142,6 +172,7 @@ impl Default for ArchiveConfig {
             retry_unit: std::time::Duration::from_secs(1),
             max_throttled_for: MAX_THROTTLED_FOR,
             gap_plan_timeout: GAP_PLAN_TIMEOUT,
+            marker_tail: DEFAULT_MARKER_TAIL,
         }
     }
 }
@@ -164,6 +195,7 @@ impl ArchiveConfig {
             retry_unit: std::time::Duration::from_secs(1),
             max_throttled_for: MAX_THROTTLED_FOR,
             gap_plan_timeout: GAP_PLAN_TIMEOUT,
+            marker_tail: parse_marker_tail(var("BACKFILL_REPLAY_MARKER_TAIL_HOURS").as_deref()),
         }
     }
 }
@@ -211,6 +243,19 @@ mod tests {
         assert_eq!(parse_concurrency(Some("lots")), 8);
         assert_eq!(parse_concurrency(Some("3")), 3);
         assert_eq!(parse_concurrency(Some("1000")), 64);
+    }
+
+    #[test]
+    fn the_marker_tail_defaults_to_twelve_hours() {
+        let hours = |h: u64| std::time::Duration::from_secs(h * 60 * 60);
+        assert_eq!(parse_marker_tail(None), hours(12));
+        assert_eq!(parse_marker_tail(Some(" ")), hours(12));
+        assert_eq!(parse_marker_tail(Some("-1")), hours(12));
+        assert_eq!(parse_marker_tail(Some("1.5")), hours(12));
+        assert_eq!(parse_marker_tail(Some("soon")), hours(12));
+        assert_eq!(parse_marker_tail(Some("0")), std::time::Duration::ZERO);
+        assert_eq!(parse_marker_tail(Some(" 24 ")), hours(24));
+        assert_eq!(ArchiveConfig::default().marker_tail, hours(12));
     }
 
     #[test]

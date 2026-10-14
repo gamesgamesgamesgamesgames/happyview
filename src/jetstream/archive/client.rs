@@ -1,5 +1,5 @@
 //! HTTP client for the Jetstream v2 archive: `planSnapshot`, `getSegment`,
-//! `getBlock`. Only these requests carry `JETSTREAM_API_KEY`. Every body byte
+//! `getBlock`, `listSegments`. Only these requests carry `JETSTREAM_API_KEY`. Every body byte
 //! received is counted, so a job can report what it downloaded (Bluesky
 //! meters Replay by key; spec, "Bluesky's answer on replay metering"), and
 //! charged to the shared `BytePacer`, so requests keep within the archive's
@@ -22,6 +22,9 @@ use crate::jetstream::config::Endpoint;
 pub const PLAN_PATH: &str = "/xrpc/network.bsky.jetstream.planSnapshot";
 pub const SEGMENT_PATH: &str = "/xrpc/network.bsky.jetstream.getSegment";
 pub const BLOCK_PATH: &str = "/xrpc/network.bsky.jetstream.getBlock";
+pub const LIST_SEGMENTS_PATH: &str = "/xrpc/network.bsky.jetstream.listSegments";
+/// Segments per `listSegments` page.
+const LIST_SEGMENTS_LIMIT: &str = "1000";
 pub const SEGMENT_PART: u64 = 16 << 20;
 pub const MAX_SEGMENT_BYTES: u64 = 1 << 30;
 pub const MAX_BLOCK_BYTES: usize = 64 << 20;
@@ -78,6 +81,31 @@ pub struct PlanEntry {
     pub mode: PlanMode,
     #[serde(default)]
     pub blocks: Vec<BlockRange>,
+}
+
+/// A sealed segment, as `listSegments` describes it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentInfo {
+    pub name: String,
+    pub index: u64,
+    pub size_bytes: u64,
+    pub checksum: String,
+    pub event_count: u64,
+    pub min_seq: u64,
+    pub max_seq: u64,
+    /// Unix microseconds.
+    pub min_witnessed_at: i64,
+    /// Unix microseconds.
+    pub max_witnessed_at: i64,
+}
+
+#[derive(Deserialize)]
+struct SegmentPage {
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    segments: Vec<SegmentInfo>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -336,6 +364,39 @@ impl ArchiveClient {
         serde_json::from_slice(&body).map_err(|e| {
             ArchiveError::Transport(format!("planSnapshot answered unreadable JSON: {e}"))
         })
+    }
+
+    /// Every sealed segment, in the archive's order, following
+    /// `listSegments`' cursor to the last page. A 404 or 501 is `NoArchive`.
+    pub async fn list_segments(&self) -> Result<Vec<SegmentInfo>, ArchiveError> {
+        let url = format!("{}{LIST_SEGMENTS_PATH}", self.base);
+        let mut segments = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let body = self
+                .fetch(true, MAX_PLAN_BYTES, || {
+                    let request = self.http.get(&url).query(&[("limit", LIST_SEGMENTS_LIMIT)]);
+                    match &cursor {
+                        Some(cursor) => request.query(&[("cursor", cursor)]),
+                        None => request,
+                    }
+                })
+                .await?;
+            let page: SegmentPage = serde_json::from_slice(&body).map_err(|e| {
+                ArchiveError::Transport(format!("listSegments answered unreadable JSON: {e}"))
+            })?;
+            segments.extend(page.segments);
+            match page.cursor.filter(|c| !c.is_empty()) {
+                // A cursor that doesn't move would page forever.
+                Some(next) if cursor.as_ref() == Some(&next) => {
+                    return Err(ArchiveError::Transport(format!(
+                        "listSegments repeated its cursor {next:?}"
+                    )));
+                }
+                Some(next) => cursor = Some(next),
+                None => return Ok(segments),
+            }
+        }
     }
 
     /// One block's zstd frame.
@@ -604,7 +665,9 @@ async fn status_error(response: reqwest::Response) -> ArchiveError {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::matchers::{
+        body_json, header, method, path, query_param, query_param_is_missing,
+    };
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     fn client(server: &MockServer, key: Option<&str>) -> ArchiveClient {
@@ -976,6 +1039,115 @@ mod tests {
             vec![7u8; 1000]
         );
         assert_eq!(client.bytes_downloaded(), 1000);
+    }
+
+    fn listed(
+        name: &str,
+        index: u64,
+        seqs: (u64, u64),
+        witnessed: (i64, i64),
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "name": name, "index": index, "sizeBytes": 1000, "checksum": "00112233aabbccdd",
+            "eventCount": seqs.1 - seqs.0 + 1, "minSeq": seqs.0, "maxSeq": seqs.1,
+            "minWitnessedAt": witnessed.0, "maxWitnessedAt": witnessed.1,
+        })
+    }
+
+    #[tokio::test]
+    async fn list_segments_pages_through_the_archive() {
+        let server = MockServer::start().await;
+        let first = serde_json::json!({
+            "cursor": "c1",
+            "segments": [listed("seg_0000000001.jss", 1, (1, 200), (10, 20))],
+        });
+        let second = serde_json::json!({
+            "segments": [listed("seg_0000000002.jss", 2, (201, 300), (30, 40))],
+        });
+        let first_len = serde_json::to_vec(&first).unwrap().len();
+        let second_len = serde_json::to_vec(&second).unwrap().len();
+        Mock::given(method("GET"))
+            .and(path(LIST_SEGMENTS_PATH))
+            .and(query_param("limit", "1000"))
+            .and(query_param("cursor", "c1"))
+            .and(header("authorization", "Bearer k3y"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(second))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(LIST_SEGMENTS_PATH))
+            .and(query_param("limit", "1000"))
+            .and(query_param_is_missing("cursor"))
+            .and(header("authorization", "Bearer k3y"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client(&server, Some("k3y"));
+        let segments = client.list_segments().await.unwrap();
+        assert_eq!(
+            segments,
+            vec![
+                SegmentInfo {
+                    name: "seg_0000000001.jss".into(),
+                    index: 1,
+                    size_bytes: 1000,
+                    checksum: "00112233aabbccdd".into(),
+                    event_count: 200,
+                    min_seq: 1,
+                    max_seq: 200,
+                    min_witnessed_at: 10,
+                    max_witnessed_at: 20,
+                },
+                SegmentInfo {
+                    name: "seg_0000000002.jss".into(),
+                    index: 2,
+                    size_bytes: 1000,
+                    checksum: "00112233aabbccdd".into(),
+                    event_count: 100,
+                    min_seq: 201,
+                    max_seq: 300,
+                    min_witnessed_at: 30,
+                    max_witnessed_at: 40,
+                },
+            ]
+        );
+        assert_eq!(client.bytes_downloaded(), (first_len + second_len) as u64);
+    }
+
+    #[tokio::test]
+    async fn a_404_or_501_segment_list_means_no_archive() {
+        for status in [404, 501] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(LIST_SEGMENTS_PATH))
+                .respond_with(ResponseTemplate::new(status))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert_eq!(
+                client(&server, None).list_segments().await,
+                Err(ArchiveError::NoArchive(status))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_segment_list_whose_cursor_repeats_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(LIST_SEGMENTS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "cursor": "again",
+                "segments": [listed("seg_0000000001.jss", 1, (1, 200), (10, 20))],
+            })))
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client(&server, None).list_segments().await,
+            Err(ArchiveError::Transport(_))
+        ));
     }
 
     /// Serves `generations[n]` by Range, honouring If-Range like Go's

@@ -8,7 +8,8 @@
 //! test calls `kick`. Events pushed later reach the next connection.
 //!
 //! The mock also serves a sealed archive (`planSnapshot`, `getSegment`,
-//! `getBlock`), whose events are scripted with `seal`.
+//! `getBlock`, and `listSegments` once `list_segments` is called), whose
+//! events are scripted with `seal`.
 //!
 //! The dictionaries in `tests/fixtures/jetstream/` are from
 //! bluesky-social/jetstream v0.3.10 (`internal/subscribe/dictionaries/`),
@@ -357,6 +358,9 @@ struct Inner {
     authorizations: Vec<(String, Option<String>)>,
     /// Segments whose `getSegment` answer waits for `release_segment`.
     held_segments: HashMap<String, Arc<tokio::sync::Notify>>,
+    /// `listSegments`' page size; `None` answers 404.
+    segment_list_page: Option<usize>,
+    segment_list_requests: Vec<Option<String>>,
 }
 
 struct Shared {
@@ -404,6 +408,10 @@ impl MockJetstream {
             )
             .route("/xrpc/network.bsky.jetstream.getSegment", get(get_segment))
             .route("/xrpc/network.bsky.jetstream.getBlock", get(get_block))
+            .route(
+                "/xrpc/network.bsky.jetstream.listSegments",
+                get(list_segments),
+            )
             .with_state(Arc::clone(&shared));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -565,6 +573,17 @@ impl MockJetstream {
             // waiting yet takes this permit.
             notify.notify_one();
         }
+    }
+
+    /// Serve `listSegments`, `page` segments a page. Until this is called it
+    /// answers 404.
+    pub fn list_segments(&self, page: usize) {
+        self.shared.lock().segment_list_page = Some(page.max(1));
+    }
+
+    /// Each `listSegments` request's cursor.
+    pub fn segment_list_requests(&self) -> Vec<Option<String>> {
+        self.shared.lock().segment_list_requests.clone()
     }
 
     pub fn plan_requests(&self) -> Vec<Value> {
@@ -975,6 +994,51 @@ async fn plan_snapshot(
         "stats": stats,
     }))
     .into_response()
+}
+
+async fn list_segments(
+    State(shared): State<Arc<Shared>>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let mut inner = shared.lock();
+    inner
+        .authorizations
+        .push(("list".into(), authorization(&headers)));
+    let cursor = query.get("cursor").cloned();
+    inner.segment_list_requests.push(cursor.clone());
+    if let Some(response) = throttled(&mut inner) {
+        return response;
+    }
+    let Some(page) = inner.segment_list_page else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let start = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+    let listed: Vec<Value> = inner
+        .segments
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(page)
+        .map(|(position, (name, written, events))| {
+            json!({
+                "name": name,
+                "index": position + 1,
+                "sizeBytes": written.bytes.len(),
+                "checksum": written.checksum,
+                "eventCount": events.len(),
+                "minSeq": written.blocks.first().map_or(0, |b| b.0),
+                "maxSeq": written.blocks.last().map_or(0, |b| b.1),
+                "minWitnessedAt": events.iter().map(|e| e.witnessed_at).min().unwrap_or(0),
+                "maxWitnessedAt": events.iter().map(|e| e.witnessed_at).max().unwrap_or(0),
+            })
+        })
+        .collect();
+    let mut body = json!({ "segments": listed });
+    if start + page < inner.segments.len() {
+        body["cursor"] = json!((start + page).to_string());
+    }
+    axum::Json(body).into_response()
 }
 
 async fn get_segment(

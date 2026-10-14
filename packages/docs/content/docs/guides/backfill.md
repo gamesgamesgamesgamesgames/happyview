@@ -36,9 +36,13 @@ Account backfills (a job with `dids`) always crawl. Planning works in whole arch
 A replay job downloads in two sweeps:
 
 1. **Records.** The archive's commits for the job's collections, from the start of the archive to its newest sealed segment.
-2. **Accounts.** The account and sync events for the accounts that hold records in those collections.
+2. **Accounts.** The account and sync events for the accounts that hold records in those collections, from the last 12 hours of the archive.
 
 Account takedowns, deletions and repo resyncs are applied as of when they happened. A takedown from three days ago removes only what the account had at that time, so records it wrote since stay.
+
+The account sweep covers only the archive's newest hours because Jetstream compacts the rest. Compaction (every 4 hours by default) removes the creates and updates that a deleted account or a repo resync supersedes, so the records sweep already skips them. Sweeping account events over the whole archive would download many gigabytes for little gain. HappyView asks the archive for its segment list (`listSegments`), finds the first segment that ends within `BACKFILL_REPLAY_MARKER_TAIL_HOURS` (12 by default, three compaction intervals) of the newest one, and starts the account sweep just before it. The job logs where it starts. If the archive doesn't list its segments, or the request fails, the job sweeps the whole archive instead. A resumed job keeps the start it chose.
+
+This has a known cost. Compaction keeps the records of taken-down and suspended accounts. If an account was taken down or suspended before those 12 hours, its records are replayed and stay indexed. A reactivation from before then doesn't lift a takedown HappyView recorded earlier. Records HappyView held before the job, from an earlier crawl or from before a gap in the live stream, aren't removed by an account deletion or repo resync from before then either. Set `BACKFILL_REPLAY_MARKER_TAIL_HOURS=0` to sweep account events over the whole archive. Do that for a self-hosted Jetstream with compaction turned off, where nothing is compacted away.
 
 Each record goes through the same checks as a crawled one: the lexicon script runs, and the record's CID is checked against its body. A record that fails the check is skipped and logged.
 

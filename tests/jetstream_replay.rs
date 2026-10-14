@@ -371,6 +371,178 @@ async fn a_network_job_replays_account_markers_for_the_dids_it_holds() {
         vec![kept.to_string(), taken.to_string()],
         "only DIDs holding records"
     );
+    assert_eq!(
+        marker_plan["afterSeq"], 0,
+        "an archive that lists no segments has its markers swept whole: {marker_plan}"
+    );
+    assert!(!mock.segment_list_requests().is_empty());
+}
+
+/// `events` witnessed `hours` later than their seqs say.
+fn hours_later(
+    mut events: Vec<common::segment_writer::ArchiveEvent>,
+    hours: i64,
+) -> Vec<common::segment_writer::ArchiveEvent> {
+    for event in &mut events {
+        event.witnessed_at += hours * 60 * 60 * 1_000_000;
+    }
+    events
+}
+
+const OLD_TAKEDOWN: &str = "did:plc:oldtakedown";
+const NEW_TAKEDOWN: &str = "did:plc:newtakedown";
+const TAIL_KEPT: &str = "did:plc:tailkept";
+
+/// Three segments, witnessed 30 hours apart end to end: an account taken
+/// down in the first, 30 hours before the tip; records in the second, 20
+/// hours after the first; and an account taken down in the third. With the
+/// default 12-hour tail, the markers sweep starts after seq 3, the first
+/// segment's last.
+fn seal_tail_archive(mock: &MockJetstream) {
+    let mut old = games(1..=2, OLD_TAKEDOWN);
+    old.push(js::archive_account(
+        3,
+        OLD_TAKEDOWN,
+        false,
+        Some("takendown"),
+    ));
+    mock.seal(old, 4);
+    mock.seal(hours_later(games(4..=5, TAIL_KEPT), 20), 4);
+    let mut new = games(6..=7, NEW_TAKEDOWN);
+    new.push(js::archive_account(
+        8,
+        NEW_TAKEDOWN,
+        false,
+        Some("takendown"),
+    ));
+    mock.seal(hours_later(new, 30), 4);
+}
+
+fn marker_plans(mock: &MockJetstream) -> Vec<serde_json::Value> {
+    mock.plan_requests()
+        .into_iter()
+        .filter(|p| p["kinds"] == json!(["account", "sync"]))
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn a_network_job_sweeps_markers_over_the_uncompacted_tail_only() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    seal_tail_archive(&mock);
+    mock.list_segments(1);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(
+        mock.segment_list_requests(),
+        vec![None, Some("1".into()), Some("2".into())],
+        "every page of the segment list, once"
+    );
+    let plans = marker_plans(&mock);
+    assert_eq!(plans[0]["afterSeq"], 3, "{plans:?}");
+    assert!(plans.iter().all(|p| p["afterSeq"].as_u64() >= Some(3)));
+    let mut uris: Vec<String> = dump(&app).await.into_iter().map(|r| r.0).collect();
+    uris.retain(|u| !u.contains(TAIL_KEPT));
+    // The known limitation: a takedown older than the tail is not replayed.
+    assert_eq!(uris.len(), 2, "{uris:?}");
+    assert!(uris.iter().all(|u| u.contains(OLD_TAKEDOWN)), "{uris:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_network_job_sweeps_every_marker_when_the_archive_lists_no_segments() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    seal_tail_archive(&mock);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(
+        mock.segment_list_requests().len(),
+        1,
+        "asked, and answered 404"
+    );
+    let plans = marker_plans(&mock);
+    assert_eq!(plans[0]["afterSeq"], 0, "{plans:?}");
+    let uris: Vec<String> = dump(&app).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(uris.len(), 2, "both takedowns purge: {uris:?}");
+    assert!(uris.iter().all(|u| u.contains(TAIL_KEPT)), "{uris:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_zero_marker_tail_sweeps_every_marker_without_listing_segments() {
+    let mock = MockJetstream::start().await;
+    let Some(mut app) = app(&mock, None).await else {
+        return;
+    };
+    app.state.archive.marker_tail = Duration::ZERO;
+    app.rebuild_router();
+    seal_tail_archive(&mock);
+    mock.list_segments(1000);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert!(mock.segment_list_requests().is_empty());
+    assert_eq!(marker_plans(&mock)[0]["afterSeq"], 0);
+    assert_eq!(dump(&app).await.len(), 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_resumed_job_keeps_the_marker_floor_it_chose() {
+    let mock = MockJetstream::start().await;
+    let Some(app) = app(&mock, None).await else {
+        return;
+    };
+    mock.set_plan_page_entries(1);
+    let did = "did:plc:resumetail";
+    mock.seal(games(1..=4, did), 4);
+    mock.seal(hours_later(games(5..=8, did), 20), 4);
+    // Two segments of markers only, so the marker sweep alone fetches them.
+    let first_markers = mock.seal(
+        hours_later(vec![js::archive_account(9, did, true, None)], 30),
+        4,
+    );
+    mock.seal(
+        hours_later(vec![js::archive_account(10, did, true, None)], 30),
+        4,
+    );
+    mock.list_segments(1000);
+    mock.hold_segment(&first_markers);
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    wait_until!(
+        "the marker sweep's first download",
+        mock.segment_downloads().contains(&first_markers)
+    );
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/pause"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    mock.release_segment(&first_markers);
+    assert_eq!(finished(&app, &id).await["status"], "paused");
+
+    let (status, body) = app
+        .post_json_status(&format!("/admin/backfill/{id}/resume"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(finished(&app, &id).await["status"], "completed");
+    assert_eq!(
+        mock.segment_list_requests().len(),
+        1,
+        "the resumed run reuses the stored floor"
+    );
+    let plans = marker_plans(&mock);
+    assert_eq!(plans[0]["afterSeq"], 4, "{plans:?}");
+    assert!(plans.len() > 1, "{plans:?}");
+    assert!(
+        plans.iter().all(|p| p["afterSeq"].as_u64() >= Some(4)),
+        "{plans:?}"
+    );
+    assert_eq!(dump(&app).await.len(), 8);
 }
 
 #[tokio::test]
@@ -737,7 +909,7 @@ async fn the_live_stream_never_sees_the_api_key() {
         );
     }
     for (route, auth) in authorizations {
-        if matches!(route.as_str(), "plan" | "segment" | "block") {
+        if matches!(route.as_str(), "plan" | "segment" | "block" | "list") {
             assert_eq!(auth.as_deref(), Some("Bearer s3cret"), "{route}");
         } else {
             assert_eq!(auth, None, "{route}");

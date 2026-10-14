@@ -13,7 +13,7 @@ use super::replay_sweeps::{self as sweeps, Sweep, SweepKind};
 use crate::AppState;
 use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure, ErrorRecorder};
 use crate::jetstream::archive::client::{
-    ArchiveClient, ArchiveError, PlanEntry, PlanMode, PlanRequest,
+    ArchiveClient, ArchiveError, PlanEntry, PlanMode, PlanRequest, SegmentInfo,
 };
 use crate::jetstream::archive::rows::{self, RowFilter, RowKinds};
 use crate::jetstream::archive::segment::{self, Row};
@@ -63,6 +63,9 @@ struct Run<'a> {
     entry_failures: Vec<(String, Option<u32>, String)>,
     /// Blocks that failed since the last one that didn't.
     consecutive_failures: u32,
+    /// Where this run's new marker sweeps start, once `marker_after` has
+    /// worked it out.
+    marker_after: Option<i64>,
 }
 
 pub(super) async fn run(
@@ -86,6 +89,7 @@ pub(super) async fn run(
         held_only: None,
         entry_failures: Vec::new(),
         consecutive_failures: 0,
+        marker_after: None,
     };
     sweep_downloads(&run.download_dir, job_id).await;
     let result = run.drive(collections, scope_dids).await;
@@ -249,7 +253,8 @@ impl Run<'_> {
         }
         if scope_dids.is_none() {
             // Network job: replay the markers of every DID left holding records.
-            let after = all.first().map_or(0, |s| s.after_seq);
+            let job_after = all.first().map_or(0, |s| s.after_seq);
+            let stored = stored_marker_after(&all);
             let mut after_id = all.iter().filter_map(|s| s.last_did_id).max().unwrap_or(0);
             let mut next = all.len() as i32;
             loop {
@@ -262,6 +267,7 @@ impl Run<'_> {
                 .await
                 .map_err(db)?;
                 let Some(&(last, _)) = held.last() else { break };
+                let after = self.marker_after(job_after, stored).await;
                 let mut sweep = Sweep {
                     sweep: next,
                     kind: SweepKind::Markers,
@@ -703,7 +709,7 @@ impl Run<'_> {
     /// a sweep, persisting each change. Only a sweep that has not planned
     /// yet takes more DIDs.
     async fn add_marker_dids(
-        &self,
+        &mut self,
         markers: &mut Vec<Sweep>,
         dids: HashSet<String>,
     ) -> Result<(), Halt> {
@@ -716,9 +722,10 @@ impl Run<'_> {
             return Ok(());
         }
         fresh.sort();
-        let after = sweeps::after_seq(self.state, self.job_id)
+        let job_after = sweeps::after_seq(self.state, self.job_id)
             .await
             .map_err(db)?;
+        let stored = stored_marker_after(markers);
         let mut fresh = fresh.into_iter().peekable();
         while fresh.peek().is_some() {
             let open = markers.last_mut().filter(|s| {
@@ -738,6 +745,7 @@ impl Run<'_> {
                         .map_err(db)?;
                 }
                 None => {
+                    let after = self.marker_after(job_after, stored).await;
                     let sweep = Sweep {
                         sweep: markers.iter().map(|s| s.sweep + 1).max().unwrap_or(0),
                         kind: SweepKind::Markers,
@@ -758,6 +766,140 @@ impl Run<'_> {
         }
         Ok(())
     }
+
+    /// Where a new marker sweep starts: `stored`, the start of one this job
+    /// already recorded, so a resumed job keeps the floor it chose; else the
+    /// floor this run worked out; else `marker_floor` over the archive's
+    /// `listSegments`, at most once a run. Without a tail, a segment list or
+    /// any segment, `job_after`: the job's whole range. Never fails the job.
+    async fn marker_after(&mut self, job_after: i64, stored: Option<i64>) -> i64 {
+        if let Some(after) = stored.or(self.marker_after) {
+            return after;
+        }
+        let tail = self.state.archive.marker_tail;
+        let after = if tail.is_zero() {
+            tracing::info!(
+                job_id = self.job_id,
+                after_seq = job_after,
+                "BACKFILL_REPLAY_MARKER_TAIL_HOURS is 0; replaying account and sync markers over the whole range"
+            );
+            job_after
+        } else {
+            match self.client.list_segments().await {
+                Ok(segments) => match marker_floor(&segments, tail, job_after) {
+                    Some(floor) => {
+                        tracing::info!(
+                            job_id = self.job_id,
+                            after_seq = floor.after_seq,
+                            witnessed_at = %witnessed(floor.witnessed_at),
+                            tip_witnessed_at = %witnessed(floor.tip_witnessed_at),
+                            tail_hours = tail.as_secs() / 3600,
+                            "replaying account and sync markers over the archive's uncompacted tail only"
+                        );
+                        floor.after_seq
+                    }
+                    None => {
+                        tracing::info!(
+                            job_id = self.job_id,
+                            after_seq = job_after,
+                            "the archive lists no segments; replaying account and sync markers over the whole range"
+                        );
+                        job_after
+                    }
+                },
+                Err(e @ ArchiveError::NoArchive(_)) => {
+                    tracing::info!(
+                        job_id = self.job_id,
+                        after_seq = job_after,
+                        error = %e,
+                        "the archive does not list its segments; replaying account and sync markers over the whole range"
+                    );
+                    job_after
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        job_id = self.job_id,
+                        after_seq = job_after,
+                        error = %e,
+                        "listing the archive's segments failed; replaying account and sync markers over the whole range"
+                    );
+                    job_after
+                }
+            }
+        };
+        self.marker_after = Some(after);
+        after
+    }
+}
+
+/// Unix microseconds as RFC 3339, or the number when out of range.
+fn witnessed(us: i64) -> String {
+    chrono::DateTime::from_timestamp_micros(us).map_or_else(|| us.to_string(), |t| t.to_rfc3339())
+}
+
+/// The start of a marker sweep this job already recorded.
+fn stored_marker_after(sweeps: &[Sweep]) -> Option<i64> {
+    sweeps
+        .iter()
+        .find(|s| s.kind == SweepKind::Markers)
+        .map(|s| s.after_seq)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MarkerFloor {
+    /// Where the marker sweeps start: `job_after` or the tail's floor,
+    /// whichever is later.
+    after_seq: i64,
+    /// When the first segment in the tail starts.
+    witnessed_at: i64,
+    /// When the last segment ends: the tail is measured back from here.
+    tip_witnessed_at: i64,
+}
+
+/// Where a network replay's account and sync marker sweeps start: just
+/// before the first segment (in seq order) that ends no more than `tail`
+/// before the last one does, or `job_after` if that is later. `None` with no
+/// tail or no segments.
+///
+/// Jetstream's compaction (every 4 hours by default) physically removes the
+/// creates and updates that a record delete or update, a deleted account
+/// (`#account`, `active: false, status: deleted`) or a `#sync` supersedes.
+/// So below its watermark the commit sweeps already return only what
+/// survived those markers, and only the uncompacted tail needs them swept.
+///
+/// What this gives up, by not folding markers older than the tail.
+/// Compaction keeps every record of a taken-down or suspended account, so
+/// the commit sweep still returns the records of one taken down or
+/// suspended before the tail, and they stay indexed, with no DID tombstone.
+/// A reactivation
+/// before the tail no longer lifts a DID tombstone written before the job.
+/// And records this instance held before the job that the commit sweeps
+/// don't rewrite (a gap replay whose gap starts before the tail, or records
+/// from an earlier crawl) miss the purge an older deleted account or `#sync`
+/// would have made. Nothing compensates; `BACKFILL_REPLAY_MARKER_TAIL_HOURS=0`
+/// sweeps every marker.
+fn marker_floor(
+    segments: &[SegmentInfo],
+    tail: std::time::Duration,
+    job_after: i64,
+) -> Option<MarkerFloor> {
+    if tail.is_zero() {
+        return None;
+    }
+    let mut ordered: Vec<&SegmentInfo> = segments.iter().collect();
+    ordered.sort_by_key(|s| (s.min_seq, s.max_seq));
+    let tip = ordered.last()?.max_witnessed_at;
+    let tail_us = i64::try_from(tail.as_micros()).unwrap_or(i64::MAX);
+    let since = tip.saturating_sub(tail_us);
+    let first = ordered.iter().find(|s| s.max_witnessed_at >= since)?;
+    let floor = i64::try_from(first.min_seq)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(1);
+    Some(MarkerFloor {
+        after_seq: floor.max(job_after),
+        witnessed_at: first.min_witnessed_at,
+        tip_witnessed_at: tip,
+    })
 }
 
 /// Whether a failed request means the archive is down or refusing, rather
@@ -901,6 +1043,113 @@ mod tests {
         assert!(!is_outage(&ArchiveError::Io("disk full".into())));
         assert!(!is_outage(&ArchiveError::NoArchive(404)));
         assert!(!is_outage(&ArchiveError::Unauthorized(401)));
+    }
+
+    const HOUR_US: i64 = 60 * 60 * 1_000_000;
+
+    /// Segment `index` holding seqs `min..=max`, witnessed from `from` to
+    /// `to` hours.
+    fn listed(index: u64, (min, max): (u64, u64), (from, to): (i64, i64)) -> SegmentInfo {
+        SegmentInfo {
+            name: format!("seg_{index:010}.jss"),
+            index,
+            size_bytes: 0,
+            checksum: String::new(),
+            event_count: max - min + 1,
+            min_seq: min,
+            max_seq: max,
+            min_witnessed_at: from * HOUR_US,
+            max_witnessed_at: to * HOUR_US,
+        }
+    }
+
+    fn archive() -> Vec<SegmentInfo> {
+        vec![
+            listed(1, (1, 100), (0, 4)),
+            listed(2, (101, 200), (4, 9)),
+            listed(3, (201, 300), (9, 15)),
+            listed(4, (301, 400), (15, 20)),
+        ]
+    }
+
+    const TWELVE_HOURS: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
+
+    #[test]
+    fn the_marker_floor_starts_at_the_first_segment_inside_the_tail() {
+        // The tip is hour 20, so the tail starts at hour 8: segment 2 ends
+        // inside it, segment 1 doesn't.
+        let floor = marker_floor(&archive(), TWELVE_HOURS, 0).unwrap();
+        assert_eq!(
+            floor,
+            MarkerFloor {
+                after_seq: 100,
+                witnessed_at: 4 * HOUR_US,
+                tip_witnessed_at: 20 * HOUR_US,
+            }
+        );
+        // A segment ending exactly at the tail's start is inside it.
+        let floor = marker_floor(&archive(), std::time::Duration::from_secs(11 * 3600), 0);
+        assert_eq!(floor.unwrap().after_seq, 100);
+        let floor = marker_floor(&archive(), std::time::Duration::from_secs(10 * 3600), 0);
+        assert_eq!(floor.unwrap().after_seq, 200);
+        // A tail longer than the archive sweeps all of it.
+        let floor = marker_floor(&archive(), std::time::Duration::from_secs(100 * 3600), 0);
+        assert_eq!(floor.unwrap().after_seq, 0);
+    }
+
+    #[test]
+    fn the_marker_floor_orders_the_list_by_seq() {
+        let mut segments = archive();
+        segments.reverse();
+        assert_eq!(
+            marker_floor(&segments, TWELVE_HOURS, 0).unwrap().after_seq,
+            100
+        );
+    }
+
+    #[test]
+    fn the_marker_floor_never_reaches_below_the_jobs_own_start() {
+        let floor = marker_floor(&archive(), TWELVE_HOURS, 250).unwrap();
+        assert_eq!(floor.after_seq, 250);
+        let floor = marker_floor(&archive(), TWELVE_HOURS, 50).unwrap();
+        assert_eq!(floor.after_seq, 100);
+    }
+
+    #[test]
+    fn no_segments_or_no_tail_is_no_marker_floor() {
+        assert_eq!(marker_floor(&[], TWELVE_HOURS, 0), None);
+        assert_eq!(marker_floor(&archive(), std::time::Duration::ZERO, 0), None);
+    }
+
+    fn marker_sweep(sweep: i32, kind: SweepKind, after_seq: i64) -> Sweep {
+        Sweep {
+            sweep,
+            kind,
+            collections: Vec::new(),
+            dids: None,
+            after_seq,
+            cursor_seq: after_seq + 7,
+            tip_seq: None,
+            last_did_id: None,
+            done: false,
+        }
+    }
+
+    #[test]
+    fn a_stored_marker_sweep_gives_the_floor_back() {
+        assert_eq!(stored_marker_after(&[]), None);
+        assert_eq!(
+            stored_marker_after(&[marker_sweep(0, SweepKind::Commits, 0)]),
+            None
+        );
+        assert_eq!(
+            stored_marker_after(&[
+                marker_sweep(0, SweepKind::Commits, 0),
+                marker_sweep(1, SweepKind::Markers, 4321),
+                marker_sweep(2, SweepKind::Markers, 4321),
+            ]),
+            Some(4321)
+        );
     }
 
     #[tokio::test]
