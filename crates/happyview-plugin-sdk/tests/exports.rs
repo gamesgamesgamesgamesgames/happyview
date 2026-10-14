@@ -193,6 +193,11 @@ const EXPECTED_INTERPRETER_IMPORTS: &[&str] = &[
     "env::host_job_wait",
     "env::host_module_resolve",
     "env::host_script_log",
+    "env::host_test_calls",
+    "env::host_test_mock",
+    "env::host_test_pds_writes",
+    "env::host_test_report",
+    "env::host_test_trigger",
 ];
 
 fn fixture_path(name: &str) -> PathBuf {
