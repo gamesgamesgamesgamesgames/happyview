@@ -4,21 +4,15 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { Loader2 } from "lucide-react";
 
-import { getLexiconPublishing, getLexiconPublishingDns } from "@/lib/api";
+import { getLexiconPublishing } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
-import type {
-  LexiconDnsEntry,
-  PublishableLexicon,
-} from "@/types/lexicon-publishing";
+import type { PublishableLexicon } from "@/types/lexicon-publishing";
 
-import { DnsStatus, dnsState } from "./dns-status";
-import {
-  expectedDid,
-  nsidAuthority,
-  unavailableSentence,
-} from "./model";
+import { LexiconDnsCheck } from "./lexicon-dns-check";
+import { nsidAuthority, unavailableSentence } from "./model";
+import { NoTargets } from "./no-targets";
 import { TargetName } from "./target-name";
 import { PublishStatusBadge, statusExplanation } from "./publish-status";
 import {
@@ -29,7 +23,7 @@ import {
 } from "./row-actions";
 import { usePublish } from "./use-publish";
 
-const PUBLISHING_HREF = "/dashboard/lexicons/publishing";
+const PUBLISHING_HREF = "/dashboard/settings/lexicon-publishing";
 
 /**
  * Where this lexicon publishes and why, beside the scripts that target it.
@@ -46,25 +40,20 @@ export function PublishingPanel({
   canPublish: boolean;
 }) {
   const [lexicon, setLexicon] = useState<PublishableLexicon | null>(null);
+  const [usable, setUsable] = useState(true);
   const [coverCount, setCoverCount] = useState(1);
   const [state, setState] = useState<"loading" | "ready" | "failed">(
     "loading",
   );
-  // Keyed by the authority it answers for, so a lookup for a different one
-  // reads as loading until its own answer arrives.
-  const [dns, setDns] = useState<{
-    authority: string;
-    entry: LexiconDnsEntry | undefined;
-  } | null>(null);
 
   const authority = nsidAuthority(nsid);
-  const dnsLoading = dns?.authority !== authority;
 
   const read = useCallback(
     () =>
       getLexiconPublishing().then(
         (overview) => {
           setLexicon(overview.lexicons.find((l) => l.nsid === nsid) ?? null);
+          setUsable(overview.usable);
           setCoverCount(
             overview.lexicons.filter((l) => nsidAuthority(l.nsid) === authority)
               .length || 1,
@@ -79,35 +68,6 @@ export function PublishingPanel({
   useEffect(() => {
     read();
   }, [read, revision]);
-
-  // A saved edit cannot change the DNS answer unless it changes the
-  // authority, and the lookup takes seconds, so it is not tied to revision.
-  useEffect(() => {
-    let current = true;
-    getLexiconPublishingDns()
-      .then((entries) => {
-        if (!current) return;
-        setDns({
-          authority,
-          entry: entries.find((e) => e.authority === authority),
-        });
-      })
-      .catch((e) => {
-        if (!current) return;
-        setDns({
-          authority,
-          entry: {
-            authority,
-            record_name: `_lexicon.${authority}`,
-            did: null,
-            error: e instanceof Error ? e.message : String(e),
-          },
-        });
-      });
-    return () => {
-      current = false;
-    };
-  }, [authority]);
 
   const { busy, publish, unpublish, announcement } = usePublish(read);
   const working = busy.has(nsid);
@@ -131,6 +91,15 @@ export function PublishingPanel({
         <p className="text-muted-foreground rounded-md border border-dashed p-3 text-sm">
           Couldn&apos;t load publishing for this lexicon.
         </p>
+      ) : !usable ? (
+        <div className="flex flex-col gap-3 rounded-md border p-3">
+          <NoTargets className="border-0 bg-transparent p-0" />
+          <dl className="flex flex-col gap-2 text-sm">
+            <DnsLine authority={authority}>
+              <LexiconDnsCheck nsid={nsid} coverCount={coverCount} />
+            </DnsLine>
+          </dl>
+        </div>
       ) : (
         <div className="flex flex-col gap-3 rounded-md border p-3">
           <div className="flex flex-col gap-1">
@@ -173,18 +142,9 @@ export function PublishingPanel({
                 )}
               </dd>
             </div>
-            <div className="flex flex-col gap-0.5">
-              <dt className="text-muted-foreground text-xs">
-                DNS{" "}
-                <span className="font-mono">_lexicon.{authority}</span>
-              </dt>
-              <dd>
-                <DnsStatus
-                  state={dnsState(dns?.entry, dnsLoading, expectedDid(lexicon))}
-                  coverCount={coverCount}
-                />
-              </dd>
-            </div>
+            <DnsLine authority={authority}>
+              <LexiconDnsCheck nsid={nsid} coverCount={coverCount} />
+            </DnsLine>
           </dl>
 
           {canPublish && (canPublishNow(lexicon) || isPublished(lexicon)) && (
@@ -222,5 +182,22 @@ export function PublishingPanel({
         {announcement}
       </p>
     </section>
+  );
+}
+
+function DnsLine({
+  authority,
+  children,
+}: {
+  authority: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <dt className="text-muted-foreground text-xs">
+        DNS <span className="font-mono">_lexicon.{authority}</span>
+      </dt>
+      <dd className="min-w-0">{children}</dd>
+    </div>
   );
 }

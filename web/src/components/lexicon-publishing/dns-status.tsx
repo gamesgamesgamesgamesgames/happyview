@@ -126,7 +126,7 @@ export function DnsStatus({
   }
 }
 
-function DnsRecord({
+export function DnsRecord({
   entry,
   expectedDid,
   currentDid,
@@ -169,7 +169,7 @@ function DnsRecord({
   );
 }
 
-function RecordField({
+export function RecordField({
   label,
   value,
   copy = true,
