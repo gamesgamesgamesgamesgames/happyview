@@ -1,4 +1,5 @@
 import { test, expect, type APIRequestContext, type Page } from "@playwright/test";
+import pg from "pg";
 import {
   loginAsTestAdmin,
   loginAsUserWithPermissions,
@@ -9,10 +10,11 @@ import {
 } from "./auth-helper";
 
 /**
- * The publishing dashboard against the real API, with no account able to
- * receive a record: the instance is either did:web or attached to a DID with
- * no session, and the only linked repo is a grant nobody has authorized. A
- * real publish is covered by lexicon-publishing-oauth.spec.ts.
+ * The publishing dashboard against the real API, with no account that can
+ * actually receive a record: the instance is did:web, or attached to a DID
+ * whose session is a stand-in no PDS would accept, and the only linked repo
+ * is a grant nobody has authorized. A real publish is covered by
+ * lexicon-publishing-oauth.spec.ts.
  */
 
 const ALPHA = "test.e2e.pub.alpha";
@@ -26,6 +28,51 @@ const ATTACHED_DID = "did:plc:e2epublishinginstance";
 const READER_DID = "did:plc:e2epublishingreader";
 const DID_WEB_REASON = "the instance identity is did:web and has no repo";
 const PENDING_REASON = "this linked repo has not been authorized yet";
+const NO_SESSION_REASON =
+  "the attached account has no session; sign it in again from Service Identity";
+const SCHEMA_SCOPE =
+  "atproto repo:com.atproto.lexicon.schema?action=create&action=update&action=delete";
+const DB_URL = "postgres://happyview:happyview@localhost:5434/happyview_test";
+
+/**
+ * A session row for the attached account carrying the schema scope, which is
+ * all the instance target reads; its token reaches no PDS, and nothing here
+ * publishes.
+ */
+async function seedAttachedSession(): Promise<void> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const now = new Date().toISOString();
+    const sessionData = JSON.stringify({
+      token_set: {
+        access_token: "e2e-lexicon-publishing-unusable",
+        scope: SCHEMA_SCOPE,
+        expires_at: new Date(Date.now() + 3600_000).toISOString(),
+      },
+    });
+    await client.query(
+      `INSERT INTO happyview_oauth_sessions (did, session_data, created_at, updated_at)
+       VALUES ($1, $2, $3, $3)
+       ON CONFLICT (did) DO UPDATE SET session_data = $2, updated_at = $3`,
+      [ATTACHED_DID, sessionData, now],
+    );
+  } finally {
+    await client.end();
+  }
+}
+
+async function removeAttachedSession(): Promise<void> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    await client.query("DELETE FROM happyview_oauth_sessions WHERE did = $1", [
+      ATTACHED_DID,
+    ]);
+  } finally {
+    await client.end();
+  }
+}
 
 const PAGE = "/dashboard/lexicons/publishing";
 
@@ -118,6 +165,7 @@ test.describe("Lexicon publishing dashboard", () => {
     try {
       if (identity !== undefined) await restoreServiceIdentity(identity);
     } finally {
+      await removeAttachedSession();
       const page = await browser.newPage();
       await loginAsTestAdmin(page);
       for (const rule of await rules(page.request)) {
@@ -192,12 +240,44 @@ test.describe("Lexicon publishing dashboard", () => {
     expect(await rules(page.request)).toEqual([]);
   });
 
-  test("the add dialog offers an unauthorized linked repo only as disabled", async ({
+  test("an attached account without a session cannot receive lexicons", async ({
     page,
   }) => {
     await setServiceIdentityMode("attach_account", {
       attachedAccountDid: ATTACHED_DID,
     });
+    await removeAttachedSession();
+
+    const overview = await (
+      await page.request.get("/admin/lexicon-publishing")
+    ).json();
+    const target = overview.targets.find(
+      (t: { kind: string }) => t.kind === "instance",
+    );
+    expect(target.available).toBe(false);
+    expect(target.unavailable_reason).toBe(NO_SESSION_REASON);
+
+    await page.goto(PAGE);
+    await expect(
+      page.getByText("Nothing can receive lexicons yet", { exact: false }),
+    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "Add default" })).toHaveCount(
+      0,
+    );
+
+    const refused = await createRule(page.request, {
+      pattern: PREFIX,
+      target_kind: "instance",
+    });
+    expect(refused.status()).toBe(400);
+    expect((await refused.json()).error).toBe(NO_SESSION_REASON);
+    expect(await rules(page.request)).toEqual([]);
+  });
+
+  test("the add dialog offers an unauthorized linked repo only as disabled", async ({
+    page,
+  }) => {
+    await seedAttachedSession();
     await page.goto(PAGE);
     await expect(
       page.getByText("Nothing can receive lexicons yet", { exact: false }),
@@ -254,6 +334,26 @@ test.describe("Lexicon publishing dashboard", () => {
       await expect(lexiconRow(page, nsid)).toContainText("Not published");
     }
     await expect(lexiconRow(page, OTHER)).toContainText("No default");
+
+    // Losing the session strands the default rather than removing it, and
+    // the edit dialog says why the instance cannot be chosen.
+    await removeAttachedSession();
+    await page.reload();
+    const stranded = cascade(page).getByRole("listitem").nth(0);
+    await expect(stranded).toContainText("Destination unavailable");
+    await expect(stranded).toContainText(
+      "The attached account has no session; sign it in again from Service Identity",
+    );
+    await stranded
+      .getByRole("button", { name: `Edit the default for ${PREFIX}` })
+      .click();
+    const edit = page.getByRole("dialog");
+    await expect(edit.getByText("Edit default")).toBeVisible();
+    const disabled = edit.locator("label", { hasText: "Instance account" });
+    await expect(disabled).toContainText(`Unavailable: ${NO_SESSION_REASON}`);
+    await expect(disabled.getByRole("radio")).toBeDisabled();
+    await edit.getByRole("button", { name: "Cancel" }).click();
+    await seedAttachedSession();
   });
 
   test("defaults are created, refused and ordered through the API", async ({

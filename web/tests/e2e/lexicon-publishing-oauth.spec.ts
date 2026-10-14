@@ -99,16 +99,18 @@ const VIEWPORTS = [
 /**
  * Captures the page in both themes at both sizes, then restores desktop light.
  * `reopen` re-opens a popover after each resize, since one opened at another
- * width stays anchored where its trigger used to be.
+ * width stays anchored where its trigger used to be. `viewports` narrows the
+ * sizes for something that exists only at some of them.
  */
 async function capture(
   page: Page,
   name: string,
   reopen?: () => Promise<void>,
+  viewports: readonly (typeof VIEWPORTS)[number][] = VIEWPORTS,
 ) {
   if (!SCREENS) return;
   fs.mkdirSync(SCREENS, { recursive: true });
-  for (const viewport of VIEWPORTS) {
+  for (const viewport of viewports) {
     await page.setViewportSize(viewport);
     if (reopen) {
       await page.keyboard.press("Escape");
@@ -284,10 +286,17 @@ test.describe("Lexicon publishing — real linked repo", () => {
     await expect(popover).toContainText(
       "this one covers all 2 lexicons under lexpub.e2e.test",
     );
-    await capture(page, "publishing-dns-popover", async () => {
-      await dns.click();
-      await expect(popover).toBeVisible();
-    });
+    // The DNS column is hidden on narrow screens, where the lexicon's own
+    // Publishing panel carries the record instead.
+    await capture(
+      page,
+      "publishing-dns-popover",
+      async () => {
+        await dns.click();
+        await expect(popover).toBeVisible();
+      },
+      VIEWPORTS.filter((v) => v.name === "desktop"),
+    );
   });
 
   test("an edit makes it outdated, and Republish updates the record", async ({
