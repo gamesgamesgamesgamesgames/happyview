@@ -72,9 +72,10 @@ function RuleForm({ onOpenChange, overview, rule, onSaved }: RuleSheetProps) {
 
   const parsed = parsePattern(pattern);
   const target = overview.targets.find((t) => targetKey(t) === destination);
-  const destinationValid =
-    target !== undefined &&
-    (target.available || (editing && destination === ruleTargetKey(rule)));
+  // A kept destination needs no target to match: one whose linked repo was
+  // removed is in no list, and the default can still have auto-publish changed.
+  const keepsDestination = editing && destination === ruleTargetKey(rule);
+  const destinationValid = keepsDestination || target?.available === true;
 
   const coverage = useMemo(() => {
     if (!parsed.ok) return null;
@@ -95,20 +96,26 @@ function RuleForm({ onOpenChange, overview, rule, onSaved }: RuleSheetProps) {
 
   async function save() {
     setTouched(true);
-    if (!canSave || !target) return;
+    if (!canSave) return;
+    if (!keepsDestination && !target) return;
     setSaving(true);
     setError(null);
     const linkedRepoId =
-      target.kind === "linked_repo" ? (target.linked_repo_id ?? undefined) : undefined;
+      target?.kind === "linked_repo" ? (target.linked_repo_id ?? undefined) : undefined;
     try {
       if (rule) {
-        await updatePublishRule(rule.id, {
-          target_kind: target.kind,
-          linked_repo_id: linkedRepoId ?? null,
-          auto_publish: autoPublish,
-        });
+        await updatePublishRule(
+          rule.id,
+          keepsDestination || !target
+            ? { auto_publish: autoPublish }
+            : {
+                target_kind: target.kind,
+                linked_repo_id: linkedRepoId ?? null,
+                auto_publish: autoPublish,
+              },
+        );
         toast.success("Default saved");
-      } else {
+      } else if (target) {
         await createPublishRule({
           pattern: pattern.trim(),
           target_kind: target.kind,
@@ -207,7 +214,8 @@ function RuleForm({ onOpenChange, overview, rule, onSaved }: RuleSheetProps) {
             destination === ruleTargetKey(rule) && (
               <p className="text-muted-foreground text-xs">
                 Its current destination is unavailable:{" "}
-                {rule.target.unavailable_reason}
+                {rule.target.unavailable_reason}. Choose another, or keep it
+                and change only auto-publish.
               </p>
             )}
           <RadioGroup
