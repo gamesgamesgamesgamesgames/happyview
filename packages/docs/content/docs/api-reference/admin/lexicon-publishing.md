@@ -56,6 +56,7 @@ GET /admin/lexicon-publishing
 
 ```json
 {
+  "usable": true,
   "targets": [],
   "rules": [],
   "lexicons": [
@@ -83,6 +84,7 @@ GET /admin/lexicon-publishing
 }
 ```
 
+- `usable`: whether any target can publish, or can remove a record HappyView put there. The dashboard keeps the publishing page closed while it's `false`.
 - `targets`: the instance first, then one per linked repo.
 - `rules`: most specific first.
 - `lexicons`: every publishable lexicon, sorted by NSID. `layer` is `manual` or `project`; network lexicons never appear. `rule_id`, `rule_pattern` and `target` are `null` when no default matches, and `auto_publish` is then `false`. `status` is one of `no_rule`, `target_unavailable`, `unpublished`, `withdrawn`, `moved`, `outdated` or `current`. `publication` is `null` until something has been attempted; it carries only the error columns when every attempt has failed. `withdrawn_at` is set when the lexicon was unpublished and has not been published since; such a lexicon reports `withdrawn` (unless no default matches or its target is unavailable) and auto-publish skips it.
@@ -113,6 +115,43 @@ Looks up `_lexicon.<authority>` for every distinct authority among the publishab
 ```
 
 `did` is `null` when there's no TXT record. `error` is set when the lookup itself failed, such as a timeout. Compare `did` with each lexicon's target DID to see what needs adding.
+
+## Check availability
+
+```http
+GET /admin/lexicon-publishing/availability
+```
+
+**Permission:** `lexicons:read`
+
+The overview's `usable` without building every lexicon's status, which the dashboard asks for on each navigation.
+
+```json
+{ "usable": true }
+```
+
+## Check one lexicon's DNS
+
+```http
+GET /admin/lexicon-publishing/dns/{nsid}
+```
+
+**Permission:** `lexicons:read`
+
+Looks up the `_lexicon` record for one lexicon's authority, with the same five-second timeout, and says which DID it should name.
+
+```json
+{
+  "nsid": "com.example.notes.getNote",
+  "authority": "notes.example.com",
+  "record_name": "_lexicon.notes.example.com",
+  "did": null,
+  "error": null,
+  "expected_did": "did:plc:abc123"
+}
+```
+
+`expected_did` is the DID of the account the lexicon's default publishes to, or failing that the account already holding its record. It's `null` for a lexicon HappyView doesn't publish, or when neither is known. Without `linked-repos:read`, a default's linked repo isn't named, so `expected_did` then comes only from a publication. An invalid NSID is a `400`.
 
 ## Create a default
 

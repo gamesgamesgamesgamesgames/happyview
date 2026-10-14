@@ -5,7 +5,7 @@ pub mod status;
 pub mod store;
 pub mod target;
 
-pub use overview::{LexiconView, Overview, RuleView, overview};
+pub use overview::{LexiconView, Overview, RuleView, expected_dns_did, overview, usable};
 pub use pattern::{Pattern, best_match};
 pub use publish::{PublishOutcome, publish, publishable, reconcile, spawn_reconcile, unpublish};
 pub use status::{

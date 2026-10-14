@@ -40,6 +40,8 @@ pub struct LexiconView {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Overview {
+    /// See [`usable`].
+    pub usable: bool,
     pub targets: Vec<TargetInfo>,
     pub rules: Vec<RuleView>,
     pub lexicons: Vec<LexiconView>,
@@ -62,6 +64,43 @@ impl Overview {
             target.redact_linked_repo();
         }
     }
+}
+
+/// Whether any account can take a publish, or give up a record HappyView put
+/// there. With neither, defaults and a publish button have nothing to act on,
+/// so the dashboard keeps the publishing page closed.
+pub fn usable(targets: &[TargetInfo]) -> bool {
+    targets.iter().any(|t| t.available || t.can_unpublish)
+}
+
+/// The DID `_lexicon.<authority>` should name for `nsid`: the account its
+/// default publishes to, or failing that the account already holding its
+/// record. `None` for a lexicon HappyView does not publish, or when neither
+/// is known. A caller who may not see linked repos learns a linked repo's DID
+/// only from a publication, where the record's `uri` names it anyway.
+pub async fn expected_dns_did(
+    state: &AppState,
+    nsid: &str,
+    can_see_linked_repos: bool,
+) -> Result<Option<String>, AppError> {
+    if !publishable(state).await?.iter().any(|l| l.id == nsid) {
+        return Ok(None);
+    }
+    let rules = parsed_rules(store::list_rules(state).await?);
+    if let Some(rule) = rule_for(nsid, &rules) {
+        let linked = LinkedRepoTargets::load(state).await?;
+        let instance = target::instance_target(state).await?;
+        let mut target = target::target_for_rule(state, rule, &linked, &instance).await;
+        if !can_see_linked_repos {
+            target.redact_linked_repo();
+        }
+        if target.did.is_some() {
+            return Ok(target.did);
+        }
+    }
+    Ok(store::get_publication(state, nsid)
+        .await?
+        .and_then(|p| p.did))
 }
 
 /// Most specific first, the order in which they win a match.
@@ -89,11 +128,13 @@ pub async fn overview(state: &AppState) -> Result<Overview, AppError> {
 
     let mut targets = vec![instance.clone()];
     targets.extend(linked.targets());
+    let usable = usable(&targets);
 
     let (lexicons, unmatched) = lexicon_views(state, &rules, &linked, &instance).await?;
     let mut orphans: Vec<Publication> = unmatched.into_iter().filter(|p| p.did.is_some()).collect();
     orphans.sort_by(|a, b| a.nsid.cmp(&b.nsid));
     Ok(Overview {
+        usable,
         targets,
         rules: rule_views,
         lexicons,
@@ -167,6 +208,26 @@ mod tests {
         };
         let p = r.parsed();
         (r, p)
+    }
+
+    fn target(available: bool, can_unpublish: bool) -> TargetInfo {
+        TargetInfo {
+            kind: "linked_repo".into(),
+            linked_repo_id: Some("r".into()),
+            did: Some("did:plc:a".into()),
+            handle: None,
+            available,
+            unavailable_reason: None,
+            can_unpublish,
+        }
+    }
+
+    #[test]
+    fn usable_needs_a_target_that_can_publish_or_unpublish() {
+        assert!(!usable(&[]));
+        assert!(!usable(&[target(false, false)]));
+        assert!(usable(&[target(false, false), target(true, false)]));
+        assert!(usable(&[target(false, true)]));
     }
 
     #[test]

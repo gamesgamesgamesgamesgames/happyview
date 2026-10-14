@@ -62,33 +62,87 @@ pub(super) async fn dns(
         .collect();
 
     let mut entries: Vec<DnsEntry> = futures_util::stream::iter(authorities)
-        .map(|authority| async move {
-            let (did, error) =
-                match tokio::time::timeout(DNS_TIMEOUT, publishing::lookup_lexicon_did(&authority))
-                    .await
-                {
-                    Ok(Ok(did)) => (did, None),
-                    Ok(Err(e)) => (None, Some(e)),
-                    Err(_) => (
-                        None,
-                        Some(format!(
-                            "DNS lookup timed out after {} seconds",
-                            DNS_TIMEOUT.as_secs()
-                        )),
-                    ),
-                };
-            DnsEntry {
-                record_name: format!("_lexicon.{authority}"),
-                authority,
-                did,
-                error,
-            }
-        })
+        .map(check_authority)
         .buffer_unordered(DNS_CONCURRENCY)
         .collect()
         .await;
     entries.sort_by(|a, b| a.authority.cmp(&b.authority));
     Ok(Json(entries))
+}
+
+async fn check_authority(authority: String) -> DnsEntry {
+    let (did, error) =
+        match tokio::time::timeout(DNS_TIMEOUT, publishing::lookup_lexicon_did(&authority)).await {
+            Ok(Ok(did)) => (did, None),
+            Ok(Err(e)) => (None, Some(e)),
+            Err(_) => (
+                None,
+                Some(format!(
+                    "DNS lookup timed out after {} seconds",
+                    DNS_TIMEOUT.as_secs()
+                )),
+            ),
+        };
+    DnsEntry {
+        record_name: format!("_lexicon.{authority}"),
+        authority,
+        did,
+        error,
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct LexiconDnsCheck {
+    nsid: String,
+    /// What the record should name; `None` when HappyView cannot tell yet.
+    expected_did: Option<String>,
+    #[serde(flatten)]
+    entry: DnsEntry,
+}
+
+/// GET /admin/lexicon-publishing/dns/{nsid}
+///
+/// One lexicon's record, looked up from this server so the dashboard needs no
+/// outside resolver, beside the DID it ought to name.
+pub(super) async fn dns_for_lexicon(
+    State(state): State<AppState>,
+    auth: UserAuth,
+    Path(nsid): Path<String>,
+) -> Result<Json<LexiconDnsCheck>, AppError> {
+    auth.require(Permission::LexiconsRead).await?;
+    let authority = happyview_nsid::nsid_authority(&nsid)
+        .map_err(|_| AppError::BadRequest(format!("{nsid} is not a valid NSID")))?
+        .to_ascii_lowercase();
+    let can_see_linked_repos = auth.has(Permission::LinkedReposRead);
+    let (expected_did, entry) = tokio::join!(
+        publishing::expected_dns_did(&state, &nsid, can_see_linked_repos),
+        check_authority(authority),
+    );
+    Ok(Json(LexiconDnsCheck {
+        nsid,
+        expected_did: expected_did?,
+        entry,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct Availability {
+    usable: bool,
+}
+
+/// GET /admin/lexicon-publishing/availability
+///
+/// The overview's `usable` without building every lexicon's status, for the
+/// navigation to ask on each page.
+pub(super) async fn availability(
+    State(state): State<AppState>,
+    auth: UserAuth,
+) -> Result<Json<Availability>, AppError> {
+    auth.require(Permission::LexiconsRead).await?;
+    let targets = publishing::list_targets(&state).await?;
+    Ok(Json(Availability {
+        usable: publishing::usable(&targets),
+    }))
 }
 
 #[derive(Deserialize)]

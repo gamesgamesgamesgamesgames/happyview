@@ -1304,6 +1304,86 @@ async fn dns_reports_one_entry_per_authority() {
     }
 }
 
+#[tokio::test]
+#[serial]
+async fn publishing_is_usable_only_once_some_account_can_take_a_publish() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+
+    let (status, body) = call(&app, "GET", &format!("{BASE}/availability"), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({"usable": false}));
+    let (_, body) = call(&app, "GET", BASE, None).await;
+    assert_eq!(body["usable"], false, "{body}");
+
+    let did = "did:plc:usablerepo";
+    active_grant(s, did, FULL_SCOPE).await;
+    seed_linked_session(s, did, Some(FULL_SCOPE)).await;
+
+    let (_, body) = call(&app, "GET", &format!("{BASE}/availability"), None).await;
+    assert_eq!(body, json!({"usable": true}));
+    let (_, body) = call(&app, "GET", BASE, None).await;
+    assert_eq!(body["usable"], true, "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_lexicon_dns_check_names_the_did_the_record_should_hold() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    let did = "did:plc:dnsrepo";
+    let grant = active_grant(s, did, FULL_SCOPE).await;
+    seed_linked_session(s, did, Some(FULL_SCOPE)).await;
+    let nsid = "test.lexdns.thing";
+    put_manual(s, nsid).await;
+    put_manual(s, "test.lexdnsnorule.thing").await;
+    store::insert_rule(
+        s,
+        &pat("test.lexdns.*"),
+        "linked_repo",
+        Some(&grant.id),
+        false,
+        "did:plc:admin",
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = call(&app, "GET", &format!("{BASE}/dns/{nsid}"), None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["nsid"], nsid);
+    assert_eq!(body["authority"], "lexdns.test");
+    assert_eq!(body["record_name"], "_lexicon.lexdns.test");
+    assert_eq!(body["expected_did"], did);
+    assert_eq!(body["did"], Value::Null, "{body}");
+
+    // Nothing decides where these go, so there is nothing to tell the
+    // operator to set.
+    for unknown in ["test.lexdnsnorule.thing", "test.lexdns.notalexicon"] {
+        let (status, body) = call(&app, "GET", &format!("{BASE}/dns/{unknown}"), None).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["expected_did"], Value::Null, "{unknown}: {body}");
+    }
+
+    let (status, _) = call(&app, "GET", &format!("{BASE}/dns/not-an-nsid"), None).await;
+    assert_eq!(status, 400);
+
+    // Without linked-repos:read the default's account stays hidden, and only
+    // a publication, whose uri names the DID anyway, says where it is.
+    let reader = limited_user(s, "did:plc:dnsreader", &["lexicons:read"]).await;
+    let path = format!("{BASE}/dns/{nsid}");
+    let (status, body) = call_as(&app, reader(), "GET", &path, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["expected_did"], Value::Null, "{body}");
+    let uri = format!("at://{did}/com.atproto.lexicon.schema/{nsid}");
+    store::record_success(s, nsid, did, &uri, "bafycid")
+        .await
+        .unwrap();
+    let (_, body) = call_as(&app, reader(), "GET", &path, None).await;
+    assert_eq!(body["expected_did"], did, "{body}");
+}
+
 // ---------------------------------------------------------------------------
 // The instance's attached account
 // ---------------------------------------------------------------------------
