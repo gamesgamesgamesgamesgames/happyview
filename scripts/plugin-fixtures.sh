@@ -21,6 +21,7 @@
 PLUGIN_FIXTURES=(
   tests/fixtures/differential_library/target/wasm32-unknown-unknown/release/differential_library.wasm
   tests/fixtures/interpreter_echo/target/wasm32-unknown-unknown/release/interpreter_echo.wasm
+  tests/fixtures/script_module/target/wasm32-wasip1/release/script_module.wasm
   tests/fixtures/sdk_atproto/target/wasm32-unknown-unknown/release/sdk_atproto.wasm
   tests/fixtures/sdk_auth/target/wasm32-unknown-unknown/release/sdk_auth.wasm
   tests/fixtures/sdk_blobs/target/wasm32-unknown-unknown/release/sdk_blobs.wasm
@@ -28,7 +29,6 @@ PLUGIN_FIXTURES=(
   tests/fixtures/sdk_http/target/wasm32-unknown-unknown/release/sdk_http.wasm
   tests/fixtures/sdk_linked_repos/target/wasm32-unknown-unknown/release/sdk_linked_repos.wasm
   tests/fixtures/sdk_objects/target/wasm32-unknown-unknown/release/sdk_objects.wasm
-  tests/fixtures/script_module/target/wasm32-wasip1/release/script_module.wasm
   tests/fixtures/sdk_spaces/target/wasm32-unknown-unknown/release/sdk_spaces.wasm
   tests/fixtures/test_library/target/wasm32-unknown-unknown/release/test_library.wasm
   tests/fixtures/test_plugin/target/wasm32-unknown-unknown/release/test_plugin.wasm

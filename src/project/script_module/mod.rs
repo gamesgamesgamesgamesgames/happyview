@@ -574,6 +574,13 @@ mod tests {
         );
     }
 
+    // The boot sweep deletes every cached module not in this set, so a boot
+    // that stopped asking would throw away each module's compiled code.
+    #[test]
+    fn the_boot_sweep_asks_for_the_live_hashes() {
+        assert!(include_str!("../../main.rs").contains("script_module::boot_live_hashes("));
+    }
+
     #[test]
     fn a_module_with_no_build_output_says_how_to_build_it() {
         let mut p = Project::new();
