@@ -4,7 +4,7 @@ title: "Lexicon Publishing"
 
 Admin API endpoints for publishing lexicons as `com.atproto.lexicon.schema` records and managing the defaults that decide where they go. For the concepts, DNS requirements and dashboard, see [Publishing Lexicons](../../guides/publishing-lexicons.md).
 
-All endpoints are under `/admin/lexicon-publishing`. Reads need `lexicons:read` and writes need `lexicons:publish`. Errors use the usual body, `{"error": "<message>"}`.
+All endpoints are under `/admin/lexicon-publishing`. Reads need `lexicons:read` and writes need `lexicons:publish`. Choosing a linked repo as a default's target also needs `linked-repos:read`; for a caller without it, every linked-repo target in a response keeps `kind`, `available` and `can_unpublish` and has `linked_repo_id`, `did`, `handle` and `unavailable_reason` set to `null`, as does a linked-repo rule's own `linked_repo_id`. Errors use the usual body, `{"error": "<message>"}`.
 
 ```sh
 # All examples assume $TOKEN is an API key (hv_...)
@@ -78,13 +78,16 @@ GET /admin/lexicon-publishing
         "withdrawn_at": null
       }
     }
-  ]
+  ],
+  "orphans": []
 }
 ```
 
 - `targets`: the instance first, then one per linked repo.
 - `rules`: most specific first.
 - `lexicons`: every publishable lexicon, sorted by NSID. `layer` is `manual` or `project`; network lexicons never appear. `rule_id`, `rule_pattern` and `target` are `null` when no default matches, and `auto_publish` is then `false`. `status` is one of `no_rule`, `target_unavailable`, `unpublished`, `withdrawn`, `moved`, `outdated` or `current`. `publication` is `null` until something has been attempted; it carries only the error columns when every attempt has failed. `withdrawn_at` is set when the lexicon was unpublished and has not been published since; such a lexicon reports `withdrawn` (unless no default matches or its target is unavailable) and auto-publish skips it.
+
+- `orphans`: publication rows, in the same shape as `publication`, for records still in a repo whose lexicon is no longer publishable, such as one deleted after it was published. [Unpublish](#unpublish) works on them as on any other.
 
 The overview computes each lexicon's CID locally, so it makes no network calls.
 
@@ -142,6 +145,7 @@ Returns `201` with the rule and its target.
 | Status | Cause                                                                                     |
 | ------ | ----------------------------------------------------------------------------------------- |
 | `400`  | A malformed pattern, an unknown `target_kind`, a missing or unknown `linked_repo_id`, or a target that is unavailable (the body gives its reason) |
+| `403`  | The target is a linked repo and the caller lacks `linked-repos:read` |
 | `409`  | A default for this pattern already exists. Patterns are compared after normalisation, so `COM.EXAMPLE.*` collides with `com.example.*` |
 
 After a successful create, HappyView starts an auto-publish run in the background.
@@ -156,7 +160,7 @@ PATCH /admin/lexicon-publishing/rules/{id}
 
 Any of `target_kind`, `linked_repo_id` and `auto_publish`. The pattern can't change; delete the default and add another. The target is re-validated only when it changes, so you can still turn off auto-publish on a default whose linked repo has gone away. Switching to `instance` clears `linked_repo_id`.
 
-Returns `200` with the rule and its target, or `404` for an unknown ID.
+Returns `200` with the rule and its target, `403` when it changes the target to a linked repo without `linked-repos:read`, or `404` for an unknown ID.
 
 ## Delete a default
 
@@ -166,7 +170,7 @@ DELETE /admin/lexicon-publishing/rules/{id}
 
 **Permission:** `lexicons:publish`
 
-Returns `204`, or `404` for an unknown ID. Records already published are left alone.
+Returns `204`, or `404` for an unknown ID. Records already published are left alone, and an auto-publish run starts in the background, since a broader default may now cover the lexicons this one did.
 
 ## Publish
 
@@ -218,9 +222,9 @@ Deletes the record from the account it was published to, clears the stored `did`
 | `404`  | The NSID isn't published                                                               |
 | `409`  | No linked repo or attached account holds the DID the record was published to; nothing is changed |
 | `401`  | The attached account needs to sign in again, or a linked repo needs reauthorization |
-| `403`  | The linked repo's grant lacks the `delete` scope |
-| `502`  | The attached account's PDS refused the delete                                          |
+| `403`  | The linked repo's grant lacks the `delete` scope, or the attached account's PDS refused the delete for lack of scope (re-authenticate it from Service Identity) |
+| `502`  | The attached account's PDS refused the delete for another reason                      |
 
 ## Events
 
-These actions are written to the event log: `lexicon_publishing.rule_created`, `lexicon_publishing.rule_updated`, `lexicon_publishing.rule_deleted`, `lexicon.published`, `lexicon.publish_failed` and `lexicon.unpublished`.
+These actions are written to the event log: `lexicon_publishing.rule_created`, `lexicon_publishing.rule_updated`, `lexicon_publishing.rule_deleted`, `lexicon.published`, `lexicon.publish_failed` and `lexicon.unpublished`. A failed publish whose error matches the last one recorded for that lexicon updates `last_attempt_at` without logging another `lexicon.publish_failed`.

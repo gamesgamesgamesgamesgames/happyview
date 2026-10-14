@@ -39,7 +39,7 @@ Each default sends lexicons to one of two places.
 
 Choose **Instance account** to publish into the account attached to your instance. This target only exists when the instance identity is in **attach account** mode (see [Service Identity](../api-reference/admin/service-identity.md)). With `did:web`, `did:plc`, or an identity that isn't exposed, there's no repo to write to, and the target is shown as unavailable with that reason.
 
-Publishing uses the attached account's dashboard sign-in. If that session has expired, publishing fails with a message asking you to sign in again.
+Publishing uses the attached account's sign-in, which has to include permission to write schema records. Accounts attached during setup, or re-authenticated from **Settings > Service Identity**, are asked for it. If yours was attached before HappyView could publish lexicons, or was last signed in through the ordinary dashboard login, the target shows as unavailable with what the session was granted: press **Re-authenticate** on the Service Identity page once and approve the request. If the session has expired, or the PDS refuses the write, publishing fails with a message asking you to do the same.
 
 ### A linked repo
 
@@ -105,7 +105,7 @@ The last error, if any, is shown beside the status. Each lexicon's own page has 
 
 ## Auto-publish
 
-With auto-publish on, HappyView publishes any matching lexicon that is `unpublished`, `moved`, or `outdated`. A `withdrawn` lexicon is skipped. It runs after the server starts, after you upload a lexicon, and after you create or change a default. There's no polling loop, so a failed publish is retried at the next of those, or when you publish by hand.
+With auto-publish on, HappyView publishes any matching lexicon that is `unpublished`, `moved`, or `outdated`. A `withdrawn` lexicon is skipped. It runs after the server starts, after you upload a lexicon, and after you create, change or delete a default. There's no polling loop, so a failed publish is retried at the next of those, or when you publish by hand.
 
 Only one run happens at a time. A trigger that arrives mid-run doesn't start a second run: it marks the work pending and the running pass goes round once more, so a change made during a run isn't missed.
 
@@ -113,13 +113,13 @@ Only one run happens at a time. A trigger that arrives mid-run doesn't start a s
 
 **Nothing ever unpublishes automatically.** Deleting a lexicon, deleting a default, or pointing a default somewhere else leaves published records where they are. A published schema is a public contract that other apps resolve, and removing one can break them.
 
-To remove a record, use **Unpublish**. It deletes the record from the account it was published to, using whichever credential holds that DID: the attached account, or the linked repo bound to it. If nothing HappyView holds can act as that account any more, unpublishing is refused and names the DID.
+To remove a record, use **Unpublish**. A record whose lexicon you've since deleted is listed under **Published records without a lexicon** on the publishing page, with its own **Unpublish** button. It deletes the record from the account it was published to, using whichever credential holds that DID: the attached account, or the linked repo bound to it. If nothing HappyView holds can act as that account any more, unpublishing is refused and names the DID.
 
 Unpublishing also withdraws the lexicon from auto-publish: its status becomes `withdrawn`, and no auto-publish run puts the record back, even under a default with auto-publish on. Publishing it by hand clears that and returns it to its default's normal handling.
 
 ## Permissions
 
-Reading the publishing page needs `lexicons:read`. Creating, changing, or deleting defaults, and publishing or unpublishing, needs `lexicons:publish`.
+Reading the publishing page needs `lexicons:read`. Creating, changing, or deleting defaults, and publishing or unpublishing, needs `lexicons:publish`. Pointing a default at a linked repo also needs `linked-repos:read`; without it, the page shows linked-repo destinations only as "A linked repo".
 
 The **Manager** template includes `lexicons:publish` for users created from it going forward. Existing non-super users don't get it automatically: grant it to them explicitly from **Access > Users**. Super users can always publish.
 
