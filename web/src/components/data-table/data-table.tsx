@@ -46,7 +46,10 @@ export function DataTable<TData>({
                   <TableHead
                     key={header.id}
                     colSpan={header.colSpan}
-                    className={cn(header.column.getIsPinned() && "bg-inherit")}
+                    className={cn(
+                      header.column.columnDef.meta?.className,
+                      header.column.getIsPinned() && "bg-inherit",
+                    )}
                     style={{
                       ...getColumnPinningStyle({ column: header.column }),
                     }}
@@ -79,7 +82,10 @@ export function DataTable<TData>({
                   {row.getVisibleCells().map((cell) => (
                     <TableCell
                       key={cell.id}
-                      className={cn(cell.column.getIsPinned() && "bg-inherit")}
+                      className={cn(
+                        cell.column.columnDef.meta?.className,
+                        cell.column.getIsPinned() && "bg-inherit",
+                      )}
                       style={{
                         ...getColumnPinningStyle({ column: cell.column }),
                       }}

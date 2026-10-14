@@ -19,6 +19,7 @@ import { useRouter } from "next/navigation";
 import { FileCode, Info, Loader2 } from "lucide-react";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
+import { useIsMobile } from "@/hooks/use-mobile";
 import {
   deletePublishRule,
   getLexiconPublishing,
@@ -63,7 +64,10 @@ import {
 } from "@/components/lexicon-publishing/model";
 import { PublishStatusBadge } from "@/components/lexicon-publishing/publish-status";
 import { RoutingCascade } from "@/components/lexicon-publishing/routing-cascade";
-import { RowActions } from "@/components/lexicon-publishing/row-actions";
+import {
+  RowActions,
+  hasRowActions,
+} from "@/components/lexicon-publishing/row-actions";
 import { TargetName } from "@/components/lexicon-publishing/target-name";
 import { RuleSheet } from "@/components/lexicon-publishing/rule-sheet";
 import { usePublish } from "@/components/lexicon-publishing/use-publish";
@@ -167,8 +171,18 @@ export default function LexiconPublishingPage() {
         header: ({ column }) => (
           <DataTableColumnHeader column={column} label="Lexicon" />
         ),
+        // Below md the status column would sit under the pinned actions, so
+        // the status moves into this cell instead.
         cell: ({ row }) => (
-          <span className="font-mono text-sm">{row.original.nsid}</span>
+          <div className="flex flex-col gap-1">
+            <span className="font-mono text-sm">{row.original.nsid}</span>
+            <PublishStatusBadge
+              lexicon={row.original}
+              publishing={busy.has(row.original.nsid)}
+              compact
+              className="md:hidden"
+            />
+          </div>
         ),
         filterFn: "includesString",
         enableColumnFilter: true,
@@ -201,6 +215,7 @@ export default function LexiconPublishingPage() {
           label: "Status",
           variant: "multiSelect",
           options: STATUS_OPTIONS,
+          className: "max-md:hidden",
         },
       },
       {
@@ -269,8 +284,8 @@ export default function LexiconPublishingPage() {
       sorting,
       columnFilters,
       pagination,
-      columnPinning: { right: ["actions"] },
     },
+    initialState: { columnPinning: { right: ["actions"] } },
     defaultColumn: { enableColumnFilter: false },
     onSortingChange: setSorting,
     onColumnFiltersChange: setColumnFilters,
@@ -283,6 +298,19 @@ export default function LexiconPublishingPage() {
     getFacetedUniqueValues: getFacetedUniqueValues(),
     getRowId: (row) => row.nsid,
   });
+
+  // Below md a pinned column covers the cells it floats over, so it pins only
+  // when this page has a button in it; an empty pinned cell would hide text
+  // for nothing.
+  const isMobile = useIsMobile();
+  useEffect(() => {
+    const pageHasActions =
+      canPublish &&
+      table.getRowModel().rows.some((r) => hasRowActions(r.original));
+    table.setColumnPinning(
+      !isMobile || pageHasActions ? { right: ["actions"] } : {},
+    );
+  }, [table, isMobile, canPublish, lexicons, sorting, columnFilters, pagination]);
 
   const publishingPending = pending.some((l) => busy.has(l.nsid));
 

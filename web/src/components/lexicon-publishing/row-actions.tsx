@@ -38,6 +38,11 @@ export function isPublished(lexicon: PublishableLexicon): boolean {
   return Boolean(lexicon.publication?.uri);
 }
 
+/** Whether {@link RowActions} renders anything for this lexicon. */
+export function hasRowActions(lexicon: PublishableLexicon): boolean {
+  return canPublishNow(lexicon) || isPublished(lexicon);
+}
+
 export function RowActions({
   lexicon,
   busy,
@@ -53,7 +58,7 @@ export function RowActions({
 }) {
   const publishable = canPublishNow(lexicon);
   const published = isPublished(lexicon);
-  if (!publishable && !published) return null;
+  if (!hasRowActions(lexicon)) return null;
 
   return (
     <div
