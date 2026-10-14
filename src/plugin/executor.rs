@@ -488,6 +488,28 @@ pub struct PluginExecutor {
 /// test file gets the same budget, and as much again in waits.
 pub const TEST_FILE_GUEST_SECONDS: u64 = 60;
 
+/// The guest deadline a run of `kind` is armed with, `None` meaning none.
+/// Running long is what a job is for, and `should_stop` is its stop; every
+/// other kind is bounded by the operator's wall clock. A job fired from a
+/// test file is bounded anyway: nothing would ever ask it to stop, and the
+/// run awaits it.
+fn guest_deadline(
+    kind: ScriptKind,
+    in_test_run: bool,
+    wall_clock: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let test_file = std::time::Duration::from_secs(TEST_FILE_GUEST_SECONDS);
+    match kind {
+        ScriptKind::Job if in_test_run => Some(test_file),
+        ScriptKind::Job => None,
+        ScriptKind::Test => Some(test_file),
+        ScriptKind::XrpcQuery
+        | ScriptKind::XrpcProcedure
+        | ScriptKind::RecordEvent
+        | ScriptKind::Label => Some(wall_clock),
+    }
+}
+
 impl PluginExecutor {
     pub fn new(
         runtime: Arc<WasmRuntime>,
@@ -651,23 +673,11 @@ impl PluginExecutor {
         inst.set_script_memory_limit(
             usize::try_from(input.limits.memory_bytes).unwrap_or(usize::MAX),
         );
-        // Running long is what a job is for, and `should_stop` is its stop;
-        // every other kind is bounded by the operator's wall clock, re-armed
-        // here so a run starts with a whole budget rather than what
-        // instantiation left. A job fired from a test file is bounded anyway:
-        // nothing would ever ask it to stop, and the run awaits it.
-        match input.kind {
-            ScriptKind::Job if self.in_test_run() => {
-                inst.arm_guest_deadline(std::time::Duration::from_secs(TEST_FILE_GUEST_SECONDS))
-            }
-            ScriptKind::Job => inst.lift_guest_deadline(),
-            ScriptKind::Test => {
-                inst.arm_guest_deadline(std::time::Duration::from_secs(TEST_FILE_GUEST_SECONDS))
-            }
-            ScriptKind::XrpcQuery
-            | ScriptKind::XrpcProcedure
-            | ScriptKind::RecordEvent
-            | ScriptKind::Label => inst.arm_guest_deadline(self.script_wall_clock()),
+        // Re-armed here so a run starts with a whole budget rather than what
+        // instantiation left.
+        match guest_deadline(input.kind, self.in_test_run(), self.script_wall_clock()) {
+            Some(budget) => inst.arm_guest_deadline(budget),
+            None => inst.lift_guest_deadline(),
         }
         // A run that failed takes its outstanding calls down with it when
         // `inst` drops; only one that answered waits for them.
@@ -2928,6 +2938,37 @@ mod baseline {
 
 #[cfg(test)]
 mod job_deadline_tests {
+    use super::{ScriptKind, TEST_FILE_GUEST_SECONDS, guest_deadline};
+    use std::time::Duration;
+
+    #[test]
+    fn each_kind_gets_its_deadline_and_only_a_test_run_bounds_a_job() {
+        let wall = Some(Duration::from_secs(7));
+        let file = Some(Duration::from_secs(TEST_FILE_GUEST_SECONDS));
+        let table = [
+            (ScriptKind::Job, false, None),
+            (ScriptKind::Job, true, file),
+            (ScriptKind::Test, false, file),
+            (ScriptKind::Test, true, file),
+            (ScriptKind::XrpcQuery, false, wall),
+            (ScriptKind::XrpcQuery, true, wall),
+            (ScriptKind::XrpcProcedure, false, wall),
+            (ScriptKind::XrpcProcedure, true, wall),
+            (ScriptKind::RecordEvent, false, wall),
+            (ScriptKind::RecordEvent, true, wall),
+            (ScriptKind::Label, false, wall),
+            (ScriptKind::Label, true, wall),
+        ];
+        assert_eq!(table.len(), ScriptKind::ALL.len() * 2);
+        for (kind, in_test_run, expected) in table {
+            assert_eq!(
+                guest_deadline(kind, in_test_run, Duration::from_secs(7)),
+                expected,
+                "{kind:?}, in a test run: {in_test_run}"
+            );
+        }
+    }
+
     /// Only a test run bounds a job: a served job runs as long as it needs
     /// and stops through `should_stop`, which no test run would ever set.
     #[tokio::test]

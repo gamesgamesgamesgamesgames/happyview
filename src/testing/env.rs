@@ -149,9 +149,10 @@ impl TestEnv {
     }
 
     /// Replace the project's configuration, for a watch session that saw
-    /// it change. Every file state made afterwards reads the new one, and
-    /// the script budgets are read again, since loading it installed a new
-    /// configuration layer they fall back to.
+    /// it change. Every file state made afterwards reads the new one. The
+    /// script budgets are read again from the database and the environment;
+    /// `happyview.toml` supplies neither today, so this keeps them in step
+    /// with the configuration layer only if it ever does.
     pub async fn set_config(&mut self, config: Config) {
         let fixture = crate::test_support::test_config(DatabaseBackend::Sqlite);
         self.base.config = run_config(config, &fixture);
