@@ -81,7 +81,7 @@ pub async fn step(
     if changed
         .iter()
         .any(|path| CONFIG_FILES.contains(&path.as_str()))
-        && let Err(e) = runner.reload_config()
+        && let Err(e) = runner.reload_config().await
     {
         // A refused load leaves the previous configuration installed, and
         // the build below reads the same file and reports why.
@@ -101,9 +101,11 @@ pub async fn step(
     state.pending.clear();
     let only = match affected(&changed, &state.snapshot, &after) {
         Affected::All => None,
-        // Only deleted test files: nothing left to run.
+        // Only deleted test files: nothing left to run, and the exit code
+        // stays the last run's.
         Affected::Only(keys) if keys.is_empty() => {
             state.snapshot = after;
+            let _ = writeln!(out, "\nwaiting for changes");
             return;
         }
         Affected::Only(keys) => Some(keys),

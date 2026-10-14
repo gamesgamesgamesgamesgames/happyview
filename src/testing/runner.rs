@@ -76,6 +76,12 @@ fn dispatch_failure(error: DispatchError, interpreter: Option<&str>) -> FileErro
                 interpreter.unwrap_or("unknown")
             )
         }
+        // The display text speaks of fuel, which is not what stops a test
+        // file: its own code ran past its wall-clock budget.
+        DispatchError::Execution(ExecutionError::Timeout) => format!(
+            "the file ran past its {}-second limit for its own code",
+            crate::plugin::executor::TEST_FILE_GUEST_SECONDS
+        ),
         other => other.to_string(),
     };
     FileError {
@@ -95,8 +101,12 @@ impl Runner {
         } else {
             args.plugin_dirs.clone()
         };
+        let cache_dir = config
+            .plugin_cache_dir
+            .clone()
+            .unwrap_or_else(|| root.join(".happyview").join("plugin-cache"));
         let runtime = Arc::new(
-            WasmRuntime::with_cache_dir(Some(root.join(".happyview").join("plugin-cache")))
+            WasmRuntime::with_cache_dir(Some(cache_dir))
                 .map_err(|e| format!("could not start the wasm runtime: {e}"))?,
         );
         let registry = Arc::new(PluginRegistry::new().with_runtime(runtime.clone()));
@@ -124,9 +134,9 @@ impl Runner {
     /// Load the project's configuration again, after a watch saw
     /// `happyview.toml` or `.env.test` change. A refused load keeps the
     /// current one.
-    pub fn reload_config(&mut self) -> Result<(), String> {
+    pub async fn reload_config(&mut self) -> Result<(), String> {
         let config = load_config(&self.root)?;
-        self.env.set_config(config);
+        self.env.set_config(config).await;
         Ok(())
     }
 
@@ -199,12 +209,12 @@ impl Runner {
         // its deadline, so a file that spins would otherwise hold up every
         // file sharing its task, and a host panic is caught at the join
         // rather than ending the run.
-        let outcome = tokio::spawn(execute(
+        let outcome = AbortOnDrop(tokio::spawn(execute(
             file.state.clone(),
             snapshot.clone(),
             key.to_string(),
             script.clone(),
-        ))
+        )))
         .await;
         let reports = file.harness.reports();
         let error = match outcome {
@@ -284,21 +294,50 @@ async fn execute(
     .await
 }
 
-/// A file whose run panicked. That is a bug in the host, and says so, so it
-/// is not read as the test's.
+/// A file's task, aborted when the run that awaits it is dropped. Otherwise
+/// its guest would carry on writing to a database in a directory the
+/// dropped run's `TestEnv` deletes.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+/// A file whose task never finished. A panic is a bug in the host, and says
+/// so, so it is not read as the test's; a cancelled task was stopped from
+/// outside and is no one's bug.
 fn panic_error(join: tokio::task::JoinError) -> FileError {
-    let reason = match join.try_into_panic() {
-        Ok(panic) => panic
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| panic.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "no message".into()),
+    let message = match join.try_into_panic() {
+        Ok(panic) => {
+            let reason = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".into());
+            format!(
+                "happyview panicked running this file ({reason}); this is a bug in happyview, not in the test"
+            )
+        }
+        Err(join) if join.is_cancelled() => {
+            "the run was cancelled before this file finished".into()
+        }
         Err(join) => join.to_string(),
     };
     FileError {
-        message: format!(
-            "happyview panicked running this file ({reason}); this is a bug in happyview, not in the test"
-        ),
+        message,
         file: None,
         line: None,
     }
@@ -406,6 +445,11 @@ mod tests {
             "{}",
             malformed.message
         );
+        let timeout = dispatch_failure(DispatchError::Execution(ExecutionError::Timeout), None);
+        assert_eq!(
+            timeout.message,
+            "the file ran past its 60-second limit for its own code"
+        );
     }
 
     #[tokio::test]
@@ -414,5 +458,12 @@ mod tests {
         let message = panic_error(join).message;
         assert!(message.contains("panicked"), "{message}");
         assert!(message.contains("boom"), "{message}");
+
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        assert_eq!(
+            panic_error(handle.await.unwrap_err()).message,
+            "the run was cancelled before this file finished"
+        );
     }
 }

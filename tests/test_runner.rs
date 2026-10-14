@@ -268,6 +268,10 @@ async fn a_file_that_spins_is_stopped_and_reported() {
     let out = String::from_utf8(out).unwrap();
     assert_eq!(code, 1, "{out}");
     assert!(out.contains(" FAIL  src/lib/spin.test.echo"), "{out}");
+    assert!(
+        out.contains("the file ran past its 60-second limit for its own code"),
+        "{out}"
+    );
     // The other file finishes on its own time rather than waiting out the
     // spinning one's deadline.
     let pass = out
@@ -569,4 +573,177 @@ async fn a_filter_excluding_every_affected_file_says_so() {
         "{text}"
     );
     assert!(text.trim_end().ends_with("waiting for changes"), "{text}");
+}
+
+/// A batch that only deletes test files runs nothing, says it is waiting,
+/// and keeps the last run's exit code.
+#[tokio::test]
+async fn a_batch_that_only_deletes_test_files_says_it_is_waiting() {
+    use happyview::testing::watch::step;
+    let Some(dir) = project() else { return };
+    let root = dir.path();
+    let (mut runner, mut state) = watch_two_files(root).await;
+    state.code = 1;
+    std::fs::remove_file(root.join("src/lib/b.test.echo")).unwrap();
+    let mut out = Vec::new();
+    step(
+        &mut runner,
+        &mut state,
+        &["src/lib/b.test.echo".to_string()],
+        None,
+        &mut out,
+    )
+    .await;
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("PASS"), "{text}");
+    assert!(text.trim_end().ends_with("waiting for changes"), "{text}");
+    assert_eq!(state.code, 1);
+}
+
+/// `happyview test` in `root` through the real binary, with `vars` set.
+fn run_binary(root: &Path, vars: &[(&str, &str)]) -> (Option<i32>, String) {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_happyview"));
+    command
+        .args(["test", "."])
+        .current_dir(root)
+        .env_remove("PLUGIN_DIR")
+        .env_remove("PLUGIN_CACHE_DIR")
+        .env_remove("DATABASE_URL")
+        .env_remove("HAPPYVIEW_PROJECT")
+        .env_remove("SCRIPT_WALL_CLOCK_SECONDS")
+        .env_remove("SCRIPT_INSTRUCTION_LIMIT");
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    let out = command.output().expect("run happyview test");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    (out.status.code(), format!("{stdout}\nstderr:\n{stderr}"))
+}
+
+/// A handler runs under the wall clock the instance's configuration sets,
+/// not the default: here a spinning handler is stopped at one second, where
+/// the default would let it run ten.
+#[test]
+fn a_handler_runs_under_the_configured_wall_clock() {
+    let Some(dir) = project() else { return };
+    let root = dir.path();
+    write(
+        root,
+        "src/lexicons/com/example/spin.json",
+        &serde_json::json!({
+            "lexicon": 1, "id": "com.example.spin",
+            "defs": {"main": {"type": "query"}}
+        })
+        .to_string(),
+    );
+    write(root, "src/lexicons/com/example/spin.echo", "spin");
+    write(
+        root,
+        "src/lib/spin.test.echo",
+        r#"test:[{"import":"trigger","request":{"kind":"query","target":"com.example.spin","as":"did:plc:alice"}},{"check":{"name":"the handler timed out","answer":0,"pointer":"/ok/status","equals":408,"line":1}}]"#,
+    );
+    let (code, out) = run_binary(root, &[("SCRIPT_WALL_CLOCK_SECONDS", "1")]);
+    assert_eq!(code, Some(0), "{out}");
+    let pass = out
+        .lines()
+        .find(|l| l.starts_with(" PASS  src/lib/spin.test.echo"))
+        .unwrap_or_else(|| panic!("{out}"));
+    let ms: u64 = pass
+        .rsplit(' ')
+        .next()
+        .and_then(|t| t.strip_suffix("ms"))
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("{pass}"));
+    assert!(ms < 8_000, "{out}");
+}
+
+/// A watch session that reloads the configuration reads the budgets again,
+/// since the layer they fall back to was just replaced. The variable is set
+/// while this runner holds the run lock, so no other runner can read it.
+#[tokio::test]
+async fn reloading_the_configuration_reads_the_script_budgets_again() {
+    let Some(dir) = project() else { return };
+    let root = dir.path();
+    let mut runner = happyview::testing::runner::Runner::prepare(&TestArgs {
+        root: root.to_path_buf(),
+        ..TestArgs::default()
+    })
+    .await
+    .unwrap();
+    let limits = runner.env.base.script_limits.clone();
+    let before = limits.wall_clock();
+    assert_ne!(before, Duration::from_secs(7));
+    // SAFETY: the variable is read only by a runner, and this one holds the
+    // lock every runner takes before reading the environment.
+    unsafe { std::env::set_var("SCRIPT_WALL_CLOCK_SECONDS", "7") };
+    let reloaded = runner.reload_config().await;
+    let after = limits.wall_clock();
+    unsafe { std::env::remove_var("SCRIPT_WALL_CLOCK_SECONDS") };
+    reloaded.unwrap();
+    assert_eq!(after, Duration::from_secs(7));
+}
+
+/// `PLUGIN_CACHE_DIR` is where a run caches compiled plugins, as it is for a
+/// served instance; the project's own directory is only the fallback.
+#[test]
+fn a_run_caches_plugins_under_plugin_cache_dir() {
+    let Some(dir) = project() else { return };
+    let root = dir.path();
+    write(
+        root,
+        "src/lexicons/com/example/getThing.test.echo",
+        &test_file(
+            r#"{"check":{"name":"answers 200","answer":0,"pointer":"/ok/status","equals":200,"line":2}}"#,
+        ),
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let cache_dir = cache.path().join("cache");
+    let (code, out) = run_binary(root, &[("PLUGIN_CACHE_DIR", cache_dir.to_str().unwrap())]);
+    assert_eq!(code, Some(0), "{out}");
+    let cached: Vec<_> = std::fs::read_dir(&cache_dir)
+        .unwrap_or_else(|e| panic!("{}: {e}\n{out}", cache_dir.display()))
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "cwasm"))
+        .collect();
+    assert!(!cached.is_empty(), "{out}");
+    assert!(!root.join(".happyview/plugin-cache").exists());
+}
+
+/// Dropping a run takes its files' tasks with it. The job below would add
+/// its two-second wait to the wait counter on waking; the run is dropped
+/// before then, so a task left running is one that eventually counts it.
+#[tokio::test]
+async fn a_dropped_run_stops_its_files() {
+    let Some(dir) = project() else { return };
+    let root = dir.path();
+    write(root, "src/jobs/sleep.echo", "host:job_wait");
+    write(
+        root,
+        "src/lib/sleep.test.echo",
+        r#"test:[{"import":"trigger","request":{"kind":"job","target":"sleep","input":{"seconds":2}}}]"#,
+    );
+    happyview::testing::identity::forge_identities();
+    let runner = happyview::testing::runner::Runner::prepare(&TestArgs {
+        root: root.to_path_buf(),
+        ..TestArgs::default()
+    })
+    .await
+    .unwrap();
+    let (snapshot, _) = runner.build().await.unwrap();
+    let waited = runner.env.base.telemetry_counters.clone();
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(1500),
+        runner.run(&snapshot, None, None),
+    )
+    .await;
+    assert!(dropped.is_err(), "the run finished before it was dropped");
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        waited
+            .job_wait_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a file's job was still running after its run was dropped"
+    );
 }

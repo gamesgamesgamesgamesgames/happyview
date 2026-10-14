@@ -120,8 +120,14 @@ impl TestEnv {
             })
             .await;
         let config = run_config(config.unwrap_or_else(|| base.config.clone()), &base.config);
+        // The budgets a served instance would run its handlers under, so a
+        // handler that fits a raised limit in production fits it here too.
+        let script_limits = Arc::new(
+            crate::lua::limits::ScriptLimits::load(&base.db, DatabaseBackend::Sqlite).await,
+        );
         let base = AppState {
             config,
+            script_limits,
             http: crate::http_retry::shared_client().clone(),
             plugin_registry: registry,
             wasm_runtime: runtime,
@@ -143,10 +149,16 @@ impl TestEnv {
     }
 
     /// Replace the project's configuration, for a watch session that saw
-    /// it change. Every file state made afterwards reads the new one.
-    pub fn set_config(&mut self, config: Config) {
+    /// it change. Every file state made afterwards reads the new one, and
+    /// the script budgets are read again, since loading it installed a new
+    /// configuration layer they fall back to.
+    pub async fn set_config(&mut self, config: Config) {
         let fixture = crate::test_support::test_config(DatabaseBackend::Sqlite);
         self.base.config = run_config(config, &fixture);
+        self.base
+            .script_limits
+            .refresh(&self.base.db, DatabaseBackend::Sqlite)
+            .await;
     }
 
     /// A state for test file `file` on a fresh copy of the template. Shares
