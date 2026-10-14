@@ -106,7 +106,7 @@ export function UnpublishButton({
       <AlertDialogTrigger asChild>
         <Button
           size={compact ? "icon-sm" : "sm"}
-          variant={compact ? "outline" : "ghost"}
+          variant="outline"
           className={cn(
             "hover:text-destructive",
             compact && "text-muted-foreground",
