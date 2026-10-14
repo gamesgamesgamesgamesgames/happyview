@@ -245,7 +245,7 @@ test.describe("Setup - Attach Account", () => {
       expect(rule.target.can_unpublish).toBe(true);
       expect(rule.target.did).toBe(account.did);
 
-      await page.goto("/dashboard/lexicons/publishing");
+      await page.goto("/dashboard/settings/lexicon-publishing");
       await page.getByPlaceholder("Filter by NSID...").fill(nsid);
       const row = lexiconRow(page, nsid);
       await expect(row).toContainText("Not published");

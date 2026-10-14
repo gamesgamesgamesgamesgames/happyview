@@ -26,6 +26,7 @@ const SEEDED = [ALPHA, BETA, GAMMA, OTHER];
 const PREFIX = "test.e2e.pub.*";
 const ATTACHED_DID = "did:plc:e2epublishinginstance";
 const READER_DID = "did:plc:e2epublishingreader";
+const STANDBY_DID = "did:plc:e2epublishingstandby";
 const DID_WEB_REASON = "the instance identity is did:web and has no repo";
 const PENDING_REASON = "this linked repo has not been authorized yet";
 const NO_SESSION_REASON =
@@ -74,7 +75,60 @@ async function removeAttachedSession(): Promise<void> {
   }
 }
 
-const PAGE = "/dashboard/lexicons/publishing";
+/**
+ * A second destination that stays able to publish, bound and given a granted
+ * session by hand, so the page stays open while the instance is taken away.
+ * Nothing here publishes, so its token reaches no PDS either.
+ */
+async function activateStandbyRepo(grantId: string): Promise<void> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const now = new Date().toISOString();
+    await client.query(
+      `UPDATE happyview_linked_repos
+       SET did = $1, status = 'active', authorized_at = $2, last_refreshed_at = $2
+       WHERE id = $3`,
+      [STANDBY_DID, now, grantId],
+    );
+    const sessionData = JSON.stringify({
+      dpop_key: {},
+      token_set: {
+        sub: STANDBY_DID,
+        scope: SCHEMA_SCOPE,
+        access_token: "e2e-lexicon-publishing-unusable",
+        token_type: "DPoP",
+      },
+    });
+    await client.query(
+      `INSERT INTO happyview_linked_repo_sessions (did, session_data, updated_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (did) DO UPDATE SET session_data = $2, updated_at = $3`,
+      [STANDBY_DID, sessionData, now],
+    );
+  } finally {
+    await client.end();
+  }
+}
+
+async function removeStandbySession(): Promise<void> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    await client.query(
+      "DELETE FROM happyview_linked_repo_sessions WHERE did = $1",
+      [STANDBY_DID],
+    );
+  } finally {
+    await client.end();
+  }
+}
+
+const PAGE = "/dashboard/settings/lexicon-publishing";
+
+function sidebarLink(page: Page) {
+  return page.getByRole("link", { name: "Lexicon Publishing" });
+}
 
 function lexicon(id: string) {
   return {
@@ -133,6 +187,7 @@ test.describe("Lexicon publishing dashboard", () => {
 
   let identity: Awaited<ReturnType<typeof snapshotServiceIdentity>>;
   let grantId: string;
+  let standbyId: string;
 
   test.beforeAll(async ({ browser }) => {
     identity = await snapshotServiceIdentity();
@@ -155,6 +210,11 @@ test.describe("Lexicon publishing dashboard", () => {
     });
     expect(grant.ok(), `create grant: ${await grant.text()}`).toBeTruthy();
     grantId = (await grant.json()).id;
+    const standby = await page.request.post("/admin/linked-repos", {
+      data: { reason: "e2e lexicon publishing standby", scopes: SCHEMA_SCOPE },
+    });
+    expect(standby.ok(), `create standby: ${await standby.text()}`).toBeTruthy();
+    standbyId = (await standby.json()).id;
     await page.close();
   });
 
@@ -166,6 +226,7 @@ test.describe("Lexicon publishing dashboard", () => {
       if (identity !== undefined) await restoreServiceIdentity(identity);
     } finally {
       await removeAttachedSession();
+      await removeStandbySession();
       const page = await browser.newPage();
       await loginAsTestAdmin(page);
       for (const rule of await rules(page.request)) {
@@ -179,6 +240,9 @@ test.describe("Lexicon publishing dashboard", () => {
         await page.request.delete(`/admin/lexicons/${id}`);
       }
       if (grantId) await page.request.delete(`/admin/linked-repos/${grantId}`);
+      if (standbyId) {
+        await page.request.delete(`/admin/linked-repos/${standbyId}`);
+      }
       await page.close();
       await removeTestUser(READER_DID);
     }
@@ -188,40 +252,32 @@ test.describe("Lexicon publishing dashboard", () => {
     await loginAsTestAdmin(page);
   });
 
-  test("with no defaults, every lexicon reads as unpublished", async ({
+  test("with nowhere to publish, publishing stays closed and the API refuses", async ({
     page,
   }) => {
-    expect(await rules(page.request)).toEqual([]);
+    await page.goto("/dashboard/lexicons");
+    await expect(
+      page.getByRole("link", { name: "Lexicons", exact: true }),
+    ).toBeVisible();
+    await expect(sidebarLink(page)).toHaveCount(0);
+    await expect(
+      page.getByRole("columnheader", { name: "Published" }),
+    ).toHaveCount(0);
+
+    // The lexicon page says what to set up, and still checks DNS.
+    await page.goto(`/dashboard/lexicons/${ALPHA}`);
+    const panel = page.locator('section[aria-labelledby="publishing-panel-title"]');
+    await expect(panel).toContainText("Nothing can receive lexicons yet");
+    await expect(panel.getByRole("link", { name: "Service Identity" })).toBeVisible();
+    await expect(panel.getByRole("link", { name: "Linked Repos" })).toBeVisible();
+    await expect(panel).toContainText("_lexicon.pub.e2e.test");
+    await expect(panel).toContainText("Not set yet");
 
     await page.goto(PAGE);
-    const list = cascade(page);
-    await expect(list.getByRole("listitem")).toHaveCount(1);
-    await expect(list.getByRole("listitem")).toContainText("Every lexicon");
-    await expect(list.getByRole("listitem")).toContainText("Not published");
-
-    await filterTo(page, "test.e2e.pub");
-    for (const nsid of SEEDED) {
-      await expect(lexiconRow(page, nsid)).toContainText("No default");
-    }
-  });
-
-  test("with nowhere to publish, the page says so and the API refuses", async ({
-    page,
-  }) => {
-    await page.goto(PAGE);
+    await expect(page).toHaveURL(/\/dashboard\/?$/);
     await expect(
-      page.getByText("Nothing can receive lexicons yet", { exact: false }),
+      page.getByText("Lexicon publishing needs an account to publish to"),
     ).toBeVisible();
-    const defaults = page.getByRole("region", { name: "Defaults" });
-    await expect(
-      defaults.getByRole("link", { name: "Service Identity" }),
-    ).toBeVisible();
-    await expect(
-      defaults.getByRole("link", { name: "Linked Repos" }),
-    ).toBeVisible();
-    await expect(page.getByRole("button", { name: "Add default" })).toHaveCount(
-      0,
-    );
 
     const instance = await createRule(page.request, {
       pattern: PREFIX,
@@ -258,12 +314,7 @@ test.describe("Lexicon publishing dashboard", () => {
     expect(target.unavailable_reason).toBe(NO_SESSION_REASON);
 
     await page.goto(PAGE);
-    await expect(
-      page.getByText("Nothing can receive lexicons yet", { exact: false }),
-    ).toBeVisible();
-    await expect(page.getByRole("button", { name: "Add default" })).toHaveCount(
-      0,
-    );
+    await expect(page).toHaveURL(/\/dashboard\/?$/);
 
     const refused = await createRule(page.request, {
       pattern: PREFIX,
@@ -272,6 +323,30 @@ test.describe("Lexicon publishing dashboard", () => {
     expect(refused.status()).toBe(400);
     expect((await refused.json()).error).toBe(NO_SESSION_REASON);
     expect(await rules(page.request)).toEqual([]);
+  });
+
+  test("once an account can receive lexicons, publishing opens from System", async ({
+    page,
+  }) => {
+    await seedAttachedSession();
+    expect(await rules(page.request)).toEqual([]);
+
+    await page.goto("/dashboard/lexicons");
+    await expect(
+      page.getByRole("columnheader", { name: "Published" }),
+    ).toBeVisible();
+    await sidebarLink(page).click();
+    await expect(page).toHaveURL(new RegExp(`${PAGE}/?$`));
+
+    const list = cascade(page);
+    await expect(list.getByRole("listitem")).toHaveCount(1);
+    await expect(list.getByRole("listitem")).toContainText("Every lexicon");
+    await expect(list.getByRole("listitem")).toContainText("Not published");
+
+    await filterTo(page, "test.e2e.pub");
+    for (const nsid of SEEDED) {
+      await expect(lexiconRow(page, nsid)).toContainText("No default");
+    }
   });
 
   test("the add dialog offers an unauthorized linked repo only as disabled", async ({
@@ -292,7 +367,9 @@ test.describe("Lexicon publishing dashboard", () => {
     await expect(instance.getByRole("radio")).toBeEnabled();
     await expect(instance.getByRole("radio")).toBeChecked();
 
-    const grant = sheet.locator("label", { hasText: PENDING_REASON });
+    const grant = sheet.locator(
+      `label[for="publish-dest-linked_repo:${grantId}"]`,
+    );
     await expect(grant).toContainText(`Unavailable: ${PENDING_REASON}`);
     await expect(grant.getByRole("radio")).toBeDisabled();
 
@@ -336,7 +413,9 @@ test.describe("Lexicon publishing dashboard", () => {
     await expect(lexiconRow(page, OTHER)).toContainText("No default");
 
     // Losing the session strands the default rather than removing it, and
-    // the edit dialog says why the instance cannot be chosen.
+    // the edit dialog says why the instance cannot be chosen. The standby
+    // repo keeps the page open meanwhile.
+    await activateStandbyRepo(standbyId);
     await removeAttachedSession();
     await page.reload();
     const stranded = cascade(page).getByRole("listitem").nth(0);
@@ -513,16 +592,25 @@ test.describe("Lexicon publishing dashboard", () => {
     await expect(panel).toContainText("Instance account");
     await expect(panel.getByRole("link", { name: PREFIX })).toHaveAttribute(
       "href",
-      /\/dashboard\/lexicons\/publishing/,
+      new RegExp(PAGE),
     );
-    await expect(panel).toContainText("_lexicon.pub.e2e.test");
     await expect(panel.getByRole("button", { name: "Publish" })).toBeVisible();
+
+    // HappyView knows where BETA goes, so it gives the whole record to add.
+    await expect(panel).toContainText("_lexicon.pub.e2e.test");
+    await expect(panel).toContainText("Not set yet");
+    await expect(panel).toContainText(`did=${ATTACHED_DID}`);
+    await expect(panel.getByRole("button", { name: "Check again" })).toBeVisible();
 
     await page.goto(`/dashboard/lexicons/${OTHER}`);
     await expect(panel).toContainText("No default");
     await expect(panel).toContainText("No default covers it.");
     await expect(panel.getByRole("link", { name: "Add one" })).toBeVisible();
-    await expect(panel.getByRole("button")).toHaveCount(0);
+    await expect(panel.getByRole("button", { name: /publish/i })).toHaveCount(0);
+    // Nothing decides OTHER's account, so only the record's name is known.
+    await expect(panel).toContainText("_lexicon.pubother.e2e.test");
+    await expect(panel).toContainText("Not set yet");
+    await expect(panel).not.toContainText("did=did:");
   });
 
   test("a reader sees publishing but none of its controls", async ({
@@ -569,9 +657,6 @@ test.describe("Lexicon publishing dashboard", () => {
     await expect(first).toContainText(
       "The instance identity is did:web and has no repo",
     );
-    await expect(
-      page.getByText("Nothing can receive lexicons yet", { exact: false }),
-    ).toBeVisible();
 
     await filterTo(page, "test.e2e.pub");
     await expect(lexiconRow(page, ALPHA)).toContainText(

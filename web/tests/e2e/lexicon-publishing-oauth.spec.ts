@@ -22,7 +22,7 @@ const DRAFT = "test.e2e.lexpub.draft";
 // Covered by nothing.
 const ASIDE = "test.e2e.lexpubaside.thing";
 const PATTERN = "test.e2e.lexpub.*";
-const PAGE = "/dashboard/lexicons/publishing";
+const PAGE = "/dashboard/settings/lexicon-publishing";
 
 // Full-page captures for design review, written only when a directory is
 // named, so an ordinary run leaves nothing behind.
