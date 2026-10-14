@@ -77,7 +77,7 @@ A test run makes up identities rather than resolving them. The handle `alice.tes
 
 ## What stands in for the outside world
 
-Nothing a test run does reaches the real network: no PLC directory, relay, Jetstream or PDS.
+HappyView itself reaches no real network during a test run: no PLC directory, relay, Jetstream or PDS. A library you do not mock is the exception, because it runs for real, network included.
 
 - **Each test file has its own database.** HappyView migrates one database at the start of the run, and each file starts from a fresh copy of it, so nothing one file writes is seen by another. The tests in one file share theirs, and run in order.
 - **Test files run in parallel**, as many at a time as the machine has cores.
@@ -96,9 +96,15 @@ Some things a test run cannot do, and each refuses with an error saying it is no
 - writing to a space whose author's copy lives on their PDS rather than in HappyView, which answers `501`, or fetching a blob from such a space
 - subscribing to or querying a labeler whose account was made up for the run
 
+Anything that verifies a signature against an account's DID document also fails, because a made-up account's document carries no keys. That includes space credentials and account delegation tokens.
+
 ## Time limits
 
-A test file may spend 60 seconds running its own code: building inputs, looping and asserting. Time spent inside a trigger does not count against it; each handler a trigger runs has the instance's usual script time limit, `script_wall_clock_seconds` (10 seconds by default). A file stopped by its limit fails, and the other files carry on.
+A test file may spend 60 seconds running its own code: building inputs, looping and asserting. Time spent inside a trigger does not count against it. A file stopped by its limit fails with an error saying so, and the other files carry on.
+
+The handler a `query`, `procedure`, record or `label` trigger runs has the limits a served instance would give it: `script_wall_clock_seconds` (10 seconds by default) and `script_instruction_limit` (1,000,000 by default). A test run has no settings saved from a dashboard, so it reads them from `SCRIPT_WALL_CLOCK_SECONDS` and `SCRIPT_INSTRUCTION_LIMIT` in the environment. Set them to match an instance that raised either one, or a heavy handler times out under test when it would not in production.
+
+A job is bounded in a test run, though a served job is not. Its own code gets the same 60 seconds as a test file, and its `ctx.job.wait` calls share another 60 seconds between them, after which a wait returns at once. A job that never finishes fails its trigger with a `500` rather than holding up the run.
 
 ## Watching
 
@@ -109,4 +115,4 @@ A test file may spend 60 seconds running its own code: building inputs, looping 
 - A change to `happyview.toml` or `.env.test` is loaded before the rerun.
 - A save that breaks the build prints the error and keeps watching. The changes it held are rerun along with the next save that builds.
 
-A save made while tests are running waits for the run to finish. `HAPPYVIEW_WATCH_POLL_MS` switches the watch to polling, as it does for [`happyview dev`](../getting-started/configuration.md#running-locally-happyview-dev).
+A save made while tests are running waits for the run to finish. A save that only deletes test files runs nothing. When the watch ends, the command exits with the code of the last run. `HAPPYVIEW_WATCH_POLL_MS` switches the watch to polling, as it does for [`happyview dev`](../getting-started/configuration.md#running-locally-happyview-dev).
