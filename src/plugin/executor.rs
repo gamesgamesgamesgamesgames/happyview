@@ -60,7 +60,9 @@ pub enum ExecutionError {
     #[error("Resource limit exceeded: {0}")]
     ResourceLimit(String),
 
-    #[error("Timeout (fuel exhausted)")]
+    /// Fuel bounds a library and a wall clock bounds a script, so the text
+    /// names neither.
+    #[error("Timeout: the run exceeded its execution limit")]
     Timeout,
 
     #[error(
@@ -482,7 +484,8 @@ pub struct PluginExecutor {
 /// Guest time a test file may spend outside the triggers it fires. Each
 /// trigger's own run is bounded by the operator's wall clock, and the time
 /// spent inside one is host time for the file, so this bounds only the
-/// file's own code: assertions, loops, building inputs.
+/// file's own code: assertions, loops, building inputs. A job fired from a
+/// test file gets the same budget, and as much again in waits.
 pub const TEST_FILE_GUEST_SECONDS: u64 = 60;
 
 impl PluginExecutor {
@@ -651,8 +654,12 @@ impl PluginExecutor {
         // Running long is what a job is for, and `should_stop` is its stop;
         // every other kind is bounded by the operator's wall clock, re-armed
         // here so a run starts with a whole budget rather than what
-        // instantiation left.
+        // instantiation left. A job fired from a test file is bounded anyway:
+        // nothing would ever ask it to stop, and the run awaits it.
         match input.kind {
+            ScriptKind::Job if self.in_test_run() => {
+                inst.arm_guest_deadline(std::time::Duration::from_secs(TEST_FILE_GUEST_SECONDS))
+            }
             ScriptKind::Job => inst.lift_guest_deadline(),
             ScriptKind::Test => {
                 inst.arm_guest_deadline(std::time::Duration::from_secs(TEST_FILE_GUEST_SECONDS))
@@ -913,6 +920,7 @@ impl PluginExecutor {
             extensions,
             stamp,
             modules,
+            waited_ms: Default::default(),
         });
         Ok(inst)
     }
@@ -943,6 +951,12 @@ impl PluginExecutor {
             .unwrap_or(std::time::Duration::from_secs(u64::from(
                 crate::lua::limits::DEFAULT_WALL_CLOCK_SECONDS,
             )))
+    }
+
+    fn in_test_run(&self) -> bool {
+        self.app_state
+            .as_ref()
+            .is_some_and(|state| state.test.is_some())
     }
 
     /// The capability set a plugin will be granted at instantiation.
@@ -2909,5 +2923,21 @@ mod baseline {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod job_deadline_tests {
+    /// Only a test run bounds a job: a served job runs as long as it needs
+    /// and stops through `should_stop`, which no test run would ever set.
+    #[tokio::test]
+    async fn only_a_test_run_bounds_a_job() {
+        let mut state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        assert!(!state.plugin_executor().in_test_run());
+        state.test = Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+            "a.test.lua",
+        )));
+        assert!(state.plugin_executor().in_test_run());
     }
 }

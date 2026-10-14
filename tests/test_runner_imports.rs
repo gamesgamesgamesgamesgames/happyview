@@ -318,7 +318,7 @@ async fn a_production_state_runs_the_real_library_for_a_mocked_namespace() {
         .await
         .expect_err("a moduleless library cannot answer once it is instantiated");
     assert!(
-        !matches!(err, ExecutionError::PluginError { .. }),
+        matches!(err, ExecutionError::Instantiation(_)),
         "expected an instantiation failure, got {err:?}"
     );
     assert!(file.harness.calls("http").is_empty());
@@ -541,6 +541,89 @@ async fn a_job_runs_once_and_reports_its_row() {
     assert_eq!(got[0]["ok"]["status"], 200, "{got:?}");
     assert_eq!(got[0]["ok"]["body"]["result"], json!({"done": true}));
     assert_eq!(got[1]["ok"]["status"], 500);
+    file.finish().await;
+}
+
+/// Runs `test` on a runtime of its own and fails once `limit` passes. A guest
+/// whose deadline was lifted never yields, so the timeout has to fire on
+/// another worker, and the spinning one is abandoned rather than awaited.
+fn within<F>(limit: Duration, test: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = runtime.spawn(test);
+    let finished = runtime.block_on(async { tokio::time::timeout(limit, handle).await });
+    runtime.shutdown_background();
+    match finished {
+        Err(_) => panic!("the test was still running after {limit:?}"),
+        Ok(Err(join)) => std::panic::resume_unwind(join.into_panic()),
+        Ok(Ok(())) => {}
+    }
+}
+
+/// A job fired from a test file has a test file's budget, where a serving job
+/// has none: nothing would ever ask it to stop, and the run awaits it.
+#[test]
+fn a_spinning_job_fired_from_a_test_file_fails_at_the_files_budget() {
+    let budget = Duration::from_secs(happyview::plugin::executor::TEST_FILE_GUEST_SECONDS);
+    within(budget + Duration::from_secs(60), async move {
+        let Some(env) = env().await else { return };
+        let file = env.file_state("src/lib/a.test.echo").await.unwrap();
+        seed_script(&file.state, "job.run:spin", "spin").await;
+
+        let started = Instant::now();
+        let got = answers(
+            &file.state,
+            &input("test", json!([trigger("job", "spin", json!({}))])),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert_eq!(got[0]["ok"]["status"], 500, "{got:?}");
+        assert_eq!(got[0]["ok"]["body"]["status"], "failed", "{got:?}");
+        assert!(
+            got[0]["ok"]["body"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("execution limit"),
+            "{got:?}"
+        );
+        assert!(
+            elapsed >= budget && elapsed < budget + Duration::from_secs(10),
+            "{elapsed:?}"
+        );
+        file.finish().await;
+    });
+}
+
+/// An hour's wait in a job fired from a test file is cut to the file's
+/// budget, and the job then completes.
+#[tokio::test]
+async fn an_hours_wait_in_a_job_fired_from_a_test_file_returns_within_its_budget() {
+    let Some(env) = env().await else { return };
+    let file = env.file_state("src/lib/a.test.echo").await.unwrap();
+    seed_script(&file.state, "job.run:sleep", "host:job_wait").await;
+    let budget = Duration::from_secs(happyview::plugin::executor::TEST_FILE_GUEST_SECONDS);
+
+    let started = Instant::now();
+    let got = tokio::time::timeout(
+        budget + Duration::from_secs(30),
+        answers(
+            &file.state,
+            &input(
+                "test",
+                json!([trigger("job", "sleep", json!({"input": {"seconds": 3600}}))]),
+            ),
+        ),
+    )
+    .await
+    .expect("an hour's wait in a test run was not cut to the file's budget");
+    assert_eq!(got[0]["ok"]["status"], 200, "{got:?}");
+    assert!(started.elapsed() < budget + Duration::from_secs(10));
     file.finish().await;
 }
 
