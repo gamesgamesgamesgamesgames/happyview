@@ -96,7 +96,7 @@ Every publishable lexicon has one status:
 | `unpublished`        | Never successfully published                                                              |
 | `moved`              | Published to a different account than its default points at now                           |
 | `outdated`           | Published to the right account, but the lexicon has changed since                         |
-| `current`            | The record on the network matches what HappyView would publish today                      |
+| `current`            | The last published record matches what HappyView would publish today                      |
 
 The last error, if any, is shown beside the status. Each lexicon's own page has a **Publishing** panel with the same information: which default applies and why, the status, the DNS record to add, and **Publish** and **Unpublish** buttons.
 
@@ -104,7 +104,7 @@ The last error, if any, is shown beside the status. Each lexicon's own page has 
 
 With auto-publish on, HappyView publishes any matching lexicon that is `unpublished`, `moved`, or `outdated`. It runs after the server starts, after you upload a lexicon, and after you create or change a default. There's no polling loop, so a failed publish is retried at the next of those, or when you publish by hand.
 
-Only one run happens at a time. A trigger that arrives mid-run waits and then runs again, so a change made during a run isn't missed.
+Only one run happens at a time. A trigger that arrives mid-run doesn't start a second run: it marks the work pending and the running pass goes round once more, so a change made during a run isn't missed.
 
 ## Unpublishing
 

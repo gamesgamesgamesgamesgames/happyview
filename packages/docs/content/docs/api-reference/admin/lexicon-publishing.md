@@ -216,7 +216,8 @@ Deletes the record from the account it was published to and forgets the publicat
 | ------ | -------------------------------------------------------------------------------------- |
 | `404`  | The NSID isn't published                                                               |
 | `409`  | No linked repo or attached account holds the DID the record was published to; nothing is changed |
-| `401`  | The attached account needs to sign in again, or a linked repo needs reauthorization, or its grant lacks the `delete` scope |
+| `401`  | The attached account needs to sign in again, or a linked repo needs reauthorization |
+| `403`  | The linked repo's grant lacks the `delete` scope |
 | `502`  | The attached account's PDS refused the delete                                          |
 
 ## Events

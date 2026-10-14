@@ -6,7 +6,7 @@ HappyView uses a granular permission system to control access to the admin API. 
 
 ## Permission list
 
-HappyView defines 50 permissions organized by category:
+HappyView defines 51 permissions organized by category:
 
 ### Lexicons
 
@@ -139,6 +139,7 @@ Revoking an invite uses `linked-repos:create` rather than `linked-repos:delete`,
 | ------------ | ---------------------------------------- |
 | `stats:read` | View collection statistics and record counts |
 | `events:read` | View the event log                      |
+| `events:purge` | Bulk-delete event log entries matching a filter |
 
 ## Permission templates
 
@@ -164,7 +165,7 @@ Adds: `lexicons:create`, `lexicons:delete`, `lexicons:publish`, `scripts:manage`
 
 ### Full Access
 
-All 50 permissions. Equivalent to granting every permission individually (but still not a super user).
+All 51 permissions. Equivalent to granting every permission individually (but still not a super user).
 
 ## Super user
 
