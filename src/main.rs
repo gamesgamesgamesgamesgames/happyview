@@ -999,11 +999,16 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
     }
 
     // Every plugin and project module this boot will run is known by now, so
-    // anything else in the cache directory is a module nothing will load. A
+    // anything else in the cache directory is a module nothing will load. In
+    // dev, a first build that failed leaves no modules in the snapshot, so
+    // theirs are swept and the next successful build compiles them again. A
     // dev rebuild does not sweep, so a long dev session leaves its replaced
     // builds behind until the next boot.
-    let mut live = state.plugin_registry.live_wasm_sha256s().await;
-    live.extend(state.project.load().script_modules.keys().cloned());
+    let live = happyview::project::script_module::boot_live_hashes(
+        &state.plugin_registry,
+        &state.project.load_full(),
+    )
+    .await;
     state.wasm_runtime.sweep_cache_dir(&live);
 
     tokio::spawn(happyview::lua::limits::run_refresh_loop(

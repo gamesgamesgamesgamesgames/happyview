@@ -76,11 +76,23 @@ pub struct LoadedModules {
     pub modules: BTreeMap<String, Arc<ScriptModule>>,
 }
 
+/// The wasm a boot keeps in the compiled-module cache: every installed
+/// plugin's and every project module's, by hex sha256.
+pub async fn boot_live_hashes(
+    plugins: &crate::plugin::PluginRegistry,
+    snapshot: &crate::project::snapshot::ProjectSnapshot,
+) -> std::collections::HashSet<String> {
+    let mut live = plugins.live_wasm_sha256s().await;
+    live.extend(snapshot.script_modules.keys().cloned());
+    live
+}
+
 /// Read, check and precompile every module `happyview.toml` declares.
 /// `files` maps each trigger a source file claims to that file, since a
 /// module handler may not share a trigger with one. Every module is checked
 /// before any error is returned, so one build reports everything wrong with
-/// the project.
+/// the project. It compiles each module, so an async caller runs it off the
+/// runtime's worker threads.
 pub fn load_modules(
     runtime: &WasmRuntime,
     root: &Path,
@@ -172,14 +184,19 @@ fn load_one(
         )]);
     }
     let artifact = artifact_path(name);
-    let bytes = std::fs::read(root.join(&artifact)).map_err(|_| {
-        vec![error(
-            &artifact,
+    let bytes = std::fs::read(root.join(&artifact)).map_err(|e| {
+        let message = if e.kind() == std::io::ErrorKind::NotFound {
             format!(
                 "module '{name}' has no build at {}; run `hpy happyview build`",
                 artifact.display()
-            ),
-        )]
+            )
+        } else {
+            format!(
+                "module '{name}': could not read its build at {}: {e}",
+                artifact.display()
+            )
+        };
+        vec![error(&artifact, message)]
     })?;
     let hash = hex::encode(Sha256::digest(&bytes));
     let sections = sections::read_sections(&bytes)
@@ -293,7 +310,6 @@ fn load_one(
     });
     // Compiling here makes a module wasmtime rejects a build error, and
     // leaves the compiled module in the runtime's cache for the first run.
-    // It blocks, which is acceptable because builds run one at a time.
     runtime.module_for(&plugin).map_err(|e| {
         vec![error(
             &artifact,
@@ -498,6 +514,64 @@ mod tests {
             ScriptBody::Module { module, hash: h } if module == "registry" && *h == hash
         ));
         assert_eq!(loaded.scripts.len(), 4);
+    }
+
+    /// Only a missing build is fixed by building; any other read failure is
+    /// reported as itself.
+    #[test]
+    fn a_build_that_cannot_be_read_says_why() {
+        let mut p = Project::new();
+        std::fs::create_dir_all(p.dir.path().join(artifact_path("registry"))).unwrap();
+        p.decls.insert(
+            "registry".into(),
+            ModuleDecl {
+                language: "rust".into(),
+                path: "modules/registry".into(),
+                capabilities: vec![],
+            },
+        );
+        let errors = p.errors();
+        assert!(
+            errors[0].contains("could not read its build at .happyview/build/registry.wasm"),
+            "{errors:?}"
+        );
+        assert!(!errors[0].contains("hpy happyview build"), "{errors:?}");
+    }
+
+    #[tokio::test]
+    async fn a_boot_keeps_both_plugins_and_project_modules() {
+        let mut p = Project::new();
+        p.module(
+            "registry",
+            &module_wat(ECHO, "", Some(SCRIPT_INTERFACE_VERSION), false),
+            vec![],
+        );
+        let loaded = p.load().unwrap();
+        let module_hash = loaded.modules.keys().next().unwrap().clone();
+        let mut snapshot = crate::project::snapshot::ProjectSnapshot::empty();
+        snapshot.script_modules = loaded.modules;
+
+        let plugins = crate::plugin::PluginRegistry::new();
+        let plugin = module_wat(ECHO, "", None, false);
+        let plugin_hash = hex::encode(Sha256::digest(&plugin));
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "installed", "name": "installed", "version": "1.0.0", "api_version": "2",
+            "plugin_type": "library", "capabilities": [],
+        }))
+        .unwrap();
+        plugins
+            .register(LoadedPlugin {
+                info: manifest.clone().into(),
+                source: PluginSource::File { path: "x".into() },
+                wasm_bytes: plugin,
+                manifest: Some(manifest),
+            })
+            .await;
+
+        assert_eq!(
+            boot_live_hashes(&plugins, &snapshot).await,
+            [module_hash, plugin_hash].into_iter().collect()
+        );
     }
 
     #[test]

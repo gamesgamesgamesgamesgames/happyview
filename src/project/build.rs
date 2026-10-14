@@ -185,13 +185,29 @@ pub async fn build_snapshot_with(
     // Compiled modules claim triggers as files do, so they join the same
     // map: a clash with a file is caught by `load_modules`, and a
     // `[scripts.*]` key naming a module trigger is not stale.
-    let loaded_modules = match script_module::load_modules(
-        env.executor.runtime(),
-        root,
-        &config.modules,
-        &project_lexicons,
-        &handled_by,
-    ) {
+    // Compiling a module takes from a tenth of a second to several, which
+    // would stall a worker thread serving requests during a dev rebuild.
+    let loading = {
+        let runtime = Arc::clone(env.executor.runtime());
+        let root = root.to_path_buf();
+        let decls = config.modules.clone();
+        let lexicons = project_lexicons.clone();
+        let files = handled_by.clone();
+        tokio::task::spawn_blocking(move || {
+            script_module::load_modules(&runtime, &root, &decls, &lexicons, &files)
+        })
+    };
+    let loaded = match loading.await {
+        Ok(loaded) => loaded,
+        Err(e) => match e.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            Err(e) => Err(vec![Diagnostic::error(
+                PROJECT_FILE,
+                format!("loading the project's modules did not finish: {e}"),
+            )]),
+        },
+    };
+    let loaded_modules = match loaded {
         Ok(loaded) => {
             for (trigger_id, script) in &loaded.scripts {
                 handled_by.insert(trigger_id.clone(), script.path.clone());
