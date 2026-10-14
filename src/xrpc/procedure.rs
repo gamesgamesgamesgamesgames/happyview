@@ -215,6 +215,14 @@ pub(crate) async fn handle_procedure(
         .await;
     }
 
+    // Only the DPoP path can act for another account. Here the write goes out
+    // as the caller, with `delegateDid` inside the record.
+    if input.get("delegateDid").is_some() {
+        return Err(AppError::Auth(
+            "delegation requires DPoP authentication".into(),
+        ));
+    }
+
     let session = match test_auth {
         Some(auth) => auth,
         None => repo::PdsAuth::OAuth(std::sync::Arc::new(
