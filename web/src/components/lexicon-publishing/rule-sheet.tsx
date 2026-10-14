@@ -75,7 +75,14 @@ function RuleForm({ onOpenChange, overview, rule, onSaved }: RuleSheetProps) {
   // A kept destination needs no target to match: one whose linked repo was
   // removed is in no list, and the default can still have auto-publish changed.
   const keepsDestination = editing && destination === ruleTargetKey(rule);
-  const destinationValid = keepsDestination || target?.available === true;
+  // `null` keeps the rule's destination; `undefined` means nothing valid is
+  // chosen.
+  const newTarget: PublishTarget | null | undefined = keepsDestination
+    ? null
+    : target?.available
+      ? target
+      : undefined;
+  const destinationValid = newTarget !== undefined;
 
   const coverage = useMemo(() => {
     if (!parsed.ok) return null;
@@ -94,36 +101,12 @@ function RuleForm({ onOpenChange, overview, rule, onSaved }: RuleSheetProps) {
 
   const canSave = !saving && (editing || parsed.ok) && destinationValid;
 
-  async function save() {
-    setTouched(true);
-    if (!canSave) return;
-    if (!keepsDestination && !target) return;
+  async function submit(request: () => Promise<unknown>, done: string) {
     setSaving(true);
     setError(null);
-    const linkedRepoId =
-      target?.kind === "linked_repo" ? (target.linked_repo_id ?? undefined) : undefined;
     try {
-      if (rule) {
-        await updatePublishRule(
-          rule.id,
-          keepsDestination || !target
-            ? { auto_publish: autoPublish }
-            : {
-                target_kind: target.kind,
-                linked_repo_id: linkedRepoId ?? null,
-                auto_publish: autoPublish,
-              },
-        );
-        toast.success("Default saved");
-      } else if (target) {
-        await createPublishRule({
-          pattern: pattern.trim(),
-          target_kind: target.kind,
-          linked_repo_id: linkedRepoId,
-          auto_publish: autoPublish,
-        });
-        toast.success("Default added");
-      }
+      await request();
+      toast.success(done);
       onSaved();
       onOpenChange(false);
     } catch (e) {
@@ -133,6 +116,36 @@ function RuleForm({ onOpenChange, overview, rule, onSaved }: RuleSheetProps) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
+    }
+  }
+
+  function save() {
+    setTouched(true);
+    // canSave already excludes an undefined target; the check narrows it.
+    if (!canSave || newTarget === undefined) return;
+    const fields = newTarget && {
+      target_kind: newTarget.kind,
+      linked_repo_id:
+        newTarget.kind === "linked_repo" ? newTarget.linked_repo_id : null,
+    };
+    if (rule) {
+      submit(
+        () =>
+          updatePublishRule(rule.id, { ...fields, auto_publish: autoPublish }),
+        "Default saved",
+      );
+    } else if (fields) {
+      // A new default never keeps a destination, so fields is always set.
+      submit(
+        () =>
+          createPublishRule({
+            pattern: pattern.trim(),
+            target_kind: fields.target_kind,
+            linked_repo_id: fields.linked_repo_id ?? undefined,
+            auto_publish: autoPublish,
+          }),
+        "Default added",
+      );
     }
   }
 
