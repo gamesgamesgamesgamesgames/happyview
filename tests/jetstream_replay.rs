@@ -1313,8 +1313,8 @@ async fn sixteen_failed_blocks_in_a_row_stop_the_job_inside_the_entry() {
     // 32 blocks, 20 with records: planned as one run of blocks 0-19.
     let segment = mock.seal(games_among_noise(1..=32, 1..=20, "did:plc:outage"), 1);
     for index in 2..=17 {
-        // Three answers: every attempt of the first fetch fails.
-        mock.fail_block(&segment, index, 3);
+        // Six answers: every attempt of the first fetch fails.
+        mock.fail_block(&segment, index, 6);
     }
     let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
     let job = finished(&app, &id).await;
@@ -1366,7 +1366,7 @@ async fn a_failed_replay_job_resumes_where_it_stopped() {
     let first = mock.seal(games(1..=4, did), 4);
     let second = mock.seal(games_among_noise(5..=36, 5..=24, did), 1);
     for index in 2..=17 {
-        mock.fail_block(&second, index, 3);
+        mock.fail_block(&second, index, 6);
     }
     let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
     let job = finished(&app, &id).await;
