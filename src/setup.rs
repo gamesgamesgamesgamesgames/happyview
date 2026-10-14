@@ -18,7 +18,7 @@ use crate::event_log::{EventLog, Severity, log_event};
 use crate::service_identity::{self, IdentityMode};
 use crate::{AppState, error::AppError};
 
-fn is_pds_session_expired(err: &impl std::fmt::Display) -> bool {
+pub(crate) fn is_pds_session_expired(err: &impl std::fmt::Display) -> bool {
     let msg = err.to_string();
     msg.contains("invalid_token") || msg.contains("expired") || msg.contains("revoked")
 }

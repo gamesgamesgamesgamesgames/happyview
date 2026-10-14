@@ -1057,6 +1057,8 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
         });
     }
 
+    happyview::lexicon_publishing::spawn_reconcile(&state);
+
     let app = server::router(state);
     let addr = config.listen_addr();
 

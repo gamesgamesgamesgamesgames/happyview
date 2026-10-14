@@ -114,7 +114,7 @@ pub async fn session_for(
     }
 }
 
-async fn post_json(
+pub(crate) async fn post_json(
     session: &HappyViewOAuthSession,
     nsid: &str,
     body: &Value,
@@ -196,7 +196,7 @@ pub async fn unindex_write(state: &AppState, uri: &str) -> Result<bool, sqlx::Er
     state.records.delete(uri).await
 }
 
-fn extract_uri_cid(value: &Value, nsid: &str) -> Result<(String, String), AppError> {
+pub(crate) fn extract_uri_cid(value: &Value, nsid: &str) -> Result<(String, String), AppError> {
     let uri = value
         .get("uri")
         .and_then(|v| v.as_str())
