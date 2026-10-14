@@ -8,6 +8,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { CodePanels } from "@/components/code-panels";
 import { LexiconServicesSheet } from "@/components/lexicon-services-sheet";
+import { PublishingPanel } from "@/components/lexicon-publishing/publishing-panel";
 import {
   deleteLexicon,
   deleteNetworkLexicon,
@@ -256,13 +257,24 @@ export default function LexiconDetailPage() {
             jsonReadOnly={readOnly}
           />
 
-          {targetingTriggers.length > 0 && (
-            <ScriptsTargetingPanel
-              lexiconId={lexicon.id}
-              scripts={scripts}
-              entries={targetingTriggers}
-              canManage={hasPermission("scripts:manage")}
-            />
+          {(targetingTriggers.length > 0 || !isNetwork) && (
+            <div className="flex flex-col gap-6 md:w-80 md:flex-shrink-0 lg:w-96">
+              {!isNetwork && (
+                <PublishingPanel
+                  nsid={lexicon.id}
+                  revision={lexicon.revision}
+                  canPublish={hasPermission("lexicons:publish")}
+                />
+              )}
+              {targetingTriggers.length > 0 && (
+                <ScriptsTargetingPanel
+                  lexiconId={lexicon.id}
+                  scripts={scripts}
+                  entries={targetingTriggers}
+                  canManage={hasPermission("scripts:manage")}
+                />
+              )}
+            </div>
           )}
         </div>
 
@@ -333,7 +345,7 @@ function ScriptsTargetingPanel({
   });
 
   return (
-    <div className="md:w-80 lg:w-96 md:flex-shrink-0">
+    <div>
       <Label className="text-muted-foreground mb-3 block">
         Scripts
       </Label>

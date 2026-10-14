@@ -25,9 +25,13 @@ import { toastError } from "@/lib/format";
 import {
   deleteLexicon,
   deleteNetworkLexicon,
+  getLexiconPublishing,
   getLexicons,
 } from "@/lib/api";
 import type { LexiconSummary } from "@/types/lexicons";
+import type { PublishableLexicon } from "@/types/lexicon-publishing";
+import { PublishStatusBadge } from "@/components/lexicon-publishing/publish-status";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -51,11 +55,19 @@ export default function LexiconsPage() {
   const { hasPermission } = useCurrentUser();
   const router = useRouter();
   const [lexicons, setLexicons] = useState<LexiconSummary[]>([]);
+  // `undefined` while loading; `null` when publishing couldn't be read, which
+  // leaves the column blank rather than failing the list.
+  const [publishing, setPublishing] = useState<
+    Map<string, PublishableLexicon> | null | undefined
+  >(undefined);
 
   const load = useCallback(() => {
     getLexicons()
       .then(setLexicons)
       .catch((e) => toastError("Failed to load lexicons", e));
+    getLexiconPublishing()
+      .then((o) => setPublishing(new Map(o.lexicons.map((l) => [l.nsid, l]))))
+      .catch(() => setPublishing(null));
   }, []);
 
   useEffect(() => {
@@ -154,6 +166,28 @@ export default function LexiconsPage() {
             { label: "Project", value: "project" },
           ],
         },
+      },
+      {
+        id: "published",
+        accessorFn: (lex) => publishing?.get(lex.id)?.status ?? "",
+        header: ({ column }) => (
+          <DataTableColumnHeader column={column} label="Published" />
+        ),
+        cell: ({ row }) => {
+          if (row.original.source === "network") {
+            return (
+              <span className="text-muted-foreground" title="Network lexicons belong to whoever published them">
+                —
+              </span>
+            );
+          }
+          if (publishing === undefined) return <Skeleton className="h-4 w-20" />;
+          const entry = publishing?.get(row.original.id);
+          if (!entry) return <span className="text-muted-foreground">—</span>;
+          return <PublishStatusBadge lexicon={entry} compact />;
+        },
+        enableSorting: true,
+        meta: { label: "Published" },
       },
       {
         id: "action",
@@ -260,7 +294,7 @@ export default function LexiconsPage() {
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [hasPermission],
+    [hasPermission, publishing],
   );
 
   const [sorting, setSorting] = useState<SortingState>([
@@ -310,6 +344,9 @@ export default function LexiconsPage() {
           }
         >
           <DataTableToolbar table={table}>
+            <Button variant="outline" asChild>
+              <Link href="/dashboard/lexicons/publishing">Publishing</Link>
+            </Button>
             {hasPermission("lexicons:create") && (
               <Button asChild>
                 <Link href="/dashboard/lexicons/new">Add Lexicon</Link>
