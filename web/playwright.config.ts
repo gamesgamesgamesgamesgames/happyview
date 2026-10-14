@@ -62,9 +62,19 @@ export default defineConfig({
       use: { browserName: "chromium" },
     },
     {
+      name: "lexicon-publishing-oauth",
+      testMatch: "lexicon-publishing-oauth.spec.ts",
+      dependencies: ["post-setup"],
+      use: { browserName: "chromium" },
+    },
+    {
       name: "attach-account",
       testMatch: "setup-attach-account.spec.ts",
-      dependencies: ["post-setup"],
+      // The PDS caches HappyView's client metadata from its first
+      // authorization and grants no scope missing from that copy. The scope
+      // union is computed from live grants, so the publishing grant has to
+      // exist at that first fetch or its lexicon schema scope is dropped.
+      dependencies: ["post-setup", "lexicon-publishing-oauth"],
       use: { browserName: "chromium" },
     },
     {
