@@ -1143,4 +1143,21 @@ mod declared_tests {
             Some(("paused".into(), Some(42)))
         );
     }
+
+    /// No test process subscribes to a labeler or queries one, so neither
+    /// refusal can be reached behaviourally and deleting one would keep every
+    /// other test green. The production half of this file is read instead.
+    #[test]
+    fn both_labeler_fetches_refuse_a_forged_pds() {
+        let production = include_str!("labeler.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for operation in ["subscribing to a labeler", "querying a labeler"] {
+            let call = format!(
+                "crate::testing::identity::refuse_forged_pds(&pds_endpoint, \"{operation}\")?;"
+            );
+            assert!(production.contains(&call), "missing: {call}");
+        }
+    }
 }

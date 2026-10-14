@@ -144,6 +144,10 @@ pub(crate) async fn require_membership(
 
 /// Fetch a space blob from its author's PDS, with the content type the PDS
 /// reported.
+///
+/// Public only so `tests/test_runner_identity.rs` can show it refuses a
+/// forged PDS before any request; the routes are its real callers.
+#[doc(hidden)]
 pub async fn fetch_space_blob(
     state: &AppState,
     author_did: &str,
