@@ -35,8 +35,8 @@ fn main() -> std::process::ExitCode {
     }
     // In a project, `.env` holds script variables. Loaded into the
     // environment it would become server configuration and beat
-    // happyview.toml.
-    if !matches!(command, happyview::cli::Command::Dev { .. }) {
+    // happyview.toml, so only a plain serve reads it.
+    if command == happyview::cli::Command::Serve {
         dotenvy::dotenv().ok();
     }
 
@@ -66,6 +66,19 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
                 )
                 .init();
             let code = happyview::project::check::run(&args, &mut std::io::stdout()).await;
+            return std::process::ExitCode::from(code);
+        }
+        happyview::cli::Command::Test(args) => {
+            // Logs go to stderr at `error` unless asked for: the run's own
+            // output is the report.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "error".parse().unwrap()),
+                )
+                .init();
+            let code = happyview::testing::runner::run(&args, &mut std::io::stdout()).await;
             return std::process::ExitCode::from(code);
         }
         happyview::cli::Command::Help => unreachable!("main answers --help itself"),

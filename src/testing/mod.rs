@@ -7,6 +7,8 @@ pub mod fake_pds;
 pub mod harness;
 pub mod identity;
 pub mod mocks;
+pub mod report;
+pub mod runner;
 pub mod seed;
 pub mod triggers;
 

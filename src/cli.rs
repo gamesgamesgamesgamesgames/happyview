@@ -9,13 +9,16 @@ pub const USAGE: &str = "\
 usage:
   happyview                                   serve; HAPPYVIEW_PROJECT names a project to serve
   happyview check <root> [--plugin <dir>]...  build the project at <root> without serving it
-  happyview dev <root>                        serve the project at <root> locally, rebuilding on save";
+  happyview dev <root>                        serve the project at <root> locally, rebuilding on save
+  happyview test <root> [--watch] [--plugin <dir>]... [filter]
+                                              run the project's *.test.* files";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Serve,
     Check(CheckArgs),
     Dev { root: PathBuf },
+    Test(TestArgs),
     Help,
 }
 
@@ -24,6 +27,17 @@ pub struct CheckArgs {
     pub root: PathBuf,
     /// Plugin directories to load interpreters from, each holding a
     /// `manifest.json`. Empty means `$PLUGIN_DIR`, then the project's own.
+    pub plugin_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TestArgs {
+    pub root: PathBuf,
+    /// Rerun the affected test files whenever the project changes.
+    pub watch: bool,
+    /// Runs only test files whose path contains this.
+    pub filter: Option<String>,
+    /// As `check`'s: empty means `$PLUGIN_DIR`, then the project's own.
     pub plugin_dirs: Vec<PathBuf>,
 }
 
@@ -66,6 +80,28 @@ fn parse_inner(mut args: impl Iterator<Item = OsString>) -> Result<Command, Stri
             }
             check.root = root.ok_or("check needs a project root: happyview check <root>")?;
             Ok(Command::Check(check))
+        }
+        "test" => {
+            let mut test = TestArgs::default();
+            let mut root = None;
+            while let Some(arg) = args.next() {
+                let text = arg.to_string_lossy().into_owned();
+                match text.as_str() {
+                    "--watch" => test.watch = true,
+                    "--plugin" => {
+                        let dir = args.next().ok_or("--plugin needs a directory")?;
+                        test.plugin_dirs.push(dir.into());
+                    }
+                    flag if flag.starts_with('-') => {
+                        return Err(format!("unknown option '{flag}' for test"));
+                    }
+                    _ if root.is_none() => root = Some(PathBuf::from(arg)),
+                    _ if test.filter.is_none() => test.filter = Some(text),
+                    _ => return Err(format!("test takes one filter; '{text}' is a second")),
+                }
+            }
+            test.root = root.ok_or("test needs a project root: happyview test <root>")?;
+            Ok(Command::Test(test))
         }
         "dev" => {
             let root = args
@@ -136,6 +172,41 @@ mod tests {
         assert!(err.contains("'serve'"), "{err}");
         assert!(err.ends_with(USAGE), "the message carries the usage: {err}");
         assert_eq!(parse_args(&["--help"]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn test_takes_a_root_watch_a_filter_and_plugins() {
+        assert_eq!(
+            parse_args(&["test", "app", "--watch", "format", "--plugin", "p/lua"]),
+            Ok(Command::Test(TestArgs {
+                root: "app".into(),
+                watch: true,
+                filter: Some("format".into()),
+                plugin_dirs: vec!["p/lua".into()],
+            }))
+        );
+        assert_eq!(
+            parse_args(&["test", "app"]),
+            Ok(Command::Test(TestArgs {
+                root: "app".into(),
+                ..TestArgs::default()
+            }))
+        );
+    }
+
+    #[test]
+    fn test_refuses_a_missing_root_a_second_filter_and_an_unknown_flag() {
+        assert!(parse_args(&["test"]).unwrap_err().contains("project root"));
+        assert!(
+            parse_args(&["test", "app", "a", "b"])
+                .unwrap_err()
+                .contains("one filter")
+        );
+        assert!(
+            parse_args(&["test", "app", "--nope"])
+                .unwrap_err()
+                .contains("--nope")
+        );
     }
 
     #[test]

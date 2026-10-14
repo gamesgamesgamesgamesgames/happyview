@@ -12,9 +12,9 @@ use super::build::{BuildEnv, BuildOptions, build_snapshot_with};
 use super::diagnostic::Severity;
 use super::snapshot::ProjectSnapshot;
 
-/// The interpreters a check loads when none are named: `$PLUGIN_DIR`, else
-/// the project's own, where `hpy` puts the locked plugins.
-fn default_plugin_dirs(root: &Path) -> Vec<PathBuf> {
+/// The interpreters a check or a test run loads when none are named:
+/// `$PLUGIN_DIR`, else the project's own, where `hpy` puts the locked plugins.
+pub(crate) fn default_plugin_dirs(root: &Path) -> Vec<PathBuf> {
     let dir = crate::config::vars::var("PLUGIN_DIR")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)

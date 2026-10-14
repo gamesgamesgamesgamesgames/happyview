@@ -14,6 +14,10 @@
 //!
 //! A source starting `old-sdk` is refused for a missing `handle` whatever
 //! its role, as an interpreter that predates roles refuses it.
+//!
+//! `execute` answers a `test` run whose source starts `predates-tests` with a
+//! `BAD_INPUT` envelope, as an interpreter that predates test runs fails to
+//! decode the kind.
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![allow(static_mut_refs)]
 
@@ -560,6 +564,9 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
         burn(iterations.parse().unwrap_or(0));
     }
 
+    if input["kind"] == "test" && source.starts_with("predates-tests") {
+        return return_json(&err("BAD_INPUT", "unknown variant `test`"));
+    }
     if let Some(steps) = source.strip_prefix("test:") {
         let steps: Value = serde_json::from_str(steps).unwrap_or(Value::Null);
         return return_json(&json!({"ok": returned(run_test_steps(&steps), "object")}));

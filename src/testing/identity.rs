@@ -124,16 +124,38 @@ mod tests {
 
     /// The switch is process-wide and one-way, so whatever calls it decides
     /// which processes accept forged identities. Only the test command may,
-    /// and only one integration target, which shares its process with no
-    /// other test.
+    /// and only integration targets that share their process with no test
+    /// that must resolve for real. Calling the runner forges too, so it is
+    /// held to the same rule.
     #[test]
     fn only_the_test_command_forges() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let allowed = [
+        let forge = vec![
             root.join("src/testing/runner.rs"),
             root.join("tests/test_runner_identity.rs"),
         ];
-        let needle = concat!("forge_", "identities");
+        let run = vec![
+            root.join("src/main.rs"),
+            root.join("src/testing/runner.rs"),
+            root.join("tests/test_runner.rs"),
+        ];
+        // The runner's `run` by its full path, which an aliased import has to
+        // spell, and by its module. A grouped import is matched by its members
+        // below, so importing `Runner` alone stays allowed.
+        let rules = [
+            (concat!("forge_", "identities"), &forge),
+            (concat!("testing::runner::", "run"), &run),
+            (concat!("runner::", "run("), &run),
+            (concat!("runner::", "{"), &run),
+        ];
+        let group = concat!("runner::", "{");
+        let names_run = |line: &str| {
+            line.split_once(group).is_some_and(|(_, members)| {
+                members
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(|member| member == "run")
+            })
+        };
         let signature = concat!("pub fn forge_", "identities() {");
         let definition = root.join("src/testing/identity.rs");
         let fixtures = root.join("tests/fixtures");
@@ -151,22 +173,30 @@ mod tests {
                     }
                     continue;
                 }
-                if path.extension().is_none_or(|e| e != "rs") || allowed.contains(&path) {
+                if path.extension().is_none_or(|e| e != "rs") {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).unwrap();
-                for (n, line) in text.lines().enumerate() {
-                    let defines = path == definition && line == signature;
-                    if line.contains(needle) && !defines {
-                        offenders.push(format!(
-                            "{}:{}",
-                            path.strip_prefix(root).unwrap().display(),
-                            n + 1
-                        ));
+                for (needle, allowed) in &rules {
+                    if allowed.contains(&path) {
+                        continue;
+                    }
+                    for (n, line) in text.lines().enumerate() {
+                        let defines = path == definition && line == signature;
+                        let grouped = *needle == group && !names_run(line);
+                        if line.contains(needle) && !defines && !grouped {
+                            offenders.push(format!(
+                                "{}:{}",
+                                path.strip_prefix(root).unwrap().display(),
+                                n + 1
+                            ));
+                        }
                     }
                 }
             }
         }
+        offenders.sort();
+        offenders.dedup();
         assert!(
             offenders.is_empty(),
             "only the test command turns on forged identities; found:\n{}",
