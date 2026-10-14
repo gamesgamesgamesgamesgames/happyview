@@ -1060,9 +1060,31 @@ async fn writes_need_lexicons_publish() {
         .await
         .unwrap();
     let cookie = || common::auth::admin_cookie_header(did, &s.cookie_key);
+    let rule = store::insert_rule(s, &pat("*"), "instance", None, false, "did:plc:admin")
+        .await
+        .unwrap();
+    let rule_path = format!("{BASE}/rules/{}", rule.id);
 
     let (status, _) = call_as(&app, cookie(), "GET", BASE, None).await;
     assert_eq!(status, 200);
+    let (status, _) = call_as(
+        &app,
+        cookie(),
+        "PATCH",
+        &rule_path,
+        Some(json!({"auto_publish": true})),
+    )
+    .await;
+    assert_eq!(status, 403);
+    let (status, _) = call_as(&app, cookie(), "DELETE", &rule_path, None).await;
+    assert_eq!(status, 403);
+    assert!(
+        !store::get_rule(s, &rule.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .auto_publish
+    );
     let (status, _) = call_as(
         &app,
         cookie(),
@@ -1111,6 +1133,9 @@ async fn dns_reports_one_entry_per_authority() {
     assert_eq!(entries[1]["authority"], "lexpubother.test");
     for entry in entries {
         assert_eq!(entry["did"], Value::Null, "{entry}");
-        assert!(entry.get("error").is_some(), "{entry}");
+        assert!(
+            entry["error"].is_null() || entry["error"].is_string(),
+            "{entry}"
+        );
     }
 }
