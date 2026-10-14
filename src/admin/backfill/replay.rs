@@ -75,7 +75,7 @@ pub(super) async fn run(
     let mut run = Run {
         state,
         job_id,
-        client: ArchiveClient::new(state.http.clone(), &endpoint, &state.archive),
+        client: ArchiveClient::new(&endpoint, &state.archive),
         fold: ReplayFold::new(state.clone(), collections.to_vec()),
         errors: ErrorRecorder::new(state, job_id).await,
         counted: 0,
@@ -804,7 +804,7 @@ pub(crate) async fn start_gap_replay(
         return Err("there are no record collections to replay".into());
     }
     let endpoint = crate::jetstream::config::parse_endpoint(&state.config.jetstream_url);
-    let client = ArchiveClient::new(state.http.clone(), &endpoint, &state.archive);
+    let client = ArchiveClient::new(&endpoint, &state.archive);
     // The live consumer waits on this call, and the archive's retry policy
     // can stretch a hung or throttled archive into minutes. Bound it, so the
     // consumer resumes without the archive instead.

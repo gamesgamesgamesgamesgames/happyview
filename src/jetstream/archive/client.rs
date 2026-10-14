@@ -29,10 +29,10 @@ const FAILED_ATTEMPTS: u32 = 3;
 const MAX_THROTTLE_WAIT: u64 = 30;
 /// The whole-request limit for `planSnapshot` and `getBlock`, and how long
 /// any request may wait for its response headers.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const REQUEST_TIMEOUT: Duration = super::ARCHIVE_READ_TIMEOUT;
 /// How long a `getSegment` body may go without delivering a chunk. A segment
 /// has no whole-request limit: 1 GiB in 120 s would need 8.5 MB/s.
-const SEGMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const SEGMENT_IDLE_TIMEOUT: Duration = super::ARCHIVE_READ_TIMEOUT;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -139,9 +139,11 @@ pub struct ArchiveClient {
 }
 
 impl ArchiveClient {
-    pub fn new(http: reqwest::Client, endpoint: &Endpoint, config: &ArchiveConfig) -> Self {
+    /// Requests go through `config.http`, the archive's own client, never
+    /// the shared one: its read timeout is too short for the archive.
+    pub fn new(endpoint: &Endpoint, config: &ArchiveConfig) -> Self {
         Self {
-            http,
+            http: config.http.clone(),
             base: endpoint.http_base.clone(),
             host: endpoint.host.clone(),
             api_key: config.api_key.clone(),
@@ -554,7 +556,7 @@ mod tests {
             retry_unit: Duration::from_millis(5),
             ..ArchiveConfig::default()
         };
-        ArchiveClient::new(reqwest::Client::new(), &endpoint, &config)
+        ArchiveClient::new(&endpoint, &config)
     }
 
     fn page() -> serde_json::Value {
@@ -672,7 +674,7 @@ mod tests {
             retry_unit: Duration::from_millis(1),
             ..ArchiveConfig::default()
         };
-        let client = ArchiveClient::new(reqwest::Client::new(), &endpoint, &config);
+        let client = ArchiveClient::new(&endpoint, &config);
         assert!(matches!(
             client.plan(&PlanRequest::default()).await,
             Err(ArchiveError::Unreachable(_))
@@ -1102,7 +1104,7 @@ mod tests {
             retry_unit: Duration::from_millis(1),
             ..ArchiveConfig::default()
         };
-        ArchiveClient::new(reqwest::Client::new(), &endpoint, &config)
+        ArchiveClient::new(&endpoint, &config)
     }
 
     #[tokio::test]
@@ -1255,6 +1257,36 @@ mod tests {
             vec![None],
             "no key without one configured"
         );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_another_host_drops_the_key() {
+        // Bluesky answers getBlock with a 307 to its CDN. The block arrives,
+        // and the key stays with the archive.
+        let cdn = MockServer::start().await;
+        let cdn_auth = authorization_log();
+        Mock::given(method("GET"))
+            .and(path("/blocks/seg/0"))
+            .respond_with(recording(
+                &cdn_auth,
+                ResponseTemplate::new(200).set_body_bytes(vec![9u8; 10]),
+            ))
+            .mount(&cdn)
+            .await;
+        let archive = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(BLOCK_PATH))
+            .and(header("authorization", "Bearer s3cret"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/blocks/seg/0", cdn.uri())),
+            )
+            .expect(1)
+            .mount(&archive)
+            .await;
+        let client = client(&archive, Some("s3cret"));
+        assert_eq!(client.block("seg", 0).await.unwrap(), vec![9u8; 10]);
+        assert_eq!(*cdn_auth.lock().unwrap(), vec![None], "no key at the CDN");
     }
 
     type AuthorizationLog = std::sync::Arc<Mutex<Vec<Option<String>>>>;

@@ -9,6 +9,10 @@ pub mod segment;
 
 pub const DEFAULT_CONCURRENCY: usize = 8;
 pub const MAX_CONCURRENCY: usize = 64;
+/// The archive client's read timeout: as long as a whole `planSnapshot` or
+/// `getBlock` may take, and as long as a segment body may go silent.
+pub const ARCHIVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// How long the live consumer waits for the archive to plan a gap replay
 /// before resuming without it.
 pub const GAP_PLAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -91,6 +95,9 @@ pub fn parse_api_key(raw: Option<&str>) -> Option<String> {
 /// probes a Jetstream archive unless `BACKFILL_SOURCE` or a job asks for it.
 #[derive(Clone, Debug)]
 pub struct ArchiveConfig {
+    /// The client archive requests go through, built once: see
+    /// `http_retry::build_archive_client`.
+    pub http: reqwest::Client,
     /// `JETSTREAM_API_KEY`, sent only to the archive endpoints.
     pub api_key: Option<String>,
     /// `BACKFILL_REPLAY_CONCURRENCY`: concurrent `getBlock` requests per job.
@@ -111,6 +118,7 @@ pub struct ArchiveConfig {
 impl Default for ArchiveConfig {
     fn default() -> Self {
         Self {
+            http: archive_client(),
             api_key: None,
             concurrency: DEFAULT_CONCURRENCY,
             download_dir: std::env::temp_dir().join("happyview-replay"),
@@ -126,6 +134,7 @@ impl ArchiveConfig {
         let var = |name: &str| std::env::var(name).ok();
         let default_source = parse_default_source(var("BACKFILL_SOURCE").as_deref());
         Self {
+            http: archive_client(),
             api_key: parse_api_key(var("JETSTREAM_API_KEY").as_deref()),
             concurrency: parse_concurrency(var("BACKFILL_REPLAY_CONCURRENCY").as_deref()),
             download_dir: var("BACKFILL_REPLAY_DIR")
@@ -138,6 +147,10 @@ impl ArchiveConfig {
             gap_plan_timeout: GAP_PLAN_TIMEOUT,
         }
     }
+}
+
+fn archive_client() -> reqwest::Client {
+    crate::http_retry::build_archive_client(&crate::version::user_agent(), ARCHIVE_READ_TIMEOUT)
 }
 
 #[cfg(test)]

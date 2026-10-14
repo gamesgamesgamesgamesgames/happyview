@@ -97,7 +97,7 @@ async fn the_mock_archive_plans_pages_and_serves_what_it_planned() {
     );
     mock.set_plan_page_entries(1);
     let endpoint = happyview::jetstream::config::parse_endpoint(&mock.url());
-    let client = ArchiveClient::new(reqwest::Client::new(), &endpoint, &ArchiveConfig::default());
+    let client = ArchiveClient::new(&endpoint, &ArchiveConfig::default());
     let request = |after, before| PlanRequest {
         kinds: vec!["commit".into()],
         collections: vec![GAME.into()],
@@ -1416,6 +1416,28 @@ async fn a_plan_that_stops_advancing_fails_the_job() {
     let job = finished(&app, &id).await;
     assert_eq!(job["status"], "failed");
     assert_eq!(job["error"], "the archive plan stopped advancing at seq 0");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_slow_plan_outlasts_the_shared_clients_read_timeout() {
+    let mock = MockJetstream::start().await;
+    let Some(mut app) = app(&mock, None).await else {
+        return;
+    };
+    // The shared client gives up on a silent response long before the
+    // archive's network-wide plans start answering (16-30 s on Bluesky's).
+    app.state.http = reqwest::Client::builder()
+        .read_timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    app.rebuild_router();
+    mock.seal(games(1..=4, "did:plc:slowplan"), 4);
+    mock.delay_plan(Duration::from_secs(1));
+    let id = start_job(&app, json!({ "collection": GAME, "source": "replay" })).await;
+    let job = finished(&app, &id).await;
+    assert_eq!(job["status"], "completed", "{job}");
+    assert_eq!(dump(&app).await.len(), 4);
 }
 
 #[tokio::test]
