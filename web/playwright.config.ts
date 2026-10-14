@@ -70,17 +70,20 @@ export default defineConfig({
     {
       name: "attach-account",
       testMatch: "setup-attach-account.spec.ts",
-      // The PDS caches HappyView's client metadata from its first
-      // authorization and grants no scope missing from that copy. The scope
-      // union is computed from live grants, so the publishing grant has to
-      // exist at that first fetch or its lexicon schema scope is dropped.
+      // Ordering is a stopgap for the PDS caching HappyView's client metadata
+      // at its first authorization and granting no scope missing from that
+      // copy: the scope union is computed from live grants, so the publishing
+      // grant has to exist at that first fetch. Every project that authorizes
+      // against the PDS runs after lexicon-publishing-oauth for that reason.
       dependencies: ["post-setup", "lexicon-publishing-oauth"],
       use: { browserName: "chromium" },
     },
     {
       name: "linked-repos-oauth",
       testMatch: "linked-repos-oauth.spec.ts",
-      dependencies: ["post-setup"],
+      // See attach-account: the first client-metadata fetch must see the
+      // publishing grant.
+      dependencies: ["post-setup", "lexicon-publishing-oauth"],
       use: { browserName: "chromium" },
     },
     {
