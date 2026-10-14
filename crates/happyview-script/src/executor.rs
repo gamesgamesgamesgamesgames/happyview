@@ -142,7 +142,19 @@ impl Drop for LibraryCall {
     }
 }
 
+/// Forgets every call when a run's `block_on` returns, however it returns, so
+/// no handle outlives the run that started it.
+struct ForgetCalls;
+
+impl Drop for ForgetCalls {
+    fn drop(&mut self) {
+        WAITING.with(|w| w.borrow_mut().clear());
+        SETTLED.with(|s| s.borrow_mut().clear());
+    }
+}
+
 pub(crate) fn block_on<F: Future>(fut: F) -> Result<F::Output> {
+    let _forget = ForgetCalls;
     let mut fut = pin!(fut);
     let mut cx = Context::from_waker(Waker::noop());
     loop {
@@ -293,6 +305,22 @@ pub(crate) mod tests {
         with_host(Rc::new(FakeHost::default()));
         let err = block_on(std::future::pending::<()>()).unwrap_err();
         assert!(err.message().contains("other than a library call"), "{err}");
+    }
+
+    #[test]
+    fn no_call_outlives_the_run_that_started_it() {
+        with_host(Rc::new(FakeHost::default()));
+        let ctx = ctx();
+        block_on(async {
+            let mut call = Box::pin(ctx.call("http", "a", vec![]));
+            let _ = futures_util::poll!(call.as_mut());
+            // A call whose drop never runs leaves nothing for its own
+            // cleanup to remove.
+            std::mem::forget(call);
+        })
+        .unwrap();
+        assert!(WAITING.with(|w| w.borrow().is_empty()));
+        assert!(SETTLED.with(|s| s.borrow().is_empty()));
     }
 
     #[test]
