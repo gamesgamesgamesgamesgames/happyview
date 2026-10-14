@@ -13,6 +13,7 @@ mod identity;
 mod jetstream;
 mod jobs;
 mod labelers;
+mod lexicon_publishing;
 mod lexicons;
 mod linked_repos;
 pub(crate) mod network_lexicons;
@@ -53,6 +54,24 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
         .route(
             "/lexicons/{id}",
             get(lexicons::get_lexicon).delete(lexicons::delete_lexicon),
+        )
+        .route("/lexicon-publishing", get(lexicon_publishing::overview))
+        .route("/lexicon-publishing/dns", get(lexicon_publishing::dns))
+        .route(
+            "/lexicon-publishing/rules",
+            post(lexicon_publishing::create_rule),
+        )
+        .route(
+            "/lexicon-publishing/rules/{id}",
+            patch(lexicon_publishing::update_rule).delete(lexicon_publishing::delete_rule),
+        )
+        .route(
+            "/lexicon-publishing/publish",
+            post(lexicon_publishing::publish),
+        )
+        .route(
+            "/lexicon-publishing/unpublish",
+            post(lexicon_publishing::unpublish),
         )
         .route("/stats", get(stats::stats))
         .route("/backfill", post(backfill::create_backfill))

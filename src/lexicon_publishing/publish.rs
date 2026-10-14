@@ -14,9 +14,7 @@ use crate::linked_repos::types::LinkedRepo;
 
 use super::store::{self, Rule};
 use super::target::{self, KIND_INSTANCE, TargetInfo};
-use super::{
-    PublishStatus, SCHEMA_COLLECTION, best_match, compute_status, record_cid, schema_record,
-};
+use super::{PublishStatus, SCHEMA_COLLECTION, best_match, record_cid, schema_record};
 
 const SIGN_IN_AGAIN: &str = "the attached account needs to sign in again";
 
@@ -72,7 +70,7 @@ pub async fn publishable(state: &AppState) -> Result<Vec<LexiconListing>, AppErr
         .collect())
 }
 
-fn parsed_rules(rules: Vec<Rule>) -> Vec<(Rule, super::Pattern)> {
+pub(super) fn parsed_rules(rules: Vec<Rule>) -> Vec<(Rule, super::Pattern)> {
     rules
         .into_iter()
         .map(|r| {
@@ -82,7 +80,7 @@ fn parsed_rules(rules: Vec<Rule>) -> Vec<(Rule, super::Pattern)> {
         .collect()
 }
 
-fn rule_for<'a>(nsid: &str, rules: &'a [(Rule, super::Pattern)]) -> Option<&'a Rule> {
+pub(super) fn rule_for<'a>(nsid: &str, rules: &'a [(Rule, super::Pattern)]) -> Option<&'a Rule> {
     best_match(nsid, rules, |(_, p)| p).map(|(r, _)| r)
 }
 
@@ -176,11 +174,11 @@ async fn write(state: &AppState, nsid: &str) -> Result<(String, String, String),
         ));
     };
 
-    if record_cid(&listing.lexicon_json).is_none() {
+    let Some(local_cid) = record_cid(&listing.lexicon_json) else {
         return Err(Refusal::Failed(
             "this lexicon cannot be encoded as a record".into(),
         ));
-    }
+    };
     let record = schema_record(&listing.lexicon_json);
 
     let (uri, cid) = if target.kind == KIND_INSTANCE {
@@ -190,6 +188,17 @@ async fn write(state: &AppState, nsid: &str) -> Result<(String, String, String),
         crate::linked_repos::pds::put_record(state, grant, SCHEMA_COLLECTION, nsid, record, None)
             .await?
     };
+    // Status compares the stored CID against this local one, so a PDS that
+    // hashes the record differently leaves the lexicon outdated and
+    // republished at every trigger; this is the only place that shows why.
+    if cid != local_cid {
+        tracing::warn!(
+            nsid,
+            pds_cid = %cid,
+            local_cid = %local_cid,
+            "the PDS reported a different CID for a published lexicon than HappyView computed"
+        );
+    }
     Ok((did, uri, cid))
 }
 
@@ -203,32 +212,28 @@ fn find_grant<'a>(
         .ok_or_else(|| Refusal::Failed(target::REMOVED_LINKED_REPO.into()))
 }
 
-async fn instance_session(
-    state: &AppState,
-    did: &str,
-) -> Result<crate::HappyViewOAuthSession, String> {
-    crate::repo::session::get_oauth_session(state, did)
-        .await
-        .map_err(|e| match e {
-            AppError::Auth(_) => SIGN_IN_AGAIN.to_string(),
-            other => message(other),
-        })
-}
-
+/// An expired attached-account session is a credential HappyView holds that
+/// an operator has to renew, so it is a 4xx; any other PDS failure is the
+/// PDS's.
 async fn instance_call(
     state: &AppState,
     did: &str,
     method: &str,
     body: &Value,
-) -> Result<Value, String> {
-    let session = instance_session(state, did).await?;
+) -> Result<Value, AppError> {
+    let session = crate::repo::session::get_oauth_session(state, did)
+        .await
+        .map_err(|e| match e {
+            AppError::Auth(_) => AppError::Auth(SIGN_IN_AGAIN.to_string()),
+            other => other,
+        })?;
     crate::linked_repos::pds::post_json(&session, method, body)
         .await
         .map_err(|e| {
             if crate::setup::is_pds_session_expired(&e) {
-                SIGN_IN_AGAIN.to_string()
+                AppError::Auth(SIGN_IN_AGAIN.to_string())
             } else {
-                message(e)
+                AppError::BadGateway(message(e))
             }
         })
 }
@@ -245,9 +250,7 @@ async fn write_instance(
         "rkey": nsid,
         "record": record,
     });
-    let out = instance_call(state, did, "com.atproto.repo.putRecord", &body)
-        .await
-        .map_err(Refusal::Failed)?;
+    let out = instance_call(state, did, "com.atproto.repo.putRecord", &body).await?;
     Ok(crate::linked_repos::pds::extract_uri_cid(
         &out,
         "putRecord",
@@ -269,9 +272,7 @@ pub async fn unpublish(state: &AppState, nsid: &str, actor: &str) -> Result<(), 
 
     if attached.as_deref() == Some(did.as_str()) {
         let body = json!({ "repo": did, "collection": SCHEMA_COLLECTION, "rkey": nsid });
-        instance_call(state, &did, "com.atproto.repo.deleteRecord", &body)
-            .await
-            .map_err(AppError::BadGateway)?;
+        instance_call(state, &did, "com.atproto.repo.deleteRecord", &body).await?;
     } else if let Some(grant) = crate::linked_repos::db::get_by_did(state, &did).await? {
         crate::linked_repos::pds::delete_record(state, &grant, SCHEMA_COLLECTION, nsid).await?;
     } else {
@@ -367,28 +368,18 @@ async fn due_for_publish(state: &AppState) -> Result<Vec<String>, AppError> {
     }
     let grants = crate::linked_repos::db::list(state).await?;
     let instance = target::instance_target(state).await?;
-    let publications = store::list_publications(state).await?;
-
-    let mut due = Vec::new();
-    for listing in publishable(state).await? {
-        let Some(rule) = rule_for(&listing.id, &rules).filter(|r| r.auto_publish) else {
-            continue;
-        };
-        let target = target::target_for_rule(state, rule, &grants, &instance).await;
-        let published = publications
-            .iter()
-            .find(|p| p.nsid == listing.id)
-            .and_then(|p| Some((p.did.as_deref()?, p.cid.as_deref()?)));
-        let local_cid = record_cid(&listing.lexicon_json);
-        let status = compute_status(true, target.writable_did(), published, local_cid.as_deref());
-        if matches!(
-            status,
-            PublishStatus::Unpublished | PublishStatus::Moved | PublishStatus::Outdated
-        ) {
-            due.push(listing.id);
-        }
-    }
-    Ok(due)
+    let views = super::overview::lexicon_views(state, &rules, &grants, &instance).await?;
+    Ok(views
+        .into_iter()
+        .filter(|v| {
+            v.auto_publish
+                && matches!(
+                    v.status,
+                    PublishStatus::Unpublished | PublishStatus::Moved | PublishStatus::Outdated
+                )
+        })
+        .map(|v| v.nsid)
+        .collect())
 }
 
 #[cfg(test)]
