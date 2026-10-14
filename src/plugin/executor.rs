@@ -487,18 +487,33 @@ fn classify_error(state: &PluginState, e: wasmtime::Error) -> ExecutionError {
 /// The `execute` answer for a run whose guest panicked: a runtime error at
 /// the panic's line, in the shape an interpreter gives a script error. A
 /// relative location is relative to the module's own crate, so it is placed
-/// under `source_root` for a terminal to open; an absolute one (a dependency
-/// in the cargo registry) already says where it is.
+/// under `source_root` for a terminal to open. An absolute one is a
+/// dependency on the build machine, and reaches an API caller, so it keeps
+/// only the part from the dependency's `<crate>-<version>` directory on; one
+/// with no such directory loses its location and keeps the message.
 pub(crate) fn panic_output(
     report: happyview_plugin_sdk::wire::PanicReport,
     source_root: Option<&std::path::Path>,
 ) -> ScriptExecuteOutput {
-    let file = std::path::Path::new(&report.file);
-    let file = match source_root {
-        Some(root) if file.is_relative() && !file.starts_with(root) => {
-            root.join(file).to_string_lossy().replace('\\', "/")
-        }
-        _ => report.file.clone(),
+    let path = std::path::Path::new(&report.file);
+    let file = if is_absolute_anywhere(&report.file) {
+        dependency_location(&report.file)
+    } else {
+        Some(match source_root {
+            Some(root) if !path.starts_with(root) => {
+                root.join(path).to_string_lossy().replace('\\', "/")
+            }
+            _ => report.file.clone(),
+        })
+    };
+    let Some(file) = file else {
+        return ScriptExecuteOutput::Error {
+            kind: crate::plugin::ScriptErrorKind::Runtime,
+            raw: format!("panicked: {}", report.message),
+            message: report.message,
+            line: None,
+            chunk: None,
+        };
     };
     ScriptExecuteOutput::Error {
         kind: crate::plugin::ScriptErrorKind::Runtime,
@@ -510,6 +525,38 @@ pub(crate) fn panic_output(
         line: Some(report.line),
         chunk: Some(file),
     }
+}
+
+/// Whether `file` is absolute on the machine that built the module, which
+/// need not be this one's platform.
+fn is_absolute_anywhere(file: &str) -> bool {
+    let bytes = file.as_bytes();
+    file.starts_with(['/', '\\'])
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+}
+
+/// `file` from its last `<crate>-<major>.<minor>.<patch>` directory onwards,
+/// the way cargo names an unpacked registry crate.
+fn dependency_location(file: &str) -> Option<String> {
+    let components: Vec<&str> = file.split(['/', '\\']).collect();
+    let crate_dir = components.iter().rposition(|name| {
+        name.match_indices('-').any(|(at, _)| {
+            let mut parts = name[at + 1..].splitn(3, '.');
+            at > 0
+                && parts.next().is_some_and(is_number)
+                && parts.next().is_some_and(is_number)
+                && parts
+                    .next()
+                    .and_then(|patch| patch.split(['-', '+']).next())
+                    .is_some_and(is_number)
+        })
+    })?;
+    // The crate directory alone names no file.
+    (crate_dir + 1 < components.len()).then(|| components[crate_dir..].join("/"))
+}
+
+fn is_number(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Factory for creating plugin instances
@@ -719,13 +766,16 @@ impl PluginExecutor {
         let output = match inst.call_execute(input).await {
             Ok(output) => output,
             // A guest that reported a panic answered the run; the trap is only
-            // how an aborting guest stops.
-            Err(e) => {
+            // how an aborting guest stops. A timeout or a refused growth after
+            // a report is still that failure: the guest did not stop by
+            // aborting.
+            Err(ExecutionError::Trap(e)) => {
                 return match inst.take_panic() {
                     Some(report) => Ok(panic_output(report, options.source_root.as_deref())),
-                    None => Err(e),
+                    None => Err(ExecutionError::Trap(e)),
                 };
             }
+            Err(e) => return Err(e),
         };
         inst.settle_pending_calls(self.script_wall_clock()).await;
         Ok(output)
@@ -3096,6 +3146,35 @@ mod panics {
         assert!(matches!(err, ExecutionError::Trap(_)), "{err}");
     }
 
+    /// A report of a 1 MiB message, well-formed, followed by the trap.
+    const OVERSIZED: &str = r#"(module
+        (import "env" "host_script_panic" (func $panic (param i32 i32)))
+        (memory (export "memory") 18)
+        (data (i32.const 65536) "{\"message\":\"")
+        (data (i32.const 1114124) "\",\"file\":\"src/lib.rs\",\"line\":7,\"column\":5}")
+        (func (export "alloc") (param i32) (result i32) i32.const 1024)
+        (func (export "dealloc") (param i32 i32))
+        (func (export "execute") (param i32 i32) (result i64)
+            i32.const 65548
+            i32.const 97
+            i32.const 1048576
+            memory.fill
+            i32.const 65536
+            i32.const 1048630
+            call $panic
+            unreachable)
+    )"#;
+
+    #[tokio::test]
+    async fn a_report_past_the_cap_is_dropped() {
+        let executor = executor_with(interpreter(OVERSIZED)).await;
+        let err = executor
+            .execute_script("guest", &input(Some(1_000_000)))
+            .await
+            .expect_err("an unread report leaves the plain trap");
+        assert!(matches!(err, ExecutionError::Trap(_)), "{err}");
+    }
+
     #[test]
     fn a_relative_location_is_placed_under_the_source_root() {
         let report = PanicReport {
@@ -3121,22 +3200,60 @@ mod panics {
         assert_eq!(line, Some(3));
         assert_eq!(chunk.as_deref(), Some("modules/registry/src/lib.rs"));
         assert_eq!(raw, "panicked at modules/registry/src/lib.rs:3:1: boom");
+    }
 
-        // A dependency's location is absolute, and already says where it is.
-        let absolute = PanicReport {
-            file: "/home/u/.cargo/registry/src/serde/lib.rs".into(),
-            ..report
+    /// A dependency's location is absolute on the build machine; what reaches
+    /// an API caller starts at the crate's own directory.
+    #[test]
+    fn a_dependency_location_keeps_no_build_machine_path() {
+        let at = |file: &str| {
+            panic_output(
+                PanicReport {
+                    message: "boom".into(),
+                    file: file.into(),
+                    line: 3,
+                    column: 1,
+                },
+                Some(std::path::Path::new("modules/registry")),
+            )
         };
-        let ScriptExecuteOutput::Error { message, chunk, .. } =
-            panic_output(absolute, Some(std::path::Path::new("modules/registry")))
+        let ScriptExecuteOutput::Error { chunk, raw, .. } = at(
+            "/Users/dev/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.140/src/value/mod.rs",
+        ) else {
+            panic!("expected an error");
+        };
+        assert_eq!(
+            chunk.as_deref(),
+            Some("serde_json-1.0.140/src/value/mod.rs")
+        );
+        assert_eq!(
+            raw,
+            "panicked at serde_json-1.0.140/src/value/mod.rs:3:1: boom"
+        );
+
+        let ScriptExecuteOutput::Error { chunk, .. } =
+            at(r"C:\Users\dev\.cargo\registry\src\index.crates.io-1\tokio-1.40.0-rc.1\src\lib.rs")
+        else {
+            panic!("expected an error");
+        };
+        assert_eq!(chunk.as_deref(), Some("tokio-1.40.0-rc.1/src/lib.rs"));
+
+        // A git checkout or a path dependency names no version.
+        let ScriptExecuteOutput::Error {
+            message,
+            line,
+            chunk,
+            raw,
+            ..
+        } = at("/Users/dev/.cargo/git/checkouts/common-3f2a/abc123/src/lib.rs")
         else {
             panic!("expected an error");
         };
         assert_eq!(message, "boom");
-        assert_eq!(
-            chunk.as_deref(),
-            Some("/home/u/.cargo/registry/src/serde/lib.rs")
-        );
+        assert_eq!(line, None);
+        assert_eq!(chunk, None);
+        assert_eq!(raw, "panicked: boom");
+        assert!(!raw.contains("/Users/dev"));
     }
 }
 
@@ -3228,6 +3345,32 @@ mod compiled {
         assert_eq!(output, returned_null());
     }
 
+    /// Reports a panic, then spins instead of trapping.
+    const PANIC_THEN_SPIN: &str = r#"(module
+        (import "env" "host_script_panic" (func $panic (param i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 32768) "{\"message\":\"boom\",\"file\":\"src/lib.rs\",\"line\":7,\"column\":5}")
+        (func (export "alloc") (param i32) (result i32) i32.const 1024)
+        (func (export "dealloc") (param i32 i32))
+        (func (export "execute") (param i32 i32) (result i64)
+            i32.const 32768
+            i32.const 58
+            call $panic
+            (loop br 0)
+            unreachable)
+    )"#;
+
+    #[tokio::test]
+    async fn a_reported_panic_does_not_hide_a_later_timeout() {
+        let executor = executor_with(interpreter(PANIC_THEN_SPIN)).await;
+        let module = Arc::new(interpreter(PANIC_THEN_SPIN));
+        let err = executor
+            .execute_compiled_as(module, std::path::Path::new("m"), &input(Some(1_000)), None)
+            .await
+            .expect_err("a guest that never stops runs out of fuel");
+        assert!(matches!(err, ExecutionError::Timeout), "{err}");
+    }
+
     /// `alloc` counts to two million before answering, roughly ten million
     /// fuel; `execute` answers `null` at once.
     const COSTLY_ALLOC: &str = r#"(module
@@ -3252,14 +3395,14 @@ mod compiled {
             i64.or)
     )"#;
 
-    /// Placing the input is the host's work: a budget far smaller than what
-    /// the guest's `alloc` spends still reaches `execute`.
+    /// Placing the input is the host's work: a one-instruction budget, which
+    /// `alloc` overspends at any plausible fuel rate, still reaches `execute`.
     #[tokio::test]
     async fn placing_the_input_is_not_charged_to_the_budget() {
         let executor = executor_with(interpreter(COSTLY_ALLOC)).await;
         let module = Arc::new(interpreter(COSTLY_ALLOC));
         let output = executor
-            .execute_compiled_as(module, std::path::Path::new("m"), &input(Some(1_000)), None)
+            .execute_compiled_as(module, std::path::Path::new("m"), &input(Some(1)), None)
             .await
             .unwrap();
         assert_eq!(output, returned_null());

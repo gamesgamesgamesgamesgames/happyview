@@ -1338,10 +1338,18 @@ fn host_log(
     super::log(&plugin_id, log_level, msg, db, db_backend);
 }
 
+/// The longest panic report the host reads. The message reaches an API
+/// caller's error body and the logs, so its size is not the guest's to choose.
+pub(crate) const MAX_PANIC_REPORT_BYTES: usize = 64 * 1024;
+
 /// Host function: record the panic a guest is about to trap on. A report
-/// that cannot be read is dropped, and the run then ends as the plain trap it
-/// would have been anyway.
+/// that cannot be read, or is longer than [`MAX_PANIC_REPORT_BYTES`], is
+/// dropped unparsed, and the run then ends as the plain trap it would have
+/// been anyway.
 fn host_script_panic(mut caller: wasmtime::Caller<'_, PluginState>, ptr: i32, len: i32) {
+    if len as u32 as usize > MAX_PANIC_REPORT_BYTES {
+        return;
+    }
     let Some(memory) = caller.data().memory else {
         return;
     };
