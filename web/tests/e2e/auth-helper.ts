@@ -150,7 +150,12 @@ export async function getOauthSessionSigningKid(
 
 export async function getOauthSessionTokenState(
   did: string,
-): Promise<{ accessToken: string; expiresAt: string | null }> {
+): Promise<{
+  accessToken: string;
+  expiresAt: string | null;
+  /** What the authorization server granted. */
+  scope: string | null;
+}> {
   const client = new pg.Client(DB_URL);
   await client.connect();
   try {
@@ -165,6 +170,7 @@ export async function getOauthSessionTokenState(
     return {
       accessToken: session.token_set.access_token,
       expiresAt: session.token_set.expires_at ?? null,
+      scope: session.token_set.scope ?? null,
     };
   } finally {
     await client.end();
