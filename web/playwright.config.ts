@@ -56,6 +56,7 @@ export default defineConfig({
         "project-layer.spec.ts",
         "plugin-catalogue.spec.ts",
         "plugin-update-approved-url.spec.ts",
+        "lexicon-publishing.spec.ts",
       ],
       dependencies: ["setup"],
       use: { browserName: "chromium" },

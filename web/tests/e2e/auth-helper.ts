@@ -96,6 +96,42 @@ export async function setServiceIdentityMode(
   }
 }
 
+type ServiceIdentityRow = Record<string, unknown>;
+
+/** The identity row as it stands, so a spec that changes the mode can put it back. */
+export async function snapshotServiceIdentity(): Promise<ServiceIdentityRow | null> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const { rows } = await client.query(
+      "SELECT * FROM happyview_service_identity WHERE id = 1",
+    );
+    return rows[0] ?? null;
+  } finally {
+    await client.end();
+  }
+}
+
+export async function restoreServiceIdentity(
+  row: ServiceIdentityRow | null,
+): Promise<void> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    await client.query("DELETE FROM happyview_service_identity");
+    if (row) {
+      const columns = Object.keys(row);
+      const placeholders = columns.map((_, i) => `$${i + 1}`).join(", ");
+      await client.query(
+        `INSERT INTO happyview_service_identity (${columns.join(", ")}) VALUES (${placeholders})`,
+        columns.map((c) => row[c]),
+      );
+    }
+  } finally {
+    await client.end();
+  }
+}
+
 export async function getOauthSessionSigningKid(
   did: string,
 ): Promise<string | null> {
@@ -174,9 +210,63 @@ export async function createFakeOauthSessionPinnedToKid(
 
 export async function loginAsTestAdmin(page: Page): Promise<void> {
   await ensureTestUser(TEST_DID);
+  await setSessionCookie(page, TEST_DID);
+}
 
+/**
+ * Sign in as a non-super user holding exactly `permissions`, for asserting
+ * what a limited operator can and cannot do.
+ */
+export async function loginAsUserWithPermissions(
+  page: Page,
+  did: string,
+  permissions: string[],
+): Promise<void> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    const id = `e2e-user-${did}`;
+    const now = new Date().toISOString();
+    await client.query(
+      `INSERT INTO happyview_users (id, did, is_super, created_at)
+       VALUES ($1, $2, 0, $3)
+       ON CONFLICT (did) DO NOTHING`,
+      [id, did, now],
+    );
+    await client.query(
+      "DELETE FROM happyview_user_permissions WHERE user_id = $1",
+      [id],
+    );
+    for (const permission of permissions) {
+      await client.query(
+        `INSERT INTO happyview_user_permissions (user_id, permission, granted_by, granted_at)
+         VALUES ($1, $2, NULL, $3)`,
+        [id, permission, now],
+      );
+    }
+  } finally {
+    await client.end();
+  }
+  await setSessionCookie(page, did);
+}
+
+export async function removeTestUser(did: string): Promise<void> {
+  const client = new pg.Client(DB_URL);
+  await client.connect();
+  try {
+    await client.query(
+      "DELETE FROM happyview_user_permissions WHERE user_id = $1",
+      [`e2e-user-${did}`],
+    );
+    await client.query("DELETE FROM happyview_users WHERE did = $1", [did]);
+  } finally {
+    await client.end();
+  }
+}
+
+async function setSessionCookie(page: Page, did: string): Promise<void> {
   const signingKey = deriveSigningKey(SESSION_SECRET);
-  const signedValue = signCookieValue(signingKey, TEST_DID);
+  const signedValue = signCookieValue(signingKey, did);
 
   const baseURL =
     process.env.PLAYWRIGHT_BASE_URL || "https://happyview.127-0-0-1.sslip.io";
