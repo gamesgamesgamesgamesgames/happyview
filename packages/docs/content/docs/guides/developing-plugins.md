@@ -135,6 +135,76 @@ The import fails with one of these codes:
 
 Keep a script-facing `load` text-only. Bytecode reaches the interpreter only from HappyView.
 
+#### Running test files
+
+`happyview test` hands each `*.test.<ext>` file to the interpreter that claims `<ext>`, as a run of kind `test`. The project-author side is in the [testing guide](testing.md). This section is the interpreter's half: what a test file's run receives, the five imports it reaches HappyView through, and what each answers.
+
+An interpreter that runs test files declares `script:test` beside `script:host`. The imports below need it, and a module that imports any of them without declaring it is refused at load. A host that predates test runs has no such imports, so a plugin built against them loads only on a host that has them. The SDK wrappers are `host::test_trigger`, `host::test_mock`, `host::test_calls`, `host::test_pds_writes` and `host::test_report`, and the request and response types are in `happyview_plugin_sdk::wire`.
+
+**What `execute` receives.** A test file's `ExecuteInput` differs from a handler's in these fields:
+
+| Field | Value |
+| --- | --- |
+| `kind` | `"test"` |
+| `source` | The file's text, or empty when `artifact` is present. The artifact was prepared by your `validate` with `role` `test`, so it defines no `handle` |
+| `chunk_name` | The file's path from the project root, such as `src/lib/format.test.lua` |
+| `input` | `null` |
+| `context.trigger` | `test:<path>`, the same path |
+| `context` | No `caller_did`, `has_pds_auth` is `false`, and there is no `job`, `method`, `collection`, `params` or `space`. `env` is the project's `.env.test` |
+| `limits.instructions` | `null`. A test file has no instruction budget; HappyView stops a file whose own code runs past 60 seconds of guest time, and time spent inside an import is not counted |
+| `libraries` | As for any run |
+
+Run the file, collect its tests, run them in order, and report each one through `host_test_report` once it has finished, after any `after_each`. Then return; the value returned is ignored. An `error` result fails the file as a whole, placed at its `chunk` and `line`, and so does a file that returns without reporting any test.
+
+An interpreter built on an SDK from before test runs cannot decode `kind: "test"` and answers `BAD_INPUT`. HappyView reports that as an interpreter that predates test runs, naming it.
+
+**The imports.** Each takes a JSON request and answers the usual `{"ok": ...}` or `{"error": {code, message, retryable}}` envelope. None of them traps.
+
+| Import | Request | `ok` |
+| --- | --- | --- |
+| `host_test_trigger` | `TestTrigger`: `{kind, target, input?, did?, rkey?, as?}` | `TestTriggerResult`: `{status, body}` |
+| `host_test_mock` | `TestMock`: `{namespace, responses}` | `null` |
+| `host_test_calls` | `TestCalls`: `{namespace}` | `[TestCall]`: `[{method, args}]`, `args` the JSON array the call carried |
+| `host_test_pds_writes` | `{}` | `[TestPdsWrite]`: `[{action, repo, collection, rkey, record?, cid?}]`, `record` and `cid` absent for a delete |
+| `host_test_report` | `TestReport`: `{path, name, status, message?, file?, line?, duration_ms}` | `null` |
+
+`TestTrigger.kind` is one of `query`, `procedure`, `record_create`, `record_update`, `record_delete`, `job` and `label`. `target` is the method's NSID, the record's collection, the job type or the label's subject URI. `input` is the query's parameters, the procedure's body, the record, the job's input, or the label's `{val, src?, neg?, cts?, exp?}`. `did` is a record's author and `rkey` its record key. `as` is the DID the trigger is forged as.
+
+`TestReport.status` is `pass`, `fail` or `skip`. `name` is the test's full name with its `describe` blocks joined by ` > `. `file` and `line` place a failing assertion, which may be in a module the test file required, and `message` says what failed. HappyView sets `path` to the file being run whatever you send, so `""` is fine.
+
+**What a trigger answers.** Every kind answers `{status, body}`. A handler that fails is not an import error: it shows in `status` and `body`.
+
+| Kind | `status` | `body` |
+| --- | --- | --- |
+| `query`, `procedure` | The HTTP status of the response | The response's JSON. A body that is not JSON is a string, and an empty one is `null` |
+| `record_create`, `record_update`, `record_delete` | `200`, or `500` when a script failed or the outcome is `errored`, `unavailable` or `invalid` | `{outcome, uri, cid, errors}`. `outcome` is `matched`, `skipped`, `schema_event`, `errored`, `unavailable` or `invalid`; `cid` is `null` for a delete; `errors` lists each failed script's message |
+| `job` | `200` when the job completed, `500` otherwise | `{id, status, result, error, progress}`, the job's row after its one run |
+| `label` | `200`, or `500` when the label script failed or the label could not be stored | `{applied, errors}`. `applied` is the label as stored, or `null` |
+
+**What clears and what persists.** Each test file gets its own database and its own record of calls, writes, mocks and reports. Within a file, `host_test_report` clears the recorded library calls and PDS writes, so each test starts with none. Mocks are not cleared: one lasts for the rest of the file, until the same namespace is mocked again, which replaces it and restarts its lists.
+
+**The mock format.** `responses` maps each method name to the answer for its calls:
+
+- A single value answers every call with that value.
+- A list answers one call per element, in order. A call after the last fails with `MOCK_EXHAUSTED`. To answer with a list, wrap it in another: `[[1, 2]]` answers `[1, 2]` once.
+- `{"$error": {"code": "TIMEOUT", "message": "slow"}}`, alone or as a list element, fails the call with that code and message. `code` must be a string, and `message`, when present, must be one too; anything else under `$error` is refused when it is set, with `BAD_INPUT` naming the method.
+
+A mocked call never reaches the library, and is recorded for `host_test_calls` whether mocked or not. A namespace that is not mocked runs the real library.
+
+**Error codes.**
+
+| Code | Where | When |
+| --- | --- | --- |
+| `UNSUPPORTED` | All five imports | The run is not a test file, or the instance is not running `happyview test` |
+| `FORBIDDEN` | All five imports | The plugin lacks `script:test` |
+| `BAD_INPUT` | All five imports | The request does not decode as the type above |
+| `BAD_INPUT` | `host_test_trigger` | The test's own mistake: a query or procedure target that is not an NSID, a query input that is not an object of parameters, a record trigger for a collection with no record lexicon, a missing `rkey` on `record_update` or `record_delete`, a record that is not an object or cannot be encoded as DAG-CBOR, an invalid job type, or a malformed label |
+| `HOST_ERROR` | `host_test_trigger` | HappyView could not run the trigger |
+| `BAD_INPUT` | `host_test_mock` | No installed library serves the namespace, `responses` is not an object, or an `$error` response is malformed |
+| `NOT_MOCKED` | A library call | The namespace is mocked and its mock lists no response for the method. The message names the methods it does list |
+| `MOCK_EXHAUSTED` | A library call | The method's list of responses has run out |
+| Any `$error` code | A library call | The mock answered with `$error` |
+
 ### Dependencies
 
 A `library` plugin may declare other libraries it calls through `host_call_library`:

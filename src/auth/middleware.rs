@@ -307,6 +307,21 @@ impl FromRequestParts<AppState> for XrpcClaims {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // A test run forges its caller the way the browser suite forges a
+        // session cookie. The extension cannot arrive over a socket, and a
+        // state without a harness ignores it, so neither half alone opens
+        // anything.
+        if state.test.is_some()
+            && let Some(forged) = parts.extensions.get::<crate::testing::ForgedCaller>()
+        {
+            return Ok(XrpcClaims {
+                identity: Some(Claims::internal(forged.did().to_string())),
+                space_credential: None,
+                space_audience: None,
+                service_auth: None,
+            });
+        }
+
         let header = parts
             .headers
             .get("authorization")

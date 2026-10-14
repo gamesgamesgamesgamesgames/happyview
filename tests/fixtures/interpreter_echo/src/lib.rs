@@ -14,6 +14,10 @@
 //!
 //! A source starting `old-sdk` is refused for a missing `handle` whatever
 //! its role, as an interpreter that predates roles refuses it.
+//!
+//! `execute` answers a `test` run whose source starts `predates-tests` with a
+//! `BAD_INPUT` envelope, as an interpreter that predates test runs fails to
+//! decode the kind.
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![allow(static_mut_refs)]
 
@@ -90,6 +94,17 @@ extern "C" {
     fn host_module_resolve(req_ptr: i32, req_len: i32) -> i64;
 }
 
+// The test runner's imports, defined only for a test file's run.
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn host_test_trigger(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_mock(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_calls(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_pds_writes(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_report(req_ptr: i32, req_len: i32) -> i64;
+}
+
 #[no_mangle]
 pub extern "C" fn alloc(size: u32) -> u32 {
     #[cfg(target_arch = "wasm32")]
@@ -129,7 +144,11 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 fn b64_encode(bytes: &[u8]) -> alloc::string::String {
     let mut out = alloc::string::String::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -252,6 +271,18 @@ mod imports {
             host_call_library_wait_any(request.as_ptr() as i32, request.len() as i32)
         })
     }
+
+    pub fn test_import(name: &str, request: &Value) -> Value {
+        let import: unsafe extern "C" fn(i32, i32) -> i64 = match name {
+            "trigger" => host_test_trigger,
+            "mock" => host_test_mock,
+            "calls" => host_test_calls,
+            "pds_writes" => host_test_pds_writes,
+            "report" => host_test_report,
+            _ => return err("BAD_INPUT", "unknown test import"),
+        };
+        send(import, request)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -289,6 +320,10 @@ mod imports {
     pub fn call_library_wait_any(_request: &str) -> Value {
         unavailable()
     }
+
+    pub fn test_import(_name: &str, _request: &Value) -> Value {
+        unavailable()
+    }
 }
 
 /// `host:calls`: run `steps` in order against the two concurrent-call imports
@@ -310,7 +345,11 @@ fn run_calls(steps: &Value) -> Value {
         if let Some(start) = step.get("start") {
             let args = match start.get("args_raw").and_then(Value::as_str) {
                 Some(raw) => raw.to_string(),
-                None => start.get("args").cloned().unwrap_or_else(|| json!([])).to_string(),
+                None => start
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+                    .to_string(),
             };
             let handle = imports::call_library_start(
                 start["library"].as_str().unwrap_or(""),
@@ -438,6 +477,54 @@ fn raised(message: &str, chunk: &str) -> Value {
     failure("runtime", message, chunk)
 }
 
+/// A test file for the host's own tests: each step calls one test import, or
+/// checks a JSON pointer into an earlier answer and reports the result, which
+/// is enough for a host test to see triggers, mocks and reports end to end
+/// without an assertion library. A `spin` step never returns, for a test of
+/// the file's own deadline after the steps before it; a `burn` step spends
+/// that many iterations of guest time and answers null.
+fn run_test_steps(steps: &Value) -> Value {
+    let mut answers: alloc::vec::Vec<Value> = alloc::vec::Vec::new();
+    for step in steps.as_array().into_iter().flatten() {
+        if step.get("spin").is_some() {
+            spin_forever()
+        }
+        if let Some(iterations) = step.get("burn").and_then(Value::as_u64) {
+            burn(iterations);
+            answers.push(Value::Null);
+            continue;
+        }
+        let answer = if let Some(check) = step.get("check") {
+            let index = check["answer"].as_u64().unwrap_or(0) as usize;
+            let earlier = answers.get(index).cloned().unwrap_or(Value::Null);
+            let actual = earlier
+                .pointer(check["pointer"].as_str().unwrap_or(""))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let passed = actual == check["equals"];
+            imports::test_import(
+                "report",
+                &json!({
+                    "path": "",
+                    "name": check["name"],
+                    "status": if passed { "pass" } else { "fail" },
+                    "message": if passed {
+                        Value::Null
+                    } else {
+                        json!(format!("expected {}, got {}", check["equals"], actual))
+                    },
+                    "line": check["line"],
+                    "duration_ms": 0,
+                }),
+            )
+        } else {
+            imports::test_import(step["import"].as_str().unwrap_or(""), &step["request"])
+        };
+        answers.push(answer);
+    }
+    json!({ "answers": answers })
+}
+
 #[no_mangle]
 pub extern "C" fn plugin_info() -> i64 {
     return_json(&json!({"ok": {
@@ -485,6 +572,14 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
         burn(iterations.parse().unwrap_or(0));
     }
 
+    if input["kind"] == "test" && source.starts_with("predates-tests") {
+        return return_json(&err("BAD_INPUT", "unknown variant `test`"));
+    }
+    if let Some(steps) = source.strip_prefix("test:") {
+        let steps: Value = serde_json::from_str(steps).unwrap_or(Value::Null);
+        return return_json(&json!({"ok": returned(run_test_steps(&steps), "object")}));
+    }
+
     let out = if let Some(kind) = source.strip_prefix("error:") {
         failed(kind, &chunk)
     } else if let Some(literal) = source.strip_prefix("returns:") {
@@ -527,9 +622,7 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
             }
             "host:job_should_stop" => returned(imports::job_should_stop(), "other"),
             "host:job_wait" => returned(
-                imports::job_wait(
-                    &json!({"seconds": payload["seconds"].as_f64().unwrap_or(0.0)}),
-                ),
+                imports::job_wait(&json!({"seconds": payload["seconds"].as_f64().unwrap_or(0.0)})),
                 "other",
             ),
             "host:library" => {

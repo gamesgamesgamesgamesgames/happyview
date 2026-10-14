@@ -54,6 +54,7 @@ pub mod spaces;
 pub mod telemetry;
 pub mod telemetry_middleware;
 pub mod test_support;
+pub mod testing;
 pub mod tid;
 pub mod tombstones;
 pub mod verification_methods;
@@ -124,6 +125,11 @@ pub struct AppState {
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
     pub script_limits: Arc<lua::limits::ScriptLimits>,
+    /// Present only in a state the test command built for one test file.
+    /// Every behaviour a test run changes — the in-process PDS, forged
+    /// callers, mocks, single-attempt record scripts — is keyed on this, and
+    /// no other code path constructs one, so a serving binary never has it.
+    pub test: Option<Arc<testing::TestHarness>>,
 }
 
 impl AppState {

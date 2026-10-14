@@ -60,7 +60,9 @@ pub enum ExecutionError {
     #[error("Resource limit exceeded: {0}")]
     ResourceLimit(String),
 
-    #[error("Timeout (fuel exhausted)")]
+    /// Fuel bounds a library or a compiled module and a wall clock bounds
+    /// an interpreted script, so the text names neither.
+    #[error("Timeout: the run exceeded its execution limit")]
     Timeout,
 
     #[error(
@@ -581,6 +583,35 @@ pub struct PluginExecutor {
     app_state: Option<crate::AppState>,
 }
 
+/// Guest time a test file may spend outside the triggers it fires. Each
+/// trigger's own run is bounded by the operator's wall clock, and the time
+/// spent inside one is host time for the file, so this bounds only the
+/// file's own code: assertions, loops, building inputs. A job fired from a
+/// test file gets the same budget, and as much again in waits.
+pub const TEST_FILE_GUEST_SECONDS: u64 = 60;
+
+/// The guest deadline a run of `kind` is armed with, `None` meaning none.
+/// Running long is what a job is for, and `should_stop` is its stop; every
+/// other kind is bounded by the operator's wall clock. A job fired from a
+/// test file is bounded anyway: nothing would ever ask it to stop, and the
+/// run awaits it.
+fn guest_deadline(
+    kind: ScriptKind,
+    in_test_run: bool,
+    wall_clock: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let test_file = std::time::Duration::from_secs(TEST_FILE_GUEST_SECONDS);
+    match kind {
+        ScriptKind::Job if in_test_run => Some(test_file),
+        ScriptKind::Job => None,
+        ScriptKind::Test => Some(test_file),
+        ScriptKind::XrpcQuery
+        | ScriptKind::XrpcProcedure
+        | ScriptKind::RecordEvent
+        | ScriptKind::Label => Some(wall_clock),
+    }
+}
+
 impl PluginExecutor {
     pub fn new(
         runtime: Arc<WasmRuntime>,
@@ -645,6 +676,32 @@ impl PluginExecutor {
     ) -> Result<serde_json::Value, ExecutionError> {
         if depth >= MAX_LIBRARY_CALL_DEPTH {
             return Err(ExecutionError::DepthExceeded);
+        }
+        // A test run sees every library call, and answers a mocked namespace
+        // from data without instantiating the library at all. This is the one
+        // dispatch path for a library call, so a mock cannot be bypassed.
+        if let Some(test) = self.app_state.as_ref().and_then(|state| state.test.clone())
+            && let Some(namespace) = self
+                .registry
+                .get(lib_id)
+                .await
+                .and_then(|plugin| plugin.namespace().map(str::to_string))
+        {
+            test.record_call(
+                &namespace,
+                crate::plugin::TestCall {
+                    method: function.to_string(),
+                    args: serde_json::Value::Array(args.to_vec()),
+                },
+            );
+            let answer = test.mocks().lock().unwrap().answer(&namespace, function);
+            if let Some(answer) = answer {
+                return answer.map_err(|e| ExecutionError::PluginError {
+                    code: e.code,
+                    message: e.message,
+                    retryable: false,
+                });
+            }
         }
         let mut inst = self.instantiate_library(lib_id, ctx, caller, depth).await?;
         let value = inst.call_library_function(function, args, ctx).await?;
@@ -753,13 +810,11 @@ impl PluginExecutor {
         if let Some(fuel) = options.call_fuel {
             inst.set_call_fuel(fuel);
         }
-        // Running long is what a job is for, and `should_stop` is its stop;
-        // every other kind is bounded by the operator's wall clock, re-armed
-        // here so a run starts with a whole budget rather than what
+        // Re-armed here so a run starts with a whole budget rather than what
         // instantiation left.
-        match input.kind {
-            ScriptKind::Job => inst.lift_guest_deadline(),
-            _ => inst.arm_guest_deadline(self.script_wall_clock()),
+        match guest_deadline(input.kind, self.in_test_run(), self.script_wall_clock()) {
+            Some(budget) => inst.arm_guest_deadline(budget),
+            None => inst.lift_guest_deadline(),
         }
         // A run that failed takes its outstanding calls down with it when
         // `inst` drops; only one that answered waits for them.
@@ -1020,10 +1075,12 @@ impl PluginExecutor {
             trigger_id: input.context.trigger.clone(),
             caller_did: input.context.caller_did.clone(),
             job_id: input.context.job.as_ref().map(|job| job.id.clone()),
+            test: input.kind == ScriptKind::Test,
             language_id,
             extensions,
             stamp,
             modules,
+            waited_ms: Default::default(),
         });
         Ok(inst)
     }
@@ -1054,6 +1111,12 @@ impl PluginExecutor {
             .unwrap_or(std::time::Duration::from_secs(u64::from(
                 crate::lua::limits::DEFAULT_WALL_CLOCK_SECONDS,
             )))
+    }
+
+    fn in_test_run(&self) -> bool {
+        self.app_state
+            .as_ref()
+            .is_some_and(|state| state.test.is_some())
     }
 
     /// The capability set a plugin will be granted at instantiation.
@@ -3435,5 +3498,52 @@ mod compiled {
         assert_eq!(line, Some(7));
         assert_eq!(chunk.as_deref(), Some("modules/registry/src/lib.rs"));
         assert_eq!(raw, "panicked at modules/registry/src/lib.rs:7:5: boom");
+    }
+}
+
+#[cfg(test)]
+mod job_deadline_tests {
+    use super::{ScriptKind, TEST_FILE_GUEST_SECONDS, guest_deadline};
+    use std::time::Duration;
+
+    #[test]
+    fn each_kind_gets_its_deadline_and_only_a_test_run_bounds_a_job() {
+        let wall = Some(Duration::from_secs(7));
+        let file = Some(Duration::from_secs(TEST_FILE_GUEST_SECONDS));
+        let table = [
+            (ScriptKind::Job, false, None),
+            (ScriptKind::Job, true, file),
+            (ScriptKind::Test, false, file),
+            (ScriptKind::Test, true, file),
+            (ScriptKind::XrpcQuery, false, wall),
+            (ScriptKind::XrpcQuery, true, wall),
+            (ScriptKind::XrpcProcedure, false, wall),
+            (ScriptKind::XrpcProcedure, true, wall),
+            (ScriptKind::RecordEvent, false, wall),
+            (ScriptKind::RecordEvent, true, wall),
+            (ScriptKind::Label, false, wall),
+            (ScriptKind::Label, true, wall),
+        ];
+        assert_eq!(table.len(), ScriptKind::ALL.len() * 2);
+        for (kind, in_test_run, expected) in table {
+            assert_eq!(
+                guest_deadline(kind, in_test_run, Duration::from_secs(7)),
+                expected,
+                "{kind:?}, in a test run: {in_test_run}"
+            );
+        }
+    }
+
+    /// Only a test run bounds a job: a served job runs as long as it needs
+    /// and stops through `should_stop`, which no test run would ever set.
+    #[tokio::test]
+    async fn only_a_test_run_bounds_a_job() {
+        let mut state =
+            crate::test_support::test_state_with_pool(crate::test_support::memory_pool().await);
+        assert!(!state.plugin_executor().in_test_run());
+        state.test = Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+            "a.test.lua",
+        )));
+        assert!(state.plugin_executor().in_test_run());
     }
 }

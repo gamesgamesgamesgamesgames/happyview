@@ -57,7 +57,7 @@ pub fn claiming(language: &str) -> LoadedPlugin {
         "api_version": "2",
         "plugin_type": "interpreter",
         "language_id": language,
-        "capabilities": ["library:call", "script:host"],
+        "capabilities": ["library:call", "script:host", "script:test"],
     }))
     .expect("the fixture manifest should parse");
     LoadedPlugin {

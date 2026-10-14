@@ -647,17 +647,21 @@ pub enum MigrateFailure {
     Db(#[from] sqlx::Error),
 }
 
-/// Connect to the configured database, run migrations, and move the record
-/// tables into the compact format if they are not yet
-/// (`record_store::upgrade::run`).
-pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
-    let max_connections = crate::config::vars::var("DATABASE_MAX_CONNECTIONS")
+/// The pool size from `DATABASE_MAX_CONNECTIONS`, else the backend's default.
+fn max_connections_from_env(backend: DatabaseBackend) -> u32 {
+    crate::config::vars::var("DATABASE_MAX_CONNECTIONS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(match backend {
             DatabaseBackend::Sqlite => 16,
             DatabaseBackend::Postgres => 32,
-        });
-    connect_with(url, backend, max_connections).await
+        })
+}
+
+/// Connect to the configured database, run migrations, and move the record
+/// tables into the compact format if they are not yet
+/// (`record_store::upgrade::run`).
+pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
+    connect_with(url, backend, max_connections_from_env(backend)).await
 }
 
 /// [`connect`] with the pool size given rather than read from
@@ -667,6 +671,18 @@ pub(crate) async fn connect_with(
     backend: DatabaseBackend,
     max_connections: u32,
 ) -> AnyPool {
+    let pool = open_with(url, backend, max_connections).await;
+    migrate(&pool, backend).await;
+    pool
+}
+
+/// Connect and apply the per-connection settings without migrating, for a
+/// caller whose database is a copy of one that already is.
+pub async fn open(url: &str, backend: DatabaseBackend) -> AnyPool {
+    open_with(url, backend, max_connections_from_env(backend)).await
+}
+
+async fn open_with(url: &str, backend: DatabaseBackend, max_connections: u32) -> AnyPool {
     install_drivers();
 
     // For SQLite, ensure the parent directory exists
@@ -716,6 +732,12 @@ pub(crate) async fn connect_with(
             .expect("Failed to set busy timeout");
     }
 
+    pool
+}
+
+/// Apply every migration this build carries, and for SQLite move the record
+/// tables into the compact format.
+pub async fn migrate(pool: &AnyPool, backend: DatabaseBackend) {
     let migrator = match backend {
         DatabaseBackend::Sqlite => &SQLITE_MIGRATIONS,
         DatabaseBackend::Postgres => &POSTGRES_MIGRATIONS,
@@ -724,23 +746,21 @@ pub(crate) async fn connect_with(
     let migrated: Result<(), MigrateFailure> = match backend {
         DatabaseBackend::Sqlite => {
             async {
-                migrator.run(&pool).await?;
-                crate::record_store::upgrade::run(&pool, backend).await?;
+                migrator.run(pool).await?;
+                crate::record_store::upgrade::run(pool, backend).await?;
                 Ok(())
             }
             .await
         }
-        DatabaseBackend::Postgres => migrate_postgres(&pool, migrator).await,
+        DatabaseBackend::Postgres => migrate_postgres(pool, migrator).await,
     };
     migrated.unwrap_or_else(|e| panic!("Failed to run migrations: {e}"));
 
     if backend == DatabaseBackend::Sqlite
-        && let Err(e) = sqlite_optimize(&pool).await
+        && let Err(e) = sqlite_optimize(pool).await
     {
         tracing::warn!(error = %e, "PRAGMA optimize after migrations failed");
     }
-
-    pool
 }
 
 /// The advisory lock HappyView holds over its Postgres migrations.
@@ -934,6 +954,38 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use serial_test::serial;
+
+    #[tokio::test]
+    async fn open_skips_migrations_and_migrate_applies_them() {
+        let dir = std::env::temp_dir().join(format!("hv-db-open-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("a.db").display());
+        let jobs_table =
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'happyview_jobs'";
+
+        let pool = open(&url, DatabaseBackend::Sqlite).await;
+        let before: Vec<(String,)> = query_as(jobs_table).fetch_all(&pool).await.unwrap();
+        assert!(before.is_empty(), "open must not migrate");
+
+        migrate(&pool, DatabaseBackend::Sqlite).await;
+        // A second run is what every boot after the first does.
+        migrate(&pool, DatabaseBackend::Sqlite).await;
+        let after: Vec<(String,)> = query_as(jobs_table).fetch_all(&pool).await.unwrap();
+        assert_eq!(after.len(), 1);
+
+        let records: (String,) =
+            query_as("SELECT type FROM sqlite_master WHERE name = 'happyview_records'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            records.0, "view",
+            "migrate must run the record store upgrade"
+        );
+
+        pool.close().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Every migration file in the tree is compiled into the binary, so a
     /// binary run outside its checkout migrates exactly as one run inside it.

@@ -829,3 +829,94 @@ async fn a_mirror_failure_leaves_the_write_successful() {
         "the probe should have refused the mirror: {row:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A test run: every write answers from the in-process PDS
+// ---------------------------------------------------------------------------
+
+/// Give `app` a test harness. The session's PDS points at the mock server with
+/// nothing mounted, so a write that leaves the process fails the test.
+async fn into_test_run(app: &mut TestApp) -> std::sync::Arc<happyview::testing::TestHarness> {
+    let harness = std::sync::Arc::new(happyview::testing::TestHarness::new("a.test.lua"));
+    app.state.test = Some(harness.clone());
+    app.rebuild_router();
+    harness
+}
+
+#[tokio::test]
+#[serial]
+async fn a_test_runs_procedure_script_writes_through_the_in_process_pds() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    install_caller_fixture(&app).await;
+    seed_procedure_lexicon(&app).await;
+    seed_script(&app, &format!("xrpc.procedure:{CREATE_GAME}"), REQUIRE).await;
+
+    const DID: &str = "did:plc:sdkcallertestrun";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+    update_session_pds_url(&app, DID, &format!("{}/pds/{DID}", app.mock_server.uri())).await;
+    let harness = into_test_run(&mut app).await;
+
+    let resp = dpop_post(
+        &app,
+        &format!("/xrpc/{CREATE_GAME}"),
+        &call(
+            "create_record",
+            json!({ "collection": "com.example.post", "rkey": "abc", "record": { "text": "hello" }, "validate": false }),
+        ),
+        &client_key,
+        &dpop_key,
+        &access_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let writes = harness.pds().writes();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].repo, DID);
+    assert_eq!(body["cid"].as_str(), writes[0].cid.as_deref());
+    let row = indexed(&app, &format!("at://{DID}/com.example.post/abc"))
+        .await
+        .expect("the write is in the index");
+    assert_eq!(row["cid"], body["cid"]);
+}
+
+/// A procedure with a lexicon and no script writes through the in-process
+/// PDS and mirrors what it answered, as the OAuth path does.
+#[tokio::test]
+#[serial]
+async fn a_test_runs_scriptless_procedure_writes_through_the_in_process_pds() {
+    common::require_db!();
+    let mut app = TestApp::new_with_encryption().await;
+    seed_procedure_lexicon(&app).await;
+
+    const DID: &str = "did:plc:scriptlesstestrun";
+    let (client_key, dpop_key, access_token) = setup_dpop_session(&app, DID).await;
+    update_session_pds_url(&app, DID, &format!("{}/pds/{DID}", app.mock_server.uri())).await;
+    let harness = into_test_run(&mut app).await;
+
+    let resp = dpop_post(
+        &app,
+        &format!("/xrpc/{CREATE_GAME}"),
+        &json!({ "name": "Tetris" }),
+        &client_key,
+        &dpop_key,
+        &access_token,
+    )
+    .await;
+    let status = resp.status();
+    let body = response_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let writes = harness.pds().writes();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].action, "create");
+    assert_eq!(writes[0].repo, DID);
+    assert_eq!(writes[0].collection, "games.gamesgamesgamesgames.game");
+    let uri = body["uri"].as_str().expect("the PDS's uri is answered");
+    let row = indexed(&app, uri).await.expect("the write is in the index");
+    assert_eq!(row["cid"], body["cid"]);
+    assert_eq!(row["record"]["name"], "Tetris");
+}

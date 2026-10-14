@@ -256,6 +256,7 @@ impl TestApp {
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
             script_limits: std::sync::Arc::new(happyview::lua::limits::ScriptLimits::default()),
+            test: None,
         };
 
         if let Some(key) = state.config.token_encryption_key.as_ref() {

@@ -67,7 +67,7 @@ pub async fn resume_interrupted_jobs(state: &AppState) {
     }
 }
 
-async fn execute_job(state: &AppState, job: &super::Job) {
+pub(crate) async fn execute_job(state: &AppState, job: &super::Job) {
     let backend = state.db_backend;
 
     log_event(
@@ -123,7 +123,9 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     };
 
     let (claims, pds_auth) = if job.inherit_auth {
-        let pds_auth = if let (Some(api_client_id), Some(dpop_key_id)) =
+        let pds_auth = if let Some(auth) = repo::test_pds_auth(state) {
+            auth
+        } else if let (Some(api_client_id), Some(dpop_key_id)) =
             (&job.api_client_id, &job.dpop_key_id)
         {
             let encryption_key = match state.config.token_encryption_key.as_ref() {

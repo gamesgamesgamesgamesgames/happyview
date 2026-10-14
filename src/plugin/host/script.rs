@@ -49,6 +49,9 @@ pub struct ScriptRun {
     /// Set for a job run, whose log lines also land in the job's own log and
     /// whose progress, stop flag and waits the three controls act on.
     pub job_id: Option<String>,
+    /// Whether this run is a test file. The five test imports answer only
+    /// when it is, whatever the plugin declared.
+    pub test: bool,
     /// The calling interpreter's language and the extensions it claims; a
     /// module resolves only to a file it could have written.
     pub language_id: String,
@@ -57,6 +60,10 @@ pub struct ScriptRun {
     /// when it carries this stamp.
     pub stamp: Option<ArtifactStamp>,
     pub modules: ModuleScope,
+    /// Milliseconds this run has spent in `host_job_wait`, which a test run
+    /// caps in total: a wait is host time, so a job that waits in a loop
+    /// would otherwise never reach its deadline.
+    pub waited_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -169,19 +176,33 @@ pub async fn should_stop(state: &AppState, run: &ScriptRun) -> Result<bool, Scri
 
 /// Sleep, clamped to the range a job may wait. The import wrapper stops the
 /// guest's execution clock for the duration, so a wait is host time and is
-/// never charged to the run's budget.
+/// never charged to the run's budget. In a test run the run's waits share
+/// one test file's budget between them, since the run awaits the job and
+/// nothing else would end it.
 pub async fn wait(
     state: &AppState,
     run: &ScriptRun,
     request: JobWaitRequest,
 ) -> Result<(), ScriptHostError> {
+    use std::sync::atomic::Ordering;
+
     job_of(run, "host_job_wait")?;
+    let ceiling = if state.test.is_some() {
+        let budget_ms = crate::plugin::executor::TEST_FILE_GUEST_SECONDS * 1000;
+        budget_ms.saturating_sub(run.waited_ms.load(Ordering::Relaxed)) as f64 / 1000.0
+    } else {
+        MAX_WAIT_SECONDS
+    };
     let duration = std::time::Duration::from_secs_f64(
         request
             .seconds
-            .clamp(0.0, MAX_WAIT_SECONDS)
+            .clamp(0.0, ceiling)
             // A NaN survives `clamp`, and `from_secs_f64` panics on one.
             .max(0.0),
+    );
+    run.waited_ms.fetch_add(
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
     );
     tokio::time::sleep(duration).await;
     crate::telemetry::counters::add_saturating(
@@ -420,6 +441,42 @@ mod tests {
         // records, since sleeping an hour is not a test.
         let clamped = std::time::Duration::from_secs_f64(f64::MAX.clamp(0.0, MAX_WAIT_SECONDS));
         assert_eq!(clamped, std::time::Duration::from_secs(3600));
+    }
+
+    /// A run that has already waited a test file's budget waits no more in a
+    /// test run, and still waits as asked in a serving one.
+    #[tokio::test]
+    async fn a_test_runs_waits_share_one_budget_and_a_serving_runs_do_not() {
+        use std::sync::atomic::Ordering;
+
+        let spent = crate::plugin::executor::TEST_FILE_GUEST_SECONDS * 1000;
+        for (test, expected_ms) in [(true, 0), (false, 300)] {
+            let mut state = state().await;
+            if test {
+                state.test = Some(Arc::new(crate::testing::TestHarness::new("a.test.lua")));
+            }
+            let job = crate::jobs::db::create_job(
+                &state,
+                "test.interpreter",
+                &serde_json::json!({}),
+                "did:plc:me",
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let run = run(Some(&job));
+            run.waited_ms.store(spent, Ordering::Relaxed);
+            wait(&state, &run, JobWaitRequest { seconds: 0.3 })
+                .await
+                .unwrap();
+            assert_eq!(
+                state.telemetry_counters.job_wait_ms.load(Ordering::Relaxed),
+                expected_ms,
+                "test run: {test}"
+            );
+        }
     }
 
     #[tokio::test]

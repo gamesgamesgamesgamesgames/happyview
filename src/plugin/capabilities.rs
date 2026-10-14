@@ -78,6 +78,8 @@ pub enum PluginCapability {
     WasiStdio,
     #[serde(rename = "script:host")]
     ScriptHost,
+    #[serde(rename = "script:test")]
+    ScriptTest,
 }
 
 impl PluginCapability {
@@ -112,6 +114,7 @@ impl PluginCapability {
             WasiRandom,
             WasiStdio,
             ScriptHost,
+            ScriptTest,
         ]
     }
 
@@ -146,6 +149,7 @@ impl PluginCapability {
             WasiRandom => "wasi:random",
             WasiStdio => "wasi:stdio",
             ScriptHost => "script:host",
+            ScriptTest => "script:test",
         }
     }
 
@@ -156,9 +160,8 @@ impl PluginCapability {
     pub fn risk(&self) -> Risk {
         use PluginCapability::*;
         match self {
-            SecretsRead | KvRead | KvWrite | JobsRead | WasiClock | WasiRandom | ScriptHost => {
-                Risk::Low
-            }
+            SecretsRead | KvRead | KvWrite | JobsRead | WasiClock | WasiRandom | ScriptHost
+            | ScriptTest => Risk::Low,
             RecordsRead
             | BlobsRead
             | BlobsWrite
@@ -256,6 +259,9 @@ impl PluginCapability {
             WasiStdio => "Write to this instance's plugin log.",
             ScriptHost => {
                 "Log, report progress, check for a stop request, wait, and load the project's own modules on behalf of the script run it is inside; the host supplies the run's identity, job and files."
+            }
+            ScriptTest => {
+                "Fire this project's triggers, mock its libraries and record results, only while the test command runs one of its test files."
             }
         }
     }
@@ -540,6 +546,26 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
     Requirement {
         import: "host_module_resolve",
         any_of: &[PluginCapability::ScriptHost],
+    },
+    Requirement {
+        import: "host_test_trigger",
+        any_of: &[PluginCapability::ScriptTest],
+    },
+    Requirement {
+        import: "host_test_mock",
+        any_of: &[PluginCapability::ScriptTest],
+    },
+    Requirement {
+        import: "host_test_calls",
+        any_of: &[PluginCapability::ScriptTest],
+    },
+    Requirement {
+        import: "host_test_pds_writes",
+        any_of: &[PluginCapability::ScriptTest],
+    },
+    Requirement {
+        import: "host_test_report",
+        any_of: &[PluginCapability::ScriptTest],
     },
 ];
 
@@ -850,6 +876,11 @@ mod tests {
             "host_job_wait",
             "host_script_panic",
             "host_module_resolve",
+            "host_test_trigger",
+            "host_test_mock",
+            "host_test_calls",
+            "host_test_pds_writes",
+            "host_test_report",
         ] {
             // `None` is only right for the free imports.
             assert_eq!(
@@ -1342,6 +1373,32 @@ mod tests {
         assert_eq!(PluginCapability::ScriptHost.risk(), Risk::Low);
     }
 
+    /// The five test runner imports share one capability, distinct from
+    /// `script:host`, so an interpreter that never runs tests never declares
+    /// the power to fire triggers.
+    #[test]
+    fn test_runner_imports_need_script_test() {
+        for import in [
+            "host_test_trigger",
+            "host_test_mock",
+            "host_test_calls",
+            "host_test_pds_writes",
+            "host_test_report",
+        ] {
+            let req = requirement_for_import(import).expect(import);
+            assert_eq!(req.any_of, &[PluginCapability::ScriptTest], "{import}");
+            let reqs = analyze_imports(&module_importing(&[import])).unwrap();
+            assert!(
+                check_declared(&[PluginCapability::ScriptHost], &reqs).is_err(),
+                "{import}"
+            );
+            assert!(
+                check_declared(&[PluginCapability::ScriptTest], &reqs).is_ok(),
+                "{import}"
+            );
+        }
+    }
+
     /// The consent sentence for each preview-1 capability says what the
     /// import does; the word WASI tells an operator nothing.
     #[test]
@@ -1351,6 +1408,7 @@ mod tests {
             (PluginCapability::WasiRandom, "wasi:random", Risk::Low),
             (PluginCapability::WasiStdio, "wasi:stdio", Risk::Medium),
             (PluginCapability::ScriptHost, "script:host", Risk::Low),
+            (PluginCapability::ScriptTest, "script:test", Risk::Low),
         ] {
             assert_eq!(cap.as_str(), name);
             assert_eq!(PluginCapability::parse_str(name), Some(cap));

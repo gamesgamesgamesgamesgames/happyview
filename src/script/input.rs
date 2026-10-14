@@ -25,7 +25,11 @@ pub enum Trigger<'a> {
     Label,
     XrpcQuery,
     XrpcProcedure,
-    Job { id: &'a str },
+    Job {
+        id: &'a str,
+    },
+    /// A test file, which reports to the test runner rather than to a trigger.
+    Test,
 }
 
 impl<'a> Trigger<'a> {
@@ -37,6 +41,7 @@ impl<'a> Trigger<'a> {
             Self::XrpcQuery => ScriptKind::XrpcQuery,
             Self::XrpcProcedure => ScriptKind::XrpcProcedure,
             Self::Job { .. } => ScriptKind::Job,
+            Self::Test => ScriptKind::Test,
         }
     }
 
@@ -171,11 +176,15 @@ pub async fn build_input(state: &AppState, inv: &Invocation<'_>) -> ScriptExecut
         },
         libraries,
         limits: ScriptExecuteLimits {
-            // A job has no instruction budget: running long is what a job is
-            // for, and `should_stop` is its stop.
+            // A job and a test file have no instruction budget: a job's stop
+            // is `should_stop`, and a test file is bounded by its guest
+            // deadline.
             instructions: match kind {
-                ScriptKind::Job => None,
-                _ => Some(state.script_limits.instruction_limit()),
+                ScriptKind::Job | ScriptKind::Test => None,
+                ScriptKind::XrpcQuery
+                | ScriptKind::XrpcProcedure
+                | ScriptKind::RecordEvent
+                | ScriptKind::Label => Some(state.script_limits.instruction_limit()),
             },
             memory_bytes: DEFAULT_SCRIPT_MEMORY_BYTES as u64,
         },
@@ -670,5 +679,20 @@ mod tests {
             assert_eq!(other.context.job, None, "{trigger:?}");
             assert!(other.limits.instructions.is_some(), "{trigger:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_test_file_run_has_no_instruction_budget_and_no_job() {
+        let state = test_state_with_pool(migrated_memory_pool().await);
+        let input = json!(null);
+        let built = build_input(
+            &state,
+            &invocation("test:src/lib/a.test.lua", Trigger::Test, &input),
+        )
+        .await;
+        assert_eq!(built.kind, ScriptKind::Test);
+        assert_eq!(built.limits.instructions, None);
+        assert!(built.context.job.is_none());
+        assert_eq!(built.context.trigger, "test:src/lib/a.test.lua");
     }
 }

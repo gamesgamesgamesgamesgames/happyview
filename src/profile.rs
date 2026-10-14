@@ -90,6 +90,18 @@ pub async fn resolve_profile(
     let pds_endpoint = find_service_endpoint(&did_doc, "atproto_pds")
         .ok_or_else(|| AppError::NotFound("no PDS endpoint in DID document".into()))?;
 
+    // The forged PDS serves no profile record, and asking it would wait on DNS.
+    if crate::testing::identity::forging() {
+        return Ok(Profile {
+            did: did.to_string(),
+            handle: handle.unwrap_or_else(|| did.to_string()),
+            display_name: None,
+            description: None,
+            avatar_url: None,
+            avatar: None,
+        });
+    }
+
     let (display_name, description, avatar_url, avatar) =
         fetch_profile_from_pds(http, &pds_endpoint, did)
             .await
@@ -163,6 +175,10 @@ pub async fn resolve_did_document_once(
 ) -> Result<DidDocument, crate::admin::backfill_errors::BackfillFailure> {
     use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure};
 
+    if crate::testing::identity::forging() {
+        return Ok(crate::testing::identity::did_document(did));
+    }
+
     let url = if let Some(domain) = did.strip_prefix("did:web:") {
         format!("https://{}/.well-known/did.json", domain)
     } else {
@@ -212,6 +228,10 @@ pub async fn resolve_did_document(
     plc_url: &str,
     did: &str,
 ) -> Result<DidDocument, AppError> {
+    if crate::testing::identity::forging() {
+        return Ok(crate::testing::identity::did_document(did));
+    }
+
     let url = if let Some(domain) = did.strip_prefix("did:web:") {
         format!("https://{}/.well-known/did.json", domain)
     } else {

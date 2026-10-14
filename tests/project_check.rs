@@ -81,3 +81,31 @@ fn a_plugin_that_will_not_load_stops_the_check() {
     assert_eq!(code, 2, "{stdout}");
     assert!(stdout.starts_with("tests/fixtures/projects: "), "{stdout}");
 }
+
+/// A project's `.env` holds script variables, not configuration for a check.
+/// It points `PLUGIN_DIR` at a plugin that cannot load, so a check that read
+/// it would exit 2 rather than build the empty project.
+#[test]
+fn a_check_does_not_load_the_projects_env() {
+    let root = tempfile::tempdir().unwrap();
+    let bogus = root.path().join("bogus/broken");
+    std::fs::create_dir_all(&bogus).unwrap();
+    std::fs::write(bogus.join("manifest.json"), "{}").unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join(".env"),
+        format!("PLUGIN_DIR={}\n", root.path().join("bogus").display()),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_happyview"))
+        .args(["check", "."])
+        .current_dir(root.path())
+        .env_remove("PLUGIN_DIR")
+        .env_remove("DATABASE_URL")
+        .env_remove("HAPPYVIEW_PROJECT")
+        .output()
+        .expect("run happyview check");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.starts_with("ok: 0 lexicons"), "{stdout}");
+}

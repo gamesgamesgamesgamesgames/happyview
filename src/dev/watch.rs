@@ -30,6 +30,8 @@ pub enum Change {
     /// `.happyview/build` itself appeared or was replaced, so its watch has
     /// to be added again.
     BuildDir,
+    /// `.env.test`, which only a test run reads. The dev server ignores it.
+    TestEnv,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -65,6 +67,9 @@ pub fn classify(root: &Path, path: &Path) -> Option<Change> {
     if rel == Path::new("happyview.toml") {
         return Some(Change::Config);
     }
+    if rel == Path::new(".env.test") {
+        return Some(Change::TestEnv);
+    }
     if rel == Path::new("src") {
         return Some(Change::SrcDir);
     }
@@ -85,21 +90,27 @@ pub fn classify(root: &Path, path: &Path) -> Option<Change> {
 
 /// Wait for a signal, then take every other one until none has arrived for
 /// `DEBOUNCE`, or `MAX_BATCH` has passed. `None` when every sender is gone.
-async fn next_batch(rx: &mut UnboundedReceiver<Change>) -> Option<Batch> {
-    let mut batch = Batch::default();
-    let mut note = |change: Change| match change {
-        Change::Config => batch.config = true,
-        Change::SrcDir => batch.src_dir = true,
-        Change::BuildDir => batch.build_dir = true,
-        Change::Source => {}
-    };
-    note(rx.recv().await?);
+pub(crate) async fn debounced<T>(rx: &mut UnboundedReceiver<T>) -> Option<Vec<T>> {
+    let mut batch = vec![rx.recv().await?];
     let cutoff = tokio::time::Instant::now() + MAX_BATCH;
     loop {
         let quiet = (tokio::time::Instant::now() + DEBOUNCE).min(cutoff);
         match tokio::time::timeout_at(quiet, rx.recv()).await {
-            Ok(Some(change)) => note(change),
+            Ok(Some(signal)) => batch.push(signal),
             _ => break,
+        }
+    }
+    Some(batch)
+}
+
+async fn next_batch(rx: &mut UnboundedReceiver<Change>) -> Option<Batch> {
+    let mut batch = Batch::default();
+    for change in debounced(rx).await? {
+        match change {
+            Change::Config => batch.config = true,
+            Change::SrcDir => batch.src_dir = true,
+            Change::BuildDir => batch.build_dir = true,
+            Change::Source | Change::TestEnv => {}
         }
     }
     Some(batch)
@@ -147,14 +158,14 @@ pub fn parse_poll_ms(raw: Option<&str>) -> Result<WatchMode, String> {
 
 /// The two watchers are different types, and the loop only ever needs to
 /// add a watch.
-enum AnyWatcher {
+pub(crate) enum AnyWatcher {
     Native(RecommendedWatcher),
     Poll(PollWatcher),
 }
 
 /// Adding a watch is all the rebuild loop does with its watcher, so a test
 /// can stand in for one.
-trait Watch {
+pub(crate) trait Watch {
     fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()>;
 }
 
@@ -167,22 +178,25 @@ impl Watch for AnyWatcher {
     }
 }
 
-type SharedWatcher = Arc<Mutex<AnyWatcher>>;
+pub(crate) type SharedWatcher = Arc<Mutex<AnyWatcher>>;
 
-/// The watcher's event handler: each classified change to `tx`, except for
-/// reads. inotify reports every open and close, and a build opens every
-/// directory under `src/`, so counting a read as a change would schedule the
-/// next build from the last one, forever. The kind is filtered here, before
-/// anything is collapsed, because it is gone once events become a `Change`.
+/// The watcher's event handler: each classified change, with the path it
+/// came from, to `on_change`, except for reads. inotify reports every open
+/// and close, and a build opens every directory under `src/`, so counting a
+/// read as a change would schedule the next build from the last one,
+/// forever. The kind is filtered here, before anything is collapsed, because
+/// it is gone once events become a `Change`.
 fn forward(
     root: PathBuf,
-    tx: UnboundedSender<Change>,
+    on_change: impl Fn(Change, &Path) + Send + 'static,
 ) -> impl FnMut(notify::Result<Event>) + Send + 'static {
     move |result| match result {
         Ok(event) if matches!(event.kind, EventKind::Access(_)) => {}
         Ok(event) => {
-            for change in event.paths.iter().filter_map(|p| classify(&root, p)) {
-                let _ = tx.send(change);
+            for path in &event.paths {
+                if let Some(change) = classify(&root, path) {
+                    on_change(change, path);
+                }
             }
         }
         Err(e) => eprintln!("file watcher: {e}"),
@@ -190,13 +204,13 @@ fn forward(
 }
 
 /// A watcher of the chosen kind, watching every path in `watched_paths`,
-/// that sends each classified change to `tx`.
-fn start_watcher(
+/// that hands each classified change, with its path, to `on_change`.
+pub(crate) fn start_watcher(
     root: &Path,
     mode: WatchMode,
-    tx: UnboundedSender<Change>,
+    on_change: impl Fn(Change, &Path) + Send + 'static,
 ) -> Result<SharedWatcher, String> {
-    let handler = forward(root.to_path_buf(), tx);
+    let handler = forward(root.to_path_buf(), on_change);
     let watcher = match mode {
         WatchMode::Native => AnyWatcher::Native(
             RecommendedWatcher::new(handler, notify::Config::default())
@@ -254,7 +268,11 @@ pub fn spawn_with(
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
     spawn_interpreter_listener(&state, &tx);
-    let watcher = start_watcher(&root, mode, tx)?;
+    let watcher = start_watcher(&root, mode, move |change, _| {
+        if serves(change) {
+            let _ = tx.send(change);
+        }
+    })?;
 
     let rewatch: Weak<Mutex<AnyWatcher>> = Arc::downgrade(&watcher);
     let mut declared = state.config.project.clone();
@@ -268,6 +286,11 @@ pub fn spawn_with(
         _watcher: watcher,
         mode,
     })
+}
+
+/// Whether a change is one the dev server rebuilds for.
+fn serves(change: Change) -> bool {
+    change != Change::TestEnv
 }
 
 /// An interpreter installed or removed changes which files are scripts and
@@ -287,24 +310,18 @@ fn spawn_interpreter_listener(state: &AppState, tx: &UnboundedSender<Change>) {
     });
 }
 
-/// One batch's work: watch again any directory that was recreated, reload
-/// the config if it changed, then build. Answers the build's line.
-async fn handle_batch<W: Watch>(
-    state: &AppState,
-    session: &DevSession,
+/// Watch again whichever of `src/` and `.happyview/build` was recreated.
+pub(crate) fn watch_again<W: Watch>(
     rewatch: &Weak<Mutex<W>>,
-    declared: &mut Option<Arc<crate::config::project::ProjectConfig>>,
-    batch: Batch,
-) -> String {
+    root: &Path,
+    src_dir: bool,
+    build_dir_recreated: bool,
+) {
     let recreated = [
+        (src_dir, root.join("src"), RecursiveMode::Recursive),
         (
-            batch.src_dir,
-            session.root.join("src"),
-            RecursiveMode::Recursive,
-        ),
-        (
-            batch.build_dir,
-            build_dir(&session.root),
+            build_dir_recreated,
+            build_dir(root),
             RecursiveMode::NonRecursive,
         ),
     ];
@@ -318,6 +335,18 @@ async fn handle_batch<W: Watch>(
             let _ = watcher.lock().unwrap().watch(&path, recursive);
         }
     }
+}
+
+/// One batch's work: watch again any directory that was recreated, reload
+/// the config if it changed, then build. Answers the build's line.
+async fn handle_batch<W: Watch>(
+    state: &AppState,
+    session: &DevSession,
+    rewatch: &Weak<Mutex<W>>,
+    declared: &mut Option<Arc<crate::config::project::ProjectConfig>>,
+    batch: Batch,
+) -> String {
+    watch_again(rewatch, &session.root, batch.src_dir, batch.build_dir);
     if batch.config
         && let Err(e) = crate::dev::reload::reload(state, session, declared).await
     {
@@ -370,6 +399,10 @@ mod tests {
             None
         );
         assert_eq!(classify(root, Path::new("/p/.env")), None);
+        assert_eq!(
+            classify(root, Path::new("/p/.env.test")),
+            Some(Change::TestEnv)
+        );
         assert_eq!(classify(root, Path::new("/p/srcery/x.lua")), None);
         assert_eq!(classify(root, Path::new("/elsewhere/src/a.json")), None);
     }
@@ -421,7 +454,14 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join(".happyview")).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
-        let watcher = start_watcher(&root, WatchMode::Poll(Duration::from_millis(50)), tx).unwrap();
+        let watcher = start_watcher(
+            &root,
+            WatchMode::Poll(Duration::from_millis(50)),
+            move |change, _| {
+                let _ = tx.send(change);
+            },
+        )
+        .unwrap();
         assert!(matches!(&*watcher.lock().unwrap(), AnyWatcher::Poll(_)));
 
         std::fs::write(root.join("src/a.json"), "{}").unwrap();
@@ -431,8 +471,7 @@ mod tests {
             Some(Change::Source)
         );
 
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
-        let native = start_watcher(&root, WatchMode::Native, tx).unwrap();
+        let native = start_watcher(&root, WatchMode::Native, |_, _| {}).unwrap();
         assert!(matches!(&*native.lock().unwrap(), AnyWatcher::Native(_)));
     }
 
@@ -475,7 +514,9 @@ mod tests {
     async fn reads_are_not_changes() {
         use notify::event::{AccessKind, AccessMode};
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
-        let mut handler = forward(PathBuf::from("/p"), tx);
+        let mut handler = forward(PathBuf::from("/p"), move |change, _| {
+            let _ = tx.send(change);
+        });
         for path in ["/p/src", "/p/src/lexicons", "/p/src/lexicons/a.json"] {
             handler(event(
                 EventKind::Access(AccessKind::Open(AccessMode::Any)),
@@ -499,7 +540,9 @@ mod tests {
             AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode,
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Change>();
-        let mut handler = forward(PathBuf::from("/p"), tx);
+        let mut handler = forward(PathBuf::from("/p"), move |change, _| {
+            let _ = tx.send(change);
+        });
         let a = "/p/src/lexicons/a.json";
         handler(event(
             EventKind::Access(AccessKind::Open(AccessMode::Any)),
@@ -529,6 +572,45 @@ mod tests {
         );
         let again = tokio::time::timeout(DEBOUNCE * 3, next_batch(&mut rx)).await;
         assert!(again.is_err(), "a second build: {again:?}");
+    }
+
+    /// `.env.test` is a test run's input, not the dev server's.
+    #[test]
+    fn the_dev_server_ignores_the_test_env() {
+        assert!(!serves(Change::TestEnv));
+        for change in [
+            Change::Source,
+            Change::Config,
+            Change::SrcDir,
+            Change::BuildDir,
+        ] {
+            assert!(serves(change), "{change:?}");
+        }
+    }
+
+    /// The path rides along with its change, so a caller can tell which
+    /// file was saved.
+    #[test]
+    fn each_change_carries_its_path() {
+        use notify::event::{DataChange, ModifyKind};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let mut handler = forward(PathBuf::from("/p"), move |change, path| {
+            record.lock().unwrap().push((change, path.to_path_buf()));
+        });
+        handler(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+            DataChange::Any,
+        )))
+        .add_path(PathBuf::from("/p/src/a.test.lua"))
+        .add_path(PathBuf::from("/p/node_modules/x.js"))
+        .add_path(PathBuf::from("/p/happyview.toml"))));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (Change::Source, PathBuf::from("/p/src/a.test.lua")),
+                (Change::Config, PathBuf::from("/p/happyview.toml")),
+            ]
+        );
     }
 
     #[tokio::test]

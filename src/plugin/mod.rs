@@ -40,6 +40,13 @@ pub use happyview_plugin_sdk::wire::{
     ValidateOutput as ScriptValidateOutput,
 };
 
+/// The test runner's wire types: what a `*.test.<ext>` file's five `script:test`
+/// imports receive and return.
+pub use happyview_plugin_sdk::wire::{
+    TestCall, TestCalls, TestMock, TestPdsWrite, TestPdsWritesRequest, TestReport, TestStatus,
+    TestTrigger, TestTriggerKind, TestTriggerResult,
+};
+
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use graph::{GraphError, PluginNode};
 use std::collections::HashMap;

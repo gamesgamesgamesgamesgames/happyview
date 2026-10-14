@@ -191,7 +191,9 @@ pub async fn execute_procedure_script(
     let script_source = script.body.clone();
     let input_json = input.clone();
 
-    let pds_auth: Option<repo::PdsAuth> = if let Some(client_key) = claims.client_key() {
+    let pds_auth: Option<repo::PdsAuth> = if let Some(auth) = repo::test_pds_auth(state) {
+        Some(auth)
+    } else if let Some(client_key) = claims.client_key() {
         let encryption_key = state
             .config
             .token_encryption_key
