@@ -2,6 +2,12 @@ use serde_json::{Value, json};
 
 pub const SCHEMA_COLLECTION: &str = "com.atproto.lexicon.schema";
 
+/// What the attached account is asked for so the instance can publish and
+/// unpublish its lexicons. Actions are repeated keys: a comma-joined list is
+/// one unknown action, and the authorization server refuses the request.
+pub const SCHEMA_WRITE_SCOPE: &str =
+    "repo:com.atproto.lexicon.schema?action=create&action=update&action=delete";
+
 /// The lexicon document with `$type` set and nothing else touched, which is
 /// what the PDS hashes when it reports the record's CID.
 pub fn schema_record(lexicon_json: &Value) -> Value {
@@ -66,6 +72,19 @@ pub fn compute_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dashboard_asks_the_attached_account_for_the_schema_scope() {
+        let web = include_str!("../../web/src/lib/attached-account-scope.ts");
+        let requested = web
+            .split('"')
+            .nth(1)
+            .expect("ATTACHED_ACCOUNT_SCOPE is a string literal");
+        assert_eq!(
+            requested,
+            format!("atproto identity:* {SCHEMA_WRITE_SCOPE}")
+        );
+    }
 
     #[test]
     fn schema_record_replaces_type_and_keeps_the_rest() {

@@ -10,6 +10,7 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { confirmAttachAuth } from "@/lib/api";
+import { ATTACHED_ACCOUNT_SCOPE } from "@/lib/attached-account-scope";
 import { docsUrl } from "@/lib/docs";
 
 const ATTACH_AUTH_STORAGE_KEY = "happyview_attach_auth";
@@ -97,7 +98,7 @@ export function SetupAttachAuth({
         localStorage.setItem(ATTACH_AUTH_STORAGE_KEY, JSON.stringify(payload));
 
         const handle = attachedHandle ?? attachedDid;
-        return fetch(`/auth/login?handle=${encodeURIComponent(handle)}&scope=${encodeURIComponent("atproto identity:*")}&redirect_uri=${encodeURIComponent("/setup")}`, {
+        return fetch(`/auth/login?handle=${encodeURIComponent(handle)}&scope=${encodeURIComponent(ATTACHED_ACCOUNT_SCOPE)}&redirect_uri=${encodeURIComponent("/setup")}`, {
           credentials: "same-origin",
         });
       })

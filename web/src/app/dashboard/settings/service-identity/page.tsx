@@ -66,6 +66,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { ATTACHED_ACCOUNT_SCOPE } from "@/lib/attached-account-scope";
 
 const SYNC_STORAGE_KEY = "happyview:service-identity:last-synced-at";
 const REAUTH_STORAGE_KEY = "happyview:service-identity:reauth";
@@ -287,7 +288,7 @@ export default function ServiceIdentityPage() {
         );
         const identifier = handle ?? did;
         return fetch(
-          `/auth/login?handle=${encodeURIComponent(identifier)}&scope=${encodeURIComponent("atproto identity:*")}&redirect_uri=${encodeURIComponent("/dashboard/settings/service-identity")}`,
+          `/auth/login?handle=${encodeURIComponent(identifier)}&scope=${encodeURIComponent(ATTACHED_ACCOUNT_SCOPE)}&redirect_uri=${encodeURIComponent("/dashboard/settings/service-identity")}`,
           { credentials: "same-origin" },
         );
       })

@@ -542,10 +542,7 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
 
     let oauth_state_store = DbStateStore::new(db_pool.clone(), db_backend);
 
-    let oauth_scopes = vec![
-        Scope::Known(KnownScope::Atproto),
-        Scope::Unknown("identity:*".to_string()),
-    ];
+    let oauth_scopes = happyview::oauth::rotation::instance_scopes();
 
     let linked_repos_scopes = oauth_scopes.clone();
     let oauth_scopes_for_by_kid = oauth_scopes.clone();
