@@ -448,21 +448,31 @@ function BulkPublish({
   const label =
     count === 0 ? "Publish pending" : `Publish ${count} pending`;
   if (count === 0) {
-    // A disabled button takes no pointer or focus events, so the reason sits
-    // on a focusable wrapper.
+    // aria-disabled rather than disabled, so the button keeps focus and a
+    // screen reader hears why it does nothing; the tooltip shows the same
+    // reason to a pointer.
+    const reason =
+      "Nothing is pending: no covered lexicon is new, changed or moved.";
     return (
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span tabIndex={0} className="rounded-md outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">
-            <Button size="sm" disabled aria-describedby="bulk-publish-reason">
+      <>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              size="sm"
+              aria-disabled="true"
+              aria-describedby="bulk-publish-reason"
+              className="aria-disabled:cursor-not-allowed aria-disabled:opacity-50 aria-disabled:hover:bg-primary"
+              onClick={(e) => e.preventDefault()}
+            >
               {label}
             </Button>
-          </span>
-        </TooltipTrigger>
-        <TooltipContent id="bulk-publish-reason">
-          Nothing to publish: every covered lexicon is current.
-        </TooltipContent>
-      </Tooltip>
+          </TooltipTrigger>
+          <TooltipContent>{reason}</TooltipContent>
+        </Tooltip>
+        <span id="bulk-publish-reason" className="sr-only">
+          {reason}
+        </span>
+      </>
     );
   }
   return (
