@@ -15,8 +15,9 @@
 # built module missing. The manifest and the target travel the other way and
 # are read back out of the path.
 #
-# wasip1 is only for the two fixtures that link preview-1 imports; every other
-# fixture is a bare wasm32 module.
+# wasip1 is for the fixtures that link preview-1 imports, and for the script
+# module, which builds the way a project module does; every other fixture is a
+# bare wasm32 module.
 PLUGIN_FIXTURES=(
   tests/fixtures/differential_library/target/wasm32-unknown-unknown/release/differential_library.wasm
   tests/fixtures/interpreter_echo/target/wasm32-unknown-unknown/release/interpreter_echo.wasm
@@ -27,6 +28,7 @@ PLUGIN_FIXTURES=(
   tests/fixtures/sdk_http/target/wasm32-unknown-unknown/release/sdk_http.wasm
   tests/fixtures/sdk_linked_repos/target/wasm32-unknown-unknown/release/sdk_linked_repos.wasm
   tests/fixtures/sdk_objects/target/wasm32-unknown-unknown/release/sdk_objects.wasm
+  tests/fixtures/script_module/target/wasm32-wasip1/release/script_module.wasm
   tests/fixtures/sdk_spaces/target/wasm32-unknown-unknown/release/sdk_spaces.wasm
   tests/fixtures/test_library/target/wasm32-unknown-unknown/release/test_library.wasm
   tests/fixtures/test_plugin/target/wasm32-unknown-unknown/release/test_plugin.wasm
