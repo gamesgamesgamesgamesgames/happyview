@@ -1431,6 +1431,7 @@ async fn write_guest_response(caller: &mut wasmtime::Caller<'_, PluginState>, da
     // The allocator is guest code: the clock has to be running again, and
     // armed from what remains, before it is entered.
     resume_guest_deadline(caller);
+    crate::plugin::runtime::grant_fuel_for_bytes(caller, data.len());
     let len = data.len() as u32;
     let ptr = match alloc.call_async(&mut *caller, len).await {
         Ok(p) if p != 0 => p,

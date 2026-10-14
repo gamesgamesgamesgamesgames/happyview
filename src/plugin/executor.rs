@@ -401,6 +401,7 @@ impl PluginInstance {
         self.store
             .set_fuel(self.store.data().call_fuel)
             .map_err(ExecutionError::Trap)?;
+        crate::plugin::runtime::grant_fuel_for_bytes(&mut self.store, input_bytes.len());
 
         let packed = func
             .call_async(&mut self.store, (input_ptr, input_len))

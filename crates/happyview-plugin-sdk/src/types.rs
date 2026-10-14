@@ -8,7 +8,7 @@
 pub use crate::wire::DEFAULT_CHUNK_NAME;
 pub use crate::wire::{
     ApiExport, ApiMethod, ApiSurface, AtprotoBlobDownload, AtprotoResolveService, AttestSign,
-    AttestVerify, AuthorizeUrlInput, BacklinksQuery, BlobData, CallContext, CallInput,
+    AttestVerify, AuthorizeUrlInput, BacklinksQuery, BlobData, Bytes, CallContext, CallInput,
     CallbackInput, CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut,
     CallerXrpcProcedure, CallerXrpcQuery, ChunkRole, Condition, ExecuteContext, ExecuteInput,
     ExecuteLimits, ExecuteOutput, ExternalProfile, Filter, ImportRef, IndexDelete, IndexPut,

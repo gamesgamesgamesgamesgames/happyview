@@ -13,5 +13,11 @@ base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
+# The guest allocator `export_abi!()` installs: memory grows as a call needs it
+# and is really freed, where a fixed heap would cap every payload a plugin can
+# hold. It is what `std` itself uses on wasm.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dlmalloc = { version = "0.2", features = ["global"] }
+
 [dev-dependencies]
 wasmparser = "0.236"
