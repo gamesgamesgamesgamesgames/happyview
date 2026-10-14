@@ -5,6 +5,7 @@ import {
   CircleCheck,
   CircleDashed,
   CircleDot,
+  CircleSlash,
   Loader2,
   Minus,
   MoveRight,
@@ -64,6 +65,14 @@ const LOOKS: Record<PublishStatus, StatusLook> = {
     icon: CircleDashed,
     tone: "text-muted-foreground",
     explain: "A default covers this lexicon, but it has not been published.",
+  },
+  withdrawn: {
+    label: "Withdrawn",
+    short: "Withdrawn",
+    icon: CircleSlash,
+    tone: "text-muted-foreground",
+    explain:
+      "Unpublished by hand. Auto-publish leaves it alone until you publish it again.",
   },
   target_unavailable: {
     label: "Destination unavailable",

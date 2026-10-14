@@ -16,7 +16,12 @@ import type {
 import { DnsStatus, dnsState } from "./dns-status";
 import { asSentence, expectedDid, nsidAuthority, targetName } from "./model";
 import { PublishStatusBadge, statusExplanation } from "./publish-status";
-import { canPublishNow, isPublished, UnpublishButton } from "./row-actions";
+import {
+  canPublishNow,
+  isPublished,
+  publishLabel,
+  UnpublishButton,
+} from "./row-actions";
 import { usePublish } from "./use-publish";
 
 const PUBLISHING_HREF = "/dashboard/lexicons/publishing";
@@ -170,7 +175,7 @@ export function PublishingPanel({
                       aria-hidden
                     />
                   )}
-                  {lexicon.status === "unpublished" ? "Publish" : "Republish"}
+                  {publishLabel(lexicon)}
                 </Button>
               )}
               {isPublished(lexicon) && (

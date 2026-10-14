@@ -20,9 +20,18 @@ import type { PublishableLexicon } from "@/types/lexicon-publishing";
 import { isPending, lastFailure } from "./model";
 
 export function canPublishNow(lexicon: PublishableLexicon): boolean {
-  if (isPending(lexicon)) return true;
+  // Withdrawn is not pending, since auto-publish skips it, but publishing it
+  // by hand is how an operator brings it back.
+  if (isPending(lexicon) || lexicon.status === "withdrawn") return true;
   // A failed republish of a current record still deserves a retry.
   return lexicon.status === "current" && lastFailure(lexicon) !== null;
+}
+
+/** "Publish" for a lexicon with no record, "Republish" for one that has one. */
+export function publishLabel(lexicon: PublishableLexicon): string {
+  return lexicon.status === "unpublished" || lexicon.status === "withdrawn"
+    ? "Publish"
+    : "Republish";
 }
 
 export function isPublished(lexicon: PublishableLexicon): boolean {
@@ -67,7 +76,7 @@ export function RowActions({
               aria-hidden
             />
           )}
-          {lexicon.status === "unpublished" ? "Publish" : "Republish"}
+          {publishLabel(lexicon)}
         </Button>
       )}
     </div>
@@ -116,10 +125,10 @@ export function UnpublishButton({
                 from <span className="font-mono break-all">{where}</span>
               </>
             ) : null}
-            . Apps that resolve this lexicon stop finding it, and anything
-            built against it may break.
+            . Other apps can no longer resolve this lexicon, and anything built
+            against it may break.
             {lexicon.auto_publish &&
-              " Its default auto-publishes, so it comes back the next time a default or lexicon changes; turn auto-publish off first to keep it unpublished."}
+              " Auto-publish won't bring it back; it stays unpublished until you publish it again."}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>

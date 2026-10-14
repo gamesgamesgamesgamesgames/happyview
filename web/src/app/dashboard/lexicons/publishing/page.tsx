@@ -72,6 +72,7 @@ const STATUS_OPTIONS: { label: string; value: PublishStatus }[] = [
   { label: "Outdated", value: "outdated" },
   { label: "Published elsewhere", value: "moved" },
   { label: "Not published", value: "unpublished" },
+  { label: "Withdrawn", value: "withdrawn" },
   { label: "Destination unavailable", value: "target_unavailable" },
   { label: "No default", value: "no_rule" },
 ];

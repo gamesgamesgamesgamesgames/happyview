@@ -28,6 +28,7 @@ export type PublishStatus =
   | "no_rule"
   | "target_unavailable"
   | "unpublished"
+  | "withdrawn"
   | "moved"
   | "outdated"
   | "current"
@@ -41,6 +42,8 @@ export interface Publication {
   published_at: string | null
   last_error: string | null
   last_attempt_at: string | null
+  /** Set by an explicit unpublish; auto-publish skips the lexicon until it is published by hand. */
+  withdrawn_at: string | null
 }
 
 export interface PublishableLexicon {
