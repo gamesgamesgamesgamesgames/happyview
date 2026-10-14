@@ -14,6 +14,11 @@ import {
 } from "lucide-react";
 
 import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
@@ -24,7 +29,7 @@ import type {
   PublishStatus,
 } from "@/types/lexicon-publishing";
 
-import { lastFailure } from "./model";
+import { asSentence, lastFailure } from "./model";
 
 type StatusLook = {
   label: string;
@@ -102,11 +107,17 @@ export function PublishStatusBadge({
   lexicon,
   publishing = false,
   compact = false,
+  explain = false,
   className,
 }: {
   lexicon: PublishableLexicon;
   publishing?: boolean;
   compact?: boolean;
+  /**
+   * Opens the explanation, the destination's reason and any failure on press,
+   * for places that show the badge without them beside it.
+   */
+  explain?: boolean;
   className?: string;
 }) {
   if (publishing) {
@@ -128,6 +139,45 @@ export function PublishStatusBadge({
     lexicon.status === "target_unavailable"
       ? lexicon.target?.unavailable_reason
       : null;
+
+  if (explain) {
+    return (
+      <Popover>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className={cn(
+              "focus-visible:ring-ring/50 inline-flex items-center gap-1.5 rounded-sm text-sm whitespace-nowrap underline decoration-dotted underline-offset-4 outline-none hover:decoration-solid focus-visible:ring-[3px]",
+              className,
+            )}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <Icon className={cn("size-4 shrink-0", look.tone)} aria-hidden />
+            {compact ? look.short : look.label}
+            {failure && (
+              <>
+                <CircleAlert className="text-destructive size-4" aria-hidden />
+                <span className="sr-only">, last publish failed</span>
+              </>
+            )}
+          </button>
+        </PopoverTrigger>
+        <PopoverContent
+          align="start"
+          className="flex w-[min(20rem,calc(100vw-2rem))] flex-col gap-2 text-sm"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <p className="font-medium">{look.label}</p>
+          <p className="text-muted-foreground">
+            {reason ? asSentence(reason) : look.explain}
+          </p>
+          {failure && (
+            <p className="text-destructive">Last publish failed: {failure}</p>
+          )}
+        </PopoverContent>
+      </Popover>
+    );
+  }
 
   return (
     <span className={cn("inline-flex items-center gap-1.5 text-sm whitespace-nowrap", className)}>

@@ -184,7 +184,7 @@ export default function LexiconsPage() {
           if (publishing === undefined) return <Skeleton className="h-4 w-20" />;
           const entry = publishing?.get(row.original.id);
           if (!entry) return <span className="text-muted-foreground">—</span>;
-          return <PublishStatusBadge lexicon={entry} compact />;
+          return <PublishStatusBadge lexicon={entry} compact explain />;
         },
         enableSorting: true,
         meta: { label: "Published" },
