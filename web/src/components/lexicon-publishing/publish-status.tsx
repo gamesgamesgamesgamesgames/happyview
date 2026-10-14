@@ -136,10 +136,13 @@ export function PublishStatusBadge({
   const look = LOOKS[lexicon.status];
   const Icon = look.icon;
   const failure = lastFailure(lexicon);
+  const elsewhere = lexicon.publication?.did;
   const reason =
     lexicon.status === "target_unavailable"
       ? unavailableSentence(lexicon.target)
-      : null;
+      : lexicon.status === "moved" && elsewhere
+        ? `Published to ${elsewhere}, not the account its default names. Publishing writes it to the new one.`
+        : null;
 
   if (explain) {
     return (
@@ -169,7 +172,7 @@ export function PublishStatusBadge({
           onClick={(e) => e.stopPropagation()}
         >
           <p className="font-medium">{look.label}</p>
-          <p className="text-muted-foreground">
+          <p className="text-muted-foreground [overflow-wrap:anywhere]">
             {reason || look.explain}
           </p>
           {failure && (

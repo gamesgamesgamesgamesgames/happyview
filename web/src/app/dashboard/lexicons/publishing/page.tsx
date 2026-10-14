@@ -177,15 +177,18 @@ export default function LexiconPublishingPage() {
         header: ({ column }) => (
           <DataTableColumnHeader column={column} label="Lexicon" />
         ),
-        // Below md the status column would sit under the pinned actions, so
-        // the status moves into this cell instead.
+        // Below md only this column and the actions show: the others would
+        // sit under the pinned actions. The status moves in here, and opens
+        // to say why a destination is unavailable or the record is elsewhere;
+        // the defaults above and the lexicon's own page carry the rest.
         cell: ({ row }) => (
-          <div className="flex flex-col gap-1">
+          <div className="flex flex-col items-start gap-1">
             <span className="font-mono text-sm">{row.original.nsid}</span>
             <PublishStatusBadge
               lexicon={row.original}
               publishing={busy.has(row.original.nsid)}
               compact
+              explain
               className="md:hidden"
             />
           </div>
@@ -231,6 +234,7 @@ export default function LexiconPublishingPage() {
           <DataTableColumnHeader column={column} label="Destination" />
         ),
         cell: ({ row }) => <DestinationCell lexicon={row.original} />,
+        meta: { label: "Destination", className: "max-md:hidden" },
       },
       {
         id: "dns",
@@ -254,6 +258,7 @@ export default function LexiconPublishingPage() {
           );
         },
         enableSorting: false,
+        meta: { label: "DNS", className: "max-md:hidden" },
       },
       {
         id: "actions",
