@@ -335,7 +335,14 @@ export default function LexiconsPage() {
 
   return (
     <>
-      <SiteHeader title="Lexicons" />
+      <SiteHeader
+        title="Lexicons"
+        actions={
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/dashboard/lexicons/publishing">Publishing</Link>
+          </Button>
+        }
+      />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
         <DataTable
           table={table}
@@ -344,9 +351,6 @@ export default function LexiconsPage() {
           }
         >
           <DataTableToolbar table={table}>
-            <Button variant="outline" asChild>
-              <Link href="/dashboard/lexicons/publishing">Publishing</Link>
-            </Button>
             {hasPermission("lexicons:create") && (
               <Button asChild>
                 <Link href="/dashboard/lexicons/new">Add Lexicon</Link>

@@ -14,9 +14,12 @@ import { ThemeToggle } from "@/components/theme-toggle"
 export function SiteHeader({
   title,
   backHref,
+  actions,
 }: {
   title: string
   backHref?: string
+  /** Page-level links that would crowd a toolbar, set beside the theme toggle. */
+  actions?: React.ReactNode
 }) {
   const { reasons } = useRestart()
   const [expanded, setExpanded] = useState(false)
@@ -39,7 +42,8 @@ export function SiteHeader({
             </Button>
           )}
           <h1 className="text-base font-medium">{title}</h1>
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-2">
+            {actions}
             <ThemeToggle />
           </div>
         </div>
