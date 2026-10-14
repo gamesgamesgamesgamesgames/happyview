@@ -67,7 +67,9 @@ export function RowActions({
     >
       {published && (
         <UnpublishButton
-          lexicon={lexicon}
+          nsid={lexicon.nsid}
+          did={lexicon.publication?.did}
+          autoPublish={lexicon.auto_publish}
           busy={busy}
           onConfirm={onUnpublish}
           compact
@@ -89,18 +91,23 @@ export function RowActions({
 }
 
 export function UnpublishButton({
-  lexicon,
+  nsid,
+  did: where,
+  autoPublish = false,
   busy,
   onConfirm,
   compact = false,
 }: {
-  lexicon: PublishableLexicon;
+  nsid: string;
+  /** The repo the record is in. */
+  did: string | null | undefined;
+  /** Whether a default would otherwise publish it again on its own. */
+  autoPublish?: boolean;
   busy: boolean;
   onConfirm: () => void;
   /** Icon only, for table rows where width is scarce. */
   compact?: boolean;
 }) {
-  const where = lexicon.publication?.did;
   return (
     <AlertDialog>
       <AlertDialogTrigger asChild>
@@ -113,7 +120,7 @@ export function UnpublishButton({
           )}
           disabled={busy}
           title={compact ? "Unpublish" : undefined}
-          aria-label={compact ? `Unpublish ${lexicon.nsid}` : undefined}
+          aria-label={compact ? `Unpublish ${nsid}` : undefined}
           onPointerDown={(e) => e.stopPropagation()}
         >
           {compact ? <CloudOff aria-hidden /> : "Unpublish"}
@@ -121,7 +128,7 @@ export function UnpublishButton({
       </AlertDialogTrigger>
       <AlertDialogContent onClick={(e) => e.stopPropagation()}>
         <AlertDialogHeader>
-          <AlertDialogTitle>Unpublish {lexicon.nsid}?</AlertDialogTitle>
+          <AlertDialogTitle>Unpublish {nsid}?</AlertDialogTitle>
           <AlertDialogDescription>
             This deletes its schema record
             {where ? (
@@ -132,7 +139,7 @@ export function UnpublishButton({
             ) : null}
             . Other apps can no longer resolve this lexicon, and anything built
             against it may break.
-            {lexicon.auto_publish &&
+            {autoPublish &&
               " Auto-publish won't bring it back; it stays unpublished until you publish it again."}
           </AlertDialogDescription>
         </AlertDialogHeader>

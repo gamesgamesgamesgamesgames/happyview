@@ -206,7 +206,9 @@ export function PublishingPanel({
               )}
               {isPublished(lexicon) && (
                 <UnpublishButton
-                  lexicon={lexicon}
+                  nsid={lexicon.nsid}
+                  did={lexicon.publication?.did}
+                  autoPublish={lexicon.auto_publish}
                   busy={working}
                   onConfirm={() => unpublish(nsid)}
                 />

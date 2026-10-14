@@ -66,6 +66,8 @@ export interface LexiconPublishingOverview {
   /** Most specific first: the order in which they win a match. */
   rules: PublishRule[]
   lexicons: PublishableLexicon[]
+  /** Records still in a repo whose lexicon this instance no longer publishes. */
+  orphans: Publication[]
 }
 
 export interface LexiconDnsEntry {

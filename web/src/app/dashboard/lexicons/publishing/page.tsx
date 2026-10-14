@@ -63,6 +63,7 @@ import {
   targetName,
   unavailableSentence,
 } from "@/components/lexicon-publishing/model";
+import { OrphanedPublications } from "@/components/lexicon-publishing/orphaned-publications";
 import { PublishStatusBadge } from "@/components/lexicon-publishing/publish-status";
 import { RoutingCascade } from "@/components/lexicon-publishing/routing-cascade";
 import {
@@ -424,6 +425,15 @@ export default function LexiconPublishingPage() {
             </DataTable>
           )}
         </section>
+
+        {overview && (
+          <OrphanedPublications
+            orphans={overview.orphans}
+            canPublish={canPublish}
+            busy={busy}
+            onUnpublish={unpublish}
+          />
+        )}
 
         <p className="sr-only" aria-live="polite" role="status">
           {announcement}
