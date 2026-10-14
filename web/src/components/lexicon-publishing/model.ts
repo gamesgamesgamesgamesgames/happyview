@@ -118,7 +118,10 @@ export function lastFailure(lexicon: PublishableLexicon): string | null {
   const p = lexicon.publication;
   if (!p?.last_error) return null;
   if (!p.published_at || !p.last_attempt_at) return p.last_error;
-  return p.last_attempt_at > p.published_at ? p.last_error : null;
+  // Offsets and fractional digits vary, so the strings don't sort as times.
+  return Date.parse(p.last_attempt_at) > Date.parse(p.published_at)
+    ? p.last_error
+    : null;
 }
 
 /**
