@@ -9,6 +9,9 @@ pub mod identity;
 pub mod mocks;
 pub mod report;
 pub mod runner;
+/// Public for the integration tests under `tests/`, which seed a file's
+/// database the way a project would; nothing in the binary calls it.
+#[doc(hidden)]
 pub mod seed;
 pub mod triggers;
 pub mod watch;

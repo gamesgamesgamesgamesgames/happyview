@@ -951,6 +951,10 @@ pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPo
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use chrono::Datelike;
+    use serial_test::serial;
+
     #[tokio::test]
     async fn open_skips_migrations_and_migrate_applies_them() {
         let dir = std::env::temp_dir().join(format!("hv-db-open-{}", uuid::Uuid::new_v4()));
@@ -982,10 +986,6 @@ mod tests {
         pool.close().await;
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
-    use super::*;
-    use chrono::Datelike;
-    use serial_test::serial;
 
     /// Every migration file in the tree is compiled into the binary, so a
     /// binary run outside its checkout migrates exactly as one run inside it.

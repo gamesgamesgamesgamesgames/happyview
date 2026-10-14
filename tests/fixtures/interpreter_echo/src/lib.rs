@@ -144,7 +144,11 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 fn b64_encode(bytes: &[u8]) -> alloc::string::String {
     let mut out = alloc::string::String::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -341,7 +345,11 @@ fn run_calls(steps: &Value) -> Value {
         if let Some(start) = step.get("start") {
             let args = match start.get("args_raw").and_then(Value::as_str) {
                 Some(raw) => raw.to_string(),
-                None => start.get("args").cloned().unwrap_or_else(|| json!([])).to_string(),
+                None => start
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]))
+                    .to_string(),
             };
             let handle = imports::call_library_start(
                 start["library"].as_str().unwrap_or(""),
@@ -614,9 +622,7 @@ pub extern "C" fn execute(ptr: u32, len: u32) -> i64 {
             }
             "host:job_should_stop" => returned(imports::job_should_stop(), "other"),
             "host:job_wait" => returned(
-                imports::job_wait(
-                    &json!({"seconds": payload["seconds"].as_f64().unwrap_or(0.0)}),
-                ),
+                imports::job_wait(&json!({"seconds": payload["seconds"].as_f64().unwrap_or(0.0)})),
                 "other",
             ),
             "host:library" => {
