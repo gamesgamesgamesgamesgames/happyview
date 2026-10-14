@@ -14,7 +14,8 @@ import type {
 } from "@/types/lexicon-publishing";
 
 import { DnsStatus, dnsState } from "./dns-status";
-import { asSentence, expectedDid, nsidAuthority, targetName } from "./model";
+import { asSentence, expectedDid, nsidAuthority } from "./model";
+import { TargetName } from "./target-name";
 import { PublishStatusBadge, statusExplanation } from "./publish-status";
 import {
   canPublishNow,
@@ -143,9 +144,7 @@ export function PublishingPanel({
               <dd className="min-w-0">
                 {lexicon.target ? (
                   <>
-                    <span className="block truncate">
-                      {targetName(lexicon.target)}
-                    </span>
+                    <TargetName target={lexicon.target} className="block" />
                     <span className="text-muted-foreground block text-xs">
                       Decided by{" "}
                       <Link

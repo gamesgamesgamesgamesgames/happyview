@@ -64,6 +64,7 @@ import {
 import { PublishStatusBadge } from "@/components/lexicon-publishing/publish-status";
 import { RoutingCascade } from "@/components/lexicon-publishing/routing-cascade";
 import { RowActions } from "@/components/lexicon-publishing/row-actions";
+import { TargetName } from "@/components/lexicon-publishing/target-name";
 import { RuleSheet } from "@/components/lexicon-publishing/rule-sheet";
 import { usePublish } from "@/components/lexicon-publishing/use-publish";
 
@@ -416,7 +417,7 @@ function DestinationCell({ lexicon }: { lexicon: PublishableLexicon }) {
   }
   return (
     <div className="flex min-w-0 max-w-64 flex-col">
-      <span className="truncate text-sm">{targetName(target)}</span>
+      <TargetName target={target} className="text-sm" />
       {lexicon.status === "target_unavailable" ? (
         <span className="text-muted-foreground text-xs text-pretty">
           {asSentence(target.unavailable_reason)}

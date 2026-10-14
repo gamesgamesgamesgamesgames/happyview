@@ -18,7 +18,8 @@ import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import type { PublishRule } from "@/types/lexicon-publishing";
 
-import { asSentence, describeStoredPattern, targetName } from "./model";
+import { asSentence, describeStoredPattern, nameIsDid } from "./model";
+import { TargetName } from "./target-name";
 
 const ROW =
   "grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-2 px-4 py-3 md:grid-cols-[minmax(0,1fr)_1rem_minmax(0,1fr)_8.5rem_4.25rem]";
@@ -142,8 +143,8 @@ function Destination({ rule }: { rule: PublishRule }) {
   }
   return (
     <div className="col-span-2 min-w-0 md:col-span-1">
-      <p className="truncate text-sm">{targetName(target)}</p>
-      {target.did && (
+      <TargetName target={target} className="block text-sm" />
+      {target.did && !nameIsDid(target) && (
         <p className="text-muted-foreground truncate font-mono text-xs">
           {target.did}
         </p>

@@ -29,11 +29,12 @@ import {
   describePattern,
   matches,
   moreSpecific,
+  nameIsDid,
   parsePattern,
   ruleTargetKey,
   targetKey,
-  targetName,
 } from "./model";
+import { TargetName } from "./target-name";
 
 interface RuleSheetProps {
   open: boolean;
@@ -327,15 +328,14 @@ function DestinationOption({
         className="mt-0.5"
       />
       <span className="flex min-w-0 flex-col gap-0.5">
-        <span
+        <TargetName
+          target={target}
           className={cn(
             "text-sm font-medium",
             !target.available && "text-muted-foreground",
           )}
-        >
-          {targetName(target)}
-        </span>
-        {target.did && (
+        />
+        {target.did && !nameIsDid(target) && (
           <span className="text-muted-foreground font-mono text-xs break-all">
             {target.did}
           </span>

@@ -126,6 +126,11 @@ export function targetName(target: PublishTarget): string {
   return target.handle ?? target.did ?? "Linked repo";
 }
 
+/** True when a target has no name of its own and is shown by its DID. */
+export function nameIsDid(target: PublishTarget): boolean {
+  return target.kind !== "instance" && !target.handle && Boolean(target.did);
+}
+
 export function targetKey(target: {
   kind: string;
   linked_repo_id: string | null;
