@@ -1291,3 +1291,142 @@ async fn dns_reports_one_entry_per_authority() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The instance's attached account
+// ---------------------------------------------------------------------------
+
+const ATTACHED: &str = "did:plc:attached";
+
+async fn attach_account(s: &happyview::AppState) {
+    happyview::service_identity::upsert_identity(
+        &s.db,
+        s.db_backend,
+        &happyview::service_identity::IdentityMode::AttachAccount,
+        Some(ATTACHED),
+        None,
+        None,
+        Some(ATTACHED),
+    )
+    .await
+    .unwrap();
+}
+
+/// Replaces the attached account's stored session with one granting `scope`.
+async fn seed_attached_session(s: &happyview::AppState, scope: &str) {
+    let sql = happyview::db::adapt_sql(
+        "DELETE FROM happyview_oauth_sessions WHERE did = ?",
+        s.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(ATTACHED)
+        .execute(&s.db)
+        .await
+        .unwrap();
+    let session = json!({
+        "dpop_key": {},
+        "token_set": { "sub": ATTACHED, "scope": scope, "access_token": "tok", "token_type": "DPoP" },
+    });
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_oauth_sessions (did, session_data) VALUES (?, ?)",
+        s.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(ATTACHED)
+        .bind(session.to_string())
+        .execute(&s.db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn the_instance_target_is_judged_by_the_scope_the_attached_session_granted() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    attach_account(s).await;
+
+    let none = instance_target(s).await.unwrap();
+    assert!(!none.available && !none.can_unpublish);
+    assert_eq!(
+        none.unavailable_reason.as_deref(),
+        Some("the attached account has no session; sign it in again from Service Identity")
+    );
+
+    seed_attached_session(s, "atproto identity:*").await;
+    let identity_only = instance_target(s).await.unwrap();
+    assert!(!identity_only.available && !identity_only.can_unpublish);
+    assert_eq!(
+        identity_only.unavailable_reason.as_deref(),
+        Some(
+            "the attached account's session cannot write com.atproto.lexicon.schema records \
+             (it granted: atproto identity:*); re-authenticate it from Service Identity to grant \
+             repo:com.atproto.lexicon.schema?action=create&action=update&action=delete"
+        )
+    );
+
+    seed_attached_session(s, "").await;
+    let empty = instance_target(s).await.unwrap();
+    assert!(
+        empty
+            .unavailable_reason
+            .unwrap()
+            .contains("(it granted no scopes)")
+    );
+
+    seed_attached_session(
+        s,
+        "atproto identity:* repo:com.atproto.lexicon.schema?action=create&action=update",
+    )
+    .await;
+    let no_delete = instance_target(s).await.unwrap();
+    assert!(
+        no_delete.available && !no_delete.can_unpublish,
+        "{no_delete:?}"
+    );
+
+    seed_attached_session(
+        s,
+        &format!(
+            "atproto identity:* {}",
+            happyview::lexicon_publishing::SCHEMA_WRITE_SCOPE
+        ),
+    )
+    .await;
+    let full = instance_target(s).await.unwrap();
+    assert!(full.available && full.can_unpublish, "{full:?}");
+    assert_eq!(full.did.as_deref(), Some(ATTACHED));
+    assert_eq!(full.unavailable_reason, None);
+}
+
+#[tokio::test]
+#[serial]
+async fn an_instance_rule_needs_the_schema_scope_on_the_attached_session() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    attach_account(s).await;
+    seed_attached_session(s, "atproto identity:*").await;
+
+    let rule = json!({"pattern": "*", "target_kind": "instance"});
+    let (status, body) = call(&app, "POST", &format!("{BASE}/rules"), Some(rule.clone())).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("re-authenticate it from Service Identity"),
+        "{body}"
+    );
+
+    seed_attached_session(
+        s,
+        &format!(
+            "atproto identity:* {}",
+            happyview::lexicon_publishing::SCHEMA_WRITE_SCOPE
+        ),
+    )
+    .await;
+    let (status, body) = call(&app, "POST", &format!("{BASE}/rules"), Some(rule)).await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["target"]["did"], ATTACHED);
+}

@@ -95,7 +95,8 @@ pub async fn granted_scopes(state: &AppState) -> Result<HashMap<String, String>,
         .collect())
 }
 
-fn session_scope(session_data: &str) -> Option<String> {
+/// The scope the authorization server granted, from a stored atrium session.
+pub(crate) fn session_scope(session_data: &str) -> Option<String> {
     let session: serde_json::Value = serde_json::from_str(session_data).ok()?;
     session
         .get("token_set")?

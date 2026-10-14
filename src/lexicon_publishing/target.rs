@@ -8,8 +8,8 @@ use crate::linked_repos::scope::{self, RepoAction};
 use crate::linked_repos::types::{LinkedRepo, STATUS_ACTIVE, STATUS_NEEDS_REAUTH};
 use crate::service_identity::{self, IdentityMode};
 
-use super::SCHEMA_COLLECTION;
 use super::store::Rule;
+use super::{SCHEMA_COLLECTION, SCHEMA_WRITE_SCOPE};
 
 pub const KIND_INSTANCE: &str = "instance";
 pub const KIND_LINKED_REPO: &str = "linked_repo";
@@ -58,15 +58,8 @@ pub async fn instance_target(state: &AppState) -> Result<TargetInfo, AppError> {
         None => "the instance identity is not set up".to_string(),
         Some(identity) => match (identity.mode, identity.attached_account_did) {
             (IdentityMode::AttachAccount, Some(did)) => {
-                return Ok(TargetInfo {
-                    kind: KIND_INSTANCE.to_string(),
-                    linked_repo_id: None,
-                    did: Some(did),
-                    handle: None,
-                    available: true,
-                    unavailable_reason: None,
-                    can_unpublish: true,
-                });
+                let session = attached_session_scope(state, &did).await?;
+                return Ok(attached_account_target(did, session));
             }
             (IdentityMode::AttachAccount, None) => {
                 "the instance identity has no attached account".to_string()
@@ -83,6 +76,76 @@ pub async fn instance_target(state: &AppState) -> Result<TargetInfo, AppError> {
         },
     };
     Ok(TargetInfo::unavailable(KIND_INSTANCE, reason))
+}
+
+/// What the stored session for `did` says about its scope: `None` when there
+/// is no session, `Some(None)` when the session records no scope.
+async fn attached_session_scope(
+    state: &AppState,
+    did: &str,
+) -> Result<Option<Option<String>>, AppError> {
+    let sql = crate::db::adapt_sql(
+        "SELECT session_data FROM happyview_oauth_sessions WHERE did = ?",
+        state.db_backend,
+    );
+    let row: Option<(String,)> = crate::db::query_as(&sql)
+        .bind(did)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read the attached session: {e}")))?;
+    Ok(row.map(|(data,)| crate::linked_repos::db::session_scope(&data)))
+}
+
+/// The attached account signs in through the dashboard's own OAuth client, so
+/// whatever it was last signed in with is what publishing has to work with: a
+/// plain dashboard login by the same account replaces the session with one
+/// that cannot write records.
+///
+/// A session that records no scope is judged available, since nothing says it
+/// cannot write; the PDS decides, and its refusal names the fix.
+pub fn attached_account_target(did: String, session: Option<Option<String>>) -> TargetInfo {
+    let granted = match session {
+        None => {
+            return TargetInfo::unavailable(
+                KIND_INSTANCE,
+                "the attached account has no session; sign it in again from Service Identity",
+            );
+        }
+        Some(granted) => granted,
+    };
+    let scopes = granted.as_deref().map(scope::parse);
+    let allows = |action| {
+        scopes
+            .as_deref()
+            .is_none_or(|s| scope::allows_repo(s, SCHEMA_COLLECTION, action))
+    };
+    if !(allows(RepoAction::Create) && allows(RepoAction::Update)) {
+        return TargetInfo::unavailable(
+            KIND_INSTANCE,
+            format!(
+                "the attached account's session cannot write {SCHEMA_COLLECTION} records ({}); \
+                 re-authenticate it from Service Identity to grant {SCHEMA_WRITE_SCOPE}",
+                granted_phrase(granted.as_deref().unwrap_or_default())
+            ),
+        );
+    }
+    TargetInfo {
+        kind: KIND_INSTANCE.to_string(),
+        linked_repo_id: None,
+        did: Some(did),
+        handle: None,
+        available: true,
+        unavailable_reason: None,
+        can_unpublish: allows(RepoAction::Delete),
+    }
+}
+
+fn granted_phrase(granted: &str) -> String {
+    if granted.trim().is_empty() {
+        "it granted no scopes".to_string()
+    } else {
+        format!("it granted: {}", granted.trim())
+    }
 }
 
 /// Every linked repo beside the scope its PDS granted, loaded once so a view
@@ -145,10 +208,10 @@ pub fn linked_repo_target(grant: &LinkedRepo, granted_scope: Option<&str>) -> Ta
         ))
     } else if !writes(effective) {
         Some(format!(
-            "the PDS granted fewer scopes than this linked repo asked for (it granted: {}). It \
-             may have cached HappyView's client details before this grant existed; link the \
-             repo again later",
-            granted_scope.unwrap_or_default()
+            "the PDS granted fewer scopes than this linked repo asked for ({}). It may have \
+             cached HappyView's client details before this grant existed; link the repo again \
+             later",
+            granted_phrase(granted_scope.unwrap_or_default())
         ))
     } else {
         None

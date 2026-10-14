@@ -17,6 +17,8 @@ use super::target::{self, KIND_INSTANCE, TargetInfo};
 use super::{PublishStatus, SCHEMA_COLLECTION, best_match, record_cid, schema_record};
 
 const SIGN_IN_AGAIN: &str = "the attached account needs to sign in again";
+const SCOPE_REFUSED: &str = "the attached account's PDS refused the write for lack of scope; \
+     re-authenticate the attached account from Service Identity to grant it";
 const WITHDRAWN: &str = "unpublished by hand, so auto-publish leaves it alone";
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,9 +228,9 @@ fn find_grant<'a>(
         .ok_or_else(|| Refusal::Failed(target::REMOVED_LINKED_REPO.into()))
 }
 
-/// An expired attached-account session is a credential HappyView holds that
-/// an operator has to renew, so it is a 4xx; any other PDS failure is the
-/// PDS's.
+/// An expired attached-account session, or one whose scope the PDS refuses,
+/// is a credential HappyView holds that an operator has to renew, so it is a
+/// 4xx naming the fix; any other PDS failure is the PDS's.
 async fn instance_call(
     state: &AppState,
     did: &str,
@@ -246,10 +248,22 @@ async fn instance_call(
         .map_err(|e| {
             if crate::setup::is_pds_session_expired(&e) {
                 AppError::Auth(SIGN_IN_AGAIN.to_string())
+            } else if is_scope_refusal(&e) {
+                AppError::Forbidden(SCOPE_REFUSED.to_string())
             } else {
                 AppError::BadGateway(message(e))
             }
         })
+}
+
+/// atrium renders a refused XRPC call as `xrpc response error: <status> <body>`;
+/// a PDS names a missing scope `InsufficientScope`, and any other 403 to the
+/// account's own repo can only be a permission it was not granted.
+fn is_scope_refusal(e: &AppError) -> bool {
+    let text = e.to_string();
+    text.contains("InsufficientScope")
+        || text.contains("insufficient_scope")
+        || text.contains("xrpc response error: 403")
 }
 
 async fn write_instance(
@@ -458,6 +472,24 @@ mod tests {
         flight.run(|| work(probe.clone())).await;
         assert_eq!(probe.runs.load(Ordering::SeqCst), 1);
         assert!(!flight.dirty.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_pds_scope_refusal_is_recognised() {
+        let refused = AppError::Internal(
+            "com.atproto.repo.putRecord failed: xrpc response error: 403 \
+             {\"error\":\"InsufficientScope\",\"message\":\"Missing required scope\"}"
+                .into(),
+        );
+        assert!(is_scope_refusal(&refused));
+        let bare = AppError::Internal(
+            "com.atproto.repo.deleteRecord failed: xrpc response error: 403".into(),
+        );
+        assert!(is_scope_refusal(&bare));
+        let other = AppError::Internal(
+            "com.atproto.repo.putRecord failed: xrpc response error: 400 InvalidRecord".into(),
+        );
+        assert!(!is_scope_refusal(&other));
     }
 
     #[test]
