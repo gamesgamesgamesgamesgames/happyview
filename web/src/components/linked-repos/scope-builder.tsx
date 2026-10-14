@@ -483,10 +483,14 @@ export function ScopeBuilder({
                 type="button"
                 variant="outline"
                 size="xs"
-                className="rounded-full"
-                disabled={applied}
+                // aria-disabled rather than disabled, so the applied state
+                // stays focusable and is announced instead of skipped.
+                className="rounded-full aria-disabled:cursor-default aria-disabled:hover:bg-background aria-disabled:hover:text-foreground dark:aria-disabled:hover:bg-input/30"
+                aria-disabled={applied}
                 aria-pressed={applied}
-                onClick={() => applyPreset(preset)}
+                onClick={() => {
+                  if (!applied) applyPreset(preset);
+                }}
               >
                 {applied ? <Check aria-hidden /> : <Plus aria-hidden />}
                 {preset.label}
