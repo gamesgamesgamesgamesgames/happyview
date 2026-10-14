@@ -17,6 +17,7 @@ use super::target::{self, KIND_INSTANCE, TargetInfo};
 use super::{PublishStatus, SCHEMA_COLLECTION, best_match, record_cid, schema_record};
 
 const SIGN_IN_AGAIN: &str = "the attached account needs to sign in again";
+const WITHDRAWN: &str = "unpublished by hand, so auto-publish leaves it alone";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublishOutcome {
@@ -96,8 +97,21 @@ impl From<AppError> for Refusal {
     }
 }
 
+/// `actor` is `None` for auto-publish, which leaves a withdrawn lexicon alone.
 pub async fn publish(state: &AppState, nsid: &str, actor: Option<&str>) -> PublishOutcome {
     let _write = WRITE.lock().await;
+
+    // Reconcile picks what is due before taking the lock, so an unpublish can
+    // land between that choice and this write; the mark is read again here.
+    if actor.is_none() {
+        match store::get_publication(state, nsid).await {
+            Ok(Some(p)) if p.withdrawn_at.is_some() => {
+                return PublishOutcome::failed(nsid, WITHDRAWN.into());
+            }
+            Ok(_) => {}
+            Err(e) => return PublishOutcome::failed(nsid, message(e)),
+        }
+    }
 
     let error = match write(state, nsid).await {
         Ok((did, uri, cid)) => {
@@ -356,8 +370,9 @@ async fn reconcile_once(state: &AppState) {
     };
     for nsid in due {
         let outcome = publish(state, &nsid, None).await;
-        if let Some(error) = outcome.error {
-            tracing::warn!(nsid, "auto-publish failed: {error}");
+        match outcome.error.as_deref() {
+            None | Some(WITHDRAWN) => {}
+            Some(error) => tracing::warn!(nsid, "auto-publish failed: {error}"),
         }
     }
 }

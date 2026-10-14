@@ -678,6 +678,43 @@ async fn reconcile_leaves_a_withdrawn_lexicon_alone_and_the_overview_says_so() {
 
 #[tokio::test]
 #[serial]
+async fn auto_publish_skips_a_lexicon_withdrawn_after_reconcile_chose_it() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    let nsid = "com.example.raced";
+    put_manual(s, nsid).await;
+    let repo = active_grant(s, "did:plc:repoa", FULL_SCOPE).await;
+    store::insert_rule(
+        s,
+        &pat("*"),
+        "linked_repo",
+        Some(&repo.id),
+        true,
+        "did:plc:admin",
+    )
+    .await
+    .unwrap();
+    store::record_withdrawn(s, nsid).await.unwrap();
+    let before = store::get_publication(s, nsid).await.unwrap().unwrap();
+
+    // What reconcile does for an NSID it chose before the unpublish landed.
+    let outcome = publish(s, nsid, None).await;
+
+    assert!(!outcome.ok);
+    let after = store::get_publication(s, nsid).await.unwrap().unwrap();
+    assert!(after.withdrawn_at.is_some());
+    assert_eq!(after.last_error, None);
+    assert_eq!(after.last_attempt_at, before.last_attempt_at);
+    assert_eq!(count_events(s, "lexicon.publish_failed", nsid).await, 0);
+    assert_eq!(
+        linked::get(s, &repo.id).await.unwrap().unwrap().status,
+        STATUS_ACTIVE
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn unpublish_without_a_publication_is_not_found() {
     common::require_db!();
     let app = TestApp::new().await;
