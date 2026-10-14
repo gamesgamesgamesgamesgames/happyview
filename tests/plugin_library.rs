@@ -1,7 +1,7 @@
 //! Library plugin ABI: `get_api_surface`, `call`, and host-side dispatch.
 
+use happyview::catalog::LexiconCatalog;
 use happyview::db::DatabaseBackend;
-use happyview::lexicon::LexiconRegistry;
 use happyview::plugin::library::LibraryCallContext;
 use happyview::plugin::{
     LoadedPlugin, PluginExecutor, PluginInfo, PluginManifest, PluginRegistry, PluginSource,
@@ -75,7 +75,7 @@ async fn executor() -> (PluginExecutor, Arc<PluginRegistry>) {
         db,
         DatabaseBackend::Sqlite,
         reqwest::Client::new(),
-        Arc::new(LexiconRegistry::new()),
+        Arc::new(LexiconCatalog::detached()),
     );
     (executor, registry)
 }
@@ -310,7 +310,7 @@ async fn executor_with_table() -> (PluginExecutor, Arc<PluginRegistry>, sqlx::An
         db.clone(),
         DatabaseBackend::Sqlite,
         reqwest::Client::new(),
-        Arc::new(LexiconRegistry::new()),
+        Arc::new(LexiconCatalog::detached()),
     );
     (executor, registry, db)
 }

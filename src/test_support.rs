@@ -9,8 +9,8 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::AppState;
+use crate::catalog::LexiconCatalog;
 use crate::config::Config;
-use crate::lexicon::LexiconRegistry;
 
 /// An in-memory SQLite pool. `max_connections(1)` is required: every
 /// connection to `sqlite::memory:` gets its own private database, so a larger
@@ -210,12 +210,18 @@ pub async fn provision_space_signing_key(state: &AppState) {
 /// assertions reach Postgres, whose dialect is the one `adapt_sql` has to
 /// build and the one nothing under `src/plugin/` had ever run against.
 pub async fn test_state_from_env() -> Option<AppState> {
+    // One connect at a time, because connecting migrates: two tests migrating
+    // a fresh SQLite file at once collide on `_sqlx_migrations`, and Postgres
+    // takes the same path so the order is the same on both.
+    static CONNECTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     let url = std::env::var("TEST_DATABASE_URL").ok()?;
     let backend = crate::db::DatabaseBackend::from_url(&url);
-    Some(test_state_with_pool_on(
-        crate::db::connect(&url, backend).await,
-        backend,
-    ))
+    let pool = {
+        let _connecting = CONNECTING.lock().await;
+        crate::db::connect(&url, backend).await
+    };
+    Some(test_state_with_pool_on(pool, backend))
 }
 
 /// Build an `AppState` backed by `pool`, wired for SQLite with no network
@@ -224,17 +230,9 @@ pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
     test_state_with_pool_on(pool, crate::db::DatabaseBackend::Sqlite)
 }
 
-/// A [`test_state_with_pool`] told which backend `pool` actually is.
-///
-/// Every statement the host imports issue goes through `adapt_sql`, and its
-/// SQLite arm is a no-op, so a state that names the wrong backend exercises a
-/// dialect the pool does not speak — or, run against SQLite alone, never
-/// exercises Postgres's at all.
-pub fn test_state_with_pool_on(
-    pool: sqlx::AnyPool,
-    backend: crate::db::DatabaseBackend,
-) -> AppState {
-    let config = Config {
+/// The configuration every in-memory test state carries.
+pub fn test_config(backend: crate::db::DatabaseBackend) -> Config {
+    Config {
         host: "127.0.0.1".into(),
         port: 3000,
         database_url: String::new(),
@@ -246,7 +244,7 @@ pub fn test_state_with_pool_on(
         jetstream_url: String::new(),
         relay_url: String::new(),
         plc_url: String::new(),
-        static_dir: String::new(),
+        static_dir: None,
         base_path: None,
         event_log_retention_days: 30,
         app_name: None,
@@ -262,7 +260,26 @@ pub fn test_state_with_pool_on(
         plugin_cache_dir: None,
         platform_api_key_hash: None,
         job_worker_concurrency: 1,
-    };
+        superadmin_did: None,
+        project_root: None,
+        project: None,
+        plugin_dir: std::path::PathBuf::from("./plugins"),
+        auto_backfill: true,
+        script_env_file: None,
+    }
+}
+
+/// A [`test_state_with_pool`] told which backend `pool` actually is.
+///
+/// Every statement the host imports issue goes through `adapt_sql`, and its
+/// SQLite arm is a no-op, so a state that names the wrong backend exercises a
+/// dialect the pool does not speak — or, run against SQLite alone, never
+/// exercises Postgres's at all.
+pub fn test_state_with_pool_on(
+    pool: sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+) -> AppState {
+    let config = test_config(backend);
     let (tx, _) = watch::channel(vec![]);
     let (labeler_tx, _) = watch::channel(());
     let atrium_http = Arc::new(crate::http_retry::HappyViewHttpClient::default());
@@ -298,6 +315,7 @@ pub fn test_state_with_pool_on(
         http_client: crate::http_retry::HappyViewHttpClient::default(),
     })
     .expect("test OAuth client");
+    let project = crate::project::shared_empty();
     AppState {
         config,
         http: reqwest::Client::new(),
@@ -306,7 +324,9 @@ pub fn test_state_with_pool_on(
         db_backend: backend,
         records: crate::record_store::RecordStore::new(pool.clone(), backend),
         domain_cache: crate::domain::DomainCache::new(),
-        lexicons: LexiconRegistry::new(),
+        lexicons: LexiconCatalog::new(project.clone()),
+        scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
+        project,
         collections_tx: tx,
         labeler_subscriptions_tx: labeler_tx,
         labeler_subscription_cache: Arc::new(crate::labeler::SubscriptionCache::default()),
@@ -351,6 +371,7 @@ pub fn test_state_with_pool_on(
         client_jwks: Vec::new(),
         telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
         script_limits: Arc::new(crate::lua::limits::ScriptLimits::default()),
+        test: None,
     }
 }
 

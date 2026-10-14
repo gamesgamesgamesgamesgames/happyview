@@ -1,0 +1,48 @@
+import { test, expect } from "@playwright/test";
+import { loginAsTestAdmin } from "./auth-helper";
+
+/**
+ * The catalogue lists every publisher's plugins. Only the official
+ * publisher's carry the badge, so a plugin anyone could have published never
+ * reads as HappyProto's.
+ */
+test("the catalogue badges the official plugin only", async ({ page }) => {
+  await page.route("**/admin/plugins/official", (route) =>
+    route.fulfill({
+      json: {
+        plugins: [
+          {
+            id: "lua",
+            name: "Lua",
+            description: null,
+            icon_url: null,
+            latest_version: "1.2.0",
+            manifest_url: "https://example.com/lua/manifest.json",
+            official: true,
+          },
+          {
+            id: "extra",
+            name: "Extra",
+            description: null,
+            icon_url: null,
+            latest_version: "9.0.0",
+            manifest_url: "https://example.com/extra/manifest.json",
+            official: false,
+          },
+        ],
+        last_refreshed_at: null,
+      },
+    }),
+  );
+  await loginAsTestAdmin(page);
+  await page.goto("/dashboard/settings/plugins");
+  await page.getByRole("button", { name: "Add Plugin" }).click();
+  await page.locator("#url").focus();
+
+  const official = page.getByRole("option", { name: /Lua/ });
+  const other = page.getByRole("option", { name: /Extra/ });
+  await expect(official).toBeVisible();
+  await expect(other).toBeVisible();
+  await expect(official.getByText("Official", { exact: true })).toBeVisible();
+  await expect(other.getByText("Official", { exact: true })).toHaveCount(0);
+});

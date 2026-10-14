@@ -70,6 +70,7 @@ interface PluginSummary {
   update_available: boolean;
   latest_version: string;
   pending_releases: string[];
+  latest_manifest_url?: string; // the manifest an update installs
   plugin_type: "auth" | "library" | "interpreter";
   namespace: string | null; // library plugins only
   dependencies: PluginDependency[];
@@ -435,6 +436,8 @@ The body is optional. To point the plugin at a new URL, pass:
 
 When a new URL is provided, the stored `sha256` is cleared (the new version has its own hash). File-based plugins cannot be reloaded via this endpoint and return `400 Bad Request`.
 
+An install from the catalogue records the publisher of the entry it came from, and a reload to a new URL must stay with that publisher. If the URL is not one the catalogue offers under this plugin's id from the recorded publisher, the reload is refused with `409 Conflict` and the installed version keeps running. To move a plugin to another publisher's package, remove it and add it again. A plugin installed from a URL the catalogue did not offer has no recorded publisher and is not checked.
+
 A reloaded version can import host functions the operator never consented to. `accepted_capabilities` guards a reload the same way it guards [`POST /admin/plugins`](#install-a-plugin): when present, every capability the reloaded plugin would be granted must be listed, or the reload is refused with `400 Bad Request` naming the missing ones. The check runs before the installed version is removed, so a refusal leaves it running.
 
 ```json
@@ -452,7 +455,7 @@ A reloaded version can import host functions the operator never consented to. `a
 POST /admin/plugins/{id}/check-update
 ```
 
-Requires `plugins:create`. Forces a cache refresh for one plugin from the official registry, then returns the updated `PluginSummary` with `update_available`, `latest_version`, and `pending_releases` reflecting the latest catalog state.
+Requires `plugins:create`. Forces a cache refresh for one plugin from the official registry, then returns the updated `PluginSummary` with `update_available`, `latest_version`, `pending_releases` and `latest_manifest_url` reflecting the latest catalog state. An update is offered only from the publisher the install recorded, and `latest_manifest_url` is that entry's manifest: pass it as the reload `url` to apply the update.
 
 **Response**: `200 OK` with a `PluginSummary`.
 

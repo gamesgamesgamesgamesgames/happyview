@@ -22,9 +22,8 @@ pub(crate) use execute::{execute_procedure_script, execute_query_script};
 pub use sandbox::validate_script;
 pub use scripts::{
     LabelAppliedEvent, LabelHookOutcome, NATIVE_LANGUAGE, ParsedTrigger, RecordEventPayload,
-    RecordHookOutcome, ResolvedScript, ScriptRow, TriggerKind, resolve, resolve_record_event,
-    run_label_applied_script, run_record_event_once, run_record_event_script,
-    trigger_for_label_uri,
+    RecordHookOutcome, ResolvedScript, TriggerKind, run_label_applied_script,
+    run_record_event_once, run_record_event_script, trigger_for_label_uri,
 };
 
 /// Test-only seams for integration tests that need a runner-shaped VM
@@ -78,7 +77,14 @@ pub async fn run_for_differential(
     };
     let lua = match lua {
         Ok(lua) => lua,
-        Err(e) => return failed(ScriptErrorKind::Runtime, &e.to_string(), false),
+        Err(e) => {
+            return failed(
+                ScriptErrorKind::Runtime,
+                &e.to_string(),
+                false,
+                &input.chunk_name,
+            );
+        }
     };
 
     let identity = builtins::ScriptIdentity {
@@ -87,12 +93,17 @@ pub async fn run_for_differential(
         job_id: context.job.as_ref().map(|job| job.id.clone()),
     };
     if let Err(e) = require_api::register_require(&lua, state, &identity, None).await {
-        return failed(ScriptErrorKind::Runtime, &e, false);
+        return failed(ScriptErrorKind::Runtime, &e, false, &input.chunk_name);
     }
 
-    if let Err(e) = sandbox::load_script(&lua, &input.source).exec() {
+    if let Err(e) = sandbox::load_named(&lua, &input.source, &input.chunk_name).exec() {
         let tripped = sandbox::limit_tripped(&lua);
-        return failed(ScriptErrorKind::Syntax, &e.to_string(), tripped);
+        return failed(
+            ScriptErrorKind::Syntax,
+            &e.to_string(),
+            tripped,
+            &input.chunk_name,
+        );
     }
     let Ok(handle) = lua.globals().get::<mlua::Function>("handle") else {
         return ScriptExecuteOutput::Error {
@@ -100,6 +111,7 @@ pub async fn run_for_differential(
             message: "script must define a handle() function".into(),
             line: None,
             raw: "script must define a handle() function".into(),
+            chunk: crate::error::file_of(Some(input.chunk_name.clone())),
         };
     };
 
@@ -107,7 +119,14 @@ pub async fn run_for_differential(
         Some(job) => {
             match context::job_ctx(&lua, std::sync::Arc::new(state.clone()), job.id.clone()) {
                 Ok(table) => Some(table),
-                Err(e) => return failed(ScriptErrorKind::Runtime, &e.to_string(), false),
+                Err(e) => {
+                    return failed(
+                        ScriptErrorKind::Runtime,
+                        &e.to_string(),
+                        false,
+                        &input.chunk_name,
+                    );
+                }
             }
         }
         None => None,
@@ -142,11 +161,25 @@ pub async fn run_for_differential(
     );
     let ctx = match ctx {
         Ok(ctx) => ctx,
-        Err(e) => return failed(ScriptErrorKind::Runtime, &e.to_string(), false),
+        Err(e) => {
+            return failed(
+                ScriptErrorKind::Runtime,
+                &e.to_string(),
+                false,
+                &input.chunk_name,
+            );
+        }
     };
     let argument = match lua.to_value(&input.input) {
         Ok(argument) => argument,
-        Err(e) => return failed(ScriptErrorKind::Runtime, &e.to_string(), false),
+        Err(e) => {
+            return failed(
+                ScriptErrorKind::Runtime,
+                &e.to_string(),
+                false,
+                &input.chunk_name,
+            );
+        }
     };
 
     // The wall clock is the host's on the plugin path, so this one carries
@@ -155,7 +188,12 @@ pub async fn run_for_differential(
         Ok(value) => value,
         Err(e) => {
             let tripped = sandbox::limit_tripped(&lua);
-            return failed(ScriptErrorKind::Runtime, &e.to_string(), tripped);
+            return failed(
+                ScriptErrorKind::Runtime,
+                &e.to_string(),
+                tripped,
+                &input.chunk_name,
+            );
         }
     };
 
@@ -166,18 +204,26 @@ pub async fn run_for_differential(
     };
     match lua.from_value(returned) {
         Ok(value) => ScriptExecuteOutput::Returned { value, value_kind },
-        Err(e) => failed(ScriptErrorKind::Runtime, &e.to_string(), false),
+        Err(e) => failed(
+            ScriptErrorKind::Runtime,
+            &e.to_string(),
+            false,
+            &input.chunk_name,
+        ),
     }
 }
 
 /// The failure shape both paths report: `kind` from the run rather than from
-/// the text, `message` and `line` split by the host's own parser.
+/// the text, `message` and `line` split by the host's own parser, and the
+/// chunk from the run: this runner loads one chunk and resolves no modules,
+/// so the run's chunk is the only one an error can come from.
 #[cfg(feature = "lua-reference")]
 #[doc(hidden)]
 fn failed(
     default: crate::plugin::ScriptErrorKind,
     raw: &str,
     budget_spent: bool,
+    chunk_name: &str,
 ) -> crate::plugin::ScriptExecuteOutput {
     use crate::plugin::{ScriptErrorKind, ScriptExecuteOutput};
 
@@ -194,5 +240,67 @@ fn failed(
         message,
         line,
         raw: raw.to_string(),
+        chunk: crate::error::file_of(Some(chunk_name.to_string())),
+    }
+}
+
+#[cfg(all(test, feature = "lua-reference"))]
+mod chunk_tests {
+    use crate::plugin::{
+        DEFAULT_CHUNK_NAME, ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits,
+        ScriptExecuteOutput, ScriptKind,
+    };
+    use crate::test_support::{migrated_memory_pool, test_state_with_pool};
+
+    fn failing(chunk_name: &str) -> ScriptExecuteInput {
+        ScriptExecuteInput {
+            source: "function handle()\n  error('boom')\nend".into(),
+            kind: ScriptKind::Job,
+            input: serde_json::Value::Null,
+            context: ScriptExecuteContext {
+                trigger: "job.run:tick".into(),
+                ..Default::default()
+            },
+            libraries: Vec::new(),
+            limits: ScriptExecuteLimits {
+                instructions: None,
+                memory_bytes: 16 << 20,
+            },
+            removed_globals: Vec::new(),
+            chunk_name: chunk_name.into(),
+            artifact: None,
+        }
+    }
+
+    /// The chunk comes from the run, not from Lua's message, which cuts a
+    /// chunk name longer than sixty bytes from the front; this path is
+    /// longer than that, and the file name still reaches the message.
+    #[tokio::test]
+    async fn a_named_chunk_reports_its_whole_path() {
+        let state = test_state_with_pool(migrated_memory_pool().await);
+        let path = "src/lexicons/at/happyproto/registry/somewhere/quite/deep/getArtifact.lua";
+        let ScriptExecuteOutput::Error {
+            chunk, line, raw, ..
+        } = super::run_for_differential(&state, &failing(path)).await
+        else {
+            panic!("the script raises");
+        };
+        assert_eq!(chunk.as_deref(), Some(path));
+        assert_eq!(line, Some(2));
+        assert!(path.len() > 60);
+        assert!(raw.contains("deep/getArtifact.lua:2:"), "{raw}");
+        assert!(!raw.contains("[string"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn the_default_chunk_reports_none() {
+        let state = test_state_with_pool(migrated_memory_pool().await);
+        let ScriptExecuteOutput::Error { chunk, raw, .. } =
+            super::run_for_differential(&state, &failing(DEFAULT_CHUNK_NAME)).await
+        else {
+            panic!("the script raises");
+        };
+        assert_eq!(chunk, None);
+        assert!(raw.contains("[string \"script\"]:2:"), "{raw}");
     }
 }

@@ -244,15 +244,6 @@ pub(super) async fn list_collections(
 ) -> Result<Json<Value>, AppError> {
     auth.require(Permission::RecordsRead).await?;
 
-    let sql = adapt_sql(
-        "SELECT id FROM happyview_lexicons WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record' ORDER BY id",
-        state.db_backend,
-    );
-    let rows: Vec<(String,)> = crate::db::query_as(&sql)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to list collections: {e}")))?;
-
-    let collections: Vec<&str> = rows.iter().map(|(id,)| id.as_str()).collect();
+    let collections = state.lexicons.get_record_collections().await;
     Ok(Json(serde_json::json!({ "collections": collections })))
 }

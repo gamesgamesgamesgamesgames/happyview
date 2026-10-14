@@ -55,7 +55,7 @@ pub fn parse_compression(raw: Option<&str>) -> Compression {
 }
 
 pub fn compression_from_env() -> Compression {
-    parse_compression(std::env::var("RECORD_COMPRESSION").ok().as_deref())
+    parse_compression(crate::config::vars::var("RECORD_COMPRESSION").as_deref())
 }
 
 struct CurrentDict {
@@ -207,7 +207,7 @@ pub fn parse_train_at(raw: Option<&str>) -> i64 {
 }
 
 pub fn train_at_from_env() -> i64 {
-    parse_train_at(std::env::var("ZSTD_DICT_TRAIN_AT").ok().as_deref())
+    parse_train_at(crate::config::vars::var("ZSTD_DICT_TRAIN_AT").as_deref())
 }
 
 /// `RECORD_COMPRESSION_INTERVAL_SECS`, the seconds between passes.
@@ -219,9 +219,7 @@ pub fn parse_interval_secs(raw: Option<&str>) -> u64 {
 
 pub fn interval_from_env() -> Duration {
     Duration::from_secs(parse_interval_secs(
-        std::env::var("RECORD_COMPRESSION_INTERVAL_SECS")
-            .ok()
-            .as_deref(),
+        crate::config::vars::var("RECORD_COMPRESSION_INTERVAL_SECS").as_deref(),
     ))
 }
 

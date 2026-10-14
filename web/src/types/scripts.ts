@@ -30,8 +30,21 @@ export interface Script {
   script_type: ScriptLanguage
   body: string
   description?: string | null
-  created_at: string
-  updated_at: string
+  /** `null` for a project script, which has no stored row. */
+  created_at: string | null
+  updated_at: string | null
+  /**
+   * `"project"` when a file in the instance's project defines this script.
+   * Such a script is read-only here: it changes by editing the file.
+   */
+  layer: "project" | "manual"
+  /** Project-relative file path, for a project script only. */
+  path: string | null
+  /**
+   * A dashboard script sits under this project file. It is kept untouched and
+   * runs again if the file is removed.
+   */
+  shadows_stored: boolean
   /**
    * `false` when this script's own trigger id would be refused if submitted
    * today — the NSID rules tightened after it was created. It still fires and
@@ -54,6 +67,24 @@ export interface Script {
    * the interpreter is installed.
    */
   runnable: boolean
+  /**
+   * Set when a compiled module's handler answers this trigger. Such a row
+   * comes from the project build and is read-only: it has no body, and it
+   * changes only when the module is rebuilt.
+   */
+  module?: ScriptModuleRow | null
+}
+
+/** A compiled module's handler, which has no body to show or edit. */
+export interface ScriptModuleRow {
+  /** The `[modules.<name>]` key in happyview.toml. */
+  module: string
+  /** The module's crate, relative to the project root. */
+  path: string
+  /** The Rust function that handles this trigger; empty when the build did not record it. */
+  handler: string
+  /** sha256 of the build HappyView is running. */
+  hash: string
 }
 
 /** One construct the codemod could not rewrite mechanically. */

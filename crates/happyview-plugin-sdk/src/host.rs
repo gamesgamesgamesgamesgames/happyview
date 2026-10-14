@@ -29,20 +29,22 @@ use crate::wire::{
     CallerBlobUpload, CallerRecordCreate, CallerRecordDelete, CallerRecordPut, CallerXrpcProcedure,
     CallerXrpcQuery, IndexDelete, IndexPut, JobCreate, JobGet, JobListAny, JobProgressRequest,
     JobView, Label, LabelsGet, LinkedRepoBlobUpload, LinkedRepoCall, LinkedRepoInfo,
-    LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut, PluginError, RecordRef,
-    RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, ResolvedIdentity, ScriptLogRequest,
-    SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd, SpaceMemberInfo,
-    SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite, SpaceRecordsPage,
-    SpaceUpdate, SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo, SpacesMembers,
-    SpacesQuery, StrongRef, TableQuery,
+    LinkedRepoRecordCreate, LinkedRepoRecordDelete, LinkedRepoRecordPut, PanicReport, PluginError,
+    RecordRef, RecordsCount, RecordsPage, RecordsQuery, RecordsSearch, ResolvedIdentity,
+    ScriptLogRequest, SpaceDelete, SpaceInfo, SpaceInviteCreate, SpaceInviteInfo, SpaceMemberAdd,
+    SpaceMemberInfo, SpaceMemberRemove, SpaceRecordDelete, SpaceRecordPut, SpaceRecordWrite,
+    SpaceRecordsPage, SpaceUpdate, SpacesAcceptInvite, SpacesAccess, SpacesCreate, SpacesInfo,
+    SpacesMembers, SpacesQuery, StrongRef, TableQuery, TestCall, TestCalls, TestMock, TestPdsWrite,
+    TestReport, TestTrigger, TestTriggerResult,
 };
 #[cfg(target_arch = "wasm32")]
 use crate::wire::{
     AtprotoResolveIdentity, AtprotoResolveService, BlobLookup, BlobPut, BlobStored,
-    JobShouldStopRequest, JobWaitRequest, LexiconGet,
+    JobShouldStopRequest, JobWaitRequest, LexiconGet, TestPdsWritesRequest,
 };
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::wire::{LibraryCallSettled, Response};
+use crate::wire::{ModuleResolve, ResolvedModule};
 
 /// The wire types these wrappers send and receive. Defined in [`crate::wire`],
 /// which the host imports too; re-exported here as the import path plugins use.
@@ -104,9 +106,16 @@ extern "C" {
     fn host_attest_sign(req_ptr: i32, req_len: i32) -> i64;
     fn host_attest_verify(req_ptr: i32, req_len: i32) -> i64;
     fn host_script_log(req_ptr: i32, req_len: i32) -> i64;
+    fn host_script_panic(req_ptr: i32, req_len: i32);
     fn host_job_progress(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_should_stop(req_ptr: i32, req_len: i32) -> i64;
     fn host_job_wait(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_trigger(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_mock(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_calls(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_pds_writes(req_ptr: i32, req_len: i32) -> i64;
+    fn host_test_report(req_ptr: i32, req_len: i32) -> i64;
+    fn host_module_resolve(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repos_list(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repo_create_record(req_ptr: i32, req_len: i32) -> i64;
     fn host_linked_repo_put_record(req_ptr: i32, req_len: i32) -> i64;
@@ -1219,6 +1228,24 @@ pub fn script_log(request: &ScriptLogRequest) -> Result<(), PluginError> {
     }
 }
 
+/// Tell the host this run panicked, and where. Meant for a panic hook: it
+/// returns nothing because a hook has nothing to do with a failure, and the
+/// guest traps straight afterwards. Needs no capability, since it only
+/// describes the run already in progress.
+pub fn script_panic(report: &PanicReport) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Ok(bytes) = serde_json::to_vec(report) {
+            // SAFETY: `bytes` is live for the duration of the call.
+            unsafe { host_script_panic(bytes.as_ptr() as i32, bytes.len() as i32) };
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = report;
+    }
+}
+
 /// Store the run's progress on its job row. The two payload-carrying script
 /// imports take their request struct, so the caller builds it once; the two
 /// below carry nothing worth a type at the call site. Needs `script:host`.
@@ -1258,6 +1285,91 @@ pub fn job_wait(seconds: f64) -> Result<(), PluginError> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = seconds;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Fire a trigger in the test run this file is executing, as the real request
+/// path would. Needs `script:test`, and answers only inside a test run.
+pub fn test_trigger(spec: &TestTrigger) -> Result<TestTriggerResult, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_test_trigger, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Answer calls to a library namespace from data for the rest of the file.
+/// Needs `script:test`.
+pub fn test_mock(spec: &TestMock) -> Result<(), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_void(host_test_mock, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// The calls made to a library namespace since the last reported test.
+/// Needs `script:test`.
+pub fn test_calls(spec: &TestCalls) -> Result<Vec<TestCall>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_test_calls, spec)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = spec;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// The writes the in-process PDS accepted since the last reported test.
+/// Needs `script:test`.
+pub fn test_pds_writes() -> Result<Vec<TestPdsWrite>, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_test_pds_writes, &TestPdsWritesRequest {})
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Report one test's outcome. Needs `script:test`.
+pub fn test_report(report: &TestReport) -> Result<(), PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_void(host_test_report, report)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = report;
+        Err(HostError::NotWasm.into())
+    }
+}
+
+/// Resolve a relative import against the project the running script belongs
+/// to. A miss is an error whose code is `NOT_FOUND` and whose message names
+/// the specifier, the importer, and a same-named file in another language if
+/// one exists; a dashboard script hears that local modules come from a
+/// project. Needs `script:host`.
+pub fn module_resolve(request: &ModuleResolve) -> Result<ResolvedModule, PluginError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_spec(host_module_resolve, request)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = request;
         Err(HostError::NotWasm.into())
     }
 }
@@ -1355,6 +1467,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_test_runner_wrappers_answer_not_wasm_natively() {
+        let report = TestReport {
+            path: "p".into(),
+            name: "n".into(),
+            status: crate::wire::TestStatus::Pass,
+            message: None,
+            file: None,
+            line: None,
+            duration_ms: 0,
+        };
+        assert!(test_report(&report).is_err());
+        assert!(test_pds_writes().is_err());
+        assert!(test_calls(&TestCalls {
+            namespace: "http".into()
+        })
+        .is_err());
+    }
+
+    #[test]
     fn every_wrapper_reports_not_wasm_off_target() {
         assert_eq!(get_secret("k"), Err(HostError::NotWasm));
         assert_eq!(kv_get("k"), Err(HostError::NotWasm));
@@ -1390,6 +1521,13 @@ mod tests {
             Err(not_wasm.clone())
         );
         assert_eq!(job_should_stop(), Err(not_wasm.clone()));
+        assert_eq!(
+            module_resolve(&ModuleResolve {
+                specifier: String::from("./lib/format"),
+                referrer: String::from("src/jobs/tick.lua"),
+            }),
+            Err(not_wasm.clone())
+        );
         assert_eq!(job_wait(1.5), Err(not_wasm));
     }
 

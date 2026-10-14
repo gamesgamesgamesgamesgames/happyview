@@ -305,6 +305,8 @@ mod tests {
                 memory_bytes: 1024,
             },
             removed_globals: alloc::vec::Vec::new(),
+            chunk_name: crate::wire::DEFAULT_CHUNK_NAME.into(),
+            artifact: None,
         }
     }
 

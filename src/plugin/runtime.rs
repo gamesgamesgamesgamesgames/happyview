@@ -38,6 +38,67 @@ pub fn fuel_for(plugin_type: PluginType) -> u64 {
     }
 }
 
+/// Fuel per unit of a script's instruction budget, for a compiled module.
+///
+/// The budget is an operator setting written for the Lua interpreter, where a
+/// unit is one bytecode instruction and everything a script does in a C
+/// builtin is free: decoding the run's JSON input, encoding its result,
+/// `table.sort`, `string.format`, `table.concat`. A compiled module does all
+/// of that in wasm and pays fuel for it, input decoding included, which is
+/// most of what a typical handler spends. The value therefore sits above the
+/// top of the measured range, so that every measured workload that fits a Lua
+/// budget also fits as a module under the same setting; the wall clock
+/// remains the hard CPU bound for both.
+///
+/// That does not hold for every handler. A module pays roughly 97 fuel per
+/// byte to decode its input (the slope of a handler that only decodes, from
+/// 22,852 to 91,886 bytes of records), which a Lua script does not pay at
+/// all, so a handler that does little with a large input gets far less from
+/// one setting as a module: at the setting's floor of 1,000, about 40 KB of
+/// input exhausts the budget before the handler runs.
+///
+/// Measured by `tests/fuel_calibration.rs` on 2026-10-13: the smallest budget
+/// at which each handler returns, as a Lua script under happyview-lua 1.0.0
+/// (sha256 `9496eb497590e44c5c8a66441156499c63dd6f9c8b9ec01bf59c9b8a5e11382b`)
+/// and as a release wasm32-wasip1 module in raw fuel, under wasmtime 49.0.2
+/// and rustc 1.96.1, with module fuel resolved to 100. Three runs of each
+/// input agreed exactly.
+///
+/// | handler   | records | Lua instructions | module fuel | fuel per instruction |
+/// |-----------|---------|------------------|-------------|----------------------|
+/// | shape     | 50      | 1,575            | 2,798,400   | 1,777                |
+/// | aggregate | 50      | 2,321            | 2,461,700   | 1,061                |
+/// | render    | 50      | 852              | 2,748,900   | 3,226                |
+/// | shape     | 200     | 6,429            | 9,899,300   | 1,540                |
+/// | aggregate | 200     | 7,445            | 9,486,600   | 1,274                |
+/// | render    | 200     | 3,252            | 10,797,700  | 3,320                |
+/// | echo      | -       | 37               | 67,700      | 1,830                |
+///
+/// `shape` filters, sorts and reshapes post envelopes, `aggregate` counts and
+/// ranks their tags, and `render` formats one line per post. The value is the
+/// largest ratio, 3,320, plus about a fifth for toolchain drift: a rustc,
+/// wasmtime or serde upgrade moves these figures by a few percent, and the
+/// calibration test should fail only on a real shift. That test is ignored
+/// and needs the plugin, so it runs only by hand: re-run it after upgrading
+/// rustc, wasmtime, serde or the SDK's input decoding, or happyview-lua. A
+/// trivial handler needs 17 units under this value, far inside the setting's
+/// floor of 1,000, and the setting's ceiling of 1,000,000,000 is 4 × 10^12
+/// fuel, nowhere near overflowing.
+pub const FUEL_PER_INSTRUCTION: u64 = 4_000;
+
+/// The fuel each call into a compiled module gets. `None` is a job, which
+/// has no budget and stops through `should_stop`.
+///
+/// Fuel can bound a compiled module where it cannot bound an interpreter
+/// (see [`fuel_for`]) because nothing here catches a wasm `throw`: stable
+/// Rust on wasm32-wasip1 aborts on panic and emits no exception-handling
+/// instructions, and a module that defines a tag is refused before it runs.
+pub fn module_fuel(instructions: Option<u32>) -> u64 {
+    instructions.map_or(u64::MAX, |n| {
+        u64::from(n).saturating_mul(FUEL_PER_INSTRUCTION)
+    })
+}
+
 /// Fuel a guest is granted for each byte the host writes into it — a call's
 /// input, or an import's answer. Data the host hands over brings the fuel to
 /// handle it: parsing it, decoding `$bytes`, and encoding it again on the way
@@ -52,9 +113,18 @@ pub fn fuel_for(plugin_type: PluginType) -> u64 {
 pub const FUEL_PER_BYTE_RECEIVED: u64 = 256;
 
 /// Add [`FUEL_PER_BYTE_RECEIVED`] for `len` bytes to a store's remaining
-/// fuel. A store whose fuel is already unbounded stays so.
-pub fn grant_fuel_for_bytes(store: &mut impl wasmtime::AsContextMut, len: usize) {
+/// fuel. A store whose fuel is already unbounded stays so. An interpreter
+/// store is left alone: an installed interpreter's fuel is unbounded, and a
+/// compiled module's is the operator's instruction budget, which
+/// [`FUEL_PER_INSTRUCTION`] already sizes to cover decoding its input.
+pub fn grant_fuel_for_bytes(
+    store: &mut impl wasmtime::AsContextMut<Data = crate::plugin::host::PluginState>,
+    len: usize,
+) {
     let mut store = store.as_context_mut();
+    if store.data().plugin_type == PluginType::Interpreter {
+        return;
+    }
     if let Ok(fuel) = store.get_fuel() {
         let grant = (len as u64).saturating_mul(FUEL_PER_BYTE_RECEIVED);
         let _ = store.set_fuel(fuel.saturating_add(grant));
@@ -304,20 +374,15 @@ fn prepare_cache_dir(dir: &Path) -> Result<(), String> {
 /// corruption; this guards them against an author.
 #[cfg(unix)]
 fn directory_is_private(metadata: &std::fs::Metadata, euid: u32) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    if metadata.uid() != euid {
-        return Err(format!(
-            "the plugin module cache directory is owned by uid {} rather than this process's uid {euid}",
-            metadata.uid()
-        ));
-    }
-    let mode = metadata.mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(format!(
+    use crate::fs_private::{NotPrivate, private_to};
+    private_to(metadata, euid).map_err(|reason| match reason {
+        NotPrivate::OtherOwner { uid, euid } => format!(
+            "the plugin module cache directory is owned by uid {uid} rather than this process's uid {euid}"
+        ),
+        NotPrivate::OpenMode { mode } => format!(
             "the plugin module cache directory has mode {mode:o}; it must grant nothing to group or other"
-        ));
-    }
-    Ok(())
+        ),
+    })
 }
 
 struct CachedModule {
@@ -659,6 +724,16 @@ impl GuestDeadline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_fuel_scales_the_budget_and_leaves_none_unbounded() {
+        assert_eq!(module_fuel(Some(1_000)), 1_000 * FUEL_PER_INSTRUCTION);
+        assert_eq!(module_fuel(None), u64::MAX);
+        assert_eq!(
+            module_fuel(Some(u32::MAX)),
+            u64::from(u32::MAX) * FUEL_PER_INSTRUCTION
+        );
+    }
 
     #[test]
     fn test_fuel_constant_value() {

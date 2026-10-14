@@ -142,6 +142,7 @@ fn refuse(method: &str, message: impl Into<String>) -> AppError {
         message: message.into(),
         method: method.to_string(),
         line: None,
+        file: None,
     }
 }
 

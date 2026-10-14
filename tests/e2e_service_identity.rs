@@ -605,6 +605,64 @@ async fn token_scope_enforcement() {
     );
 }
 
+/// The scope check reads the outbound list of the script that will answer, so
+/// a project file's list is enforced even though no row declares one.
+#[tokio::test]
+#[serial]
+async fn token_scope_is_checked_against_a_project_scripts_outbound_list() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    let plc_store = plc::setup_mock_plc(&app.mock_server).await;
+    let did = app.setup_did_web().await;
+
+    seed_procedure_lexicon(&app).await;
+    seed_procedure_script(&app, "function handle() return {} end").await;
+
+    let trigger = "xrpc.procedure:games.gamesgamesgamesgames.createGame";
+    let mut snap = common::project::snapshot();
+    common::project::add_script(&mut snap, trigger, "project", "src/lexicons/createGame.lua");
+    snap.scripts.get_mut(trigger).unwrap().outbound_xrpcs =
+        vec!["games.birb.chess.getGame".to_string()];
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let entry_id = app
+        .create_service_entry("#chess", "ChessAppView", "specific")
+        .await;
+    app.add_entry_xrpcs(entry_id, &["games.gamesgamesgamesgames.createGame"])
+        .await;
+    let auth = app
+        .service_auth_jwt(&plc_store, "did:plc:scopecheck", &did, "#chess")
+        .await;
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/games.gamesgamesgamesgames.createGame")
+                .header("authorization", &auth)
+                .header("host", "127.0.0.1:0")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"title": "test"})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = json_body(resp).await;
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("games.birb.chess.getGame"),
+        "error should list the project script's outbound XRPC"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Edge cases — identity modes, invalid JWTs, missing fragments
 // ---------------------------------------------------------------------------

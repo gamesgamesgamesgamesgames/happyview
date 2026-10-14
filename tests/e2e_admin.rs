@@ -412,6 +412,34 @@ async fn record_lexicon_with_backfill_starts_a_backfill_job() {
 
 #[tokio::test]
 #[serial]
+async fn record_lexicon_upload_does_not_backfill_when_automatic_backfill_is_off() {
+    common::require_db!();
+    let mut app = TestApp::new().await;
+    app.state.config.auto_backfill = false;
+    app.rebuild_router();
+    let body = json!({
+        "lexicon_json": fixtures::game_record_lexicon(),
+        "backfill": true
+    });
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(admin_post("/admin/lexicons", app.admin_cookie(), &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json = json_body(resp).await;
+    assert!(json["backfill_job_id"].is_null(), "{json}");
+    assert_eq!(
+        backfill_job_count(&app, "games.gamesgamesgamesgames.game").await,
+        0
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn re_uploading_a_lexicon_does_not_start_a_second_backfill_job() {
     common::require_db!();
     let app = TestApp::new().await;
@@ -706,22 +734,27 @@ async fn stats_with_seeded_records() {
     let app = TestApp::new().await;
     let backend = app.state.db_backend;
 
-    // Seed a lexicon so the stats query can join against it
+    // Seed a lexicon so the stats list has a collection to count
     let lexicon_json_val = serde_json::json!({
         "lexicon": 1,
         "id": "test.collection",
         "defs": { "main": { "type": "record", "key": "tid", "record": { "type": "object", "properties": {} } } }
     });
     let now = now_rfc3339();
-    let sql = adapt_sql(
-        "INSERT INTO happyview_lexicons (id, lexicon_json, created_at) VALUES (?, ?, ?)",
-        backend,
-    );
-    happyview::db::query(&sql)
-        .bind("test.collection")
-        .bind(serde_json::to_string(&lexicon_json_val).unwrap_or_default())
-        .bind(&now)
-        .execute(&app.state.db)
+    app.state
+        .lexicons
+        .put_manual(
+            &app.state.db,
+            backend,
+            happyview::catalog::LexiconWrite {
+                lexicon_json: lexicon_json_val,
+                backfill: false,
+                target_collection: None,
+                action: happyview::lexicon::ProcedureAction::Upsert,
+                token_cost: None,
+                authority_did: None,
+            },
+        )
         .await
         .unwrap();
 

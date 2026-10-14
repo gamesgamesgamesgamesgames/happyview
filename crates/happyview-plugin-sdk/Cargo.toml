@@ -1,6 +1,6 @@
 [package]
 name = "happyview-plugin-sdk"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Guest-side SDK for HappyView WASM plugins"
@@ -9,9 +9,9 @@ description = "Guest-side SDK for HappyView WASM plugins"
 name = "happyview_plugin_sdk"
 
 [dependencies]
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 # The guest allocator `export_abi!()` installs: memory grows as a call needs it
 # and is really freed, where a fixed heap would cap every payload a plugin can

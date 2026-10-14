@@ -144,7 +144,11 @@ pub(crate) async fn require_membership(
 
 /// Fetch a space blob from its author's PDS, with the content type the PDS
 /// reported.
-pub(crate) async fn fetch_space_blob(
+///
+/// Public only so `tests/test_runner_identity.rs` can show it refuses a
+/// forged PDS before any request; the routes are its real callers.
+#[doc(hidden)]
+pub async fn fetch_space_blob(
     state: &AppState,
     author_did: &str,
     cid: &str,
@@ -159,6 +163,13 @@ pub(crate) async fn fetch_space_blob(
     let pds_endpoint =
         crate::profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, author_did)
             .await?;
+    crate::testing::identity::refuse_forged_pds(&pds_endpoint, "fetching a space blob").map_err(
+        |message| AppError::XrpcError {
+            status: axum::http::StatusCode::NOT_IMPLEMENTED,
+            code: "MethodNotImplemented",
+            message,
+        },
+    )?;
 
     let url = format!(
         "{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}",
@@ -428,6 +439,19 @@ async fn forward_write_if_native(
 
     if repo_state.host_mode.is_authoritative_here() {
         return Ok(None);
+    }
+
+    // The in-process PDS answers repo writes only, so re-authenticating, which
+    // is the advice below, could never help here.
+    if state.test.is_some() {
+        return Err(AppError::XrpcError {
+            status: axum::http::StatusCode::NOT_IMPLEMENTED,
+            code: "MethodNotImplemented",
+            message: format!(
+                "this space lives on {author_did}'s PDS, and a test run serves no \
+                 PDS-backed spaces; {method} reaches only spaces HappyView hosts"
+            ),
+        });
     }
 
     tracing::warn!(
@@ -1143,9 +1167,9 @@ pub(crate) async fn accept_invite(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::LexiconCatalog;
     use crate::config::Config;
     use crate::db::DatabaseBackend;
-    use crate::lexicon::LexiconRegistry;
     use tokio::sync::watch;
 
     macro_rules! require_test_db {
@@ -1175,7 +1199,7 @@ mod tests {
             jetstream_url: String::new(),
             relay_url: String::new(),
             plc_url: String::new(),
-            static_dir: String::new(),
+            static_dir: None,
             base_path: None,
             event_log_retention_days: 30,
             app_name: None,
@@ -1190,6 +1214,12 @@ mod tests {
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
+            superadmin_did: None,
+            project_root: None,
+            project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
         let (collections_tx, _) = watch::channel(vec![]);
         let (labeler_subscriptions_tx, _) = watch::channel(());
@@ -1227,6 +1257,8 @@ mod tests {
         })
         .expect("Failed to create test OAuth client");
 
+        let project = crate::project::shared_empty();
+
         let state = AppState {
             config,
             http: reqwest::Client::new(),
@@ -1235,7 +1267,9 @@ mod tests {
             db_backend: backend,
             records: crate::record_store::RecordStore::new(pool.clone(), backend),
             domain_cache: crate::domain::DomainCache::new(),
-            lexicons: LexiconRegistry::new(),
+            lexicons: LexiconCatalog::new(project.clone()),
+            scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
+            project,
             collections_tx,
             labeler_subscriptions_tx,
             labeler_subscription_cache: std::sync::Arc::new(
@@ -1291,6 +1325,7 @@ mod tests {
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
             script_limits: std::sync::Arc::new(crate::lua::limits::ScriptLimits::default()),
+            test: None,
         };
 
         crate::test_support::provision_space_signing_key(&state).await;
@@ -2258,6 +2293,33 @@ mod native_write_bridge_tests {
             format!("{err}").contains("re-authenticate"),
             "the error should tell the user what to do: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_native_write_in_a_test_run_says_the_run_serves_no_pds_spaces() {
+        let (mut state, space) = state_with_space(HostMode::Native).await;
+        state.test = Some(std::sync::Arc::new(crate::testing::TestHarness::new(
+            "src/a.test.lua",
+        )));
+        let err = forward_write_if_native(
+            &state,
+            &space,
+            USER,
+            "com.atproto.space.createRecord",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("a test run cannot forward a write to a PDS");
+
+        let AppError::XrpcError {
+            status, message, ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(*status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(message.contains("test run"), "{message}");
+        assert!(!message.contains("re-authenticate"), "{message}");
     }
 }
 

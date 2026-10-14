@@ -5,7 +5,6 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::auth::Claims;
 use crate::auth::ServiceAuthClaims;
-use crate::db::adapt_sql;
 use crate::error::AppError;
 use crate::lexicon::ProcedureAction;
 use crate::repo;
@@ -46,6 +45,10 @@ pub(crate) async fn handle_procedure(
     // overrides the default PDS-write flow.
     let trigger =
         crate::lua::ParsedTrigger::new(crate::lua::TriggerKind::XrpcProcedure, &lexicon.id);
+    // One lookup for the whole call: the scope check below and the run after
+    // it must describe the same script, whatever the snapshot does meanwhile.
+    let project = state.project.load_full();
+    let resolved = state.scripts.resolve_in(&project, &trigger).await;
 
     // Service auth access and scope checks
     if let Some(sa) = &service_auth {
@@ -81,18 +84,10 @@ pub(crate) async fn handle_procedure(
         }
 
         // Check token scope against outbound XRPCs declared by the script
-        let outbound_sql = adapt_sql(
-            "SELECT outbound_xrpcs FROM happyview_scripts WHERE id = ?",
-            state.db_backend,
-        );
-        if let Ok(Some((Some(json_str),))) = crate::db::query_as::<(Option<String>,)>(&outbound_sql)
-            .bind(trigger.id())
-            .fetch_optional(&state.db)
-            .await
-            && let Ok(outbound_list) = serde_json::from_str::<Vec<String>>(&json_str)
-        {
+        if let Some(script) = &resolved {
             let token_scope: Vec<&str> = vec![&method];
-            let missing: Vec<&String> = outbound_list
+            let missing: Vec<&String> = script
+                .outbound_xrpcs
                 .iter()
                 .filter(|x| !token_scope.contains(&x.as_str()))
                 .collect();
@@ -106,7 +101,19 @@ pub(crate) async fn handle_procedure(
             }
         }
     }
-    if let Some(resolved) = crate::lua::resolve(state, &trigger).await {
+    // A forged caller holds no DPoP session, so the delegation guard below
+    // would refuse it for missing authentication, and the scriptless path
+    // would write `delegateDid` into the record. A test acts as an account
+    // by naming it.
+    if state.test.is_some() && input.get("delegateDid").is_some() {
+        return Err(AppError::BadRequest(
+            "a test run does not support delegateDid; fire the trigger `as` the \
+             delegated account instead"
+                .into(),
+        ));
+    }
+
+    if let Some(resolved) = resolved {
         // Delegation guard preserved from origin/dev: scripts that run
         // under a `delegateDid` must come from a caller who is an
         // active write-capable delegate of that account, scoped to the
@@ -174,9 +181,14 @@ pub(crate) async fn handle_procedure(
         AppError::BadRequest(format!("{method} has no target_collection configured"))
     })?;
 
+    // A test run writes through its in-process PDS whatever the caller holds.
+    let test_auth = repo::test_pds_auth(state);
+
     // If the user authenticated via a DPoP session (has a client_key from DPoP auth),
     // use the DPoP PDS write path. Otherwise, fall back to the atrium OAuth session.
-    if let Some(client_key) = claims.client_key() {
+    if test_auth.is_none()
+        && let Some(client_key) = claims.client_key()
+    {
         let encryption_key = state
             .config
             .token_encryption_key
@@ -203,7 +215,20 @@ pub(crate) async fn handle_procedure(
         .await;
     }
 
-    let session = repo::get_oauth_session(state, claims.did()).await?;
+    // Only the DPoP path can act for another account. Here the write goes out
+    // as the caller, with `delegateDid` inside the record.
+    if input.get("delegateDid").is_some() {
+        return Err(AppError::Auth(
+            "delegation requires DPoP authentication".into(),
+        ));
+    }
+
+    let session = match test_auth {
+        Some(auth) => auth,
+        None => repo::PdsAuth::OAuth(std::sync::Arc::new(
+            repo::get_oauth_session(state, claims.did()).await?,
+        )),
+    };
 
     match &lexicon.action {
         ProcedureAction::Create => {
@@ -232,7 +257,7 @@ async fn handle_create_record(
     claims: &Claims,
     input: &Value,
     collection: &str,
-    session: &crate::HappyViewOAuthSession,
+    session: &repo::PdsAuth,
 ) -> Result<Response, AppError> {
     // Build record from input, adding $type
     let mut record = input.clone();
@@ -248,8 +273,14 @@ async fn handle_create_record(
         "record": record,
     });
 
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.createRecord", &pds_body).await?;
+    let resp = session
+        .post_json(
+            state,
+            claims.did(),
+            "com.atproto.repo.createRecord",
+            &pds_body,
+        )
+        .await?;
 
     if resp.status().is_success() {
         let bytes = resp
@@ -301,7 +332,7 @@ async fn handle_put_record(
     claims: &Claims,
     input: &Value,
     collection: &str,
-    session: &crate::HappyViewOAuthSession,
+    session: &repo::PdsAuth,
 ) -> Result<Response, AppError> {
     let client_uri = input
         .get("uri")
@@ -327,8 +358,9 @@ async fn handle_put_record(
         "record": record,
     });
 
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.putRecord", &pds_body).await?;
+    let resp = session
+        .post_json(state, claims.did(), "com.atproto.repo.putRecord", &pds_body)
+        .await?;
 
     if resp.status().is_success() {
         let bytes = resp
@@ -376,7 +408,7 @@ async fn handle_delete_record(
     claims: &Claims,
     input: &Value,
     collection: &str,
-    session: &crate::HappyViewOAuthSession,
+    session: &repo::PdsAuth,
 ) -> Result<Response, AppError> {
     let client_uri = input
         .get("uri")
@@ -393,8 +425,14 @@ async fn handle_delete_record(
         "rkey": rkey,
     });
 
-    let resp =
-        repo::pds_post_json_raw(state, session, "com.atproto.repo.deleteRecord", &pds_body).await?;
+    let resp = session
+        .post_json(
+            state,
+            claims.did(),
+            "com.atproto.repo.deleteRecord",
+            &pds_body,
+        )
+        .await?;
 
     if resp.status().is_success() {
         let bytes = resp

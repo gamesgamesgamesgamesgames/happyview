@@ -30,7 +30,7 @@ const ALLOWED_INTERNAL_TABLES: &[&str] = &[
     "happyview_records",
     "happyview_record_refs",
     "happyview_labels",
-    "happyview_lexicons",
+    crate::catalog::lexicon_rows::TABLE,
     // Background jobs.
     "happyview_jobs",
     // Space data (not the credential/key-material tables).
@@ -167,7 +167,13 @@ mod tests {
         );
         assert!(super::check_raw_sql_tables("SELECT * FROM happyview_record_refs").is_ok());
         assert!(super::check_raw_sql_tables("SELECT * FROM happyview_labels").is_ok());
-        assert!(super::check_raw_sql_tables("SELECT * FROM happyview_lexicons").is_ok());
+        assert!(
+            super::check_raw_sql_tables(&format!(
+                "SELECT * FROM {}",
+                crate::catalog::lexicon_rows::TABLE
+            ))
+            .is_ok()
+        );
         assert!(super::check_raw_sql_tables("SELECT * FROM happyview_jobs").is_ok());
         // Space data (access, not confidentiality).
         assert!(super::check_raw_sql_tables("SELECT * FROM happyview_space_records").is_ok());

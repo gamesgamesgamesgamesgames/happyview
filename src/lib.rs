@@ -1,12 +1,16 @@
 pub mod admin;
 pub mod auth;
 pub mod blobs;
+pub mod catalog;
 pub mod cid_verify;
+pub mod cli;
 pub mod codemod;
 pub mod config;
 pub mod constant_time;
+pub mod dashboard;
 pub mod db;
 pub mod delegation;
+pub mod dev;
 pub mod dev_happyview;
 pub mod dns;
 pub mod domain;
@@ -16,6 +20,8 @@ pub mod event_log;
 pub mod external_auth;
 pub mod feature_flags;
 pub mod feature_middleware;
+#[cfg(unix)]
+pub(crate) mod fs_private;
 pub mod http_retry;
 pub mod identity;
 pub mod jetstream;
@@ -30,6 +36,7 @@ pub mod oauth;
 pub mod plc;
 pub mod plugin;
 pub mod profile;
+pub mod project;
 pub mod proxy_config;
 pub mod rate_limit;
 pub mod raw_sql_guard;
@@ -47,6 +54,7 @@ pub mod spaces;
 pub mod telemetry;
 pub mod telemetry_middleware;
 pub mod test_support;
+pub mod testing;
 pub mod tid;
 pub mod tombstones;
 pub mod verification_methods;
@@ -54,10 +62,10 @@ pub mod version;
 pub mod xrpc;
 
 use auth::oauth_store::{DbSessionStore, DbStateStore};
+use catalog::LexiconCatalog;
 use config::Config;
 use db::DatabaseBackend;
 use dns::NativeDnsResolver;
-use lexicon::LexiconRegistry;
 use plugin::official_registry::{RegistryConfig, SharedRegistry};
 use rate_limit::RateLimiter;
 use std::sync::Arc;
@@ -92,7 +100,11 @@ pub struct AppState {
     /// The record tables' one reader and writer (see `record_store`).
     pub records: record_store::RecordStore,
     pub domain_cache: domain::DomainCache,
-    pub lexicons: LexiconRegistry,
+    /// The current project build. Readers that must not see a swap mid-run
+    /// take `load_full()` once and keep it.
+    pub project: Arc<arc_swap::ArcSwap<project::ProjectSnapshot>>,
+    pub lexicons: LexiconCatalog,
+    pub scripts: catalog::ScriptCatalog,
     pub collections_tx: watch::Sender<Vec<String>>,
     pub labeler_subscriptions_tx: watch::Sender<()>,
     pub labeler_subscription_cache: Arc<labeler::SubscriptionCache>,
@@ -113,6 +125,11 @@ pub struct AppState {
     pub client_jwks: Vec<jose_jwk::Jwk>,
     pub telemetry_counters: std::sync::Arc<telemetry::counters::Counters>,
     pub script_limits: Arc<lua::limits::ScriptLimits>,
+    /// Present only in a state the test command built for one test file.
+    /// Every behaviour a test run changes — the in-process PDS, forged
+    /// callers, mocks, single-attempt record scripts — is keyed on this, and
+    /// no other code path constructs one, so a serving binary never has it.
+    pub test: Option<Arc<testing::TestHarness>>,
 }
 
 impl AppState {

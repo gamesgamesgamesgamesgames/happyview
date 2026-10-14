@@ -217,7 +217,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn from_env(jetstream_url: &str) -> Self {
-        let var = |name: &str| std::env::var(name).ok();
+        use crate::config::vars::var;
         Self {
             endpoint: parse_endpoint(jetstream_url),
             protocol: parse_protocol(var("JETSTREAM_PROTOCOL").as_deref()),
@@ -411,5 +411,34 @@ mod tests {
             dictionary_url(&parse_endpoint("wss://js.example.com")),
             "https://js.example.com/xrpc/network.bsky.jetstream.getZstdDictionary"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn the_project_layer_reaches_the_jetstream_settings() {
+        use crate::config::vars::{LayerReset, set_project_layer};
+        let _reset = LayerReset;
+        unsafe {
+            std::env::remove_var("JETSTREAM_PROTOCOL");
+            std::env::remove_var("JETSTREAM_COMPRESSION");
+        }
+        set_project_layer(
+            [
+                ("JETSTREAM_PROTOCOL".to_string(), "v1".to_string()),
+                ("JETSTREAM_COMPRESSION".to_string(), "false".to_string()),
+            ]
+            .into(),
+        );
+        let settings = Settings::from_env("wss://jetstream.example");
+        assert_eq!(settings.protocol, ProtocolChoice::V1);
+        assert!(!settings.compression);
+
+        unsafe { std::env::set_var("JETSTREAM_PROTOCOL", "v2") };
+        assert_eq!(
+            Settings::from_env("wss://jetstream.example").protocol,
+            ProtocolChoice::V2,
+            "the environment wins over the file"
+        );
+        unsafe { std::env::remove_var("JETSTREAM_PROTOCOL") };
     }
 }

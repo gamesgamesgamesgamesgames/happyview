@@ -3,9 +3,9 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use base64::Engine;
 use sqlx::AnyPool;
-use std::env;
 
 use crate::AppState;
+use crate::config::vars;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
@@ -73,7 +73,7 @@ pub async fn try_get_setting(
         return Ok(Some(value));
     }
 
-    Ok(env_var_for(key).and_then(|env_var| env::var(env_var).ok()))
+    Ok(env_var_for(key).and_then(vars::var))
 }
 
 /// The script budgets are read from a cache rather than the database on
@@ -86,6 +86,22 @@ async fn refresh_script_limits(state: &AppState, key: &str) {
             .refresh(&state.db, state.db_backend)
             .await;
     }
+}
+
+/// Fallback values for settings with no stored row, labelled with where
+/// they came from so the dashboard can say which file or variable to edit.
+fn fallback_entries(db_keys: &std::collections::HashSet<String>) -> Vec<SettingEntry> {
+    ENV_FALLBACKS
+        .iter()
+        .filter(|(setting_key, _)| !db_keys.contains(*setting_key))
+        .filter_map(|(setting_key, env_var)| {
+            vars::var_with_source(env_var).map(|(value, source)| SettingEntry {
+                key: setting_key.to_string(),
+                value,
+                source: source.as_str().to_string(),
+            })
+        })
+        .collect()
 }
 
 /// GET /admin/settings — list all settings with their source.
@@ -116,18 +132,7 @@ pub(super) async fn list(
         })
         .collect();
 
-    // Add env-var fallback entries for keys not already present in DB.
-    for (setting_key, env_var) in ENV_FALLBACKS {
-        if !db_keys.contains(*setting_key)
-            && let Ok(value) = env::var(env_var)
-        {
-            entries.push(SettingEntry {
-                key: setting_key.to_string(),
-                value,
-                source: "env".to_string(),
-            });
-        }
-    }
+    entries.extend(fallback_entries(&db_keys));
 
     Ok(Json(entries))
 }
@@ -416,5 +421,105 @@ pub(crate) async fn serve_logo(
                 .unwrap())
         }
         _ => Err(AppError::NotFound("no logo uploaded".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use serial_test::serial;
+
+    use super::*;
+    use crate::config::vars::{LayerReset, set_project_layer};
+    use crate::test_support::migrated_memory_pool;
+
+    fn file_says_app_name(value: &str) -> LayerReset {
+        set_project_layer([("APP_NAME".to_string(), value.to_string())].into());
+        LayerReset
+    }
+
+    /// Restores `APP_NAME` to unset even when the test panics.
+    struct AppNameEnv;
+
+    impl AppNameEnv {
+        fn set(value: Option<&str>) -> Self {
+            match value {
+                Some(v) => unsafe { std::env::set_var("APP_NAME", v) },
+                None => unsafe { std::env::remove_var("APP_NAME") },
+            }
+            Self
+        }
+    }
+
+    impl Drop for AppNameEnv {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("APP_NAME") };
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_file_answers_when_neither_the_database_nor_the_env_does() {
+        let _env = AppNameEnv::set(None);
+        let _reset = file_says_app_name("From The File");
+        let pool = migrated_memory_pool().await;
+        assert_eq!(
+            get_setting(&pool, "app_name", DatabaseBackend::Sqlite)
+                .await
+                .as_deref(),
+            Some("From The File")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_env_wins_over_the_file() {
+        let _env = AppNameEnv::set(Some("From Env"));
+        let _reset = file_says_app_name("From The File");
+        let pool = migrated_memory_pool().await;
+        let value = get_setting(&pool, "app_name", DatabaseBackend::Sqlite).await;
+        assert_eq!(value.as_deref(), Some("From Env"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_stored_setting_wins_over_the_file() {
+        let _env = AppNameEnv::set(None);
+        let _reset = file_says_app_name("From The File");
+        let pool = migrated_memory_pool().await;
+        crate::db::query(
+            "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?)",
+        )
+        .bind("app_name")
+        .bind("From The Dashboard")
+        .bind("2026-01-01T00:00:00+00:00")
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            get_setting(&pool, "app_name", DatabaseBackend::Sqlite)
+                .await
+                .as_deref(),
+            Some("From The Dashboard")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn the_listing_names_the_file_as_the_source() {
+        let _env = AppNameEnv::set(None);
+        let _reset = file_says_app_name("From The File");
+        let entries = fallback_entries(&HashSet::new());
+        let app_name = entries.iter().find(|e| e.key == "app_name").unwrap();
+        assert_eq!(app_name.value, "From The File");
+        assert_eq!(app_name.source, "project");
+
+        let stored: HashSet<String> = ["app_name".to_string()].into();
+        assert!(
+            fallback_entries(&stored)
+                .iter()
+                .all(|e| e.key != "app_name")
+        );
     }
 }

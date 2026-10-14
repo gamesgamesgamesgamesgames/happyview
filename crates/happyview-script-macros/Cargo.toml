@@ -1,0 +1,15 @@
+[package]
+name = "happyview-script-macros"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Handler attributes and export! for happyview-script"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+happyview-nsid = { path = "../happyview-nsid" }
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

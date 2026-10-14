@@ -71,14 +71,37 @@ pub const LUA_AUTH_ERROR_PREFIX: &str = "AUTH_ERROR:";
 /// the event log untouched for anyone debugging.
 pub fn parse_lua_line(raw: &str) -> (Option<u32>, String) {
     let raw = raw.split("\nstack traceback:").next().unwrap_or(raw);
-    if let Some(bracket_pos) = raw.find("]:") {
-        let after_bracket = &raw[bracket_pos + 2..];
+    if let Some(start) = raw.find("[string \"")
+        && let Some(close) = raw[start..].find("]:")
+    {
+        let after_bracket = &raw[start + close + 2..];
         if let Some(colon_pos) = after_bracket.find(": ") {
             let line_str = &after_bracket[..colon_pos];
             if let Ok(line) = line_str.parse::<u32>() {
                 let message = after_bracket[colon_pos + 2..].to_string();
                 return (Some(line), message);
             }
+        }
+    }
+    // A file chunk: `<path>:<line>: message`, read only at the start of the
+    // message (after a `runtime error: `-style category, if any). A script
+    // can put `x.lua:3:` or `]:2:` anywhere in its own text, and only the
+    // position Lua prepends is the location.
+    let body = match raw.split_once(" error: ") {
+        Some((category, rest)) if !category.contains(' ') => rest,
+        _ => raw,
+    };
+    if let Some(colon) = body.find(':') {
+        let rest = &body[colon + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let location = &body[..colon];
+        if digits > 0
+            && rest[digits..].starts_with(": ")
+            && !location.contains(' ')
+            && location.ends_with(".lua")
+            && let Ok(line) = rest[..digits].parse::<u32>()
+        {
+            return (Some(line), rest[digits + 2..].to_string());
         }
     }
     (None, raw.to_string())
@@ -149,14 +172,18 @@ pub enum AppError {
         message: String,
         method: String,
         line: Option<u32>,
+        file: Option<String>,
     },
 }
 
+/// The file a failure happened in, when the chunk names one. A dashboard
+/// script's chunk is `script`, which no one can open.
+pub(crate) fn file_of(chunk: Option<String>) -> Option<String> {
+    chunk.filter(|chunk| chunk != crate::plugin::DEFAULT_CHUNK_NAME)
+}
+
 fn unmigrated_script_message(globals: &[String]) -> String {
-    format!(
-        "script references removed globals: {} -- run the codemod first",
-        globals.join(", ")
-    )
+    crate::script::checks::unmigrated_message(globals)
 }
 
 impl std::fmt::Display for AppError {
@@ -186,16 +213,22 @@ impl std::fmt::Display for AppError {
                 message,
                 method,
                 line,
-            } => {
-                if let Some(l) = line {
-                    write!(
-                        f,
-                        "script {error_type} error in {method} at line {l}: {message}"
-                    )
-                } else {
-                    write!(f, "script {error_type} error in {method}: {message}")
-                }
-            }
+                file,
+            } => match (file, line) {
+                (Some(file), Some(l)) => write!(
+                    f,
+                    "script {error_type} error in {method} at {file}:{l}: {message}"
+                ),
+                (Some(file), None) => write!(
+                    f,
+                    "script {error_type} error in {method} in {file}: {message}"
+                ),
+                (None, Some(l)) => write!(
+                    f,
+                    "script {error_type} error in {method} at line {l}: {message}"
+                ),
+                (None, None) => write!(f, "script {error_type} error in {method}: {message}"),
+            },
         }
     }
 }
@@ -222,18 +255,20 @@ impl IntoResponse for AppError {
                 message,
                 method,
                 line,
+                file,
             } => {
                 let status = match &error_type {
                     ScriptErrorType::Timeout => StatusCode::REQUEST_TIMEOUT,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
-                tracing::error!(%method, ?error_type, ?line, "{message}");
+                tracing::error!(%method, ?error_type, ?file, ?line, "{message}");
                 let body = serde_json::json!({
                     "error": "script_error",
                     "errorType": error_type,
                     "message": message,
                     "method": method,
                     "line": line,
+                    "file": file,
                 });
                 (status, axum::Json(body)).into_response()
             }
@@ -417,6 +452,7 @@ mod tests {
             message: "attempt to index a nil value".into(),
             method: "games.gamesgamesgamesgames.search".into(),
             line: Some(42),
+            file: None,
         })
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -425,6 +461,7 @@ mod tests {
         assert_eq!(body["message"], "attempt to index a nil value");
         assert_eq!(body["method"], "games.gamesgamesgamesgames.search");
         assert_eq!(body["line"], 42);
+        assert!(body["file"].is_null());
     }
 
     #[tokio::test]
@@ -434,6 +471,7 @@ mod tests {
             message: "script exceeded execution time limit".into(),
             method: "test.method".into(),
             line: None,
+            file: None,
         })
         .await;
         assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
@@ -451,6 +489,7 @@ mod tests {
             message: "script exceeded its memory limit".into(),
             method: "test.method".into(),
             line: None,
+            file: None,
         })
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -465,6 +504,7 @@ mod tests {
             message: "unexpected symbol near ')'".into(),
             method: "test.method".into(),
             line: Some(5),
+            file: None,
         })
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -585,6 +625,66 @@ mod tests {
         assert_eq!(msg, "bad argument");
     }
 
+    /// A project chunk is named `@<path>`, which Lua renders as the bare
+    /// path, cut from the front when it is longer than its 60-byte buffer.
+    #[test]
+    fn parse_lua_line_reads_a_chunk_named_by_its_path() {
+        let (line, msg) =
+            parse_lua_line("runtime error: src/lexicons/com/example/getThing.lua:12: boom");
+        assert_eq!(line, Some(12));
+        assert_eq!(msg, "boom");
+
+        let long = "...exicons/at/happyproto/registry/somewhere/quite/deep/getArtifact.lua";
+        assert!(long.len() > 60);
+        let (line, msg) = parse_lua_line(&format!("{long}:3: attempt to call a nil value"));
+        assert_eq!(line, Some(3));
+        assert_eq!(msg, "attempt to call a nil value");
+
+        // A message that merely contains a colon and a number is not a location.
+        let (line, msg) = parse_lua_line("runtime error: expected 2:3 got nothing");
+        assert_eq!(line, None);
+        assert_eq!(msg, "runtime error: expected 2:3 got nothing");
+    }
+
+    #[tokio::test]
+    async fn a_script_error_with_a_file_names_it_in_the_body_and_the_text() {
+        let error = AppError::ScriptError {
+            error_type: ScriptErrorType::Runtime,
+            message: "boom".into(),
+            method: "com.example.getThing".into(),
+            line: Some(12),
+            file: Some("src/lexicons/com/example/getThing.lua".into()),
+        };
+        assert_eq!(
+            error.to_string(),
+            "script runtime error in com.example.getThing at src/lexicons/com/example/getThing.lua:12: boom"
+        );
+        let (_, body) = response_parts(error).await;
+        assert_eq!(body["file"], "src/lexicons/com/example/getThing.lua");
+        assert_eq!(body["line"], 12);
+    }
+
+    /// Only the position Lua prepends is the location: text the script wrote
+    /// into its own message must not be read as one.
+    #[test]
+    fn parse_lua_line_reads_only_the_leading_position() {
+        let (line, msg) = parse_lua_line("src/a.lua:5: bad t[1]:2: x");
+        assert_eq!(line, Some(5));
+        assert_eq!(msg, "bad t[1]:2: x");
+
+        let (line, msg) = parse_lua_line("runtime error: src/a.lua:5: see x.lua:9: y");
+        assert_eq!(line, Some(5));
+        assert_eq!(msg, "see x.lua:9: y");
+
+        // A dashboard script that raises a message shaped like a location.
+        let (line, msg) = parse_lua_line("[string \"script\"]:4: x.lua:3: y");
+        assert_eq!(line, Some(4));
+        assert_eq!(msg, "x.lua:3: y");
+
+        let (line, _) = parse_lua_line("runtime error: oops t[1]:2: x");
+        assert_eq!(line, None);
+    }
+
     #[test]
     fn parse_lua_line_drops_the_traceback() {
         let (line, msg) = parse_lua_line(
@@ -698,6 +798,7 @@ mod tests {
                 message: "oops".into(),
                 method: "test.method".into(),
                 line: Some(5),
+                file: None,
             }
             .to_string(),
             "script runtime error in test.method at line 5: oops"
