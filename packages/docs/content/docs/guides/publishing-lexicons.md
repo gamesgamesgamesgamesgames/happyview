@@ -94,6 +94,7 @@ Every publishable lexicon has one status:
 | `no_rule`            | No default matches                                                                        |
 | `target_unavailable` | A default matches, but its target can't publish right now; the reason is shown            |
 | `unpublished`        | Never successfully published                                                              |
+| `withdrawn`          | Unpublished by hand; auto-publish leaves it alone until you publish it again               |
 | `moved`              | Published to a different account than its default points at now                           |
 | `outdated`           | Published to the right account, but the lexicon has changed since                         |
 | `current`            | The last published record matches what HappyView would publish today                      |
@@ -102,7 +103,7 @@ The last error, if any, is shown beside the status. Each lexicon's own page has 
 
 ## Auto-publish
 
-With auto-publish on, HappyView publishes any matching lexicon that is `unpublished`, `moved`, or `outdated`. It runs after the server starts, after you upload a lexicon, and after you create or change a default. There's no polling loop, so a failed publish is retried at the next of those, or when you publish by hand.
+With auto-publish on, HappyView publishes any matching lexicon that is `unpublished`, `moved`, or `outdated`. A `withdrawn` lexicon is skipped. It runs after the server starts, after you upload a lexicon, and after you create or change a default. There's no polling loop, so a failed publish is retried at the next of those, or when you publish by hand.
 
 Only one run happens at a time. A trigger that arrives mid-run doesn't start a second run: it marks the work pending and the running pass goes round once more, so a change made during a run isn't missed.
 
@@ -111,6 +112,8 @@ Only one run happens at a time. A trigger that arrives mid-run doesn't start a s
 **Nothing ever unpublishes automatically.** Deleting a lexicon, deleting a default, or pointing a default somewhere else leaves published records where they are. A published schema is a public contract that other apps resolve, and removing one can break them.
 
 To remove a record, use **Unpublish**. It deletes the record from the account it was published to, using whichever credential holds that DID: the attached account, or the linked repo bound to it. If nothing HappyView holds can act as that account any more, unpublishing is refused and names the DID.
+
+Unpublishing also withdraws the lexicon from auto-publish: its status becomes `withdrawn`, and no auto-publish run puts the record back, even under a default with auto-publish on. Publishing it by hand clears that and returns it to its default's normal handling.
 
 ## Permissions
 

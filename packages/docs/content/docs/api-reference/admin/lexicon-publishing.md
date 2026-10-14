@@ -74,7 +74,8 @@ GET /admin/lexicon-publishing
         "cid": "bafyrei...",
         "published_at": "2026-10-13T09:00:00+00:00",
         "last_error": null,
-        "last_attempt_at": "2026-10-13T09:00:00+00:00"
+        "last_attempt_at": "2026-10-13T09:00:00+00:00",
+        "withdrawn_at": null
       }
     }
   ]
@@ -83,7 +84,7 @@ GET /admin/lexicon-publishing
 
 - `targets`: the instance first, then one per linked repo.
 - `rules`: most specific first.
-- `lexicons`: every publishable lexicon, sorted by NSID. `layer` is `manual` or `project`; network lexicons never appear. `rule_id`, `rule_pattern` and `target` are `null` when no default matches, and `auto_publish` is then `false`. `status` is one of `no_rule`, `target_unavailable`, `unpublished`, `moved`, `outdated` or `current`. `publication` is `null` until something has been attempted; it carries only the error columns when every attempt has failed.
+- `lexicons`: every publishable lexicon, sorted by NSID. `layer` is `manual` or `project`; network lexicons never appear. `rule_id`, `rule_pattern` and `target` are `null` when no default matches, and `auto_publish` is then `false`. `status` is one of `no_rule`, `target_unavailable`, `unpublished`, `withdrawn`, `moved`, `outdated` or `current`. `publication` is `null` until something has been attempted; it carries only the error columns when every attempt has failed. `withdrawn_at` is set when the lexicon was unpublished and has not been published since; such a lexicon reports `withdrawn` (unless no default matches or its target is unavailable) and auto-publish skips it.
 
 The overview computes each lexicon's CID locally, so it makes no network calls.
 
@@ -177,7 +178,7 @@ POST /admin/lexicon-publishing/publish
 
 **Body:** `{ "nsids": ["com.example.notes.getNote"] }`, between 1 and 500 NSIDs. An empty or longer list is a `400`.
 
-NSIDs are published one after another, in the order given. The response is `200` even when some fail:
+NSIDs are published one after another, in the order given. A success clears `withdrawn_at`, so a lexicon unpublished earlier returns to auto-publish. The response is `200` even when some fail:
 
 ```json
 {
@@ -210,7 +211,7 @@ POST /admin/lexicon-publishing/unpublish
 
 **Body:** `{ "nsid": "com.example.notes.getNote" }`
 
-Deletes the record from the account it was published to and forgets the publication. Returns `204`.
+Deletes the record from the account it was published to, clears the stored `did`, `uri`, `cid` and `published_at`, and sets `withdrawn_at`. Auto-publish then leaves the lexicon alone until a [publish](#publish) succeeds for it. Returns `204`.
 
 | Status | Cause                                                                                  |
 | ------ | -------------------------------------------------------------------------------------- |

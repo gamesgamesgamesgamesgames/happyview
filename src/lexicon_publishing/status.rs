@@ -22,6 +22,8 @@ pub enum PublishStatus {
     NoRule,
     TargetUnavailable,
     Unpublished,
+    /// Unpublished by hand, which auto-publish respects.
+    Withdrawn,
     Moved,
     Outdated,
     Current,
@@ -29,11 +31,13 @@ pub enum PublishStatus {
 
 /// `target_did` is `None` when the rule's target cannot be used right now. A
 /// rule whose target is gone reports that rather than falling back to a
-/// broader rule's target.
+/// broader rule's target. `withdrawn` is the publication row's mark from an
+/// explicit unpublish; it only matters while nothing is published.
 pub fn compute_status(
     has_rule: bool,
     target_did: Option<&str>,
     published: Option<(&str, &str)>,
+    withdrawn: bool,
     local_cid: Option<&str>,
 ) -> PublishStatus {
     if !has_rule {
@@ -43,7 +47,11 @@ pub fn compute_status(
         return PublishStatus::TargetUnavailable;
     };
     let Some((published_did, published_cid)) = published else {
-        return PublishStatus::Unpublished;
+        return if withdrawn {
+            PublishStatus::Withdrawn
+        } else {
+            PublishStatus::Unpublished
+        };
     };
     if published_did != target_did {
         return PublishStatus::Moved;
@@ -93,33 +101,67 @@ mod tests {
     fn status_branches() {
         use PublishStatus::*;
         assert_eq!(
-            compute_status(false, None, Some(("did:a", "c")), Some("c")),
+            compute_status(false, None, Some(("did:a", "c")), false, Some("c")),
             NoRule
         );
-        assert_eq!(compute_status(false, Some("did:a"), None, None), NoRule);
         assert_eq!(
-            compute_status(true, None, Some(("did:a", "c")), Some("c")),
+            compute_status(false, Some("did:a"), None, false, None),
+            NoRule
+        );
+        assert_eq!(
+            compute_status(true, None, Some(("did:a", "c")), false, Some("c")),
             TargetUnavailable
         );
         assert_eq!(
-            compute_status(true, Some("did:a"), None, Some("c")),
+            compute_status(true, Some("did:a"), None, false, Some("c")),
             Unpublished
         );
         assert_eq!(
-            compute_status(true, Some("did:a"), Some(("did:b", "c")), Some("c")),
+            compute_status(true, Some("did:a"), Some(("did:b", "c")), false, Some("c")),
             Moved
         );
         assert_eq!(
-            compute_status(true, Some("did:a"), Some(("did:a", "old")), Some("c")),
+            compute_status(
+                true,
+                Some("did:a"),
+                Some(("did:a", "old")),
+                false,
+                Some("c")
+            ),
             Outdated
         );
         assert_eq!(
-            compute_status(true, Some("did:a"), Some(("did:a", "c")), None),
+            compute_status(true, Some("did:a"), Some(("did:a", "c")), false, None),
             Outdated
         );
         assert_eq!(
-            compute_status(true, Some("did:a"), Some(("did:a", "c")), Some("c")),
+            compute_status(true, Some("did:a"), Some(("did:a", "c")), false, Some("c")),
             Current
+        );
+    }
+
+    #[test]
+    fn withdrawn_applies_only_when_a_rule_and_target_exist_and_nothing_is_published() {
+        use PublishStatus::*;
+        assert_eq!(
+            compute_status(true, Some("did:a"), None, true, Some("c")),
+            Withdrawn
+        );
+        assert_eq!(
+            compute_status(false, Some("did:a"), None, true, Some("c")),
+            NoRule
+        );
+        assert_eq!(
+            compute_status(true, None, None, true, Some("c")),
+            TargetUnavailable
+        );
+        assert_eq!(
+            compute_status(true, Some("did:a"), Some(("did:a", "c")), true, Some("c")),
+            Current
+        );
+        assert_eq!(
+            compute_status(true, Some("did:a"), None, false, Some("c")),
+            Unpublished
         );
     }
 }

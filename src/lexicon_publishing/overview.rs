@@ -99,6 +99,9 @@ pub(super) async fn lexicon_views(
             rule.is_some(),
             target.as_ref().and_then(TargetInfo::writable_did),
             published,
+            publication
+                .as_ref()
+                .is_some_and(|p| p.withdrawn_at.is_some()),
             local_cid.as_deref(),
         );
         views.push(LexiconView {

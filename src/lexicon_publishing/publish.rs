@@ -282,7 +282,7 @@ pub async fn unpublish(state: &AppState, nsid: &str, actor: &str) -> Result<(), 
         )));
     }
 
-    store::delete_publication(state, nsid).await?;
+    store::record_withdrawn(state, nsid).await?;
     log_event(
         &state.db,
         EventLog {
@@ -336,7 +336,8 @@ impl SingleFlight {
 }
 
 /// Publishes every lexicon whose rule auto-publishes and whose record is
-/// missing, elsewhere, or stale.
+/// missing, elsewhere, or stale. A withdrawn lexicon is missing on purpose and
+/// is left alone.
 pub async fn reconcile(state: AppState) {
     RECONCILE.run(|| reconcile_once(&state)).await;
 }

@@ -157,8 +157,65 @@ async fn publication_failure_keeps_the_record_and_success_clears_the_error() {
     );
 
     assert_eq!(store::list_publications(s).await.unwrap().len(), 1);
-    assert!(store::delete_publication(s, nsid).await.unwrap());
-    assert!(store::get_publication(s, nsid).await.unwrap().is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn withdrawal_forgets_the_record_and_a_success_clears_it() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    let nsid = "com.example.withdrawn";
+
+    store::record_success(s, nsid, "did:plc:a", "at://did:plc:a/x/y", "bafycid")
+        .await
+        .unwrap();
+    assert_eq!(
+        store::get_publication(s, nsid)
+            .await
+            .unwrap()
+            .unwrap()
+            .withdrawn_at,
+        None
+    );
+
+    store::record_withdrawn(s, nsid).await.unwrap();
+    let withdrawn = store::get_publication(s, nsid).await.unwrap().unwrap();
+    assert!(withdrawn.withdrawn_at.is_some());
+    assert_eq!(withdrawn.did, None);
+    assert_eq!(withdrawn.uri, None);
+    assert_eq!(withdrawn.cid, None);
+    assert_eq!(withdrawn.published_at, None);
+    assert_eq!(withdrawn.last_error, None);
+
+    store::record_failure(s, nsid, "boom").await.unwrap();
+    let failed = store::get_publication(s, nsid).await.unwrap().unwrap();
+    assert!(failed.withdrawn_at.is_some());
+    assert_eq!(failed.last_error.as_deref(), Some("boom"));
+
+    store::record_success(s, nsid, "did:plc:a", "at://did:plc:a/x/y", "bafycid")
+        .await
+        .unwrap();
+    assert_eq!(
+        store::get_publication(s, nsid)
+            .await
+            .unwrap()
+            .unwrap()
+            .withdrawn_at,
+        None
+    );
+
+    store::record_withdrawn(s, "com.example.neverpublished")
+        .await
+        .unwrap();
+    assert!(
+        store::get_publication(s, "com.example.neverpublished")
+            .await
+            .unwrap()
+            .unwrap()
+            .withdrawn_at
+            .is_some()
+    );
 }
 
 const FULL_SCOPE: &str =
@@ -526,6 +583,57 @@ async fn concurrent_reconciles_complete_and_attempt_each_lexicon_once() {
         STATUS_NEEDS_REAUTH
     );
     assert_eq!(count_events(s, "lexicon.publish_failed", nsid).await, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn reconcile_leaves_a_withdrawn_lexicon_alone_and_the_overview_says_so() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    let nsid = "com.example.pulled";
+    put_manual(s, nsid).await;
+    // Writing through this grant would fail and mark it needs_reauth, so its
+    // status staying active shows nothing was attempted.
+    let repo = active_grant(s, "did:plc:repoa", FULL_SCOPE).await;
+    store::insert_rule(
+        s,
+        &pat("*"),
+        "linked_repo",
+        Some(&repo.id),
+        true,
+        "did:plc:admin",
+    )
+    .await
+    .unwrap();
+    store::record_withdrawn(s, nsid).await.unwrap();
+    let before = store::get_publication(s, nsid).await.unwrap().unwrap();
+
+    reconcile(s.clone()).await;
+
+    let after = store::get_publication(s, nsid).await.unwrap().unwrap();
+    assert_eq!(after.last_error, None);
+    assert_eq!(after.last_attempt_at, before.last_attempt_at);
+    assert_eq!(count_events(s, "lexicon.publish_failed", nsid).await, 0);
+    assert_eq!(
+        linked::get(s, &repo.id).await.unwrap().unwrap().status,
+        STATUS_ACTIVE
+    );
+
+    let (status, body) = call(&app, "GET", BASE, None).await;
+    assert_eq!(status, 200, "{body}");
+    let lexicon = &body["lexicons"][0];
+    assert_eq!(lexicon["nsid"], nsid);
+    assert_eq!(lexicon["status"], "withdrawn");
+    assert!(lexicon["publication"]["withdrawn_at"].is_string(), "{body}");
+
+    // A publish by hand is still an attempt: it fails here for want of a
+    // session, and the lexicon stays withdrawn until one succeeds.
+    let outcome = publish(s, nsid, Some("did:plc:admin")).await;
+    assert!(!outcome.ok);
+    let row = store::get_publication(s, nsid).await.unwrap().unwrap();
+    assert!(row.last_error.is_some());
+    assert!(row.withdrawn_at.is_some());
 }
 
 #[tokio::test]

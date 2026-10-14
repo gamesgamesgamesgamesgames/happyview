@@ -36,6 +36,9 @@ pub struct Publication {
     pub published_at: Option<String>,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<String>,
+    /// Set by an explicit unpublish, which keeps the lexicon out of
+    /// auto-publish until someone publishes it by hand.
+    pub withdrawn_at: Option<String>,
 }
 
 type RuleRow = (
@@ -75,9 +78,11 @@ type PublicationRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
-const PUBLICATION_COLUMNS: &str = "nsid, did, uri, cid, published_at, last_error, last_attempt_at";
+const PUBLICATION_COLUMNS: &str =
+    "nsid, did, uri, cid, published_at, last_error, last_attempt_at, withdrawn_at";
 
 fn publication_from_row(r: PublicationRow) -> Publication {
     Publication {
@@ -88,6 +93,7 @@ fn publication_from_row(r: PublicationRow) -> Publication {
         published_at: r.4,
         last_error: r.5,
         last_attempt_at: r.6,
+        withdrawn_at: r.7,
     }
 }
 
@@ -259,7 +265,7 @@ pub async fn record_success(
          VALUES (?, ?, ?, ?, ?, NULL, ?) \
          ON CONFLICT (nsid) DO UPDATE SET did = excluded.did, uri = excluded.uri, \
          cid = excluded.cid, published_at = excluded.published_at, \
-         last_error = NULL, last_attempt_at = excluded.last_attempt_at",
+         last_error = NULL, last_attempt_at = excluded.last_attempt_at, withdrawn_at = NULL",
         state.db_backend,
     );
     query(&sql)
@@ -295,15 +301,22 @@ pub async fn record_failure(state: &AppState, nsid: &str, error: &str) -> Result
     Ok(())
 }
 
-pub async fn delete_publication(state: &AppState, nsid: &str) -> Result<bool, AppError> {
+/// Forgets where the record was, since it is gone, and marks the lexicon
+/// withdrawn so auto-publish does not put it back.
+pub async fn record_withdrawn(state: &AppState, nsid: &str) -> Result<(), AppError> {
     let sql = adapt_sql(
-        "DELETE FROM happyview_lexicon_publications WHERE nsid = ?",
+        "INSERT INTO happyview_lexicon_publications \
+         (nsid, did, uri, cid, published_at, last_error, last_attempt_at, withdrawn_at) \
+         VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL, ?) \
+         ON CONFLICT (nsid) DO UPDATE SET did = NULL, uri = NULL, cid = NULL, \
+         published_at = NULL, last_error = NULL, withdrawn_at = excluded.withdrawn_at",
         state.db_backend,
     );
-    let result = query(&sql)
+    query(&sql)
         .bind(nsid)
+        .bind(now_rfc3339())
         .execute(&state.db)
         .await
-        .map_err(|e| internal("failed to delete lexicon publication", e))?;
-    Ok(result.rows_affected() > 0)
+        .map_err(|e| internal("failed to record lexicon withdrawal", e))?;
+    Ok(())
 }
