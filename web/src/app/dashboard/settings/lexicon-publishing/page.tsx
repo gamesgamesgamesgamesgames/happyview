@@ -16,7 +16,8 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { FileCode, Info, Loader2 } from "lucide-react";
+import { FileCode, Loader2 } from "lucide-react";
+import { toast } from "sonner";
 
 import { useCurrentUser } from "@/hooks/use-current-user";
 import { useIsMobile } from "@/hooks/use-mobile";
@@ -63,6 +64,7 @@ import {
   targetName,
   unavailableSentence,
 } from "@/components/lexicon-publishing/model";
+import { NoTargets } from "@/components/lexicon-publishing/no-targets";
 import { OrphanedPublications } from "@/components/lexicon-publishing/orphaned-publications";
 import { PublishStatusBadge } from "@/components/lexicon-publishing/publish-status";
 import { RoutingCascade } from "@/components/lexicon-publishing/routing-cascade";
@@ -102,13 +104,24 @@ export default function LexiconPublishingPage() {
 
   const load = useCallback(async () => {
     try {
-      setOverview(await getLexiconPublishing());
+      const next = await getLexiconPublishing();
+      // The navigation hides this page while nothing can publish; a bookmark
+      // or a typed URL is sent back with the reason instead of a dead page.
+      if (!next.usable) {
+        toast("Lexicon publishing needs an account to publish to", {
+          description:
+            "Attach one in Service Identity, or link a repo with the lexicon publishing scope.",
+        });
+        router.replace("/dashboard");
+        return;
+      }
+      setOverview(next);
       setLoadFailed(false);
     } catch (e) {
       setLoadFailed(true);
       toastError("Failed to load lexicon publishing", e);
     }
-  }, []);
+  }, [router]);
 
   // DNS answers in seconds rather than milliseconds, so it loads on its own
   // and never holds up the table.
@@ -327,7 +340,7 @@ export default function LexiconPublishingPage() {
 
   return (
     <>
-      <SiteHeader title="Lexicon publishing" backHref="/dashboard/lexicons" />
+      <SiteHeader title="Lexicon Publishing" />
       <div className="flex flex-1 flex-col gap-10 p-4 md:p-6">
         <section
           aria-labelledby="publishing-defaults"
@@ -532,31 +545,6 @@ function BulkPublish({
       )}
       {label}
     </Button>
-  );
-}
-
-function NoTargets() {
-  return (
-    <div className="bg-muted/40 flex items-start gap-3 rounded-lg border p-4 text-sm">
-      <Info className="text-muted-foreground mt-0.5 size-4 shrink-0" aria-hidden />
-      <p>
-        Nothing can receive lexicons yet: attach an account in{" "}
-        <Link
-          href="/dashboard/settings/service-identity"
-          className="font-medium underline underline-offset-4"
-        >
-          Service Identity
-        </Link>
-        , or link a repo with the lexicon publishing scope in{" "}
-        <Link
-          href="/dashboard/settings/linked-repos"
-          className="font-medium underline underline-offset-4"
-        >
-          Linked Repos
-        </Link>
-        .
-      </p>
-    </div>
   );
 }
 

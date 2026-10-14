@@ -29,7 +29,7 @@ For example, publishing `com.example.notes.getNote` to `did:plc:abc123` needs:
 _lexicon.notes.example.com.  TXT  "did=did:plc:abc123"
 ```
 
-The publishing page runs this check for you and shows the record to add whenever the DNS is missing or names a different DID.
+HappyView runs this check itself, from its own server. The publishing page checks every authority at once, and each lexicon's **Publishing** panel checks its own, with a **Check again** button for after you change DNS. When the record is missing or names a different DID, both show the record to add. If no default decides where a lexicon goes yet, the panel can only give the record's name, since the value depends on the account.
 
 ## Targets
 
@@ -63,7 +63,9 @@ A PDS can approve fewer scopes than a grant asks for, and HappyView judges the t
 
 ## Publishing defaults
 
-A publishing default is a rule that says where a set of lexicons goes. Manage them at **Lexicons > Publishing** (`/dashboard/lexicons/publishing`).
+A publishing default is a rule that says where a set of lexicons goes. Manage them at **System > Lexicon Publishing** (`/dashboard/settings/lexicon-publishing`).
+
+That page, and the **Published** column on the Lexicons page, only appear once some account can take a publish: an attached account with a session that grants the schema scope, or an active linked repo that does. Until then, each lexicon's Publishing panel says what to set up.
 
 Each default has:
 

@@ -62,6 +62,8 @@ export interface PublishableLexicon {
 }
 
 export interface LexiconPublishingOverview {
+  /** Some account can take a publish or give up a record; the page stays closed otherwise. */
+  usable: boolean
   targets: PublishTarget[]
   /** Most specific first: the order in which they win a match. */
   rules: PublishRule[]
@@ -76,6 +78,17 @@ export interface LexiconDnsEntry {
   /** `null` when no `_lexicon` record exists. */
   did: string | null
   error: string | null
+}
+
+/** One lexicon's `_lexicon` record, looked up by HappyView itself. */
+export interface LexiconDnsCheck extends LexiconDnsEntry {
+  nsid: string
+  /** The DID the record should name; `null` until a default or a publication decides it. */
+  expected_did: string | null
+}
+
+export interface LexiconPublishingAvailability {
+  usable: boolean
 }
 
 export interface CreatePublishRuleBody {

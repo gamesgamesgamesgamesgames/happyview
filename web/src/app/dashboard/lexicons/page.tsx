@@ -31,7 +31,6 @@ import {
 import type { LexiconSummary } from "@/types/lexicons";
 import type { PublishableLexicon } from "@/types/lexicon-publishing";
 import { PublishStatusBadge } from "@/components/lexicon-publishing/publish-status";
-import { Skeleton } from "@/components/ui/skeleton";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -55,18 +54,24 @@ export default function LexiconsPage() {
   const { hasPermission } = useCurrentUser();
   const router = useRouter();
   const [lexicons, setLexicons] = useState<LexiconSummary[]>([]);
-  // `undefined` while loading; `null` when publishing couldn't be read, which
-  // leaves the column blank rather than failing the list.
-  const [publishing, setPublishing] = useState<
-    Map<string, PublishableLexicon> | null | undefined
-  >(undefined);
+  // `null` until publishing has loaded and is usable here. The column appears
+  // only then: an instance with nowhere to publish has nothing to report, and
+  // a failed read leaves the list as it was.
+  const [publishing, setPublishing] = useState<Map<
+    string,
+    PublishableLexicon
+  > | null>(null);
 
   const load = useCallback(() => {
     getLexicons()
       .then(setLexicons)
       .catch((e) => toastError("Failed to load lexicons", e));
     getLexiconPublishing()
-      .then((o) => setPublishing(new Map(o.lexicons.map((l) => [l.nsid, l]))))
+      .then((o) =>
+        setPublishing(
+          o.usable ? new Map(o.lexicons.map((l) => [l.nsid, l])) : null,
+        ),
+      )
       .catch(() => setPublishing(null));
   }, []);
 
@@ -167,28 +172,7 @@ export default function LexiconsPage() {
           ],
         },
       },
-      {
-        id: "published",
-        accessorFn: (lex) => publishing?.get(lex.id)?.status ?? "",
-        header: ({ column }) => (
-          <DataTableColumnHeader column={column} label="Published" />
-        ),
-        cell: ({ row }) => {
-          if (row.original.source === "network") {
-            return (
-              <span className="text-muted-foreground" title="Network lexicons belong to whoever published them">
-                —
-              </span>
-            );
-          }
-          if (publishing === undefined) return <Skeleton className="h-4 w-20" />;
-          const entry = publishing?.get(row.original.id);
-          if (!entry) return <span className="text-muted-foreground">—</span>;
-          return <PublishStatusBadge lexicon={entry} compact explain />;
-        },
-        enableSorting: true,
-        meta: { label: "Published" },
-      },
+      ...(publishing ? [publishedColumn(publishing)] : []),
       {
         id: "action",
         accessorKey: "action",
@@ -335,14 +319,7 @@ export default function LexiconsPage() {
 
   return (
     <>
-      <SiteHeader
-        title="Lexicons"
-        actions={
-          <Button variant="outline" size="sm" asChild>
-            <Link href="/dashboard/lexicons/publishing">Publishing</Link>
-          </Button>
-        }
-      />
+      <SiteHeader title="Lexicons" />
       <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
         <DataTable
           table={table}
@@ -361,4 +338,33 @@ export default function LexiconsPage() {
       </div>
     </>
   );
+}
+
+function publishedColumn(
+  publishing: Map<string, PublishableLexicon>,
+): ColumnDef<LexiconSummary> {
+  return {
+    id: "published",
+    accessorFn: (lex) => publishing.get(lex.id)?.status ?? "",
+    header: ({ column }) => (
+      <DataTableColumnHeader column={column} label="Published" />
+    ),
+    cell: ({ row }) => {
+      if (row.original.source === "network") {
+        return (
+          <span
+            className="text-muted-foreground"
+            title="Network lexicons belong to whoever published them"
+          >
+            —
+          </span>
+        );
+      }
+      const entry = publishing.get(row.original.id);
+      if (!entry) return <span className="text-muted-foreground">—</span>;
+      return <PublishStatusBadge lexicon={entry} compact explain />;
+    },
+    enableSorting: true,
+    meta: { label: "Published" },
+  };
 }

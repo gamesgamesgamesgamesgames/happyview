@@ -4,7 +4,9 @@ import type { LexiconSummary, LexiconDetail } from "@/types/lexicons";
 import type { NetworkLexiconSummary } from "@/types/network-lexicons";
 import type {
   CreatePublishRuleBody,
+  LexiconDnsCheck,
   LexiconDnsEntry,
+  LexiconPublishingAvailability,
   LexiconPublishingOverview,
   PublishOutcome,
   PublishRule,
@@ -245,6 +247,18 @@ export function getLexiconPublishing() {
 
 export function getLexiconPublishingDns() {
   return apiFetch<LexiconDnsEntry[]>("/admin/lexicon-publishing/dns");
+}
+
+export function getLexiconPublishingAvailability() {
+  return apiFetch<LexiconPublishingAvailability>(
+    "/admin/lexicon-publishing/availability",
+  );
+}
+
+export function checkLexiconDns(nsid: string) {
+  return apiFetch<LexiconDnsCheck>(
+    `/admin/lexicon-publishing/dns/${encodeURIComponent(nsid)}`,
+  );
 }
 
 export function createPublishRule(body: CreatePublishRuleBody) {
