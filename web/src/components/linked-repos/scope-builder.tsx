@@ -488,13 +488,18 @@ export function ScopeBuilder({
               <Button
                 key={preset.label}
                 type="button"
-                variant="outline"
+                // An applied preset takes the secondary variant rather than
+                // aria-pressed overrides on the outline one, whose dark-mode
+                // border and fill outrank them. aria-disabled rather than
+                // disabled keeps it focusable and announced; it is never
+                // dimmed, since it is on rather than unavailable.
+                variant={applied ? "secondary" : "outline"}
                 size="xs"
-                // aria-disabled rather than disabled, so the applied state
-                // stays focusable and is announced instead of skipped. The
-                // applied look is set outright rather than left to the outline
-                // variant, whose dark fill is too close to the page to read.
-                className="aria-pressed:bg-secondary aria-pressed:text-secondary-foreground dark:aria-pressed:bg-accent dark:aria-pressed:text-accent-foreground aria-pressed:hover:bg-secondary aria-pressed:hover:text-secondary-foreground dark:aria-pressed:hover:bg-accent dark:aria-pressed:hover:text-accent-foreground rounded-full aria-pressed:border-transparent aria-disabled:cursor-default"
+                className={cn(
+                  "rounded-full",
+                  applied &&
+                    "hover:bg-secondary border border-transparent opacity-100 aria-disabled:cursor-default",
+                )}
                 aria-disabled={applied}
                 aria-pressed={applied}
                 onClick={() => {
