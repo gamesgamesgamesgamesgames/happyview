@@ -3,6 +3,7 @@
   "pages": [
     "admin-api",
     "lexicons",
+    "lexicon-publishing",
     "scripts",
     "records",
     "spaces",

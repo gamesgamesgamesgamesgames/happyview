@@ -45,6 +45,7 @@ AUTH="Authorization: Bearer $TOKEN"
 | Group | Description |
 | ----- | ----------- |
 | [Lexicons](lexicons.md) | Upload, list, get, and delete lexicons and network lexicons |
+| [Lexicon Publishing](lexicon-publishing.md) | Publish lexicons to the network and manage publishing defaults |
 | [Stats](stats.md) | Record counts by collection |
 | [Backfill](backfill.md) | Create and monitor historical backfill jobs |
 | [Event Logs](events.md) | Query the audit trail of system events |
@@ -80,6 +81,13 @@ Each admin API endpoint requires a specific permission. See the [Permissions gui
 | `POST /admin/network-lexicons`           | `lexicons:create`          |
 | `GET /admin/network-lexicons`            | `lexicons:read`            |
 | `DELETE /admin/network-lexicons/{id}`    | `lexicons:delete`          |
+| `GET /admin/lexicon-publishing`          | `lexicons:read`            |
+| `GET /admin/lexicon-publishing/dns`      | `lexicons:read`            |
+| `POST /admin/lexicon-publishing/rules`   | `lexicons:publish`         |
+| `PATCH /admin/lexicon-publishing/rules/{id}` | `lexicons:publish`     |
+| `DELETE /admin/lexicon-publishing/rules/{id}` | `lexicons:publish`    |
+| `POST /admin/lexicon-publishing/publish` | `lexicons:publish`         |
+| `POST /admin/lexicon-publishing/unpublish` | `lexicons:publish`       |
 | `GET /admin/stats`                       | `stats:read`               |
 | `GET /admin/jetstream/status`            | `stats:read`               |
 | `POST /admin/backfill`                   | `backfill:create`          |
