@@ -16,6 +16,15 @@ pub struct RuleView {
     pub target: TargetInfo,
 }
 
+impl RuleView {
+    pub fn redact_linked_repo(&mut self) {
+        if self.rule.target_kind == target::KIND_LINKED_REPO {
+            self.rule.linked_repo_id = None;
+        }
+        self.target.redact_linked_repo();
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LexiconView {
     pub nsid: String,
@@ -34,6 +43,22 @@ pub struct Overview {
     pub targets: Vec<TargetInfo>,
     pub rules: Vec<RuleView>,
     pub lexicons: Vec<LexiconView>,
+}
+
+impl Overview {
+    /// Publication rows keep their DID: the record is public in that repo, and
+    /// its `uri` names the DID anyway.
+    pub fn redact_linked_repos(&mut self) {
+        for target in &mut self.targets {
+            target.redact_linked_repo();
+        }
+        for rule in &mut self.rules {
+            rule.redact_linked_repo();
+        }
+        for target in self.lexicons.iter_mut().filter_map(|l| l.target.as_mut()) {
+            target.redact_linked_repo();
+        }
+    }
 }
 
 /// Most specific first, the order in which they win a match.

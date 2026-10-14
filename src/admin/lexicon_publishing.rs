@@ -30,7 +30,11 @@ pub(super) async fn overview(
     auth: UserAuth,
 ) -> Result<Json<Overview>, AppError> {
     auth.require(Permission::LexiconsRead).await?;
-    Ok(Json(publishing::overview(&state).await?))
+    let mut overview = publishing::overview(&state).await?;
+    if !auth.has(Permission::LinkedReposRead) {
+        overview.redact_linked_repos();
+    }
+    Ok(Json(overview))
 }
 
 #[derive(Debug, Serialize)]
@@ -151,11 +155,30 @@ async fn validate_target(
     Ok((target, stored_id))
 }
 
-async fn rule_view(state: &AppState, rule: store::Rule) -> Result<RuleView, AppError> {
+async fn rule_view(
+    state: &AppState,
+    auth: &UserAuth,
+    rule: store::Rule,
+) -> Result<RuleView, AppError> {
     let linked = LinkedRepoTargets::load(state).await?;
     let instance = publishing::instance_target(state).await?;
     let target = publishing::target_for_rule(state, &rule, &linked, &instance).await;
-    Ok(RuleView { rule, target })
+    let mut view = RuleView { rule, target };
+    if !auth.has(Permission::LinkedReposRead) {
+        view.redact_linked_repo();
+    }
+    Ok(view)
+}
+
+/// Pointing a default at a linked repo publishes into that account, so it
+/// takes the permission that lets a caller see linked repos at all. A caller
+/// without it can still change auto-publish on a default that already points
+/// at one, since that chooses no account.
+async fn require_linked_repo_access(auth: &UserAuth, target_kind: &str) -> Result<(), AppError> {
+    if target_kind == KIND_LINKED_REPO {
+        auth.require(Permission::LinkedReposRead).await?;
+    }
+    Ok(())
 }
 
 async fn log_rule_event(state: &AppState, event_type: &str, actor: &str, rule: &store::Rule) {
@@ -186,6 +209,7 @@ pub(super) async fn create_rule(
 ) -> Result<(StatusCode, Json<RuleView>), AppError> {
     auth.require(Permission::LexiconsPublish).await?;
 
+    require_linked_repo_access(&auth, &body.target_kind).await?;
     let pattern = Pattern::parse(&body.pattern).map_err(AppError::BadRequest)?;
     let (_, linked_repo_id) =
         validate_target(&state, &body.target_kind, body.linked_repo_id.as_deref()).await?;
@@ -202,7 +226,10 @@ pub(super) async fn create_rule(
 
     log_rule_event(&state, "lexicon_publishing.rule_created", &auth.did, &rule).await;
     publishing::spawn_reconcile(&state);
-    Ok((StatusCode::CREATED, Json(rule_view(&state, rule).await?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(rule_view(&state, &auth, rule).await?),
+    ))
 }
 
 /// PATCH /admin/lexicon-publishing/rules/{id}
@@ -231,6 +258,7 @@ pub(super) async fn update_rule(
     // An unchanged target is left alone even when it is unavailable, so a
     // default whose repo went away can still have auto-publish switched off.
     let linked_repo_update = if target_changed {
+        require_linked_repo_access(&auth, &target_kind).await?;
         let (_, stored) = validate_target(&state, &target_kind, linked_repo_id.as_deref()).await?;
         Some(stored)
     } else {
@@ -249,7 +277,7 @@ pub(super) async fn update_rule(
 
     log_rule_event(&state, "lexicon_publishing.rule_updated", &auth.did, &rule).await;
     publishing::spawn_reconcile(&state);
-    Ok(Json(rule_view(&state, rule).await?))
+    Ok(Json(rule_view(&state, &auth, rule).await?))
 }
 
 /// DELETE /admin/lexicon-publishing/rules/{id}

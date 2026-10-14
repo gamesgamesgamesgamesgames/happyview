@@ -1180,13 +1180,12 @@ async fn publish_validates_the_batch_and_reports_each_failure() {
     assert_eq!(status, 404, "{body}");
 }
 
-#[tokio::test]
-#[serial]
-async fn writes_need_lexicons_publish() {
-    common::require_db!();
-    let app = TestApp::new().await;
-    let s = &app.state;
-    let did = "did:plc:reader";
+/// A user holding exactly `permissions`, and a cookie that signs in as them.
+async fn limited_user(
+    s: &happyview::AppState,
+    did: &str,
+    permissions: &[&str],
+) -> impl Fn() -> (axum::http::HeaderName, axum::http::HeaderValue) {
     let user_id = uuid::Uuid::new_v4().to_string();
     let now = happyview::db::now_rfc3339();
     let sql = happyview::db::adapt_sql(
@@ -1204,14 +1203,27 @@ async fn writes_need_lexicons_publish() {
         "INSERT INTO happyview_user_permissions (user_id, permission, granted_at) VALUES (?, ?, ?)",
         s.db_backend,
     );
-    happyview::db::query(&sql)
-        .bind(&user_id)
-        .bind("lexicons:read")
-        .bind(&now)
-        .execute(&s.db)
-        .await
-        .unwrap();
-    let cookie = || common::auth::admin_cookie_header(did, &s.cookie_key);
+    for permission in permissions {
+        happyview::db::query(&sql)
+            .bind(&user_id)
+            .bind(*permission)
+            .bind(&now)
+            .execute(&s.db)
+            .await
+            .unwrap();
+    }
+    let did = did.to_string();
+    let key = s.cookie_key.clone();
+    move || common::auth::admin_cookie_header(&did, &key)
+}
+
+#[tokio::test]
+#[serial]
+async fn writes_need_lexicons_publish() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    let cookie = limited_user(s, "did:plc:reader", &["lexicons:read"]).await;
     let rule = store::insert_rule(s, &pat("*"), "instance", None, false, "did:plc:admin")
         .await
         .unwrap();
@@ -1429,4 +1441,147 @@ async fn an_instance_rule_needs_the_schema_scope_on_the_attached_session() {
     let (status, body) = call(&app, "POST", &format!("{BASE}/rules"), Some(rule)).await;
     assert_eq!(status, 201, "{body}");
     assert_eq!(body["target"]["did"], ATTACHED);
+}
+
+// ---------------------------------------------------------------------------
+// Linked repos behind linked-repos:read
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn choosing_a_linked_repo_for_a_default_needs_linked_repos_read() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    let grant = active_grant(s, "did:plc:linkedtarget", FULL_SCOPE).await;
+    seed_linked_session(s, "did:plc:linkedtarget", Some(FULL_SCOPE)).await;
+    let cookie = limited_user(
+        s,
+        "did:plc:publisher",
+        &["lexicons:read", "lexicons:publish"],
+    )
+    .await;
+
+    let (status, body) = call_as(
+        &app,
+        cookie(),
+        "POST",
+        &format!("{BASE}/rules"),
+        Some(json!({
+            "pattern": "com.example.*",
+            "target_kind": "linked_repo",
+            "linked_repo_id": grant.id,
+        })),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["message"], "Missing permission: linked-repos:read");
+    assert!(store::list_rules(s).await.unwrap().is_empty());
+
+    let instance_rule = store::insert_rule(s, &pat("*"), "instance", None, false, "did:plc:admin")
+        .await
+        .unwrap();
+    let (status, body) = call_as(
+        &app,
+        cookie(),
+        "PATCH",
+        &format!("{BASE}/rules/{}", instance_rule.id),
+        Some(json!({"target_kind": "linked_repo", "linked_repo_id": grant.id})),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["message"], "Missing permission: linked-repos:read");
+    let unchanged = store::get_rule(s, &instance_rule.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.target_kind, "instance");
+
+    // Auto-publish on a default that already points at a linked repo chooses
+    // no account, and the answer does not name the one it points at.
+    let linked_rule = store::insert_rule(
+        s,
+        &pat("com.example.*"),
+        "linked_repo",
+        Some(&grant.id),
+        false,
+        "did:plc:admin",
+    )
+    .await
+    .unwrap();
+    let (status, body) = call_as(
+        &app,
+        cookie(),
+        "PATCH",
+        &format!("{BASE}/rules/{}", linked_rule.id),
+        Some(json!({"auto_publish": true})),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["auto_publish"], true);
+    assert_eq!(body["linked_repo_id"], Value::Null);
+    assert_eq!(body["target"]["did"], Value::Null);
+    assert_eq!(body["target"]["available"], true);
+}
+
+#[tokio::test]
+#[serial]
+async fn the_overview_hides_which_linked_repo_from_a_caller_without_linked_repos_read() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    let did = "did:plc:hiddenrepo";
+    let grant = active_grant(s, did, FULL_SCOPE).await;
+    seed_linked_session(s, did, Some(FULL_SCOPE)).await;
+    let nsid = "com.example.hidden.thing";
+    put_manual(s, nsid).await;
+    store::insert_rule(
+        s,
+        &pat("com.example.*"),
+        "linked_repo",
+        Some(&grant.id),
+        false,
+        "did:plc:admin",
+    )
+    .await
+    .unwrap();
+    let uri = format!("at://{did}/com.atproto.lexicon.schema/{nsid}");
+    store::record_success(s, nsid, did, &uri, "bafycid")
+        .await
+        .unwrap();
+
+    let reader = limited_user(s, "did:plc:lexreader", &["lexicons:read"]).await;
+    let (status, body) = call_as(&app, reader(), "GET", BASE, None).await;
+    assert_eq!(status, 200, "{body}");
+
+    let linked_target = body["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["kind"] == "linked_repo")
+        .unwrap();
+    let rule = &body["rules"][0];
+    let lexicon = body["lexicons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["nsid"] == nsid)
+        .unwrap();
+    for target in [linked_target, &rule["target"], &lexicon["target"]] {
+        for field in ["linked_repo_id", "did", "handle", "unavailable_reason"] {
+            assert_eq!(target[field], Value::Null, "{field} in {target}");
+        }
+        assert_eq!(target["kind"], "linked_repo");
+        assert_eq!(target["available"], true);
+        assert_eq!(target["can_unpublish"], true);
+    }
+    assert_eq!(rule["linked_repo_id"], Value::Null);
+    // The record is public in that repo, so its row keeps saying where.
+    assert_eq!(lexicon["publication"]["did"], did);
+    assert!(!body.to_string().contains(&grant.id), "{body}");
+
+    let (status, body) = call(&app, "GET", BASE, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rules"][0]["target"]["did"], did);
+    assert_eq!(body["rules"][0]["linked_repo_id"], grant.id.as_str());
 }

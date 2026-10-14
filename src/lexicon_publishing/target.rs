@@ -37,6 +37,17 @@ impl TargetInfo {
         }
     }
 
+    /// Keeps whether a linked repo can be written, and drops which account it
+    /// is, for a caller allowed to see lexicons but not linked repos.
+    pub fn redact_linked_repo(&mut self) {
+        if self.kind == KIND_LINKED_REPO {
+            self.linked_repo_id = None;
+            self.did = None;
+            self.handle = None;
+            self.unavailable_reason = None;
+        }
+    }
+
     fn unavailable(kind: &str, reason: impl Into<String>) -> Self {
         TargetInfo {
             kind: kind.to_string(),
