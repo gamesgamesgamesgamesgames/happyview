@@ -129,7 +129,7 @@ function Destination({ rule }: { rule: PublishRule }) {
       <div className="col-span-2 min-w-0 md:col-span-1">
         <p className="flex items-center gap-1.5 text-sm">
           <TriangleAlert
-            className="size-4 shrink-0 text-amber-700 dark:text-amber-400"
+            className="text-warning size-4 shrink-0"
             aria-hidden
           />
           Destination unavailable

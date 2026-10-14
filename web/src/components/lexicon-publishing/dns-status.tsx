@@ -88,10 +88,7 @@ export function DnsStatus({
     case "ok":
       return (
         <span className="inline-flex items-center gap-1.5 text-sm whitespace-nowrap">
-          <CircleCheck
-            className="size-4 shrink-0 text-emerald-700 dark:text-emerald-400"
-            aria-hidden
-          />
+          <CircleCheck className="size-4 shrink-0" aria-hidden />
           Resolves here
         </span>
       );
@@ -106,7 +103,7 @@ export function DnsStatus({
               onClick={(e) => e.stopPropagation()}
             >
               <TriangleAlert
-                className="size-4 shrink-0 text-amber-700 dark:text-amber-400"
+                className="text-warning size-4 shrink-0"
                 aria-hidden
               />
               {state.kind === "missing" ? "Not set" : "Points elsewhere"}

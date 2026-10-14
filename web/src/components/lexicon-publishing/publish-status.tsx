@@ -39,28 +39,29 @@ type StatusLook = {
   explain: string;
 };
 
-// The icon carries the colour and the word carries the meaning, so the text
-// stays at foreground contrast and the status reads without colour at all.
+// The word carries the meaning and the icon's shape backs it up, so the status
+// reads without colour at all. Only the states asking for attention tint their
+// icon, and the text stays at foreground contrast.
 const LOOKS: Record<PublishStatus, StatusLook> = {
   current: {
     label: "Published",
     short: "Published",
     icon: CircleCheck,
-    tone: "text-emerald-700 dark:text-emerald-400",
+    tone: "",
     explain: "The published record matches this lexicon.",
   },
   outdated: {
     label: "Outdated",
     short: "Outdated",
     icon: CircleDot,
-    tone: "text-amber-700 dark:text-amber-400",
+    tone: "text-warning",
     explain: "The lexicon changed after it was published.",
   },
   moved: {
     label: "Published elsewhere",
     short: "Elsewhere",
     icon: MoveRight,
-    tone: "text-amber-700 dark:text-amber-400",
+    tone: "text-warning",
     explain:
       "Published to a different account than its default names. Publishing writes it to the new one.",
   },
@@ -83,7 +84,7 @@ const LOOKS: Record<PublishStatus, StatusLook> = {
     label: "Destination unavailable",
     short: "Unavailable",
     icon: TriangleAlert,
-    tone: "text-amber-700 dark:text-amber-400",
+    tone: "text-warning",
     explain: "The account its default names cannot receive records right now.",
   },
   no_rule: {
