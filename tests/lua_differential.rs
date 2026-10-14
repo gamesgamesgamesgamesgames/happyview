@@ -672,7 +672,12 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
         if native_progress != Value::Null && native_progress != json!({}) {
             progress_compared += 1;
         }
-        calls_compared += native_calls
+        // The plugin's side, because its count does not depend on the
+        // backend: a native library call that ends its run is a dropped
+        // future, and SQLite's driver runs a statement it was already handed
+        // where Postgres's sends nothing, so `bridge/query.coroutines.lua`
+        // records its one call natively on SQLite only.
+        calls_compared += plugin_calls
             .as_object()
             .map(|by_library| {
                 by_library
@@ -721,7 +726,7 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
     // deliberately.
     assert_eq!(
         (calls_compared, logs_compared, progress_compared),
-        (82, 18, 2),
+        (83, 18, 2),
         "the transcript, the log rows or the job progress are not being recorded; \
          a deliberate change to the case list has to be recorded here. Two of the \
          three job cases call `ctx.job.progress`, which is why that one is 2"
