@@ -109,6 +109,8 @@ fn input(source: &str, kind: ScriptKind) -> ScriptExecuteInput {
             memory_bytes: 64 * 1024 * 1024,
         },
         removed_globals: Vec::new(),
+        chunk_name: happyview::plugin::DEFAULT_CHUNK_NAME.to_string(),
+        artifact: None,
     }
 }
 

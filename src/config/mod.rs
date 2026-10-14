@@ -30,7 +30,7 @@ const MIN_SESSION_SECRET_BYTES: usize = 32;
 
 /// Validate a session secret, rejecting known placeholder values and anything
 /// too short to be secure. Returns a human-readable reason on failure.
-fn validate_session_secret(secret: &str) -> Result<(), String> {
+pub(crate) fn validate_session_secret(secret: &str) -> Result<(), String> {
     if secret.is_empty() {
         return Err(
             "SESSION_SECRET is not set. Generate a random value of at least 32 bytes \
@@ -118,6 +118,20 @@ pub fn parse_platform_api_key_hash(raw: Option<&str>) -> Result<Option<String>, 
 /// on the database pool, so an unbounded value could starve the request path.
 const MAX_JOB_WORKERS: usize = 32;
 
+/// Parse `HAPPYVIEW_DEV_BACKFILL`. Off when unset: in dev, a record lexicon
+/// saved with `backfill` would otherwise start a relay crawl on every save.
+/// Only the two values the project file's layer and `hpy` write are accepted,
+/// so a typo is reported instead of silently meaning "off".
+pub fn parse_dev_backfill(raw: Option<&str>) -> Result<bool, String> {
+    match raw {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(other) => Err(format!(
+            "HAPPYVIEW_DEV_BACKFILL must be `true` or `false`, got {other:?}"
+        )),
+    }
+}
+
 /// Parse `JOB_WORKER_CONCURRENCY`. Defaults to 1 (the historical behaviour);
 /// anything unparseable or below 1 falls back to 1; values above
 /// `MAX_JOB_WORKERS` clamp to it.
@@ -189,6 +203,16 @@ pub struct Config {
     pub project_root: Option<PathBuf>,
     /// The project's `happyview.toml`, when it has one.
     pub project: Option<Arc<ProjectConfig>>,
+    /// Where boot looks for plugin directories (`<dir>/*/manifest.json`).
+    pub plugin_dir: PathBuf,
+    /// Whether a backfill may start as a side effect: of uploading or
+    /// tracking a record lexicon with `backfill` set, or of a project's
+    /// declared backfill. A backfill created directly (`POST /admin/backfill`,
+    /// the dashboard's Backfill page) always runs.
+    pub auto_backfill: bool,
+    /// A dotenv file whose variables reach scripts as `ctx.env`, over the
+    /// database's. Read on every run, so an edit needs no restart.
+    pub script_env_file: Option<PathBuf>,
 }
 
 /// `PLUGIN_CACHE_DIR` when set; otherwise a `plugin-cache` directory beside
@@ -247,7 +271,25 @@ impl Config {
         for (name, value) in defaults(&view) {
             layer.entry(name).or_insert(value);
         }
+        // The checks below read through the layer, so the candidate has to be
+        // installed to be validated. A refused load restores the previous
+        // layer: a failed dev reload must not leave the rejected edit live
+        // for request-time readers. Validating against a private copy would
+        // mean a second lookup path beside `var`.
+        let previous = vars::project_layer();
         vars::set_project_layer(layer);
+        let result = Self::finish_load(root, mode, project);
+        if result.is_err() {
+            vars::set_project_layer(previous);
+        }
+        result
+    }
+
+    fn finish_load(
+        root: Option<&Path>,
+        mode: ConfigMode,
+        project: Option<project::ProjectConfig>,
+    ) -> Result<Self, project::ProjectConfigError> {
         // An unusable superadmin must not read as "none configured": that
         // would hand the first login the admin role.
         if let Err(message) = parse_superadmin_did(var("SUPERADMIN_DID").as_deref()) {
@@ -260,6 +302,13 @@ impl Config {
             tracing::warn!("{message}");
         }
         let mut config = Self::from_env();
+        config.auto_backfill = match mode {
+            project::ConfigMode::Serve => true,
+            project::ConfigMode::Dev => {
+                parse_dev_backfill(var("HAPPYVIEW_DEV_BACKFILL").as_deref())
+                    .map_err(|message| project::ProjectConfigError::InvalidSetting { message })?
+            }
+        };
         config.project_root = root.map(Path::to_path_buf);
         config.project = project.map(Arc::new);
         Ok(config)
@@ -365,6 +414,14 @@ impl Config {
             },
             project_root: None,
             project: None,
+            plugin_dir: var("PLUGIN_DIR")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("./plugins")),
+            auto_backfill: true,
+            script_env_file: var("HAPPYVIEW_SCRIPT_ENV_FILE")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
         }
     }
 
@@ -449,12 +506,103 @@ mod tests {
             "JOB_WORKER_CONCURRENCY",
             "SUPERADMIN_DID",
             "HAPPYVIEW_PROJECT",
+            "PLUGIN_DIR",
+            "HAPPYVIEW_SCRIPT_ENV_FILE",
+            "HAPPYVIEW_DEV_BACKFILL",
         ] {
             unsafe {
                 env::remove_var(key);
             }
         }
         vars::set_project_layer(std::collections::BTreeMap::new());
+    }
+
+    /// Exactly the two values every writer of this variable uses; a typo
+    /// is refused rather than read as "off", which would hide it.
+    #[test]
+    fn dev_backfill_accepts_true_and_false_and_nothing_else() {
+        assert_eq!(parse_dev_backfill(None), Ok(false));
+        assert_eq!(parse_dev_backfill(Some("true")), Ok(true));
+        assert_eq!(parse_dev_backfill(Some("false")), Ok(false));
+        for bad in ["TRUE", "False", "1", "0", "yes", "on", "", " true"] {
+            let err = parse_dev_backfill(Some(bad)).unwrap_err();
+            assert!(err.contains("HAPPYVIEW_DEV_BACKFILL"), "{err}");
+            assert!(err.contains("`true` or `false`"), "{err}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_the_plugin_dir() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        assert_eq!(Config::from_env().plugin_dir, PathBuf::from("./plugins"));
+        unsafe { env::set_var("PLUGIN_DIR", "/srv/project/.happyview/plugins") };
+        assert_eq!(
+            Config::from_env().plugin_dir,
+            PathBuf::from("/srv/project/.happyview/plugins")
+        );
+        unsafe { clear_env() };
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_reads_the_script_env_file() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        assert_eq!(Config::from_env().script_env_file, None);
+        unsafe { env::set_var("HAPPYVIEW_SCRIPT_ENV_FILE", "") };
+        assert_eq!(Config::from_env().script_env_file, None);
+        unsafe { env::set_var("HAPPYVIEW_SCRIPT_ENV_FILE", "/srv/project/.env") };
+        assert_eq!(
+            Config::from_env().script_env_file,
+            Some(PathBuf::from("/srv/project/.env"))
+        );
+        unsafe { clear_env() };
+    }
+
+    /// Serve always backfills on its own; dev only when the file or the
+    /// environment says so, and the environment wins.
+    #[test]
+    #[serial]
+    fn auto_backfill_follows_the_mode() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let on = project::TempProject::new(Some("[dev]\nbackfill = true\n"));
+        let empty = project::TempProject::new(None);
+        let load = |dir: &project::TempProject, mode| Config::load_from(Some(dir.path()), mode);
+
+        assert!(
+            load(&empty, project::ConfigMode::Serve)
+                .unwrap()
+                .auto_backfill
+        );
+        assert!(
+            !load(&empty, project::ConfigMode::Dev)
+                .unwrap()
+                .auto_backfill
+        );
+        assert!(load(&on, project::ConfigMode::Dev).unwrap().auto_backfill);
+
+        unsafe { env::set_var("HAPPYVIEW_DEV_BACKFILL", "false") };
+        assert!(!load(&on, project::ConfigMode::Dev).unwrap().auto_backfill);
+
+        unsafe { env::set_var("HAPPYVIEW_DEV_BACKFILL", "1") };
+        let err = load(&on, project::ConfigMode::Dev).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("HAPPYVIEW_DEV_BACKFILL must be"),
+            "{err}"
+        );
+        // Serve never reads it, so a stray value can't stop a production boot.
+        assert!(load(&on, project::ConfigMode::Serve).unwrap().auto_backfill);
+        unsafe { clear_env() };
     }
 
     unsafe fn set_required_env() {
@@ -526,6 +674,9 @@ mod tests {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(
             config.listen_addr(),
@@ -607,6 +758,29 @@ mod tests {
         let config = Config::load().unwrap();
         assert!(config.project_root.is_none() && config.project.is_none());
         assert!(!config.declares_labeler("did:plc:anything"));
+    }
+
+    /// A refused load must not leave its layer installed: request-time
+    /// readers would otherwise follow an edit the server rejected.
+    #[test]
+    #[serial]
+    fn a_refused_load_leaves_the_previous_layer() {
+        unsafe {
+            clear_env();
+            set_required_env();
+        }
+        let _reset = vars::LayerReset;
+        let _unset = EnvGuard("APP_NAME");
+        let good = project::TempProject::new(Some("[instance]\napp_name = \"Before\"\n"));
+        Config::load_from(Some(good.path()), ConfigMode::Serve).unwrap();
+        assert_eq!(var("APP_NAME").as_deref(), Some("Before"));
+
+        // Refused only once the layer is installed, since `var` is what reads it.
+        let _superadmin = EnvGuard("SUPERADMIN_DID");
+        unsafe { env::set_var("SUPERADMIN_DID", "alice.bsky.social") };
+        let bad = project::TempProject::new(Some("[instance]\napp_name = \"After\"\n"));
+        assert!(Config::load_from(Some(bad.path()), ConfigMode::Serve).is_err());
+        assert_eq!(var("APP_NAME").as_deref(), Some("Before"));
     }
 
     #[test]
@@ -990,6 +1164,9 @@ mod tests {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com");
     }
@@ -1025,6 +1202,9 @@ mod tests {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -1060,6 +1240,9 @@ mod tests {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(config.effective_public_url(), "https://example.com/hv");
     }
@@ -1095,6 +1278,9 @@ mod tests {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),
@@ -1160,6 +1346,9 @@ mod tests {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
         assert_eq!(
             config.url_with_base_path("https://otherdomain.com"),

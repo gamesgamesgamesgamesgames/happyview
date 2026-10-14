@@ -33,7 +33,12 @@ fn main() -> std::process::ExitCode {
         println!("{}", happyview::cli::USAGE);
         return std::process::ExitCode::SUCCESS;
     }
-    dotenvy::dotenv().ok();
+    // In a project, `.env` holds script variables. Loaded into the
+    // environment it would become server configuration and beat
+    // happyview.toml, so only a plain serve reads it.
+    if command == happyview::cli::Command::Serve {
+        dotenvy::dotenv().ok();
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -46,6 +51,10 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
     // Install rustls crypto provider early so all TLS users (jetstream, labeler, etc.) can find it.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    let dev_root = match &command {
+        happyview::cli::Command::Dev { root } => Some(root.clone()),
+        _ => None,
+    };
     match command {
         happyview::cli::Command::Check(args) => {
             // Logs go to stderr, so stdout holds only what the build found.
@@ -59,32 +68,65 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
             let code = happyview::project::check::run(&args, &mut std::io::stdout()).await;
             return std::process::ExitCode::from(code);
         }
+        happyview::cli::Command::Test(args) => {
+            // Logs go to stderr at `error` unless asked for: the run's own
+            // output is the report.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "error".parse().unwrap()),
+                )
+                .init();
+            let code = happyview::testing::runner::run(&args, &mut std::io::stdout()).await;
+            return std::process::ExitCode::from(code);
+        }
         happyview::cli::Command::Help => unreachable!("main answers --help itself"),
-        happyview::cli::Command::Serve => {}
+        happyview::cli::Command::Serve | happyview::cli::Command::Dev { .. } => {}
     }
 
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "happyview=debug,tower_http=debug,sqlx=warn"
-                    .parse()
-                    .unwrap()
+                if dev_root.is_some() {
+                    happyview::dev::env::DEV_LOG_FILTER
+                } else {
+                    "happyview=debug,tower_http=debug,sqlx=warn"
+                }
+                .parse()
+                .unwrap()
             }),
         )
         .init();
 
-    let config = match Config::load() {
-        Ok(config) => config,
-        Err(e) => {
-            tracing::error!("{e}");
-            std::process::exit(1);
-        }
+    let (dev, config) = match &dev_root {
+        Some(root) => match happyview::dev::prepare(root) {
+            Ok((session, config)) => (Some(session), config),
+            Err(e) => {
+                eprintln!("happyview dev: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+        None => match Config::load() {
+            Ok(config) => (None, config),
+            Err(e) => {
+                tracing::error!("{e}");
+                std::process::exit(1);
+            }
+        },
     };
     let db_backend = config.database_backend;
 
     // Connect to database and run migrations.
     let db_pool = db::connect(&config.database_url, db_backend).await;
     let backfill_db_pool = db::connect_backfill_pool(&config.database_url, db_backend).await;
+
+    if dev.is_some()
+        && let Err(e) = happyview::dev::instance::seed(&db_pool, db_backend).await
+    {
+        eprintln!("happyview dev: could not prepare the instance: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
 
     info!(
         backend = ?db_backend,
@@ -317,7 +359,7 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
     }
 
     // Load plugins from directory
-    for path in happyview::plugin::loader::plugin_dirs_in(std::path::Path::new("./plugins")) {
+    for path in happyview::plugin::loader::plugin_dirs_in(&config.plugin_dir) {
         match happyview::plugin::loader::load_from_file(&path).await {
             Ok(plugin) => {
                 tracing::info!(id = %plugin.info.id, "Loaded plugin from file");
@@ -356,10 +398,6 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
              install one from the plugins page in the dashboard"
         );
     }
-
-    // Every plugin this boot will run is registered by now, so anything
-    // else in the cache directory is a module nothing will load.
-    wasm_runtime.sweep_cache_dir(&plugin_registry.live_wasm_sha256s().await);
 
     // Seed and load per-instance default token costs from instance_settings.
     let defaults = seed_and_load_rate_limit_defaults(&db_pool, db_backend).await;
@@ -931,17 +969,35 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
         client_jwks,
         telemetry_counters,
         script_limits,
+        test: None,
     };
 
     // Before anything that runs a script starts: a worker that came first
     // would run against no project at all, and serving without the project
     // would answer its routes with nothing.
     if let Some(root) = state.config.project_root.clone() {
-        match happyview::project::boot::build_and_install(&state, &root).await {
+        let started = std::time::Instant::now();
+        let mode = if dev.is_some() {
+            happyview::project::boot::Mode::Dev
+        } else {
+            happyview::project::boot::Mode::Serve
+        };
+        match happyview::project::boot::start(&state, &root, mode).await {
+            Ok(installed) if dev.is_some() => {
+                println!(
+                    "{}",
+                    happyview::dev::report::booted(&installed.warnings, started.elapsed())
+                );
+            }
             Ok(installed) => {
                 for warning in &installed.warnings {
                     eprintln!("{warning}");
                 }
+            }
+            // A dev server waits for the fix; production refuses to serve a
+            // project it could not build.
+            Err(diagnostics) if dev.is_some() => {
+                println!("{}", happyview::dev::report::failed(&diagnostics));
             }
             Err(diagnostics) => {
                 for diagnostic in &diagnostics {
@@ -955,6 +1011,19 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
             }
         }
     }
+
+    // Every plugin and project module this boot will run is known by now, so
+    // anything else in the cache directory is a module nothing will load. In
+    // dev, a first build that failed leaves no modules in the snapshot, so
+    // theirs are swept and the next successful build compiles them again. A
+    // dev rebuild does not sweep, so a long dev session leaves its replaced
+    // builds behind until the next boot.
+    let live = happyview::project::script_module::boot_live_hashes(
+        &state.plugin_registry,
+        &state.project.load_full(),
+    )
+    .await;
+    state.wasm_runtime.sweep_cache_dir(&live);
 
     tokio::spawn(happyview::lua::limits::run_refresh_loop(
         state.script_limits.clone(),
@@ -1057,14 +1126,48 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
         });
     }
 
+    let dev_mode = dev.is_some();
+    let _watch = match dev {
+        Some(session) => {
+            println!("{}", happyview::dev::report::banner(&session));
+            if let Some(warning) = happyview::dev::report::network_warning(
+                happyview::config::vars::var("HAPPYVIEW_NETWORK").as_deref(),
+            ) {
+                println!("{warning}");
+            }
+            match happyview::dev::watch::spawn(state.clone(), session) {
+                Ok(handle) => {
+                    if let happyview::dev::watch::WatchMode::Poll(every) = handle.mode() {
+                        println!(
+                            "watching by polling every {} ms (HAPPYVIEW_WATCH_POLL_MS)",
+                            every.as_millis()
+                        );
+                    }
+                    Some(handle)
+                }
+                Err(e) => {
+                    eprintln!("happyview dev: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+
     let app = server::router(state);
     let addr = config.listen_addr();
 
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) if dev_mode => {
+            eprintln!(
+                "happyview dev: cannot listen on {addr}: {e}; set [dev] port in happyview.toml, or PORT"
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+        Err(e) => panic!("failed to bind {addr}: {e}"),
+    };
     info!(%addr, "HappyView is listening");
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("failed to bind");
 
     axum::serve(listener, app).await.expect("server error");
     std::process::ExitCode::SUCCESS

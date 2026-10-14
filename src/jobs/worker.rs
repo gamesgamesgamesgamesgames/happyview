@@ -6,7 +6,7 @@ use crate::event_log::{EventLog, Severity, log_event};
 use crate::lua::scripts;
 use crate::plugin::ScriptExecuteOutput;
 use crate::repo;
-use crate::script::{Invocation, dispatch};
+use crate::script::{Invocation, ScriptOrigin, dispatch};
 
 use super::db;
 
@@ -67,7 +67,7 @@ pub async fn resume_interrupted_jobs(state: &AppState) {
     }
 }
 
-async fn execute_job(state: &AppState, job: &super::Job) {
+pub(crate) async fn execute_job(state: &AppState, job: &super::Job) {
     let backend = state.db_backend;
 
     log_event(
@@ -123,7 +123,9 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     };
 
     let (claims, pds_auth) = if job.inherit_auth {
-        let pds_auth = if let (Some(api_client_id), Some(dpop_key_id)) =
+        let pds_auth = if let Some(auth) = repo::test_pds_auth(state) {
+            auth
+        } else if let (Some(api_client_id), Some(dpop_key_id)) =
             (&job.api_client_id, &job.dpop_key_id)
         {
             let encryption_key = match state.config.token_encryption_key.as_ref() {
@@ -213,6 +215,7 @@ async fn execute_job(state: &AppState, job: &super::Job) {
             params: None,
             delegate_did: None,
             space: None,
+            origin: ScriptOrigin::of(&script),
         },
         caller_session,
     )
@@ -223,9 +226,13 @@ async fn execute_job(state: &AppState, job: &super::Job) {
     // outcome by the shape of its value.
     let outcome = match run {
         Ok(ScriptExecuteOutput::Returned { value, .. }) => JobOutcome::Completed(value),
-        Ok(ScriptExecuteOutput::Error { kind, raw, .. }) => {
-            JobOutcome::Failed(scripts::failure_text(kind, &raw))
-        }
+        Ok(ScriptExecuteOutput::Error {
+            kind, raw, chunk, ..
+        }) => JobOutcome::Failed(scripts::failure_text(
+            kind,
+            crate::error::file_of(chunk).as_deref(),
+            &raw,
+        )),
         Err(e) => JobOutcome::Failed(e.to_string()),
     };
     finalize(state, job, outcome).await;

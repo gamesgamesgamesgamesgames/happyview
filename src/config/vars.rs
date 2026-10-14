@@ -33,6 +33,15 @@ pub fn set_project_layer(layer: BTreeMap<String, String>) {
     *PROJECT_LAYER.write().unwrap_or_else(|e| e.into_inner()) = layer;
 }
 
+/// The layer as it stands, so a caller that installs a candidate can put the
+/// previous one back.
+pub fn project_layer() -> BTreeMap<String, String> {
+    PROJECT_LAYER
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// A set variable wins even when it is empty, as it always has: `BASE_PATH=`
 /// means "no base path", and the file must not reinterpret it.
 pub fn var_with_source(name: &str) -> Option<(String, VarSource)> {

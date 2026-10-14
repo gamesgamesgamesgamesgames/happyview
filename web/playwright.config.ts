@@ -54,6 +54,7 @@ export default defineConfig({
         "telemetry-settings.spec.ts",
         "telemetry-prompt.spec.ts",
         "project-layer.spec.ts",
+        "script-module-row.spec.ts",
         "plugin-catalogue.spec.ts",
         "plugin-update-approved-url.spec.ts",
       ],

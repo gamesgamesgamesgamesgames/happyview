@@ -224,17 +224,9 @@ pub fn test_state_with_pool(pool: sqlx::AnyPool) -> AppState {
     test_state_with_pool_on(pool, crate::db::DatabaseBackend::Sqlite)
 }
 
-/// A [`test_state_with_pool`] told which backend `pool` actually is.
-///
-/// Every statement the host imports issue goes through `adapt_sql`, and its
-/// SQLite arm is a no-op, so a state that names the wrong backend exercises a
-/// dialect the pool does not speak — or, run against SQLite alone, never
-/// exercises Postgres's at all.
-pub fn test_state_with_pool_on(
-    pool: sqlx::AnyPool,
-    backend: crate::db::DatabaseBackend,
-) -> AppState {
-    let config = Config {
+/// The configuration every in-memory test state carries.
+pub fn test_config(backend: crate::db::DatabaseBackend) -> Config {
+    Config {
         host: "127.0.0.1".into(),
         port: 3000,
         database_url: String::new(),
@@ -265,7 +257,23 @@ pub fn test_state_with_pool_on(
         superadmin_did: None,
         project_root: None,
         project: None,
-    };
+        plugin_dir: std::path::PathBuf::from("./plugins"),
+        auto_backfill: true,
+        script_env_file: None,
+    }
+}
+
+/// A [`test_state_with_pool`] told which backend `pool` actually is.
+///
+/// Every statement the host imports issue goes through `adapt_sql`, and its
+/// SQLite arm is a no-op, so a state that names the wrong backend exercises a
+/// dialect the pool does not speak — or, run against SQLite alone, never
+/// exercises Postgres's at all.
+pub fn test_state_with_pool_on(
+    pool: sqlx::AnyPool,
+    backend: crate::db::DatabaseBackend,
+) -> AppState {
+    let config = test_config(backend);
     let (tx, _) = watch::channel(vec![]);
     let (labeler_tx, _) = watch::channel(());
     let atrium_http = Arc::new(crate::http_retry::HappyViewHttpClient::default());
@@ -357,6 +365,7 @@ pub fn test_state_with_pool_on(
         client_jwks: Vec::new(),
         telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),
         script_limits: Arc::new(crate::lua::limits::ScriptLimits::default()),
+        test: None,
     }
 }
 

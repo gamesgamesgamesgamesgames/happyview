@@ -885,6 +885,15 @@ capabilities = ["library:call"]
     }
 
     #[test]
+    fn an_unknown_module_capability_is_refused_at_its_line() {
+        assert_refused_at(
+            "[modules.m]\nlanguage = \"rust\"\npath = \"m\"\ncapabilities = [\"nope\"]\n",
+            4,
+            "nope",
+        );
+    }
+
+    #[test]
     fn the_full_example_still_parses_under_validation() {
         parse(FULL).unwrap();
     }

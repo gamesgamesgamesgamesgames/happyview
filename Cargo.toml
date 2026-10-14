@@ -15,6 +15,7 @@ exclude = [
     "tests/fixtures/wasi_forbidden",
     "tests/fixtures/interpreter_echo",
     "tests/fixtures/differential_library",
+    "tests/fixtures/script_module",
 ]
 
 [workspace.dependencies]
@@ -121,6 +122,7 @@ subtle = "2"
 mime_guess = "2"
 rust-embed = { version = "8", optional = true }
 sfv = "0.15"
+notify = "8.2"
 
 [features]
 # The native Lua runtime under `src/lua/`, kept to be compared against the

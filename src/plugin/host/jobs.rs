@@ -45,17 +45,18 @@ pub async fn create(
     let caller_did = caller_did.ok_or(JobsError::NoCaller)?;
 
     let (api_client_id, dpop_key_id) = if spec.auth {
-        let dpop_ids = session
+        session
             .and_then(|s| match s.pds_auth.as_ref() {
                 PdsAuth::Dpop {
                     api_client_id,
                     dpop_key_id,
                     ..
-                } => Some((api_client_id.clone(), dpop_key_id.clone())),
-                _ => None,
+                } => Some((Some(api_client_id.clone()), Some(dpop_key_id.clone()))),
+                // The job finds the fake again through `test_pds_auth`.
+                PdsAuth::Fake(_) => Some((None, None)),
+                PdsAuth::OAuth(_) => None,
             })
-            .ok_or(JobsError::NoSession)?;
-        (Some(dpop_ids.0), Some(dpop_ids.1))
+            .ok_or(JobsError::NoSession)?
     } else {
         (None, None)
     };
@@ -216,6 +217,34 @@ mod tests {
         assert_eq!(inherit_auth, 1);
         assert_eq!(api_client_id.as_deref(), Some("test_client"));
         assert_eq!(dpop_key_id.as_deref(), Some("test_key"));
+    }
+
+    /// The fake carries no DPoP ids; the worker finds it again through
+    /// `test_pds_auth`.
+    #[tokio::test]
+    async fn create_with_auth_holding_the_test_pds_carries_no_ids() {
+        let state = AppState {
+            test: Some(Arc::new(crate::testing::TestHarness::new("a.test.lua"))),
+            ..seeded_state().await
+        };
+        let session = CallerSession {
+            pds_auth: Arc::new(crate::repo::test_pds_auth(&state).unwrap()),
+            ..dpop_session(&state, "did:plc:caller")
+        };
+
+        let id = create(
+            &state,
+            Some("did:plc:caller"),
+            Some(&session),
+            spec("test.fake-auth", true),
+        )
+        .await
+        .expect("create should succeed");
+
+        let (_, inherit_auth, api_client_id, dpop_key_id) = job_row(&state, &id).await;
+        assert_eq!(inherit_auth, 1);
+        assert!(api_client_id.is_none());
+        assert!(dpop_key_id.is_none());
     }
 
     #[tokio::test]

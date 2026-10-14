@@ -135,15 +135,10 @@ pub(super) async fn add(
         && tracked.revision == 1
         && auth.has(Permission::BackfillCreate)
     {
-        match crate::admin::backfill::start_backfill(
-            &state,
-            Some(nsid.clone()),
-            Vec::new(),
-            &auth.did,
-        )
-        .await
+        match crate::admin::backfill::start_automatic_backfill(&state, nsid.clone(), &auth.did)
+            .await
         {
-            Ok(job_id) => Some(job_id),
+            Ok(job_id) => job_id,
             Err(e) => {
                 warn!(
                     lexicon = nsid.as_str(),

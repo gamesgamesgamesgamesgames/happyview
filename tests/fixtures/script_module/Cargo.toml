@@ -1,0 +1,17 @@
+[package]
+name = "script-module"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "script_module"
+crate-type = ["cdylib"]
+
+[dependencies]
+happyview-script = { path = "../../../crates/happyview-script" }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"

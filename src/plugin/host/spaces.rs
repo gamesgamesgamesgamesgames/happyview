@@ -560,6 +560,9 @@ mod tests {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
         let (collections_tx, _) = watch::channel(vec![]);
         let (labeler_subscriptions_tx, _) = watch::channel(());
@@ -665,6 +668,7 @@ mod tests {
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(crate::telemetry::counters::Counters::new()),
             script_limits: std::sync::Arc::new(crate::lua::limits::ScriptLimits::default()),
+            test: None,
         };
 
         crate::test_support::provision_space_signing_key(&state).await;

@@ -128,6 +128,8 @@ async fn sample(state: &AppState, interpreter: &str, iterations: u64) -> Duratio
             memory_bytes: 16 * 1024 * 1024,
         },
         removed_globals: Vec::new(),
+        chunk_name: happyview::plugin::DEFAULT_CHUNK_NAME.to_string(),
+        artifact: None,
     };
 
     let started = Instant::now();

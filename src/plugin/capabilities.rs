@@ -78,6 +78,8 @@ pub enum PluginCapability {
     WasiStdio,
     #[serde(rename = "script:host")]
     ScriptHost,
+    #[serde(rename = "script:test")]
+    ScriptTest,
 }
 
 impl PluginCapability {
@@ -112,6 +114,7 @@ impl PluginCapability {
             WasiRandom,
             WasiStdio,
             ScriptHost,
+            ScriptTest,
         ]
     }
 
@@ -146,6 +149,7 @@ impl PluginCapability {
             WasiRandom => "wasi:random",
             WasiStdio => "wasi:stdio",
             ScriptHost => "script:host",
+            ScriptTest => "script:test",
         }
     }
 
@@ -156,9 +160,8 @@ impl PluginCapability {
     pub fn risk(&self) -> Risk {
         use PluginCapability::*;
         match self {
-            SecretsRead | KvRead | KvWrite | JobsRead | WasiClock | WasiRandom | ScriptHost => {
-                Risk::Low
-            }
+            SecretsRead | KvRead | KvWrite | JobsRead | WasiClock | WasiRandom | ScriptHost
+            | ScriptTest => Risk::Low,
             RecordsRead
             | BlobsRead
             | BlobsWrite
@@ -255,7 +258,10 @@ impl PluginCapability {
             WasiRandom => "Read secure random numbers.",
             WasiStdio => "Write to this instance's plugin log.",
             ScriptHost => {
-                "Log, report progress, check for a stop request and wait on behalf of the script run it is inside; the host supplies the run's identity and job."
+                "Log, report progress, check for a stop request, wait, and load the project's own modules on behalf of the script run it is inside; the host supplies the run's identity, job and files."
+            }
+            ScriptTest => {
+                "Fire this project's triggers, mock its libraries and record results, only while the test command runs one of its test files."
             }
         }
     }
@@ -537,6 +543,30 @@ const IMPORT_REQUIREMENTS: &[Requirement] = &[
         import: "host_job_wait",
         any_of: &[PluginCapability::ScriptHost],
     },
+    Requirement {
+        import: "host_module_resolve",
+        any_of: &[PluginCapability::ScriptHost],
+    },
+    Requirement {
+        import: "host_test_trigger",
+        any_of: &[PluginCapability::ScriptTest],
+    },
+    Requirement {
+        import: "host_test_mock",
+        any_of: &[PluginCapability::ScriptTest],
+    },
+    Requirement {
+        import: "host_test_calls",
+        any_of: &[PluginCapability::ScriptTest],
+    },
+    Requirement {
+        import: "host_test_pds_writes",
+        any_of: &[PluginCapability::ScriptTest],
+    },
+    Requirement {
+        import: "host_test_report",
+        any_of: &[PluginCapability::ScriptTest],
+    },
 ];
 
 /// The preview-1 imports a plugin may link, each behind the capability that
@@ -593,8 +623,14 @@ pub fn requirement_for_wasi_import(name: &str) -> Option<Requirement> {
 /// lexicon (published schema rather than anybody's data), and reading back
 /// the plugin's own effective allowed-hosts list, which a plugin needs to
 /// behave sensibly regardless of which of the three network capabilities (or
-/// none) it holds, and which carries nothing secret.
-const FREE_IMPORTS: &[&str] = &["host_log", "host_lexicon_get", "host_allowed_hosts"];
+/// none) it holds, and which carries nothing secret. `host_script_panic` only
+/// describes the run already in progress, so it costs nothing either.
+const FREE_IMPORTS: &[&str] = &[
+    "host_log",
+    "host_lexicon_get",
+    "host_allowed_hosts",
+    "host_script_panic",
+];
 
 pub fn is_free_import(name: &str) -> bool {
     FREE_IMPORTS.contains(&name)
@@ -838,6 +874,13 @@ mod tests {
             "host_job_progress",
             "host_job_should_stop",
             "host_job_wait",
+            "host_script_panic",
+            "host_module_resolve",
+            "host_test_trigger",
+            "host_test_mock",
+            "host_test_calls",
+            "host_test_pds_writes",
+            "host_test_report",
         ] {
             // `None` is only right for the free imports.
             assert_eq!(
@@ -1299,7 +1342,14 @@ mod tests {
         assert!(err.contains("wasi_snapshot_preview2"), "{err}");
     }
 
-    /// The four `env` imports only an interpreter reaches share one Low
+    #[test]
+    fn a_panic_report_needs_no_capability() {
+        assert!(is_free_import("host_script_panic"));
+        let reqs = analyze_imports(&module_importing(&["host_script_panic"])).unwrap();
+        assert!(reqs.is_empty());
+    }
+
+    /// The five `env` imports only an interpreter reaches share one Low
     /// capability: each acts on the run it is inside, and the host supplies
     /// the identity and the job id.
     #[test]
@@ -1309,6 +1359,7 @@ mod tests {
             "host_job_progress",
             "host_job_should_stop",
             "host_job_wait",
+            "host_module_resolve",
         ] {
             let req = requirement_for_import(import).expect(import);
             assert_eq!(req.any_of, &[PluginCapability::ScriptHost], "{import}");
@@ -1322,6 +1373,32 @@ mod tests {
         assert_eq!(PluginCapability::ScriptHost.risk(), Risk::Low);
     }
 
+    /// The five test runner imports share one capability, distinct from
+    /// `script:host`, so an interpreter that never runs tests never declares
+    /// the power to fire triggers.
+    #[test]
+    fn test_runner_imports_need_script_test() {
+        for import in [
+            "host_test_trigger",
+            "host_test_mock",
+            "host_test_calls",
+            "host_test_pds_writes",
+            "host_test_report",
+        ] {
+            let req = requirement_for_import(import).expect(import);
+            assert_eq!(req.any_of, &[PluginCapability::ScriptTest], "{import}");
+            let reqs = analyze_imports(&module_importing(&[import])).unwrap();
+            assert!(
+                check_declared(&[PluginCapability::ScriptHost], &reqs).is_err(),
+                "{import}"
+            );
+            assert!(
+                check_declared(&[PluginCapability::ScriptTest], &reqs).is_ok(),
+                "{import}"
+            );
+        }
+    }
+
     /// The consent sentence for each preview-1 capability says what the
     /// import does; the word WASI tells an operator nothing.
     #[test]
@@ -1331,6 +1408,7 @@ mod tests {
             (PluginCapability::WasiRandom, "wasi:random", Risk::Low),
             (PluginCapability::WasiStdio, "wasi:stdio", Risk::Medium),
             (PluginCapability::ScriptHost, "script:host", Risk::Low),
+            (PluginCapability::ScriptTest, "script:test", Risk::Low),
         ] {
             assert_eq!(cap.as_str(), name);
             assert_eq!(PluginCapability::parse_str(name), Some(cap));

@@ -1457,15 +1457,21 @@ pub enum ScriptKind {
     RecordEvent,
     Label,
     Job,
+    /// A `*.test.<ext>` file run by `happyview test`. It defines no `handle`:
+    /// the interpreter runs the file, collects its tests, runs them and
+    /// reports each through `host_test_report`. An interpreter built before
+    /// this variant existed fails to decode the input and answers `BAD_INPUT`.
+    Test,
 }
 
 impl ScriptKind {
-    pub const ALL: [ScriptKind; 5] = [
+    pub const ALL: [ScriptKind; 6] = [
         ScriptKind::XrpcQuery,
         ScriptKind::XrpcProcedure,
         ScriptKind::RecordEvent,
         ScriptKind::Label,
         ScriptKind::Job,
+        ScriptKind::Test,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -1475,6 +1481,7 @@ impl ScriptKind {
             ScriptKind::RecordEvent => "record_event",
             ScriptKind::Label => "label",
             ScriptKind::Job => "job",
+            ScriptKind::Test => "test",
         }
     }
 }
@@ -1488,11 +1495,21 @@ pub struct LibraryRef {
     pub id: String,
 }
 
+/// The chunk name of a script that has no file: a dashboard row, or a run
+/// from a host that predates chunk naming.
+pub const DEFAULT_CHUNK_NAME: &str = "script";
+
+fn default_chunk_name() -> String {
+    String::from(DEFAULT_CHUNK_NAME)
+}
+
 /// What `execute` receives. Every field is data: nothing in it is a handle
-/// or a credential, and the host holds the identity the four `script:host`
+/// or a credential, and the host holds the identity the five `script:host`
 /// imports act on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecuteInput {
+    /// Empty when `artifact` is present: the host sends whichever of the two
+    /// the interpreter should load, never both.
     pub source: String,
     pub kind: ScriptKind,
     /// The first argument of `handle`.
@@ -1511,6 +1528,16 @@ pub struct ExecuteInput {
     /// exists to prevent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_globals: Vec<String>,
+    /// What the interpreter names the handler's chunk, and the `referrer` it
+    /// sends `host_module_resolve` for an import from it. A project file's
+    /// path from the project root (`src/jobs/tick.lua`), so an error points
+    /// at a file a terminal can open.
+    #[serde(default = "default_chunk_name")]
+    pub chunk_name: String,
+    /// The handler as this interpreter's own `validate` prepared it. Only the
+    /// host supplies one, and only one it stamped for this interpreter build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<PreparedArtifact>,
 }
 
 /// The data half of `ctx`. A field that does not apply to the script's kind
@@ -1653,6 +1680,9 @@ pub enum ExecuteOutput {
         kind: ScriptErrorKind,
         /// What a caller is shown. A `timeout` is the host's cue to write its
         /// own sentence, and an `AUTH_ERROR:` prefix passes through untouched.
+        /// It carries no `chunk:line:` prefix: `chunk` and `line` say where,
+        /// and the host prints them beside the message, so a prefix would
+        /// read twice.
         message: String,
         /// Omitted rather than null when the interpreter could not place the
         /// error on a line, the same spelling [`ValidateError`] uses.
@@ -1660,7 +1690,33 @@ pub enum ExecuteOutput {
         line: Option<u32>,
         /// The interpreter's unparsed text, for the event log.
         raw: String,
+        /// The chunk the interpreter reports `line` in, as it named it: a
+        /// module's id or the run's `chunk_name`, in full, since the chunk
+        /// text inside a message may be truncated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk: Option<String>,
     },
+}
+
+/// What a chunk is for. A handler must define `handle`; a module and a test
+/// need not, so validation that insisted would refuse every module.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkRole {
+    #[default]
+    Handler,
+    Module,
+    Test,
+}
+
+impl ChunkRole {
+    pub fn is_handler(&self) -> bool {
+        matches!(self, ChunkRole::Handler)
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What `validate` receives.
@@ -1676,21 +1732,40 @@ pub struct ValidateInput {
     /// list is not sent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_globals: Vec<String>,
+    /// The name to give the chunk, which a prepared artifact keeps in its
+    /// debug information. Absent means [`DEFAULT_CHUNK_NAME`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_name: Option<String>,
+    /// Return a [`PreparedArtifact`] beside the verdict. Absent and false
+    /// mean the editor's plain check.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prepare: bool,
+    #[serde(default, skip_serializing_if = "ChunkRole::is_handler")]
+    pub role: ChunkRole,
 }
 
-/// What `validate` returns: `{valid: true}`, or `{valid: false, errors}`.
+/// What `validate` returns: `{valid: true}`, or `{valid: false, errors}`,
+/// plus the artifact and the literal imports when asked to prepare.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidateOutput {
     pub valid: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<ValidateError>,
+    /// Absent from an interpreter that cannot prepare, which the host answers
+    /// by running from source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<PreparedArtifact>,
+    /// Every import whose specifier is a literal, so a missing local module
+    /// is reported when the file is saved rather than at its first run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<ImportRef>,
 }
 
 impl ValidateOutput {
     pub fn valid() -> Self {
         Self {
             valid: true,
-            errors: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -1698,7 +1773,82 @@ impl ValidateOutput {
         Self {
             valid: false,
             errors,
+            ..Self::default()
         }
+    }
+}
+
+/// A script or module as its interpreter can load it quickly — bytecode,
+/// typically. Opaque to the host, which only stamps and routes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedArtifact {
+    /// The interpreter plugin's id. The host overwrites whatever the guest
+    /// wrote, so an artifact can only ever claim the build that made it.
+    pub interpreter: String,
+    /// The interpreter build, stamped by the host the same way.
+    pub version: String,
+    /// The engine inside the interpreter, set by the interpreter, e.g.
+    /// `puc-lua-5.4.7`.
+    pub engine: String,
+    /// What `bytes` holds, e.g. `lua-bytecode`.
+    pub format: String,
+    /// Base64 on the wire, standard alphabet (RFC 4648 §4), padded, with no
+    /// whitespace: bytecode is binary, and a JSON array of numbers would be
+    /// several times its size on every run. Any other dialect is refused
+    /// when the JSON is parsed.
+    #[serde(with = "base64_bytes")]
+    pub bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_map: Option<String>,
+}
+
+/// One import `validate` found whose specifier is a literal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportRef {
+    pub specifier: String,
+    pub line: u32,
+}
+
+/// What `host_module_resolve` receives. `referrer` is the importing chunk's
+/// name: the run's `chunk_name`, or the `id` a previous resolution answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleResolve {
+    pub specifier: String,
+    pub referrer: String,
+}
+
+/// A resolved local module. `id` is canonical — two specifiers naming one
+/// file answer the same `id` — so an interpreter de-duplicates by it and
+/// names the module's chunk with it.
+///
+/// `source` is always present. `artifact` is present only when the host holds
+/// one this interpreter build prepared from that same source; load it when it
+/// is there, and fall back to `source` when it is absent or will not load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedModule {
+    pub id: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<PreparedArtifact>,
+}
+
+mod base64_bytes {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD
+            .decode(text.as_bytes())
+            .map_err(|e| serde::de::Error::custom(alloc::format!("bytes are not base64: {e}")))
     }
 }
 
@@ -1708,6 +1858,8 @@ pub struct ValidateError {
     pub kind: ScriptErrorKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u32>,
+    /// The reason alone, with no `chunk:line:` prefix: `line` says where,
+    /// and the host names the file beside the message.
     pub message: String,
 }
 
@@ -1719,6 +1871,18 @@ pub struct ScriptLogRequest {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<Value>,
+}
+
+/// What `host_script_panic` receives: where a guest panicked and what it
+/// said. A guest built with `panic = "abort"` cannot return an `execute`
+/// answer once it panics, so its hook sends this just before it traps and the
+/// host answers the run with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanicReport {
+    pub message: String,
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
 }
 
 /// What `host_job_progress` receives: the value stored on the job row.
@@ -1735,6 +1899,127 @@ pub struct JobShouldStopRequest {}
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct JobWaitRequest {
     pub seconds: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Test runner imports
+// ---------------------------------------------------------------------------
+
+/// Which trigger `host_test_trigger` fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestTriggerKind {
+    Query,
+    Procedure,
+    RecordCreate,
+    RecordUpdate,
+    RecordDelete,
+    Job,
+    Label,
+}
+
+impl TestTriggerKind {
+    pub const ALL: [TestTriggerKind; 7] = [
+        TestTriggerKind::Query,
+        TestTriggerKind::Procedure,
+        TestTriggerKind::RecordCreate,
+        TestTriggerKind::RecordUpdate,
+        TestTriggerKind::RecordDelete,
+        TestTriggerKind::Job,
+        TestTriggerKind::Label,
+    ];
+}
+
+/// What `host_test_trigger` receives. `target` is the NSID, collection, job
+/// type or label subject URI the kind needs; `input` is the query's
+/// parameters, the procedure's body, the record, the job's input or the
+/// label's body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestTrigger {
+    pub kind: TestTriggerKind,
+    pub target: String,
+    #[serde(default)]
+    pub input: Value,
+    /// The record's author, for the three record kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rkey: Option<String>,
+    /// The caller the trigger is forged as.
+    #[serde(default, rename = "as", skip_serializing_if = "Option::is_none")]
+    pub as_did: Option<String>,
+}
+
+/// What a trigger produced: an HTTP status and a JSON body for every kind, so
+/// a test asserts on one shape whichever trigger it fired.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestTriggerResult {
+    pub status: u16,
+    pub body: Value,
+}
+
+/// What `host_test_mock` receives: `{method: response | [responses]}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestMock {
+    pub namespace: String,
+    pub responses: Value,
+}
+
+/// What `host_test_calls` receives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCalls {
+    pub namespace: String,
+}
+
+/// One recorded library call, `args` as the JSON array the call carried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestCall {
+    pub method: String,
+    pub args: Value,
+}
+
+/// What `host_test_pds_writes` receives. Empty: the writes are the run's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestPdsWritesRequest {}
+
+/// One write the in-process PDS accepted. `record` and `cid` are absent for a
+/// delete.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestPdsWrite {
+    pub action: String,
+    pub repo: String,
+    pub collection: String,
+    pub rkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+}
+
+/// A test's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestStatus {
+    Pass,
+    Fail,
+    Skip,
+}
+
+/// What `host_test_report` receives, once per test. `name` is the test's
+/// full name, its `describe` blocks joined with ` > `; `file` and `line` place
+/// the failing assertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestReport {
+    pub path: String,
+    pub name: String,
+    pub status: TestStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub duration_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -3923,6 +4208,9 @@ mod interpreter_tests {
                     id: "job-1".to_string(),
                 });
             }
+            ScriptKind::Test => {
+                ctx.trigger = "test:src/lib/format.test.lua".to_string();
+            }
         }
         ctx
     }
@@ -3949,7 +4237,7 @@ mod interpreter_tests {
                 id: "happyview-db".to_string(),
             }],
             limits: ExecuteLimits {
-                instructions: if kind == ScriptKind::Job {
+                instructions: if matches!(kind, ScriptKind::Job | ScriptKind::Test) {
                     None
                 } else {
                     Some(1_000_000)
@@ -3957,6 +4245,8 @@ mod interpreter_tests {
                 memory_bytes: 64 * 1024 * 1024,
             },
             removed_globals: vec!["Record".to_string(), "xrpc".to_string()],
+            chunk_name: DEFAULT_CHUNK_NAME.to_string(),
+            artifact: None,
         }
     }
 
@@ -4072,6 +4362,62 @@ mod interpreter_tests {
     }
 
     #[test]
+    fn the_test_runner_types_carry_their_wire_names() {
+        let trigger: TestTrigger = serde_json::from_value(json!({
+            "kind": "record_create", "target": "app.test.rec", "input": {"a": 1},
+            "did": "did:plc:alice", "rkey": "3k", "as": "did:plc:bob",
+        }))
+        .unwrap();
+        assert_eq!(trigger.kind, TestTriggerKind::RecordCreate);
+        assert_eq!(trigger.as_did.as_deref(), Some("did:plc:bob"));
+        assert_eq!(
+            serde_json::to_value(&trigger).unwrap()["as"],
+            json!("did:plc:bob")
+        );
+
+        let bare: TestTrigger =
+            serde_json::from_value(json!({"kind": "query", "target": "app.test.q"})).unwrap();
+        assert_eq!(bare.input, Value::Null);
+        assert!(bare.did.is_none() && bare.rkey.is_none() && bare.as_did.is_none());
+
+        let kinds: Vec<Value> = TestTriggerKind::ALL
+            .iter()
+            .map(|k| serde_json::to_value(k).unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                json!("query"),
+                json!("procedure"),
+                json!("record_create"),
+                json!("record_update"),
+                json!("record_delete"),
+                json!("job"),
+                json!("label"),
+            ]
+        );
+
+        let report: TestReport = serde_json::from_value(json!({
+            "path": "src/lib/a.test.lua", "name": "a > b", "status": "fail",
+            "message": "expected 1, got 2", "file": "src/lib/a.test.lua", "line": 3, "duration_ms": 4,
+        }))
+        .unwrap();
+        assert_eq!(report.status, TestStatus::Fail);
+        assert_eq!(report.line, Some(3));
+        let minimal: TestReport = serde_json::from_value(json!({
+            "path": "p", "name": "n", "status": "skip", "duration_ms": 0,
+        }))
+        .unwrap();
+        assert!(minimal.message.is_none() && minimal.file.is_none() && minimal.line.is_none());
+
+        let write: TestPdsWrite = serde_json::from_value(json!({
+            "action": "delete", "repo": "did:plc:a", "collection": "c", "rkey": "r",
+        }))
+        .unwrap();
+        assert!(write.record.is_none() && write.cid.is_none());
+    }
+
+    #[test]
     fn script_enums_serialize_snake_case() {
         let kinds: Vec<Value> = ScriptKind::ALL
             .iter()
@@ -4084,7 +4430,8 @@ mod interpreter_tests {
                 json!("xrpc_procedure"),
                 json!("record_event"),
                 json!("label"),
-                json!("job")
+                json!("job"),
+                json!("test")
             ]
         );
         for kind in ScriptKind::ALL {
@@ -4142,6 +4489,7 @@ mod interpreter_tests {
                 message: "attempt to index a nil value".to_string(),
                 line: Some(12),
                 raw: "[string \"script\"]:12: attempt to index a nil value".to_string(),
+                chunk: None,
             }
         );
 
@@ -4193,6 +4541,7 @@ mod interpreter_tests {
             message: "script exceeded execution limit".to_string(),
             line: None,
             raw: "instruction limit".to_string(),
+            chunk: None,
         };
         let value = serde_json::to_value(&error).unwrap();
         assert_eq!(value["status"], "error");
@@ -4219,6 +4568,7 @@ mod interpreter_tests {
         let input = ValidateInput {
             source: "function handle() end".to_string(),
             removed_globals: vec!["env".to_string(), "Record".to_string()],
+            ..Default::default()
         };
         assert_eq!(
             serde_json::to_value(&input).unwrap(),
@@ -4234,6 +4584,7 @@ mod interpreter_tests {
         let bare = ValidateInput {
             source: "function handle() end".to_string(),
             removed_globals: Vec::new(),
+            ..Default::default()
         };
         let value = serde_json::to_value(&bare).unwrap();
         assert_eq!(value, json!({"source": "function handle() end"}));
@@ -4271,6 +4622,197 @@ mod interpreter_tests {
         }))
         .unwrap();
         assert_eq!(prototype.errors[0].line, None);
+    }
+
+    fn artifact() -> PreparedArtifact {
+        PreparedArtifact {
+            interpreter: "lua".to_string(),
+            version: "1.4.0+0123456789abcdef".to_string(),
+            engine: "puc-lua-5.4.7".to_string(),
+            format: "lua-bytecode".to_string(),
+            bytes: vec![0x1b, 0x4c, 0x75, 0x61, 0x00, 0xff],
+            source_map: None,
+        }
+    }
+
+    #[test]
+    fn artifact_bytes_travel_as_base64_and_an_absent_source_map_is_omitted() {
+        let value = serde_json::to_value(artifact()).unwrap();
+        assert_eq!(value["bytes"], "G0x1YQD/");
+        assert!(value.get("source_map").is_none(), "{value}");
+        assert_eq!(
+            serde_json::from_value::<PreparedArtifact>(value).unwrap(),
+            artifact()
+        );
+
+        let with_map = PreparedArtifact {
+            source_map: Some("{\"version\":3}".to_string()),
+            ..artifact()
+        };
+        let value = serde_json::to_value(&with_map).unwrap();
+        assert_eq!(value["source_map"], "{\"version\":3}");
+        assert_eq!(
+            serde_json::from_value::<PreparedArtifact>(value).unwrap(),
+            with_map
+        );
+
+        let err = serde_json::from_value::<PreparedArtifact>(json!({
+            "interpreter": "lua", "version": "1", "engine": "e", "format": "f",
+            "bytes": "not base64!",
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("bytes") || err.to_string().contains("base64"),
+            "{err}"
+        );
+    }
+
+    /// An interpreter built before artifacts existed sends none of the new
+    /// fields, and a host that sends none of them is talking to it; both must
+    /// parse as "nothing prepared".
+    #[test]
+    fn the_new_fields_default_so_either_side_may_predate_them() {
+        let validate_in: ValidateInput = serde_json::from_value(json!({"source": "x"})).unwrap();
+        assert_eq!(validate_in.chunk_name, None);
+        assert!(!validate_in.prepare);
+        assert_eq!(validate_in.role, ChunkRole::Handler);
+        assert_eq!(
+            serde_json::to_value(&validate_in).unwrap(),
+            json!({"source": "x"})
+        );
+
+        let validate_out: ValidateOutput = serde_json::from_value(json!({"valid": true})).unwrap();
+        assert_eq!(validate_out.artifact, None);
+        assert!(validate_out.imports.is_empty());
+        assert_eq!(
+            serde_json::to_value(&validate_out).unwrap(),
+            json!({"valid": true})
+        );
+
+        let execute_in: ExecuteInput = serde_json::from_value(json!({
+            "source": "s", "kind": "job", "input": null,
+            "context": {"trigger": "job.run:x"},
+            "limits": {"instructions": null, "memory_bytes": 1},
+        }))
+        .unwrap();
+        assert_eq!(execute_in.chunk_name, DEFAULT_CHUNK_NAME);
+        assert_eq!(execute_in.artifact, None);
+
+        let error: ExecuteOutput = serde_json::from_value(json!({
+            "status": "error", "kind": "runtime", "message": "m", "raw": "r",
+        }))
+        .unwrap();
+        let ExecuteOutput::Error { chunk, .. } = &error else {
+            panic!("expected an error, got {error:?}");
+        };
+        assert_eq!(*chunk, None);
+        assert!(serde_json::to_value(&error).unwrap().get("chunk").is_none());
+    }
+
+    #[test]
+    fn a_prepare_request_and_its_answer_round_trip() {
+        let input = ValidateInput {
+            source: "return {}".to_string(),
+            removed_globals: Vec::new(),
+            chunk_name: Some("src/lib/format.lua".to_string()),
+            prepare: true,
+            role: ChunkRole::Module,
+        };
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            value,
+            json!({"source": "return {}", "chunk_name": "src/lib/format.lua",
+                   "prepare": true, "role": "module"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ValidateInput>(value).unwrap(),
+            input
+        );
+
+        let output = ValidateOutput {
+            artifact: Some(artifact()),
+            imports: vec![ImportRef {
+                specifier: "./lib/format".to_string(),
+                line: 3,
+            }],
+            ..ValidateOutput::valid()
+        };
+        let value = serde_json::to_value(&output).unwrap();
+        assert_eq!(
+            value["imports"],
+            json!([{"specifier": "./lib/format", "line": 3}])
+        );
+        assert_eq!(
+            serde_json::from_value::<ValidateOutput>(value).unwrap(),
+            output
+        );
+
+        for (role, name) in [
+            (ChunkRole::Handler, "handler"),
+            (ChunkRole::Module, "module"),
+            (ChunkRole::Test, "test"),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), json!(name));
+        }
+    }
+
+    #[test]
+    fn module_resolution_types_round_trip() {
+        let request = ModuleResolve {
+            specifier: "../lib/format".to_string(),
+            referrer: "src/jobs/tick.lua".to_string(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            json!({"specifier": "../lib/format", "referrer": "src/jobs/tick.lua"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ModuleResolve>(value).unwrap(),
+            request
+        );
+
+        let resolved = ResolvedModule {
+            id: "src/lib/format.lua".to_string(),
+            source: "return {}".to_string(),
+            artifact: None,
+        };
+        let value = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(
+            value,
+            json!({"id": "src/lib/format.lua", "source": "return {}"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ResolvedModule>(value).unwrap(),
+            resolved
+        );
+
+        let with_artifact = ResolvedModule {
+            artifact: Some(artifact()),
+            ..resolved
+        };
+        assert_eq!(
+            serde_json::from_value::<ResolvedModule>(serde_json::to_value(&with_artifact).unwrap())
+                .unwrap(),
+            with_artifact
+        );
+    }
+
+    #[test]
+    fn an_execute_input_carries_its_chunk_and_artifact() {
+        let input = ExecuteInput {
+            source: String::new(),
+            chunk_name: "src/jobs/tick.lua".to_string(),
+            artifact: Some(artifact()),
+            ..full_input(ScriptKind::Job)
+        };
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value["chunk_name"], "src/jobs/tick.lua");
+        assert_eq!(value["artifact"]["format"], "lua-bytecode");
+        assert_eq!(
+            serde_json::from_value::<ExecuteInput>(value).unwrap(),
+            input
+        );
     }
 
     #[test]
@@ -4330,5 +4872,21 @@ mod interpreter_tests {
             serde_json::from_value::<JobWaitRequest>(value).unwrap(),
             wait
         );
+    }
+
+    #[test]
+    fn a_panic_report_round_trips_with_its_location() {
+        let report = PanicReport {
+            message: "boom".into(),
+            file: "src/lib.rs".into(),
+            line: 7,
+            column: 5,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"message": "boom", "file": "src/lib.rs", "line": 7, "column": 5})
+        );
+        assert_eq!(serde_json::from_value::<PanicReport>(json).unwrap(), report);
     }
 }

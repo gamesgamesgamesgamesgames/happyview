@@ -73,7 +73,7 @@ async fn a_project_query_is_served_by_its_file_with_its_overrides() {
     assert_eq!(resp.status(), StatusCode::OK);
     let sent = json_body(resp).await;
     assert_eq!(
-        sent["source"],
+        echo_interpreter::script_text(&sent),
         std::fs::read_to_string(format!(
             "{BASIC}/src/lexicons/com/example/project/getThing.echo"
         ))
@@ -96,7 +96,7 @@ async fn a_project_query_is_served_by_its_file_with_its_overrides() {
 }
 
 /// The real interpreter's verdicts: a handler builds, a syntax error comes
-/// back with its file and line, and a module (not yet validated) is stored.
+/// back with its file and line, and a module with no `handle` is stored.
 #[tokio::test]
 async fn a_lua_project_builds_through_the_real_interpreter() {
     let Some(dir) = common::lua_plugin::plugin_dir() else {

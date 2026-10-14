@@ -222,7 +222,14 @@ export default function ScriptsPage() {
         // Muted rather than destructive: the row is intact, and what is
         // missing is an install the operator has not done yet.
         cell: ({ row }) =>
-          row.original.runnable ? null : (
+          row.original.module ? (
+            <Badge
+              variant="secondary"
+              title={`Built from ${row.original.module.path}`}
+            >
+              Module
+            </Badge>
+          ) : row.original.runnable ? null : (
             <Badge
               variant="outline"
               className="text-muted-foreground"

@@ -95,14 +95,8 @@ mod tests {
     use crate::db::DatabaseBackend;
     use crate::test_support::migrated_memory_pool;
 
-    /// The test state's `Config`, which is a complete literal; the state's
-    /// own pool is not used.
-    async fn config_with(superadmin: Option<&str>) -> Config {
-        let mut config = crate::test_support::test_state_with_pool_on(
-            crate::test_support::memory_pool().await,
-            DatabaseBackend::Sqlite,
-        )
-        .config;
+    fn config_with(superadmin: Option<&str>) -> Config {
+        let mut config = crate::test_support::test_config(DatabaseBackend::Sqlite);
         config.superadmin_did = superadmin.map(str::to_string);
         config
     }
@@ -110,7 +104,7 @@ mod tests {
     #[tokio::test]
     async fn boot_subscribes_the_declared_labelers() {
         let db = migrated_memory_pool().await;
-        let mut config = config_with(None).await;
+        let mut config = config_with(None);
         config.project = Some(std::sync::Arc::new(
             crate::config::project::parse_project_config(
                 "[labels]\nsubscribe = [\"did:plc:declared\"]\n",
@@ -138,7 +132,7 @@ mod tests {
     #[tokio::test]
     async fn boot_seeds_the_configured_superadmin() {
         let db = migrated_memory_pool().await;
-        let config = config_with(Some("did:plc:boss")).await;
+        let config = config_with(Some("did:plc:boss"));
         apply_at_boot(
             &config,
             &db,
@@ -159,7 +153,7 @@ mod tests {
     #[tokio::test]
     async fn boot_hands_the_declared_network_lexicons_to_the_tracker() {
         let db = migrated_memory_pool().await;
-        let mut config = config_with(None).await;
+        let mut config = config_with(None);
         config.project = Some(std::sync::Arc::new(
             crate::config::project::parse_project_config(
                 "[network_lexicons]\ninclude = [\"at.example.declared\"]\n",

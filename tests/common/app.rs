@@ -112,6 +112,9 @@ impl TestApp {
             superadmin_did: None,
             project_root: None,
             project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
 
         let sql = adapt_sql(
@@ -253,6 +256,7 @@ impl TestApp {
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
             script_limits: std::sync::Arc::new(happyview::lua::limits::ScriptLimits::default()),
+            test: None,
         };
 
         if let Some(key) = state.config.token_encryption_key.as_ref() {

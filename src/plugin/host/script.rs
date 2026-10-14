@@ -1,21 +1,47 @@
-//! The four imports only an interpreter reaches: the running script's log
-//! line and its job's three controls.
+//! The five imports only an interpreter reaches: the running script's log
+//! line, its job's three controls, and resolving a local module.
 //!
 //! The host holds the run's identity for the whole run, so a guest can neither
-//! attribute a log line to another trigger nor act on another run's job.
+//! attribute a log line to another trigger, act on another run's job, nor
+//! read a module from any snapshot but the one its run pinned.
+
+use std::sync::Arc;
 
 use crate::AppState;
 use crate::event_log::{EventLog, Severity, log_event};
+use crate::plugin::prepared::ArtifactStamp;
+use crate::project::snapshot::ProjectSnapshot;
 
-use happyview_plugin_sdk::wire::{JobProgressRequest, JobWaitRequest, Level, ScriptLogRequest};
+use happyview_plugin_sdk::wire::{
+    JobProgressRequest, JobWaitRequest, Level, ModuleResolve, ResolvedModule, ScriptLogRequest,
+};
 
 /// The longest a job may wait in one call, matching the range the `ctx.job`
 /// surface documents.
 const MAX_WAIT_SECONDS: f64 = 3600.0;
 
+/// Where a run's relative imports resolve.
+#[derive(Clone, Default)]
+pub enum ModuleScope {
+    /// A script created in the dashboard, which has no files beside it.
+    #[default]
+    Dashboard,
+    /// A project file, resolving against the snapshot its run pinned.
+    Project(Arc<ProjectSnapshot>),
+}
+
+impl std::fmt::Debug for ModuleScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dashboard => f.write_str("Dashboard"),
+            Self::Project(snapshot) => write!(f, "Project(generation {})", snapshot.generation),
+        }
+    }
+}
+
 /// Who a run is and which job it belongs to. `None` on a
 /// [`PluginState`](super::PluginState) means no script run is in progress,
-/// which is what makes these four imports refuse for a library or auth plugin.
+/// which is what makes these five imports refuse for a library or auth plugin.
 #[derive(Debug, Clone, Default)]
 pub struct ScriptRun {
     pub trigger_id: String,
@@ -23,6 +49,21 @@ pub struct ScriptRun {
     /// Set for a job run, whose log lines also land in the job's own log and
     /// whose progress, stop flag and waits the three controls act on.
     pub job_id: Option<String>,
+    /// Whether this run is a test file. The five test imports answer only
+    /// when it is, whatever the plugin declared.
+    pub test: bool,
+    /// The calling interpreter's language and the extensions it claims; a
+    /// module resolves only to a file it could have written.
+    pub language_id: String,
+    pub extensions: Vec<String>,
+    /// The calling interpreter's build. A module's artifact is answered only
+    /// when it carries this stamp.
+    pub stamp: Option<ArtifactStamp>,
+    pub modules: ModuleScope,
+    /// Milliseconds this run has spent in `host_job_wait`, which a test run
+    /// caps in total: a wait is host time, so a job that waits in a loop
+    /// would otherwise never reach its deadline.
+    pub waited_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +72,14 @@ pub enum ScriptHostError {
     NoJob(&'static str),
     #[error("{0}")]
     Database(String),
+    #[error(
+        "'{0}' is a local module, and local modules come from a project: a script created in the dashboard has no files beside it to import"
+    )]
+    NoProject(String),
+    #[error("{0}")]
+    BadSpecifier(String),
+    #[error("{0}")]
+    ModuleNotFound(String),
 }
 
 impl ScriptHostError {
@@ -40,6 +89,9 @@ impl ScriptHostError {
         match self {
             Self::NoJob(_) => "BAD_INPUT",
             Self::Database(_) => "HOST_ERROR",
+            Self::NoProject(_) => "UNSUPPORTED",
+            Self::BadSpecifier(_) => "BAD_INPUT",
+            Self::ModuleNotFound(_) => "NOT_FOUND",
         }
     }
 }
@@ -124,19 +176,33 @@ pub async fn should_stop(state: &AppState, run: &ScriptRun) -> Result<bool, Scri
 
 /// Sleep, clamped to the range a job may wait. The import wrapper stops the
 /// guest's execution clock for the duration, so a wait is host time and is
-/// never charged to the run's budget.
+/// never charged to the run's budget. In a test run the run's waits share
+/// one test file's budget between them, since the run awaits the job and
+/// nothing else would end it.
 pub async fn wait(
     state: &AppState,
     run: &ScriptRun,
     request: JobWaitRequest,
 ) -> Result<(), ScriptHostError> {
+    use std::sync::atomic::Ordering;
+
     job_of(run, "host_job_wait")?;
+    let ceiling = if state.test.is_some() {
+        let budget_ms = crate::plugin::executor::TEST_FILE_GUEST_SECONDS * 1000;
+        budget_ms.saturating_sub(run.waited_ms.load(Ordering::Relaxed)) as f64 / 1000.0
+    } else {
+        MAX_WAIT_SECONDS
+    };
     let duration = std::time::Duration::from_secs_f64(
         request
             .seconds
-            .clamp(0.0, MAX_WAIT_SECONDS)
+            .clamp(0.0, ceiling)
             // A NaN survives `clamp`, and `from_secs_f64` panics on one.
             .max(0.0),
+    );
+    run.waited_ms.fetch_add(
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
     );
     tokio::time::sleep(duration).await;
     crate::telemetry::counters::add_saturating(
@@ -144,6 +210,41 @@ pub async fn wait(
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
     );
     Ok(())
+}
+
+/// Resolve a relative import against the run's pinned snapshot. A memory
+/// lookup, so a guest may block on it: `require` and a module loader are
+/// synchronous in the languages that call it.
+pub fn module_resolve(
+    run: &ScriptRun,
+    request: ModuleResolve,
+) -> Result<ResolvedModule, ScriptHostError> {
+    use crate::project::modules::{ModuleError, resolve_module};
+
+    let ModuleScope::Project(snapshot) = &run.modules else {
+        return Err(ScriptHostError::NoProject(request.specifier));
+    };
+    let module = resolve_module(
+        snapshot,
+        &request.specifier,
+        &request.referrer,
+        &run.extensions,
+        &run.language_id,
+    )
+    .map_err(|e| match e {
+        ModuleError::NotFound(message) => ScriptHostError::ModuleNotFound(message),
+        other => ScriptHostError::BadSpecifier(other.to_string()),
+    })?;
+    let artifact = module
+        .artifact
+        .as_ref()
+        .filter(|artifact| run.stamp.as_ref().is_some_and(|s| s.matches(artifact)))
+        .cloned();
+    Ok(ResolvedModule {
+        id: module.id.clone(),
+        source: module.source.to_string(),
+        artifact,
+    })
 }
 
 #[cfg(test)]
@@ -156,7 +257,96 @@ mod tests {
             trigger_id: "xrpc.query:app.test.q".into(),
             caller_did: Some("did:plc:me".into()),
             job_id: job_id.map(str::to_string),
+            ..ScriptRun::default()
         }
+    }
+
+    use crate::plugin::PreparedArtifact;
+    use crate::project::snapshot::ProjectModule;
+
+    fn stamp() -> ArtifactStamp {
+        ArtifactStamp {
+            interpreter: "lua".into(),
+            version: "1.0.0+0000000000000000".into(),
+        }
+    }
+
+    fn artifact(version: &str) -> PreparedArtifact {
+        PreparedArtifact {
+            interpreter: "lua".into(),
+            version: version.into(),
+            engine: "e".into(),
+            format: "lua-bytecode".into(),
+            bytes: vec![1],
+            source_map: None,
+        }
+    }
+
+    fn project_run(module_artifact: Option<PreparedArtifact>) -> ScriptRun {
+        let mut snap = ProjectSnapshot::empty();
+        snap.modules.insert(
+            "src/lib/format.lua".into(),
+            ProjectModule {
+                id: "src/lib/format.lua".into(),
+                path: "src/lib/format.lua".into(),
+                language_id: "lua".into(),
+                source: Arc::from("return {}"),
+                artifact: module_artifact,
+            },
+        );
+        ScriptRun {
+            language_id: "lua".into(),
+            extensions: vec!["lua".into()],
+            stamp: Some(stamp()),
+            modules: ModuleScope::Project(Arc::new(snap)),
+            ..run(None)
+        }
+    }
+
+    fn request(specifier: &str) -> ModuleResolve {
+        ModuleResolve {
+            specifier: specifier.into(),
+            referrer: "src/jobs/tick.lua".into(),
+        }
+    }
+
+    #[test]
+    fn a_project_run_resolves_and_receives_a_matching_artifact() {
+        let run = project_run(Some(artifact(&stamp().version)));
+        let resolved = module_resolve(&run, request("../lib/format")).unwrap();
+        assert_eq!(resolved.id, "src/lib/format.lua");
+        assert_eq!(resolved.source, "return {}");
+        assert_eq!(resolved.artifact, Some(artifact(&stamp().version)));
+    }
+
+    #[test]
+    fn an_artifact_from_another_build_is_withheld_and_the_source_still_answers() {
+        let run = project_run(Some(artifact("0.9.0+ffffffffffffffff")));
+        let resolved = module_resolve(&run, request("../lib/format")).unwrap();
+        assert_eq!(resolved.artifact, None);
+        assert_eq!(resolved.source, "return {}");
+    }
+
+    #[test]
+    fn a_miss_is_not_found() {
+        let err = module_resolve(&project_run(None), request("./nothing")).unwrap_err();
+        assert_eq!(err.code(), "NOT_FOUND", "{err}");
+        assert!(err.to_string().contains("./nothing"), "{err}");
+    }
+
+    #[test]
+    fn an_escaping_specifier_is_bad_input() {
+        let err = module_resolve(&project_run(None), request("../../../etc/passwd")).unwrap_err();
+        assert_eq!(err.code(), "BAD_INPUT", "{err}");
+    }
+
+    #[test]
+    fn a_dashboard_run_hears_that_local_modules_come_from_a_project() {
+        let err = module_resolve(&run(None), request("./lib/format")).unwrap_err();
+        assert_eq!(err.code(), "UNSUPPORTED", "{err}");
+        let message = err.to_string();
+        assert!(message.contains("./lib/format"), "{message}");
+        assert!(message.contains("project"), "{message}");
     }
 
     async fn state() -> AppState {
@@ -251,6 +441,42 @@ mod tests {
         // records, since sleeping an hour is not a test.
         let clamped = std::time::Duration::from_secs_f64(f64::MAX.clamp(0.0, MAX_WAIT_SECONDS));
         assert_eq!(clamped, std::time::Duration::from_secs(3600));
+    }
+
+    /// A run that has already waited a test file's budget waits no more in a
+    /// test run, and still waits as asked in a serving one.
+    #[tokio::test]
+    async fn a_test_runs_waits_share_one_budget_and_a_serving_runs_do_not() {
+        use std::sync::atomic::Ordering;
+
+        let spent = crate::plugin::executor::TEST_FILE_GUEST_SECONDS * 1000;
+        for (test, expected_ms) in [(true, 0), (false, 300)] {
+            let mut state = state().await;
+            if test {
+                state.test = Some(Arc::new(crate::testing::TestHarness::new("a.test.lua")));
+            }
+            let job = crate::jobs::db::create_job(
+                &state,
+                "test.interpreter",
+                &serde_json::json!({}),
+                "did:plc:me",
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let run = run(Some(&job));
+            run.waited_ms.store(spent, Ordering::Relaxed);
+            wait(&state, &run, JobWaitRequest { seconds: 0.3 })
+                .await
+                .unwrap();
+            assert_eq!(
+                state.telemetry_counters.job_wait_ms.load(Ordering::Relaxed),
+                expected_ms,
+                "test run: {test}"
+            );
+        }
     }
 
     #[tokio::test]
