@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { ScriptModuleRow } from "@/types/scripts";
 
 /**
@@ -6,11 +7,19 @@ import type { ScriptModuleRow } from "@/types/scripts";
  * binary edited here would have no source anyone could review or rebuild.
  */
 export function ScriptModulePanel({ module }: { module: ScriptModuleRow }) {
-  const rows: [string, string][] = [
+  const rows: [string, ReactNode][] = [
     ["Module", module.module],
     ["Path", module.path],
-    ["Handler", module.handler],
-    ["Build", module.hash.slice(0, 12)],
+    [
+      "Handler",
+      module.handler || (
+        <>
+          <span aria-hidden="true">—</span>
+          <span className="sr-only">not recorded</span>
+        </>
+      ),
+    ],
+    ["Build", module.hash],
   ];
   return (
     <section
@@ -25,12 +34,7 @@ export function ScriptModulePanel({ module }: { module: ScriptModuleRow }) {
         {rows.map(([label, value]) => (
           <div key={label} className="contents">
             <dt className="text-muted-foreground">{label}</dt>
-            <dd
-              className="font-mono break-all"
-              title={label === "Build" ? module.hash : undefined}
-            >
-              {value}
-            </dd>
+            <dd className="font-mono break-all">{value}</dd>
           </div>
         ))}
       </dl>

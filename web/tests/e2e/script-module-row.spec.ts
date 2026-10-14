@@ -54,7 +54,7 @@ test.describe("A compiled module's handler", () => {
       "registry",
       "modules/registry",
       "echo",
-      ROW.module.hash.slice(0, 12),
+      ROW.module.hash,
     ]);
 
     await expect(page.getByRole("button", { name: /^save/i })).toHaveCount(0);
@@ -62,5 +62,28 @@ test.describe("A compiled module's handler", () => {
       page.getByRole("button", { name: /delete script/i }),
     ).toHaveCount(0);
     await expect(page.getByText(/No interpreter is installed/)).toHaveCount(0);
+  });
+
+  test("says when the build did not record the handler's function", async ({
+    page,
+  }) => {
+    await page.route(
+      (url) =>
+        url.pathname.endsWith(`/admin/scripts/${encodeURIComponent(ID)}`),
+      (route) =>
+        route.request().isNavigationRequest()
+          ? route.continue()
+          : route.fulfill({
+              json: { ...ROW, module: { ...ROW.module, handler: "" } },
+            }),
+    );
+    await page.goto(`/dashboard/settings/scripts/${encodeURIComponent(ID)}`);
+
+    const handler = page
+      .getByRole("region", { name: "Compiled module" })
+      .locator("dd")
+      .nth(2);
+    await expect(handler).toHaveText("—not recorded");
+    await expect(handler.locator(".sr-only")).toHaveText("not recorded");
   });
 });

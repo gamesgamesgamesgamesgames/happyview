@@ -227,7 +227,7 @@ export default function ScriptsPage() {
               variant="secondary"
               title={`Built from ${row.original.module.path}`}
             >
-              module
+              Module
             </Badge>
           ) : row.original.runnable ? null : (
             <Badge

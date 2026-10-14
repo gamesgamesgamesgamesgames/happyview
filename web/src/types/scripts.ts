@@ -81,7 +81,7 @@ export interface ScriptModuleRow {
   module: string
   /** The module's crate, relative to the project root. */
   path: string
-  /** The Rust function that handles this trigger. */
+  /** The Rust function that handles this trigger; empty when the build did not record it. */
   handler: string
   /** sha256 of the build HappyView is running. */
   hash: string
