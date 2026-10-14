@@ -56,11 +56,12 @@ import {
 } from "@/components/ui/tooltip";
 import { DnsStatus, dnsState } from "@/components/lexicon-publishing/dns-status";
 import {
-  asSentence,
+  choosableTargets,
   expectedDid,
   isPending,
   nsidAuthority,
   targetName,
+  unavailableSentence,
 } from "@/components/lexicon-publishing/model";
 import { PublishStatusBadge } from "@/components/lexicon-publishing/publish-status";
 import { RoutingCascade } from "@/components/lexicon-publishing/routing-cascade";
@@ -85,6 +86,7 @@ const STATUS_OPTIONS: { label: string; value: PublishStatus }[] = [
 export default function LexiconPublishingPage() {
   const { hasPermission } = useCurrentUser();
   const canPublish = hasPermission("lexicons:publish");
+  const canSeeLinkedRepos = hasPermission("linked-repos:read");
   const router = useRouter();
 
   const [overview, setOverview] = useState<LexiconPublishingOverview | null>(
@@ -161,7 +163,10 @@ export default function LexiconPublishingPage() {
   }, [lexicons]);
 
   const noTargets =
-    overview !== null && !overview.targets.some((t) => t.available);
+    overview !== null &&
+    !choosableTargets(overview.targets, canSeeLinkedRepos).some(
+      (t) => t.available,
+    );
 
   const columns = useMemo<ColumnDef<PublishableLexicon>[]>(
     () => [
@@ -432,6 +437,7 @@ export default function LexiconPublishingPage() {
           overview={overview}
           rule={editing}
           onSaved={load}
+          canSeeLinkedRepos={canSeeLinkedRepos}
         />
       )}
     </>
@@ -448,7 +454,7 @@ function DestinationCell({ lexicon }: { lexicon: PublishableLexicon }) {
       <TargetName target={target} className="text-sm" />
       {lexicon.status === "target_unavailable" ? (
         <span className="text-muted-foreground text-xs text-pretty">
-          {asSentence(target.unavailable_reason)}
+          {unavailableSentence(target)}
         </span>
       ) : lexicon.status === "moved" && publication?.did ? (
         <span className="text-muted-foreground truncate text-xs">

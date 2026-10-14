@@ -121,9 +121,42 @@ export function lastFailure(lexicon: PublishableLexicon): string | null {
   return p.last_attempt_at > p.published_at ? p.last_error : null;
 }
 
+/**
+ * A linked repo the server described without naming it, because the viewer
+ * lacks `linked-repos:read`. A removed one still carries its reason.
+ */
+export function isRedacted(target: PublishTarget): boolean {
+  return (
+    target.kind === "linked_repo" &&
+    !target.linked_repo_id &&
+    !target.did &&
+    !target.handle &&
+    !target.unavailable_reason
+  );
+}
+
 export function targetName(target: PublishTarget): string {
   if (target.kind === "instance") return "Instance account";
+  if (isRedacted(target)) return "A linked repo";
   return target.handle ?? target.did ?? "Linked repo";
+}
+
+/** Why a destination can't publish, as a sentence. */
+export function unavailableSentence(
+  target: PublishTarget | null | undefined,
+): string {
+  if (target && isRedacted(target)) {
+    return "The linked repo it publishes to can't receive lexicons right now.";
+  }
+  return asSentence(target?.unavailable_reason);
+}
+
+/** Destinations a viewer may pick for a default; the server refuses the rest. */
+export function choosableTargets(
+  targets: PublishTarget[],
+  canSeeLinkedRepos: boolean,
+): PublishTarget[] {
+  return targets.filter((t) => t.kind === "instance" || canSeeLinkedRepos);
 }
 
 /** True when a target has no name of its own and is shown by its DID. */

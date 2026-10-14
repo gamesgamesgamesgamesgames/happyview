@@ -26,6 +26,7 @@ import type {
 } from "@/types/lexicon-publishing";
 
 import {
+  choosableTargets,
   describePattern,
   matches,
   moreSpecific,
@@ -43,6 +44,8 @@ interface RuleSheetProps {
   /** The default being edited; absent to add one. */
   rule: PublishRule | null;
   onSaved: () => void;
+  /** Without `linked-repos:read`, only the instance account can be chosen. */
+  canSeeLinkedRepos: boolean;
 }
 
 export function RuleSheet(props: RuleSheetProps) {
@@ -59,9 +62,16 @@ export function RuleSheet(props: RuleSheetProps) {
   );
 }
 
-function RuleForm({ onOpenChange, overview, rule, onSaved }: RuleSheetProps) {
+function RuleForm({
+  onOpenChange,
+  overview,
+  rule,
+  onSaved,
+  canSeeLinkedRepos,
+}: RuleSheetProps) {
   const editing = rule !== null;
-  const firstAvailable = overview.targets.find((t) => t.available);
+  const targets = choosableTargets(overview.targets, canSeeLinkedRepos);
+  const firstAvailable = targets.find((t) => t.available);
   const [pattern, setPattern] = useState(rule?.pattern ?? "");
   const [destination, setDestination] = useState<string>(
     rule ? ruleTargetKey(rule) : firstAvailable ? targetKey(firstAvailable) : "",
@@ -72,7 +82,7 @@ function RuleForm({ onOpenChange, overview, rule, onSaved }: RuleSheetProps) {
   const [error, setError] = useState<string | null>(null);
 
   const parsed = parsePattern(pattern);
-  const target = overview.targets.find((t) => targetKey(t) === destination);
+  const target = targets.find((t) => targetKey(t) === destination);
   // A kept destination needs no target to match: one whose linked repo was
   // removed is in no list, and the default can still have auto-publish changed.
   const keepsDestination = editing && destination === ruleTargetKey(rule);
@@ -227,9 +237,20 @@ function RuleForm({ onOpenChange, overview, rule, onSaved }: RuleSheetProps) {
           {editing && rule.target.available === false &&
             destination === ruleTargetKey(rule) && (
               <p className="text-muted-foreground text-xs">
-                Its current destination is unavailable:{" "}
-                {rule.target.unavailable_reason}. Choose another, or keep it
-                and change only auto-publish.
+                Its current destination is unavailable
+                {rule.target.unavailable_reason
+                  ? `: ${rule.target.unavailable_reason}`
+                  : ""}
+                . Choose another, or keep it and change only auto-publish.
+              </p>
+            )}
+          {editing &&
+            !canSeeLinkedRepos &&
+            rule.target_kind === "linked_repo" && (
+              <p className="text-muted-foreground text-xs">
+                It publishes to a linked repo. Keep it and change only
+                auto-publish, or choose the instance account. Choosing a
+                linked repo needs permission to view linked repos.
               </p>
             )}
           <RadioGroup
@@ -237,7 +258,7 @@ function RuleForm({ onOpenChange, overview, rule, onSaved }: RuleSheetProps) {
             onValueChange={setDestination}
             className="gap-2"
           >
-            {overview.targets.map((t) => (
+            {targets.map((t) => (
               <DestinationOption
                 key={targetKey(t)}
                 target={t}

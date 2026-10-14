@@ -18,7 +18,7 @@ import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import type { PublishRule } from "@/types/lexicon-publishing";
 
-import { asSentence, describeStoredPattern, nameIsDid } from "./model";
+import { describeStoredPattern, nameIsDid, unavailableSentence } from "./model";
 import { TargetName } from "./target-name";
 
 const ROW =
@@ -136,7 +136,7 @@ function Destination({ rule }: { rule: PublishRule }) {
           Destination unavailable
         </p>
         <p className="text-muted-foreground text-xs">
-          {asSentence(target.unavailable_reason)}
+          {unavailableSentence(target)}
         </p>
       </div>
     );

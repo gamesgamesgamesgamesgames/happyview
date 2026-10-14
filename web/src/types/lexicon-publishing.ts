@@ -1,5 +1,9 @@
 export type PublishTargetKind = "instance" | "linked_repo"
 
+/**
+ * For a caller without `linked-repos:read`, a linked repo keeps `kind`,
+ * `available` and `can_unpublish`, and its identity fields are `null`.
+ */
 export interface PublishTarget {
   kind: PublishTargetKind
   linked_repo_id: string | null
@@ -15,7 +19,7 @@ export interface PublishRule {
   /** `*`, `com.example.*`, or an exact NSID, as stored after normalisation. */
   pattern: string
   target_kind: PublishTargetKind
-  /** `null` once the linked repo it named has been removed. */
+  /** `null` once the linked repo it named has been removed, or when the caller can't see linked repos. */
   linked_repo_id: string | null
   auto_publish: boolean
   created_by: string

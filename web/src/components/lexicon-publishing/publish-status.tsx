@@ -29,7 +29,7 @@ import type {
   PublishStatus,
 } from "@/types/lexicon-publishing";
 
-import { asSentence, lastFailure } from "./model";
+import { lastFailure, unavailableSentence } from "./model";
 
 type StatusLook = {
   label: string;
@@ -138,7 +138,7 @@ export function PublishStatusBadge({
   const failure = lastFailure(lexicon);
   const reason =
     lexicon.status === "target_unavailable"
-      ? lexicon.target?.unavailable_reason
+      ? unavailableSentence(lexicon.target)
       : null;
 
   if (explain) {
@@ -170,7 +170,7 @@ export function PublishStatusBadge({
         >
           <p className="font-medium">{look.label}</p>
           <p className="text-muted-foreground">
-            {reason ? asSentence(reason) : look.explain}
+            {reason || look.explain}
           </p>
           {failure && (
             <p className="text-destructive">Last publish failed: {failure}</p>
@@ -183,7 +183,7 @@ export function PublishStatusBadge({
   return (
     <span className={cn("inline-flex items-center gap-1.5 text-sm whitespace-nowrap", className)}>
       <Icon className={cn("size-4 shrink-0", look.tone)} aria-hidden />
-      <span title={reason ?? look.explain}>
+      <span title={reason || look.explain}>
         {compact ? look.short : look.label}
       </span>
       {failure && <FailureMark message={failure} />}

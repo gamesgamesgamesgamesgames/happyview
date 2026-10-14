@@ -14,7 +14,11 @@ import type {
 } from "@/types/lexicon-publishing";
 
 import { DnsStatus, dnsState } from "./dns-status";
-import { asSentence, expectedDid, nsidAuthority } from "./model";
+import {
+  expectedDid,
+  nsidAuthority,
+  unavailableSentence,
+} from "./model";
 import { TargetName } from "./target-name";
 import { PublishStatusBadge, statusExplanation } from "./publish-status";
 import {
@@ -133,7 +137,7 @@ export function PublishingPanel({
             <PublishStatusBadge lexicon={lexicon} publishing={working} />
             <p className="text-muted-foreground text-xs">
               {lexicon.status === "target_unavailable"
-                ? asSentence(lexicon.target?.unavailable_reason)
+                ? unavailableSentence(lexicon.target)
                 : statusExplanation(lexicon.status)}
             </p>
           </div>
