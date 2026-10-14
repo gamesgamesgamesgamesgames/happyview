@@ -132,6 +132,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let forge = vec![
             root.join("src/testing/runner.rs"),
+            root.join("tests/test_runner.rs"),
             root.join("tests/test_runner_identity.rs"),
         ];
         let run = vec![

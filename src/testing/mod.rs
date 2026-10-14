@@ -11,6 +11,7 @@ pub mod report;
 pub mod runner;
 pub mod seed;
 pub mod triggers;
+pub mod watch;
 
 pub use fake_pds::{FakePds, FakePdsError};
 pub use harness::{ForgedCaller, TestHarness, TestHostError};

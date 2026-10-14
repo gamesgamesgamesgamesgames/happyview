@@ -60,6 +60,26 @@ fn sweep_stale(temp: &Path) {
     }
 }
 
+/// A project's configuration as a test run uses it.
+fn run_config(config: Config, fixture: &Config) -> Config {
+    Config {
+        // Space writes sign with a key stored under the encryption key, so a
+        // project that sets none still gets the fixture's.
+        token_encryption_key: config.token_encryption_key.or(fixture.token_encryption_key),
+        // In-process requests name `/xrpc/...` at the root, and a test run
+        // serves no dashboard.
+        base_path: None,
+        static_dir: None,
+        // Blank, as the fixture's are, so nothing in a run can reach the real
+        // directory, relay, Jetstream or telemetry collector.
+        plc_url: String::new(),
+        relay_url: String::new(),
+        jetstream_url: String::new(),
+        telemetry_collector_url: String::new(),
+        ..config
+    }
+}
+
 fn url(path: &Path) -> String {
     format!("sqlite://{}?mode=rwc", path.display())
 }
@@ -99,30 +119,7 @@ impl TestEnv {
                 updated_at: crate::db::now_rfc3339(),
             })
             .await;
-        let config = match config {
-            // Space writes sign with a key stored under the encryption key,
-            // so a project that sets none still gets the fixture's.
-            Some(config) => Config {
-                token_encryption_key: config
-                    .token_encryption_key
-                    .or(base.config.token_encryption_key),
-                ..config
-            },
-            None => base.config.clone(),
-        };
-        let config = Config {
-            // In-process requests name `/xrpc/...` at the root, and a test
-            // run serves no dashboard.
-            base_path: None,
-            static_dir: None,
-            // Blank, as the fixture's are, so nothing in a run can reach the
-            // real directory, relay, Jetstream or telemetry collector.
-            plc_url: String::new(),
-            relay_url: String::new(),
-            jetstream_url: String::new(),
-            telemetry_collector_url: String::new(),
-            ..config
-        };
+        let config = run_config(config.unwrap_or_else(|| base.config.clone()), &base.config);
         let base = AppState {
             config,
             http: crate::http_retry::shared_client().clone(),
@@ -143,6 +140,13 @@ impl TestEnv {
             dir,
             next: AtomicU64::new(0),
         })
+    }
+
+    /// Replace the project's configuration, for a watch session that saw
+    /// it change. Every file state made afterwards reads the new one.
+    pub fn set_config(&mut self, config: Config) {
+        let fixture = crate::test_support::test_config(DatabaseBackend::Sqlite);
+        self.base.config = run_config(config, &fixture);
     }
 
     /// A state for test file `file` on a fresh copy of the template. Shares

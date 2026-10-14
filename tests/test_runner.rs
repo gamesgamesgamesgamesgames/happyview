@@ -245,9 +245,27 @@ async fn a_file_that_spins_is_stopped_and_reported() {
             r#"{"check":{"name":"answers 200","answer":0,"pointer":"/ok/status","equals":200,"line":2}}"#,
         ),
     );
-    let (code, out) = tokio::time::timeout(Duration::from_secs(240), run(root, None))
-        .await
-        .expect("the run finishes");
+    happyview::testing::identity::forge_identities();
+    // Prepared outside the timeout: preparing waits for the run lock, which
+    // other slow tests in this binary hold for a minute at a time.
+    let runner = happyview::testing::runner::Runner::prepare(&TestArgs {
+        root: root.to_path_buf(),
+        ..TestArgs::default()
+    })
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    let code = tokio::time::timeout(Duration::from_secs(240), async {
+        let (snapshot, _) = runner.build().await.unwrap();
+        let started = std::time::Instant::now();
+        let results = runner.run(&snapshot, None, None).await;
+        let summary =
+            happyview::testing::report::render(&results, started.elapsed(), &mut out).unwrap();
+        happyview::testing::report::exit_code(&summary)
+    })
+    .await
+    .expect("the run finishes");
+    let out = String::from_utf8(out).unwrap();
     assert_eq!(code, 1, "{out}");
     assert!(out.contains(" FAIL  src/lib/spin.test.echo"), "{out}");
     // The other file finishes on its own time rather than waiting out the
@@ -263,4 +281,292 @@ async fn a_file_that_spins_is_stopped_and_reported() {
         .and_then(|t| t.parse().ok())
         .unwrap_or_else(|| panic!("{pass}"));
     assert!(ms < 30_000, "{out}");
+}
+
+/// A broken save reports its diagnostic and keeps the session alive, and the
+/// save that fixes it reruns the tests against the fixed build.
+#[tokio::test]
+async fn a_broken_save_keeps_watching_and_the_next_good_one_reruns() {
+    use happyview::testing::watch::{WatchState, step};
+    let Some(dir) = project() else { return };
+    let root = dir.path();
+    write(
+        root,
+        "src/lexicons/com/example/getThing.test.echo",
+        &test_file(
+            r#"{"check":{"name":"answers 200","answer":0,"pointer":"/ok/status","equals":200,"line":2}}"#,
+        ),
+    );
+    happyview::testing::identity::forge_identities();
+    let args = TestArgs {
+        root: root.to_path_buf(),
+        ..TestArgs::default()
+    };
+    let mut runner = happyview::testing::runner::Runner::prepare(&args)
+        .await
+        .unwrap();
+    let (snapshot, _) = runner.build().await.unwrap();
+    let mut state = WatchState::new(snapshot, 0);
+    let lexicon = vec!["src/lexicons/com/example/getThing.json".to_string()];
+
+    write(root, "src/lexicons/com/example/getThing.json", "{ broken");
+    let mut out = Vec::new();
+    step(&mut runner, &mut state, &lexicon, None, &mut out).await;
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("getThing.json"), "{text}");
+    assert!(text.contains("waiting for changes"), "{text}");
+
+    write(
+        root,
+        "src/lexicons/com/example/getThing.json",
+        &serde_json::json!({
+            "lexicon": 1, "id": "com.example.getThing",
+            "defs": {"main": {"type": "query", "parameters": {"type": "params", "properties": {"id": {"type": "string"}}}}}
+        })
+        .to_string(),
+    );
+    let mut out = Vec::new();
+    step(&mut runner, &mut state, &lexicon, None, &mut out).await;
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains(" PASS  src/lexicons/com/example/getThing.test.echo"),
+        "{text}"
+    );
+    assert_eq!(state.code, 0);
+}
+
+/// A save during a run is held until that run ends rather than abandoning
+/// it: the spinning file is still stopped and reported before the next batch
+/// runs, so no file of the old run is left going beside the new one. Slow by
+/// necessity, for the same reason as the spinning file above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_during_a_run_waits_for_it_to_end() {
+    use happyview::testing::watch::{WatchState, rerun};
+    let Some(dir) = project() else { return };
+    let root = dir.path();
+    write(root, "src/lib/spin.test.echo", r#"test:[{"spin":true}]"#);
+    write(
+        root,
+        "src/lexicons/com/example/getThing.test.echo",
+        &test_file(
+            r#"{"check":{"name":"answers 200","answer":0,"pointer":"/ok/status","equals":200,"line":2}}"#,
+        ),
+    );
+    happyview::testing::identity::forge_identities();
+    let args = TestArgs {
+        root: root.to_path_buf(),
+        ..TestArgs::default()
+    };
+    let mut runner = happyview::testing::runner::Runner::prepare(&args)
+        .await
+        .unwrap();
+    let (snapshot, _) = runner.build().await.unwrap();
+    let mut state = WatchState::new(snapshot, 0);
+
+    let (tx, mut changes) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tx.send("src/lib/spin.test.echo".into()).unwrap();
+    // Long after the first batch closed, so it lands while the spinning file
+    // runs; dropping the sender then ends the session once both are done.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = tx.send("src/lexicons/com/example/getThing.test.echo".into());
+    });
+    let mut out = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(240),
+        rerun(&mut runner, &mut state, &mut changes, None, &mut out),
+    )
+    .await
+    .expect("the session ends once its changes are handled");
+    let text = String::from_utf8(out).unwrap();
+    let spin = text
+        .find(" FAIL  src/lib/spin.test.echo")
+        .unwrap_or_else(|| panic!("the spinning run was abandoned: {text}"));
+    let pass = text
+        .find(" PASS  src/lexicons/com/example/getThing.test.echo")
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(spin < pass, "{text}");
+    assert_eq!(text.matches("waiting for changes").count(), 2, "{text}");
+    assert_eq!(state.code, 0, "the latest run passed");
+}
+
+/// A watch session on a project with two passing test files, the second a
+/// copy of the first under `src/lib/`.
+async fn watch_two_files(
+    root: &Path,
+) -> (
+    happyview::testing::runner::Runner,
+    happyview::testing::watch::WatchState,
+) {
+    let passing = test_file(
+        r#"{"check":{"name":"answers 200","answer":0,"pointer":"/ok/status","equals":200,"line":2}}"#,
+    );
+    write(
+        root,
+        "src/lexicons/com/example/getThing.test.echo",
+        &passing,
+    );
+    write(root, "src/lib/b.test.echo", &passing);
+    happyview::testing::identity::forge_identities();
+    let runner = happyview::testing::runner::Runner::prepare(&TestArgs {
+        root: root.to_path_buf(),
+        ..TestArgs::default()
+    })
+    .await
+    .unwrap();
+    let (snapshot, _) = runner.build().await.unwrap();
+    (
+        runner,
+        happyview::testing::watch::WatchState::new(snapshot, 0),
+    )
+}
+
+/// A batch whose build fails is not forgotten: the save that fixes the build
+/// reruns what the failed batch affected too. Here the failed batch held a
+/// handler edit, so the fix to one test file reruns every file.
+#[tokio::test]
+async fn a_failed_build_carries_its_changes_to_the_next() {
+    use happyview::testing::watch::step;
+    let Some(dir) = project() else { return };
+    let root = dir.path();
+    let (mut runner, mut state) = watch_two_files(root).await;
+
+    write(
+        root,
+        "src/lexicons/com/example/getThing.echo",
+        "returns:{\"thing\":2}",
+    );
+    write(root, "src/lib/b.test.echo", "invalid");
+    let mut out = Vec::new();
+    step(
+        &mut runner,
+        &mut state,
+        &[
+            "src/lexicons/com/example/getThing.echo".to_string(),
+            "src/lib/b.test.echo".to_string(),
+        ],
+        None,
+        &mut out,
+    )
+    .await;
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("the build failed"), "{text}");
+
+    write(
+        root,
+        "src/lib/b.test.echo",
+        &test_file(
+            r#"{"check":{"name":"answers 200","answer":0,"pointer":"/ok/status","equals":200,"line":2}}"#,
+        ),
+    );
+    let mut out = Vec::new();
+    step(
+        &mut runner,
+        &mut state,
+        &["src/lib/b.test.echo".to_string()],
+        None,
+        &mut out,
+    )
+    .await;
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(" PASS  src/lib/b.test.echo"), "{text}");
+    assert!(
+        text.contains(" PASS  src/lexicons/com/example/getThing.test.echo"),
+        "the handler edit from the failed batch reran nothing: {text}"
+    );
+}
+
+/// An edit to `.env.test` reruns the tests, which read the new values, and
+/// an edit to `happyview.toml` installs its settings before they run.
+#[tokio::test]
+async fn an_edited_env_test_or_config_is_loaded_before_the_rerun() {
+    use happyview::testing::watch::{WatchState, step};
+    let Some(dir) = project() else { return };
+    let root = dir.path();
+    std::fs::write(root.join(".env.test"), "WHO=before\n").unwrap();
+    write(
+        root,
+        "src/lexicons/com/example/whoami.json",
+        &serde_json::json!({
+            "lexicon": 1, "id": "com.example.whoami",
+            "defs": {"main": {"type": "query"}}
+        })
+        .to_string(),
+    );
+    write(root, "src/lexicons/com/example/whoami.echo", "value:object");
+    write(
+        root,
+        "src/lib/env.test.echo",
+        r#"test:[{"import":"trigger","request":{"kind":"query","target":"com.example.whoami","as":"did:plc:alice"}},{"check":{"name":"reads the edited env","answer":0,"pointer":"/ok/body/env/WHO","equals":"after","line":1}}]"#,
+    );
+    happyview::testing::identity::forge_identities();
+    let mut runner = happyview::testing::runner::Runner::prepare(&TestArgs {
+        root: root.to_path_buf(),
+        ..TestArgs::default()
+    })
+    .await
+    .unwrap();
+    let (snapshot, _) = runner.build().await.unwrap();
+    let mut state = WatchState::new(snapshot, 1);
+
+    std::fs::write(root.join(".env.test"), "WHO=after\n").unwrap();
+    let mut out = Vec::new();
+    step(
+        &mut runner,
+        &mut state,
+        &[".env.test".to_string()],
+        None,
+        &mut out,
+    )
+    .await;
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(" PASS  src/lib/env.test.echo"), "{text}");
+    assert_eq!(state.code, 0, "{text}");
+
+    std::fs::write(
+        root.join("happyview.toml"),
+        "[instance]\napp_name = \"edited\"\n",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    step(
+        &mut runner,
+        &mut state,
+        &["happyview.toml".to_string()],
+        None,
+        &mut out,
+    )
+    .await;
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(" PASS  src/lib/env.test.echo"), "{text}");
+    assert_eq!(
+        happyview::config::vars::var("APP_NAME").as_deref(),
+        Some("edited"),
+        "{text}"
+    );
+}
+
+/// A save that touches only files the filter excludes says so rather than
+/// passing in silence.
+#[tokio::test]
+async fn a_filter_excluding_every_affected_file_says_so() {
+    use happyview::testing::watch::step;
+    let Some(dir) = project() else { return };
+    let root = dir.path();
+    let (mut runner, mut state) = watch_two_files(root).await;
+    let mut out = Vec::new();
+    step(
+        &mut runner,
+        &mut state,
+        &["src/lib/b.test.echo".to_string()],
+        Some("getThing"),
+        &mut out,
+    )
+    .await;
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("no affected test file matches 'getThing'"),
+        "{text}"
+    );
+    assert!(text.trim_end().ends_with("waiting for changes"), "{text}");
 }

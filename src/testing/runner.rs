@@ -25,14 +25,16 @@ use super::report::{FileError, FileResult, exit_code, render};
 /// The first SDK whose interpreters accept a test file as input.
 const TEST_RUN_SDK: &str = "0.3.0";
 
-/// Held for the whole of a run. A run installs its project's settings as the
-/// process-wide configuration layer, which is read through for as long as the
-/// run lasts, so a second run in the same process would read the first's.
+/// Held for as long as a `Runner` lives. Preparing one installs its project's
+/// settings as the process-wide configuration layer, which is read through
+/// for every later build and run, so a second runner in the same process
+/// would read the first's.
 static RUN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub struct Runner {
     pub env: TestEnv,
     pub root: PathBuf,
+    _run: tokio::sync::MutexGuard<'static, ()>,
 }
 
 /// The configuration a test run starts from. The defaults fill only what
@@ -85,6 +87,7 @@ fn dispatch_failure(error: DispatchError, interpreter: Option<&str>) -> FileErro
 
 impl Runner {
     pub async fn prepare(args: &TestArgs) -> Result<Runner, String> {
+        let run = RUN.lock().await;
         let root = args.root.clone();
         let config = load_config(&root)?;
         let dirs = if args.plugin_dirs.is_empty() {
@@ -111,7 +114,20 @@ impl Runner {
         let env = TestEnv::new(registry, runtime, Some(config))
             .await
             .map_err(|e| format!("could not create the test database: {e}"))?;
-        Ok(Runner { env, root })
+        Ok(Runner {
+            env,
+            root,
+            _run: run,
+        })
+    }
+
+    /// Load the project's configuration again, after a watch saw
+    /// `happyview.toml` or `.env.test` change. A refused load keeps the
+    /// current one.
+    pub fn reload_config(&mut self) -> Result<(), String> {
+        let config = load_config(&self.root)?;
+        self.env.set_config(config);
+        Ok(())
     }
 
     /// Build with the tests included and install the result on the base
@@ -294,13 +310,12 @@ pub fn print_diagnostics(diagnostics: &[Diagnostic], out: &mut dyn Write) {
     }
 }
 
-/// Runs one at a time in a process: the configuration a run reads is
-/// process-wide.
+/// Runs one at a time in a process, since the runner it prepares holds the
+/// process-wide configuration.
 pub async fn run(args: &TestArgs, out: &mut (dyn Write + Send)) -> u8 {
-    let _run = RUN.lock().await;
     // Before anything resolves: a test run never asks PLC or DNS.
     super::identity::forge_identities();
-    let runner = match Runner::prepare(args).await {
+    let mut runner = match Runner::prepare(args).await {
         Ok(runner) => runner,
         Err(e) => {
             let _ = writeln!(out, "{e}");
@@ -319,17 +334,23 @@ pub async fn run(args: &TestArgs, out: &mut (dyn Write + Send)) -> u8 {
     };
     let started = Instant::now();
     let results = runner.run(&snapshot, None, args.filter.as_deref()).await;
-    if results.is_empty() {
+    let code = if results.is_empty() {
         let _ = match &args.filter {
             Some(filter) => writeln!(out, "no test file matches '{filter}'"),
             None => writeln!(out, "no test files: name one *.test.<ext> under src/"),
         };
-        return 1;
+        1
+    } else {
+        match render(&results, started.elapsed(), out) {
+            Ok(summary) => exit_code(&summary),
+            Err(_) => 1,
+        }
+    };
+    if args.watch {
+        // The watch reuses this runner, and with it the lock it holds.
+        return super::watch::watch(&mut runner, snapshot, code, args.filter.as_deref(), out).await;
     }
-    match render(&results, started.elapsed(), out) {
-        Ok(summary) => exit_code(&summary),
-        Err(_) => 1,
-    }
+    code
 }
 
 #[cfg(test)]
