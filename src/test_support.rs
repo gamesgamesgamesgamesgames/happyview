@@ -210,12 +210,18 @@ pub async fn provision_space_signing_key(state: &AppState) {
 /// assertions reach Postgres, whose dialect is the one `adapt_sql` has to
 /// build and the one nothing under `src/plugin/` had ever run against.
 pub async fn test_state_from_env() -> Option<AppState> {
+    // One connect at a time, because connecting migrates: two tests migrating
+    // a fresh SQLite file at once collide on `_sqlx_migrations`, and Postgres
+    // takes the same path so the order is the same on both.
+    static CONNECTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     let url = std::env::var("TEST_DATABASE_URL").ok()?;
     let backend = crate::db::DatabaseBackend::from_url(&url);
-    Some(test_state_with_pool_on(
-        crate::db::connect(&url, backend).await,
-        backend,
-    ))
+    let pool = {
+        let _connecting = CONNECTING.lock().await;
+        crate::db::connect(&url, backend).await
+    };
+    Some(test_state_with_pool_on(pool, backend))
 }
 
 /// Build an `AppState` backed by `pool`, wired for SQLite with no network

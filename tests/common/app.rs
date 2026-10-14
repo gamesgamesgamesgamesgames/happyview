@@ -26,7 +26,7 @@ pub struct TestApp {
     pub mock_server: MockServer,
     pub admin_did: String,
     pub admin_token: String,
-    _db_lock: Option<sqlx::AnyPool>,
+    _db_lock: Option<db::TestLock>,
 }
 
 impl TestApp {
