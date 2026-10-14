@@ -398,7 +398,7 @@ async fn due_for_publish(state: &AppState) -> Result<Vec<String>, AppError> {
     }
     let linked = target::LinkedRepoTargets::load(state).await?;
     let instance = target::instance_target(state).await?;
-    let views = super::overview::lexicon_views(state, &rules, &linked, &instance).await?;
+    let (views, _) = super::overview::lexicon_views(state, &rules, &linked, &instance).await?;
     Ok(views
         .into_iter()
         .filter(|v| {

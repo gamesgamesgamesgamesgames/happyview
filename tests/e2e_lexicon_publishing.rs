@@ -1585,3 +1585,70 @@ async fn the_overview_hides_which_linked_repo_from_a_caller_without_linked_repos
     assert_eq!(body["rules"][0]["target"]["did"], did);
     assert_eq!(body["rules"][0]["linked_repo_id"], grant.id.as_str());
 }
+
+// ---------------------------------------------------------------------------
+// Orphaned publications and repeated failures
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn a_publication_whose_lexicon_is_gone_is_listed_and_can_be_unpublished() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    let did = "did:plc:orphanholder";
+    let grant = active_grant(s, did, FULL_SCOPE).await;
+
+    let orphan = "com.example.deleted";
+    let uri = format!("at://{did}/com.atproto.lexicon.schema/{orphan}");
+    store::record_success(s, orphan, did, &uri, "bafycid")
+        .await
+        .unwrap();
+    // Withdrawn and never-published rows hold nothing on a PDS.
+    store::record_withdrawn(s, "com.example.withdrawn")
+        .await
+        .unwrap();
+    store::record_failure(s, "com.example.failed", "boom")
+        .await
+        .unwrap();
+    let present = "com.example.present";
+    put_manual(s, present).await;
+    store::record_success(
+        s,
+        present,
+        did,
+        &format!("at://{did}/com.atproto.lexicon.schema/{present}"),
+        "bafycid",
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = call(&app, "GET", BASE, None).await;
+    assert_eq!(status, 200, "{body}");
+    let orphans = body["orphans"].as_array().unwrap();
+    assert_eq!(orphans.len(), 1, "{body}");
+    assert_eq!(orphans[0]["nsid"], orphan);
+    assert_eq!(orphans[0]["did"], did);
+    assert_eq!(orphans[0]["uri"], uri.as_str());
+
+    // Unpublish finds the repo from the row's DID. With no stored session the
+    // grant's PDS cannot be reached, which is as far as a test can follow it.
+    let err = unpublish(s, orphan, "did:plc:admin").await.unwrap_err();
+    match err {
+        AppError::Auth(msg) => assert!(msg.contains("needs reauthorization"), "{msg}"),
+        other => panic!("expected the linked repo's session error, got {other:?}"),
+    }
+    assert_eq!(
+        linked::get(s, &grant.id).await.unwrap().unwrap().status,
+        STATUS_NEEDS_REAUTH
+    );
+    assert_eq!(
+        store::get_publication(s, orphan)
+            .await
+            .unwrap()
+            .unwrap()
+            .did
+            .as_deref(),
+        Some(did)
+    );
+}

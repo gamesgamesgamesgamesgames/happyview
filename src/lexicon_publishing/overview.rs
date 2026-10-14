@@ -43,6 +43,9 @@ pub struct Overview {
     pub targets: Vec<TargetInfo>,
     pub rules: Vec<RuleView>,
     pub lexicons: Vec<LexiconView>,
+    /// Records still on a PDS whose lexicon HappyView no longer publishes,
+    /// listed so they can be unpublished.
+    pub orphans: Vec<Publication>,
 }
 
 impl Overview {
@@ -87,19 +90,24 @@ pub async fn overview(state: &AppState) -> Result<Overview, AppError> {
     let mut targets = vec![instance.clone()];
     targets.extend(linked.targets());
 
+    let (lexicons, unmatched) = lexicon_views(state, &rules, &linked, &instance).await?;
+    let mut orphans: Vec<Publication> = unmatched.into_iter().filter(|p| p.did.is_some()).collect();
+    orphans.sort_by(|a, b| a.nsid.cmp(&b.nsid));
     Ok(Overview {
         targets,
         rules: rule_views,
-        lexicons: lexicon_views(state, &rules, &linked, &instance).await?,
+        lexicons,
+        orphans,
     })
 }
 
+/// Also returns the publication rows that matched no publishable lexicon.
 pub(super) async fn lexicon_views(
     state: &AppState,
     rules: &[(Rule, Pattern)],
     linked: &LinkedRepoTargets,
     instance: &TargetInfo,
-) -> Result<Vec<LexiconView>, AppError> {
+) -> Result<(Vec<LexiconView>, Vec<Publication>), AppError> {
     let mut publications = store::list_publications(state).await?;
     let mut listings = publishable(state).await?;
     listings.sort_by(|a, b| a.id.cmp(&b.id));
@@ -139,7 +147,7 @@ pub(super) async fn lexicon_views(
             publication,
         });
     }
-    Ok(views)
+    Ok((views, publications))
 }
 
 #[cfg(test)]
