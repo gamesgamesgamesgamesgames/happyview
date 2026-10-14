@@ -484,8 +484,10 @@ export function ScopeBuilder({
                 variant="outline"
                 size="xs"
                 // aria-disabled rather than disabled, so the applied state
-                // stays focusable and is announced instead of skipped.
-                className="rounded-full aria-disabled:cursor-default aria-disabled:hover:bg-background aria-disabled:hover:text-foreground dark:aria-disabled:hover:bg-input/30"
+                // stays focusable and is announced instead of skipped. The
+                // applied look is set outright rather than left to the outline
+                // variant, whose dark fill is too close to the page to read.
+                className="aria-pressed:bg-secondary aria-pressed:text-secondary-foreground dark:aria-pressed:bg-accent dark:aria-pressed:text-accent-foreground aria-pressed:hover:bg-secondary aria-pressed:hover:text-secondary-foreground dark:aria-pressed:hover:bg-accent dark:aria-pressed:hover:text-accent-foreground rounded-full aria-pressed:border-transparent aria-disabled:cursor-default"
                 aria-disabled={applied}
                 aria-pressed={applied}
                 onClick={() => {
