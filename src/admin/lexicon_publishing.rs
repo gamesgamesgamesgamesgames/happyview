@@ -295,6 +295,8 @@ pub(super) async fn delete_rule(
     }
 
     log_rule_event(&state, "lexicon_publishing.rule_deleted", &auth.did, &rule).await;
+    // A broader auto-publish default may cover what this one did.
+    publishing::spawn_reconcile(&state);
     Ok(StatusCode::NO_CONTENT)
 }
 
