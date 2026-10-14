@@ -45,10 +45,15 @@ export function PublishingPanel({
   const [state, setState] = useState<"loading" | "ready" | "failed">(
     "loading",
   );
-  const [dns, setDns] = useState<LexiconDnsEntry | undefined>(undefined);
-  const [dnsLoading, setDnsLoading] = useState(true);
+  // Keyed by the authority it answers for, so a lookup for a different one
+  // reads as loading until its own answer arrives.
+  const [dns, setDns] = useState<{
+    authority: string;
+    entry: LexiconDnsEntry | undefined;
+  } | null>(null);
 
   const authority = nsidAuthority(nsid);
+  const dnsLoading = dns?.authority !== authority;
 
   const read = useCallback(
     () =>
@@ -68,18 +73,36 @@ export function PublishingPanel({
 
   useEffect(() => {
     read();
+  }, [read, revision]);
+
+  // A saved edit cannot change the DNS answer unless it changes the
+  // authority, and the lookup takes seconds, so it is not tied to revision.
+  useEffect(() => {
+    let current = true;
     getLexiconPublishingDns()
-      .then((entries) => setDns(entries.find((e) => e.authority === authority)))
-      .catch((e) =>
+      .then((entries) => {
+        if (!current) return;
         setDns({
           authority,
-          record_name: `_lexicon.${authority}`,
-          did: null,
-          error: e instanceof Error ? e.message : String(e),
-        }),
-      )
-      .finally(() => setDnsLoading(false));
-  }, [read, authority, revision]);
+          entry: entries.find((e) => e.authority === authority),
+        });
+      })
+      .catch((e) => {
+        if (!current) return;
+        setDns({
+          authority,
+          entry: {
+            authority,
+            record_name: `_lexicon.${authority}`,
+            did: null,
+            error: e instanceof Error ? e.message : String(e),
+          },
+        });
+      });
+    return () => {
+      current = false;
+    };
+  }, [authority]);
 
   const { busy, publish, unpublish, announcement } = usePublish(read);
   const working = busy.has(nsid);
@@ -154,7 +177,7 @@ export function PublishingPanel({
               </dt>
               <dd>
                 <DnsStatus
-                  state={dnsState(dns, dnsLoading, expectedDid(lexicon))}
+                  state={dnsState(dns?.entry, dnsLoading, expectedDid(lexicon))}
                   coverCount={coverCount}
                 />
               </dd>
