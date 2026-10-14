@@ -174,17 +174,23 @@ test.describe("Lexicon publishing — real linked repo", () => {
   });
 
   test.afterAll(async ({ browser }) => {
-    const page = await browser.newPage();
-    await loginAsTestAdmin(page);
-    if (ruleId) {
-      await page.request.delete(`/admin/lexicon-publishing/rules/${ruleId}`);
+    // Later projects depend on the identity, so it goes back before any
+    // other cleanup can fail and skip it. Undefined means the snapshot was
+    // never taken, and restoring that would delete the identity outright.
+    try {
+      if (identity !== undefined) await restoreServiceIdentity(identity);
+    } finally {
+      const page = await browser.newPage();
+      await loginAsTestAdmin(page);
+      if (ruleId) {
+        await page.request.delete(`/admin/lexicon-publishing/rules/${ruleId}`);
+      }
+      for (const id of [NOTE, DRAFT, ASIDE]) {
+        await page.request.delete(`/admin/lexicons/${id}`);
+      }
+      if (grantId) await page.request.delete(`/admin/linked-repos/${grantId}`);
+      await page.close();
     }
-    for (const id of [NOTE, DRAFT, ASIDE]) {
-      await page.request.delete(`/admin/lexicons/${id}`);
-    }
-    if (grantId) await page.request.delete(`/admin/linked-repos/${grantId}`);
-    await page.close();
-    await restoreServiceIdentity(identity);
   });
 
   test("the account links through a real authorization", async ({ page }) => {

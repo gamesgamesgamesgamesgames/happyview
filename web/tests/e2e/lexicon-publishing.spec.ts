@@ -112,20 +112,28 @@ test.describe("Lexicon publishing dashboard", () => {
   });
 
   test.afterAll(async ({ browser }) => {
-    const page = await browser.newPage();
-    await loginAsTestAdmin(page);
-    for (const rule of await rules(page.request)) {
-      if (rule.pattern === "*" || rule.pattern.startsWith("test.e2e.pub")) {
-        await page.request.delete(`/admin/lexicon-publishing/rules/${rule.id}`);
+    // Later projects depend on the identity, so it goes back before any
+    // other cleanup can fail and skip it. Undefined means the snapshot was
+    // never taken, and restoring that would delete the identity outright.
+    try {
+      if (identity !== undefined) await restoreServiceIdentity(identity);
+    } finally {
+      const page = await browser.newPage();
+      await loginAsTestAdmin(page);
+      for (const rule of await rules(page.request)) {
+        if (rule.pattern === "*" || rule.pattern.startsWith("test.e2e.pub")) {
+          await page.request.delete(
+            `/admin/lexicon-publishing/rules/${rule.id}`,
+          );
+        }
       }
+      for (const id of SEEDED) {
+        await page.request.delete(`/admin/lexicons/${id}`);
+      }
+      if (grantId) await page.request.delete(`/admin/linked-repos/${grantId}`);
+      await page.close();
+      await removeTestUser(READER_DID);
     }
-    for (const id of SEEDED) {
-      await page.request.delete(`/admin/lexicons/${id}`);
-    }
-    if (grantId) await page.request.delete(`/admin/linked-repos/${grantId}`);
-    await page.close();
-    await removeTestUser(READER_DID);
-    await restoreServiceIdentity(identity);
   });
 
   test.beforeEach(async ({ page }) => {
