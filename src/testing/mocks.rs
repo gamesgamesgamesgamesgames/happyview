@@ -38,19 +38,24 @@ impl Mocks {
                 "a mock of {namespace} is an object of method names, each answered by a response or a list of them"
             ));
         };
-        let table = methods
-            .iter()
-            .map(|(method, answer)| {
-                let answers = match answer {
-                    Value::Array(list) => Answers::InOrder {
-                        queue: list.iter().cloned().collect(),
-                        total: list.len(),
-                    },
-                    single => Answers::Always(single.clone()),
-                };
-                (method.clone(), answers)
-            })
-            .collect();
+        let mut table = BTreeMap::new();
+        for (method, answer) in methods {
+            let answers = match answer {
+                Value::Array(list) => Answers::InOrder {
+                    queue: list.iter().cloned().collect(),
+                    total: list.len(),
+                },
+                single => Answers::Always(single.clone()),
+            };
+            let responses: Vec<&Value> = match &answers {
+                Answers::Always(value) => vec![value],
+                Answers::InOrder { queue, .. } => queue.iter().collect(),
+            };
+            for response in responses {
+                check_error_response(namespace, method, response)?;
+            }
+            table.insert(method.clone(), answers);
+        }
         self.by_namespace.insert(namespace.to_string(), table);
         Ok(())
     }
@@ -90,6 +95,23 @@ impl Mocks {
             None => Ok(value),
         })
     }
+}
+
+/// An error response is refused when it is set rather than answered as an
+/// error with no code or message, which would fail the handler's call for a
+/// reason the test never chose.
+fn check_error_response(namespace: &str, method: &str, response: &Value) -> Result<(), String> {
+    let Some(error) = response.get("$error") else {
+        return Ok(());
+    };
+    let message_ok = error.get("message").is_none_or(Value::is_string);
+    if error.get("code").is_some_and(Value::is_string) && message_ok {
+        return Ok(());
+    }
+    Err(format!(
+        "the mock for {namespace}.{method} has an error response that is not \
+         {{\"$error\": {{\"code\": \"...\", \"message\": \"...\"}}}}"
+    ))
 }
 
 /// `host_test_mock`: refuse a namespace nothing installed serves, because a
@@ -187,6 +209,27 @@ mod tests {
         mocks.answer("http", "get");
         mocks.set("http", &json!({"get": [5]})).unwrap();
         assert_eq!(mocks.answer("http", "get").unwrap().unwrap(), json!(5));
+    }
+
+    #[test]
+    fn a_malformed_error_response_is_refused_naming_the_method() {
+        for bad in [
+            json!({"$error": "x"}),
+            json!({"$error": {}}),
+            json!({"$error": {"code": 1}}),
+            json!({"$error": {"code": "X", "message": 2}}),
+        ] {
+            for responses in [
+                json!({"get": bad.clone()}),
+                json!({"get": [1, bad.clone()]}),
+            ] {
+                let err = Mocks::default().set("http", &responses).unwrap_err();
+                assert!(err.contains("http.get"), "{err}");
+            }
+        }
+        Mocks::default()
+            .set("http", &json!({"get": {"$error": {"code": "X"}}}))
+            .unwrap();
     }
 
     #[test]
