@@ -59,6 +59,8 @@ Both `create` and `update` are required, because publishing is an upsert. The **
 
 Scopes on a grant are immutable. If a grant is missing one, the target shows as unavailable and says what to add; delete the grant and link the repo again with the right scopes. A linked repo that is pending, or needs reauthorization, is unavailable until it's active again.
 
+A PDS can approve fewer scopes than a grant asks for, and HappyView judges the target by what was approved. If it shows as unavailable because the PDS granted fewer scopes, the PDS probably cached HappyView's client details from before the grant existed; link the repo again later.
+
 ## Publishing defaults
 
 A publishing default is a rule that says where a set of lexicons goes. Manage them at **Lexicons > Publishing** (`/dashboard/lexicons/publishing`).

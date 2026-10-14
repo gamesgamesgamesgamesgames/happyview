@@ -13,7 +13,8 @@ use crate::error::AppError;
 use crate::event_log::{EventLog, Severity, log_event};
 use crate::lexicon_publishing::target::{KIND_INSTANCE, KIND_LINKED_REPO};
 use crate::lexicon_publishing::{
-    self as publishing, Overview, Pattern, PublishOutcome, RuleView, TargetInfo, store,
+    self as publishing, LinkedRepoTargets, Overview, Pattern, PublishOutcome, RuleView, TargetInfo,
+    store,
 };
 
 use super::auth::UserAuth;
@@ -127,13 +128,11 @@ async fn validate_target(
             let id = linked_repo_id.ok_or_else(|| {
                 AppError::BadRequest("a linked_repo target needs a linked_repo_id".into())
             })?;
-            let grant = crate::linked_repos::db::get(state, id)
-                .await?
+            let linked = LinkedRepoTargets::load(state).await?;
+            let grant = linked
+                .find(id)
                 .ok_or_else(|| AppError::BadRequest("unknown linked repo".into()))?;
-            (
-                publishing::linked_repo_target(&grant),
-                Some(grant.id.clone()),
-            )
+            (linked.target(grant), Some(grant.id.clone()))
         }
         other => {
             return Err(AppError::BadRequest(format!(
@@ -153,9 +152,9 @@ async fn validate_target(
 }
 
 async fn rule_view(state: &AppState, rule: store::Rule) -> Result<RuleView, AppError> {
-    let grants = crate::linked_repos::db::list(state).await?;
+    let linked = LinkedRepoTargets::load(state).await?;
     let instance = publishing::instance_target(state).await?;
-    let target = publishing::target_for_rule(state, &rule, &grants, &instance).await;
+    let target = publishing::target_for_rule(state, &rule, &linked, &instance).await;
     Ok(RuleView { rule, target })
 }
 

@@ -3,11 +3,10 @@ use serde::Serialize;
 use crate::AppState;
 use crate::catalog::Layer;
 use crate::error::AppError;
-use crate::linked_repos::types::LinkedRepo;
 
 use super::publish::{parsed_rules, publishable, rule_for};
 use super::store::{self, Publication, Rule};
-use super::target::{self, TargetInfo};
+use super::target::{self, LinkedRepoTargets, TargetInfo};
 use super::{Pattern, PublishStatus, compute_status, record_cid};
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,31 +48,31 @@ fn sort_rules(rules: &mut [(Rule, Pattern)]) {
 pub async fn overview(state: &AppState) -> Result<Overview, AppError> {
     let mut rules = parsed_rules(store::list_rules(state).await?);
     sort_rules(&mut rules);
-    let grants = crate::linked_repos::db::list(state).await?;
+    let linked = LinkedRepoTargets::load(state).await?;
     let instance = target::instance_target(state).await?;
 
     let mut rule_views = Vec::with_capacity(rules.len());
     for (rule, _) in &rules {
         rule_views.push(RuleView {
-            target: target::target_for_rule(state, rule, &grants, &instance).await,
+            target: target::target_for_rule(state, rule, &linked, &instance).await,
             rule: rule.clone(),
         });
     }
 
     let mut targets = vec![instance.clone()];
-    targets.extend(grants.iter().map(target::linked_repo_target));
+    targets.extend(linked.targets());
 
     Ok(Overview {
         targets,
         rules: rule_views,
-        lexicons: lexicon_views(state, &rules, &grants, &instance).await?,
+        lexicons: lexicon_views(state, &rules, &linked, &instance).await?,
     })
 }
 
 pub(super) async fn lexicon_views(
     state: &AppState,
     rules: &[(Rule, Pattern)],
-    grants: &[LinkedRepo],
+    linked: &LinkedRepoTargets,
     instance: &TargetInfo,
 ) -> Result<Vec<LexiconView>, AppError> {
     let mut publications = store::list_publications(state).await?;
@@ -84,7 +83,7 @@ pub(super) async fn lexicon_views(
     for listing in listings {
         let rule = rule_for(&listing.id, rules);
         let target = match rule {
-            Some(rule) => Some(target::target_for_rule(state, rule, grants, instance).await),
+            Some(rule) => Some(target::target_for_rule(state, rule, linked, instance).await),
             None => None,
         };
         let publication = publications

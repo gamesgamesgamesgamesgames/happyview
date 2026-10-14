@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Serialize;
 
 use crate::AppState;
@@ -83,10 +85,52 @@ pub async fn instance_target(state: &AppState) -> Result<TargetInfo, AppError> {
     Ok(TargetInfo::unavailable(KIND_INSTANCE, reason))
 }
 
+/// Every linked repo beside the scope its PDS granted, loaded once so a view
+/// judging many rules reads the session table once.
+pub struct LinkedRepoTargets {
+    pub grants: Vec<LinkedRepo>,
+    granted_scopes: HashMap<String, String>,
+}
+
+impl LinkedRepoTargets {
+    pub async fn load(state: &AppState) -> Result<Self, AppError> {
+        Ok(LinkedRepoTargets {
+            grants: crate::linked_repos::db::list(state).await?,
+            granted_scopes: crate::linked_repos::db::granted_scopes(state).await?,
+        })
+    }
+
+    pub fn target(&self, grant: &LinkedRepo) -> TargetInfo {
+        let granted = grant
+            .did
+            .as_deref()
+            .and_then(|did| self.granted_scopes.get(did))
+            .map(String::as_str);
+        linked_repo_target(grant, granted)
+    }
+
+    pub fn find(&self, id: &str) -> Option<&LinkedRepo> {
+        self.grants.iter().find(|g| g.id == id)
+    }
+
+    pub fn targets(&self) -> impl Iterator<Item = TargetInfo> + '_ {
+        self.grants.iter().map(|g| self.target(g))
+    }
+}
+
 /// `putRecord` is an upsert, so publishing needs both `create` and `update`.
-pub fn linked_repo_target(grant: &LinkedRepo) -> TargetInfo {
-    let scopes = scope::parse(&grant.scopes);
-    let allows = |action| scope::allows_repo(&scopes, SCHEMA_COLLECTION, action);
+///
+/// `granted_scope` is what the PDS approved, which can be less than the grant
+/// asked for; it decides when known, and the requested scopes stand in when
+/// it is not.
+pub fn linked_repo_target(grant: &LinkedRepo, granted_scope: Option<&str>) -> TargetInfo {
+    let requested = scope::parse(&grant.scopes);
+    let granted = granted_scope.map(scope::parse);
+    let effective = granted.as_deref().unwrap_or(&requested);
+    let allows = |scopes: &[String], action| scope::allows_repo(scopes, SCHEMA_COLLECTION, action);
+    let writes = |scopes: &[String]| {
+        allows(scopes, RepoAction::Create) && allows(scopes, RepoAction::Update)
+    };
 
     let reason = if grant.did.is_none() {
         Some("this linked repo has not been authorized yet".to_string())
@@ -94,10 +138,17 @@ pub fn linked_repo_target(grant: &LinkedRepo) -> TargetInfo {
         Some("this linked repo needs to be reauthorized".to_string())
     } else if grant.status != STATUS_ACTIVE {
         Some(format!("this linked repo is {}", grant.status))
-    } else if !(allows(RepoAction::Create) && allows(RepoAction::Update)) {
+    } else if !writes(&requested) {
         Some(format!(
             "this linked repo's grant cannot write {SCHEMA_COLLECTION} records; add it again \
              with repo:{SCHEMA_COLLECTION}?action=create&action=update"
+        ))
+    } else if !writes(effective) {
+        Some(format!(
+            "the PDS granted fewer scopes than this linked repo asked for (it granted: {}). It \
+             may have cached HappyView's client details before this grant existed; link the \
+             repo again later",
+            granted_scope.unwrap_or_default()
         ))
     } else {
         None
@@ -109,19 +160,14 @@ pub fn linked_repo_target(grant: &LinkedRepo) -> TargetInfo {
         did: grant.did.clone(),
         handle: grant.handle.clone(),
         available: reason.is_none(),
-        can_unpublish: reason.is_none() && allows(RepoAction::Delete),
+        can_unpublish: reason.is_none() && allows(effective, RepoAction::Delete),
         unavailable_reason: reason,
     }
 }
 
 pub async fn list_targets(state: &AppState) -> Result<Vec<TargetInfo>, AppError> {
     let mut targets = vec![instance_target(state).await?];
-    targets.extend(
-        crate::linked_repos::db::list(state)
-            .await?
-            .iter()
-            .map(linked_repo_target),
-    );
+    targets.extend(LinkedRepoTargets::load(state).await?.targets());
     Ok(targets)
 }
 
@@ -131,18 +177,18 @@ pub async fn list_targets(state: &AppState) -> Result<Vec<TargetInfo>, AppError>
 pub async fn target_for_rule(
     _state: &AppState,
     rule: &Rule,
-    grants: &[LinkedRepo],
+    linked: &LinkedRepoTargets,
     instance: &TargetInfo,
 ) -> TargetInfo {
     match rule.target_kind.as_str() {
         KIND_INSTANCE => instance.clone(),
         KIND_LINKED_REPO => {
-            let grant = rule
+            match rule
                 .linked_repo_id
                 .as_deref()
-                .and_then(|id| grants.iter().find(|g| g.id == id));
-            match grant {
-                Some(grant) => linked_repo_target(grant),
+                .and_then(|id| linked.find(id))
+            {
+                Some(grant) => linked.target(grant),
                 None => TargetInfo {
                     linked_repo_id: rule.linked_repo_id.clone(),
                     ..TargetInfo::unavailable(KIND_LINKED_REPO, REMOVED_LINKED_REPO)

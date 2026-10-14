@@ -3,8 +3,8 @@ mod common;
 use common::app::TestApp;
 use happyview::error::AppError;
 use happyview::lexicon_publishing::{
-    Pattern, instance_target, linked_repo_target, list_targets, publish, publishable, reconcile,
-    store, target_for_rule, unpublish,
+    LinkedRepoTargets, Pattern, instance_target, linked_repo_target, list_targets, publish,
+    publishable, reconcile, store, target_for_rule, unpublish,
 };
 use happyview::linked_repos::db as linked;
 use happyview::linked_repos::types::{
@@ -327,25 +327,31 @@ fn grant(did: Option<&str>, status: &str, scopes: &str) -> LinkedRepo {
 
 #[test]
 fn linked_repo_target_reads_the_grant_status_and_scopes() {
-    let pending = linked_repo_target(&grant(None, STATUS_PENDING, FULL_SCOPE));
+    let pending = linked_repo_target(&grant(None, STATUS_PENDING, FULL_SCOPE), None);
     assert!(!pending.available);
     assert_eq!(
         pending.unavailable_reason.as_deref(),
         Some("this linked repo has not been authorized yet")
     );
 
-    let reauth = linked_repo_target(&grant(Some("did:plc:a"), STATUS_NEEDS_REAUTH, FULL_SCOPE));
+    let reauth = linked_repo_target(
+        &grant(Some("did:plc:a"), STATUS_NEEDS_REAUTH, FULL_SCOPE),
+        None,
+    );
     assert!(!reauth.available && !reauth.can_unpublish);
     assert_eq!(
         reauth.unavailable_reason.as_deref(),
         Some("this linked repo needs to be reauthorized")
     );
 
-    let create_only = linked_repo_target(&grant(
-        Some("did:plc:a"),
-        STATUS_ACTIVE,
-        "atproto repo:com.atproto.lexicon.schema?action=create",
-    ));
+    let create_only = linked_repo_target(
+        &grant(
+            Some("did:plc:a"),
+            STATUS_ACTIVE,
+            "atproto repo:com.atproto.lexicon.schema?action=create",
+        ),
+        None,
+    );
     assert!(!create_only.available);
     assert!(
         create_only
@@ -354,20 +360,129 @@ fn linked_repo_target_reads_the_grant_status_and_scopes() {
             .contains("repo:com.atproto.lexicon.schema?action=create&action=update")
     );
 
-    let no_delete = linked_repo_target(&grant(
-        Some("did:plc:a"),
-        STATUS_ACTIVE,
-        "atproto repo:com.atproto.lexicon.schema?action=create&action=update",
-    ));
+    let no_delete = linked_repo_target(
+        &grant(
+            Some("did:plc:a"),
+            STATUS_ACTIVE,
+            "atproto repo:com.atproto.lexicon.schema?action=create&action=update",
+        ),
+        None,
+    );
     assert!(no_delete.available && !no_delete.can_unpublish);
 
-    let full = linked_repo_target(&grant(Some("did:plc:a"), STATUS_ACTIVE, FULL_SCOPE));
+    let full = linked_repo_target(&grant(Some("did:plc:a"), STATUS_ACTIVE, FULL_SCOPE), None);
     assert!(full.available && full.can_unpublish);
     assert_eq!(full.unavailable_reason, None);
     assert_eq!(full.kind, "linked_repo");
     assert_eq!(full.linked_repo_id.as_deref(), Some("g1"));
     assert_eq!(full.did.as_deref(), Some("did:plc:a"));
     assert_eq!(full.handle.as_deref(), Some("a.test"));
+}
+
+#[test]
+fn a_granted_scope_narrower_than_the_request_decides() {
+    let active = grant(Some("did:plc:a"), STATUS_ACTIVE, FULL_SCOPE);
+
+    let reduced = linked_repo_target(&active, Some("atproto"));
+    assert!(!reduced.available && !reduced.can_unpublish);
+    assert_eq!(
+        reduced.unavailable_reason.as_deref(),
+        Some(GRANTED_FEWER_ATPROTO)
+    );
+
+    let no_delete = linked_repo_target(
+        &active,
+        Some("atproto repo:com.atproto.lexicon.schema?action=create&action=update"),
+    );
+    assert!(no_delete.available && !no_delete.can_unpublish);
+
+    // A request that never asked for the collection keeps its own reason,
+    // whatever the PDS granted.
+    let unasked = linked_repo_target(
+        &grant(Some("did:plc:a"), STATUS_ACTIVE, "atproto"),
+        Some(FULL_SCOPE),
+    );
+    assert!(!unasked.available);
+    assert!(unasked.unavailable_reason.unwrap().contains("add it again"));
+}
+
+const GRANTED_FEWER_ATPROTO: &str = "the PDS granted fewer scopes than this linked repo asked \
+     for (it granted: atproto). It may have cached HappyView's client details before this grant \
+     existed; link the repo again later";
+
+async fn seed_linked_session(s: &happyview::AppState, did: &str, scope: Option<&str>) {
+    let session = serde_json::json!({
+        "dpop_key": {},
+        "token_set": { "sub": did, "scope": scope, "access_token": "tok", "token_type": "DPoP" },
+    });
+    let sql = happyview::db::adapt_sql(
+        "INSERT INTO happyview_linked_repo_sessions (did, session_data, updated_at) VALUES (?, ?, ?)",
+        s.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(did)
+        .bind(session.to_string())
+        .bind(happyview::db::now_rfc3339())
+        .execute(&s.db)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn linked_repo_targets_judge_by_the_scope_in_the_stored_session() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+
+    let reduced = active_grant(s, "did:plc:reduced", FULL_SCOPE).await;
+    seed_linked_session(s, "did:plc:reduced", Some("atproto")).await;
+    let full = active_grant(s, "did:plc:full", FULL_SCOPE).await;
+    seed_linked_session(s, "did:plc:full", Some(FULL_SCOPE)).await;
+    let unknown = active_grant(s, "did:plc:unknown", FULL_SCOPE).await;
+    seed_linked_session(s, "did:plc:unknown", None).await;
+    let missing = active_grant(s, "did:plc:missing", FULL_SCOPE).await;
+
+    let linked_repos = LinkedRepoTargets::load(s).await.unwrap();
+    let target = |id: &str| linked_repos.target(linked_repos.find(id).unwrap());
+
+    let reduced_id = reduced.id.clone();
+    let reduced = target(&reduced_id);
+    assert!(!reduced.available && !reduced.can_unpublish);
+    assert_eq!(
+        reduced.unavailable_reason.as_deref(),
+        Some(GRANTED_FEWER_ATPROTO)
+    );
+    for id in [&full.id, &unknown.id, &missing.id] {
+        let t = target(id);
+        assert!(t.available && t.can_unpublish, "{t:?}");
+    }
+
+    let listed = list_targets(s).await.unwrap();
+    let listed_reduced = listed
+        .iter()
+        .find(|t| t.did.as_deref() == Some("did:plc:reduced"))
+        .unwrap();
+    assert_eq!(
+        listed_reduced.unavailable_reason.as_deref(),
+        Some(GRANTED_FEWER_ATPROTO)
+    );
+
+    // A rule on the reduced repo is refused with the same reason.
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("{BASE}/rules"),
+        Some(json!({
+            "pattern": "com.example.*",
+            "target_kind": "linked_repo",
+            "linked_repo_id": reduced_id,
+            "auto_publish": false,
+        })),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.to_string().contains("granted fewer scopes"), "{body}");
 }
 
 #[tokio::test]
@@ -533,9 +648,9 @@ async fn a_rule_whose_linked_repo_was_removed_never_falls_back_to_a_broader_rule
     assert!(linked::delete(s, &chosen.id).await.unwrap());
 
     let rule = store::get_rule(s, &rule.id).await.unwrap().unwrap();
-    let grants = linked::list(s).await.unwrap();
+    let linked_repos = LinkedRepoTargets::load(s).await.unwrap();
     let instance = instance_target(s).await.unwrap();
-    let target = target_for_rule(s, &rule, &grants, &instance).await;
+    let target = target_for_rule(s, &rule, &linked_repos, &instance).await;
     assert!(!target.available);
     assert_eq!(target.kind, "linked_repo");
     assert_eq!(target.did, None);

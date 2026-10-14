@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -72,6 +74,34 @@ pub async fn list(state: &AppState) -> Result<Vec<LinkedRepo>, AppError> {
         .await
         .map_err(|e| AppError::Internal(format!("failed to list linked repos: {e}")))?;
     Ok(rows.iter().map(row_to_grant).collect())
+}
+
+/// The scope each linked repo's PDS granted, keyed by DID. Read straight from
+/// the stored session so judging a grant needs no session restore and no
+/// network; a row whose session does not parse, or carries no scope, is
+/// absent, which callers read as "not known".
+pub async fn granted_scopes(state: &AppState) -> Result<HashMap<String, String>, AppError> {
+    let sql = adapt_sql(
+        "SELECT did, session_data FROM happyview_linked_repo_sessions",
+        state.db_backend,
+    );
+    let rows: Vec<(String, String)> = crate::db::query_as(&sql)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to read linked sessions: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(did, data)| Some((did, session_scope(&data)?)))
+        .collect())
+}
+
+fn session_scope(session_data: &str) -> Option<String> {
+    let session: serde_json::Value = serde_json::from_str(session_data).ok()?;
+    session
+        .get("token_set")?
+        .get("scope")?
+        .as_str()
+        .map(str::to_string)
 }
 
 pub async fn get(state: &AppState, id: &str) -> Result<Option<LinkedRepo>, AppError> {

@@ -177,9 +177,9 @@ async fn write(state: &AppState, nsid: &str) -> Result<(String, String, String),
     let rule = rule_for(nsid, &rules)
         .ok_or_else(|| Refusal::Failed(format!("no publishing default covers {nsid}")))?;
 
-    let grants = crate::linked_repos::db::list(state).await?;
+    let linked = target::LinkedRepoTargets::load(state).await?;
     let instance = target::instance_target(state).await?;
-    let target = target::target_for_rule(state, rule, &grants, &instance).await;
+    let target = target::target_for_rule(state, rule, &linked, &instance).await;
     let Some(did) = target.writable_did().map(str::to_string) else {
         return Err(Refusal::Failed(
             target
@@ -198,7 +198,7 @@ async fn write(state: &AppState, nsid: &str) -> Result<(String, String, String),
     let (uri, cid) = if target.kind == KIND_INSTANCE {
         write_instance(state, &did, nsid, record).await?
     } else {
-        let grant = find_grant(&grants, &target)?;
+        let grant = find_grant(&linked.grants, &target)?;
         crate::linked_repos::pds::put_record(state, grant, SCHEMA_COLLECTION, nsid, record, None)
             .await?
     };
@@ -382,9 +382,9 @@ async fn due_for_publish(state: &AppState) -> Result<Vec<String>, AppError> {
     if !rules.iter().any(|(r, _)| r.auto_publish) {
         return Ok(Vec::new());
     }
-    let grants = crate::linked_repos::db::list(state).await?;
+    let linked = target::LinkedRepoTargets::load(state).await?;
     let instance = target::instance_target(state).await?;
-    let views = super::overview::lexicon_views(state, &rules, &grants, &instance).await?;
+    let views = super::overview::lexicon_views(state, &rules, &linked, &instance).await?;
     Ok(views
         .into_iter()
         .filter(|v| {

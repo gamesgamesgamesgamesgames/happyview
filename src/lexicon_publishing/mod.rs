@@ -9,7 +9,10 @@ pub use overview::{LexiconView, Overview, RuleView, overview};
 pub use pattern::{Pattern, best_match};
 pub use publish::{PublishOutcome, publish, publishable, reconcile, spawn_reconcile, unpublish};
 pub use status::{PublishStatus, SCHEMA_COLLECTION, compute_status, record_cid, schema_record};
-pub use target::{TargetInfo, instance_target, linked_repo_target, list_targets, target_for_rule};
+pub use target::{
+    LinkedRepoTargets, TargetInfo, instance_target, linked_repo_target, list_targets,
+    target_for_rule,
+};
 
 /// The DID named by `_lexicon.<authority>`, or `None` when the name has no
 /// TXT record. A resolver is built per call because the shared one panics on
