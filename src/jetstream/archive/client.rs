@@ -1,7 +1,9 @@
 //! HTTP client for the Jetstream v2 archive: `planSnapshot`, `getSegment`,
 //! `getBlock`. Only these requests carry `JETSTREAM_API_KEY`. Every body byte
 //! received is counted, so a job can report what it downloaded (Bluesky
-//! meters Replay by key; spec, "Bluesky's answer on replay metering").
+//! meters Replay by key; spec, "Bluesky's answer on replay metering"), and
+//! charged to the shared `BytePacer`, so requests keep within the archive's
+//! byte quota instead of running into its 429s.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 use super::ArchiveConfig;
+use super::pacer::BytePacer;
 use crate::jetstream::config::Endpoint;
 
 pub const PLAN_PATH: &str = "/xrpc/network.bsky.jetstream.planSnapshot";
@@ -24,8 +27,15 @@ pub const MAX_SEGMENT_BYTES: u64 = 1 << 30;
 pub const MAX_BLOCK_BYTES: usize = 64 << 20;
 pub const MAX_GENERATION_RESTARTS: u32 = 2;
 const MAX_PLAN_BYTES: usize = 64 << 20;
-const THROTTLED_ATTEMPTS: u32 = 5;
-const FAILED_ATTEMPTS: u32 = 3;
+/// Attempts at a request the archive answers 503.
+const UNAVAILABLE_ATTEMPTS: u32 = 5;
+/// Attempts at a request that fails in transport or with another 5xx (but
+/// 501). Backing off from one second, they span 31 s of waiting: enough for
+/// an upstream blip such as a `502 upstream unavailable`.
+const FAILED_ATTEMPTS: u32 = 6;
+/// The longest one backoff step waits.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The longest a 429 or 503's `Retry-After` is waited out at a time.
 const MAX_THROTTLE_WAIT: u64 = 30;
 /// The whole-request limit for `planSnapshot` and `getBlock`, and how long
 /// any request may wait for its response headers.
@@ -134,8 +144,10 @@ pub struct ArchiveClient {
     host: String,
     api_key: Option<String>,
     retry_unit: Duration,
+    max_throttled_for: Duration,
     part_size: u64,
     bytes: Arc<AtomicU64>,
+    pacer: Arc<BytePacer>,
 }
 
 impl ArchiveClient {
@@ -148,8 +160,10 @@ impl ArchiveClient {
             host: endpoint.host.clone(),
             api_key: config.api_key.clone(),
             retry_unit: config.retry_unit,
+            max_throttled_for: config.max_throttled_for,
             part_size: SEGMENT_PART,
             bytes: Arc::new(AtomicU64::new(0)),
+            pacer: config.pacer.clone(),
         }
     }
 
@@ -167,14 +181,29 @@ impl ArchiveClient {
         self.bytes.load(Ordering::Relaxed)
     }
 
+    /// Count body bytes received, and charge them to the quota.
     fn count(&self, n: usize) {
         self.bytes.fetch_add(n as u64, Ordering::Relaxed);
+        self.pacer.charge(n as u64);
     }
 
-    /// Send with the archive's retry policy: 429/503 wait out `Retry-After`
-    /// (at most 30 s) up to 5 attempts; other 5xx (but 501) and transport
-    /// errors back off `retry_unit` doubling, 3 attempts in all. Any other
-    /// answer is returned to the caller.
+    fn backoff(&self, attempt: u32) -> Duration {
+        backoff(self.retry_unit, attempt)
+    }
+
+    /// Send with the archive's retry policy. Every attempt first waits for
+    /// the byte quota (`BytePacer`), and every answer teaches it the quota
+    /// the archive advertises.
+    ///
+    /// - 429 is backpressure: it empties the shared bucket, so every request
+    ///   waits out `Retry-After` (at most 30 s), and is retried for as long as
+    ///   it takes, unless one request is throttled for longer than
+    ///   `max_throttled_for` (15 minutes): then the 429 is returned.
+    /// - 503 waits out `Retry-After` (at most 30 s), 5 attempts in all.
+    /// - Other 5xx (but 501) and transport errors back off `retry_unit`
+    ///   doubling, each step at most 30 s, 6 attempts in all.
+    ///
+    /// Any other answer is returned to the caller.
     ///
     /// Response headers must arrive within `REQUEST_TIMEOUT`. With
     /// `whole_request`, the body must finish within it too; `getSegment`
@@ -184,8 +213,10 @@ impl ArchiveClient {
         whole_request: bool,
         build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, ArchiveError> {
-        let (mut throttled, mut failed) = (0u32, 0u32);
+        let (mut unavailable, mut failed) = (0u32, 0u32);
+        let mut throttled_since: Option<tokio::time::Instant> = None;
         loop {
+            self.pacer.acquire().await;
             let mut request = build();
             if whole_request {
                 request = request.timeout(REQUEST_TIMEOUT);
@@ -193,15 +224,33 @@ impl ArchiveClient {
             if let Some(key) = &self.api_key {
                 request = request.bearer_auth(key);
             }
-            let error = match tokio::time::timeout(REQUEST_TIMEOUT, request.send()).await {
-                Ok(Ok(response))
-                    if matches!(
-                        response.status(),
-                        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
-                    ) =>
-                {
-                    throttled += 1;
-                    if throttled >= THROTTLED_ATTEMPTS {
+            let sent = tokio::time::timeout(REQUEST_TIMEOUT, request.send()).await;
+            if let Ok(Ok(response)) = &sent {
+                self.pacer.learn(response.headers());
+            }
+            let error = match sent {
+                Ok(Ok(response)) if response.status() == StatusCode::TOO_MANY_REQUESTS => {
+                    let since = *throttled_since.get_or_insert_with(tokio::time::Instant::now);
+                    if since.elapsed() >= self.max_throttled_for {
+                        return Err(status_error(response).await);
+                    }
+                    // At least `retry_unit`, so `Retry-After: 0` can't spin.
+                    let wait = Duration::from_secs(
+                        crate::http_retry::parse_retry_after(response.headers())
+                            .min(MAX_THROTTLE_WAIT),
+                    )
+                    .max(self.retry_unit);
+                    // With a quota, the emptied bucket holds back this
+                    // request and every other one; without, wait here.
+                    if !self.pacer.throttled(wait) {
+                        tokio::time::sleep(wait).await;
+                    }
+                    continue;
+                }
+                Ok(Ok(response)) if response.status() == StatusCode::SERVICE_UNAVAILABLE => {
+                    throttled_since = None;
+                    unavailable += 1;
+                    if unavailable >= UNAVAILABLE_ATTEMPTS {
                         return Err(status_error(response).await);
                     }
                     let wait = crate::http_retry::parse_retry_after(response.headers())
@@ -213,11 +262,12 @@ impl ArchiveClient {
                     if response.status().is_server_error()
                         && response.status() != StatusCode::NOT_IMPLEMENTED =>
                 {
+                    throttled_since = None;
                     failed += 1;
                     if failed >= FAILED_ATTEMPTS {
                         return Err(status_error(response).await);
                     }
-                    tokio::time::sleep(self.retry_unit * 2u32.pow(failed - 1)).await;
+                    tokio::time::sleep(self.backoff(failed)).await;
                     continue;
                 }
                 Ok(Ok(response)) => return Ok(response),
@@ -229,11 +279,12 @@ impl ArchiveClient {
                 )),
             };
             // A transport failure: no response, or none in time.
+            throttled_since = None;
             failed += 1;
             if failed >= FAILED_ATTEMPTS {
                 return Err(error);
             }
-            tokio::time::sleep(self.retry_unit * 2u32.pow(failed - 1)).await;
+            tokio::time::sleep(self.backoff(failed)).await;
         }
     }
 
@@ -270,7 +321,7 @@ impl ArchiveClient {
                     if failed >= FAILED_ATTEMPTS {
                         return Err(e);
                     }
-                    tokio::time::sleep(self.retry_unit * 2u32.pow(failed - 1)).await;
+                    tokio::time::sleep(self.backoff(failed)).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -450,7 +501,7 @@ impl ArchiveClient {
             if body_failures >= FAILED_ATTEMPTS {
                 return Err(outcome);
             }
-            tokio::time::sleep(self.retry_unit * 2u32.pow(body_failures - 1)).await;
+            tokio::time::sleep(self.backoff(body_failures)).await;
         }
     }
 
@@ -521,6 +572,13 @@ fn too_large(name: &str, len: u64) -> ArchiveError {
     ArchiveError::TooLarge(format!(
         "segment {name} is {len} bytes, over the {MAX_SEGMENT_BYTES}-byte cap"
     ))
+}
+
+/// The wait before retry `attempt` (from 1): `unit` doubling, at most
+/// `MAX_BACKOFF`.
+fn backoff(unit: Duration, attempt: u32) -> Duration {
+    unit.saturating_mul(2u32.saturating_pow(attempt - 1))
+        .min(MAX_BACKOFF)
 }
 
 /// `bytes <start>-<end>/<total>`.
@@ -710,7 +768,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn throttling_gives_up_after_five_attempts() {
+    async fn throttling_is_waited_out_however_many_times_it_takes() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(PLAN_PATH))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(8)
+            .expect(8)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(PLAN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(
+            client(&server, None)
+                .plan(&PlanRequest::default())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn throttling_that_outlasts_the_bound_fails_with_the_429() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(BLOCK_PATH))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "0")
+                    .set_body_json(serde_json::json!({ "error": "byte limit exceeded" })),
+            )
+            .mount(&server)
+            .await;
+        let endpoint = crate::jetstream::config::parse_endpoint(&server.uri());
+        let config = ArchiveConfig {
+            retry_unit: Duration::from_millis(5),
+            max_throttled_for: Duration::from_millis(50),
+            ..ArchiveConfig::default()
+        };
+        let Err(ArchiveError::Status {
+            status: 429,
+            message,
+        }) = ArchiveClient::new(&endpoint, &config).block("seg", 0).await
+        else {
+            panic!("a 429");
+        };
+        assert!(message.contains("byte limit exceeded"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn unavailability_gives_up_after_five_attempts() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(PLAN_PATH))
@@ -725,13 +835,105 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_errors_retry_three_times_and_client_errors_not_at_all() {
+    async fn a_plan_survives_an_upstream_blip() {
+        for failures in [2, 4] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(PLAN_PATH))
+                .respond_with(
+                    ResponseTemplate::new(502)
+                        .set_body_json(serde_json::json!({ "error": "upstream unavailable" })),
+                )
+                .up_to_n_times(failures)
+                .expect(failures)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(PLAN_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert!(
+                client(&server, None)
+                    .plan(&PlanRequest::default())
+                    .await
+                    .is_ok(),
+                "{failures} 502s"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_thirty_seconds() {
+        let unit = Duration::from_secs(1);
+        let steps: Vec<_> = (1..=7).map(|n| backoff(unit, n).as_secs()).collect();
+        assert_eq!(steps, vec![1, 2, 4, 8, 16, 30, 30]);
+    }
+
+    /// The headers Bluesky's archive sends on every response.
+    fn quota(response: ResponseTemplate, burst: &str, refill: &str) -> ResponseTemplate {
+        response
+            .insert_header("headwind-quota-burst-bytes", burst)
+            .insert_header("headwind-quota-refill-bytes", refill)
+            .insert_header("headwind-quota-refill-period-seconds", "1")
+    }
+
+    #[tokio::test]
+    async fn the_archive_quota_is_learned_and_charged() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(PLAN_PATH))
+            .respond_with(quota(
+                ResponseTemplate::new(200).set_body_json(page()),
+                "1000000000",
+                "2000000",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(BLOCK_PATH))
+            .respond_with(quota(
+                ResponseTemplate::new(200).set_body_bytes(vec![7u8; 1500]),
+                "1000",
+                "100000",
+            ))
+            .mount(&server)
+            .await;
+        let endpoint = crate::jetstream::config::parse_endpoint(&server.uri());
+        let config = ArchiveConfig::default();
+        let client = ArchiveClient::new(&endpoint, &config);
+        client.plan(&PlanRequest::default()).await.unwrap();
+        assert_eq!(
+            config.pacer.quota(),
+            Some(super::super::pacer::Quota {
+                burst_bytes: 1e9,
+                refill_per_sec: 2e6,
+            })
+        );
+        // A second client of the same config shares the bucket: its block
+        // overspends a 1000-byte burst by 500, which at 100 kB/s takes 5 ms
+        // to repay.
+        let other = ArchiveClient::new(&endpoint, &config);
+        other.block("seg", 0).await.unwrap();
+        assert_eq!(config.pacer.quota().map(|q| q.burst_bytes), Some(1000.0));
+        let start = std::time::Instant::now();
+        config.pacer.acquire().await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(4),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_errors_retry_and_client_errors_do_not() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(BLOCK_PATH))
             .and(query_param("blockIndex", "1"))
             .respond_with(ResponseTemplate::new(500))
-            .expect(3)
+            .expect(u64::from(FAILED_ATTEMPTS))
             .mount(&server)
             .await;
         Mock::given(method("GET"))

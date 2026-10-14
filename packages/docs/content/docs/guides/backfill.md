@@ -44,11 +44,13 @@ Each record goes through the same checks as a crawled one: the lexicon script ru
 
 The job page shows `seq {n} of {tip}` while it runs, along with the bytes downloaded and any failed blocks. A block that can't be downloaded or decoded after retries is recorded as a `replay_block` error. `POST /admin/backfill/{id}/retry-failed` starts a new job that fetches only those blocks, then applies the account events of every account those blocks wrote records for, so a later takedown still removes them. See [Retry failed](../api-reference/admin/backfill.md#retry-failed).
 
-A replay job stops and fails rather than run on through an archive outage. It stops after 16 blocks in a row that the archive didn't answer or answered with an HTTP error, with the error `the archive failed 16 blocks in a row; stopping (resume to continue)`. A block that arrives but doesn't decode, or is over a size cap, is recorded and skipped instead, and doesn't count towards the 16. A job also stops when a failed block can't be recorded, since a block that isn't recorded could never be retried. Either way it stops before it moves past the blocks in question.
+A replay job stops and fails rather than run on through an archive outage. Each request is retried first: a 502, 504 or other server error, or no answer at all, is retried 6 times over about 30 seconds, and a 503 is retried 5 times, waiting out its `Retry-After`. It stops after 16 blocks in a row that the archive didn't answer or answered with an HTTP error after those retries, with the error `the archive failed 16 blocks in a row; stopping (resume to continue)`. A block that arrives but doesn't decode, or is over a size cap, is recorded and skipped instead, and doesn't count towards the 16. A job also stops when a failed block can't be recorded, since a block that isn't recorded could never be retried. Either way it stops before it moves past the blocks in question.
 
 A failed replay job can be resumed like a paused one: it carries on from where it stopped, without downloading again what it had finished. Two exceptions need a new backfill instead. A job that stopped because its error log is full (10,000 failures) stops again on every resume. An account replay job created before account backfills always crawled can't be resumed once its account list is gone, which happens when its details are cleared.
 
 Replay needs a Jetstream that serves the v2 archive. Bluesky's hosted archive, which the default `JETSTREAM_URL` points at, requires a key: without `JETSTREAM_API_KEY`, `auto` jobs crawl and `replay` jobs fail. If `JETSTREAM_API_KEY` is set, it is sent to the archive and nowhere else. Replay jobs spool each segment to `BACKFILL_REPLAY_DIR` while they decode it, up to 1 GiB per segment.
+
+Bluesky's hosted archive meters each key by the bytes it serves: about 1 GB at once, then about 2 MB per second. It advertises that quota on its responses, and HappyView paces every replay request to it, shared across every job using the key. Past the first gigabyte a replay downloads at about 2 MB/s however high `BACKFILL_REPLAY_CONCURRENCY` is set, so raising it doesn't speed replay up there. When the archive answers 429 anyway, every replay request waits out its `Retry-After` and tries again, for as long as it takes. Only a request that stays throttled for 15 minutes fails, and counts towards the 16 failed blocks above. A Jetstream that advertises no quota, such as a self-hosted one, isn't paced.
 
 Crawl is what runs by default, for every account backfill, and for `auto` jobs when the Jetstream has no archive HappyView may use.
 
@@ -58,7 +60,7 @@ When the live stream falls further behind than Jetstream keeps, Jetstream refuse
 
 ### Rate limiting
 
-All three phases handle HTTP 429 responses. HappyView reads the `RateLimit-Reset` header (a Unix timestamp, the atproto convention) to determine how long to wait, falling back to the `retry-after` header, then defaulting to 5 seconds.
+All three crawl phases handle HTTP 429 responses. HappyView reads the `RateLimit-Reset` header (a Unix timestamp, the atproto convention) to determine how long to wait, falling back to the `retry-after` header, then defaulting to 5 seconds. Replay paces itself to the archive's quota instead; see [Replay and crawl](#replay-and-crawl).
 
 ## Job lifecycle
 

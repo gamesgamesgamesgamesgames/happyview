@@ -20,7 +20,8 @@ use crate::jetstream::archive::segment::{self, Row};
 
 const STALLED_PAGES: u32 = 5;
 /// Failed blocks in a row, across entries, after which the job stops rather
-/// than run on through an archive outage.
+/// than run on through an archive outage. Throttling alone doesn't get here:
+/// the client paces to the archive's byte quota and waits out its 429s.
 const MAX_CONSECUTIVE_FAILURES: u32 = 16;
 
 pub(super) enum ReplayOutcome {
@@ -760,7 +761,10 @@ impl Run<'_> {
 }
 
 /// Whether a failed request means the archive is down or refusing, rather
-/// than that it answered with something unusable.
+/// than that it answered with something unusable. The client has already
+/// retried: a `Status` here is a 5xx that outlasted its backoff, or a 429
+/// that kept the request throttled for `MAX_THROTTLED_FOR`, well past the
+/// pacing that normally keeps replay within the archive's quota.
 fn is_outage(error: &ArchiveError) -> bool {
     matches!(
         error,

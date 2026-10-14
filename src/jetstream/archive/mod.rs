@@ -2,8 +2,12 @@
 //! and the conversion of archive rows into the events live ingest applies.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use pacer::BytePacer;
 
 pub mod client;
+pub mod pacer;
 pub mod rows;
 pub mod segment;
 
@@ -12,6 +16,11 @@ pub const MAX_CONCURRENCY: usize = 64;
 /// The archive client's read timeout: as long as a whole `planSnapshot` or
 /// `getBlock` may take, and as long as a segment body may go silent.
 pub const ARCHIVE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long one archive request may keep being answered 429 before it
+/// fails. The archive's quota refills steadily, so a 429 is a reason to wait,
+/// not to give up; only one that lasts this long is treated as an outage.
+pub const MAX_THROTTLED_FOR: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// How long the live consumer waits for the archive to plan a gap replay
 /// before resuming without it.
@@ -98,6 +107,9 @@ pub struct ArchiveConfig {
     /// The client archive requests go through, built once: see
     /// `http_retry::build_archive_client`.
     pub http: reqwest::Client,
+    /// The archive's byte quota, learned from its responses and shared by
+    /// every client built from this config: one key, one bucket.
+    pub pacer: Arc<BytePacer>,
     /// `JETSTREAM_API_KEY`, sent only to the archive endpoints.
     pub api_key: Option<String>,
     /// `BACKFILL_REPLAY_CONCURRENCY`: concurrent `getBlock` requests per job.
@@ -109,6 +121,9 @@ pub struct ArchiveConfig {
     /// The first backoff step after a 5xx or a transport error; doubles per
     /// attempt. One second in production; tests shorten it.
     pub retry_unit: std::time::Duration,
+    /// How long one request may keep being throttled (429) before it fails.
+    /// `MAX_THROTTLED_FOR` in production; tests shorten it.
+    pub max_throttled_for: std::time::Duration,
     /// The longest a gap replay's `planSnapshot` may take, retries included,
     /// before the live consumer resumes without it. `GAP_PLAN_TIMEOUT` in
     /// production; tests shorten it.
@@ -119,11 +134,13 @@ impl Default for ArchiveConfig {
     fn default() -> Self {
         Self {
             http: archive_client(),
+            pacer: Arc::default(),
             api_key: None,
             concurrency: DEFAULT_CONCURRENCY,
             download_dir: std::env::temp_dir().join("happyview-replay"),
             default_source: SourceChoice::Crawl,
             retry_unit: std::time::Duration::from_secs(1),
+            max_throttled_for: MAX_THROTTLED_FOR,
             gap_plan_timeout: GAP_PLAN_TIMEOUT,
         }
     }
@@ -135,6 +152,7 @@ impl ArchiveConfig {
         let default_source = parse_default_source(var("BACKFILL_SOURCE").as_deref());
         Self {
             http: archive_client(),
+            pacer: Arc::default(),
             api_key: parse_api_key(var("JETSTREAM_API_KEY").as_deref()),
             concurrency: parse_concurrency(var("BACKFILL_REPLAY_CONCURRENCY").as_deref()),
             download_dir: var("BACKFILL_REPLAY_DIR")
@@ -144,6 +162,7 @@ impl ArchiveConfig {
                 .unwrap_or_else(|| Self::default().download_dir),
             default_source,
             retry_unit: std::time::Duration::from_secs(1),
+            max_throttled_for: MAX_THROTTLED_FOR,
             gap_plan_timeout: GAP_PLAN_TIMEOUT,
         }
     }
