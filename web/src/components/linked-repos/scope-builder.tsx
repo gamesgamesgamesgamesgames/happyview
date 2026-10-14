@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, X } from "lucide-react";
+import { AlertTriangle, Check, Plus, X } from "lucide-react";
 
 import { isValidNsid } from "@happyview/nsid";
 
@@ -311,6 +311,35 @@ function buildScopeString(rows: ScopeRow[]): string {
   return parts.join(" ");
 }
 
+/**
+ * Scope sets a feature needs, offered whole so an operator does not have to
+ * know the collection or remember that publishing upserts.
+ */
+const PRESETS: { label: string; rows: ScopeRow[] }[] = [
+  {
+    // Publishing upserts, which needs create and update; unpublishing needs
+    // delete. Mirrors what src/lexicon_publishing/target.rs checks.
+    label: "Lexicon publishing",
+    rows: [
+      {
+        prefix: "repo",
+        rest: "com.atproto.lexicon.schema",
+        actions: ["create", "update", "delete"],
+      },
+    ],
+  },
+];
+
+/** Whether every action a preset row asks for is already granted. */
+function rowCovered(rows: ScopeRow[], wanted: ScopeRow): boolean {
+  return rows.some(
+    (r) =>
+      r.prefix.trim() === wanted.prefix &&
+      r.rest.trim() === wanted.rest &&
+      wanted.actions.every((a) => r.actions.includes(a)),
+  );
+}
+
 interface ScopeBuilderProps {
   value: string;
   onChange: (scopes: string) => void;
@@ -401,6 +430,27 @@ export function ScopeBuilder({
     update(rows.filter((_, i) => i !== index));
   }
 
+  // Widens a row that already names the collection rather than adding a
+  // second one, so the preview never carries the same collection twice.
+  function applyPreset(preset: (typeof PRESETS)[number]) {
+    let next = rows.filter((r) => r.prefix.trim() || r.rest.trim());
+    for (const wanted of preset.rows) {
+      const i = next.findIndex(
+        (r) => r.prefix.trim() === wanted.prefix && r.rest.trim() === wanted.rest,
+      );
+      if (i === -1) {
+        next = [...next, { ...wanted }];
+      } else {
+        next = next.map((r, j) =>
+          j === i
+            ? { ...r, actions: orderActions([...r.actions, ...wanted.actions]) }
+            : r,
+        );
+      }
+    }
+    update(next);
+  }
+
   const rowErrors = rows.map((row) => {
     const token = rowToToken(row);
     if (!token) return null;
@@ -422,6 +472,28 @@ export function ScopeBuilder({
           <code className="font-mono">com.example.note</code>, then the actions
           it may perform on that collection.
         </p>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-muted-foreground text-xs">Presets</span>
+          {PRESETS.map((preset) => {
+            const applied = preset.rows.every((r) => rowCovered(rows, r));
+            return (
+              <Button
+                key={preset.label}
+                type="button"
+                variant="outline"
+                size="xs"
+                className="rounded-full"
+                disabled={applied}
+                aria-pressed={applied}
+                onClick={() => applyPreset(preset)}
+              >
+                {applied ? <Check aria-hidden /> : <Plus aria-hidden />}
+                {preset.label}
+              </Button>
+            );
+          })}
+        </div>
 
         <div className="flex flex-col gap-2">
           {/* `atproto` is mandatory in every authorization request, so it is
