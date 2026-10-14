@@ -17,6 +17,7 @@ import {
   ComboboxList,
 } from "@/components/ui/combobox";
 import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 import {
   InputGroup,
   InputGroupAddon,
@@ -30,9 +31,15 @@ import {
  * button, so the value inputs all end at the same x. Secondary content —
  * checkboxes, errors, notes — sits at `col-start-2` and therefore lines up
  * under the value it describes instead of hanging off the left edge.
+ *
+ * Below `sm` an 11rem prefix leaves a collection NSID a few characters, so
+ * the prefix takes a line of its own and the value gets the full width.
  */
 const ROW_GRID =
-  "grid grid-cols-[11rem_minmax(0,1fr)_2.25rem] items-start gap-x-2 gap-y-1";
+  "grid grid-cols-[minmax(0,1fr)_2.25rem] items-start gap-x-2 gap-y-1 sm:grid-cols-[11rem_minmax(0,1fr)_2.25rem]";
+
+/** Secondary content under a row's value, at every width. */
+const UNDER_VALUE = "col-span-2 sm:col-start-2";
 
 // Mirrors src/linked_repos/scope.rs byte-for-byte. Keep the two in sync —
 // this is the client-side half of the same grammar the server enforces.
@@ -511,7 +518,7 @@ export function ScopeBuilder({
               value={BASE_SCOPE}
               readOnly
               aria-label="Base scope, always included"
-              className="col-span-2 bg-muted font-mono text-sm"
+              className="bg-muted font-mono text-sm sm:col-span-2"
             />
           </div>
 
@@ -533,7 +540,7 @@ export function ScopeBuilder({
                   }}
                 >
                   <ComboboxInput
-                    className="w-full font-mono text-sm"
+                    className="col-span-2 w-full font-mono text-sm sm:col-span-1"
                     placeholder="prefix"
                     aria-label={`Scope ${index + 1} prefix`}
                   />
@@ -571,7 +578,7 @@ export function ScopeBuilder({
                       // to the checkboxes, so it stops here.
                       onClick={(e) => e.stopPropagation()}
                     >
-                      <fieldset className="flex flex-wrap items-center gap-x-5 gap-y-1.5">
+                      <fieldset className="flex flex-wrap items-center gap-x-3 gap-y-1.5 sm:gap-x-5">
                         <legend className="sr-only">
                           Scope {index + 1} actions
                         </legend>
@@ -632,13 +639,13 @@ export function ScopeBuilder({
                 )}
 
                 {rowErrors[index] && (
-                  <p className="col-start-2 col-span-2 text-destructive text-xs">
+                  <p className={cn(UNDER_VALUE, "text-destructive text-xs")}>
                     {rowErrors[index]}
                   </p>
                 )}
 
                 {cannotUpsert(row) && (
-                  <p className="col-start-2 col-span-2 text-muted-foreground text-xs">
+                  <p className={cn(UNDER_VALUE, "text-muted-foreground text-xs")}>
                     <code className="font-mono">update</code> without{" "}
                     <code className="font-mono">create</code> can&apos;t{" "}
                     <code className="font-mono">put_record</code>, which upserts
