@@ -149,8 +149,17 @@ pub async fn publish(state: &AppState, nsid: &str, actor: Option<&str>) -> Publi
         Err(Refusal::Failed(error)) => error,
     };
 
+    // Auto-publish retries at every trigger, so a lexicon stuck on one cause
+    // would otherwise log the same failure again each time.
+    let repeated = matches!(
+        store::get_publication(state, nsid).await,
+        Ok(Some(p)) if p.last_error.as_deref() == Some(error.as_str())
+    );
     if let Err(e) = store::record_failure(state, nsid, &error).await {
         tracing::warn!(nsid, "failed to record lexicon publish failure: {e}");
+    }
+    if repeated {
+        return PublishOutcome::failed(nsid, error);
     }
     log_event(
         &state.db,

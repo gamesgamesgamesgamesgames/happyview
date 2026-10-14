@@ -1652,3 +1652,32 @@ async fn a_publication_whose_lexicon_is_gone_is_listed_and_can_be_unpublished() 
         Some(did)
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn a_repeated_publish_failure_is_logged_once_and_a_new_one_again() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+    let nsid = "com.example.repeat";
+    put_manual(s, nsid).await;
+
+    publish(s, nsid, None).await;
+    let first = store::get_publication(s, nsid).await.unwrap().unwrap();
+    publish(s, nsid, None).await;
+    let second = store::get_publication(s, nsid).await.unwrap().unwrap();
+    assert_eq!(count_events(s, "lexicon.publish_failed", nsid).await, 1);
+    assert_eq!(second.last_error, first.last_error);
+    let at = |p: &store::Publication| {
+        chrono::DateTime::parse_from_rfc3339(p.last_attempt_at.as_deref().unwrap()).unwrap()
+    };
+    assert!(at(&second) > at(&first));
+
+    // An instance default with no instance identity fails for another reason.
+    store::insert_rule(s, &pat("*"), "instance", None, false, "did:plc:admin")
+        .await
+        .unwrap();
+    let outcome = publish(s, nsid, None).await;
+    assert_ne!(outcome.error, first.last_error);
+    assert_eq!(count_events(s, "lexicon.publish_failed", nsid).await, 2);
+}
