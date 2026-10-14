@@ -101,6 +101,18 @@ fn internal(context: &str, e: sqlx::Error) -> AppError {
     AppError::Internal(format!("{context}: {e}"))
 }
 
+/// The handlers check the linked repo before writing, so a foreign-key
+/// violation means it was removed between that check and this write.
+fn rule_write_error(context: &str, e: sqlx::Error) -> AppError {
+    if e.as_database_error()
+        .is_some_and(|d| d.is_foreign_key_violation())
+    {
+        AppError::BadRequest("unknown linked repo".into())
+    } else {
+        internal(context, e)
+    }
+}
+
 pub async fn list_rules(state: &AppState) -> Result<Vec<Rule>, AppError> {
     let sql = adapt_sql(
         &format!(
@@ -163,7 +175,7 @@ pub async fn insert_rule(
             {
                 AppError::Conflict(format!("a default for {stored} already exists"))
             } else {
-                internal("failed to create lexicon publish rule", e)
+                rule_write_error("failed to create lexicon publish rule", e)
             }
         })?;
 
@@ -205,7 +217,7 @@ pub async fn update_rule(
         .bind(id)
         .execute(&state.db)
         .await
-        .map_err(|e| internal("failed to update lexicon publish rule", e))?;
+        .map_err(|e| rule_write_error("failed to update lexicon publish rule", e))?;
 
     get_rule(state, id).await
 }

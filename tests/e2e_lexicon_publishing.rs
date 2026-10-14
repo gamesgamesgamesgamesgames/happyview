@@ -218,6 +218,46 @@ async fn withdrawal_forgets_the_record_and_a_success_clears_it() {
     );
 }
 
+#[tokio::test]
+#[serial]
+async fn a_rule_naming_a_missing_linked_repo_is_a_bad_request() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let s = &app.state;
+
+    let err = store::insert_rule(
+        s,
+        &pat("com.example.*"),
+        "linked_repo",
+        Some("no-such-grant"),
+        false,
+        "did:plc:a",
+    )
+    .await
+    .unwrap_err();
+    match err {
+        AppError::BadRequest(msg) => assert_eq!(msg, "unknown linked repo"),
+        other => panic!("expected bad request, got {other:?}"),
+    }
+
+    let rule = store::insert_rule(s, &pat("*"), "instance", None, false, "did:plc:a")
+        .await
+        .unwrap();
+    let err = store::update_rule(
+        s,
+        &rule.id,
+        Some("linked_repo"),
+        Some(Some("no-such-grant")),
+        None,
+    )
+    .await
+    .unwrap_err();
+    match err {
+        AppError::BadRequest(msg) => assert_eq!(msg, "unknown linked repo"),
+        other => panic!("expected bad request, got {other:?}"),
+    }
+}
+
 const FULL_SCOPE: &str =
     "atproto repo:com.atproto.lexicon.schema?action=create&action=update&action=delete";
 
