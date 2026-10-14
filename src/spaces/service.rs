@@ -289,6 +289,30 @@ pub(crate) async fn service_signing_key(
     load_signing_key(&state.db, state.db_backend, encryption_key).await
 }
 
+/// Begin a write to one space, holding the space for the whole transaction.
+///
+/// Every write reads its author's repo state and folds into it, so writes to
+/// a space have to land one at a time. SQLite's `BEGIN IMMEDIATE` already
+/// does that. Postgres runs them in parallel, so the space row is locked
+/// first: taken any later, after an insert's foreign key has share-locked the
+/// same row, two writers each wait on the other's share lock and deadlock.
+pub(crate) async fn begin_space_write(
+    state: &AppState,
+    space_id: &str,
+) -> Result<sqlx::Transaction<'static, sqlx::Any>, AppError> {
+    let mut tx = crate::db::begin_write(&state.db, state.db_backend)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    if state.db_backend == DatabaseBackend::Postgres {
+        crate::db::query("SELECT id FROM happyview_spaces WHERE id = $1 FOR UPDATE")
+            .bind(space_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::Internal(format!("failed to lock space: {e}")))?;
+    }
+    Ok(tx)
+}
+
 pub(crate) async fn commit_write(
     conn: &mut sqlx::AnyConnection,
     backend: DatabaseBackend,
@@ -573,11 +597,7 @@ pub(crate) async fn create_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
     db::insert_space_record(&mut *tx, state.db_backend, &rec).await?;
     let committed = commit_write(
         &mut tx,
@@ -667,11 +687,7 @@ pub(crate) async fn put_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
 
     let old_cid = match swap_cid.as_deref() {
         Some(swap) => Some(swap.to_string()),
@@ -761,11 +777,7 @@ pub(crate) async fn delete_record(
     // Before the transaction; see `service_signing_key`.
     let signing_key = service_signing_key(state).await?;
 
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to begin transaction: {e}")))?;
+    let mut tx = begin_space_write(state, &space.id).await?;
 
     let old_cid = if let Some(swap) = swap_cid {
         db::delete_space_record_with_swap(&mut tx, state.db_backend, &record_uri, &swap).await?;
