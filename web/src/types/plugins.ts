@@ -69,6 +69,20 @@ export interface OfficialPluginSummary {
   latest_version: string;
   manifest_url: string;
   official: boolean;
+  /** The publisher's long-form prose. Every field is optional, and the whole
+   * object is empty for a GitHub-sourced entry, which has no profile record
+   * behind it. */
+  sections: PluginSections;
+}
+
+/** The four long-form fields of `at.happyproto.plugin.profile`. CommonMark
+ * from a publisher, so a renderer strips embedded HTML and refuses a link
+ * scheme it does not recognise. */
+export interface PluginSections {
+  description?: string;
+  installation?: string;
+  changelog?: string;
+  security?: string;
 }
 
 export interface OfficialPluginsListResponse {

@@ -1140,6 +1140,7 @@ pub(super) async fn list_official(
             latest_version: p.latest_version.clone(),
             manifest_url: p.manifest_url.clone(),
             official: p.official,
+            sections: p.sections.clone(),
         })
         .collect::<Vec<_>>();
 
@@ -1174,6 +1175,7 @@ mod tests {
                     body: "notes".into(),
                 })
                 .collect(),
+            sections: Default::default(),
         }
     }
 
