@@ -21,6 +21,8 @@ pub mod plc;
 #[allow(dead_code, unused_imports)]
 pub mod project;
 #[allow(dead_code, unused_imports)]
+pub mod quickjs_plugins;
+#[allow(dead_code, unused_imports)]
 pub mod segment_writer;
 #[allow(dead_code, unused_imports)]
 pub mod syncer;
