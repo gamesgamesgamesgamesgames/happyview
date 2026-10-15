@@ -569,6 +569,9 @@ async fn job_wait_clamps_its_range_and_is_not_charged_to_the_deadline() {
     let mut sent = input("host:job_wait", ScriptKind::XrpcQuery);
     sent.context.job = Some(ScriptJob { id: job.clone() });
     sent.input = json!({"seconds": -5.0});
+    // Timed on a second run: the first compiles and instantiates the module,
+    // which under coverage instrumentation alone can pass the second.
+    returned(executor.execute_script(id, &sent).await.unwrap());
     let started = std::time::Instant::now();
     let (value, _) = returned(executor.execute_script(id, &sent).await.unwrap());
     assert!(value.get("error").is_none(), "{value}");
