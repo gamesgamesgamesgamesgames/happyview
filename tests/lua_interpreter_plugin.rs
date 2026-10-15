@@ -30,12 +30,12 @@ use serde_json::json;
 use common::app::TestApp;
 use common::lua_plugin::{identify, plugin_dir};
 use happyview::plugin::{
-    PluginType, ScriptErrorKind, ScriptExecuteContext, ScriptExecuteInput, ScriptExecuteLimits,
-    ScriptExecuteOutput, ScriptKind, ScriptValueKind, loader,
+    ChunkRole, ModuleScope, PluginType, ScriptErrorKind, ScriptExecuteContext, ScriptExecuteInput,
+    ScriptExecuteLimits, ScriptExecuteOutput, ScriptKind, ScriptValueKind, loader,
 };
 
 /// What the plugin's manifest declares, and what its imports need: the two
-/// bridge functions and the four `script:host` ones are `library:call` and
+/// bridge functions and the five `script:host` ones are `library:call` and
 /// `script:host`, and the clock, randomness and `fd_write` are the three
 /// WASI ones.
 const CAPABILITIES: [&str; 5] = [
@@ -588,4 +588,183 @@ async fn a_library_call_from_inside_a_coroutine_answers_its_value() {
             value_kind: ScriptValueKind::Object,
         }
     );
+}
+
+/// `validate` with `prepare` hands back bytecode the host can run with no
+/// source at all, and an error in it still names the file and the line.
+#[tokio::test]
+async fn a_prepared_artifact_runs_without_its_source() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let Some(id) = registered(&app).await else {
+        return;
+    };
+    let executor = app.state.plugin_executor();
+    let name = "src/lexicons/app/test/q.lua";
+    let prepared = executor
+        .prepare_script(
+            &id,
+            "function handle(input)\n  if input.q == 'boom' then\n    error('boom')\n  end\n  return { echoed = input.q }\nend",
+            name,
+            ChunkRole::Handler,
+        )
+        .await
+        .expect("validate should answer");
+    let artifact = prepared.artifact.expect("a prepared artifact");
+    assert_eq!(artifact.format, "lua-bytecode");
+    assert!(
+        artifact.engine.starts_with("puc-lua-5.4."),
+        "{}",
+        artifact.engine
+    );
+    assert_eq!(artifact.interpreter, id, "the host stamps the artifact");
+
+    let mut sent = input("", ScriptKind::XrpcQuery);
+    sent.chunk_name = name.to_string();
+    sent.artifact = Some(artifact);
+    let output = executor
+        .execute_script(&id, &sent)
+        .await
+        .expect("execute should answer");
+    assert_eq!(
+        output,
+        ScriptExecuteOutput::Returned {
+            value: json!({ "echoed": "hi" }),
+            value_kind: ScriptValueKind::Object,
+        }
+    );
+
+    sent.input = json!({ "q": "boom" });
+    match executor
+        .execute_script(&id, &sent)
+        .await
+        .expect("execute should answer")
+    {
+        ScriptExecuteOutput::Error { chunk, line, .. } => {
+            assert_eq!(chunk.as_deref(), Some(name));
+            assert_eq!(line, Some(3));
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+/// A relative `require` crosses `host_module_resolve` and is answered from
+/// the run's snapshot: the module's artifact when it has one.
+#[tokio::test]
+async fn a_relative_require_resolves_through_the_host_against_the_snapshot() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let Some(id) = registered(&app).await else {
+        return;
+    };
+    let executor = app.state.plugin_executor();
+    let module_id = "src/lexicons/app/test/lib/format.lua";
+    let module_source = "local M = {}\nfunction M.shout(s) return s:upper() end\nreturn M";
+    let prepared = executor
+        .prepare_script(&id, module_source, module_id, ChunkRole::Module)
+        .await
+        .expect("validate should answer");
+    assert!(prepared.valid, "{:?}", prepared.errors);
+
+    let mut snapshot = happyview::project::snapshot::ProjectSnapshot::empty();
+    snapshot.modules.insert(
+        module_id.to_string(),
+        happyview::project::snapshot::ProjectModule {
+            id: module_id.to_string(),
+            path: module_id.into(),
+            language_id: "lua".to_string(),
+            source: module_source.into(),
+            artifact: prepared.artifact,
+        },
+    );
+
+    let mut sent = input(
+        "local format = require('./lib/format')\nfunction handle(input) return format.shout(input.q) end",
+        ScriptKind::XrpcQuery,
+    );
+    sent.chunk_name = "src/lexicons/app/test/q.lua".to_string();
+    let output = executor
+        .execute_script_in(
+            &id,
+            &sent,
+            None,
+            ModuleScope::Project(std::sync::Arc::new(snapshot)),
+        )
+        .await
+        .expect("execute should answer");
+    assert_eq!(
+        output,
+        ScriptExecuteOutput::Returned {
+            value: json!("HI"),
+            value_kind: ScriptValueKind::Other,
+        }
+    );
+
+    // The same script run as a dashboard script has no project, and fails
+    // with the host's sentence saying so.
+    let outside = executor
+        .execute_script(&id, &sent)
+        .await
+        .expect("execute should answer");
+    let (kind, message, _) = failure(outside);
+    assert_eq!(kind, ScriptErrorKind::Runtime);
+    assert!(
+        message.contains("'./lib/format' is a local module"),
+        "{message}"
+    );
+}
+
+/// A module's artifact is what runs when the host hands one over, not its
+/// source: the two disagree here, so the answer says which one was loaded.
+#[tokio::test]
+async fn a_module_runs_from_its_artifact_rather_than_its_source() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    let Some(id) = registered(&app).await else {
+        return;
+    };
+    let executor = app.state.plugin_executor();
+    let module_id = "src/lexicons/app/test/lib/which.lua";
+    let prepared = executor
+        .prepare_script(&id, "return 'artifact'", module_id, ChunkRole::Module)
+        .await
+        .expect("validate should answer");
+    assert!(prepared.valid, "{:?}", prepared.errors);
+    let artifact = prepared.artifact.expect("a prepared artifact");
+
+    let module = |artifact| happyview::project::snapshot::ProjectModule {
+        id: module_id.to_string(),
+        path: module_id.into(),
+        language_id: "lua".to_string(),
+        source: "return 'source'".into(),
+        artifact,
+    };
+    let mut sent = input(
+        "local which = require('./lib/which')\nfunction handle() return which end",
+        ScriptKind::XrpcQuery,
+    );
+    sent.chunk_name = "src/lexicons/app/test/q.lua".to_string();
+
+    for (artifact, expected) in [(Some(artifact), "artifact"), (None, "source")] {
+        let mut snapshot = happyview::project::snapshot::ProjectSnapshot::empty();
+        snapshot
+            .modules
+            .insert(module_id.to_string(), module(artifact));
+        let output = executor
+            .execute_script_in(
+                &id,
+                &sent,
+                None,
+                ModuleScope::Project(std::sync::Arc::new(snapshot)),
+            )
+            .await
+            .expect("execute should answer");
+        assert_eq!(
+            output,
+            ScriptExecuteOutput::Returned {
+                value: json!(expected),
+                value_kind: ScriptValueKind::Other,
+            }
+        );
+    }
 }

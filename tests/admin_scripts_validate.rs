@@ -520,6 +520,29 @@ async fn a_dashboard_script_that_imports_a_file_is_refused() {
     );
 }
 
+/// The same refusal with the imports found by the real Lua plugin, so the
+/// specifier the operator wrote is what the sentence names.
+#[tokio::test]
+#[serial]
+async fn a_dashboard_lua_script_that_requires_a_file_is_refused() {
+    common::require_db!();
+    let app = TestApp::new().await;
+    if lua_interpreter(&app).await.is_none() {
+        return;
+    }
+
+    let body = "local x = require('./x')\nfunction handle() return x end\n";
+    let error = refusal(post_script(&app, &json!({ "id": LUA_ID, "body": body })).await).await;
+    assert_eq!(
+        error,
+        "dashboard scripts can't import files, only project scripts can: ./x (line 1)"
+    );
+    assert_eq!(
+        get_script(&app, LUA_ID).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
 async fn delete_script(app: &TestApp, id: &str) -> axum::response::Response {
     let cookie = app.admin_cookie();
     app.router

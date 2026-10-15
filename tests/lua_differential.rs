@@ -127,6 +127,15 @@ const ZONE_DEPENDENT: [&str; 2] = [
     "bridge/query.timezone_format.lua",
 ];
 
+/// The case that differs **only when the plugin has `internal.async`**.
+///
+/// It prints the "built-in modules are: …" sentence, and the plugin's list
+/// names `internal.async` from 1.1.0 on, which the native runner does not
+/// implement and never will. The harness asks the plugin under test whether it
+/// has the module, as it asks the native runner for its zone, so an older
+/// module that agrees here is not reported as a closed difference.
+const ASYNC_DEPENDENT: [&str; 1] = ["bridge/query.require_rules.lua"];
+
 /// A case that has not finished by now is not going to tell us anything: mlua
 /// cannot be interrupted from outside, and a job run has no deadline on
 /// either path, so the harness needs its own or one script ends the run
@@ -261,6 +270,20 @@ async fn native_local_time_is_utc(app: &TestApp) -> bool {
     matches!(
         happyview::lua::run_for_differential(&app.state, &probe).await,
         ScriptExecuteOutput::Returned { value, .. } if value == json!(true)
+    )
+}
+
+/// Whether the plugin under test has `internal.async`, asked of the plugin
+/// itself because it is the side whose built-ins vary by release.
+async fn plugin_has_internal_async(executor: &happyview::plugin::PluginExecutor, id: &str) -> bool {
+    let probe = input(
+        "query.async_probe",
+        r#"function handle() return (pcall(require, "internal.async")) end"#,
+        None,
+    );
+    matches!(
+        executor.execute_script(id, &probe).await,
+        Ok(ScriptExecuteOutput::Returned { value, .. }) if value == json!(true)
     )
 }
 
@@ -610,6 +633,7 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
     cases.retain(|(name, _)| !EXCLUDED.contains(&name.as_str()));
 
     let on_utc = native_local_time_is_utc(&app).await;
+    let has_async = plugin_has_internal_async(&executor, &id).await;
     let mut agreed = 0usize;
     let mut calls_compared = 0usize;
     let mut logs_compared = 0usize;
@@ -710,7 +734,8 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
     println!(
         "module: {}\ncases: {} ({excluded} excluded) | identical in every respect: {agreed} \
          | library calls compared: {calls_compared} | log lines compared: {logs_compared} \
-         | job progress compared: {progress_compared} | native process on UTC: {on_utc}",
+         | job progress compared: {progress_compared} | native process on UTC: {on_utc} \
+         | plugin has internal.async: {has_async}",
         identify(&dir),
         cases.len()
     );
@@ -739,6 +764,11 @@ async fn the_plugin_and_the_native_runner_agree_case_for_case() {
             [].iter().copied()
         } else {
             ZONE_DEPENDENT.iter().copied()
+        })
+        .chain(if has_async {
+            ASYNC_DEPENDENT.iter().copied()
+        } else {
+            [].iter().copied()
         })
         .collect();
     let unexpected: Vec<&String> = differences
