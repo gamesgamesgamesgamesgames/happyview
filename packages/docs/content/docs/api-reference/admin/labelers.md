@@ -94,6 +94,7 @@ interface Labeler {
   cursor: number | null;
   created_at: string;
   updated_at: string;
+  declared: boolean;
 }
 
 const response = await fetch("http://127.0.0.1:3000/admin/labelers", {
@@ -215,6 +216,8 @@ DELETE /admin/labelers/{did}
 ```
 
 Requires `labelers:delete` permission. Removes the subscription and all labels emitted by this labeler.
+
+`declared` is `true` for a labeler the project's `happyview.toml` subscribes to under `[labels] subscribe`. Deleting one returns `409 Conflict`; remove it from the file instead.
 
 ```ts tab="TypeScript" tab-group="language"
 const response = await fetch(

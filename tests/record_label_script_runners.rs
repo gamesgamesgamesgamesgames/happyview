@@ -219,7 +219,7 @@ async fn a_record_event_hands_the_interpreter_its_event_and_its_context() {
         .await,
     );
 
-    assert_eq!(sent["source"], "echo");
+    assert_eq!(echo_interpreter::script_text(&sent), "echo");
     assert_eq!(sent["kind"], "record_event");
     assert_eq!(
         sent["input"],
@@ -311,7 +311,7 @@ async fn a_label_hands_the_interpreter_its_event_and_its_context() {
     assert_eq!(logged.len(), 1, "{logged:?}");
     let sent = &logged[0].2["fields"];
 
-    assert_eq!(sent["source"], "host:log_input");
+    assert_eq!(echo_interpreter::script_text(sent), "host:log_input");
     assert_eq!(sent["kind"], "label");
     assert_eq!(
         sent["input"],
@@ -794,4 +794,157 @@ async fn a_missing_interpreter_dead_letters_once_and_does_not_wait() {
         elapsed < std::time::Duration::from_secs(3),
         "the run waited out a backoff: {elapsed:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The project layer
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_project_script_answers_a_record_event_ahead_of_its_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    seed_script(&app, &format!("record.create:{NSID}"), "value:none").await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        &format!("record.create:{NSID}"),
+        "echo",
+        "src/lexicons/thing.create.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let body = json!({ "title": "Hello" });
+    let sent = replaced(
+        run_record_event_script(
+            &app.state,
+            RecordEventPayload {
+                record: Some(&body),
+                ..record_payload("create")
+            },
+        )
+        .await,
+    );
+    assert_eq!(sent["source"], "echo");
+    // It runs as its file, so its errors and imports are named from there.
+    assert_eq!(sent["chunk_name"], "src/lexicons/thing.create.lua");
+}
+
+#[tokio::test]
+async fn a_project_script_answers_a_label_ahead_of_its_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    seed_script(&app, "labeler.apply:app.bsky.feed.post", "value:none").await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        "labeler.apply:app.bsky.feed.post",
+        "value:other",
+        "src/labels/app.bsky.feed.post.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    // The row would skip the label; the file waves it through.
+    let kept = continued(run_label_applied_script(&app.state, label_event()).await);
+    assert_eq!(kept.uri, LABEL_URI);
+}
+
+/// A project label script runs as its file: the chunk the interpreter is
+/// handed is the file's path, read back off the run's own log line.
+#[tokio::test]
+async fn a_project_label_script_runs_as_its_file() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        "labeler.apply:app.bsky.feed.post",
+        "host:log_input",
+        "src/labels/app.bsky.feed.post.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    run_label_applied_script(&app.state, label_event()).await;
+
+    let logged = events(&app, "script.log").await;
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert_eq!(
+        logged[0].2["fields"]["chunk_name"],
+        "src/labels/app.bsky.feed.post.lua"
+    );
+}
+
+/// The only script bound after the failure is a project file, so a retry that
+/// still read the table would find nothing and answer 404.
+#[tokio::test]
+async fn retrying_a_dead_letter_runs_a_project_script() {
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    let trigger = format!("record.delete:{NSID}");
+    seed_script(&app, &trigger, "error:runtime").await;
+    let outcome = run_record_event_script(&app.state, record_payload("delete")).await;
+    assert_eq!(outcome, RecordHookOutcome::Proceed);
+
+    let sql = happyview::db::adapt_sql(
+        "DELETE FROM happyview_scripts WHERE id = ?",
+        app.state.db_backend,
+    );
+    happyview::db::query(&sql)
+        .bind(&trigger)
+        .execute(&app.state.db)
+        .await
+        .expect("drop the row");
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        &trigger,
+        "value:none",
+        "src/lexicons/thing.delete.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let cookie = app.admin_cookie();
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/dead-letters")
+                .header(cookie.0.clone(), cookie.1.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let list: Value = serde_json::from_slice(&bytes).unwrap();
+    let id = list["dead_letters"][0]["id"]
+        .as_str()
+        .expect("dead letter listed")
+        .to_string();
+
+    let resp = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/admin/dead-letters/{id}/retry"))
+                .header(cookie.0, cookie.1)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

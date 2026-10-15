@@ -39,16 +39,45 @@ pub async fn insert_oauth_session(
         .expect("failed to insert oauth session fixture");
 }
 
-/// Acquire a cross-process advisory lock via a dedicated Postgres connection pool.
-/// The lock is held on a connection within the returned pool. When the pool is dropped,
-/// the connection closes and the advisory lock is released.
-/// For SQLite, returns None (no cross-process locking needed).
-pub async fn acquire_test_lock() -> Option<AnyPool> {
+/// Held for as long as a test uses the shared database; dropping it lets the
+/// next test in. Tests in one binary run in parallel and every one of them
+/// truncates and seeds the same tables, so without it they read each other's
+/// rows.
+pub enum TestLock {
+    /// An advisory lock, held on the one connection in this pool.
+    Postgres(AnyPool),
+    /// An exclusive lock on a file beside the database. A file lock rather
+    /// than a mutex because it also holds across processes, as the advisory
+    /// lock does.
+    Sqlite(std::fs::File),
+}
+
+/// Acquire the lock that serialises tests on `TEST_DATABASE_URL`, or `None`
+/// when no database is configured (or SQLite runs in memory, where nothing is
+/// shared).
+pub async fn acquire_test_lock() -> Option<TestLock> {
     let url = std::env::var("TEST_DATABASE_URL").ok()?;
     let backend = DatabaseBackend::from_url(&url);
 
     if !matches!(backend, DatabaseBackend::Postgres) {
-        return None;
+        let mut path = db::sqlite_path_from_url(&url)?.into_os_string();
+        path.push(".test-lock");
+        // Taken before the first connection, so the test holding it is also
+        // the only one migrating a fresh file.
+        let file = tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .expect("failed to open the SQLite test lock file");
+            file.lock()
+                .expect("failed to lock the SQLite test lock file");
+            file
+        })
+        .await
+        .expect("the SQLite test lock task panicked");
+        return Some(TestLock::Sqlite(file));
     }
 
     // Migrate before taking the lock. A test blocked on `pg_advisory_lock(42)`
@@ -69,7 +98,7 @@ pub async fn acquire_test_lock() -> Option<AnyPool> {
         .await
         .expect("failed to acquire advisory lock");
 
-    Some(lock_pool)
+    Some(TestLock::Postgres(lock_pool))
 }
 
 pub async fn truncate_all(pool: &AnyPool) {

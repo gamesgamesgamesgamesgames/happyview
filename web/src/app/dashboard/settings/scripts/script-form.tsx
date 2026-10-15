@@ -129,11 +129,31 @@ const PROCEDURE_ACTIONS: ActionOption[] = [
 const JOB_ACTIONS: ActionOption[] = [{ kind: "job.run", label: "Job runner" }];
 
 const JOB_TYPE_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+const RESERVED_JOB_PREFIX = "happyview.";
+
+/**
+ * Why `value` cannot name a job, or `null` when it can. The same rules as the
+ * server's trigger grammar, so the form never offers a save the server
+ * refuses.
+ */
+export function jobTypeProblem(value: string): string | null {
+  if (value.length === 0 || value.length > 128) {
+    return "Between 1 and 128 characters.";
+  }
+  if (!JOB_TYPE_PATTERN.test(value)) {
+    return "Lowercase letters, numbers, dots, hyphens, and underscores only.";
+  }
+  if (value.startsWith(RESERVED_JOB_PREFIX)) {
+    return "The happyview. prefix is reserved for built-in jobs.";
+  }
+  if (value.endsWith(".test")) {
+    return "A final .test segment is reserved for test files.";
+  }
+  return null;
+}
 
 export function isValidJobType(value: string): boolean {
-  return (
-    value.length > 0 && value.length <= 128 && JOB_TYPE_PATTERN.test(value)
-  );
+  return jobTypeProblem(value) === null;
 }
 
 /**
@@ -190,6 +210,7 @@ export function ScriptForm({
   idLocked,
   lexicons,
   lexiconsLoading,
+  readOnly,
 }: {
   state: ScriptFormState;
   onChange: (next: ScriptFormState) => void;
@@ -198,6 +219,8 @@ export function ScriptForm({
   lexicons?: LexiconSummary[];
   /** True while the lexicon list is being fetched. */
   lexiconsLoading?: boolean;
+  /** For a script a project file owns: everything shows, nothing edits. */
+  readOnly?: boolean;
 }) {
   return (
     <div className="flex flex-col flex-1 min-h-0 gap-4">
@@ -220,6 +243,7 @@ export function ScriptForm({
           id="description"
           value={state.description}
           onChange={(e) => onChange({ ...state, description: e.target.value })}
+          readOnly={readOnly}
           maxLength={300}
           rows={2}
           placeholder="What does this script do?"
@@ -236,6 +260,7 @@ export function ScriptForm({
             value={state.body}
             onChange={(v) => onChange({ ...state, body: v })}
             language="lua"
+            readOnly={readOnly}
             className="h-full"
           />
         </div>
@@ -274,6 +299,7 @@ function TriggerComposer({
   );
 
   const isJob = state.source === JOB_SOURCE;
+  const jobProblem = state.suffix.length > 0 ? jobTypeProblem(state.suffix) : null;
 
   const stateRef = useRef(state);
   useEffect(() => {
@@ -378,15 +404,10 @@ function TriggerComposer({
                 onChange={(e) => onChange({ ...state, suffix: e.target.value })}
                 placeholder="e.g. export, migrate, sync"
                 className="h-8 text-sm font-mono"
-                aria-invalid={
-                  state.suffix.length > 0 && !isValidJobType(state.suffix)
-                }
+                aria-invalid={jobProblem !== null}
               />
-              {state.suffix.length > 0 && !isValidJobType(state.suffix) ? (
-                <p className="text-xs text-destructive">
-                  Lowercase letters, numbers, dots, hyphens, and underscores
-                  only.
-                </p>
+              {jobProblem !== null ? (
+                <p className="text-xs text-destructive">{jobProblem}</p>
               ) : (
                 <p className="text-xs text-muted-foreground">
                   Must match the type passed to{" "}

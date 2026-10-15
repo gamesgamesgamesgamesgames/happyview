@@ -23,7 +23,6 @@ import {
   type PluginSummary,
   type SecretDefinition,
 } from "@/lib/api"
-import { useOfficialPlugins } from "@/hooks/use-official-plugins"
 
 interface PluginUpdateDialogProps {
   plugin: PluginSummary | null
@@ -38,8 +37,10 @@ export function PluginUpdateDialog({
   onOpenChange,
   onUpdated,
 }: PluginUpdateDialogProps) {
-  const { byId } = useOfficialPlugins()
-  const manifestUrl = plugin ? byId.get(plugin.id)?.manifest_url ?? null : null
+  // The entry the server's update gate approved for this install. The
+  // catalogue listing is not consulted: it is one entry per id from any
+  // publisher, and may have moved on since the gate ran.
+  const manifestUrl = plugin?.latest_manifest_url ?? null
 
   const [newManifestPreview, setNewManifestPreview] =
     useState<PluginPreview | null>(null)

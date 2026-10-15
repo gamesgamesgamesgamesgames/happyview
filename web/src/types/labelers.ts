@@ -4,4 +4,5 @@ export interface LabelerSummary {
   cursor: number | null
   created_at: string
   updated_at: string
+  declared: boolean
 }

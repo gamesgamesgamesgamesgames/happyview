@@ -12,6 +12,7 @@ Pick whichever option fits your situation:
 | ------------------------------------------ | ------------------------------------------------------------------------------------ |
 | [**Railway**](deployment/railway.md)       | Fastest path — one-click deploy of HappyView + Postgres |
 | [**Docker**](deployment/docker.md) | Self-hosting on your own server, from the images published to ghcr.io |
+| [**Native binary**](deployment/binary.md) | Running a released binary with no container or toolchain |
 | [**Local development**](deployment/local-development.md) | Running the whole stack locally with hot reloading |
 | [**From source**](deployment/other.md)     | Running HappyView with `cargo run` and managing dependencies yourself                |
 

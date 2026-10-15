@@ -111,4 +111,30 @@ test.describe("Job Script Creation", () => {
     await expect(row.getByText("Job runner", { exact: true })).toBeVisible()
     await expect(row.getByText("Job runners", { exact: true })).toBeVisible()
   })
+
+  test("a job type ending in .test is refused before saving", async ({
+    page,
+  }) => {
+    await page.goto("/dashboard/settings/scripts/new")
+
+    await page.locator("#source-pick").click()
+    await page.getByRole("option", { name: /Job/ }).click()
+
+    await page.locator("#job-type-input").fill("instance.operation.test")
+
+    await expect(
+      page.getByText("A final .test segment is reserved for test files."),
+    ).toBeVisible()
+    await expect(
+      page.getByRole("button", { name: "Create script" }),
+    ).toBeDisabled()
+
+    await page.locator("#job-type-input").fill("happyview.mine")
+    await expect(
+      page.getByText("The happyview. prefix is reserved for built-in jobs."),
+    ).toBeVisible()
+    await expect(
+      page.getByRole("button", { name: "Create script" }),
+    ).toBeDisabled()
+  })
 })

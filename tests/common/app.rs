@@ -7,9 +7,9 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::Request;
 use base64::Engine as _;
+use happyview::catalog::LexiconCatalog;
 use happyview::config::Config;
 use happyview::db::{DatabaseBackend, adapt_sql, now_rfc3339};
-use happyview::lexicon::LexiconRegistry;
 use happyview::{AppState, server};
 use http_body_util::BodyExt;
 use p256::elliptic_curve::sec1::ToSec1Point;
@@ -26,7 +26,7 @@ pub struct TestApp {
     pub mock_server: MockServer,
     pub admin_did: String,
     pub admin_token: String,
-    _db_lock: Option<sqlx::AnyPool>,
+    _db_lock: Option<db::TestLock>,
 }
 
 impl TestApp {
@@ -40,10 +40,35 @@ impl TestApp {
     pub async fn new_with_registry_config(
         registry_config: happyview::plugin::official_registry::RegistryConfig,
     ) -> Self {
+        Self::build(registry_config, false).await
+    }
+
+    /// A [`TestApp`] whose plugin registry writes `happyview_plugins` rows, as
+    /// production's does, for tests that read what an install recorded. The
+    /// table is cleared first; its child tables cascade.
+    pub async fn new_with_persisted_plugins(
+        registry_config: happyview::plugin::official_registry::RegistryConfig,
+    ) -> Self {
+        Self::build(registry_config, true).await
+    }
+
+    async fn build(
+        registry_config: happyview::plugin::official_registry::RegistryConfig,
+        persist_plugins: bool,
+    ) -> Self {
         let _db_lock = db::acquire_test_lock().await;
         let pool = db::test_pool().await;
         let backend = db::test_backend();
         db::truncate_all(&pool).await;
+        let plugin_registry = if persist_plugins {
+            happyview::db::query("DELETE FROM happyview_plugins")
+                .execute(&pool)
+                .await
+                .expect("failed to clear happyview_plugins");
+            happyview::plugin::PluginRegistry::with_db(pool.clone(), backend)
+        } else {
+            happyview::plugin::PluginRegistry::new()
+        };
 
         let mock_server = MockServer::start().await;
         let mock_url = mock_server.uri();
@@ -69,7 +94,7 @@ impl TestApp {
             jetstream_url: "wss://jetstream1.us-east.bsky.network".into(),
             relay_url: mock_url.clone(),
             plc_url: mock_url.clone(),
-            static_dir: "./web/out".into(),
+            static_dir: Some("./web/out".into()),
             base_path: None,
             event_log_retention_days: 30,
             app_name: None,
@@ -84,6 +109,12 @@ impl TestApp {
             plugin_cache_dir: None,
             platform_api_key_hash: None,
             job_worker_concurrency: 1,
+            superadmin_did: None,
+            project_root: None,
+            project: None,
+            plugin_dir: std::path::PathBuf::from("./plugins"),
+            auto_backfill: true,
+            script_env_file: None,
         };
 
         let sql = adapt_sql(
@@ -99,7 +130,8 @@ impl TestApp {
             .await
             .expect("failed to seed admin user");
 
-        let lexicons = LexiconRegistry::new();
+        let project = happyview::project::shared_empty();
+        let lexicons = LexiconCatalog::new(project.clone());
         lexicons
             .load_from_db(&pool)
             .await
@@ -167,6 +199,8 @@ impl TestApp {
             archive: happyview::jetstream::archive::ArchiveConfig::default(),
             domain_cache,
             lexicons,
+            scripts: happyview::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
+            project,
             collections_tx,
             labeler_subscriptions_tx,
             labeler_subscription_cache: std::sync::Arc::new(
@@ -205,7 +239,7 @@ impl TestApp {
             cookie_key: axum_extra::extract::cookie::Key::derive_from(
                 b"test-secret-that-is-at-least-32-bytes-long",
             ),
-            plugin_registry: std::sync::Arc::new(happyview::plugin::PluginRegistry::new()),
+            plugin_registry: std::sync::Arc::new(plugin_registry),
             wasm_runtime: std::sync::Arc::new(
                 happyview::plugin::WasmRuntime::new().expect("wasm runtime"),
             ),
@@ -223,6 +257,7 @@ impl TestApp {
             client_jwks: Vec::new(),
             telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
             script_limits: std::sync::Arc::new(happyview::lua::limits::ScriptLimits::default()),
+            test: None,
         };
 
         if let Some(key) = state.config.token_encryption_key.as_ref() {
@@ -758,6 +793,13 @@ impl TestApp {
 
     /// Install a fake plugin directly into the registry at the given version.
     pub async fn install_fake_plugin(&self, id: &str, version: &str) {
+        self.install_fake_plugin_from(id, version, &format!("https://example.com/{id}.wasm"))
+            .await;
+    }
+
+    /// [`Self::install_fake_plugin`], recording `url` as where its module
+    /// came from.
+    pub async fn install_fake_plugin_from(&self, id: &str, version: &str, url: &str) {
         use happyview::plugin::{LoadedPlugin, PluginInfo, PluginManifest, PluginSource};
 
         let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
@@ -777,7 +819,7 @@ impl TestApp {
                 config_schema: None,
             },
             source: PluginSource::Url {
-                url: format!("https://example.com/{id}.wasm"),
+                url: url.to_string(),
                 sha256: None,
             },
             // Valid, trivial WASM — not `vec![]`, which `analyze_imports`

@@ -9,7 +9,6 @@ use sqlx::pool::PoolOptions;
 use sqlx::query::{Query, QueryAs, QueryScalar};
 use sqlx::{Any, AssertSqlSafe, FromRow};
 use sqlx::{query as sqlx_query, query_as as sqlx_query_as, query_scalar as sqlx_query_scalar};
-use std::path::Path;
 use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
@@ -531,7 +530,7 @@ pub fn parse_journal_size_limit(raw: Option<&str>) -> u64 {
 
 /// Resolve the configured journal size limit from the environment.
 pub fn journal_size_limit_bytes() -> u64 {
-    parse_journal_size_limit(std::env::var("SQLITE_JOURNAL_SIZE_LIMIT").ok().as_deref())
+    parse_journal_size_limit(crate::config::vars::var("SQLITE_JOURNAL_SIZE_LIMIT").as_deref())
 }
 
 /// Parse `SQLITE_SYNCHRONOUS`. `NORMAL` is the default: in WAL mode a crash
@@ -556,7 +555,7 @@ pub fn parse_sqlite_synchronous(raw: Option<&str>) -> &'static str {
 
 /// Resolve the configured `synchronous` level from the environment.
 pub fn sqlite_synchronous() -> &'static str {
-    parse_sqlite_synchronous(std::env::var("SQLITE_SYNCHRONOUS").ok().as_deref())
+    parse_sqlite_synchronous(crate::config::vars::var("SQLITE_SYNCHRONOUS").as_deref())
 }
 
 /// Rows `ANALYZE` samples per index when `PRAGMA optimize` decides to run it.
@@ -622,6 +621,12 @@ fn with_sqlite_pragmas(
     })
 }
 
+/// Compiled in rather than read from `./migrations` at boot, so the binary
+/// migrates the same wherever it is run from. `build.rs` makes cargo rebuild
+/// when a migration file is added.
+pub(crate) static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
+pub(crate) static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
+
 /// Install sqlx's `Any` drivers and register the record store's SQLite
 /// functions (`record_store::sqlite_functions`), which must happen before
 /// the first SQLite connection opens. Call this, not
@@ -642,18 +647,21 @@ pub enum MigrateFailure {
     Db(#[from] sqlx::Error),
 }
 
-/// Connect to the configured database, run migrations, and move the record
-/// tables into the compact format if they are not yet
-/// (`record_store::upgrade::run`).
-pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
-    let max_connections = std::env::var("DATABASE_MAX_CONNECTIONS")
-        .ok()
+/// The pool size from `DATABASE_MAX_CONNECTIONS`, else the backend's default.
+fn max_connections_from_env(backend: DatabaseBackend) -> u32 {
+    crate::config::vars::var("DATABASE_MAX_CONNECTIONS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(match backend {
             DatabaseBackend::Sqlite => 16,
             DatabaseBackend::Postgres => 32,
-        });
-    connect_with(url, backend, max_connections).await
+        })
+}
+
+/// Connect to the configured database, run migrations, and move the record
+/// tables into the compact format if they are not yet
+/// (`record_store::upgrade::run`).
+pub async fn connect(url: &str, backend: DatabaseBackend) -> AnyPool {
+    connect_with(url, backend, max_connections_from_env(backend)).await
 }
 
 /// [`connect`] with the pool size given rather than read from
@@ -663,6 +671,18 @@ pub(crate) async fn connect_with(
     backend: DatabaseBackend,
     max_connections: u32,
 ) -> AnyPool {
+    let pool = open_with(url, backend, max_connections).await;
+    migrate(&pool, backend).await;
+    pool
+}
+
+/// Connect and apply the per-connection settings without migrating, for a
+/// caller whose database is a copy of one that already is.
+pub async fn open(url: &str, backend: DatabaseBackend) -> AnyPool {
+    open_with(url, backend, max_connections_from_env(backend)).await
+}
+
+async fn open_with(url: &str, backend: DatabaseBackend, max_connections: u32) -> AnyPool {
     install_drivers();
 
     // For SQLite, ensure the parent directory exists
@@ -712,36 +732,35 @@ pub(crate) async fn connect_with(
             .expect("Failed to set busy timeout");
     }
 
-    // Run migrations from the appropriate directory
-    let migration_dir = match backend {
-        DatabaseBackend::Sqlite => "./migrations/sqlite",
-        DatabaseBackend::Postgres => "./migrations/postgres",
-    };
+    pool
+}
 
-    let migrator = Migrator::new(Path::new(migration_dir))
-        .await
-        .unwrap_or_else(|e| panic!("Failed to load migrations from {migration_dir}: {e}"));
+/// Apply every migration this build carries, and for SQLite move the record
+/// tables into the compact format.
+pub async fn migrate(pool: &AnyPool, backend: DatabaseBackend) {
+    let migrator = match backend {
+        DatabaseBackend::Sqlite => &SQLITE_MIGRATIONS,
+        DatabaseBackend::Postgres => &POSTGRES_MIGRATIONS,
+    };
 
     let migrated: Result<(), MigrateFailure> = match backend {
         DatabaseBackend::Sqlite => {
             async {
-                migrator.run(&pool).await?;
-                crate::record_store::upgrade::run(&pool, backend).await?;
+                migrator.run(pool).await?;
+                crate::record_store::upgrade::run(pool, backend).await?;
                 Ok(())
             }
             .await
         }
-        DatabaseBackend::Postgres => migrate_postgres(&pool, &migrator).await,
+        DatabaseBackend::Postgres => migrate_postgres(pool, migrator).await,
     };
     migrated.unwrap_or_else(|e| panic!("Failed to run migrations: {e}"));
 
     if backend == DatabaseBackend::Sqlite
-        && let Err(e) = sqlite_optimize(&pool).await
+        && let Err(e) = sqlite_optimize(pool).await
     {
         tracing::warn!(error = %e, "PRAGMA optimize after migrations failed");
     }
-
-    pool
 }
 
 /// The advisory lock HappyView holds over its Postgres migrations.
@@ -879,8 +898,7 @@ pub fn compute_backfill_pool_size(
     dids_per_pds: u32,
     resolution: u32,
 ) -> u32 {
-    std::env::var("BACKFILL_DATABASE_MAX_CONNECTIONS")
-        .ok()
+    crate::config::vars::var("BACKFILL_DATABASE_MAX_CONNECTIONS")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or_else(|| {
             needed_backfill_connections(pds, dids_per_pds, resolution)
@@ -892,16 +910,13 @@ pub fn compute_backfill_pool_size(
 pub async fn connect_backfill_pool(url: &str, backend: DatabaseBackend) -> AnyPool {
     install_drivers();
 
-    let pds: u32 = std::env::var("BACKFILL_CONCURRENT_PDS")
-        .ok()
+    let pds: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_PDS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
-    let dids: u32 = std::env::var("BACKFILL_CONCURRENT_DIDS_PER_PDS")
-        .ok()
+    let dids: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_DIDS_PER_PDS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let resolution: u32 = std::env::var("BACKFILL_CONCURRENT_RESOLUTION")
-        .ok()
+    let resolution: u32 = crate::config::vars::var("BACKFILL_CONCURRENT_RESOLUTION")
         .and_then(|v| v.parse().ok())
         .unwrap_or(100);
     let max_connections = compute_backfill_pool_size(backend, pds, dids, resolution);
@@ -939,6 +954,57 @@ mod tests {
     use super::*;
     use chrono::Datelike;
     use serial_test::serial;
+
+    #[tokio::test]
+    async fn open_skips_migrations_and_migrate_applies_them() {
+        let dir = std::env::temp_dir().join(format!("hv-db-open-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("a.db").display());
+        let jobs_table =
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'happyview_jobs'";
+
+        let pool = open(&url, DatabaseBackend::Sqlite).await;
+        let before: Vec<(String,)> = query_as(jobs_table).fetch_all(&pool).await.unwrap();
+        assert!(before.is_empty(), "open must not migrate");
+
+        migrate(&pool, DatabaseBackend::Sqlite).await;
+        // A second run is what every boot after the first does.
+        migrate(&pool, DatabaseBackend::Sqlite).await;
+        let after: Vec<(String,)> = query_as(jobs_table).fetch_all(&pool).await.unwrap();
+        assert_eq!(after.len(), 1);
+
+        let records: (String,) =
+            query_as("SELECT type FROM sqlite_master WHERE name = 'happyview_records'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            records.0, "view",
+            "migrate must run the record store upgrade"
+        );
+
+        pool.close().await;
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every migration file in the tree is compiled into the binary, so a
+    /// binary run outside its checkout migrates exactly as one run inside it.
+    #[test]
+    fn embedded_migrations_cover_every_file() {
+        for (dir, migrator) in [
+            ("migrations/sqlite", &super::SQLITE_MIGRATIONS),
+            ("migrations/postgres", &super::POSTGRES_MIGRATIONS),
+        ] {
+            let on_disk =
+                std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "sql"))
+                    .count();
+            assert!(on_disk > 0, "{dir} holds no migrations");
+            assert_eq!(migrator.iter().count(), on_disk, "{dir}");
+        }
+    }
 
     #[test]
     fn json_field_paths() {

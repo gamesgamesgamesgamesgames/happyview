@@ -27,23 +27,20 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 
-const SETTING_KEYS = [
-  "app_name",
-  "backfill_concurrent_dids_per_pds",
-  "backfill_concurrent_pds",
-  "backfill_concurrent_resolution",
-  "backfill_retention_days",
-  "client_uri",
-  "event_log_retention_days",
-  "logo_uri",
-  "tos_uri",
-  "policy_uri",
-  "script_instruction_limit",
-  "script_wall_clock_seconds",
-  "verbose_event_logging",
-] as const;
-
-type FieldKey = (typeof SETTING_KEYS)[number];
+type FieldKey =
+  | "app_name"
+  | "backfill_concurrent_dids_per_pds"
+  | "backfill_concurrent_pds"
+  | "backfill_concurrent_resolution"
+  | "backfill_retention_days"
+  | "client_uri"
+  | "event_log_retention_days"
+  | "logo_uri"
+  | "tos_uri"
+  | "policy_uri"
+  | "script_instruction_limit"
+  | "script_wall_clock_seconds"
+  | "verbose_event_logging";
 
 type FieldConfig = {
   key: FieldKey;
@@ -135,6 +132,15 @@ function scriptLimitError(
   return `Enter a whole number from ${min.toLocaleString()} to ${max.toLocaleString()}.`;
 }
 
+function SourceLabel({ source }: { source: SettingEntry["source"] | "unset" }) {
+  if (source !== "env" && source !== "project") return null;
+  return (
+    <span className="text-xs text-muted-foreground">
+      {source === "env" ? "from env var" : "from happyview.toml"}
+    </span>
+  );
+}
+
 export default function GeneralSettingsPage() {
   const { hasPermission } = useCurrentUser();
   const canManage = hasPermission("settings:manage");
@@ -157,7 +163,7 @@ export default function GeneralSettingsPage() {
     verbose_event_logging: "",
   });
   const [sources, setSources] = useState<
-    Record<FieldKey, "database" | "env" | "unset">
+    Record<FieldKey, SettingEntry["source"] | "unset">
   >({
     app_name: "unset",
     backfill_concurrent_dids_per_pds: "unset",
@@ -193,8 +199,7 @@ export default function GeneralSettingsPage() {
       );
       const val = (key: string, fallback: string) =>
         byKey.get(key)?.value ?? fallback;
-      const src = (key: string) =>
-        (byKey.get(key)?.source as "database" | "env" | undefined) ?? "unset";
+      const src = (key: string) => byKey.get(key)?.source ?? "unset";
       setValues({
         app_name: val("app_name", ""),
         backfill_concurrent_dids_per_pds: val(
@@ -409,11 +414,7 @@ export default function GeneralSettingsPage() {
           <div key={field.key} className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
               <Label htmlFor={field.key}>{field.label}</Label>
-              {sources[field.key] === "env" && (
-                <span className="text-xs text-muted-foreground">
-                  from env var
-                </span>
-              )}
+              <SourceLabel source={sources[field.key]} />
             </div>
             <Input
               id={field.key}
@@ -483,11 +484,7 @@ export default function GeneralSettingsPage() {
             <Label htmlFor="backfill_retention_days">
               Backfill Detail Retention (days)
             </Label>
-            {sources["backfill_retention_days"] === "env" && (
-              <span className="text-xs text-muted-foreground">
-                from env var
-              </span>
-            )}
+            <SourceLabel source={sources["backfill_retention_days"]} />
           </div>
           <Input
             id="backfill_retention_days"
@@ -557,11 +554,7 @@ export default function GeneralSettingsPage() {
           <div key={field.key} className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
               <Label htmlFor={field.id}>{field.label}</Label>
-              {sources[field.key] === "env" && (
-                <span className="text-xs text-muted-foreground">
-                  from env var
-                </span>
-              )}
+              <SourceLabel source={sources[field.key]} />
             </div>
             <Input
               id={field.id}
@@ -591,11 +584,7 @@ export default function GeneralSettingsPage() {
           <div key={field.key} className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
               <Label htmlFor={field.key}>{field.label}</Label>
-              {sources[field.key] === "env" && (
-                <span className="text-xs text-muted-foreground">
-                  from env var
-                </span>
-              )}
+              <SourceLabel source={sources[field.key]} />
               {sources[field.key] === "unset" && (
                 <span className="text-xs text-muted-foreground">
                   default {SCRIPT_LIMIT_DEFAULTS[field.key]}
@@ -640,11 +629,7 @@ export default function GeneralSettingsPage() {
             <Label htmlFor="event_log_retention_days">
               Event Log Retention (days)
             </Label>
-            {sources["event_log_retention_days"] === "env" && (
-              <span className="text-xs text-muted-foreground">
-                from env var
-              </span>
-            )}
+            <SourceLabel source={sources["event_log_retention_days"]} />
           </div>
           <Input
             id="event_log_retention_days"
@@ -673,11 +658,7 @@ export default function GeneralSettingsPage() {
               <Label htmlFor="verbose_event_logging">
                 Verbose Event Logging
               </Label>
-              {sources["verbose_event_logging"] === "env" && (
-                <span className="text-xs text-muted-foreground">
-                  from env var
-                </span>
-              )}
+              <SourceLabel source={sources["verbose_event_logging"]} />
             </div>
             <p className="text-muted-foreground text-xs">
               Log every record index, hook execution, and hook skip to the event

@@ -46,7 +46,7 @@ Each plugin has a `manifest.json` that describes its metadata:
 
 Each `required_secrets` key is a full environment variable name: `PLUGIN_`, then the plugin's `id` upper-cased with every non-alphanumeric character replaced by `_`, then the secret's own name — so a plugin with the id `auth-steam` asks for `PLUGIN_AUTH_STEAM_API_KEY`. The plugin itself reads the part after that prefix: `host_get_secret("API_KEY")`.
 
-The fields above are the `auth` baseline. [Plugin Types](#plugin-types) below covers the fields a `library` or `interpreter` manifest adds: `plugin_type`, `capabilities`, `allowed_hosts`, `publisher`, `dependencies`, and `namespace`.
+The fields above are the `auth` baseline. [Plugin Types](#plugin-types) below covers the fields a `library` or `interpreter` manifest adds: `plugin_type`, `capabilities`, `allowed_hosts`, `publisher`, `dependencies`, `namespace`, and an interpreter's `language_id` and `extensions`.
 
 ## Plugin Types
 
@@ -56,13 +56,154 @@ The manifest's `plugin_type` field decides what the host expects the plugin to e
 | --- | --- |
 | `auth` (default) | An external-auth plugin: OAuth/OpenID/API-key login plus profile lookup. The [Plugin Exports](#plugin-exports) and [Host Functions](#host-functions) below are the `auth` contract. |
 | `library` | A plugin other plugins and Lua scripts call into, via `host_call_library` or `require(namespace)`. See [Library Plugins](#library-plugins) below. |
-| `interpreter` | Reserved for future non-Lua script runtimes. Not yet implemented. |
+| `interpreter` | A script runtime. It runs the scripts written in its language. See [Interpreter manifests](#interpreter-manifests) below. |
 
 Every plugin, `auth` included, needs `api_version` `"2"` and a `capabilities` list covering everything its compiled module imports. The loader refuses an older or missing `api_version` with an error naming the plugin type and the version it found.
 
 A `library` plugin may declare `namespace` — the name scripts use in `require(namespace)`. It defaults to `id` when omitted.
 
 Namespaces are dotted `publisher.name` (`happyview.db`); ids are hyphenated (`happyview-db`). A script's `require("happyview.db")` names the implementation it depends on, since a script is often read without the instance that runs it.
+
+### Interpreter manifests
+
+An `interpreter` manifest names its language and the file extensions it runs:
+
+```json
+{
+  "id": "happyview-lua",
+  "name": "Lua",
+  "version": "1.0.0",
+  "api_version": "2",
+  "plugin_type": "interpreter",
+  "language_id": "lua",
+  "extensions": ["lua"],
+  "capabilities": ["library:call", "script:host", "wasi:clock", "wasi:random", "wasi:stdio"],
+  "wasm_file": "happyview-lua.wasm"
+}
+```
+
+| Field | Description |
+| --- | --- |
+| `language_id` | The language's name, stored as each script's `script_type`. Lowercase letters, digits, `-` and `_`, starting with a letter. Two installed interpreters cannot share one |
+| `extensions` | The file extensions this interpreter runs in a project's `src/`, without the dot. Each is 1 to 16 lowercase letters or digits, none may be `json` (lexicons use it), and none may be listed twice |
+
+A file in a project's `src/` with one of these extensions belongs to this interpreter, which checks it when the project builds and runs it when it is a script. Two installed interpreters cannot claim the same extension: installing the second is refused with `files ending in .<ext> are already run by interpreter '<id>'`. A manifest with no `extensions` claims its older `file_extension` field instead, if it has one.
+
+#### Prepared artifacts and local modules
+
+An interpreter can hand HappyView a prepared form of a script, typically bytecode, so a run skips the parse. It can also let a project script import files that sit beside it in `src/`. Both are optional: an interpreter that does neither still runs every script from source.
+
+**Preparing.** HappyView calls `validate` when a script is saved and for every file when a project builds. Three fields of its input matter here:
+
+| Field | Meaning |
+| --- | --- |
+| `prepare` | `true` asks for an `artifact` beside the verdict. Absent means a plain check |
+| `chunk_name` | The name to give the chunk. For a project file it is the path from the project root, such as `src/lib/format.lua`. Absent means `script` |
+| `role` | `handler`, `module` or `test`. Only a `handler` must define `handle`. Absent means `handler` |
+
+`validate` answers with `valid` and `errors`, and may add `artifact` and `imports`:
+
+```json
+{
+  "valid": true,
+  "artifact": { "interpreter": "", "version": "", "engine": "puc-lua-5.4.7", "format": "lua-bytecode", "bytes": "G0x1YVQAGZMNChoKBAgIeFYAAAA=" },
+  "imports": [{ "specifier": "../lib/format", "line": 2 }]
+}
+```
+
+- Set `engine` and `format` yourself. HappyView overwrites `interpreter` and `version` with the build that answered, so an artifact can only be handed back to that build.
+- `bytes` is standard base64 (RFC 4648 §4), padded, with no whitespace.
+- `imports` lists every import whose specifier is a literal. HappyView checks each relative one when the project builds, and reports a missing file at its line.
+- A dashboard script that imports a relative path is refused when it is saved, because it has no files beside it.
+- An error's `message` carries no `chunk:line:` prefix. `line` says where, and HappyView names the file beside it.
+
+**Running.** `execute` receives `chunk_name` and, when HappyView holds an artifact this build prepared from that exact source, `artifact`. When `artifact` is present, `source` is empty: load the artifact and name its chunk `chunk_name`. An `error` result may set `chunk` to the chunk `line` is in, in full, since a language may truncate the chunk name inside its own message. HappyView reports it to the caller as the error's `file`.
+
+**Local modules.** For a specifier that starts with `./` or `../`, call `host_module_resolve` (`host::module_resolve` in the SDK, under `script:host`) with the `specifier` and a `referrer`: the importing chunk's name. It answers `{id, source, artifact?}`.
+
+- `id` is the module's path from the project root. Two specifiers naming one file answer the same `id`, so de-duplicate by it, and name the module's chunk with it.
+- `source` is always present. `artifact` is present only when it matches this build and that source. Load it when you have it, and the source otherwise.
+- Only files in your own language resolve, and only from inside `src/`.
+
+The import fails with one of these codes:
+
+| Code | When |
+| --- | --- |
+| `NOT_FOUND` | No such file. The message names the specifier, the importer and where HappyView looked, and a same-named file in another language if there is one. Raise it as the script's error |
+| `BAD_INPUT` | The specifier is not relative, uses `\`, or climbs out of `src/` |
+| `UNSUPPORTED` | The script is a dashboard script, which has no files to import |
+
+Keep a script-facing `load` text-only. Bytecode reaches the interpreter only from HappyView.
+
+#### Running test files
+
+`happyview test` hands each `*.test.<ext>` file to the interpreter that claims `<ext>`, as a run of kind `test`. The project-author side is in the [testing guide](testing.md). This section is the interpreter's half: what a test file's run receives, the five imports it reaches HappyView through, and what each answers.
+
+An interpreter that runs test files declares `script:test` beside `script:host`. The imports below need it, and a module that imports any of them without declaring it is refused at load. A host that predates test runs has no such imports, so a plugin built against them loads only on a host that has them. The SDK wrappers are `host::test_trigger`, `host::test_mock`, `host::test_calls`, `host::test_pds_writes` and `host::test_report`, and the request and response types are in `happyview_plugin_sdk::wire`.
+
+**What `execute` receives.** A test file's `ExecuteInput` differs from a handler's in these fields:
+
+| Field | Value |
+| --- | --- |
+| `kind` | `"test"` |
+| `source` | The file's text, or empty when `artifact` is present. The artifact was prepared by your `validate` with `role` `test`, so it defines no `handle` |
+| `chunk_name` | The file's path from the project root, such as `src/lib/format.test.lua` |
+| `input` | `null` |
+| `context.trigger` | `test:<path>`, the same path |
+| `context` | No `caller_did`, `has_pds_auth` is `false`, and there is no `job`, `method`, `collection`, `params` or `space`. `env` is the project's `.env.test` |
+| `limits.instructions` | `null`. A test file has no instruction budget; HappyView stops a file whose own code runs past 60 seconds of guest time, and time spent inside an import is not counted |
+| `libraries` | As for any run |
+
+Run the file, collect its tests, run them in order, and report each one through `host_test_report` once it has finished, after any `after_each`. Then return; the value returned is ignored. An `error` result fails the file as a whole, placed at its `chunk` and `line`, and so does a file that returns without reporting any test.
+
+An interpreter built on an SDK from before test runs cannot decode `kind: "test"` and answers `BAD_INPUT`. HappyView reports that as an interpreter that predates test runs, naming it.
+
+**The imports.** Each takes a JSON request and answers the usual `{"ok": ...}` or `{"error": {code, message, retryable}}` envelope. None of them traps.
+
+| Import | Request | `ok` |
+| --- | --- | --- |
+| `host_test_trigger` | `TestTrigger`: `{kind, target, input?, did?, rkey?, as?}` | `TestTriggerResult`: `{status, body}` |
+| `host_test_mock` | `TestMock`: `{namespace, responses}` | `null` |
+| `host_test_calls` | `TestCalls`: `{namespace}` | `[TestCall]`: `[{method, args}]`, `args` the JSON array the call carried |
+| `host_test_pds_writes` | `{}` | `[TestPdsWrite]`: `[{action, repo, collection, rkey, record?, cid?}]`, `record` and `cid` absent for a delete |
+| `host_test_report` | `TestReport`: `{path, name, status, message?, file?, line?, duration_ms}` | `null` |
+
+`TestTrigger.kind` is one of `query`, `procedure`, `record_create`, `record_update`, `record_delete`, `job` and `label`. `target` is the method's NSID, the record's collection, the job type or the label's subject URI. `input` is the query's parameters, the procedure's body, the record, the job's input, or the label's `{val, src?, neg?, cts?, exp?}`. `did` is a record's author and `rkey` its record key. `as` is the DID the trigger is forged as.
+
+`TestReport.status` is `pass`, `fail` or `skip`. `name` is the test's full name with its `describe` blocks joined by ` > `. `file` and `line` place a failing assertion, which may be in a module the test file required, and `message` says what failed. HappyView sets `path` to the file being run whatever you send, so `""` is fine.
+
+**What a trigger answers.** Every kind answers `{status, body}`. A handler that fails is not an import error: it shows in `status` and `body`.
+
+| Kind | `status` | `body` |
+| --- | --- | --- |
+| `query`, `procedure` | The HTTP status of the response | The response's JSON. A body that is not JSON is a string, and an empty one is `null` |
+| `record_create`, `record_update`, `record_delete` | `200`, or `500` when a script failed or the outcome is `errored`, `unavailable` or `invalid` | `{outcome, uri, cid, errors}`. `outcome` is `matched`, `skipped`, `schema_event`, `errored`, `unavailable` or `invalid`; `cid` is `null` for a delete; `errors` lists each failed script's message |
+| `job` | `200` when the job completed, `500` otherwise | `{id, status, result, error, progress}`, the job's row after its one run |
+| `label` | `200`, or `500` when the label script failed or the label could not be stored | `{applied, errors}`. `applied` is the label as stored, or `null` |
+
+**What clears and what persists.** Each test file gets its own database and its own record of calls, writes, mocks and reports. Within a file, `host_test_report` clears the recorded library calls and PDS writes, so each test starts with none. Mocks are not cleared: one lasts for the rest of the file, until the same namespace is mocked again, which replaces it and restarts its lists.
+
+**The mock format.** `responses` maps each method name to the answer for its calls:
+
+- A single value answers every call with that value.
+- A list answers one call per element, in order. A call after the last fails with `MOCK_EXHAUSTED`. To answer with a list, wrap it in another: `[[1, 2]]` answers `[1, 2]` once.
+- `{"$error": {"code": "TIMEOUT", "message": "slow"}}`, alone or as a list element, fails the call with that code and message. `code` must be a string, and `message`, when present, must be one too; anything else under `$error` is refused when it is set, with `BAD_INPUT` naming the method.
+
+A mocked call never reaches the library, and is recorded for `host_test_calls` whether mocked or not. A namespace that is not mocked runs the real library.
+
+**Error codes.**
+
+| Code | Where | When |
+| --- | --- | --- |
+| `UNSUPPORTED` | All five imports | The run is not a test file, or the instance is not running `happyview test` |
+| `FORBIDDEN` | All five imports | The plugin lacks `script:test` |
+| `BAD_INPUT` | All five imports | The request does not decode as the type above |
+| `BAD_INPUT` | `host_test_trigger` | The test's own mistake: a query or procedure target that is not an NSID, a query input that is not an object of parameters, a record trigger for a collection with no record lexicon, a missing `rkey` on `record_update` or `record_delete`, a record that is not an object or cannot be encoded as DAG-CBOR, an invalid job type, or a malformed label |
+| `HOST_ERROR` | `host_test_trigger` | HappyView could not run the trigger |
+| `BAD_INPUT` | `host_test_mock` | No installed library serves the namespace, `responses` is not an object, or an `$error` response is malformed |
+| `NOT_MOCKED` | A library call | The namespace is mocked and its mock lists no response for the method. The message names the methods it does list |
+| `MOCK_EXHAUSTED` | A library call | The method's list of responses has run out |
+| Any `$error` code | A library call | The mock answered with `$error` |
 
 ### Dependencies
 
@@ -428,6 +569,12 @@ Every import needs no caller session, except `host_jobs_create` with `auth` set,
 Errors reaching the guest: linked repos imports use `NOT_LINKED` (no grant for that DID), `SCOPE` (the grant's scopes don't cover the write), `NEEDS_REAUTH` (the grant needs re-authorization), `PDS_ERROR`, `FORBIDDEN`, `BAD_INPUT`, and `HOST_ERROR`. `host_jobs_create` uses `BAD_INPUT` (an invalid or reserved job type, or a call with no caller DID), `NO_SESSION` (`auth` set on a runner with no DPoP session), `FORBIDDEN`, and `HOST_ERROR`.
 
 `host_linked_repo_call` has no scope pre-check; the PDS enforces the token's actual scope.
+
+#### How bytes travel
+
+Wherever an import's spec or answer carries bytes — a blob, an upload, an HTTP body — they're a JSON string when they're valid UTF-8, and the atproto data model's `{"$bytes": "<base64>"}` when they aren't. Scripts see the same two forms, and pass them on as they are. The SDK's `Bytes` type reads and writes both, so a library function that takes or returns content can use it for its own arguments too: `Bytes::from_value(&args[0])` reads one without copying it.
+
+Data the host hands a plugin brings its own fuel, so a library plugin can move a payload as large as the host allows — a multi-megabyte blob, say — without running out of the budget that bounds its computation.
 
 ### Spaces
 

@@ -201,6 +201,7 @@ async fn run_subscription_once(
     let pds_endpoint = profile::resolve_labeler_endpoint(&state.http, &state.config.plc_url, did)
         .await
         .map_err(|e| format!("failed to resolve labeler endpoint for {did}: {e:?}"))?;
+    crate::testing::identity::refuse_forged_pds(&pds_endpoint, "subscribing to a labeler")?;
 
     // Convert HTTP URL to WebSocket URL.
     let ws_url = http_to_ws(&pds_endpoint);
@@ -399,15 +400,19 @@ async fn apply_label(state: &AppState, label: &Label) {
         cts: label.cts.clone(),
         exp: label.exp.clone(),
     };
-    let final_label = match crate::lua::run_label_applied_script(state, event).await {
+    apply_label_event(state, event).await;
+}
+
+/// Run the label-applied script for `event` and persist what it decided.
+/// Returns the label as persisted, or `None` when the script skipped it or
+/// the write failed.
+pub async fn apply_label_event(
+    state: &AppState,
+    event: crate::lua::LabelAppliedEvent,
+) -> Option<crate::lua::LabelAppliedEvent> {
+    let mut final_label = match crate::lua::run_label_applied_script(state, event).await {
         crate::lua::LabelHookOutcome::Continue(next) => next,
-        crate::lua::LabelHookOutcome::Skip => {
-            tracing::debug!(
-                src = %label.src, uri = %label.uri, val = %label.val,
-                "label.applied script skipped persistence"
-            );
-            return;
-        }
+        crate::lua::LabelHookOutcome::Skip => return None,
     };
 
     let db = &state.db;
@@ -430,6 +435,7 @@ async fn apply_label(state: &AppState, label: &Label) {
                 src = %final_label.src, uri = %final_label.uri, val = %final_label.val,
                 "failed to delete negated label: {e}"
             );
+            return not_stored(state, format!("failed to delete negated label: {e}"));
         }
     } else {
         // The label lexicon types `exp` as a datetime, so an upstream labeler
@@ -484,8 +490,20 @@ async fn apply_label(state: &AppState, label: &Label) {
                 src = %final_label.src, uri = %final_label.uri, val = %final_label.val,
                 "failed to upsert label: {e}"
             );
+            return not_stored(state, format!("failed to upsert label: {e}"));
         }
+        final_label.exp = exp;
     }
+    Some(final_label)
+}
+
+/// The firehose only logs a label it could not store; a test run's trigger
+/// has to hear about it, or it would report a label that is not there.
+fn not_stored(state: &AppState, message: String) -> Option<crate::lua::LabelAppliedEvent> {
+    if let Some(test) = &state.test {
+        test.note_script_failure(&message);
+    }
+    None
 }
 
 async fn persist_cursor(db: &sqlx::AnyPool, did: &str, seq: i64, backend: DatabaseBackend) {
@@ -546,6 +564,7 @@ async fn backfill_from_labeler(
         profile::resolve_pds_endpoint(&state.http, &state.config.plc_url, labeler_did)
             .await
             .map_err(|e| format!("failed to resolve PDS for {labeler_did}: {e:?}"))?;
+    crate::testing::identity::refuse_forged_pds(&pds_endpoint, "querying a labeler")?;
 
     let encoded_uri = urlencoding::encode(uri);
     let url = format!(
@@ -710,6 +729,34 @@ pub async fn spawn_label_gc(db: sqlx::AnyPool, backend: DatabaseBackend) {
             );
         }
     }
+}
+
+/// Subscribe to every labeler the project declares. Only missing rows are
+/// inserted: status and cursor are runtime state, so a subscription the
+/// dashboard paused stays paused across restarts. Runs before `AppState`
+/// exists; a caller on a live instance must invalidate
+/// `labeler_subscription_cache` afterwards.
+pub async fn ensure_declared_subscriptions(
+    db: &sqlx::AnyPool,
+    backend: DatabaseBackend,
+    dids: &[String],
+) -> Result<u64, sqlx::Error> {
+    let now = now_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO happyview_labeler_subscriptions (did, created_at, updated_at) VALUES (?, ?, ?) ON CONFLICT (did) DO NOTHING",
+        backend,
+    );
+    let mut added = 0;
+    for did in dids {
+        added += crate::db::query(&sql)
+            .bind(did)
+            .bind(&now)
+            .bind(&now)
+            .execute(db)
+            .await?
+            .rows_affected();
+    }
+    Ok(added)
 }
 
 #[cfg(test)]
@@ -1035,5 +1082,82 @@ mod tests {
             stored["unparseable"], None,
             "an expiry no comparison can order is dropped for a deterministic NULL"
         );
+    }
+}
+
+#[cfg(test)]
+mod declared_tests {
+    use super::*;
+    use crate::test_support::migrated_memory_pool;
+
+    async fn row(db: &sqlx::AnyPool, did: &str) -> Option<(String, Option<i64>)> {
+        crate::db::query_as(
+            "SELECT status, cursor FROM happyview_labeler_subscriptions WHERE did = ?",
+        )
+        .bind(did)
+        .fetch_optional(db)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_declared_labeler_is_subscribed_once() {
+        let db = migrated_memory_pool().await;
+        let dids = vec!["did:plc:lab1".to_string(), "did:plc:lab2".to_string()];
+        assert_eq!(
+            ensure_declared_subscriptions(&db, DatabaseBackend::Sqlite, &dids)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            ensure_declared_subscriptions(&db, DatabaseBackend::Sqlite, &dids)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            row(&db, "did:plc:lab1").await,
+            Some(("active".into(), None))
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_does_not_resume_a_paused_subscription_or_move_its_cursor() {
+        let db = migrated_memory_pool().await;
+        crate::db::query(
+            "INSERT INTO happyview_labeler_subscriptions (did, cursor, status, created_at, updated_at) VALUES (?, ?, 'paused', ?, ?)",
+        )
+        .bind("did:plc:lab1")
+        .bind(42_i64)
+        .bind("2026-01-01T00:00:00+00:00")
+        .bind("2026-01-01T00:00:00+00:00")
+        .execute(&db)
+        .await
+        .unwrap();
+        ensure_declared_subscriptions(&db, DatabaseBackend::Sqlite, &["did:plc:lab1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            row(&db, "did:plc:lab1").await,
+            Some(("paused".into(), Some(42)))
+        );
+    }
+
+    /// No test process subscribes to a labeler or queries one, so neither
+    /// refusal can be reached behaviourally and deleting one would keep every
+    /// other test green. The production half of this file is read instead.
+    #[test]
+    fn both_labeler_fetches_refuse_a_forged_pds() {
+        let production = include_str!("labeler.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for operation in ["subscribing to a labeler", "querying a labeler"] {
+            let call = format!(
+                "crate::testing::identity::refuse_forged_pds(&pds_endpoint, \"{operation}\")?;"
+            );
+            assert!(production.contains(&call), "missing: {call}");
+        }
     }
 }

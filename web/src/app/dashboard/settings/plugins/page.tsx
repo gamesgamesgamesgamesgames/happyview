@@ -359,7 +359,7 @@ export default function PluginsPage() {
                 <ResponsiveDialogHeader>
                   <ResponsiveDialogTitle>Add Plugin</ResponsiveDialogTitle>
                   <ResponsiveDialogDescription>
-                    Select an official plugin or enter a plugin URL.
+                    Select a plugin from the registry or enter a plugin URL.
                   </ResponsiveDialogDescription>
                 </ResponsiveDialogHeader>
 
@@ -449,6 +449,14 @@ export default function PluginsPage() {
                                               >
                                                 v{p.latest_version}
                                               </Badge>
+                                              {p.official && (
+                                                <Badge
+                                                  variant="outline"
+                                                  className="shrink-0"
+                                                >
+                                                  Official
+                                                </Badge>
+                                              )}
                                             </div>
                                             {p.description && (
                                               <span className="text-muted-foreground text-xs truncate">

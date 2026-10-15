@@ -13,15 +13,63 @@ pub(super) struct LexiconSummary {
     pub(super) backfill: bool,
     pub(super) action: Option<String>,
     pub(super) target_collection: Option<String>,
+    /// The layer answering for this id, under the name the dashboard has
+    /// always read. `layer` says the same and is what new clients should read.
     pub(super) source: String,
+    pub(super) layer: crate::catalog::Layer,
+    /// Project-relative file path, for a project lexicon only.
+    pub(super) path: Option<String>,
+    /// A stored row sits under this project file and answers again when the
+    /// file goes.
+    pub(super) shadows_stored: bool,
     pub(super) authority_did: Option<String>,
     pub(super) last_fetched_at: Option<String>,
-    pub(super) created_at: String,
-    pub(super) updated_at: String,
+    /// `None` for a project lexicon, which has no row.
+    pub(super) created_at: Option<String>,
+    pub(super) updated_at: Option<String>,
     /// For record-type lexicons: the `properties` object from `defs.main.record`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) record_schema: Option<Value>,
     pub(super) token_cost: Option<i32>,
+}
+
+impl From<crate::catalog::LexiconListing> for LexiconSummary {
+    fn from(l: crate::catalog::LexiconListing) -> Self {
+        use crate::lexicon::{LexiconType, ParsedLexicon, ProcedureAction};
+        let parsed = ParsedLexicon::parse(
+            l.lexicon_json,
+            l.revision,
+            None,
+            ProcedureAction::Upsert,
+            None,
+        );
+        let lexicon_type = parsed
+            .as_ref()
+            .map(|p| format!("{:?}", p.lexicon_type).to_lowercase())
+            .unwrap_or_else(|_| "unknown".into());
+        let record_schema = parsed
+            .ok()
+            .filter(|p| p.lexicon_type == LexiconType::Record)
+            .and_then(|p| p.record_schema);
+        Self {
+            id: l.id,
+            revision: l.revision,
+            lexicon_type,
+            backfill: l.backfill,
+            action: l.action,
+            target_collection: l.target_collection,
+            source: l.layer.as_str().to_string(),
+            layer: l.layer,
+            path: l.path.as_deref().map(crate::catalog::path_string),
+            shadows_stored: l.shadows_stored,
+            authority_did: l.authority_did,
+            last_fetched_at: l.last_fetched_at,
+            created_at: l.created_at,
+            updated_at: l.updated_at,
+            record_schema,
+            token_cost: l.token_cost,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -259,6 +307,7 @@ pub(super) struct NetworkLexiconSummary {
     pub(super) target_collection: Option<String>,
     pub(super) last_fetched_at: Option<String>,
     pub(super) created_at: String,
+    pub(super) declared: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +390,7 @@ pub(super) struct AddLabelerBody {
 
 #[derive(Serialize)]
 pub(super) struct LabelerSummary {
+    pub(super) declared: bool,
     pub(super) did: String,
     pub(super) status: String,
     pub(super) cursor: Option<i64>,
@@ -416,6 +466,11 @@ pub(super) struct PluginSummary {
     pub(super) latest_version: Option<String>,
     #[serde(default)]
     pub(super) pending_releases: Vec<crate::plugin::official_registry::ReleaseEntry>,
+    /// The manifest of the catalogue entry the update gate approved for this
+    /// install, which is what an update installs. Absent when no entry is
+    /// offered to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) latest_manifest_url: Option<String>,
     pub(super) plugin_type: String,
     pub(super) namespace: Option<String>,
     #[serde(default)]
@@ -447,6 +502,7 @@ pub(super) struct OfficialPluginSummary {
     pub(super) icon_url: Option<String>,
     pub(super) latest_version: String,
     pub(super) manifest_url: String,
+    pub(super) official: bool,
 }
 
 #[derive(Serialize)]

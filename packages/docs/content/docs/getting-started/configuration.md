@@ -2,7 +2,7 @@
 title: "Configuration"
 ---
 
-HappyView is configured via environment variables. A `.env` file in the project root is loaded automatically on startup. See [Local Development](deployment/local-development.md) for local setup, [Docker](deployment/docker.md) for deploying from published images, or [Production](deployment/production.md) for the hardening checklist.
+HappyView is configured via environment variables. Serving with a plain `happyview` loads a `.env` file on startup, from the working directory or the nearest parent that has one. `happyview check`, `happyview dev` and `happyview test` do not: under `happyview dev` the project's `.env` supplies script variables (`ctx.env`) only, as [Running locally](#running-locally-happyview-dev) explains, and under `happyview test` they come from `.env.test` instead, as [Testing](../guides/testing.md) explains. See [Local Development](deployment/local-development.md) for local setup, [Docker](deployment/docker.md) for deploying from published images, [Native binary](deployment/binary.md) for a released binary, or [Production](deployment/production.md) for the hardening checklist.
 
 ## Environment variables
 
@@ -28,7 +28,14 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `JETSTREAM_API_KEY` | no | _(none)_ | Key for the Jetstream archive (`planSnapshot`, `getSegment`, `getBlock`), sent as `Authorization: Bearer`. Never sent to the live stream. Bluesky's hosted archive requires one: without it, `auto` backfills crawl instead of replaying. Only used when `BACKFILL_SOURCE` or a job asks for replay |
 | `RELAY_URL` | no | `https://bsky.network` | Relay URL for [backfill](../guides/backfill.md) repo discovery |
 | `PLC_URL` | no | `https://plc.directory` | [PLC directory](https://github.com/did-method-plc/did-method-plc) URL for DID resolution |
-| `STATIC_DIR` | no | `./web/out` | Directory containing the built dashboard static assets |
+| `STATIC_DIR` | no | _(embedded)_ | Directory to serve the dashboard from instead of the copy built into release binaries. Set but empty is the same as unset. A binary built from source without the `embedded-dashboard` feature falls back to `./web/out` |
+| `PLUGIN_DIR` | no | `./plugins` | Directory whose subdirectories (`<id>/manifest.json` beside the `.wasm`) are loaded as plugins at boot. `happyview dev` sets it to `<project>/.happyview/plugins` |
+| `HAPPYVIEW_SCRIPT_ENV_FILE` | no | _(none)_ | A dotenv file whose variables reach scripts as `ctx.env`, over the ones stored in the dashboard. Read on every run. `happyview dev` sets it to the project's `.env`, and `happyview test` to the project's `.env.test` |
+| `HAPPYVIEW_DEV_BACKFILL` | no | `[dev] backfill`, else `false` | Under `happyview dev` only: whether a backfill may start on its own when a record lexicon with `backfill` is added or declared. Exactly `true` or `false`; any other value stops `happyview dev` with an error. A backfill created from the dashboard's Backfill page always runs; the backfill option on a lexicon upload follows this setting |
+| `HAPPYVIEW_NETWORK` | no | _(none)_ | Under `happyview dev` only: `local` suppresses the warning that writes reach the real network. `hpy happyview dev --network local` sets it |
+| `HAPPYVIEW_WATCH_POLL_MS` | no | _(native file events)_ | Under `happyview dev` and `happyview test --watch` only: watch the project by polling every N milliseconds (50 to 60000) instead of with file-system events, for mounts that don't deliver events, such as a Docker Desktop bind mount. Any other value stops the command with an error |
+| `PLUGIN_REGISTRY_URL` | no | `https://api.happyproto.at` | Registry the plugin catalogue is read from. Empty reads only the GitHub walk; `off` turns the catalogue off entirely, so neither the registry nor GitHub is contacted |
+| `PLUGIN_GITHUB_API_BASE` | no | `https://api.github.com` | GitHub API the catalogue walks `happyproto/plugins` releases through. Read on every refresh alongside the registry, not only when the registry is empty: its plugins are official by construction, and hold their ids against any other publisher's package of the same name |
 | `SCRIPT_INSTRUCTION_LIMIT` | no | `1000000` | Lua VM instructions a query, procedure, record or label script may execute per run, from loading the chunk to `handle` returning, before it fails with `timeout`. An integer from `1000` to `1000000000`. Job scripts are not limited. The **Instruction limit** setting in Settings → General takes precedence when set. See [Lua Scripting](../guides/lua-scripting.md#sandbox) |
 | `SCRIPT_WALL_CLOCK_SECONDS` | no | `10` | Seconds a query, procedure, record or label script may spend running, before it fails with `timeout`. Time spent awaiting the host — an HTTP request, a database read — is not charged against it. An integer from `1` to `300`. Job scripts are not clocked. The **Request wall clock** setting in Settings → General takes precedence when set |
 | `EVENT_LOG_RETENTION_DAYS` | no | `30` | Number of days to keep event logs before automatic cleanup. Set to `0` to disable cleanup |
@@ -55,6 +62,8 @@ HappyView is configured via environment variables. A `.env` file in the project 
 | `VERBOSE_EVENT_LOGGING` | no | `false` | Log every record index, hook execution, and hook skip to the event log. High write volume — recommended only for debugging. Overridden by database setting if set via admin API |
 | `RUST_LOG` | no | `happyview=debug,tower_http=debug,sqlx=warn` | Log filter (uses `tracing_subscriber::EnvFilter`) |
 | `APP_NAME` | no | --- | Application name shown on OAuth authorization screens. Overridden by database setting if set via admin API |
+| `SUPERADMIN_DID` | no | --- | DID seeded as a super user at every boot, before the server accepts requests. Setting it turns off the first-sign-in admin bootstrap, even if seeding fails (restart to retry). A value that is not a valid DID refuses boot. Additive: other super users keep their role, and removing it later demotes nobody. A platform super-user transfer demotes the other super users, and the configured superadmin is promoted again at the next boot |
+| `HAPPYVIEW_PROJECT` | no | --- | Path to a project directory. Its `happyview.toml` is read at boot; see [Project file](#project-file-happyviewtoml). A path that does not exist stops boot |
 | `LOGO_URI` | no | --- | URL to application logo for OAuth screens. Overridden by database setting or logo upload |
 | `TOS_URI` | no | --- | URL to terms of service. Overridden by database setting if set via admin API |
 | `POLICY_URI` | no | --- | URL to privacy policy. Overridden by database setting if set via admin API |
@@ -114,6 +123,98 @@ SESSION_SECRET=change-me-in-production
 # TOS_URI=https://example.com/tos
 # POLICY_URI=https://example.com/privacy
 ```
+
+## Project file (`happyview.toml`)
+
+When `HAPPYVIEW_PROJECT` names a directory, HappyView reads `happyview.toml` from it at boot. The file is optional, and **every environment variable wins over it**, including one set to an empty string. Instance settings saved in the dashboard win over both.
+
+```toml
+[happyview]
+version = "3.0.0"            # warns at boot when the running binary differs
+
+[instance]
+app_name = "HappyProto Registry"           # stands in for APP_NAME
+superadmin = "did:plc:..."                 # stands in for SUPERADMIN_DID
+
+[dev]
+port = 3000                  # stands in for PORT, under `happyview dev` only
+backfill = false             # stands in for HAPPYVIEW_DEV_BACKFILL, under `happyview dev` only
+
+[network_lexicons]
+include = ["app.bsky.actor.profile"]
+
+[labels]
+subscribe = ["did:plc:ar7c4by46qjdydhdevvrndac"]
+
+[jetstream]
+protocol = "auto"            # stands in for JETSTREAM_PROTOCOL: auto, v2 or v1
+compression = true           # stands in for JETSTREAM_COMPRESSION
+
+[lexicons."com.example.thing"]
+backfill = true              # backfill this record collection once
+```
+
+- `[network_lexicons] include` lexicons are tracked at boot, with no target collection and no backfill. One whose id a dashboard lexicon already uses is skipped with a warning; the dashboard lexicon is kept.
+- `[labels] subscribe` labelers are subscribed at boot. Pausing one from the dashboard sticks across restarts.
+- Neither can be removed from the dashboard or the admin API (`409`); remove the line from the file. A line removed from the file leaves its subscription or lexicon in place, now removable from the dashboard.
+- `backfill = true` on a record lexicon in the project's `src/lexicons/` starts a backfill only the first time. Under `happyview dev`, only when `[dev] backfill = true`; dev also checks after every rebuild, so a lexicon added while dev runs gets its backfill then. At boot, HappyView starts one for the collection unless a network backfill of that collection already exists, whatever its outcome: completed, failed, cancelled or still running. A backfill of named accounts does not count, and neither does a backfill of all collections, so either of those leaves the declared one to start. Restarting does not crawl the network again, even if the first backfill failed or was cancelled. To run it again, open **Backfill** in the dashboard, choose **Create Backfill Job** and select the collection, or call [`POST /admin/backfill`](../api-reference/admin/backfill.md) with `{"collection": "..."}`.
+- Unknown sections and keys are refused, and every error names the file, line and column: `happyview.toml:3:1: unknown field ...`.
+
+## Checking a project
+
+`happyview check <root>` builds the project at `<root>` the way boot does, without serving it, and prints what it found. It needs no database and no `DATABASE_URL`, so it can run in CI on every pull request.
+
+```sh
+happyview check ./my-project
+happyview check ./my-project --plugin ./plugins/lua
+```
+
+Each problem is printed on its own line, with paths relative to the project root. An error reads `path:line: message`, or `path: message` when there is no line; a warning reads the same with `warning: ` before the message:
+
+```text
+src/lexicons/com/example/getThing.json: the lexicon's id is 'com.example.getOther', ...
+src/lexicons/com/example/thing.index.lua: warning: overrides the dashboard script ...
+```
+
+A project that fails prints its problems followed by a count of errors. A project that builds prints its warnings and a summary such as `ok: 4 lexicons, 6 scripts, 1 module`.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The project builds |
+| `1` | The project does not build; the reasons are printed |
+| `2` | The check could not run, for example because an interpreter plugin failed to load |
+
+Scripts are checked by the interpreter that claims their file extension, so `check` needs the interpreter plugins. It loads them from, in order:
+
+1. each `--plugin <dir>`, where the directory holds one plugin's `manifest.json`, when any are given;
+2. otherwise every plugin directory inside `$PLUGIN_DIR`;
+3. otherwise every plugin directory inside `<root>/.happyview/plugins`.
+
+## Running locally (`happyview dev`)
+
+`happyview dev` serves a project from its own directory with nothing to configure. It listens on `127.0.0.1` at `[dev] port` (default `3000`) and skips the setup wizard, so the dashboard is usable on first start. An unfinished wizard is left alone, not overwritten.
+
+State lives in `<project>/.happyview/`:
+
+- `.happyview/` itself is kept at `0700`; one that is looser is tightened.
+- `happyview.db` is the SQLite database.
+- `plugins/` holds the plugins, and the compiled-module cache sits beside the database.
+- `secrets` holds the generated session secret and token encryption key. It is created once with mode `0600`, and a file that grants any permission to group or other, or that another user owns, is refused. A damaged file is never regenerated over. Deleting it generates new keys, and sessions and tokens stored under the old ones stop working.
+
+Precedence is the same as everywhere: environment variables, then `happyview.toml`, then these defaults.
+
+**`.env` is for scripts, not the server.** The project's `.env` supplies `ctx.env` only, and is re-read on every script run. It never sets server configuration, so a `DATABASE_URL` or `PORT` in it is just a script variable. `$VAR` references in it are expanded from the process environment first, then from lines above it in the same file. The process environment holds only what was exported in the shell that started HappyView, not the defaults dev supplies. So `X=$DATABASE_URL` gives `ctx.env` the `DATABASE_URL` you exported, else the value of a `DATABASE_URL=` line earlier in `.env`, else an empty value.
+
+**Saving rebuilds.** The watcher covers `src/`, `happyview.toml` and the modules in `.happyview/build/`. Each build prints one line listing what changed, followed by a line for each warning. A build that fails prints every error, then `build failed; still serving the previous build`, and the last good build keeps serving until you fix it. Dev also starts when the project's `src/` is already broken, and waits for the fix. A `happyview.toml` that does not parse at startup stops it; the same breakage while dev runs is reported and survived. If file events don't arrive (a Docker Desktop bind mount, say), set `HAPPYVIEW_WATCH_POLL_MS`.
+
+**Editing `happyview.toml` while dev runs:**
+
+- Added declarations apply at once.
+- Removed declarations are reported, not applied. They stay until you delete them from the dashboard after a restart.
+- A setting that is read only at startup prints `restart required to apply: <names>`, naming the variables, such as `PORT` or `PUBLIC_URL`.
+- An edit that is rejected leaves the running configuration untouched.
+
+**Writes reach the real network.** Dev prints a warning once at startup: writes from the instance go to your real PDS and the live network, where any instance indexing the same collections, including your production one, will index them. Set `HAPPYVIEW_NETWORK=local`, or run `hpy happyview dev --network local`, to silence it.
 
 ## Next steps
 

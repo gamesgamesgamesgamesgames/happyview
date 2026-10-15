@@ -58,6 +58,12 @@ pub struct PluginManifest {
     pub language_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_extension: Option<String>,
+    /// Interpreter only: the extensions, without the dot, of the project
+    /// files this interpreter runs. Empty means the one `file_extension`
+    /// names, which is all a manifest written before project files existed
+    /// declares; read it through [`LoadedPlugin::extensions`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monaco_language: Option<String>,
     /// Interpreter only: library ids it can bridge; `["*"]` means any, which
@@ -72,6 +78,16 @@ pub struct PluginManifest {
 
 fn default_wasm_file() -> String {
     "plugin.wasm".to_string()
+}
+
+/// The extensions a manifest claims, whichever field names them. Shared by
+/// the accessor and the loader's shape check so the two read one list.
+pub(crate) fn effective_extensions(m: &PluginManifest) -> Vec<&str> {
+    if m.extensions.is_empty() {
+        m.file_extension.as_deref().into_iter().collect()
+    } else {
+        m.extensions.iter().map(String::as_str).collect()
+    }
 }
 
 /// The wildcard an interpreter declares to bridge whatever is installed.
@@ -245,6 +261,16 @@ impl LoadedPlugin {
             return None;
         }
         m.language_id.as_deref()
+    }
+
+    /// The project file extensions an interpreter runs; empty for every other
+    /// type. Falls back to `file_extension`, so an interpreter released before
+    /// the field existed still claims the extension it always named.
+    pub fn extensions(&self) -> Vec<&str> {
+        match self.manifest.as_ref() {
+            Some(m) if m.plugin_type == PluginType::Interpreter => effective_extensions(m),
+            _ => Vec::new(),
+        }
     }
 
     /// What the manifest says. `manifest: None` declares nothing; the loader

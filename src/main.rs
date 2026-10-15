@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use happyview::auth::oauth_store::{DbSessionStore, DbStateStore};
+use happyview::catalog::LexiconCatalog;
 use happyview::config::Config;
 use happyview::db;
 use happyview::dns::NativeDnsResolver;
-use happyview::lexicon::{LexiconRegistry, ParsedLexicon, ProcedureAction};
 use happyview::rate_limit::{RateLimitDefaults, RateLimiter};
 use happyview::resolve::{fetch_lexicon_from_pds, resolve_nsid_authority};
 use happyview::{AppState, jetstream, labeler, server};
@@ -19,29 +19,114 @@ use atrium_oauth::{
     OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 
-#[tokio::main]
-async fn main() {
-    dotenvy::dotenv().ok();
+fn main() -> std::process::ExitCode {
+    // Before anything reads configuration: `check` has no database, and
+    // `Config::from_env` refuses to start without one.
+    let command = match happyview::cli::parse(std::env::args_os().skip(1)) {
+        Ok(command) => command,
+        Err(usage) => {
+            eprintln!("{usage}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    if command == happyview::cli::Command::Help {
+        println!("{}", happyview::cli::USAGE);
+        return std::process::ExitCode::SUCCESS;
+    }
+    // In a project, `.env` holds script variables. Loaded into the
+    // environment it would become server configuration and beat
+    // happyview.toml, so only a plain serve reads it.
+    if command == happyview::cli::Command::Serve {
+        dotenvy::dotenv().ok();
+    }
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to start the tokio runtime")
+        .block_on(run(command))
+}
+
+async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
     // Install rustls crypto provider early so all TLS users (jetstream, labeler, etc.) can find it.
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dev_root = match &command {
+        happyview::cli::Command::Dev { root } => Some(root.clone()),
+        _ => None,
+    };
+    match command {
+        happyview::cli::Command::Check(args) => {
+            // Logs go to stderr, so stdout holds only what the build found.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "warn".parse().unwrap()),
+                )
+                .init();
+            let code = happyview::project::check::run(&args, &mut std::io::stdout()).await;
+            return std::process::ExitCode::from(code);
+        }
+        happyview::cli::Command::Test(args) => {
+            // Logs go to stderr at `error` unless asked for: the run's own
+            // output is the report.
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "error".parse().unwrap()),
+                )
+                .init();
+            let code = happyview::testing::runner::run(&args, &mut std::io::stdout()).await;
+            return std::process::ExitCode::from(code);
+        }
+        happyview::cli::Command::Help => unreachable!("main answers --help itself"),
+        happyview::cli::Command::Serve | happyview::cli::Command::Dev { .. } => {}
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "happyview=debug,tower_http=debug,sqlx=warn"
-                    .parse()
-                    .unwrap()
+                if dev_root.is_some() {
+                    happyview::dev::env::DEV_LOG_FILTER
+                } else {
+                    "happyview=debug,tower_http=debug,sqlx=warn"
+                }
+                .parse()
+                .unwrap()
             }),
         )
         .init();
 
-    let config = Config::from_env();
+    let (dev, config) = match &dev_root {
+        Some(root) => match happyview::dev::prepare(root) {
+            Ok((session, config)) => (Some(session), config),
+            Err(e) => {
+                eprintln!("happyview dev: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+        None => match Config::load() {
+            Ok(config) => (None, config),
+            Err(e) => {
+                tracing::error!("{e}");
+                std::process::exit(1);
+            }
+        },
+    };
     let db_backend = config.database_backend;
 
     // Connect to database and run migrations.
     let db_pool = db::connect(&config.database_url, db_backend).await;
     let backfill_db_pool = db::connect_backfill_pool(&config.database_url, db_backend).await;
+
+    if dev.is_some()
+        && let Err(e) = happyview::dev::instance::seed(&db_pool, db_backend).await
+    {
+        eprintln!("happyview dev: could not prepare the instance: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
 
     info!(
         backend = ?db_backend,
@@ -151,7 +236,10 @@ async fn main() {
         });
     }
 
-    let lexicons = LexiconRegistry::new();
+    let project = happyview::project::shared_empty();
+    let lexicons = LexiconCatalog::new(project.clone());
+    let scripts =
+        happyview::catalog::ScriptCatalog::new(db_pool.clone(), db_backend, project.clone());
     lexicons
         .load_from_db(&db_pool)
         .await
@@ -159,49 +247,30 @@ async fn main() {
 
     // Re-fetch all network lexicons from their respective PDSes.
     let http = happyview::http_retry::init_shared_client(&config.user_agent);
-    let network_rows: Vec<(String, Option<String>, Option<String>)> = crate::db::query_as(
-        "SELECT id, authority_did, target_collection FROM happyview_lexicons WHERE source = 'network'",
-    )
-    .fetch_all(&db_pool)
-    .await
-    .unwrap_or_default();
-
-    for (nsid, _authority_did, target_collection) in &network_rows {
+    // From the table rather than memory, so a row that failed to parse at load
+    // is fetched again and repaired.
+    let network: Vec<String> = match lexicons.list_network(&db_pool, db_backend).await {
+        Ok(rows) => rows.into_iter().map(|l| l.id).collect(),
+        Err(e) => {
+            warn!("failed to list network lexicons for refresh: {e}");
+            Vec::new()
+        }
+    };
+    for nsid in &network {
+        let nsid = nsid.as_str();
         match resolve_nsid_authority(&http, &config.plc_url, nsid).await {
             Ok((did, pds_endpoint)) => {
                 match fetch_lexicon_from_pds(&http, &pds_endpoint, &did, nsid).await {
                     Ok(lexicon_json) => {
-                        match ParsedLexicon::parse(
-                            lexicon_json.clone(),
-                            1,
-                            target_collection.clone(),
-                            ProcedureAction::Upsert,
-                            None,
-                        ) {
-                            Ok(parsed) => {
-                                let now = db::now_rfc3339();
-                                let update_sql = db::adapt_sql(
-                                    "UPDATE happyview_lexicons SET lexicon_json = ?, last_fetched_at = ?, revision = revision + 1, updated_at = ? WHERE id = ? AND source = 'network'",
-                                    db_backend,
-                                );
-                                let lexicon_json_str =
-                                    serde_json::to_string(&lexicon_json).unwrap_or_default();
-                                if let Err(e) = crate::db::query(&update_sql)
-                                    .bind(&lexicon_json_str)
-                                    .bind(&now)
-                                    .bind(&now)
-                                    .bind(nsid)
-                                    .execute(&db_pool)
-                                    .await
-                                {
-                                    warn!(nsid, "failed to update network lexicon in DB: {e}");
-                                    continue;
-                                }
-
-                                lexicons.upsert(parsed).await;
-                                info!(nsid, "refreshed network lexicon");
+                        match lexicons
+                            .refresh_network(&db_pool, db_backend, nsid, lexicon_json)
+                            .await
+                        {
+                            Ok(Some(_)) => info!(nsid, "refreshed network lexicon"),
+                            Ok(None) => {
+                                info!(nsid, "network lexicon was removed before it was refreshed")
                             }
-                            Err(e) => warn!(nsid, "failed to parse network lexicon: {e}"),
+                            Err(e) => warn!(nsid, "failed to refresh network lexicon: {e}"),
                         }
                     }
                     Err(e) => warn!(nsid, "failed to fetch network lexicon from PDS: {e}"),
@@ -211,12 +280,15 @@ async fn main() {
         }
     }
 
-    if !network_rows.is_empty() {
+    if !network.is_empty() {
         info!(
-            count = network_rows.len(),
+            count = network.len(),
             "processed network lexicons on startup"
         );
     }
+
+    happyview::config::declarations::apply_at_boot(&config, &db_pool, db_backend, &http, &lexicons)
+        .await;
 
     // Initialize WASM runtime
     if config.plugin_cache_dir.is_none() {
@@ -259,7 +331,7 @@ async fn main() {
     // regardless of which of these two sources it came from.
     let mut boot_plugins: Vec<happyview::plugin::LoadedPlugin> = Vec::new();
 
-    if let Ok(urls) = std::env::var("PLUGIN_URLS") {
+    if let Some(urls) = happyview::config::vars::var("PLUGIN_URLS") {
         for (id, url, sha256) in happyview::plugin::loader::parse_plugin_urls(&urls) {
             match happyview::plugin::loader::fetch_manifest(&http, &url).await {
                 Ok(preview) => {
@@ -287,25 +359,14 @@ async fn main() {
     }
 
     // Load plugins from directory
-    let plugin_dir = std::path::Path::new("./plugins");
-    if plugin_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(plugin_dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if !path.join("manifest.json").exists() {
-                    continue;
-                }
-                match happyview::plugin::loader::load_from_file(&path).await {
-                    Ok(plugin) => {
-                        tracing::info!(id = %plugin.info.id, "Loaded plugin from file");
-                        boot_plugins.push(plugin);
-                    }
-                    Err(e) => {
-                        tracing::error!(path = %path.display(), error = %e, "Failed to load plugin");
-                    }
-                }
+    for path in happyview::plugin::loader::plugin_dirs_in(&config.plugin_dir) {
+        match happyview::plugin::loader::load_from_file(&path).await {
+            Ok(plugin) => {
+                tracing::info!(id = %plugin.info.id, "Loaded plugin from file");
+                boot_plugins.push(plugin);
+            }
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "Failed to load plugin");
             }
         }
     }
@@ -337,10 +398,6 @@ async fn main() {
              install one from the plugins page in the dashboard"
         );
     }
-
-    // Every plugin this boot will run is registered by now, so anything
-    // else in the cache directory is a module nothing will load.
-    wasm_runtime.sweep_cache_dir(&plugin_registry.live_wasm_sha256s().await);
 
     // Seed and load per-instance default token costs from instance_settings.
     let defaults = seed_and_load_rate_limit_defaults(&db_pool, db_backend).await;
@@ -843,7 +900,9 @@ async fn main() {
             happyview::plugin::official_registry::OfficialRegistryState::default(),
         ));
     let official_registry_config =
-        happyview::plugin::official_registry::RegistryConfig::production().with_registry_from_env();
+        happyview::plugin::official_registry::RegistryConfig::production()
+            .with_github_base_from_env()
+            .with_registry_from_env();
     happyview::plugin::official_registry::spawn_refresh_task(
         http.clone(),
         official_registry_config.clone(),
@@ -889,6 +948,8 @@ async fn main() {
         db_backend,
         domain_cache: domain_cache.clone(),
         lexicons,
+        scripts,
+        project,
         collections_tx,
         labeler_subscriptions_tx,
         labeler_subscription_cache: Arc::new(happyview::labeler::SubscriptionCache::default()),
@@ -909,7 +970,61 @@ async fn main() {
         client_jwks,
         telemetry_counters,
         script_limits,
+        test: None,
     };
+
+    // Before anything that runs a script starts: a worker that came first
+    // would run against no project at all, and serving without the project
+    // would answer its routes with nothing.
+    if let Some(root) = state.config.project_root.clone() {
+        let started = std::time::Instant::now();
+        let mode = if dev.is_some() {
+            happyview::project::boot::Mode::Dev
+        } else {
+            happyview::project::boot::Mode::Serve
+        };
+        match happyview::project::boot::start(&state, &root, mode).await {
+            Ok(installed) if dev.is_some() => {
+                println!(
+                    "{}",
+                    happyview::dev::report::booted(&installed.warnings, started.elapsed())
+                );
+            }
+            Ok(installed) => {
+                for warning in &installed.warnings {
+                    eprintln!("{warning}");
+                }
+            }
+            // A dev server waits for the fix; production refuses to serve a
+            // project it could not build.
+            Err(diagnostics) if dev.is_some() => {
+                println!("{}", happyview::dev::report::failed(&diagnostics));
+            }
+            Err(diagnostics) => {
+                for diagnostic in &diagnostics {
+                    eprintln!("{diagnostic}");
+                }
+                eprintln!(
+                    "{}: the project did not build, so HappyView is not starting",
+                    root.display()
+                );
+                return std::process::ExitCode::from(1);
+            }
+        }
+    }
+
+    // Every plugin and project module this boot will run is known by now, so
+    // anything else in the cache directory is a module nothing will load. In
+    // dev, a first build that failed leaves no modules in the snapshot, so
+    // theirs are swept and the next successful build compiles them again. A
+    // dev rebuild does not sweep, so a long dev session leaves its replaced
+    // builds behind until the next boot.
+    let live = happyview::project::script_module::boot_live_hashes(
+        &state.plugin_registry,
+        &state.project.load_full(),
+    )
+    .await;
+    state.wasm_runtime.sweep_cache_dir(&live);
 
     tokio::spawn(happyview::lua::limits::run_refresh_loop(
         state.script_limits.clone(),
@@ -941,7 +1056,7 @@ async fn main() {
         state.db.clone(),
         state.db_backend,
         happyview::event_log::parse_dead_letter_retention_days(
-            std::env::var("DEAD_LETTER_RETENTION_DAYS").ok().as_deref(),
+            happyview::config::vars::var("DEAD_LETTER_RETENTION_DAYS").as_deref(),
         ),
         happyview::tombstones::retention_hours(),
     ));
@@ -981,6 +1096,12 @@ async fn main() {
 
     happyview::admin::backfill::resume_backfill_jobs(&state).await;
 
+    // After the resume, which re-spawns running jobs and would otherwise run
+    // one started here twice.
+    if state.config.project_root.is_some() {
+        happyview::project::boot::start_declared_backfills(&state).await;
+    }
+
     // Resume interrupted jobs and start the job worker
     happyview::jobs::worker::resume_interrupted_jobs(&state).await;
     happyview::jobs::worker::spawn_workers(state.clone(), state.config.job_worker_concurrency);
@@ -1006,16 +1127,51 @@ async fn main() {
         });
     }
 
+    let dev_mode = dev.is_some();
+    let _watch = match dev {
+        Some(session) => {
+            println!("{}", happyview::dev::report::banner(&session));
+            if let Some(warning) = happyview::dev::report::network_warning(
+                happyview::config::vars::var("HAPPYVIEW_NETWORK").as_deref(),
+            ) {
+                println!("{warning}");
+            }
+            match happyview::dev::watch::spawn(state.clone(), session) {
+                Ok(handle) => {
+                    if let happyview::dev::watch::WatchMode::Poll(every) = handle.mode() {
+                        println!(
+                            "watching by polling every {} ms (HAPPYVIEW_WATCH_POLL_MS)",
+                            every.as_millis()
+                        );
+                    }
+                    Some(handle)
+                }
+                Err(e) => {
+                    eprintln!("happyview dev: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+
     let app = server::router(state);
     let addr = config.listen_addr();
 
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) if dev_mode => {
+            eprintln!(
+                "happyview dev: cannot listen on {addr}: {e}; set [dev] port in happyview.toml, or PORT"
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+        Err(e) => panic!("failed to bind {addr}: {e}"),
+    };
     info!(%addr, "HappyView is listening");
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("failed to bind");
-
     axum::serve(listener, app).await.expect("server error");
+    std::process::ExitCode::SUCCESS
 }
 
 async fn seed_and_load_rate_limit_defaults(

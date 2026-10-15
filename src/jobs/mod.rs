@@ -57,6 +57,13 @@ pub fn validate_job_type(job_type: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// `happyview.jobs` create reaches this function, so a job saved before
+    /// the grammar refused `.test` stays enqueueable.
+    #[test]
+    fn validate_job_type_still_accepts_a_final_test_segment() {
+        assert!(validate_job_type("nightly.test").is_ok());
+    }
+
     #[test]
     fn validate_job_type_accepts_a_normal_type() {
         assert!(validate_job_type("test.export").is_ok());

@@ -943,9 +943,7 @@ pub(crate) async fn start_gap_replay(
     state: &AppState,
     after_seq: i64,
 ) -> Result<(String, i64), String> {
-    let collections = super::record_collections(state)
-        .await
-        .map_err(|e| e.to_string())?;
+    let collections = state.lexicons.get_record_collections().await;
     if collections.is_empty() {
         return Err("there are no record collections to replay".into());
     }

@@ -33,6 +33,18 @@ pub fn plugin(language: &str) -> LoadedPlugin {
     }
 }
 
+/// The fixture, claiming `language` and the project file `extensions` that
+/// select it.
+pub fn plugin_with_extensions(language: &str, extensions: &[&str]) -> LoadedPlugin {
+    let mut plugin = plugin(language);
+    let manifest = plugin
+        .manifest
+        .as_mut()
+        .expect("the fixture has a manifest");
+    manifest.extensions = extensions.iter().map(|e| e.to_string()).collect();
+    plugin
+}
+
 /// An interpreter claiming `language` with no module behind it, for a caller
 /// that only needs the registry to answer which languages are installed.
 /// Reading a stored row is such a caller, and making it read a built module
@@ -45,7 +57,7 @@ pub fn claiming(language: &str) -> LoadedPlugin {
         "api_version": "2",
         "plugin_type": "interpreter",
         "language_id": language,
-        "capabilities": ["library:call", "script:host"],
+        "capabilities": ["library:call", "script:host", "script:test"],
     }))
     .expect("the fixture manifest should parse");
     LoadedPlugin {
@@ -55,5 +67,22 @@ pub fn claiming(language: &str) -> LoadedPlugin {
         },
         wasm_bytes: Vec::new(),
         manifest: Some(manifest),
+    }
+}
+
+/// The script text a run delivered, whether as source or as the echo
+/// fixture's artifact, which is the source's own bytes.
+#[allow(dead_code)]
+pub fn script_text(sent: &serde_json::Value) -> String {
+    use base64::Engine as _;
+    match sent["source"].as_str() {
+        Some(source) if !source.is_empty() => source.to_string(),
+        _ => {
+            let bytes = sent["artifact"]["bytes"].as_str().unwrap_or("");
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(bytes)
+                .expect("the echo artifact is base64");
+            String::from_utf8(decoded).expect("the echo artifact is the source's own bytes")
+        }
     }
 }

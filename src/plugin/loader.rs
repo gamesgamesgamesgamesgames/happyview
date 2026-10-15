@@ -62,6 +62,8 @@ pub enum LoadError {
     InvalidLanguageId { id: String, reason: String },
     #[error("interpreter '{id}' declares an unusable supports_libraries: {reason}")]
     InvalidSupportsLibraries { id: String, reason: String },
+    #[error("interpreter '{id}' declares an unusable extension: {reason}")]
+    InvalidExtensions { id: String, reason: String },
 }
 
 /// Preview result with manifest and derived WASM URL
@@ -185,6 +187,22 @@ pub async fn load_from_file(path: &Path) -> Result<LoadedPlugin, LoadError> {
     })
 }
 
+/// The plugin directories inside `dir`: each immediate subdirectory holding
+/// a `manifest.json`, sorted so plugins load in the same order every time.
+/// A missing or unreadable `dir` has none.
+pub fn plugin_dirs_in(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("manifest.json").exists())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
 fn validate_api_version(info: &PluginInfo) -> Result<(), LoadError> {
     // Parse as integer for comparison
     let plugin_version: u32 = info.api_version.parse().unwrap_or(0);
@@ -258,6 +276,18 @@ pub fn is_valid_language_id(id: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
+/// The shape a project file extension may take: 1-16 lowercase ASCII letters
+/// or digits, with no dot. A file is matched on the text after its last dot,
+/// so anything else is a claim no file name can meet. `json` is refused
+/// because a project's lexicons are `.json` files.
+pub fn is_valid_extension(extension: &str) -> bool {
+    (1..=16).contains(&extension.len())
+        && extension
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && extension != "json"
+}
+
 /// An interpreter's own manifest rules. It bridges whatever is installed
 /// through the API surface, so it names a language and the libraries it can
 /// reach, and never a dependency it would not call by name.
@@ -302,6 +332,24 @@ fn validate_interpreter(manifest: &PluginManifest) -> Result<(), LoadError> {
             id,
             reason: format!("an entry must be '{ANY_LIBRARY}' or a plugin id, never empty"),
         });
+    }
+
+    let extensions = crate::plugin::types::effective_extensions(manifest);
+    for (i, extension) in extensions.iter().enumerate() {
+        if !is_valid_extension(extension) {
+            return Err(LoadError::InvalidExtensions {
+                id,
+                reason: format!(
+                    "'{extension}' must be 1-16 lowercase letters or digits with no dot, and not 'json', which names lexicons"
+                ),
+            });
+        }
+        if extensions[..i].contains(extension) {
+            return Err(LoadError::InvalidExtensions {
+                id,
+                reason: format!("extension '{extension}' is listed twice"),
+            });
+        }
     }
     Ok(())
 }
@@ -934,6 +982,76 @@ mod tests {
             validate_manifest(&m),
             Err(LoadError::InvalidSupportsLibraries { .. })
         ));
+    }
+
+    #[test]
+    fn validate_manifest_accepts_an_interpreter_claiming_extensions() {
+        let m = interpreter_manifest(r#","language_id":"ts","extensions":["ts","mts"]"#);
+        assert!(validate_manifest(&m).is_ok());
+    }
+
+    /// A project names its lexicons `.json`, and an extension is matched
+    /// against a file name exactly, so anything but the conservative shape
+    /// would be a claim no file could meet or one that steals lexicons.
+    #[test]
+    fn validate_manifest_refuses_an_extension_outside_the_allowed_shape() {
+        for bad in [
+            r#"[".lua"]"#,
+            r#"["Lua"]"#,
+            r#"[""]"#,
+            r#"["json"]"#,
+            r#"["lua","lua"]"#,
+            r#"["a-b"]"#,
+        ] {
+            let m = interpreter_manifest(&format!(r#","language_id":"lua","extensions":{bad}"#));
+            let err = validate_manifest(&m).unwrap_err();
+            assert!(
+                matches!(err, LoadError::InvalidExtensions { .. }),
+                "{bad}: {err}"
+            );
+            assert!(err.to_string().contains("extension"), "{bad}: {err}");
+        }
+    }
+
+    /// A manifest written before `extensions` existed still claims the one
+    /// extension it named, and the same shape rules apply to it.
+    #[test]
+    fn an_interpreter_without_extensions_claims_its_file_extension() {
+        let loaded = |m: PluginManifest| LoadedPlugin {
+            info: m.clone().into(),
+            source: PluginSource::File { path: "x".into() },
+            wasm_bytes: vec![],
+            manifest: Some(m),
+        };
+        let legacy = interpreter_manifest(r#","language_id":"lua","file_extension":"lua""#);
+        assert!(validate_manifest(&legacy).is_ok());
+        assert_eq!(loaded(legacy).extensions(), vec!["lua"]);
+
+        let both = interpreter_manifest(
+            r#","language_id":"lua","file_extension":"lua","extensions":["lua","luau"]"#,
+        );
+        assert_eq!(loaded(both).extensions(), vec!["lua", "luau"]);
+
+        let bad_legacy = interpreter_manifest(r#","language_id":"lua","file_extension":".lua""#);
+        assert!(matches!(
+            validate_manifest(&bad_legacy),
+            Err(LoadError::InvalidExtensions { .. })
+        ));
+
+        let library = manifest(
+            r#"{"id":"http","name":"HTTP","version":"1.0.0","api_version":"2",
+                "plugin_type":"library","capabilities":[],"extensions":["lua"]}"#,
+        );
+        assert!(loaded(library).extensions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interpreter_echo_fixture_claims_its_extension() {
+        let Some(dir) = built_fixture("interpreter_echo", "wasm32-unknown-unknown") else {
+            return;
+        };
+        let plugin = load_from_file(&dir).await.expect("the echo should load");
+        assert_eq!(plugin.extensions(), vec!["echo"]);
     }
 
     #[test]

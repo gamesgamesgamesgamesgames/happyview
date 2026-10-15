@@ -40,6 +40,7 @@ import {
   stateFromScript,
 } from "../script-form";
 import { MigrateScriptDialog } from "../migrate-dialog";
+import { ScriptModulePanel } from "./script-module-panel";
 
 export default function ScriptDetail() {
   const pathname = usePathname();
@@ -100,6 +101,7 @@ export default function ScriptDetail() {
 
   const handleSave = useCallback(async () => {
     if (!state || !script || !original || !isDirty || saving) return;
+    if (script.layer === "project") return;
     setSaving(true);
     setError(null);
     setRefused(false);
@@ -166,6 +168,9 @@ export default function ScriptDetail() {
   }
 
   const canManage = hasPermission("scripts:manage");
+  // A project file owns this script: it changes by editing the file, so the
+  // page offers nothing that would write.
+  const projectPath = script?.layer === "project" ? script.path : null;
   const parsed = parseTriggerId(id);
   const familyLabel: Record<TriggerFamily, string> = {
     record: "Record event",
@@ -173,6 +178,22 @@ export default function ScriptDetail() {
     labeler: "Label arrival",
     job: "Job runner",
   };
+
+  if (script?.module) {
+    return (
+      <>
+        <SiteHeader title={`Script: ${id}`} backHref={returnHref} />
+        <div className="flex flex-col gap-6 p-4 md:p-6">
+          {parsed && (
+            <div className="flex gap-2 items-baseline">
+              <Badge variant="outline">{TRIGGER_KIND_LABELS[parsed.kind]}</Badge>
+            </div>
+          )}
+          <ScriptModulePanel module={script.module} />
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
@@ -248,80 +269,101 @@ export default function ScriptDetail() {
             </div>
           )}
 
-          <ScriptForm state={state} onChange={setState} idLocked />
+          {projectPath && script?.shadows_stored && (
+            <p className="text-muted-foreground text-xs">
+              A dashboard version of this script is kept and runs again if the
+              file is removed.
+            </p>
+          )}
+
+          <ScriptForm
+            state={state}
+            onChange={setState}
+            idLocked
+            readOnly={projectPath !== null}
+          />
         </div>
 
-        <footer className="bg-sidebar-accent flex justify-between gap-2 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
-          {canManage && (
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button variant="destructive" disabled={deleting}>
-                  {deleting ? "Deleting..." : "Delete script"}
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Delete script?</AlertDialogTitle>
-                  <AlertDialogDescription asChild>
-                    <div className="flex flex-col gap-3">
-                      <p>
-                        This will permanently remove the script. This action
-                        cannot be undone.
-                      </p>
-                      {script?.recreatable === false && (
-                        <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
-                          <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
-                          <p className="text-xs text-amber-500">
-                            This script&rsquo;s trigger id no longer satisfies
-                            current NSID rules. It will keep firing and can
-                            still be edited in place — but once deleted, it{" "}
-                            <span className="font-medium">
-                              cannot be recreated
-                            </span>{" "}
-                            with the same id. Deletion is not required to
-                            change it.
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel disabled={deleting}>
-                    Cancel
-                  </AlertDialogCancel>
-                  <AlertDialogAction
-                    variant="destructive"
-                    disabled={deleting}
-                    onClick={handleDelete}
-                  >
-                    {script?.recreatable === false
-                      ? "Delete anyway"
-                      : "Delete"}
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          )}
-          <div className="flex gap-2">
-            {script?.script_type === "lua" && (
-              <MigrateScriptDialog
-                scriptId={id}
-                currentBody={script.body}
-                canApply={canManage}
-                onApplied={load}
-              />
-            )}
+        {projectPath ? (
+          <footer className="bg-sidebar-accent flex gap-2 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
+            <p className="text-muted-foreground text-sm">
+              Defined by <span className="font-mono">{projectPath}</span>. Edit
+              that file to change this script.
+            </p>
+          </footer>
+        ) : (
+          <footer className="bg-sidebar-accent flex justify-between gap-2 ps-4 pt-2 pb-1 md:px-6 md:py-4 rounded-b-md">
             {canManage && (
-              <Button onClick={handleSave} disabled={!isDirty || saving}>
-                {saving ? "Saving..." : "Save"}
-                <kbd className="ml-2 text-xs text-muted-foreground opacity-60 hidden sm:inline">
-                  ⌘↵
-                </kbd>
-              </Button>
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button variant="destructive" disabled={deleting}>
+                    {deleting ? "Deleting..." : "Delete script"}
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Delete script?</AlertDialogTitle>
+                    <AlertDialogDescription asChild>
+                      <div className="flex flex-col gap-3">
+                        <p>
+                          This will permanently remove the script. This action
+                          cannot be undone.
+                        </p>
+                        {script?.recreatable === false && (
+                          <div className="flex items-start gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
+                            <AlertTriangle className="size-4 text-amber-500 shrink-0 mt-0.5" />
+                            <p className="text-xs text-amber-500">
+                              This script&rsquo;s trigger id no longer satisfies
+                              current NSID rules. It will keep firing and can
+                              still be edited in place — but once deleted, it{" "}
+                              <span className="font-medium">
+                                cannot be recreated
+                              </span>{" "}
+                              with the same id. Deletion is not required to
+                              change it.
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel disabled={deleting}>
+                      Cancel
+                    </AlertDialogCancel>
+                    <AlertDialogAction
+                      variant="destructive"
+                      disabled={deleting}
+                      onClick={handleDelete}
+                    >
+                      {script?.recreatable === false
+                        ? "Delete anyway"
+                        : "Delete"}
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
             )}
-          </div>
-        </footer>
+            <div className="flex gap-2">
+              {script?.script_type === "lua" && (
+                <MigrateScriptDialog
+                  scriptId={id}
+                  currentBody={script.body}
+                  canApply={canManage}
+                  onApplied={load}
+                />
+              )}
+              {canManage && (
+                <Button onClick={handleSave} disabled={!isDirty || saving}>
+                  {saving ? "Saving..." : "Save"}
+                  <kbd className="ml-2 text-xs text-muted-foreground opacity-60 hidden sm:inline">
+                    ⌘↵
+                  </kbd>
+                </Button>
+              )}
+            </div>
+          </footer>
+        )}
       </div>
     </>
   );

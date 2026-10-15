@@ -9,6 +9,8 @@
 
 mod common;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use serde_json::{Value, json};
 
 use common::app::TestApp;
@@ -72,9 +74,15 @@ async fn call(app: &TestApp, plugin: &str, function: &str, args: &[Value]) -> Va
         .unwrap_or_else(|e| panic!("{function}: {e:?}"))
 }
 
-/// Bytes that are not valid UTF-8, so the wire's byte-array branch is the one
+/// Bytes that are not valid UTF-8, so the wire's `$bytes` branch is the one
 /// exercised. A string payload would only ever prove the other branch.
 const ARTIFACT: [u8; 5] = [0x00, 0x61, 0xff, 0x73, 0x6d];
+
+/// Bytes as the wire carries them when they are not valid UTF-8: the atproto
+/// data model's `{"$bytes": "<base64>"}`.
+fn wire_bytes(bytes: &[u8]) -> Value {
+    json!({ "$bytes": STANDARD_NO_PAD.encode(bytes) })
+}
 
 #[tokio::test]
 async fn bytes_survive_the_boundary_and_come_back_whole() {
@@ -88,7 +96,7 @@ async fn bytes_survive_the_boundary_and_come_back_whole() {
         &app,
         "sdk_blobs",
         "put",
-        &[json!(ARTIFACT.to_vec()), json!("application/wasm")],
+        &[wire_bytes(&ARTIFACT), json!("application/wasm")],
     )
     .await;
     let cid = cid.as_str().expect("put answers a cid").to_string();
@@ -101,8 +109,11 @@ async fn bytes_survive_the_boundary_and_come_back_whole() {
     );
 
     let got = call(&app, "sdk_blobs", "get", &[json!(cid)]).await;
-    let bytes: Vec<u8> = serde_json::from_value(got["bytes"].clone()).expect("bytes");
-    assert_eq!(bytes, ARTIFACT, "the bytes came back changed");
+    assert_eq!(
+        got["bytes"],
+        wire_bytes(&ARTIFACT),
+        "the bytes came back changed"
+    );
     assert_eq!(got["mime_type"], "application/wasm");
     assert_eq!(got["size"], ARTIFACT.len());
 
@@ -116,6 +127,43 @@ async fn bytes_survive_the_boundary_and_come_back_whole() {
     );
 
     assert_eq!(call(&app, "sdk_blobs", "exists", &[json!(cid)]).await, true);
+}
+
+/// A blob the size of a real plugin module — megabytes, and not UTF-8 —
+/// crosses into a library plugin and back whole. Two things used to stop it:
+/// a fixed 512 KiB guest heap that never freed, and an envelope decoded
+/// through serde's buffered `Content`, at about 32 bytes per byte of blob.
+#[tokio::test]
+async fn a_module_sized_blob_crosses_the_boundary_whole() {
+    let app = TestApp::new().await;
+    app.state
+        .plugin_registry
+        .register(blobs_plugin("sdk_blobs", &["blobs:read", "blobs:write"]))
+        .await;
+
+    let mut artifact: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    artifact[0] = 0xff; // never valid UTF-8
+    let cid = call(
+        &app,
+        "sdk_blobs",
+        "put",
+        &[wire_bytes(&artifact), json!("application/wasm")],
+    )
+    .await;
+    let cid = cid.as_str().expect("put answers a cid").to_string();
+    assert_eq!(
+        cid,
+        happyview::cid_verify::raw_cid(&artifact)
+            .expect("cid")
+            .to_string()
+    );
+
+    let got = call(&app, "sdk_blobs", "get", &[json!(cid)]).await;
+    assert!(
+        got["bytes"] == wire_bytes(&artifact),
+        "the bytes came back changed"
+    );
+    assert_eq!(got["size"], artifact.len());
 }
 
 /// Absent is an ordinary answer on both reads, which is what lets a caller
@@ -168,7 +216,7 @@ async fn each_import_refuses_without_its_capability() {
         .call_library(
             "read_only",
             "put",
-            &[json!(ARTIFACT.to_vec()), json!("application/wasm")],
+            &[wire_bytes(&ARTIFACT), json!("application/wasm")],
             &caller(),
             0,
         )
@@ -185,7 +233,7 @@ async fn each_import_refuses_without_its_capability() {
         &app,
         "write_only",
         "put",
-        &[json!(ARTIFACT.to_vec()), json!("application/wasm")],
+        &[wire_bytes(&ARTIFACT), json!("application/wasm")],
     )
     .await;
     let cid = cid.as_str().expect("cid").to_string();

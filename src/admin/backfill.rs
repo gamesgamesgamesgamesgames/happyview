@@ -3390,23 +3390,9 @@ async fn fetch_records_page_loop(
 // Background backfill worker
 // ---------------------------------------------------------------------------
 
-/// Every collection with a record-type lexicon: what a network backfill
-/// without a collection covers.
-pub(crate) async fn record_collections(state: &AppState) -> Result<Vec<String>, sqlx::Error> {
-    let sql = adapt_sql(
-        "SELECT id FROM happyview_lexicons WHERE json_extract(lexicon_json, '$.defs.main.type') = 'record'",
-        state.db_backend,
-    );
-    Ok(crate::db::query_as::<(String,)>(&sql)
-        .fetch_all(&state.backfill_db)
-        .await?
-        .into_iter()
-        .map(|(id,)| id)
-        .collect())
-}
-
 async fn run_backfill_job(state: AppState, job_id: String) {
-    let window = parse_discovery_window(std::env::var("BACKFILL_DISCOVERY_WINDOW").ok().as_deref());
+    let window =
+        parse_discovery_window(crate::config::vars::var("BACKFILL_DISCOVERY_WINDOW").as_deref());
     run_backfill_job_with(state, job_id, window).await;
 }
 
@@ -3454,14 +3440,7 @@ async fn run_backfill_job_with(state: AppState, job_id: String, window: i64) {
         }
         vec![col.clone()]
     } else {
-        match record_collections(&state).await {
-            Ok(collections) => collections,
-            Err(e) => {
-                let error = format!("failed to query backfill-eligible lexicons: {e}");
-                fail_job(&state, &job_id, &error).await;
-                return;
-            }
-        }
+        state.lexicons.get_record_collections().await
     };
 
     if collections.is_empty() {
@@ -4070,6 +4049,26 @@ pub(crate) async fn start_backfill_with(
     });
 
     Ok(job_id)
+}
+
+/// The one way to start a backfill nobody explicitly asked for, such as a
+/// project lexicon's `backfill = true`, so that `HAPPYVIEW_DEV_BACKFILL` can
+/// be honoured in one place. `None` means it was not started.
+pub(crate) async fn start_automatic_backfill(
+    state: &AppState,
+    collection: String,
+    actor_did: &str,
+) -> Result<Option<String>, AppError> {
+    if !state.config.auto_backfill {
+        tracing::info!(
+            collection = collection.as_str(),
+            "automatic backfill is off; not backfilling"
+        );
+        return Ok(None);
+    }
+    start_backfill(state, Some(collection), Vec::new(), actor_did)
+        .await
+        .map(Some)
 }
 
 /// POST /admin/backfill/{id}/cancel — cancel a running backfill job.
@@ -5339,6 +5338,24 @@ mod tests {
 
     use crate::lexicon::{ParsedLexicon, ProcedureAction};
 
+    /// With automatic backfill off, nothing is queued: no job row, no task.
+    #[tokio::test]
+    async fn automatic_backfill_is_refused_when_off() {
+        let mut state = crate::test_support::test_state_with_pool(
+            crate::test_support::migrated_memory_pool().await,
+        );
+        state.config.auto_backfill = false;
+        let started = start_automatic_backfill(&state, "com.example.thing".into(), "did:plc:dev")
+            .await
+            .unwrap();
+        assert!(started.is_none());
+        let (count,): (i64,) = crate::db::query_as("SELECT COUNT(*) FROM happyview_backfill_jobs")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
     const POST: &str = "app.test.post";
     const LIKE: &str = "app.test.like";
 
@@ -5613,20 +5630,28 @@ mod tests {
     }
 
     /// A migrated state whose relay, PLC and PDS are all `mock`, with
-    /// `collections` registered as record lexicons in the table and the registry.
+    /// `collections` registered as record lexicons through the catalog.
     async fn pipeline_state(mock: &MockServer, collections: &[&str]) -> AppState {
         let mut state = migrated_state().await;
         state.config.relay_url = mock.uri();
         state.config.plc_url = mock.uri();
         for nsid in collections {
-            let (lexicon, parsed) = record_lexicon(nsid);
-            crate::db::query("INSERT INTO happyview_lexicons (id, lexicon_json) VALUES (?, ?)")
-                .bind(*nsid)
-                .bind(lexicon.to_string())
-                .execute(&state.db)
+            state
+                .lexicons
+                .put_manual(
+                    &state.db,
+                    state.db_backend,
+                    crate::catalog::LexiconWrite {
+                        lexicon_json: record_lexicon(nsid).0,
+                        backfill: true,
+                        target_collection: Some(nsid.to_string()),
+                        action: ProcedureAction::Upsert,
+                        token_cost: None,
+                        authority_did: None,
+                    },
+                )
                 .await
                 .expect("seed lexicon");
-            state.lexicons.upsert(parsed).await;
         }
         state
     }
@@ -5935,6 +5960,36 @@ mod tests {
             lookups, 1,
             "a DID queued under two collections is resolved once"
         );
+    }
+
+    /// The all-collections job takes its targets from the catalog, so a record
+    /// lexicon only a project file defines is backfilled like any other.
+    #[tokio::test]
+    async fn an_all_collections_job_includes_a_project_only_record_lexicon() {
+        let mock = MockServer::start().await;
+        let state = pipeline_state(&mock, &[]).await;
+        let mut snap = crate::project::ProjectSnapshot::empty();
+        snap.lexicons.insert(
+            POST.to_string(),
+            crate::project::ProjectLexicon {
+                parsed: record_lexicon(POST).1,
+                path: "src/lexicons/post.json".into(),
+                backfill: false,
+            },
+        );
+        state.project.store(Arc::new(snap));
+        mount_relay_page(&mock, POST, None, &["did:plc:a"], None).await;
+        mount_plc(&mock).await;
+        mount_records(&mock, "did:plc:a", POST, 1).await;
+        forbid_other_record_fetches(&mock).await;
+
+        let job_id = create_backfill_job(&state, None, &[])
+            .await
+            .expect("create job");
+        run_to_end(&state, &job_id, DEFAULT_DISCOVERY_WINDOW).await;
+
+        let job = job_row(&state, &job_id).await;
+        assert_eq!((job.status.as_str(), job.total_records), ("completed", 1));
     }
 
     #[tokio::test]

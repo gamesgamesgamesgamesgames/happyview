@@ -156,6 +156,8 @@ async fn blob_download_capped(
     let pds_endpoint = profile::resolve_pds_endpoint(http, plc_url, did)
         .await
         .map_err(|e| AtprotoError::Resolve(format!("failed to resolve PDS for {did}: {e}")))?;
+    crate::testing::identity::refuse_forged_pds(&pds_endpoint, "downloading a blob")
+        .map_err(AtprotoError::Resolve)?;
 
     if !allow_local {
         refuse_unsafe_endpoint(&pds_endpoint)?;

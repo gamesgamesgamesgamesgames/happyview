@@ -1,7 +1,7 @@
 export type SettingEntry = {
   key: string
   value: string
-  source: "database" | "env"
+  source: "database" | "env" | "project"
 }
 
 export type InstanceSettings = {

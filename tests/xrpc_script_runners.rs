@@ -227,7 +227,7 @@ async fn a_query_hands_the_interpreter_its_params_and_its_context() {
     assert_eq!(resp.status(), StatusCode::OK);
     let sent = json_body(resp).await;
 
-    assert_eq!(sent["source"], "echo");
+    assert_eq!(echo_interpreter::script_text(&sent), "echo");
     assert_eq!(sent["kind"], "xrpc_query");
     assert_eq!(sent["input"]["limit"], 5);
     assert_eq!(sent["context"]["trigger"], format!("xrpc.query:{QUERY}"));
@@ -818,4 +818,51 @@ async fn a_json_procedure_still_requires_a_json_body() {
 
     let resp = post_bytes(&app, PROCEDURE, Some("application/json"), b"{}").await;
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// The project layer
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_project_script_answers_a_query_ahead_of_its_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = query_app("row").await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        &format!("xrpc.query:{QUERY}"),
+        "project",
+        "src/lexicons/listGames.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let sent = json_body(call_query(&app, "").await).await;
+    assert_eq!(sent["source"], "project");
+
+    app.state.project.store(std::sync::Arc::new(
+        happyview::project::ProjectSnapshot::empty(),
+    ));
+    let sent = json_body(call_query(&app, "").await).await;
+    assert_eq!(echo_interpreter::script_text(&sent), "row");
+}
+
+#[tokio::test]
+async fn a_project_script_answers_a_procedure_ahead_of_its_row() {
+    common::require_db!();
+    require_fixture!();
+    let app = procedure_app("row").await;
+    let mut snap = common::project::snapshot();
+    common::project::add_script(
+        &mut snap,
+        &format!("xrpc.procedure:{PROCEDURE}"),
+        "project",
+        "src/lexicons/createGame.lua",
+    );
+    app.state.project.store(std::sync::Arc::new(snap));
+
+    let resp = call_procedure(&app, &json!({ "title": "hello" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["source"], "project");
 }
