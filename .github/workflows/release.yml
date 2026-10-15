@@ -149,10 +149,14 @@ jobs:
         with:
           "node-version": 24
       - name: "Build the dashboard"
-        run: "cd web && npm ci && npm run build"
+        run: |
+          node -e 'const v = process.env.NEXT_PUBLIC_BASE_PATH; if (v !== "/__HAPPYVIEW_BP__") { console.error(`NEXT_PUBLIC_BASE_PATH reached node as ${v}`); process.exit(1) }'
+          cd web && npm ci && npm run build
         shell: "bash"
         env:
           "NEXT_PUBLIC_BASE_PATH": "/__HAPPYVIEW_BP__"
+          "MSYS2_ENV_CONV_EXCL": "NEXT_PUBLIC_BASE_PATH"
+          "MSYS_NO_PATHCONV": "1"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
