@@ -1,7 +1,9 @@
 - name: Stamp the release version
   if: ${{ inputs.tag && inputs.tag != 'dry-run' }}
   shell: bash
-  run: bash scripts/stamp-version.sh "${{ inputs.tag }}"
+  env:
+    TAG: ${{ inputs.tag }}
+  run: bash scripts/stamp-version.sh "$TAG"
 - name: Setup Node.js
   uses: actions/setup-node@v7
   with:
