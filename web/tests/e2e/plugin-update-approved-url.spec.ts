@@ -82,8 +82,9 @@ test("the update dialog installs the approved entry, not the listing's", async (
   });
 
   await loginAsTestAdmin(page);
-  await page.goto("/dashboard/settings/plugins");
-  await page.getByRole("button", { name: "Update to v1.1.0" }).click();
+  // The update lives on the plugin's own page now; the ledger links to it.
+  await page.goto("/dashboard/settings/plugins/lua");
+  await page.getByRole("button", { name: "Update", exact: true }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
   await dialog.getByRole("button", { name: "Update to v1.1.0" }).click();

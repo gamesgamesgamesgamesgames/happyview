@@ -133,6 +133,8 @@ struct Artifacts {
     package: Option<Artifact>,
     #[serde(default)]
     icon: Option<Artifact>,
+    #[serde(default)]
+    banner: Option<Artifact>,
     /// The module's own `manifest.json`, where the publisher uploaded one.
     /// A release whose module is a blob has no sibling file to derive a
     /// manifest from, so this is the only way such a release is installable.
@@ -437,6 +439,12 @@ async fn entry_for(
             .icon
             .as_ref()
             .and_then(|a| artifact_url(base, &package.did, &slug, &version, "icon", a)),
+        banner_url: release
+            .record
+            .artifacts
+            .banner
+            .as_ref()
+            .and_then(|a| artifact_url(base, &package.did, &slug, &version, "banner", a)),
         latest_version: version,
         manifest_url,
         wasm_url,

@@ -195,6 +195,22 @@ struct CapabilityFields {
     capabilities: capabilities::CapabilityReport,
 }
 
+/// What a surface shows about a plugin before it shows what it does.
+/// Gathered here so every summary reads the same source.
+struct PresentationFields {
+    description: Option<String>,
+    icon_url: Option<String>,
+    banner_url: Option<String>,
+}
+
+fn presentation_fields(p: &LoadedPlugin) -> PresentationFields {
+    PresentationFields {
+        description: p.description().map(String::from),
+        icon_url: p.icon_url().map(String::from),
+        banner_url: p.banner_url().map(String::from),
+    }
+}
+
 fn capability_fields(p: &LoadedPlugin) -> CapabilityFields {
     let report = capabilities::report(p).unwrap_or_else(|e| capabilities::CapabilityReport {
         declared: Vec::new(),
@@ -293,11 +309,15 @@ pub(super) async fn list(
                 official_guard.plugins.get(&p.info.id),
             );
             let cap_fields = capability_fields(&p);
+            let pres = presentation_fields(&p);
 
             PluginSummary {
                 id: p.info.id.clone(),
                 name: p.info.name.clone(),
                 version: p.info.version.clone(),
+                description: pres.description,
+                icon_url: pres.icon_url,
+                banner_url: pres.banner_url,
                 source,
                 url,
                 sha256,
@@ -346,14 +366,16 @@ pub(super) async fn preview(
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     let cap_fields = capability_fields(&plugin);
+    let pres = presentation_fields(&plugin);
     let sha256 = hex::encode(Sha256::digest(&plugin.wasm_bytes));
 
     Ok(Json(PluginPreviewResponse {
         id: preview.manifest.id,
         name: preview.manifest.name,
         version: preview.manifest.version,
-        description: preview.manifest.description,
-        icon_url: preview.manifest.icon_url,
+        description: pres.description,
+        icon_url: pres.icon_url,
+        banner_url: pres.banner_url,
         auth_type: preview.manifest.auth_type,
         required_secrets: preview
             .manifest
@@ -455,11 +477,15 @@ pub(super) async fn add(
     // Newly added plugins are not configured (unless they have no required secrets)
     let secrets_configured = required_secrets.is_empty();
     let cap_fields = capability_fields(&plugin);
+    let pres = presentation_fields(&plugin);
 
     let summary = PluginSummary {
         id: plugin.info.id.clone(),
         name: plugin.info.name.clone(),
         version: plugin.info.version.clone(),
+        description: pres.description,
+        icon_url: pres.icon_url,
+        banner_url: pres.banner_url,
         source: "url".to_string(),
         url: Some(body.url.clone()),
         sha256: body.sha256.clone(),
@@ -701,11 +727,15 @@ pub(super) async fn reload(
     };
 
     let cap_fields = capability_fields(&plugin);
+    let pres = presentation_fields(&plugin);
 
     let summary = PluginSummary {
         id: plugin.info.id.clone(),
         name: plugin.info.name.clone(),
         version: plugin.info.version.clone(),
+        description: pres.description,
+        icon_url: pres.icon_url,
+        banner_url: pres.banner_url,
         source: "url".to_string(),
         url: Some(url.clone()),
         sha256,
@@ -1096,11 +1126,15 @@ pub(super) async fn check_update(
     };
 
     let cap_fields = capability_fields(&current);
+    let pres = presentation_fields(&current);
 
     Ok(Json(PluginSummary {
         id: current.info.id.clone(),
         name: current.info.name.clone(),
         version: current.info.version.clone(),
+        description: pres.description,
+        icon_url: pres.icon_url,
+        banner_url: pres.banner_url,
         source,
         url,
         sha256,
@@ -1140,6 +1174,8 @@ pub(super) async fn list_official(
             latest_version: p.latest_version.clone(),
             manifest_url: p.manifest_url.clone(),
             official: p.official,
+            banner_url: p.banner_url.clone(),
+            releases: p.releases.clone(),
             sections: p.sections.clone(),
         })
         .collect::<Vec<_>>();
@@ -1176,6 +1212,7 @@ mod tests {
                 })
                 .collect(),
             sections: Default::default(),
+            banner_url: None,
         }
     }
 
