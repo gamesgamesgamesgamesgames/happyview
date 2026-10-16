@@ -1,6 +1,6 @@
 .DS_Store
 /data
-/target
+target/
 .env
 node_modules/
 .next/
