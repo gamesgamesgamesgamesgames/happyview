@@ -17,6 +17,8 @@ export interface LexiconSummary {
   path: string | null
   /** A stored lexicon sits under this project file and answers again if it is removed. */
   shadows_stored: boolean
+  /** Listed in happyview.toml, which would restore it after a delete. */
+  declared: boolean
   token_cost: number | null
 }
 

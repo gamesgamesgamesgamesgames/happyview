@@ -224,7 +224,8 @@ export default function LexiconsPage() {
             </Button>
 
             {hasPermission("lexicons:delete") &&
-              row.original.layer !== "project" && (
+              row.original.layer !== "project" &&
+              !row.original.declared && (
               <AlertDialog>
                 <AlertDialogTrigger asChild>
                   <Button
