@@ -942,6 +942,7 @@ async fn run(command: happyview::cli::Command) -> std::process::ExitCode {
         records: happyview::record_store::RecordStore::shared(db_pool.clone(), db_backend)
             .await
             .expect("failed to load record compression dictionaries"),
+        archive: happyview::jetstream::archive::ArchiveConfig::from_env(),
         db: db_pool,
         backfill_db: backfill_db_pool,
         db_backend,

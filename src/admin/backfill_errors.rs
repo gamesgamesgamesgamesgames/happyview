@@ -26,6 +26,8 @@ pub enum BackfillErrorKind {
     RepoDeactivated,
     RepoTakendown,
     Other,
+    /// An archive block or segment that failed to download or decode.
+    ReplayBlock,
 }
 
 impl BackfillErrorKind {
@@ -37,6 +39,7 @@ impl BackfillErrorKind {
                 | Self::Timeout
                 | Self::PdsServerError
                 | Self::RateLimited
+                | Self::ReplayBlock
         )
     }
 
@@ -54,6 +57,7 @@ impl BackfillErrorKind {
             Self::RepoDeactivated => "repo_deactivated",
             Self::RepoTakendown => "repo_takendown",
             Self::Other => "other",
+            Self::ReplayBlock => "replay_block",
         }
     }
 
@@ -71,12 +75,13 @@ impl BackfillErrorKind {
             "repo_deactivated" => Self::RepoDeactivated,
             "repo_takendown" => Self::RepoTakendown,
             "other" => Self::Other,
+            "replay_block" => Self::ReplayBlock,
             _ => return None,
         })
     }
 
     /// Every kind, for zero-filling count maps and driving the dashboard legend.
-    pub fn all() -> [Self; 12] {
+    pub fn all() -> [Self; 13] {
         [
             Self::DnsFailure,
             Self::ConnectionFailed,
@@ -90,6 +95,7 @@ impl BackfillErrorKind {
             Self::RepoDeactivated,
             Self::RepoTakendown,
             Self::Other,
+            Self::ReplayBlock,
         ]
     }
 }
@@ -384,6 +390,9 @@ impl ErrorRecorder {
     /// The count is unconditional. That is the whole point of splitting them —
     /// `ErrorCounts` must stay exact past `ERROR_DETAIL_CAP`, so the aggregate
     /// picture survives even when the detail log stops growing.
+    ///
+    /// Returns whether the detail row was stored: false past the cap or when
+    /// the insert failed.
     #[allow(clippy::too_many_arguments)]
     pub async fn record(
         &self,
@@ -394,7 +403,7 @@ impl ErrorRecorder {
         phase: &str,
         failure: &BackfillFailure,
         attempts: u32,
-    ) {
+    ) -> bool {
         // Never hold the lock across an await.
         if let Ok(mut counts) = self.counts.lock() {
             counts.record(failure.kind);
@@ -409,12 +418,15 @@ impl ErrorRecorder {
         let slot = self.stored.fetch_add(1, Ordering::Relaxed);
         if slot >= ERROR_DETAIL_CAP {
             self.stored.fetch_sub(1, Ordering::Relaxed);
-            return;
+            return false;
         }
 
-        if !persist_failure(state, job_id, did, collection, phase, failure, attempts).await {
+        let stored =
+            persist_failure(state, job_id, did, collection, phase, failure, attempts).await;
+        if !stored {
             self.stored.fetch_sub(1, Ordering::Relaxed);
         }
+        stored
     }
 
     pub async fn flush(&self, state: &AppState, job_id: &str) {
@@ -441,6 +453,7 @@ mod tests {
             Timeout,
             PdsServerError,
             RateLimited,
+            ReplayBlock,
         ] {
             assert!(k.is_retryable(), "{k:?} should be retryable");
         }

@@ -99,6 +99,8 @@ pub struct AppState {
     pub db_backend: DatabaseBackend,
     /// The record tables' one reader and writer (see `record_store`).
     pub records: record_store::RecordStore,
+    /// Replay backfill settings (`JETSTREAM_API_KEY`, `BACKFILL_SOURCE`, ...).
+    pub archive: crate::jetstream::archive::ArchiveConfig,
     pub domain_cache: domain::DomainCache,
     /// The current project build. Readers that must not see a swap mid-run
     /// take `load_full()` once and keep it.

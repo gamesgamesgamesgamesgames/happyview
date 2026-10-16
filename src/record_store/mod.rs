@@ -804,6 +804,7 @@ impl RecordStore {
         executor: E,
         did: &str,
         collections: Option<&[String]>,
+        before_rev: Option<&str>,
         limit: i64,
     ) -> Result<Vec<i64>, sqlx::Error>
     where
@@ -818,12 +819,21 @@ impl RecordStore {
                 placeholders(collections.len())
             ));
         }
+        if before_rev.is_some() {
+            select.push_str(&format!(
+                " AND (rev IS NULL OR {})",
+                crate::db::rev_compare(self.backend, "rev", "<", "?")
+            ));
+        }
         select.push_str(" LIMIT ?");
         let select = adapt_sql(&select, self.backend);
 
         let mut query = crate::db::query_as::<(i64,)>(&select).bind(did);
         for collection in collections.unwrap_or_default() {
             query = query.bind(collection.as_str());
+        }
+        if let Some(before_rev) = before_rev {
+            query = query.bind(before_rev);
         }
         Ok(query
             .bind(limit)
@@ -842,7 +852,7 @@ impl RecordStore {
         collections: Option<&[String]>,
     ) -> Result<bool, sqlx::Error> {
         Ok(!self
-            .held_network_ids(&self.db, did, collections, 1)
+            .held_network_ids(&self.db, did, collections, None, 1)
             .await?
             .is_empty())
     }
@@ -861,7 +871,38 @@ impl RecordStore {
         limit: i64,
     ) -> Result<u64, sqlx::Error> {
         let ids = self
-            .held_network_ids(&mut *conn, did, collections, limit)
+            .held_network_ids(&mut *conn, did, collections, None, limit)
+            .await?;
+        self.delete_ids(conn, &ids).await?;
+        Ok(ids.len() as u64)
+    }
+
+    /// [`Self::holds_network_records`], counting only rows older than
+    /// `before_rev` (or with no rev).
+    pub async fn holds_network_records_before(
+        &self,
+        did: &str,
+        collections: Option<&[String]>,
+        before_rev: &str,
+    ) -> Result<bool, sqlx::Error> {
+        Ok(!self
+            .held_network_ids(&self.db, did, collections, Some(before_rev), 1)
+            .await?
+            .is_empty())
+    }
+
+    /// [`Self::purge_network_batch`] for rows older than `before_rev` (or with
+    /// no rev): what a marker replayed from the archive supersedes.
+    pub async fn purge_network_batch_before(
+        &self,
+        conn: &mut AnyConnection,
+        did: &str,
+        collections: Option<&[String]>,
+        before_rev: &str,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let ids = self
+            .held_network_ids(&mut *conn, did, collections, Some(before_rev), limit)
             .await?;
         self.delete_ids(conn, &ids).await?;
         Ok(ids.len() as u64)

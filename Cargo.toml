@@ -161,6 +161,7 @@ path = "tests/lua_differential.rs"
 required-features = ["lua-reference"]
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 axum = { version = "0.8", features = ["multipart", "ws"] }
 wiremock = "0.6"
 tower = { version = "0.5", features = ["util"] }

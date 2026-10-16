@@ -87,7 +87,7 @@ pub async fn apply_event(state: &AppState, tracked: &[String], event: Event) -> 
             active: false,
             status,
         } if status.as_deref() == Some("deleted") => {
-            account_purged(state, &did, cursor, "jetstream.account_deleted", None).await
+            account_purged(state, &did, cursor, "jetstream.account_deleted", None, None).await
         }
         EventKind::Account {
             active: false,
@@ -99,6 +99,7 @@ pub async fn apply_event(state: &AppState, tracked: &[String], event: Event) -> 
                 cursor,
                 "jetstream.account_takendown",
                 status.as_deref(),
+                None,
             )
             .await
         }
@@ -106,12 +107,72 @@ pub async fn apply_event(state: &AppState, tracked: &[String], event: Event) -> 
             active: false,
             status,
         } => account_inactive(state, &did, status.as_deref()).await,
-        EventKind::Account { active: true, .. } => account_active(state, &did).await,
-        EventKind::Sync { rev } => repo_resynced(state, &did, rev.as_deref(), tracked).await,
+        EventKind::Account { active: true, .. } => account_active(state, &did, None).await,
+        EventKind::Sync { rev } => repo_resynced(state, &did, rev.as_deref(), tracked, None).await,
         EventKind::Identity { handle } => {
             // HappyView caches no DID documents or handles, so there is
             // nothing to refresh.
             tracing::debug!(did, ?handle, "jetstream identity event");
+            ApplyOutcome::Applied
+        }
+    }
+}
+
+/// Apply an account or sync marker replayed from the archive. It acts as of
+/// its own time (plan ruling P2): it purges only rows older than itself and
+/// never lifts or lowers a newer tombstone, so applying it after the commits
+/// of the same range leaves what seq order would, and live writes made since
+/// survive. `tracked` scopes a `#sync` purge, as for live.
+pub async fn apply_replayed_marker(
+    state: &AppState,
+    tracked: &[String],
+    event: Event,
+) -> ApplyOutcome {
+    let Event { did, cursor, kind } = event;
+    let marker_rev = crate::tid::tid_from_unix_microseconds(cursor.time_us());
+    match kind {
+        EventKind::Account {
+            active: false,
+            status,
+        } if status.as_deref() == Some("deleted") => {
+            account_purged(
+                state,
+                &did,
+                cursor,
+                "jetstream.account_deleted",
+                None,
+                Some(&marker_rev),
+            )
+            .await
+        }
+        EventKind::Account {
+            active: false,
+            status,
+        } if matches!(status.as_deref(), Some("takendown" | "suspended")) => {
+            account_purged(
+                state,
+                &did,
+                cursor,
+                "jetstream.account_takendown",
+                status.as_deref(),
+                Some(&marker_rev),
+            )
+            .await
+        }
+        // Historical deactivations aren't news.
+        EventKind::Account { active: false, .. } => ApplyOutcome::Applied,
+        EventKind::Account { active: true, .. } => {
+            account_active(state, &did, Some(&marker_rev)).await
+        }
+        EventKind::Sync { rev } => {
+            let before = rev.clone().unwrap_or(marker_rev);
+            repo_resynced(state, &did, rev.as_deref(), tracked, Some(&before)).await
+        }
+        EventKind::Commit(_) | EventKind::Identity { .. } => {
+            debug_assert!(
+                false,
+                "apply_replayed_marker takes account and sync markers only"
+            );
             ApplyOutcome::Applied
         }
     }
@@ -253,6 +314,7 @@ async fn account_purged(
     cursor: CursorPoint,
     event_type: &str,
     status: Option<&str>,
+    before: Option<&str>,
 ) -> ApplyOutcome {
     let backend = state.db_backend;
     let deleted = status.is_none();
@@ -293,7 +355,12 @@ async fn account_purged(
     })
     .await;
     let purged = match tombstoned {
-        Ok(()) => crate::tombstones::purge_did_records(&state.records, did, None).await,
+        Ok(()) => match before {
+            None => crate::tombstones::purge_did_records(&state.records, did, None).await,
+            Some(before) => {
+                crate::tombstones::purge_did_records_before(&state.records, did, None, before).await
+            }
+        },
         Err(e) => Err(e),
     };
     match purged {
@@ -302,6 +369,9 @@ async fn account_purged(
             let mut detail = serde_json::json!({ "purged": purged, "seq": cursor.seq() });
             if let Some(status) = status {
                 detail["status"] = status.into();
+            }
+            if before.is_some() {
+                detail["replayed"] = true.into();
             }
             log(state, event_type, Severity::Info, did, detail).await;
             ApplyOutcome::Applied
@@ -399,10 +469,10 @@ async fn account_inactive(state: &AppState, did: &str, status: Option<&str>) -> 
 /// `active=true`. Ruling F6: lift the DID's tombstone, whatever event left
 /// it, so a reinstated account can be backfilled again. Nearly every account
 /// on the network has none, so look before taking the lock.
-async fn account_active(state: &AppState, did: &str) -> ApplyOutcome {
+async fn account_active(state: &AppState, did: &str, before: Option<&str>) -> ApplyOutcome {
     let backend = state.db_backend;
     let sql = adapt_sql(
-        "SELECT did FROM happyview_did_tombstones WHERE did = ?",
+        "SELECT rev FROM happyview_did_tombstones WHERE did = ?",
         backend,
     );
     let found: Result<Option<(String,)>, sqlx::Error> = crate::db::query_as(&sql)
@@ -411,16 +481,34 @@ async fn account_active(state: &AppState, did: &str) -> ApplyOutcome {
         .await;
     let lifted = match found {
         Ok(None) => return ApplyOutcome::Applied,
+        // A replayed reactivation older than the tombstone lifts nothing.
+        // TIDs are fixed-width and base32-sortable, so this is the order
+        // `rev_compare` gives.
+        Ok(Some((stored,))) if before.is_some_and(|before| stored.as_str() >= before) => {
+            return ApplyOutcome::Applied;
+        }
         Ok(Some(_)) => {
+            // The rev check repeats in the DELETE, so a newer tombstone
+            // written since the look above survives too.
             let delete = adapt_sql(
-                "DELETE FROM happyview_did_tombstones WHERE did = ?",
+                &match before {
+                    None => "DELETE FROM happyview_did_tombstones WHERE did = ?".to_string(),
+                    Some(_) => format!(
+                        "DELETE FROM happyview_did_tombstones WHERE did = ? AND {}",
+                        crate::db::rev_compare(backend, "rev", "<", "?")
+                    ),
+                },
                 backend,
             );
             let delete = delete.as_str();
             crate::db::retry_on_busy(|| async move {
                 let mut tx = crate::db::begin_write(&state.db, backend).await?;
                 crate::tombstones::lock_did(&mut tx, backend, did).await?;
-                crate::db::query(delete).bind(did).execute(&mut *tx).await?;
+                let mut query = crate::db::query(delete).bind(did);
+                if let Some(before) = before {
+                    query = query.bind(before);
+                }
+                query.execute(&mut *tx).await?;
                 tx.commit().await
             })
             .await
@@ -447,25 +535,29 @@ async fn repo_resynced(
     did: &str,
     rev: Option<&str>,
     tracked: &[String],
+    before: Option<&str>,
 ) -> ApplyOutcome {
     let collections: Vec<String> = tracked
         .iter()
         .filter(|c| c.as_str() != LEXICON_SCHEMA_COLLECTION)
         .cloned()
         .collect();
-    match crate::tombstones::purge_did_records(&state.records, did, Some(collections.as_slice()))
-        .await
-    {
+    let collections = Some(collections.as_slice());
+    let purged = match before {
+        None => crate::tombstones::purge_did_records(&state.records, did, collections).await,
+        Some(before) => {
+            crate::tombstones::purge_did_records_before(&state.records, did, collections, before)
+                .await
+        }
+    };
+    match purged {
         Ok(0) => ApplyOutcome::Applied,
         Ok(purged) => {
-            log(
-                state,
-                "jetstream.sync_purged",
-                Severity::Info,
-                did,
-                serde_json::json!({ "purged": purged, "rev": rev }),
-            )
-            .await;
+            let mut detail = serde_json::json!({ "purged": purged, "rev": rev });
+            if before.is_some() {
+                detail["replayed"] = true.into();
+            }
+            log(state, "jetstream.sync_purged", Severity::Info, did, detail).await;
             ApplyOutcome::Applied
         }
         // As for an account purge, `give_up_fn` logs it if it never applies.
@@ -1294,5 +1386,200 @@ mod tests {
         tx.send(vec![NSID.to_string()]).expect("send");
         assert_eq!(apply(sync(&did, 3, None)).await, ApplyOutcome::Applied);
         assert!(rkeys(&state, &did).await.is_empty());
+    }
+
+    async fn replay(state: &AppState, event: Event) {
+        assert_eq!(
+            apply_replayed_marker(state, &[NSID.to_string()], event).await,
+            ApplyOutcome::Applied
+        );
+    }
+
+    /// A network row at `rev_at(seq)`, or with no rev (a crawl row) for `None`.
+    async fn put(state: &AppState, did: &str, rkey: &str, seq: Option<i64>) {
+        // Bound outside the closure: the future `write_network` returns
+        // borrows the slice, so it can't point at a temporary made inside.
+        let prepared = [crate::record_store::PreparedRecord {
+            did: did.into(),
+            collection: NSID.into(),
+            rkey: rkey.into(),
+            record_json: serde_json::json!({ "text": rkey }).to_string(),
+            cid: String::new(),
+            rev: seq.map(rev_at),
+        }];
+        crate::db::retry_on_busy(|| state.records.write_network(&state.db, &prepared))
+            .await
+            .expect("put");
+    }
+
+    async fn did_tombstone_rev(state: &AppState, did: &str) -> Option<String> {
+        crate::db::query_as::<(String,)>(&adapt_sql(
+            "SELECT rev FROM happyview_did_tombstones WHERE did = ?",
+            state.db_backend,
+        ))
+        .bind(did)
+        .fetch_optional(&state.db)
+        .await
+        .expect("read tombstone")
+        .map(|(rev,)| rev)
+    }
+
+    #[tokio::test]
+    async fn a_replayed_takedown_keeps_records_written_after_it() {
+        for state in states().await {
+            let did = unique_did();
+            put(&state, &did, "crawled", None).await;
+            put(&state, &did, "older", Some(10)).await;
+            put(&state, &did, "newer", Some(30)).await;
+
+            replay(&state, account(&did, 20, false, Some("takendown"))).await;
+
+            assert_eq!(rkeys(&state, &did).await, vec!["newer"]);
+            assert_eq!(did_tombstone_rev(&state, &did).await, Some(rev_at(20)));
+            let logged = logged(&state, "jetstream.account_takendown", &did).await;
+            assert_eq!(logged.len(), 1);
+            assert_eq!(logged[0]["replayed"], true);
+            // The tombstone still refuses what the takedown superseded...
+            put(&state, &did, "late-old", Some(15)).await;
+            // ...and admits what came after it.
+            put(&state, &did, "late-new", Some(25)).await;
+            assert_eq!(rkeys(&state, &did).await, vec!["late-new", "newer"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replayed_sync_keeps_newer_records() {
+        for state in states().await {
+            let did = unique_did();
+            put(&state, &did, "older", Some(10)).await;
+            put(&state, &did, "newer", Some(30)).await;
+            replay(&state, sync(&did, 25, Some(rev_at(20)))).await;
+            assert_eq!(rkeys(&state, &did).await, vec!["newer"]);
+            assert_eq!(
+                did_tombstone_rev(&state, &did).await,
+                None,
+                "a sync leaves no tombstone"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replayed_sync_without_a_rev_acts_as_of_its_own_time() {
+        for state in states().await {
+            let did = unique_did();
+            put(&state, &did, "crawled", None).await;
+            put(&state, &did, "older", Some(10)).await;
+            put(&state, &did, "newer", Some(30)).await;
+            replay(&state, sync(&did, 20, None)).await;
+            assert_eq!(rkeys(&state, &did).await, vec!["newer"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replayed_marker_keeps_a_record_at_its_own_rev() {
+        // "Before" is strict: a row with the marker's rev is not older.
+        for state in states().await {
+            let did = unique_did();
+            put(&state, &did, "same", Some(20)).await;
+            put(&state, &did, "older", Some(19)).await;
+            replay(&state, sync(&did, 25, Some(rev_at(20)))).await;
+            assert_eq!(rkeys(&state, &did).await, vec!["same"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replayed_reactivation_does_not_lift_a_newer_tombstone() {
+        for state in states().await {
+            let did = unique_did();
+            apply(&state, account(&did, 30, false, Some("takendown"))).await;
+            assert_eq!(did_tombstone_rev(&state, &did).await, Some(rev_at(30)));
+            replay(&state, account(&did, 20, true, None)).await;
+            assert_eq!(
+                did_tombstone_rev(&state, &did).await,
+                Some(rev_at(30)),
+                "older reactivation"
+            );
+            replay(&state, account(&did, 30, true, None)).await;
+            assert_eq!(
+                did_tombstone_rev(&state, &did).await,
+                Some(rev_at(30)),
+                "same-rev reactivation"
+            );
+            replay(&state, account(&did, 40, true, None)).await;
+            assert_eq!(
+                did_tombstone_rev(&state, &did).await,
+                None,
+                "newer reactivation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replayed_marker_never_lowers_a_newer_tombstone() {
+        for state in states().await {
+            let did = unique_did();
+            apply(&state, account(&did, 30, false, Some("deleted"))).await;
+            replay(&state, account(&did, 20, false, Some("suspended"))).await;
+            assert_eq!(did_tombstone_rev(&state, &did).await, Some(rev_at(30)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replayed_deactivation_changes_nothing() {
+        for state in states().await {
+            let did = unique_did();
+            put(&state, &did, "kept", Some(10)).await;
+            replay(&state, account(&did, 20, false, Some("deactivated"))).await;
+            assert_eq!(rkeys(&state, &did).await, vec!["kept"]);
+            assert!(
+                logged(&state, "jetstream.account_inactive", &did)
+                    .await
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn markers_commute_with_the_commits_they_follow() {
+        // The fold applies commit sweeps before marker sweeps (P1); the
+        // result must match seq order.
+        for state in states().await {
+            let (seq_order, sweep_order) = (unique_did(), unique_did());
+            let events = |did: &str| {
+                vec![
+                    commit(did, 10, "a", "create"),
+                    account(did, 20, false, Some("takendown")),
+                    account(did, 30, true, None),
+                    commit(did, 40, "b", "create"),
+                ]
+            };
+            for event in events(&seq_order) {
+                match event.kind {
+                    EventKind::Commit(_) => apply(&state, event).await,
+                    _ => replay(&state, event).await,
+                }
+            }
+            let (commits, markers): (Vec<_>, Vec<_>) = events(&sweep_order)
+                .into_iter()
+                .partition(|e| matches!(e.kind, EventKind::Commit(_)));
+            for event in commits {
+                apply(&state, event).await;
+            }
+            for event in markers {
+                replay(&state, event).await;
+            }
+            assert_eq!(rkeys(&state, &seq_order).await, vec!["b"]);
+            assert_eq!(rkeys(&state, &sweep_order).await, vec!["b"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_markers_still_purge_everything() {
+        for state in states().await {
+            let did = unique_did();
+            put(&state, &did, "newer", Some(30)).await;
+            apply(&state, account(&did, 20, false, Some("takendown"))).await;
+            assert!(rkeys(&state, &did).await.is_empty());
+        }
     }
 }

@@ -35,7 +35,7 @@ graph LR
   Labeler["Labeler<br/><small>WebSocket (out-of-band)</small>"] -->|label events| DB
 ```
 
-Queries go through the query handler to the database (SQLite by default, or Postgres). Writes go through the procedure handler to the user's PDS, then HappyView indexes the record locally. Real-time record events stream in via [Jetstream](https://github.com/bluesky-social/jetstream) (its v2 `subscribeEvents` stream when the host offers it, otherwise v1), applied in order for each repo, with the stream position saved only once every earlier event has been applied; historical records are backfilled in-process by discovering repos via the relay's `listReposByCollection` and fetching records directly from each PDS. [Labelers](../guides/labelers.md) are external services that emit content labels over a direct WebSocket connection — they operate out-of-band, outside the relay/repo system. [Spaces](../experimental/spaces/index.md) provide permissioned data containers with membership-gated access, per-user repo state tracking (LtHash + signed commits), and cross-service credential-based authentication.
+Queries go through the query handler to the database (SQLite by default, or Postgres). Writes go through the procedure handler to the user's PDS, then HappyView indexes the record locally. Real-time record events stream in via [Jetstream](https://github.com/bluesky-social/jetstream) (its v2 `subscribeEvents` stream when the host offers it, otherwise v1), applied in order for each repo, with the stream position saved only once every earlier event has been applied; historical records are backfilled in-process, either by replaying the Jetstream archive or by discovering repos via the relay's `listReposByCollection` and fetching records directly from each PDS. [Labelers](../guides/labelers.md) are external services that emit content labels over a direct WebSocket connection — they operate out-of-band, outside the relay/repo system. [Spaces](../experimental/spaces/index.md) provide permissioned data containers with membership-gated access, per-user repo state tracking (LtHash + signed commits), and cross-service credential-based authentication.
 
 ## Request flow
 
@@ -160,7 +160,7 @@ sequenceDiagram
 
 **Recovering a cursor.**
 
-- A cursor older than Jetstream keeps resumes from the stored witnessed time. Jetstream clamps that to its oldest event and announces the gap with `#info OutdatedCursor`, which is logged as `jetstream.gap` with reason `outdated_cursor`. Only when there is no stored time does HappyView resume from the live tip, logged as `cursor_too_old`. A [backfill](../guides/backfill.md) recovers what was missed.
+- A cursor older than Jetstream keeps (`CursorTooOld`) is replayed from the Jetstream archive when it has one and `BACKFILL_SOURCE` is `auto` or `replay`: see Gap replay under [Backfill](#backfill). Otherwise it resumes from the stored witnessed time. Jetstream clamps that to its oldest event and announces the gap with `#info OutdatedCursor`, which is logged as `jetstream.gap` with reason `outdated_cursor`. Only when there is no stored time does HappyView resume from the live tip, logged as `cursor_too_old`. A [backfill](../guides/backfill.md) recovers what was missed.
 - If the server renumbers its seqs (`FutureCursor`), HappyView resumes by witnessed time too.
 - An unexplained 400 first drops compression, then the seq cursor (only when a seq was sent and a witnessed time is saved; otherwise it goes straight to the hourly retry and keeps the cursor), then retries hourly and logs `jetstream.invalid_request`.
 - Under `auto`, a 404 falls back to v1 until the process restarts.
@@ -218,7 +218,10 @@ sequenceDiagram
     H->>D: Mark job completed (or failed)
 ```
 
-## Database schema
+**Two sources.** A backfill job reads its records from one of two places, chosen by `BACKFILL_SOURCE` (default `crawl`) or the job's `source`. A crawl runs the pipeline above, and every account backfill crawls. A replay asks the Jetstream archive for a plan (`planSnapshot`), downloads the segments and blocks that hold the job's collections, and writes the records through the same path as live events. A second sweep then applies the account and sync events for the accounts that hold records. Markers are applied as of their own time, so the two sweeps give the same result in either order and never remove records written after them. `auto` replays when the Jetstream has an archive and crawls when it doesn't. A replay returns only what the archive holds; some repos' history in Bluesky's archive starts after their first record, which a crawl would find.
+
+**Gap replay.** When the live consumer's cursor is older than Jetstream keeps, HappyView creates a replay job for the gap between its last applied seq and the archive's sealed tip, and resumes the live stream at that tip. The consumer waits at most 30 seconds for the archive's plan; past that it resumes without a replay. Live events and the replay overlap safely, because the rev guard and tombstones make every write idempotent. Instances on `BACKFILL_SOURCE=crawl` (the default), or on a Jetstream without an archive, keep the old behaviour of skipping the gap.
+
 
 ### `records`
 

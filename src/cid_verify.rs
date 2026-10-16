@@ -93,6 +93,50 @@ pub fn record_to_dag_cbor(value: &Value) -> Option<Vec<u8>> {
     serde_ipld_dagcbor::to_vec(&ipld).ok()
 }
 
+/// A DAG-CBOR record (the bytes a repo stores, and the payload of a Jetstream
+/// archive row) as atproto JSON: links as `{"$link": cid}` and bytes as
+/// `{"$bytes": base64}`, unpadded as Jetstream emits them. The inverse of
+/// [`record_to_dag_cbor`] for every value the atproto data model allows.
+pub fn dag_cbor_to_json(cbor: &[u8]) -> Result<Value, String> {
+    let ipld: Ipld = serde_ipld_dagcbor::from_slice(cbor).map_err(|e| e.to_string())?;
+    ipld_to_atproto_json(ipld)
+}
+
+fn ipld_to_atproto_json(ipld: Ipld) -> Result<Value, String> {
+    Ok(match ipld {
+        Ipld::Null => Value::Null,
+        Ipld::Bool(b) => Value::Bool(b),
+        Ipld::Integer(i) => {
+            if let Ok(i) = i64::try_from(i) {
+                Value::from(i)
+            } else if let Ok(u) = u64::try_from(i) {
+                Value::from(u)
+            } else {
+                return Err(format!("integer {i} is out of range"));
+            }
+        }
+        Ipld::Float(f) => serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .ok_or_else(|| format!("float {f} has no JSON form"))?,
+        Ipld::String(s) => Value::String(s),
+        Ipld::Bytes(bytes) => serde_json::json!({
+            "$bytes": base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, bytes)
+        }),
+        Ipld::List(items) => Value::Array(
+            items
+                .into_iter()
+                .map(ipld_to_atproto_json)
+                .collect::<Result<_, _>>()?,
+        ),
+        Ipld::Map(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| Ok((k, ipld_to_atproto_json(v)?)))
+                .collect::<Result<_, String>>()?,
+        ),
+        Ipld::Link(cid) => serde_json::json!({ "$link": cid.to_string() }),
+    })
+}
+
 /// `<code=0x12><len=0x20><digest>`, which both CID forms below carry: they
 /// differ only in the codec naming how the bytes are to be read.
 fn sha256_multihash(bytes: &[u8]) -> Option<Multihash<64>> {
@@ -296,5 +340,136 @@ mod tests {
             compute_record_cid(&as_bytes).expect("encodable"),
             compute_record_cid(&as_string).expect("encodable"),
         );
+    }
+
+    /// Split the golden segment's raw record payloads out without the segment
+    /// reader (Task 3), so this test does not depend on it: walk the blocks by
+    /// the index and read the payload column of each.
+    fn golden_payloads() -> Vec<Vec<u8>> {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/jetstream/corpus/golden_corpus_segment.jss"
+        ))
+        .expect("golden segment");
+        let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u64_at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let block_count = u32_at(&bytes, 14) as usize;
+        let index = u64_at(&bytes, 90) as usize;
+        let mut payloads = Vec::new();
+        for i in 0..block_count {
+            let entry = index + i * 52;
+            let offset = u64_at(&bytes, entry) as usize;
+            let size = u32_at(&bytes, entry + 8) as usize;
+            let frame = &bytes[offset + 8..offset + 8 + size];
+            let block = zstd::bulk::decompress(frame, 64 << 20).expect("block");
+            let n = u32_at(&block, 0) as usize;
+            // seq, witnessed_at, indexed_at (8 bytes each), kind, collection_len (1 each)
+            let mut at = 4 + n * (8 + 8 + 8 + 1 + 1);
+            let did_lens: Vec<usize> = (0..n)
+                .map(|j| {
+                    u16::from_le_bytes(block[at + 2 * j..at + 2 * j + 2].try_into().unwrap())
+                        as usize
+                })
+                .collect();
+            at += 2 * n;
+            let rkey_lens: Vec<usize> = (0..n).map(|j| block[at + j] as usize).collect();
+            at += n;
+            let rev_lens: Vec<usize> = (0..n).map(|j| block[at + j] as usize).collect();
+            at += n;
+            let payload_lens: Vec<usize> = (0..n)
+                .map(|j| u32_at(&block, at + 4 * j) as usize)
+                .collect();
+            at += 4 * n;
+            let collection_lens: Vec<usize> =
+                (0..n).map(|j| block[4 + n * 25 + j] as usize).collect();
+            at += collection_lens.iter().sum::<usize>()
+                + did_lens.iter().sum::<usize>()
+                + rkey_lens.iter().sum::<usize>()
+                + rev_lens.iter().sum::<usize>();
+            for len in payload_lens {
+                payloads.push(block[at..at + len].to_vec());
+                at += len;
+            }
+            assert_eq!(at, block.len(), "no trailing bytes");
+        }
+        payloads
+    }
+
+    fn golden_cids() -> Vec<String> {
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/jetstream/corpus/car_expected_records.tsv"
+        ))
+        .expect("tsv")
+        .lines()
+        .map(|line| line.split('\t').nth(1).expect("cid column").to_string())
+        .collect()
+    }
+
+    #[test]
+    fn golden_records_round_trip_through_atproto_json() {
+        let payloads = golden_payloads();
+        let cids = golden_cids();
+        assert_eq!(payloads.len(), 23);
+        assert_eq!(cids.len(), 23);
+        for (payload, cid) in payloads.iter().zip(&cids) {
+            assert_eq!(
+                &dag_cbor_cid(payload).unwrap().to_string(),
+                cid,
+                "CID of the raw payload"
+            );
+            let json = dag_cbor_to_json(payload).expect("decodes");
+            assert!(
+                json.get("$type").is_some(),
+                "a record names its type: {json}"
+            );
+            assert_eq!(
+                record_to_dag_cbor(&json).as_deref(),
+                Some(payload.as_slice()),
+                "JSON re-encodes to the same bytes"
+            );
+            assert_eq!(verify_record_cid(cid, &json), CidCheck::Match);
+        }
+    }
+
+    #[test]
+    fn bytes_and_links_use_the_atproto_json_forms() {
+        let cid = dag_cbor_cid(b"x").unwrap();
+        let ipld = Ipld::Map(BTreeMap::from([
+            ("$type".to_string(), Ipld::String("app.test.thing".into())),
+            ("blob".to_string(), Ipld::Link(cid)),
+            (
+                "raw".to_string(),
+                Ipld::Bytes(vec![0xde, 0xad, 0xbe, 0xef, 0x01]),
+            ),
+            ("n".to_string(), Ipld::Integer(-7)),
+            ("big".to_string(), Ipld::Integer(i64::MAX as i128)),
+            (
+                "list".to_string(),
+                Ipld::List(vec![Ipld::Null, Ipld::Bool(true)]),
+            ),
+        ]));
+        let cbor = serde_ipld_dagcbor::to_vec(&ipld).unwrap();
+        let json = dag_cbor_to_json(&cbor).unwrap();
+        assert_eq!(
+            json["blob"],
+            serde_json::json!({ "$link": cid.to_string() })
+        );
+        // Unpadded, as Jetstream emits `$bytes`.
+        assert_eq!(json["raw"], serde_json::json!({ "$bytes": "3q2+7wE" }));
+        assert_eq!(json["n"], -7);
+        assert_eq!(json["big"], i64::MAX);
+        assert_eq!(json["list"], serde_json::json!([null, true]));
+        assert_eq!(record_to_dag_cbor(&json).unwrap(), cbor);
+    }
+
+    #[test]
+    fn undecodable_cbor_is_an_error_not_a_panic() {
+        assert!(dag_cbor_to_json(&[]).is_err());
+        assert!(dag_cbor_to_json(&[0xff, 0x00]).is_err());
+        let too_big = serde_ipld_dagcbor::to_vec(&Ipld::Integer(u64::MAX as i128 + 1));
+        if let Ok(bytes) = too_big {
+            assert!(dag_cbor_to_json(&bytes).is_err());
+        }
     }
 }

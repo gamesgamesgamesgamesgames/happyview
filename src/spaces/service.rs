@@ -1278,6 +1278,7 @@ mod tests {
             backfill_db: pool.clone(),
             db_backend: backend,
             records: crate::record_store::RecordStore::new(pool.clone(), backend),
+            archive: Default::default(),
             domain_cache: crate::domain::DomainCache::new(),
             lexicons: LexiconCatalog::new(project.clone()),
             scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
