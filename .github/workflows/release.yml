@@ -72,7 +72,9 @@ jobs:
       - name: Stamp the release version
         if: ${{ inputs.tag && inputs.tag != 'dry-run' }}
         shell: bash
-        run: bash scripts/stamp-version.sh "${{ inputs.tag }}"
+        env:
+          TAG: ${{ inputs.tag }}
+        run: bash scripts/stamp-version.sh "$TAG"
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -142,8 +144,10 @@ jobs:
           fi
       - name: "Stamp the release version"
         if: "${{ inputs.tag && inputs.tag != 'dry-run' }}"
-        run: "bash scripts/stamp-version.sh \"${{ inputs.tag }}\""
+        run: "bash scripts/stamp-version.sh \"$TAG\""
         shell: "bash"
+        env:
+          "TAG": "${{ inputs.tag }}"
       - name: "Setup Node.js"
         uses: "actions/setup-node@v7"
         with:
@@ -212,7 +216,9 @@ jobs:
       - name: Stamp the release version
         if: ${{ inputs.tag && inputs.tag != 'dry-run' }}
         shell: bash
-        run: bash scripts/stamp-version.sh "${{ inputs.tag }}"
+        env:
+          TAG: ${{ inputs.tag }}
+        run: bash scripts/stamp-version.sh "$TAG"
       - name: Install cached dist
         uses: actions/download-artifact@v8
         with:
@@ -266,7 +272,9 @@ jobs:
       - name: Stamp the release version
         if: ${{ inputs.tag && inputs.tag != 'dry-run' }}
         shell: bash
-        run: bash scripts/stamp-version.sh "${{ inputs.tag }}"
+        env:
+          TAG: ${{ inputs.tag }}
+        run: bash scripts/stamp-version.sh "$TAG"
       - name: Install cached dist
         uses: actions/download-artifact@v8
         with:
