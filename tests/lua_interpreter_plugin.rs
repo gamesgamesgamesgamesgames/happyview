@@ -2,7 +2,7 @@
 //!
 //! The plugin's own tests read its built module's sections and run its two
 //! handlers natively. Neither can say whether wasmtime will instantiate it,
-//! whether the five capabilities it declares cover the imports it actually
+//! whether the six capabilities it declares cover the imports it actually
 //! links, or whether `execute_script` gets a result back through the ABI —
 //! and this is the first thing that asserts any of them, which makes it the
 //! first evidence that `interpreter_plugin!` produces a module a host can
@@ -36,11 +36,12 @@ use happyview::plugin::{
 
 /// What the plugin's manifest declares, and what its imports need: the two
 /// bridge functions and the five `script:host` ones are `library:call` and
-/// `script:host`, and the clock, randomness and `fd_write` are the three
-/// WASI ones.
-const CAPABILITIES: [&str; 5] = [
+/// `script:host`, the test file imports are `script:test`, and the clock,
+/// randomness and `fd_write` are the three WASI ones.
+const CAPABILITIES: [&str; 6] = [
     "library:call",
     "script:host",
+    "script:test",
     "wasi:clock",
     "wasi:random",
     "wasi:stdio",
@@ -127,7 +128,7 @@ fn failure(output: ScriptExecuteOutput) -> (ScriptErrorKind, String, Option<u32>
 }
 
 /// Loading is where the manifest and the module's import section are checked
-/// against each other, so this is what says the five declared capabilities
+/// against each other, so this is what says the six declared capabilities
 /// are the ones the compiled module needs.
 #[tokio::test]
 async fn the_plugin_loads_with_the_capabilities_its_imports_need() {
@@ -156,7 +157,7 @@ async fn the_plugin_loads_with_the_capabilities_its_imports_need() {
     expected.sort();
     assert_eq!(declared, expected);
 
-    // Each of the five is load-bearing: drop one and the module's own imports
+    // Each of the six is load-bearing: drop one and the module's own imports
     // no longer have a grant covering them.
     for dropped in CAPABILITIES {
         let mut narrowed = manifest.clone();
