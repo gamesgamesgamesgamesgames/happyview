@@ -250,6 +250,8 @@ async fn a_declared_network_lexicon_cannot_be_deleted_through_the_lexicon_route(
     let mut app = TestApp::new().await;
     let nsid = "games.gamesgamesgamesgames.game";
     seed_network_lexicon(&app, nsid, "did:plc:authority").await;
+    let undeclared = "games.gamesgamesgamesgames.platform";
+    seed_network_lexicon(&app, undeclared, "did:plc:authority").await;
     app.state.config.project = Some(declaring(&format!(
         "[network_lexicons]\ninclude = [\"{nsid}\"]\n"
     )));
@@ -280,4 +282,30 @@ async fn a_declared_network_lexicon_cannot_be_deleted_through_the_lexicon_route(
     )
     .await;
     assert_eq!(list[0]["nsid"], nsid);
+
+    // The lexicons page reads these, and offers Delete only when it is false.
+    let lexicons = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get("/admin/lexicons", app.admin_cookie()))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(lexicons[0]["id"], nsid);
+    assert_eq!(lexicons[0]["declared"], true);
+    assert_eq!(lexicons[1]["id"], undeclared);
+    assert_eq!(lexicons[1]["declared"], false);
+    let detail = json_body(
+        app.router
+            .clone()
+            .oneshot(admin_get(
+                &format!("/admin/lexicons/{nsid}"),
+                app.admin_cookie(),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(detail["declared"], true);
 }

@@ -22,6 +22,9 @@ pub(super) struct LexiconSummary {
     /// A stored row sits under this project file and answers again when the
     /// file goes.
     pub(super) shadows_stored: bool,
+    /// Listed in `happyview.toml`'s `[network_lexicons] include`, so a delete
+    /// is refused: the file would restore it at the next boot.
+    pub(super) declared: bool,
     pub(super) authority_did: Option<String>,
     pub(super) last_fetched_at: Option<String>,
     /// `None` for a project lexicon, which has no row.
@@ -62,6 +65,7 @@ impl From<crate::catalog::LexiconListing> for LexiconSummary {
             layer: l.layer,
             path: l.path.as_deref().map(crate::catalog::path_string),
             shadows_stored: l.shadows_stored,
+            declared: false,
             authority_did: l.authority_did,
             last_fetched_at: l.last_fetched_at,
             created_at: l.created_at,
