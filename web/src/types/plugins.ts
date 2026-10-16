@@ -36,6 +36,12 @@ export interface PluginSummary {
   id: string;
   name: string;
   version: string;
+  /** What a surface shows before it shows what the plugin does. Each is
+   * independently optional: a plugin may carry an icon, a banner, both, or
+   * neither. */
+  description: string | null;
+  icon_url: string | null;
+  banner_url: string | null;
   source: "file" | "url";
   url: string | null;
   sha256: string | null;
@@ -69,6 +75,9 @@ export interface OfficialPluginSummary {
   latest_version: string;
   manifest_url: string;
   official: boolean;
+  banner_url: string | null;
+  /** Every release the catalogue knows, newest first. */
+  releases: ReleaseEntry[];
   /** The publisher's long-form prose. Every field is optional, and the whole
    * object is empty for a GitHub-sourced entry, which has no profile record
    * behind it. */
