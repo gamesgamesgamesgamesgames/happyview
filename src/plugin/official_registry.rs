@@ -46,6 +46,24 @@ pub struct OfficialPlugin {
     pub manifest_url: String,
     pub wasm_url: String,
     pub releases: Vec<ReleaseEntry>,
+    /// The publisher's long-form prose. Empty for a GitHub-sourced entry,
+    /// which has no profile record to carry it.
+    pub sections: PluginSections,
+}
+
+/// The four long-form fields of `at.happyproto.plugin.profile`. CommonMark
+/// written by a publisher and shown to an operator, so a renderer strips
+/// embedded HTML and refuses a link scheme it does not recognise.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct PluginSections {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<String>,
 }
 
 /// Cache state stored on `AppState` behind an `Arc<RwLock<_>>`.
@@ -269,6 +287,9 @@ async fn build_official_plugin(
         manifest_url,
         wasm_url,
         releases: to_release_entries(entries),
+        // A GitHub release carries no profile record, so this source has no
+        // prose to offer; only a registry-sourced entry does.
+        sections: PluginSections::default(),
     }
 }
 
@@ -835,6 +856,7 @@ mod tests {
                     manifest_url: "https://example.com/m".into(),
                     wasm_url: "https://example.com/w".into(),
                     releases: vec![],
+                    sections: Default::default(),
                 },
             )]),
             last_refreshed_at: Some("2026-04-12T00:00:00Z".into()),
@@ -988,6 +1010,7 @@ mod tests {
                     manifest_url: "https://example.com/m".into(),
                     wasm_url: "https://example.com/w".into(),
                     releases: vec![],
+                    sections: Default::default(),
                 },
             )]),
             last_refreshed_at: None,
@@ -1175,6 +1198,7 @@ mod tests {
             manifest_url: url.into(),
             wasm_url: url.replace("manifest.json", "lua.wasm"),
             releases: vec![],
+            sections: Default::default(),
         };
         // Many impostors, so a lookup that ignored the id would almost surely
         // reach one before `lua` in a HashMap's order.
@@ -1226,6 +1250,7 @@ mod tests {
                 manifest_url: url.clone(),
                 wasm_url: url.replace("manifest.json", "lua.wasm"),
                 releases: vec![],
+                sections: Default::default(),
             },
         );
         assert_eq!(
@@ -1254,6 +1279,7 @@ mod tests {
             manifest_url: "https://a.example/lua/manifest.json".into(),
             wasm_url: "https://a.example/lua/lua.wasm".into(),
             releases: vec![],
+            sections: Default::default(),
         };
         let registry = OfficialPlugin {
             id: "extra".into(),

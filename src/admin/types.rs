@@ -507,6 +507,9 @@ pub(super) struct OfficialPluginSummary {
     pub(super) latest_version: String,
     pub(super) manifest_url: String,
     pub(super) official: bool,
+    /// The publisher's long-form prose, as published. Empty for a
+    /// GitHub-sourced entry, which has no profile record behind it.
+    pub(super) sections: crate::plugin::official_registry::PluginSections,
 }
 
 #[derive(Serialize)]
