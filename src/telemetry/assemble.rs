@@ -29,6 +29,7 @@ pub async fn assemble(
     db_url: &str,
     consent: &Consent,
     counters: &Counters,
+    lexicons: &crate::catalog::LexiconCatalog,
 ) -> Option<Snapshot> {
     let instance_id = consent.instance_id.clone()?;
 
@@ -118,6 +119,18 @@ pub async fn assemble(
         .await
         .flatten()
     };
+    // Through the catalog rather than the table, since a project's lexicons
+    // have no rows.
+    let lexicon_count_fut = async {
+        match budgeted("lexicon_count", lexicons.list(pool, backend)).await {
+            Some(Ok(listed)) => Some(i64::try_from(listed.len()).unwrap_or(i64::MAX)),
+            Some(Err(e)) => {
+                tracing::warn!(metric = "lexicon_count", error = %e, "telemetry metric failed, omitting");
+                None
+            }
+            None => None,
+        }
+    };
     let job_runtime_seconds_fut = async {
         budgeted(
             "job_runtime_seconds",
@@ -140,6 +153,7 @@ pub async fn assemble(
         vacuum_result,
         postgres_db_bytes,
         job_runtime_seconds,
+        lexicon_count,
     ) = tokio::join!(
         totals_fut,
         features_fut,
@@ -153,6 +167,7 @@ pub async fn assemble(
         vacuum_fut,
         postgres_db_bytes_fut,
         job_runtime_seconds_fut,
+        lexicon_count_fut,
     );
 
     let mut totals = totals;
@@ -183,7 +198,16 @@ pub async fn assemble(
             .or_insert_with(|| serde_json::json!(bytes));
     }
 
-    let lexicon_count = totals.get("lexicons").copied().unwrap_or(0);
+    let lexicon_count = lexicon_count
+        .or_else(|| totals.get("lexicons").copied())
+        .unwrap_or(0);
+    let mut feature_usage = feature_usage;
+    if lexicon_count > 0 {
+        feature_usage
+            .entry("lexicons".to_string())
+            .or_default()
+            .ever = true;
+    }
 
     Some(Snapshot {
         schema_version: SCHEMA_VERSION,
@@ -210,6 +234,7 @@ pub async fn assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::LexiconCatalog;
     use crate::db::DatabaseBackend;
     use crate::telemetry::consent::{Consent, TelemetryMode};
     use crate::telemetry::counters::Counters;
@@ -243,6 +268,7 @@ mod tests {
             "sqlite::memory:",
             &c,
             &Counters::new(),
+            &LexiconCatalog::detached(),
         )
         .await;
         assert!(out.is_none());
@@ -257,6 +283,7 @@ mod tests {
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
+            &LexiconCatalog::detached(),
         )
         .await
         .unwrap();
@@ -283,6 +310,7 @@ mod tests {
             "sqlite::memory:",
             &consent(TelemetryMode::Manual),
             &Counters::new(),
+            &LexiconCatalog::detached(),
         )
         .await
         .unwrap();
@@ -302,6 +330,7 @@ mod tests {
             "sqlite::memory:",
             &c,
             &Counters::new(),
+            &LexiconCatalog::detached(),
         )
         .await
         .unwrap();
@@ -320,6 +349,7 @@ mod tests {
             "sqlite::memory:",
             &c,
             &Counters::new(),
+            &LexiconCatalog::detached(),
         )
         .await
         .unwrap();
@@ -344,6 +374,7 @@ mod tests {
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
+            &LexiconCatalog::detached(),
         )
         .await;
 
@@ -365,6 +396,7 @@ mod tests {
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
+            &LexiconCatalog::detached(),
         )
         .await
         .unwrap();
@@ -392,10 +424,58 @@ mod tests {
             "sqlite::memory:",
             &consent(TelemetryMode::Auto),
             &Counters::new(),
+            &LexiconCatalog::detached(),
         )
         .await
         .unwrap();
 
         assert_eq!(snap.totals.get("job_runtime_seconds"), Some(&60));
+    }
+
+    #[tokio::test]
+    async fn a_project_lexicon_is_counted_though_it_has_no_row() {
+        use crate::lexicon::{ParsedLexicon, ProcedureAction};
+        use crate::project::snapshot::{ProjectLexicon, ProjectSnapshot};
+
+        let parsed = ParsedLexicon::parse(
+            serde_json::json!({
+                "lexicon": 1,
+                "id": "com.example.project.thing",
+                "defs": { "main": { "type": "record", "key": "tid",
+                    "record": { "type": "object", "properties": {} } } }
+            }),
+            0,
+            None,
+            ProcedureAction::Upsert,
+            None,
+        )
+        .unwrap();
+        let mut project = ProjectSnapshot::empty();
+        project.lexicons.insert(
+            parsed.id.clone(),
+            ProjectLexicon {
+                parsed,
+                path: "lexicons/thing.json".into(),
+                backfill: false,
+            },
+        );
+        let catalog = LexiconCatalog::new(std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            project,
+        )));
+
+        let pool = pool_for_assembly().await;
+        let snap = assemble(
+            &pool,
+            DatabaseBackend::Sqlite,
+            "sqlite::memory:",
+            &consent(TelemetryMode::Auto),
+            &Counters::new(),
+            &catalog,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snap.lexicons.count, 1);
+        assert!(snap.features["lexicons"].ever);
     }
 }
