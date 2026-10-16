@@ -21,6 +21,11 @@ pub struct PluginManifest {
     pub api_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,
+    /// A wide header image. Optional and independent of `icon_url`: a plugin
+    /// may ship either, both, or neither, and every surface that shows one
+    /// has to read well in all four cases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub banner_url: Option<String>,
     #[serde(default)]
     pub required_secrets: Vec<SecretDefinition>,
     /// Authentication type: "oauth2", "openid", "api_key"
@@ -231,6 +236,31 @@ impl LoadedPlugin {
             .as_ref()
             .map(|m| m.dependencies.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// What a surface shows about a plugin before it shows what it does.
+    ///
+    /// Only a manifest carries a description; the module's own report has no
+    /// such field, so there is nothing to fall back to.
+    pub fn description(&self) -> Option<&str> {
+        self.manifest
+            .as_ref()
+            .and_then(|m| m.description.as_deref())
+    }
+
+    /// The manifest's icon wins over the module's own report: a manifest is
+    /// what the operator installed and can be read before the module runs.
+    pub fn icon_url(&self) -> Option<&str> {
+        self.manifest
+            .as_ref()
+            .and_then(|m| m.icon_url.as_deref())
+            .or(self.info.icon_url.as_deref())
+    }
+
+    /// Independent of [`icon_url`](Self::icon_url): a plugin may ship either,
+    /// both, or neither. Only a manifest carries one.
+    pub fn banner_url(&self) -> Option<&str> {
+        self.manifest.as_ref().and_then(|m| m.banner_url.as_deref())
     }
 
     /// Import name for library plugins; `None` for every other type.

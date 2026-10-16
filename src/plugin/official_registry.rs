@@ -42,6 +42,8 @@ pub struct OfficialPlugin {
     pub name: String,
     pub description: Option<String>,
     pub icon_url: Option<String>,
+    /// Independent of `icon_url`: an entry may carry either, both, or neither.
+    pub banner_url: Option<String>,
     pub latest_version: String,
     pub manifest_url: String,
     pub wasm_url: String,
@@ -286,6 +288,8 @@ async fn build_official_plugin(
         latest_version,
         manifest_url,
         wasm_url,
+        // A GitHub release names no banner; only a registry entry can.
+        banner_url: None,
         releases: to_release_entries(entries),
         // A GitHub release carries no profile record, so this source has no
         // prose to offer; only a registry-sourced entry does.
@@ -857,6 +861,7 @@ mod tests {
                     wasm_url: "https://example.com/w".into(),
                     releases: vec![],
                     sections: Default::default(),
+                    banner_url: None,
                 },
             )]),
             last_refreshed_at: Some("2026-04-12T00:00:00Z".into()),
@@ -1011,6 +1016,7 @@ mod tests {
                     wasm_url: "https://example.com/w".into(),
                     releases: vec![],
                     sections: Default::default(),
+                    banner_url: None,
                 },
             )]),
             last_refreshed_at: None,
@@ -1199,6 +1205,7 @@ mod tests {
             wasm_url: url.replace("manifest.json", "lua.wasm"),
             releases: vec![],
             sections: Default::default(),
+            banner_url: None,
         };
         // Many impostors, so a lookup that ignored the id would almost surely
         // reach one before `lua` in a HashMap's order.
@@ -1251,6 +1258,7 @@ mod tests {
                 wasm_url: url.replace("manifest.json", "lua.wasm"),
                 releases: vec![],
                 sections: Default::default(),
+                banner_url: None,
             },
         );
         assert_eq!(
@@ -1280,6 +1288,7 @@ mod tests {
             wasm_url: "https://a.example/lua/lua.wasm".into(),
             releases: vec![],
             sections: Default::default(),
+            banner_url: None,
         };
         let registry = OfficialPlugin {
             id: "extra".into(),

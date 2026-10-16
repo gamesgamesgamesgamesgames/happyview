@@ -424,6 +424,12 @@ pub(super) struct PluginSummary {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) version: String,
+    /// What a surface shows about a plugin before it shows what it does.
+    /// Each is independently optional: a plugin may carry an icon, a banner,
+    /// both, or neither.
+    pub(super) description: Option<String>,
+    pub(super) icon_url: Option<String>,
+    pub(super) banner_url: Option<String>,
     pub(super) source: String,
     pub(super) url: Option<String>,
     pub(super) sha256: Option<String>,
@@ -476,6 +482,11 @@ pub(super) struct OfficialPluginSummary {
     pub(super) latest_version: String,
     pub(super) manifest_url: String,
     pub(super) official: bool,
+    pub(super) banner_url: Option<String>,
+    /// Every release the catalogue knows, newest first. A detail page lists
+    /// them; `PluginSummary::pending_releases` carries only the newer ones,
+    /// which cannot answer "what versions exist".
+    pub(super) releases: Vec<crate::plugin::official_registry::ReleaseEntry>,
     /// The publisher's long-form prose, as published. Empty for a
     /// GitHub-sourced entry, which has no profile record behind it.
     pub(super) sections: crate::plugin::official_registry::PluginSections,
@@ -523,6 +534,7 @@ pub(super) struct PluginPreviewResponse {
     pub(super) version: String,
     pub(super) description: Option<String>,
     pub(super) icon_url: Option<String>,
+    pub(super) banner_url: Option<String>,
     pub(super) auth_type: String,
     pub(super) required_secrets: Vec<SecretDefinition>,
     pub(super) manifest_url: String,
