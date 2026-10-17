@@ -1,0 +1,147 @@
+[
+  {
+    "body": "{\"error\":\"backfill job not found\"}",
+    "call": "POST /admin/backfill/no-such-job/cancel",
+    "status": 404
+  },
+  {
+    "body": "{\"error\":\"job is not running (status: completed)\"}",
+    "call": "POST /admin/backfill/job-crawl/cancel",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"backfill job not found\"}",
+    "call": "POST /admin/backfill/no-such-job/pause",
+    "status": 404
+  },
+  {
+    "body": "{\"error\":\"job is not running (status: completed)\"}",
+    "call": "POST /admin/backfill/job-crawl/pause",
+    "status": 400
+  },
+  {
+    "body": "{\"id\":\"job-gap\",\"status\":\"pausing\"}",
+    "call": "POST /admin/backfill/job-gap/pause",
+    "status": 200
+  },
+  {
+    "body": "{\"id\":\"job-gap\",\"status\":\"pausing\"}",
+    "call": "POST /admin/backfill/job-gap/pause",
+    "status": 200
+  },
+  {
+    "body": "{\"error\":\"job is not running (status: pausing)\"}",
+    "call": "POST /admin/backfill/job-gap/cancel",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"backfill job not found\"}",
+    "call": "POST /admin/backfill/no-such-job/resume",
+    "status": 404
+  },
+  {
+    "body": "{\"error\":\"job is not paused (status: completed)\"}",
+    "call": "POST /admin/backfill/job-crawl/resume",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"the job's DID list is no longer available; start a new backfill\"}",
+    "call": "POST /admin/backfill/job-replay-failed/resume",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"backfill job not found\"}",
+    "call": "POST /admin/backfill/no-such-job/retry-failed",
+    "status": 404
+  },
+  {
+    "body": "{\"error\":\"no retryable failures for this job\"}",
+    "call": "POST /admin/backfill/job-crawl/retry-failed",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"no retryable failures for this job\"}",
+    "call": "POST /admin/backfill/job-failed/retry-failed",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"no retryable failures for this job\"}",
+    "call": "POST /admin/backfill/job-replay-failed/retry-failed",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"the job's DID list is no longer available; start a new backfill\"}",
+    "call": "POST /admin/backfill/job-replay-failed/retry-failed",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"source must be one of auto, replay, crawl\"}",
+    "call": "POST /admin/backfill",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"replay is only available for collection backfills; account backfills always crawl\"}",
+    "call": "POST /admin/backfill",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"no valid accounts given: every entry was blank\"}",
+    "call": "POST /admin/backfill",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"could not resolve 2 account(s): invalid DID did:bad: Invalid DID; invalid DID did:: Invalid DID\"}",
+    "call": "POST /admin/backfill",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"a backfill can target at most 500 accounts, got 501\"}",
+    "call": "POST /admin/backfill",
+    "status": 400
+  },
+  {
+    "body": "{\"error\":\"job is pausing; only completed, cancelled or failed jobs can be flushed\"}",
+    "call": "DELETE /admin/backfill/job-gap/details",
+    "status": 409
+  },
+  {
+    "body": "",
+    "call": "DELETE /admin/backfill/job-failed/details",
+    "status": 204
+  },
+  {
+    "body": "",
+    "call": "DELETE /admin/backfill/job-crawl/details",
+    "status": 204
+  },
+  {
+    "body": "",
+    "call": "DELETE /admin/backfill/details",
+    "status": 204
+  },
+  {
+    "body": "[{\"id\":\"job-replay-failed\",\"collection\":\"app.pinned.post\",\"did\":null,\"scope\":\"dids\",\"status\":\"failed\",\"stage\":\"replaying\",\"total_repos\":2,\"resolved_repos\":null,\"processed_repos\":0,\"total_records\":0,\"error\":\"archive unavailable\",\"started_at\":\"2026-01-06T00:00:00+00:00\",\"completed_at\":\"2026-01-06T00:10:00+00:00\",\"created_at\":\"2026-01-06T00:00:00+00:00\",\"discovery_complete\":true,\"recent_completions_limit\":1000,\"source\":\"replay\",\"replay\":{\"after_seq\":0,\"through_seq\":100,\"tip_seq\":200,\"bytes\":64,\"blocks_failed\":1}},{\"id\":\"job-paused\",\"collection\":\"app.pinned.missing\",\"did\":null,\"scope\":\"network\",\"status\":\"paused\",\"stage\":\"fetching_records\",\"total_repos\":1,\"resolved_repos\":0,\"processed_repos\":0,\"total_records\":0,\"error\":null,\"started_at\":\"2026-01-05T00:00:00+00:00\",\"completed_at\":null,\"created_at\":\"2026-01-05T00:00:00+00:00\",\"discovery_complete\":true,\"recent_completions_limit\":1000,\"source\":\"crawl\",\"replay\":null},{\"id\":\"job-failed\",\"collection\":\"app.pinned.post\",\"did\":null,\"scope\":\"dids\",\"status\":\"failed\",\"stage\":\"fetching_records\",\"total_repos\":5,\"resolved_repos\":4,\"processed_repos\":2,\"total_records\":9,\"error\":\"boom\",\"started_at\":\"2026-01-04T00:00:00+00:00\",\"completed_at\":\"2026-01-04T00:30:00+00:00\",\"created_at\":\"2026-01-04T00:00:00+00:00\",\"discovery_complete\":true,\"recent_completions_limit\":null,\"source\":\"crawl\",\"replay\":null},{\"id\":\"job-gap\",\"collection\":null,\"did\":null,\"scope\":\"network\",\"status\":\"pausing\",\"stage\":\"replaying\",\"total_repos\":0,\"resolved_repos\":null,\"processed_repos\":0,\"total_records\":7,\"error\":null,\"started_at\":\"2026-01-03T00:00:00+00:00\",\"completed_at\":null,\"created_at\":\"2026-01-03T00:00:00+00:00\",\"discovery_complete\":false,\"recent_completions_limit\":1000,\"source\":\"replay\",\"replay\":{\"after_seq\":777,\"through_seq\":800,\"tip_seq\":900,\"bytes\":2048,\"blocks_failed\":1}},{\"id\":\"job-replay\",\"collection\":\"app.pinned.post\",\"did\":null,\"scope\":\"network\",\"status\":\"completed\",\"stage\":\"completed\",\"total_repos\":0,\"resolved_repos\":null,\"processed_repos\":0,\"total_records\":40,\"error\":null,\"started_at\":\"2026-01-02T00:00:00+00:00\",\"completed_at\":\"2026-01-02T02:00:00+00:00\",\"created_at\":\"2026-01-02T00:00:00+00:00\",\"discovery_complete\":true,\"recent_completions_limit\":1000,\"source\":\"replay\",\"replay\":{\"after_seq\":0,\"through_seq\":5000,\"tip_seq\":5000,\"bytes\":123456,\"blocks_failed\":0}},{\"id\":\"job-crawl\",\"collection\":\"app.pinned.post\",\"did\":null,\"scope\":\"network\",\"status\":\"completed\",\"stage\":\"completed\",\"total_repos\":3,\"resolved_repos\":3,\"processed_repos\":3,\"total_records\":12,\"error\":null,\"started_at\":\"2026-01-01T00:00:00+00:00\",\"completed_at\":\"2026-01-01T01:00:00+00:00\",\"created_at\":\"2026-01-01T00:00:00+00:00\",\"discovery_complete\":true,\"recent_completions_limit\":1000,\"source\":\"crawl\",\"replay\":null}]",
+    "call": "GET /admin/backfill/status",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-crawl/repos",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-crawl/repos?phase=fetched",
+    "status": 200
+  },
+  {
+    "body": "{\"pds_endpoints\":[]}",
+    "call": "GET /admin/backfill/job-crawl/pds-summary",
+    "status": 200
+  },
+  {
+    "body": "{\"repos\":[],\"cursor\":null}",
+    "call": "GET /admin/backfill/job-failed/repos",
+    "status": 200
+  }
+]
