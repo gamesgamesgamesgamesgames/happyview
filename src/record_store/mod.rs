@@ -1158,6 +1158,34 @@ impl RecordStore {
             .map(StoredRecord::from))
     }
 
+    /// The stored body and rev of `uri` on `route`, unrouted: what a
+    /// dead-letter retry checks before it changes a claimed record's view.
+    pub(crate) async fn stored_version_on(
+        route: &ReadRoute,
+        uri: &str,
+    ) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+        let Some((did, collection, rkey)) = codec::parse_record_uri(uri) else {
+            return Ok(None);
+        };
+        let record = match route.backend {
+            DatabaseBackend::Sqlite => "hv_record(body, body_dict)",
+            DatabaseBackend::Postgres => "record",
+        };
+        let sql = adapt_sql(
+            &format!(
+                "SELECT {record}, rev FROM happyview_records_v2 \
+                 WHERE did_id = {DID_ID} AND collection_id = {COLLECTION_ID} AND rkey = ?"
+            ),
+            route.backend,
+        );
+        crate::db::query_as::<(String, Option<String>)>(&sql)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
+            .fetch_optional(&route.pool)
+            .await
+    }
+
     pub async fn stored_cid(&self, uri: &str) -> Result<Option<String>, sqlx::Error> {
         let Some((did, collection, rkey)) = codec::parse_record_uri(uri) else {
             return Ok(None);

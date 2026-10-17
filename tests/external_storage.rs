@@ -758,3 +758,155 @@ async fn no_external_storage_means_no_behaviour_change() {
     assert_eq!(with, expected);
     assert!(storage.deltas().is_empty());
 }
+
+/// A claimed record whose stored event's hook failed: the delivery failed
+/// open (a Proceed delta) and left a dead letter. The claiming store holds
+/// `stored` at rev `tid(10)`. Returns the dead letter's id.
+async fn dead_lettered(state: &AppState, storage: &FakeStorage, stored: Value) -> String {
+    state
+        .plugin_registry
+        .register(echo_interpreter::plugin("lua"))
+        .await;
+    let trigger = format!("record.create:{CLAIMED}");
+    install_script(state, &trigger, "error:runtime").await;
+    let body = json!({"$type": CLAIMED, "text": "arrived"});
+    let outcome = happyview::ingest::apply(
+        state,
+        record_event(
+            CLAIMED,
+            "dl",
+            Action::Create,
+            Some(body),
+            Some(tid(10)),
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(outcome, IngestOutcome::Matched, "fail-open");
+    let mut record = prepared(CLAIMED, "dl", stored);
+    record.rev = Some(tid(10));
+    storage.seed(&[record]).await;
+
+    let (name, value) = common::auth::admin_cookie_header(ADMIN, &state.cookie_key);
+    let (status, list) = send(
+        state,
+        Request::get("/admin/dead-letters")
+            .header("host", "127.0.0.1")
+            .header(name, value)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(
+        list["dead_letters"].as_array().map(Vec::len),
+        Some(1),
+        "{list}"
+    );
+    list["dead_letters"][0]["id"].as_str().unwrap().to_string()
+}
+
+/// Retry dead letter `id` through the admin route, with the hook now `hook`.
+async fn retry(state: &AppState, id: &str, hook: &str) {
+    install_script(state, &format!("record.create:{CLAIMED}"), hook).await;
+    let (name, value) = common::auth::admin_cookie_header(ADMIN, &state.cookie_key);
+    let (status, body) = send(
+        state,
+        Request::post(format!("/admin/dead-letters/{id}/retry"))
+            .header("host", "127.0.0.1")
+            .header("content-type", "application/json")
+            .header(name, value)
+            .body(Body::from("{}"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+async fn open_dead_letters(state: &AppState) -> i64 {
+    happyview::db::query_scalar::<i64>(
+        "SELECT COUNT(*) FROM happyview_dead_letter_scripts WHERE resolved_at IS NULL",
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_claimed_retry_whose_hook_now_skips_hides_the_version_it_was_made_from() {
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    let id = dead_lettered(
+        &state,
+        &storage,
+        json!({"$type": CLAIMED, "text": "arrived"}),
+    )
+    .await;
+
+    retry(&state, &id, "value:none").await;
+
+    assert_eq!(
+        storage.deltas().last(),
+        Some(&(key(CLAIMED, "dl"), Delta::Hide, Some(tid(10))))
+    );
+    assert_eq!(open_dead_letters(&state).await, 0);
+}
+
+#[tokio::test]
+async fn a_claimed_retry_leaves_a_record_changed_since_alone() {
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    let id = dead_lettered(
+        &state,
+        &storage,
+        json!({"$type": CLAIMED, "text": "edited"}),
+    )
+    .await;
+    let before = storage.deltas();
+
+    retry(&state, &id, "value:none").await;
+
+    assert_eq!(storage.deltas(), before, "no delta for a newer version");
+    assert_eq!(open_dead_letters(&state).await, 0, "still resolved");
+}
+
+#[tokio::test]
+async fn a_claimed_retry_whose_hook_now_replaces_names_the_replaced_body() {
+    if !echo_interpreter::is_built() {
+        eprintln!("skipping: {}", echo_interpreter::BUILD);
+        return;
+    }
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    let id = dead_lettered(
+        &state,
+        &storage,
+        json!({"$type": CLAIMED, "text": "arrived"}),
+    )
+    .await;
+
+    retry(&state, &id, r#"returns:{"text":"retried"}"#).await;
+
+    let replaced = json!({"text": "retried"});
+    assert_eq!(
+        storage.deltas().last(),
+        Some(&(
+            key(CLAIMED, "dl"),
+            Delta::Replace {
+                cid: cid_of(&replaced),
+                rev: None,
+                body: replaced.to_string(),
+            },
+            Some(tid(10)),
+        ))
+    );
+    assert_eq!(open_dead_letters(&state).await, 0);
+}

@@ -693,7 +693,13 @@ async fn apply_claimed(
                 Decision::Proceed => (Delta::Proceed, IngestOutcome::Matched),
                 Decision::Replace(replaced) => (
                     Delta::Replace {
-                        cid: ev.cid.clone().unwrap_or_default(),
+                        // A retried event carries no CID: name the
+                        // replaced body by its own.
+                        cid: ev.cid.clone().unwrap_or_else(|| {
+                            crate::cid_verify::compute_record_cid(&replaced)
+                                .map(|cid| cid.to_string())
+                                .unwrap_or_default()
+                        }),
                         rev: ev.rev.clone(),
                         body: serde_json::to_string(&replaced).unwrap_or_default(),
                     },
@@ -731,7 +737,36 @@ async fn apply_claimed(
         Action::Delete => "record.deleted",
         Action::Create | Action::Update => "record.created",
     };
-    match ext.apply_delta(&ev.key, delta, ev.rev.as_deref()).await {
+    // A dead-letter retry carries no rev. Its delta applies only to the
+    // version the dead letter was made from: while the claiming store still
+    // holds that body, and at that version's rev, so the store's own rev
+    // check guards it too. A version that changed or went since is left
+    // alone, as the local path's `delete_network_if_body` leaves it.
+    let mut for_rev = ev.rev.clone();
+    if ev.origin == Origin::Retry && ev.action != Action::Delete {
+        let route = ext.read_route(&ev.key.collection);
+        match crate::record_store::RecordStore::stored_version_on(&route, &uri).await {
+            Ok(Some((stored, rev)))
+                if serde_json::from_str::<Value>(&stored).ok().as_ref() == ev.body.as_ref() =>
+            {
+                for_rev = rev;
+            }
+            Ok(_) => {
+                tracing::debug!(uri = %uri, "a retried delta's record changed since; dropped");
+                return outcome;
+            }
+            Err(e) => {
+                tracing::warn!(uri = %uri, "failed to read a retried record: {e}");
+                log_record(state, event_type, Severity::Error, ev, &uri, Some(&e)).await;
+                return if ext.unavailable(&e) {
+                    IngestOutcome::Unavailable
+                } else {
+                    failed_write_outcome(&e)
+                };
+            }
+        }
+    }
+    match ext.apply_delta(&ev.key, delta, for_rev.as_deref()).await {
         Ok(()) => {
             if outcome == IngestOutcome::Matched && ev.action != Action::Delete {
                 fetch_labels(state, std::slice::from_ref(&uri)).await;
