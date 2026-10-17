@@ -973,10 +973,15 @@ mod tests {
     /// Ruling FR1: a delete for a record this instance never held, from an
     /// account it holds nothing for in the collection, leaves no tombstone
     /// unless a backfill still writing (running, pausing or cancelling)
-    /// covers the collection.
+    /// covers the collection. A job is running while the record source runs
+    /// it, so each one here is also entered into the source's running jobs.
     #[tokio::test]
     async fn a_delete_with_no_row_tombstones_only_when_a_create_may_follow() {
-        let state = tracked_state().await;
+        let mut state = tracked_state().await;
+        let running = crate::host::attach_jetstream(&mut state, Default::default())
+            .jobs()
+            .expect("attached")
+            .running;
         let did = "did:plc:stranger";
         let delete = |rkey: &str| RecordEvent {
             did: did.to_string(),
@@ -995,7 +1000,8 @@ mod tests {
 
         // Another account's records and other collections' jobs don't count.
         insert_record(&state).await;
-        add_backfill_job(&state, "running", Some("com.example.other")).await;
+        let other = add_backfill_job(&state, "running", Some("com.example.other")).await;
+        let _other = running.enter(&other, Some("com.example.other".into()));
         add_backfill_job(&state, "completed", None).await;
         let _ = handle_record_event(&state, &delete("never")).await;
         assert!(!tombstoned("never").await, "nothing could resurrect it");
@@ -1006,6 +1012,7 @@ mod tests {
             ("cancelling", Some(NSID)),
         ] {
             let job = add_backfill_job(&state, status, collection).await;
+            let guard = running.enter(&job, collection.map(str::to_string));
             let rkey = format!("job{status}");
             let _ = handle_record_event(&state, &delete(&rkey)).await;
             assert!(
@@ -1017,6 +1024,7 @@ mod tests {
                 .execute(&state.db)
                 .await
                 .expect("drop job");
+            drop(guard);
         }
 
         let held = RecordEvent {

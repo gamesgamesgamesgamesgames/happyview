@@ -26,10 +26,7 @@ use crate::db::{adapt_sql, now_rfc3339};
 use crate::profile;
 use crate::record_store::PreparedRecord;
 
-/// The job system over `state`, as `BuiltinSource` builds it.
-fn jobs(state: &AppState) -> JobState {
-    crate::builtin_source::job_state(state)
-}
+use super::jobs;
 
 /// Write one `listRecords` page through `record_store` on the backfill pool:
 /// one transaction, tombstoned rows skipped, a repeated URI written once with

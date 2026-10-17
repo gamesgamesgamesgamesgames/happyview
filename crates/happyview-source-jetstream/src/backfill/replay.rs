@@ -8,18 +8,17 @@ use std::path::PathBuf;
 
 use futures_util::StreamExt;
 
+use happyview_provider::{ProviderEvent, Severity};
+
+use super::errors::{BackfillErrorKind, BackfillFailure, ErrorRecorder};
 use super::replay_fold::ReplayFold;
 use super::replay_sweeps::{self as sweeps, Sweep, SweepKind};
-use crate::AppState;
-use crate::jetstream::archive::client::{
+use crate::archive::client::{
     ArchiveClient, ArchiveError, PlanEntry, PlanMode, PlanRequest, SegmentInfo,
 };
-use crate::jetstream::archive::rows::{self, RowFilter, RowKinds};
-use crate::jetstream::archive::segment::{self, Row};
-use happyview_source_jetstream::backfill::errors::{
-    BackfillErrorKind, BackfillFailure, ErrorRecorder,
-};
-use happyview_source_jetstream::backfill::{self as job_system, JobState, ReplayOutcome};
+use crate::archive::rows::{self, RowFilter, RowKinds};
+use crate::archive::segment::{self, Row};
+use crate::backfill::{self as job_system, JobState, ReplayOutcome};
 
 const STALLED_PAGES: u32 = 5;
 /// Failed blocks in a row, across entries, after which the job stops rather
@@ -34,7 +33,6 @@ enum Halt {
 }
 
 struct Run<'a> {
-    state: &'a AppState,
     jobs: &'a JobState,
     job_id: &'a str,
     client: ArchiveClient,
@@ -60,26 +58,26 @@ struct Run<'a> {
     marker_after: Option<i64>,
 }
 
-pub(super) async fn run(
-    state: &AppState,
+/// Run replay job `job_id` over `collections` (and, for an account job,
+/// `scope_dids`) from the archive of `jobs.endpoint`. `source` is the job's:
+/// `auto` falls back to a crawl when there is no archive.
+pub async fn run(
     jobs: &JobState,
     job_id: &str,
     collections: &[String],
     scope_dids: Option<Vec<String>>,
     source: &str,
 ) -> ReplayOutcome {
-    let endpoint = crate::jetstream::config::parse_endpoint(&state.config.jetstream_url);
     let mut run = Run {
-        state,
         jobs,
         job_id,
-        client: ArchiveClient::new(&endpoint, &state.archive),
-        fold: ReplayFold::new(state.clone(), job_id, collections.to_vec()),
+        client: ArchiveClient::new(&jobs.endpoint, &jobs.archive),
+        fold: ReplayFold::new(jobs.host.clone(), job_id, collections.to_vec()),
         errors: ErrorRecorder::new(jobs, job_id).await,
         counted: 0,
         records_counted: 0,
         probing: source == "auto",
-        download_dir: state.archive.download_dir.clone(),
+        download_dir: jobs.archive.download_dir.clone(),
         held_only: None,
         entry_failures: Vec::new(),
         consecutive_failures: 0,
@@ -99,8 +97,8 @@ pub(super) async fn run(
             // this run only knows its own.
             let totals = match counted {
                 Ok(()) => match (
-                    sweeps::records(state, job_id).await,
-                    sweeps::counters(state, job_id).await,
+                    sweeps::records(jobs, job_id).await,
+                    sweeps::counters(jobs, job_id).await,
                 ) {
                     (Ok(records), Ok((bytes, _))) => Ok((records, bytes)),
                     (Err(e), _) | (_, Err(e)) => Err(format!("replay bookkeeping failed: {e}")),
@@ -132,8 +130,8 @@ pub(super) async fn run(
             }
             tracing::info!(job_id, error = %e, "no jetstream archive; backfilling by crawl");
             match (
-                sweeps::clear(state, job_id).await,
-                sweeps::set_source(state, job_id, "crawl").await,
+                sweeps::clear(jobs, job_id).await,
+                sweeps::set_source(jobs, job_id, "crawl").await,
             ) {
                 (Ok(()), Ok(())) => ReplayOutcome::FellBack,
                 (Err(e), _) | (_, Err(e)) => {
@@ -214,20 +212,20 @@ impl Run<'_> {
         collections: &[String],
         scope_dids: Option<Vec<String>>,
     ) -> Result<(), Halt> {
-        if sweeps::has_retries(self.state, self.job_id)
+        if sweeps::has_retries(self.jobs, self.job_id)
             .await
             .map_err(db)?
         {
             job_system::set_stage(self.jobs, self.job_id, "retrying_blocks").await;
             return self.retry_blocks(collections, scope_dids).await;
         }
-        let mut all = sweeps::load(self.state, self.job_id).await.map_err(db)?;
+        let mut all = sweeps::load(self.jobs, self.job_id).await.map_err(db)?;
         if all.is_empty() {
-            let after = sweeps::after_seq(self.state, self.job_id)
+            let after = sweeps::after_seq(self.jobs, self.job_id)
                 .await
                 .map_err(db)?;
             all = sweeps::initial_sweeps(collections, scope_dids.as_deref(), after);
-            sweeps::insert(self.state, self.job_id, &all)
+            sweeps::insert(self.jobs, self.job_id, &all)
                 .await
                 .map_err(db)?;
         }
@@ -249,35 +247,39 @@ impl Run<'_> {
             // Network job: replay the markers of every DID left holding records.
             let job_after = all.first().map_or(0, |s| s.after_seq);
             let stored = stored_marker_after(&all);
-            let mut after_id = all.iter().filter_map(|s| s.last_did_id).max().unwrap_or(0);
+            let mut after_did = held_cursor(&all);
             let mut next = all.len() as i32;
             loop {
-                let held = sweeps::next_held_dids(
-                    self.state,
-                    collections,
-                    after_id,
-                    sweeps::MAX_PLAN_DIDS as i64,
-                )
-                .await
-                .map_err(db)?;
-                let Some(&(last, _)) = held.last() else { break };
+                let held = self
+                    .jobs
+                    .host
+                    .held_dids_page(
+                        collections,
+                        after_did.as_deref(),
+                        sweeps::MAX_PLAN_DIDS as i64,
+                    )
+                    .await
+                    .map_err(db)?;
+                let Some(last) = held.last().cloned() else {
+                    break;
+                };
                 let after = self.marker_after(job_after, stored).await;
                 let mut sweep = Sweep {
                     sweep: next,
                     kind: SweepKind::Markers,
                     collections: Vec::new(),
-                    dids: Some(held.into_iter().map(|(_, did)| did).collect()),
+                    dids: Some(held),
                     after_seq: after,
                     cursor_seq: after,
                     tip_seq: None,
-                    last_did_id: Some(last),
+                    last_did_id: None,
                     done: false,
                 };
-                sweeps::insert(self.state, self.job_id, std::slice::from_ref(&sweep))
+                sweeps::insert(self.jobs, self.job_id, std::slice::from_ref(&sweep))
                     .await
                     .map_err(db)?;
                 self.sweep(&mut sweep).await?;
-                after_id = last;
+                after_did = Some(last);
                 next += 1;
             }
         }
@@ -297,7 +299,7 @@ impl Run<'_> {
         let written = self.fold.written();
         let new_records = written - self.records_counted;
         if new_records > 0 {
-            sweeps::add_records(self.state, self.job_id, new_records as i64)
+            sweeps::add_records(self.jobs, self.job_id, new_records as i64)
                 .await
                 .map_err(db)?;
             self.records_counted = written;
@@ -308,7 +310,7 @@ impl Run<'_> {
         if delta == 0 && failed == 0 {
             return Ok(());
         }
-        sweeps::add_counters(self.state, self.job_id, delta, failed)
+        sweeps::add_counters(self.jobs, self.job_id, delta, failed)
             .await
             .map_err(db)?;
         Ok(())
@@ -346,7 +348,7 @@ impl Run<'_> {
                 }
                 // A configured key the archive refuses is a mistake to fix,
                 // not a reason to crawl.
-                Err(ArchiveError::Unauthorized(status)) if self.state.archive.api_key.is_some() => {
+                Err(ArchiveError::Unauthorized(status)) if self.jobs.archive.api_key.is_some() => {
                     return Err(Halt::Failed(format!(
                         "the jetstream at {} refused the replay key (HTTP {status})",
                         self.client.host()
@@ -360,13 +362,13 @@ impl Run<'_> {
                 Err(e) => return Err(Halt::Failed(format!("planSnapshot failed: {e}"))),
             };
             if self.probing && sweep.tip_seq.is_none() {
-                sweeps::set_source(self.state, self.job_id, "replay")
+                sweeps::set_source(self.jobs, self.job_id, "replay")
                     .await
                     .map_err(db)?;
                 self.probing = false;
             }
             let tip = *sweep.tip_seq.get_or_insert(page.sealed_tip_seq as i64);
-            sweeps::save(self.state, self.job_id, sweep)
+            sweeps::save(self.jobs, self.job_id, sweep)
                 .await
                 .map_err(db)?;
             let page_start = sweep.cursor_seq;
@@ -383,7 +385,7 @@ impl Run<'_> {
                 }
                 let failed = self.entry(entry, &filter).await?;
                 sweep.cursor_seq = sweep.cursor_seq.max((entry.max_seq as i64).min(tip));
-                sweeps::save(self.state, self.job_id, sweep)
+                sweeps::save(self.jobs, self.job_id, sweep)
                     .await
                     .map_err(db)?;
                 self.count_bytes(failed).await?;
@@ -404,7 +406,7 @@ impl Run<'_> {
             if through >= tip {
                 sweep.done = true;
             }
-            sweeps::save(self.state, self.job_id, sweep)
+            sweeps::save(self.jobs, self.job_id, sweep)
                 .await
                 .map_err(db)?;
             if sweep.done {
@@ -414,7 +416,7 @@ impl Run<'_> {
     }
 
     async fn publish(&self, sweep: &Sweep) {
-        let (bytes, failed) = sweeps::counters(self.state, self.job_id)
+        let (bytes, failed) = sweeps::counters(self.jobs, self.job_id)
             .await
             .unwrap_or((0, 0));
         job_system::publish_event(
@@ -454,7 +456,7 @@ impl Run<'_> {
                         let (client, name) = (client.clone(), name.clone());
                         async move { (i, client.block(&name, i).await) }
                     })
-                    .buffered(self.state.archive.concurrency);
+                    .buffered(self.jobs.archive.concurrency);
                 while let Some((i, result)) = fetched.next().await {
                     match fetched_rows(result).await {
                         Ok(rows) => self.fold_rows(rows, filter, &entry.name).await?,
@@ -546,9 +548,9 @@ impl Run<'_> {
                 && let Some(collections) = &self.held_only
                 && !self.fold.buffers(&row.did)
                 && !self
-                    .state
-                    .records
-                    .holds_network_records(&row.did, Some(collections.as_slice()))
+                    .jobs
+                    .host
+                    .holds_records(&row.did, collections)
                     .await
                     .map_err(db)?
             {
@@ -664,8 +666,8 @@ impl Run<'_> {
             through_seq: u64::MAX,
         };
         // Marker sweeps an earlier run of this job already recorded.
-        let mut markers = sweeps::load(self.state, self.job_id).await.map_err(db)?;
-        for (segment, block) in sweeps::retries(self.state, self.job_id).await.map_err(db)? {
+        let mut markers = sweeps::load(self.jobs, self.job_id).await.map_err(db)?;
+        for (segment, block) in sweeps::retries(self.jobs, self.job_id).await.map_err(db)? {
             if self.stop_requested().await {
                 return Err(Halt::Stopped);
             }
@@ -687,7 +689,7 @@ impl Run<'_> {
             // replays the markers of what it wrote.
             let wrote = self.fold.take_written_dids();
             self.add_marker_dids(&mut markers, wrote).await?;
-            sweeps::retry_done(self.state, self.job_id, &segment, block)
+            sweeps::retry_done(self.jobs, self.job_id, &segment, block)
                 .await
                 .map_err(db)?;
             self.count_bytes(failed).await?;
@@ -718,7 +720,7 @@ impl Run<'_> {
             return Ok(());
         }
         fresh.sort();
-        let job_after = sweeps::after_seq(self.state, self.job_id)
+        let job_after = sweeps::after_seq(self.jobs, self.job_id)
             .await
             .map_err(db)?;
         let stored = stored_marker_after(markers);
@@ -736,7 +738,7 @@ impl Run<'_> {
                     let dids = sweep.dids.get_or_insert_with(Vec::new);
                     let room = sweeps::MAX_PLAN_DIDS - dids.len();
                     dids.extend(fresh.by_ref().take(room));
-                    sweeps::set_dids(self.state, self.job_id, sweep)
+                    sweeps::set_dids(self.jobs, self.job_id, sweep)
                         .await
                         .map_err(db)?;
                 }
@@ -753,7 +755,7 @@ impl Run<'_> {
                         last_did_id: None,
                         done: false,
                     };
-                    sweeps::insert(self.state, self.job_id, std::slice::from_ref(&sweep))
+                    sweeps::insert(self.jobs, self.job_id, std::slice::from_ref(&sweep))
                         .await
                         .map_err(db)?;
                     markers.push(sweep);
@@ -772,7 +774,7 @@ impl Run<'_> {
         if let Some(after) = stored.or(self.marker_after) {
             return after;
         }
-        let tail = self.state.archive.marker_tail;
+        let tail = self.jobs.archive.marker_tail;
         let after = if tail.is_zero() {
             tracing::info!(
                 job_id = self.job_id,
@@ -831,6 +833,20 @@ impl Run<'_> {
 /// Unix microseconds as RFC 3339, or the number when out of range.
 fn witnessed(us: i64) -> String {
     chrono::DateTime::from_timestamp_micros(us).map_or_else(|| us.to_string(), |t| t.to_rfc3339())
+}
+
+/// Where a network job's held-DID marker sweeps go on from: after the last
+/// DID of the last one it recorded, or from the start. A sweep recorded
+/// before these paged by DID has `last_did_id` set: it paged by row id,
+/// which says nothing of DID order, so a job holding only those starts the
+/// list again. Markers apply as of their own time, so sweeping a DID twice
+/// changes nothing.
+fn held_cursor(sweeps: &[Sweep]) -> Option<String> {
+    sweeps
+        .iter()
+        .filter(|s| s.kind == SweepKind::Markers && s.last_did_id.is_none())
+        .max_by_key(|s| s.sweep)
+        .and_then(|s| s.dids.as_ref()?.last().cloned())
 }
 
 /// The start of a marker sweep this job already recorded.
@@ -935,21 +951,16 @@ async fn decode(frame: Vec<u8>) -> Result<Vec<Row>, String> {
 /// Close a gap in the live stream from the archive (plan ruling P7): start a
 /// network replay job for everything after `after_seq`, and return its id and
 /// the archive's sealed tip, where the live stream can resume at once.
-pub(crate) async fn start_gap_replay(
-    state: &AppState,
-    jobs: &JobState,
-    after_seq: i64,
-) -> Result<(String, i64), String> {
-    let collections = state.lexicons.get_record_collections().await;
+pub async fn start_gap_replay(jobs: &JobState, after_seq: i64) -> Result<(String, i64), String> {
+    let collections = jobs.host.tracked_collections().borrow().clone();
     if collections.is_empty() {
         return Err("there are no record collections to replay".into());
     }
-    let endpoint = crate::jetstream::config::parse_endpoint(&state.config.jetstream_url);
-    let client = ArchiveClient::new(&endpoint, &state.archive);
+    let client = ArchiveClient::new(&jobs.endpoint, &jobs.archive);
     // The live consumer waits on this call, and the archive's retry policy
     // can stretch a hung or throttled archive into minutes. Bound it, so the
     // consumer resumes without the archive instead.
-    let timeout = state.archive.gap_plan_timeout;
+    let timeout = jobs.archive.gap_plan_timeout;
     let page = tokio::time::timeout(
         timeout,
         client.plan(&PlanRequest {
@@ -975,14 +986,14 @@ pub(crate) async fn start_gap_replay(
     // A repeated CursorTooOld before anything new is applied asks for the
     // same gap again. Reuse the job already filling it instead of stacking
     // another one.
-    let existing: Option<(String,)> = crate::db::query_as(&crate::db::adapt_sql(
+    let existing: Option<(String,)> = happyview_provider::db::query_as(&happyview_provider::db::adapt_sql(
         "SELECT id FROM happyview_backfill_jobs \
          WHERE source = 'replay' AND replay_after_seq = ? AND status IN ('running', 'pausing', 'paused') \
          ORDER BY created_at DESC LIMIT 1",
-        state.db_backend,
+        jobs.db_backend,
     ))
     .bind(after_seq)
-    .fetch_optional(&state.backfill_db)
+    .fetch_optional(&jobs.backfill_db)
     .await
     .map_err(|e| e.to_string())?;
     if let Some((job_id,)) = existing {
@@ -996,11 +1007,10 @@ pub(crate) async fn start_gap_replay(
     let job_id = job_system::create_gap_replay_job(jobs, after_seq)
         .await
         .map_err(|e| e.to_string())?;
-    crate::event_log::log_event(
-        &state.db,
-        crate::event_log::EventLog {
+    jobs.host
+        .log_event(ProviderEvent {
             event_type: "backfill.started".to_string(),
-            severity: crate::event_log::Severity::Info,
+            severity: Severity::Info,
             actor_did: None,
             subject: None,
             detail: serde_json::json!({
@@ -1011,10 +1021,8 @@ pub(crate) async fn start_gap_replay(
                 "after_seq": after_seq,
                 "tip_seq": tip,
             }),
-        },
-        state.db_backend,
-    )
-    .await;
+        })
+        .await;
     let spawn_jobs = jobs.clone();
     let spawn_id = job_id.clone();
     tokio::spawn(async move { job_system::run_backfill_job(spawn_jobs, spawn_id).await });
@@ -1144,6 +1152,36 @@ mod tests {
                 marker_sweep(2, SweepKind::Markers, 4321),
             ]),
             Some(4321)
+        );
+    }
+
+    #[test]
+    fn held_sweeps_go_on_after_the_last_did_of_the_last_one() {
+        let held = |sweep: i32, dids: &[&str], last_did_id: Option<i64>| Sweep {
+            dids: Some(dids.iter().map(|d| d.to_string()).collect()),
+            last_did_id,
+            ..marker_sweep(sweep, SweepKind::Markers, 0)
+        };
+        assert_eq!(held_cursor(&[]), None);
+        assert_eq!(held_cursor(&[marker_sweep(0, SweepKind::Commits, 0)]), None);
+        assert_eq!(
+            held_cursor(&[
+                marker_sweep(0, SweepKind::Commits, 0),
+                held(1, &["did:plc:a", "did:plc:b"], None),
+                held(2, &["did:plc:c", "did:plc:d"], None),
+            ])
+            .as_deref(),
+            Some("did:plc:d")
+        );
+        // Sweeps paged by row id say nothing of DID order: start again.
+        assert_eq!(held_cursor(&[held(1, &["did:plc:z"], Some(9))]), None);
+        assert_eq!(
+            held_cursor(&[
+                held(1, &["did:plc:z"], Some(9)),
+                held(2, &["did:plc:b"], None),
+            ])
+            .as_deref(),
+            Some("did:plc:b")
         );
     }
 

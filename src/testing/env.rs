@@ -217,6 +217,9 @@ impl TestEnv {
         // per database: the base's would hand one file's rows to the next.
         state.labeler_subscription_cache = Arc::new(crate::labeler::SubscriptionCache::default());
         state.test = Some(harness.clone());
+        // The base's source works on the base's pools: give this state one
+        // of its own.
+        crate::host::attach_jetstream(&mut state, Default::default());
         Ok(FileState {
             state,
             harness,

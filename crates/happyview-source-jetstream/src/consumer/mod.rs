@@ -24,7 +24,6 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use futures_util::future::BoxFuture;
 use happyview_provider::{Host, ProviderEvent, Severity};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -45,12 +44,6 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// Events each worker may have queued before reading the socket waits.
 const WORKER_QUEUE_CAPACITY: usize = 512;
 
-/// Plans a replay of the events after a seq from the Jetstream archive, when
-/// the server refuses the saved cursor as too old: the replay job's id and
-/// the archive's sealed tip, where the live stream resumes.
-pub type GapReplay =
-    Arc<dyn Fn(i64) -> BoxFuture<'static, Result<(String, i64), String>> + Send + Sync>;
-
 /// Start the consumer with `settings`.
 pub fn spawn(host: Arc<dyn Host>, settings: Settings) -> JoinHandle<()> {
     spawn_with(host, settings, None)
@@ -63,21 +56,21 @@ pub fn spawn_with(
     settings: Settings,
     retry: Option<RetryPolicy>,
 ) -> JoinHandle<()> {
-    spawn_with_gap_replay(host, settings, retry, None)
+    spawn_replaying(host, settings, retry, None)
 }
 
-/// [`spawn_with`], replaying a refused cursor's gap by `gap_replay`. With
-/// `None` (as when backfill only crawls) a refused cursor resumes without
-/// the archive.
-pub fn spawn_with_gap_replay(
+/// [`spawn_with`], replaying a refused cursor's gap from the archive as a
+/// job of `gap_jobs`. With `None` (as when backfill only crawls) a refused
+/// cursor resumes without the archive.
+pub(crate) fn spawn_replaying(
     host: Arc<dyn Host>,
     settings: Settings,
     retry: Option<RetryPolicy>,
-    gap_replay: Option<GapReplay>,
+    gap_jobs: Option<crate::backfill::JobState>,
 ) -> JoinHandle<()> {
     let collections_rx = host.tracked_collections();
     tokio::spawn(run(
-        Consumer { host, gap_replay },
+        Consumer { host, gap_jobs },
         collections_rx,
         settings,
         retry.unwrap_or_default(),
@@ -87,7 +80,8 @@ pub fn spawn_with_gap_replay(
 /// What the consumer works with for its life.
 struct Consumer {
     host: Arc<dyn Host>,
-    gap_replay: Option<GapReplay>,
+    /// The jobs a gap replay runs as; `None`: no gap replay.
+    gap_jobs: Option<crate::backfill::JobState>,
 }
 
 /// Connection state carried across reconnects.
@@ -256,12 +250,12 @@ async fn handle_rejection(
             // A refusal of the tip a gap replay already resumed at would only
             // plan the same gap and send the same cursor again, forever.
             if session.protocol == Protocol::V2
-                && let Some(gap_replay) = &state.gap_replay
+                && let Some(gap_jobs) = &state.gap_jobs
                 && (session.gap_resumed_at.is_none()
                     || session.sent_cursor != session.gap_resumed_at)
                 && let Some(after_seq) = gap_floor(state, settings).await
             {
-                match gap_replay(after_seq).await {
+                match crate::backfill::replay::start_gap_replay(gap_jobs, after_seq).await {
                     Ok((job_id, tip)) => {
                         tracing::warn!(
                             %message,

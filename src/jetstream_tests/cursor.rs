@@ -4,11 +4,11 @@
 use serial_test::serial;
 use sqlx::AnyPool;
 
-use super::config::Protocol;
-use super::cursor::*;
-use super::event::CursorPoint;
 use crate::db::{DatabaseBackend, adapt_sql, now_rfc3339};
 use crate::test_support::test_pools;
+use happyview_source_jetstream::consumer::config::Protocol;
+use happyview_source_jetstream::consumer::cursor::*;
+use happyview_source_jetstream::consumer::event::CursorPoint;
 
 const T: i64 = 1_779_719_000_000_000;
 

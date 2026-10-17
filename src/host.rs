@@ -1,15 +1,19 @@
 //! `AppHost`: what HappyView gives a record provider (`happyview_provider::Host`),
 //! over `AppState`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use tokio::sync::watch;
 
 use happyview_provider::{
-    Action, BatchOutcome, Host, IngestCounters, IngestOutcome, InstanceInfo, ProviderDb,
-    ProviderEvent, ResolveError, Severity, SourceEvent,
+    Action, BackfillError, BackfillRequest, BatchOutcome, Host, IngestCounters, IngestOutcome,
+    InstanceInfo, ProviderDb, ProviderError, ProviderEvent, RecordSource, ResolveError, Severity,
+    SourceEvent,
 };
+use happyview_source_jetstream::JetstreamSource;
+use happyview_source_jetstream::archive::ArchiveConfig;
+use happyview_source_jetstream::consumer::config::Settings;
 
 use crate::AppState;
 
@@ -66,6 +70,13 @@ impl Host for AppHost {
         self.state
             .records
             .held_dids_page(&self.state.backfill_db, collections, after_did, limit)
+            .await
+    }
+
+    async fn holds_records(&self, did: &str, collections: &[String]) -> Result<bool, sqlx::Error> {
+        self.state
+            .records
+            .holds_network_records(did, Some(collections))
             .await
     }
 
@@ -137,5 +148,94 @@ impl Host for AppHost {
 
     fn counters(&self) -> Arc<IngestCounters> {
         Arc::clone(&self.state.telemetry_counters.ingest)
+    }
+}
+
+/// Make a detached Jetstream source over `state` its record source, with
+/// replay settings `archive` and `state.config.jetstream_url`: its backfill
+/// jobs and admin routes work on `state`, and nothing is started. For a state
+/// built without `run`'s boot (tests and the test runner), and again after
+/// such a state's pools or settings change.
+///
+/// The state the source's host holds reaches back to the source weakly, so
+/// the two don't keep each other (and their pools) alive.
+pub fn attach_jetstream(state: &mut AppState, archive: ArchiveConfig) -> Arc<JetstreamSource> {
+    let source = JetstreamSource::builder()
+        .settings(Settings::from_env(&state.config.jetstream_url))
+        .archive(archive)
+        .build_detached();
+    let mut held = state.clone();
+    held.source = Arc::new(WeakSource(Arc::downgrade(&source)));
+    source.attach(AppHost::new(held));
+    state.source = source.clone();
+    source
+}
+
+/// A source's host's handle back to it. Once the source is gone it answers
+/// as a detached source would.
+struct WeakSource(Weak<JetstreamSource>);
+
+#[async_trait]
+impl RecordSource for WeakSource {
+    fn id(&self) -> &'static str {
+        "jetstream"
+    }
+
+    fn migrations(
+        &self,
+        _backend: happyview_provider::db::DatabaseBackend,
+    ) -> Option<&'static sqlx::migrate::Migrator> {
+        None
+    }
+
+    async fn start(self: Arc<Self>, host: Arc<dyn Host>) -> Result<(), ProviderError> {
+        match self.0.upgrade() {
+            Some(source) => source.start(host).await,
+            None => Ok(()),
+        }
+    }
+
+    fn admin_routes(&self) -> axum::Router {
+        match self.0.upgrade() {
+            Some(source) => source.admin_routes(),
+            None => axum::Router::new(),
+        }
+    }
+
+    async fn start_backfill(&self, req: BackfillRequest) -> Result<Option<String>, BackfillError> {
+        match self.0.upgrade() {
+            Some(source) => source.start_backfill(req).await,
+            None => Err(BackfillError::Internal(
+                "the jetstream source has no host yet".into(),
+            )),
+        }
+    }
+
+    async fn has_backfill(&self, collection: &str) -> bool {
+        match self.0.upgrade() {
+            Some(source) => source.has_backfill(collection).await,
+            None => false,
+        }
+    }
+
+    async fn backfill_running(&self, collection: &str) -> bool {
+        match self.0.upgrade() {
+            Some(source) => source.backfill_running(collection).await,
+            None => false,
+        }
+    }
+
+    async fn status(&self) -> serde_json::Value {
+        match self.0.upgrade() {
+            Some(source) => source.status().await,
+            None => serde_json::Value::Null,
+        }
+    }
+
+    async fn metrics(&self) -> Vec<(String, i64)> {
+        match self.0.upgrade() {
+            Some(source) => source.metrics().await,
+            None => Vec::new(),
+        }
     }
 }

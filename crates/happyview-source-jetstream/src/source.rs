@@ -1,9 +1,8 @@
 //! `JetstreamSource`: the Jetstream record source behind the `RecordSource`
-//! contract. The live consumer and the backfill job system are this crate's
-//! own. A gap in the live stream is replayed by the `gap_replay` HappyView
-//! hands over, until archive replay moves here too.
+//! contract: the live consumer, the backfill job system, archive replay and
+//! their admin routes.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use happyview_provider::{
@@ -11,10 +10,12 @@ use happyview_provider::{
     db::{DatabaseBackend, adapt_sql},
     telemetry,
 };
+use tokio::task::JoinHandle;
 
 use crate::admin::AdminError;
-use crate::backfill::JobState;
-use crate::consumer::{self, GapReplay, config::Settings};
+use crate::archive::{ArchiveConfig, SourceChoice};
+use crate::backfill::{JobState, RunningJobs};
+use crate::consumer::{self, config::Settings, workers::RetryPolicy};
 
 /// Tables counted into telemetry `totals`, as (payload key, table name).
 const COUNTED_TABLES: &[(&str, &str)] = &[
@@ -25,27 +26,156 @@ const COUNTED_TABLES: &[(&str, &str)] = &[
     ("backfill_cursors", "happyview_backfill_cursors"),
 ];
 
+/// The Jetstream a source built without settings consumes, when
+/// `JETSTREAM_URL` is unset.
+const DEFAULT_JETSTREAM_URL: &str = "wss://jetstream1.us-east.bsky.network";
+
 pub struct JetstreamSource {
+    /// `false` for a [`JetstreamSource::detached`] source: `start` spawns
+    /// nothing.
+    live: bool,
+    /// `None`: `JETSTREAM_URL` and the other Jetstream settings, read when a
+    /// host is given.
+    settings: Option<Settings>,
+    /// `None`: the replay settings, read when a host is given.
+    archive: Option<ArchiveConfig>,
+    /// Shared by every job system this source builds, so `backfill_running`
+    /// sees each job it runs.
+    running: RunningJobs,
+    /// The job system over the host, once one is given.
+    bound: RwLock<Option<Bound>>,
+    /// The consumer and the retention sweep `start` spawned.
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+#[derive(Clone)]
+struct Bound {
     settings: Settings,
-    gap_replay: Option<GapReplay>,
     jobs: JobState,
 }
 
-impl JetstreamSource {
-    /// A source consuming Jetstream by `settings`, replaying a refused
-    /// cursor's gap by `gap_replay` (none: resume without the archive), with
-    /// its backfill jobs in `jobs`.
-    pub fn new(settings: Settings, gap_replay: Option<GapReplay>, jobs: JobState) -> Arc<Self> {
-        Arc::new(Self {
-            settings,
-            gap_replay,
-            jobs,
-        })
+/// Builds a [`JetstreamSource`]. Settings not given are read from the
+/// environment when the source is given its host.
+#[derive(Default)]
+pub struct JetstreamSourceBuilder {
+    settings: Option<Settings>,
+    archive: Option<ArchiveConfig>,
+}
+
+impl JetstreamSourceBuilder {
+    /// Consume Jetstream by `settings` instead of the environment's.
+    pub fn settings(mut self, settings: Settings) -> Self {
+        self.settings = Some(settings);
+        self
     }
 
-    /// The backfill job system this source runs.
-    pub fn jobs(&self) -> &JobState {
-        &self.jobs
+    /// Replay the archive by `archive` instead of the environment's.
+    pub fn archive(mut self, archive: ArchiveConfig) -> Self {
+        self.archive = Some(archive);
+        self
+    }
+
+    /// The source a served instance runs.
+    pub fn build(self) -> Arc<JetstreamSource> {
+        Arc::new(self.source(true))
+    }
+
+    /// A source whose `start` spawns nothing; [`JetstreamSource::attach`]
+    /// gives it a host.
+    pub fn build_detached(self) -> Arc<JetstreamSource> {
+        Arc::new(self.source(false))
+    }
+
+    fn source(self, live: bool) -> JetstreamSource {
+        JetstreamSource {
+            live,
+            settings: self.settings,
+            archive: self.archive,
+            running: RunningJobs::default(),
+            bound: RwLock::new(None),
+            tasks: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl JetstreamSource {
+    pub fn builder() -> JetstreamSourceBuilder {
+        JetstreamSourceBuilder::default()
+    }
+
+    /// A source whose `start` spawns nothing and that has no host until
+    /// [`Self::attach`] gives it one.
+    pub fn detached() -> Arc<Self> {
+        Self::builder().build_detached()
+    }
+
+    /// Give this source `host` without starting anything: its backfill jobs,
+    /// admin routes and answers work over `host` from now on. `start` does
+    /// this itself.
+    pub fn attach(&self, host: Arc<dyn Host>) {
+        let settings = self.settings.clone().unwrap_or_else(|| {
+            Settings::from_env(
+                &happyview_provider::vars::var("JETSTREAM_URL")
+                    .unwrap_or_else(|| DEFAULT_JETSTREAM_URL.to_string()),
+            )
+        });
+        let archive = self
+            .archive
+            .clone()
+            .unwrap_or_else(|| ArchiveConfig::from_env(&host.instance().user_agent));
+        let mut jobs = JobState::new(host, archive, settings.endpoint.clone());
+        jobs.running = self.running.clone();
+        *self.bound.write().unwrap_or_else(|e| e.into_inner()) = Some(Bound { settings, jobs });
+    }
+
+    fn bound(&self) -> Option<Bound> {
+        self.bound.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The backfill job system this source runs, once it has a host.
+    pub fn jobs(&self) -> Option<JobState> {
+        self.bound().map(|bound| bound.jobs)
+    }
+
+    /// Start the live consumer over `host` by `settings`, retrying failed
+    /// events by `retry`. A cursor the server refuses as too old is replayed
+    /// from the archive as one of this source's jobs, unless backfill only
+    /// crawls (P8), which never asks the archive. Gives the source `host`
+    /// first if it has none.
+    pub fn spawn_consumer(
+        &self,
+        host: Arc<dyn Host>,
+        settings: Settings,
+        retry: Option<RetryPolicy>,
+    ) -> JoinHandle<()> {
+        let jobs = match self.jobs() {
+            Some(jobs) => jobs.for_host(host.clone()),
+            None => {
+                self.attach(host.clone());
+                self.jobs().expect("attached above")
+            }
+        };
+        let gap_jobs = (jobs.archive.default_source != SourceChoice::Crawl).then_some(jobs);
+        consumer::spawn_replaying(host, settings, retry, gap_jobs)
+    }
+
+    /// Stop what `start` spawned: the live consumer and the retention
+    /// sweep. Running backfill jobs are left to finish.
+    pub fn stop(&self) {
+        for task in self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for JetstreamSource {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -55,6 +185,10 @@ fn backfill_error(e: AdminError) -> BackfillError {
         AdminError::Conflict(_) => BackfillError::Conflict(e.to_string()),
         _ => BackfillError::Internal(e.to_string()),
     }
+}
+
+fn unbound_error() -> BackfillError {
+    BackfillError::Internal("the jetstream source has no host yet".into())
 }
 
 #[async_trait]
@@ -69,21 +203,38 @@ impl RecordSource for JetstreamSource {
     }
 
     async fn start(self: Arc<Self>, host: Arc<dyn Host>) -> Result<(), ProviderError> {
-        consumer::spawn_with_gap_replay(host, self.settings.clone(), None, self.gap_replay.clone());
-        crate::backfill::resume_backfill_jobs(&self.jobs).await;
-        let jobs = self.jobs.clone();
-        tokio::spawn(async move {
-            crate::backfill::run_backfill_retention_cleanup(&jobs).await;
-        });
+        if !self.live {
+            return Ok(());
+        }
+        self.attach(host.clone());
+        let Bound { settings, jobs } = self.bound().expect("attached above");
+        // Before the consumer, so a job the last run left running is known
+        // to be running before a live delete asks.
+        crate::backfill::resume_backfill_jobs(&jobs).await;
+        let consumer = self.spawn_consumer(host, settings, None);
+        let retention = {
+            let jobs = jobs.clone();
+            tokio::spawn(async move {
+                crate::backfill::run_backfill_retention_cleanup(&jobs).await;
+            })
+        };
+        self.stop();
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend([consumer, retention]);
         Ok(())
     }
 
     fn admin_routes(&self) -> axum::Router {
-        crate::admin::routes(self)
+        match self.jobs() {
+            Some(jobs) => crate::admin::routes(jobs),
+            None => axum::Router::new(),
+        }
     }
 
     async fn start_backfill(&self, req: BackfillRequest) -> Result<Option<String>, BackfillError> {
-        let jobs = &self.jobs;
+        let jobs = &self.jobs().ok_or_else(unbound_error)?;
         match req.kind {
             BackfillKind::Automatic => {
                 let collection = req.collection.ok_or_else(|| {
@@ -99,7 +250,7 @@ impl RecordSource for JetstreamSource {
                     Some(raw) => crate::archive::parse_source(raw).ok_or_else(|| {
                         BackfillError::Invalid(format!("unknown backfill source: {raw}"))
                     })?,
-                    None => jobs.default_source,
+                    None => jobs.archive.default_source,
                 };
                 crate::backfill::start_backfill_with(
                     jobs,
@@ -112,15 +263,14 @@ impl RecordSource for JetstreamSource {
                 .map(Some)
                 .map_err(backfill_error)
             }
-            BackfillKind::Gap { after_seq } => match &self.gap_replay {
-                Some(replay) => replay(after_seq)
+            // Asked for, a gap is replayed whatever `BACKFILL_SOURCE` says;
+            // only the consumer's own gap replay is off under `crawl`.
+            BackfillKind::Gap { after_seq } => {
+                crate::backfill::replay::start_gap_replay(jobs, after_seq)
                     .await
                     .map(|(job_id, _tip)| Some(job_id))
-                    .map_err(BackfillError::Internal),
-                None => Err(BackfillError::Invalid(
-                    "this source replays no gaps: backfill only crawls".into(),
-                )),
-            },
+                    .map_err(BackfillError::Internal)
+            }
         }
     }
 
@@ -129,13 +279,16 @@ impl RecordSource for JetstreamSource {
     /// the collection's. When it cannot tell, it says yes, so no caller starts
     /// one on a guess.
     async fn has_backfill(&self, collection: &str) -> bool {
+        let Some(jobs) = self.jobs() else {
+            return false;
+        };
         let sql = adapt_sql(
             "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE collection = ? AND scope = 'network'",
-            self.jobs.db_backend,
+            jobs.db_backend,
         );
         let seen: Result<(i64,), _> = happyview_provider::db::query_as(&sql)
             .bind(collection)
-            .fetch_one(&self.jobs.db)
+            .fetch_one(&jobs.db)
             .await;
         match seen {
             Ok((0,)) => false,
@@ -151,32 +304,12 @@ impl RecordSource for JetstreamSource {
         }
     }
 
-    /// Whether a backfill covering `collection` may still write: running, or
-    /// pausing or cancelling (both stop once in-flight pages are written).
-    /// When it cannot tell, it says yes, so a delete still leaves its
-    /// tombstone.
+    /// Whether a backfill covering `collection` may still write: a job of
+    /// this source's running, pausing or cancelling (both stop once in-flight
+    /// pages are written). Answered from the jobs this source runs, without
+    /// a query.
     async fn backfill_running(&self, collection: &str) -> bool {
-        let sql = adapt_sql(
-            "SELECT 1 FROM happyview_backfill_jobs \
-             WHERE status IN ('running', 'pausing', 'cancelling') \
-             AND (collection IS NULL OR collection = ?) LIMIT 1",
-            self.jobs.db_backend,
-        );
-        match happyview_provider::db::query(&sql)
-            .bind(collection)
-            .fetch_optional(&self.jobs.db)
-            .await
-        {
-            Ok(row) => row.is_some(),
-            Err(e) => {
-                tracing::warn!(
-                    collection = %collection,
-                    error = %e,
-                    "could not tell whether a backfill is running; assuming one is"
-                );
-                true
-            }
-        }
+        self.running.covers(collection)
     }
 
     async fn status(&self) -> serde_json::Value {
@@ -187,37 +320,36 @@ impl RecordSource for JetstreamSource {
     /// left out), and `feature.backfill.ever` / `feature.backfill.active`
     /// (any job, and any job in the last seven days).
     async fn metrics(&self) -> Vec<(String, i64)> {
+        let Some(jobs) = self.jobs() else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         for (key, table) in COUNTED_TABLES {
-            if let Some(n) = self.count_table(table).await {
+            if let Some(n) = telemetry::count_table(&jobs.db, jobs.db_backend, table).await {
                 out.push(((*key).to_string(), n));
             }
         }
-        let ever = self
-            .count_feature("SELECT COUNT(*) FROM happyview_backfill_jobs", None)
-            .await
+        let (db, backend) = (&jobs.db, jobs.db_backend);
+        let ever = telemetry::count(
+            db,
+            backend,
+            "SELECT COUNT(*) FROM happyview_backfill_jobs",
+            None,
+        )
+        .await
             >= 1;
         let since = telemetry::window_start();
         let active = ever
-            && self
-                .count_feature(
-                    "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE created_at >= ?",
-                    Some(&since),
-                )
-                .await
+            && telemetry::count(
+                db,
+                backend,
+                "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE created_at >= ?",
+                Some(&since),
+            )
+            .await
                 >= 1;
         out.push(("feature.backfill.ever".to_string(), i64::from(ever)));
         out.push(("feature.backfill.active".to_string(), i64::from(active)));
         out
-    }
-}
-
-impl JetstreamSource {
-    async fn count_table(&self, table: &'static str) -> Option<i64> {
-        telemetry::count_table(&self.jobs.db, self.jobs.db_backend, table).await
-    }
-
-    async fn count_feature(&self, sql: &str, bind: Option<&str>) -> i64 {
-        telemetry::count(&self.jobs.db, self.jobs.db_backend, sql, bind).await
     }
 }

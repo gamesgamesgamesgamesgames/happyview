@@ -26,6 +26,11 @@ pub struct TestApp {
     pub mock_server: MockServer,
     pub admin_did: String,
     pub admin_token: String,
+    /// The replay settings the state's Jetstream source is given; set it,
+    /// then [`TestApp::rebuild_router`].
+    pub archive: happyview_source_jetstream::archive::ArchiveConfig,
+    /// The state's Jetstream source.
+    pub jetstream: std::sync::Arc<happyview_source_jetstream::JetstreamSource>,
     _db_lock: Option<db::TestLock>,
 }
 
@@ -221,7 +226,8 @@ impl TestApp {
 
         // The source holds the state it works on: give it this one, as
         // changed above.
-        state.source = happyview::builtin_source::BuiltinSource::attached(&state);
+        let archive = happyview_source_jetstream::archive::ArchiveConfig::default();
+        let jetstream = happyview::host::attach_jetstream(&mut state, archive.clone());
         let router = Self::build_router(&state);
 
         Self {
@@ -231,6 +237,8 @@ impl TestApp {
             admin_did,
             _db_lock,
             admin_token,
+            archive,
+            jetstream,
         }
     }
 
@@ -247,7 +255,7 @@ impl TestApp {
     }
 
     pub fn rebuild_router(&mut self) {
-        self.state.source = happyview::builtin_source::BuiltinSource::attached(&self.state);
+        self.jetstream = happyview::host::attach_jetstream(&mut self.state, self.archive.clone());
         self.router = Self::build_router(&self.state);
     }
 

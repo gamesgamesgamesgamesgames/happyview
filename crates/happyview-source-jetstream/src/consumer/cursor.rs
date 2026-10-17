@@ -85,10 +85,6 @@ pub async fn load(db: &AnyPool, backend: DatabaseBackend) -> Result<StoredCursor
     Ok(stored)
 }
 
-fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
-}
-
 /// A row's `updated_at`, or `None` if it isn't RFC 3339 (a row written by
 /// hand, say), which leaves the seq alone.
 fn saved_at(updated_at: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
@@ -102,7 +98,7 @@ pub async fn save(
     host: &str,
     point: &CursorPoint,
 ) -> Result<(), sqlx::Error> {
-    let now = now_rfc3339();
+    let now = happyview_provider::db::now_rfc3339();
     let upsert = adapt_sql(
         "INSERT INTO happyview_instance_settings (key, value, updated_at) VALUES (?, ?, ?) \
          ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",

@@ -7,11 +7,13 @@ use common::app::TestApp;
 use common::jetstream::{self as js, MockJetstream};
 use common::segment_writer::write_segment;
 use happyview::host::AppHost;
-use happyview::jetstream::archive::SourceChoice;
-use happyview::jetstream::archive::client::{ArchiveClient, PlanMode, PlanRequest};
-use happyview::jetstream::archive::{ArchiveConfig, rows, segment};
-use happyview::jetstream::config::{DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint};
-use happyview::jetstream::workers::RetryPolicy;
+use happyview_source_jetstream::archive::SourceChoice;
+use happyview_source_jetstream::archive::client::{ArchiveClient, PlanMode, PlanRequest};
+use happyview_source_jetstream::archive::{ArchiveConfig, rows, segment};
+use happyview_source_jetstream::consumer::config::{
+    DRAIN_TIMEOUT, ProtocolChoice, Settings, parse_endpoint,
+};
+use happyview_source_jetstream::consumer::workers::RetryPolicy;
 use serde_json::json;
 use serial_test::serial;
 use std::io::Cursor;
@@ -61,7 +63,8 @@ fn the_test_writer_round_trips_through_the_reader() {
     // And the conversion agrees with the live mock's events of the same seq.
     let created = rows::row_to_event(rows_read[0].clone()).unwrap().unwrap();
     let live = js::create(1, "did:plc:a", GAME, "r1", game("one"));
-    let happyview::jetstream::event::EventKind::Commit(commit) = created.kind else {
+    let happyview_source_jetstream::consumer::event::EventKind::Commit(commit) = created.kind
+    else {
         panic!()
     };
     assert_eq!(commit.cid.as_deref(), live["cid"].as_str());
@@ -97,7 +100,7 @@ async fn the_mock_archive_plans_pages_and_serves_what_it_planned() {
         4,
     );
     mock.set_plan_page_entries(1);
-    let endpoint = happyview::jetstream::config::parse_endpoint(&mock.url());
+    let endpoint = happyview_source_jetstream::consumer::config::parse_endpoint(&mock.url());
     let client = ArchiveClient::new(&endpoint, &ArchiveConfig::default());
     let request = |after, before| PlanRequest {
         kinds: vec!["commit".into()],
@@ -176,7 +179,7 @@ async fn app(mock: &MockJetstream, key: Option<&str>) -> Option<TestApp> {
         .await;
     assert!(status == 200 || status == 201, "{body}");
     app.state.config.jetstream_url = mock.url();
-    app.state.archive = ArchiveConfig {
+    app.archive = ArchiveConfig {
         api_key: key.map(str::to_string),
         download_dir: std::env::temp_dir().join(format!("hv-replay-{}", uuid::Uuid::new_v4())),
         retry_unit: Duration::from_millis(5),
@@ -278,7 +281,7 @@ async fn replay_matches_applying_the_same_events_live() {
 
     common::db::truncate_all(&app.state.db).await;
     for event in all {
-        let row = happyview::jetstream::archive::segment::Row {
+        let row = happyview_source_jetstream::archive::segment::Row {
             seq: event.seq,
             witnessed_at: event.witnessed_at,
             indexed_at: 0,
@@ -290,7 +293,7 @@ async fn replay_matches_applying_the_same_events_live() {
             payload: event.payload,
         };
         if let Some(event) = rows::row_to_event(row).unwrap() {
-            happyview::jetstream::apply::apply_event(
+            happyview_source_jetstream::consumer::apply::apply_event(
                 &*AppHost::new(app.state.clone()),
                 &[GAME.to_string()],
                 event,
@@ -486,7 +489,7 @@ async fn a_zero_marker_tail_sweeps_every_marker_without_listing_segments() {
     let Some(mut app) = app(&mock, None).await else {
         return;
     };
-    app.state.archive.marker_tail = Duration::ZERO;
+    app.archive.marker_tail = Duration::ZERO;
     app.rebuild_router();
     seal_tail_archive(&mock);
     mock.list_segments(1000);
@@ -566,15 +569,15 @@ async fn replay_never_resurrects_a_record_deleted_live() {
         js::create(2, did, GAME, "g0002", game("t2")),
         js::delete(50, did, GAME, "g0002"),
     ] {
-        let happyview::jetstream::event::Frame::Event(event) =
-            happyview::jetstream::event::parse_v2(
+        let happyview_source_jetstream::consumer::event::Frame::Event(event) =
+            happyview_source_jetstream::consumer::event::parse_v2(
                 &json!({ "$type": "message", "payload": event }).to_string(),
             )
             .unwrap()
         else {
             panic!("an event")
         };
-        happyview::jetstream::apply::apply_event(
+        happyview_source_jetstream::consumer::apply::apply_event(
             &*AppHost::new(app.state.clone()),
             &[GAME.to_string()],
             event,
@@ -828,7 +831,7 @@ async fn an_account_job_crawls_when_the_default_is_replay() {
     let Some(mut app) = app(&mock, None).await else {
         return;
     };
-    app.state.archive.default_source = SourceChoice::Replay;
+    app.archive.default_source = SourceChoice::Replay;
     app.rebuild_router();
     mock.seal(games(1..=4, "did:plc:defaultreplay"), 4);
     let id = start_job(
@@ -910,14 +913,12 @@ async fn the_live_stream_never_sees_the_api_key() {
     let (tx, _) = tokio::sync::watch::channel(vec![GAME.to_string()]);
     let mut state = app.state.clone();
     state.collections_tx = tx.clone();
-    let consumer = happyview::jetstream::spawn_with_gap_replay(
+    let consumer = app.jetstream.spawn_consumer(
         AppHost::new(state.clone()),
-        happyview::jetstream::config::Settings::from_env(&state.config.jetstream_url),
-        None,
-        happyview::builtin_source::gap_replay(
-            &state,
-            &happyview::builtin_source::job_state(&state),
+        happyview_source_jetstream::consumer::config::Settings::from_env(
+            &state.config.jetstream_url,
         ),
+        None,
     );
     wait_until!("a live connection", !mock.connections().is_empty());
     consumer.abort();
@@ -1716,14 +1717,10 @@ fn consume(
     let (tx, _) = tokio::sync::watch::channel(vec![GAME.to_string()]);
     let mut state = app.state.clone();
     state.collections_tx = tx.clone();
-    let handle = happyview::jetstream::spawn_with_gap_replay(
+    let handle = app.jetstream.spawn_consumer(
         AppHost::new(state.clone()),
         settings(mock),
         Some(fast_retries()),
-        happyview::builtin_source::gap_replay(
-            &state,
-            &happyview::builtin_source::job_state(&state),
-        ),
     );
     (handle, tx)
 }
@@ -1732,7 +1729,7 @@ fn consume(
 /// The default crawls, and under `crawl` gap replay is off (P8).
 async fn auto_app(mock: &MockJetstream) -> Option<TestApp> {
     let mut app = app(mock, None).await?;
-    app.state.archive.default_source = SourceChoice::Auto;
+    app.archive.default_source = SourceChoice::Auto;
     app.rebuild_router();
     Some(app)
 }
@@ -1884,7 +1881,7 @@ async fn cursor_too_old_with_a_hung_archive_resumes_as_before() {
     let Some(mut app) = auto_app(&mock).await else {
         return;
     };
-    app.state.archive.gap_plan_timeout = Duration::from_millis(200);
+    app.archive.gap_plan_timeout = Duration::from_millis(200);
     app.rebuild_router();
     mock.seal(games(1..=50, "did:plc:hungarchive"), 10);
     // Far longer than the gap plan may take, retries or not.

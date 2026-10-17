@@ -52,6 +52,25 @@ pub trait Host: Send + Sync + 'static {
         after_did: Option<&str>,
         limit: i64,
     ) -> Result<Vec<String>, sqlx::Error>;
+    /// Whether `did` holds records in `collections`: whether
+    /// [`Host::held_dids_page`] would list it. The default pages through
+    /// that list; a host that can answer for one DID directly should.
+    async fn holds_records(&self, did: &str, collections: &[String]) -> Result<bool, sqlx::Error> {
+        const PAGE: i64 = 1000;
+        let mut after: Option<String> = None;
+        loop {
+            let page = self
+                .held_dids_page(collections, after.as_deref(), PAGE)
+                .await?;
+            if page.iter().any(|held| held == did) {
+                return Ok(true);
+            }
+            if (page.len() as i64) < PAGE {
+                return Ok(false);
+            }
+            after = page.last().cloned();
+        }
+    }
     fn database(&self) -> ProviderDb;
     async fn setting(&self, key: &str) -> Option<String>;
     async fn put_setting(&self, key: &str, value: &str) -> Result<(), sqlx::Error>;

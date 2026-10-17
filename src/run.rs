@@ -36,7 +36,7 @@ impl Default for Providers {
     /// The in-tree Jetstream source and no external storage.
     fn default() -> Self {
         Self {
-            source: crate::builtin_source::BuiltinSource::new(),
+            source: happyview_source_jetstream::JetstreamSource::builder().build(),
             storage: None,
         }
     }
@@ -1071,7 +1071,6 @@ async fn boot(
         http,
         records,
         source: providers.source,
-        archive: crate::jetstream::archive::ArchiveConfig::from_env(&crate::version::user_agent()),
         db: db_pool,
         backfill_db: backfill_db_pool,
         db_backend,
@@ -1100,7 +1099,6 @@ async fn boot(
         script_limits,
         test: None,
     };
-    crate::builtin_source::attach_if_builtin(&state.source, &state);
 
     // Populate record_refs once, for records indexed before the table existed.
     // Spawned before anything that writes records starts, as it was before
@@ -1189,6 +1187,11 @@ async fn boot(
     {
         tracing::error!(source = state.source.id(), error = %e, "the record source did not start");
         return Err(std::process::ExitCode::FAILURE);
+    }
+    // After the source resumed the jobs that were running, which would
+    // otherwise run one started here twice.
+    if state.config.project_root.is_some() {
+        crate::project::boot::start_declared_backfills(&state).await;
     }
     drop(collections_rx);
 

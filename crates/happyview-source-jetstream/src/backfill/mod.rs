@@ -1,17 +1,21 @@
 //! The backfill job system: job rows, the run loop, resume, retention and
-//! the job event channel. Crawl is in [`crawl`]; HappyView's archive replay
-//! is reached through [`Replay`] until it moves here too.
+//! the job event channel. Crawl is in [`crawl`], archive replay in
+//! [`replay`].
 //!
 //! Items are `pub` for HappyView's database-backed tests, which need a host
 //! this crate cannot build; they are not an API.
 
 pub mod crawl;
 pub mod errors;
+pub mod replay;
+pub mod replay_fold;
+pub mod replay_sweeps;
 pub mod retry;
 pub mod types;
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rand::RngExt;
 use tokio::sync::broadcast;
@@ -22,7 +26,8 @@ use happyview_provider::db::{DatabaseBackend, adapt_sql};
 use happyview_provider::{Host, ProviderEvent, Severity};
 
 use crate::admin::AdminError;
-use crate::archive::SourceChoice;
+use crate::archive::{ArchiveConfig, SourceChoice};
+use crate::consumer::config::Endpoint;
 
 pub use crawl::*;
 use types::BackfillEvent;
@@ -33,8 +38,9 @@ use crate::admin::DIDS_GONE;
 /// from a snapshot.
 const EVENT_CHANNEL_CAPACITY: usize = 16384;
 
-/// What the job system works with: the host, its pools, and the job event
-/// channel. Cheap to clone: every field is a handle.
+/// What the job system works with: the host, its pools, the archive replay
+/// settings and the job event channel. Cheap to clone: every field is a
+/// handle.
 #[derive(Clone)]
 pub struct JobState {
     pub host: Arc<dyn Host>,
@@ -44,10 +50,15 @@ pub struct JobState {
     pub db_backend: DatabaseBackend,
     pub http: reqwest::Client,
     pub config: JobConfig,
-    /// The source a job uses when its request names none (`BACKFILL_SOURCE`).
-    pub default_source: SourceChoice,
+    /// Replay settings (`JETSTREAM_API_KEY`, `BACKFILL_SOURCE`, ...).
+    /// `archive.default_source` is the source a job uses when its request
+    /// names none.
+    pub archive: ArchiveConfig,
+    /// The Jetstream whose archive replay jobs read.
+    pub endpoint: Endpoint,
     pub backfill_events_tx: broadcast::Sender<BackfillEvent>,
-    pub replay: Arc<dyn Replay>,
+    /// The jobs running in this process.
+    pub running: RunningJobs,
 }
 
 /// The addresses a crawl asks.
@@ -58,7 +69,7 @@ pub struct JobConfig {
 }
 
 impl JobState {
-    pub fn new(host: Arc<dyn Host>, default_source: SourceChoice, replay: Arc<dyn Replay>) -> Self {
+    pub fn new(host: Arc<dyn Host>, archive: ArchiveConfig, endpoint: Endpoint) -> Self {
         let db = host.database();
         let instance = host.instance();
         Self {
@@ -70,11 +81,101 @@ impl JobState {
                 plc_url: instance.plc_url,
                 relay_url: instance.relay_url,
             },
-            default_source,
+            archive,
+            endpoint,
             backfill_events_tx: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
-            replay,
+            running: RunningJobs::default(),
             host,
         }
+    }
+
+    /// These jobs over `host` instead: its pools and addresses, with this
+    /// state's settings, event channel and running jobs.
+    pub fn for_host(&self, host: Arc<dyn Host>) -> Self {
+        Self {
+            backfill_events_tx: self.backfill_events_tx.clone(),
+            running: self.running.clone(),
+            ..Self::new(host, self.archive.clone(), self.endpoint.clone())
+        }
+    }
+}
+
+/// The backfill jobs whose run is in progress in this process, with the
+/// collection each covers (`None`: every collection). A job is in it from
+/// the moment its run loads it until the run returns, which covers the
+/// `running`, `pausing` and `cancelling` statuses: a pausing or cancelling
+/// job still writes the pages it has in flight.
+#[derive(Clone, Default)]
+pub struct RunningJobs(Arc<Mutex<HashMap<String, (Option<String>, usize)>>>);
+
+impl RunningJobs {
+    /// Note `job_id` as running until the guard is dropped. Guards nest: the
+    /// job runs until the last one goes.
+    pub fn enter(&self, job_id: &str, collection: Option<String>) -> RunningGuard {
+        self.lock()
+            .entry(job_id.to_string())
+            .or_insert((collection, 0))
+            .1 += 1;
+        RunningGuard {
+            jobs: self.clone(),
+            job_id: job_id.to_string(),
+        }
+    }
+
+    /// Whether a running job covers `collection`.
+    pub fn covers(&self, collection: &str) -> bool {
+        self.lock()
+            .values()
+            .any(|(covered, _)| covered.as_deref().is_none_or(|c| c == collection))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Option<String>, usize)>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Removes its job from [`RunningJobs`] when dropped.
+pub struct RunningGuard {
+    jobs: RunningJobs,
+    job_id: String,
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let mut jobs = self.jobs.lock();
+        if let Some((_, guards)) = jobs.get_mut(&self.job_id) {
+            *guards -= 1;
+            if *guards == 0 {
+                jobs.remove(&self.job_id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod running_tests {
+    use super::RunningJobs;
+
+    #[test]
+    fn a_job_runs_until_its_last_guard_goes() {
+        let running = RunningJobs::default();
+        assert!(!running.covers("app.a"));
+        let outer = running.enter("j1", Some("app.a".into()));
+        let inner = running.enter("j1", Some("app.a".into()));
+        assert!(running.covers("app.a"));
+        assert!(!running.covers("app.b"));
+        drop(inner);
+        assert!(running.covers("app.a"));
+        drop(outer);
+        assert!(!running.covers("app.a"));
+    }
+
+    #[test]
+    fn a_job_without_a_collection_covers_every_one() {
+        let running = RunningJobs::default();
+        let _all = running.enter("j2", None);
+        assert!(running.covers("app.a"));
+        assert!(running.covers("app.b"));
     }
 }
 
@@ -89,30 +190,6 @@ pub enum ReplayOutcome {
     /// Pausing or cancelling; the caller finalises.
     Stopped,
     Failed(String),
-}
-
-/// HappyView's archive replay, which the run loop hands replay jobs to.
-/// Temporary: replay moves into this crate next, and this goes with it.
-#[async_trait::async_trait]
-pub trait Replay: Send + Sync + 'static {
-    async fn run(
-        &self,
-        state: &JobState,
-        job_id: &str,
-        collections: &[String],
-        scope_dids: Option<Vec<String>>,
-        source: &str,
-    ) -> ReplayOutcome;
-    /// An account job's accounts, from its queue rows.
-    async fn job_dids(&self, state: &JobState, job_id: &str) -> Result<Vec<String>, sqlx::Error>;
-    /// Record `blocks` (segment, block index; -1 for a whole segment) for
-    /// `job_id` to retry.
-    async fn insert_retries(
-        &self,
-        state: &JobState,
-        job_id: &str,
-        blocks: &[(String, i32)],
-    ) -> Result<(), sqlx::Error>;
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +604,7 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
         tracing::error!(job_id, "backfill job not found");
         return;
     };
+    let _running = state.running.enter(&job_id, collection.clone());
 
     // Determine target collections
     let collections: Vec<String> = if let Some(ref col) = collection {
@@ -555,7 +633,7 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
 
     if source != "crawl" {
         let scope_dids = if scope == "dids" {
-            match state.replay.job_dids(&state, &job_id).await {
+            match replay_sweeps::job_dids(&state, &job_id).await {
                 // Never plan an account job without its accounts.
                 Ok(dids) if dids.is_empty() => {
                     fail_job(&state, &job_id, DIDS_GONE).await;
@@ -575,11 +653,7 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
         } else {
             None
         };
-        match state
-            .replay
-            .run(&state, &job_id, &collections, scope_dids, &source)
-            .await
-        {
+        match replay::run(&state, &job_id, &collections, scope_dids, &source).await {
             ReplayOutcome::FellBack => {}
             ReplayOutcome::Completed { records, bytes } => {
                 let records = i32::try_from(records).unwrap_or(i32::MAX);
@@ -835,7 +909,7 @@ pub async fn create_backfill_job(
     collection: Option<&str>,
     dids: &[String],
 ) -> Result<String, AdminError> {
-    create_backfill_job_with(state, collection, dids, state.default_source).await
+    create_backfill_job_with(state, collection, dids, state.archive.default_source).await
 }
 
 /// Insert a backfill job without starting it. With no `dids` the job
@@ -910,7 +984,14 @@ pub async fn start_backfill(
     dids: Vec<String>,
     actor_did: &str,
 ) -> Result<String, AdminError> {
-    start_backfill_with(state, collection, dids, actor_did, state.default_source).await
+    start_backfill_with(
+        state,
+        collection,
+        dids,
+        actor_did,
+        state.archive.default_source,
+    )
+    .await
 }
 
 /// `start_backfill` with an explicit source.
@@ -1115,15 +1196,15 @@ pub async fn run_backfill_retention_cleanup(state: &JobState) {
 /// Jobs stuck in `cancelling` are finalised immediately.
 pub async fn resume_backfill_jobs(state: &JobState) {
     let sql = adapt_sql(
-        "SELECT id, status FROM happyview_backfill_jobs WHERE status IN ('running', 'cancelling', 'pausing')",
+        "SELECT id, status, collection FROM happyview_backfill_jobs WHERE status IN ('running', 'cancelling', 'pausing')",
         state.db_backend,
     );
-    let rows: Vec<(String, String)> = happyview_provider::db::query_as(&sql)
+    let rows: Vec<(String, String, Option<String>)> = happyview_provider::db::query_as(&sql)
         .fetch_all(&state.backfill_db)
         .await
         .unwrap_or_default();
 
-    for (job_id, status) in rows {
+    for (job_id, status, collection) in rows {
         match status.as_str() {
             "cancelling" => {
                 tracing::info!(
@@ -1138,9 +1219,12 @@ pub async fn resume_backfill_jobs(state: &JobState) {
             }
             _ => {
                 tracing::info!(job_id, "resuming interrupted backfill job");
+                // Running from now, not from when the task first runs.
+                let running = state.running.enter(&job_id, collection);
                 let spawn_state = state.clone();
                 tokio::spawn(async move {
                     run_backfill_job(spawn_state, job_id).await;
+                    drop(running);
                 });
             }
         }

@@ -1,7 +1,6 @@
 pub mod admin;
 pub mod auth;
 pub mod blobs;
-pub mod builtin_source;
 pub mod catalog;
 pub use happyview_provider::cid as cid_verify;
 pub mod cli;
@@ -27,7 +26,8 @@ pub mod host;
 pub mod http_retry;
 pub mod identity;
 pub mod ingest;
-pub mod jetstream;
+#[cfg(test)]
+mod jetstream_tests;
 pub mod jobs;
 pub mod labeler;
 pub mod lexicon;
@@ -110,8 +110,6 @@ pub struct AppState {
     /// Where records come from: live ingest, backfills and their admin
     /// routes (`happyview::run`'s `Providers::source`).
     pub source: Arc<dyn happyview_provider::RecordSource>,
-    /// Replay backfill settings (`JETSTREAM_API_KEY`, `BACKFILL_SOURCE`, ...).
-    pub archive: crate::jetstream::archive::ArchiveConfig,
     pub domain_cache: domain::DomainCache,
     /// The current project build. Readers that must not see a swap mid-run
     /// take `load_full()` once and keep it.

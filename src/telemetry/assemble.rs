@@ -298,7 +298,7 @@ mod tests {
             &c,
             &Counters::new(),
             &LexiconCatalog::detached(),
-            &crate::builtin_source::BuiltinSource::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await;
         assert!(out.is_none());
@@ -313,7 +313,7 @@ mod tests {
             &consent(TelemetryMode::Auto),
             &Counters::new(),
             &LexiconCatalog::detached(),
-            &crate::builtin_source::BuiltinSource::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -340,7 +340,7 @@ mod tests {
             &consent(TelemetryMode::Manual),
             &Counters::new(),
             &LexiconCatalog::detached(),
-            &crate::builtin_source::BuiltinSource::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -360,7 +360,7 @@ mod tests {
             &c,
             &Counters::new(),
             &LexiconCatalog::detached(),
-            &crate::builtin_source::BuiltinSource::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -379,7 +379,7 @@ mod tests {
             &c,
             &Counters::new(),
             &LexiconCatalog::detached(),
-            &crate::builtin_source::BuiltinSource::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -404,7 +404,7 @@ mod tests {
             &consent(TelemetryMode::Auto),
             &Counters::new(),
             &LexiconCatalog::detached(),
-            &crate::builtin_source::BuiltinSource::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await;
 
@@ -426,7 +426,7 @@ mod tests {
             &consent(TelemetryMode::Auto),
             &Counters::new(),
             &LexiconCatalog::detached(),
-            &crate::builtin_source::BuiltinSource::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -454,7 +454,7 @@ mod tests {
             &consent(TelemetryMode::Auto),
             &Counters::new(),
             &LexiconCatalog::detached(),
-            &crate::builtin_source::BuiltinSource::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();
@@ -500,7 +500,7 @@ mod tests {
             &consent(TelemetryMode::Auto),
             &Counters::new(),
             &catalog,
-            &crate::builtin_source::BuiltinSource::detached(),
+            &*happyview_source_jetstream::JetstreamSource::detached(),
         )
         .await
         .unwrap();

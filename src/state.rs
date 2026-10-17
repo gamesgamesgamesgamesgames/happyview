@@ -68,16 +68,14 @@ pub fn state_with_pool_on(
     })
     .expect("test OAuth client");
     let project = crate::project::shared_empty();
-    let source = Arc::new(crate::builtin_source::BuiltinSource::detached());
-    let state = AppState {
+    let mut state = AppState {
         config,
         http: reqwest::Client::new(),
         db: pool.clone(),
         backfill_db: pool.clone(),
         db_backend: backend,
         records: crate::record_store::RecordStore::new(pool.clone(), backend),
-        source: source.clone(),
-        archive: Default::default(),
+        source: happyview_source_jetstream::JetstreamSource::detached(),
         domain_cache: crate::domain::DomainCache::new(),
         lexicons: LexiconCatalog::new(project.clone()),
         scripts: crate::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
@@ -128,6 +126,6 @@ pub fn state_with_pool_on(
         test: None,
     };
     // Backfills and their admin routes work on this state; nothing is started.
-    source.attach(&state);
+    crate::host::attach_jetstream(&mut state, Default::default());
     state
 }

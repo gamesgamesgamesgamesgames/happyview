@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use happyview_provider::Host;
 
-use super::apply::*;
-use super::event::{Commit, CursorPoint, Event, EventKind};
-use super::workers::ApplyOutcome;
 use crate::AppState;
 use crate::db::{adapt_sql, now_rfc3339};
 use crate::ingest::REPO_STATUS_MAX_BYTES;
 use crate::lexicon::{ParsedLexicon, ProcedureAction};
+use happyview_source_jetstream::consumer::apply::*;
+use happyview_source_jetstream::consumer::event::{Commit, CursorPoint, Event, EventKind};
+use happyview_source_jetstream::consumer::workers::ApplyOutcome;
 use std::time::Duration;
 
 const NSID: &str = "app.test.applied";
@@ -700,8 +700,8 @@ async fn refuse_deletes(state: &AppState, did: &str) -> Vec<String> {
 /// it up writes exactly one `jetstream.apply_failed`.
 #[tokio::test]
 async fn a_purge_that_keeps_failing_logs_one_error_when_given_up() {
-    use super::watermark::WatermarkHandle;
-    use super::workers::{Job, RetryPolicy, WorkerPool};
+    use happyview_source_jetstream::consumer::watermark::WatermarkHandle;
+    use happyview_source_jetstream::consumer::workers::{Job, RetryPolicy, WorkerPool};
 
     for state in states().await {
         let did = unique_did();

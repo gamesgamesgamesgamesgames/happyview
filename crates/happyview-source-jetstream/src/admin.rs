@@ -24,7 +24,6 @@ use crate::backfill::types::{
     CreateBackfillBody, ReplayProgress,
 };
 use crate::backfill::*;
-use crate::source::JetstreamSource;
 
 // ---------------------------------------------------------------------------
 // Admin handlers
@@ -39,7 +38,7 @@ pub async fn create_backfill(
     admin.require("backfill:create")?;
 
     let source = match body.source.as_deref() {
-        None => state.default_source,
+        None => state.archive.default_source,
         Some(raw) => crate::archive::parse_source(raw).ok_or_else(|| {
             AdminError::BadRequest("source must be one of auto, replay, crawl".into())
         })?,
@@ -296,9 +295,7 @@ pub async fn resume_backfill(
         Some((status, _, scope))
             if status == "failed"
                 && scope == "dids"
-                && state
-                    .replay
-                    .job_dids(&state, &job_id)
+                && crate::backfill::replay_sweeps::job_dids(&state, &job_id)
                     .await
                     .map_err(|e| {
                         AdminError::Internal(format!("failed to read the job's accounts: {e}"))
@@ -1041,9 +1038,11 @@ pub async fn retry_failed_backfill(
             ));
         }
         let dids = if scope == "dids" {
-            let dids = state.replay.job_dids(&state, &job_id).await.map_err(|e| {
-                AdminError::Internal(format!("failed to read the job's accounts: {e}"))
-            })?;
+            let dids = crate::backfill::replay_sweeps::job_dids(&state, &job_id)
+                .await
+                .map_err(|e| {
+                    AdminError::Internal(format!("failed to read the job's accounts: {e}"))
+                })?;
             // A finished job's queue rows go with a detail flush or the
             // retention sweep. Never widen an account job to the network.
             if dids.is_empty() {
@@ -1060,9 +1059,7 @@ pub async fn retry_failed_backfill(
             crate::archive::SourceChoice::Replay,
         )
         .await?;
-        state
-            .replay
-            .insert_retries(&state, &new_job_id, &blocks)
+        crate::backfill::replay_sweeps::insert_retries(&state, &new_job_id, &blocks)
             .await
             .map_err(|e| {
                 AdminError::Internal(format!("failed to record the blocks to retry: {e}"))
@@ -1224,9 +1221,9 @@ pub async fn flush_all_backfill_details(
 // Routes
 // ---------------------------------------------------------------------------
 
-/// `/backfill*` and `/jetstream/status`, for `source`'s jobs.
-pub fn routes(source: &JetstreamSource) -> axum::Router {
-    router().with_state(source.jobs().clone())
+/// `/backfill*` and `/jetstream/status`, over `jobs`.
+pub fn routes(jobs: JobState) -> axum::Router {
+    router().with_state(jobs)
 }
 
 /// [`routes`] before it is given its jobs.

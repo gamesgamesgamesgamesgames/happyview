@@ -3,14 +3,15 @@
 //! (`happyview_backfill_replay_retries`). Every write here is load-bearing for
 //! resume, so errors propagate instead of being logged and dropped.
 
-use crate::AppState;
-use crate::db::adapt_sql;
+use happyview_provider::db::adapt_sql;
 
-pub(super) const MAX_PLAN_COLLECTIONS: usize = 100;
-pub(super) const MAX_PLAN_DIDS: usize = 10_000;
+use super::JobState;
+
+pub const MAX_PLAN_COLLECTIONS: usize = 100;
+pub const MAX_PLAN_DIDS: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SweepKind {
+pub enum SweepKind {
     Commits,
     Markers,
 }
@@ -25,7 +26,7 @@ impl SweepKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Sweep {
+pub struct Sweep {
     pub sweep: i32,
     pub kind: SweepKind,
     pub collections: Vec<String>,
@@ -41,7 +42,7 @@ pub(super) struct Sweep {
 /// job's DIDs when it targets accounts, then (for an account job) its marker
 /// sweeps, the DIDs in chunks of 10,000. A network job's marker sweeps are
 /// added later, from the DIDs the commit sweeps left holding records.
-pub(super) fn initial_sweeps(
+pub fn initial_sweeps(
     collections: &[String],
     dids: Option<&[String]>,
     after_seq: i64,
@@ -88,8 +89,8 @@ type SweepRow = (
     i32,
 );
 
-pub(super) async fn load(state: &AppState, job_id: &str) -> Result<Vec<Sweep>, sqlx::Error> {
-    let rows: Vec<SweepRow> = crate::db::query_as(&adapt_sql(
+pub async fn load(state: &JobState, job_id: &str) -> Result<Vec<Sweep>, sqlx::Error> {
+    let rows: Vec<SweepRow> = happyview_provider::db::query_as(&adapt_sql(
         "SELECT sweep, kind, collections, dids, after_seq, cursor_seq, tip_seq, last_did_id, done \
          FROM happyview_backfill_replay_sweeps WHERE job_id = ? ORDER BY sweep",
         state.db_backend,
@@ -152,11 +153,7 @@ pub(super) async fn load(state: &AppState, job_id: &str) -> Result<Vec<Sweep>, s
         .collect()
 }
 
-pub(super) async fn insert(
-    state: &AppState,
-    job_id: &str,
-    sweeps: &[Sweep],
-) -> Result<(), sqlx::Error> {
+pub async fn insert(state: &JobState, job_id: &str, sweeps: &[Sweep]) -> Result<(), sqlx::Error> {
     let sql = adapt_sql(
         "INSERT INTO happyview_backfill_replay_sweeps \
          (job_id, sweep, kind, collections, dids, after_seq, cursor_seq, tip_seq, last_did_id, done) \
@@ -169,8 +166,8 @@ pub(super) async fn insert(
             .dids
             .as_ref()
             .map(|d| serde_json::to_string(d).expect("strings serialize"));
-        crate::db::retry_on_busy(|| {
-            crate::db::query(&sql)
+        happyview_provider::db::retry_on_busy(|| {
+            happyview_provider::db::query(&sql)
                 .bind(job_id)
                 .bind(sweep.sweep)
                 .bind(sweep.kind.as_str())
@@ -188,7 +185,7 @@ pub(super) async fn insert(
 }
 
 /// Save a sweep's position, and mirror it on the job for the dashboard.
-pub(super) async fn save(state: &AppState, job_id: &str, sweep: &Sweep) -> Result<(), sqlx::Error> {
+pub async fn save(state: &JobState, job_id: &str, sweep: &Sweep) -> Result<(), sqlx::Error> {
     let backend = state.db_backend;
     let progress = adapt_sql(
         "UPDATE happyview_backfill_replay_sweeps SET cursor_seq = ?, tip_seq = ?, done = ? \
@@ -199,8 +196,8 @@ pub(super) async fn save(state: &AppState, job_id: &str, sweep: &Sweep) -> Resul
         "UPDATE happyview_backfill_jobs SET replay_through_seq = ?, replay_tip_seq = ? WHERE id = ?",
         backend,
     );
-    crate::db::retry_on_busy(|| async {
-        crate::db::query(&progress)
+    happyview_provider::db::retry_on_busy(|| async {
+        happyview_provider::db::query(&progress)
             .bind(sweep.cursor_seq)
             .bind(sweep.tip_seq)
             .bind(i32::from(sweep.done))
@@ -208,7 +205,7 @@ pub(super) async fn save(state: &AppState, job_id: &str, sweep: &Sweep) -> Resul
             .bind(sweep.sweep)
             .execute(&state.backfill_db)
             .await?;
-        crate::db::query(&mirror)
+        happyview_provider::db::query(&mirror)
             .bind(sweep.cursor_seq)
             .bind(sweep.tip_seq)
             .bind(job_id)
@@ -221,17 +218,13 @@ pub(super) async fn save(state: &AppState, job_id: &str, sweep: &Sweep) -> Resul
 
 /// Replace the DIDs of a marker sweep that has not planned yet (a retry
 /// job adds the DIDs each refetched block wrote).
-pub(super) async fn set_dids(
-    state: &AppState,
-    job_id: &str,
-    sweep: &Sweep,
-) -> Result<(), sqlx::Error> {
+pub async fn set_dids(state: &JobState, job_id: &str, sweep: &Sweep) -> Result<(), sqlx::Error> {
     let dids = sweep
         .dids
         .as_ref()
         .map(|d| serde_json::to_string(d).expect("strings serialize"));
-    crate::db::retry_on_busy(|| {
-        crate::db::query(&adapt_sql(
+    happyview_provider::db::retry_on_busy(|| {
+        happyview_provider::db::query(&adapt_sql(
             "UPDATE happyview_backfill_replay_sweeps SET dids = ? WHERE job_id = ? AND sweep = ?",
             state.db_backend,
         ))
@@ -245,9 +238,9 @@ pub(super) async fn set_dids(
 }
 
 /// Forget a job's sweeps (an `auto` job that fell back to crawling).
-pub(super) async fn clear(state: &AppState, job_id: &str) -> Result<(), sqlx::Error> {
-    crate::db::retry_on_busy(|| {
-        crate::db::query(&adapt_sql(
+pub async fn clear(state: &JobState, job_id: &str) -> Result<(), sqlx::Error> {
+    happyview_provider::db::retry_on_busy(|| {
+        happyview_provider::db::query(&adapt_sql(
             "DELETE FROM happyview_backfill_replay_sweeps WHERE job_id = ?",
             state.db_backend,
         ))
@@ -258,13 +251,9 @@ pub(super) async fn clear(state: &AppState, job_id: &str) -> Result<(), sqlx::Er
     Ok(())
 }
 
-pub(super) async fn set_source(
-    state: &AppState,
-    job_id: &str,
-    source: &str,
-) -> Result<(), sqlx::Error> {
-    crate::db::retry_on_busy(|| {
-        crate::db::query(&adapt_sql(
+pub async fn set_source(state: &JobState, job_id: &str, source: &str) -> Result<(), sqlx::Error> {
+    happyview_provider::db::retry_on_busy(|| {
+        happyview_provider::db::query(&adapt_sql(
             "UPDATE happyview_backfill_jobs SET source = ? WHERE id = ?",
             state.db_backend,
         ))
@@ -278,20 +267,16 @@ pub(super) async fn set_source(
 
 /// Add `n` replayed records to the job's `total_records`, which spans every
 /// run of the job (a resumed run starts a fresh fold).
-pub(super) async fn add_records(state: &AppState, job_id: &str, n: i64) -> Result<(), sqlx::Error> {
+pub async fn add_records(state: &JobState, job_id: &str, n: i64) -> Result<(), sqlx::Error> {
     let sql = adapt_sql(
         &format!(
             "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
-            happyview_source_jetstream::backfill::saturating_counter(
-                "total_records",
-                "?",
-                state.db_backend
-            )
+            super::saturating_counter("total_records", "?", state.db_backend)
         ),
         state.db_backend,
     );
-    crate::db::retry_on_busy(|| {
-        crate::db::query(&sql)
+    happyview_provider::db::retry_on_busy(|| {
+        happyview_provider::db::query(&sql)
             .bind(n)
             .bind(job_id)
             .execute(&state.backfill_db)
@@ -301,8 +286,8 @@ pub(super) async fn add_records(state: &AppState, job_id: &str, n: i64) -> Resul
 }
 
 /// The job's `total_records`, across all its runs.
-pub(super) async fn records(state: &AppState, job_id: &str) -> Result<i32, sqlx::Error> {
-    let (n,): (Option<i32>,) = crate::db::query_as(&adapt_sql(
+pub async fn records(state: &JobState, job_id: &str) -> Result<i32, sqlx::Error> {
+    let (n,): (Option<i32>,) = happyview_provider::db::query_as(&adapt_sql(
         "SELECT total_records FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     ))
@@ -313,8 +298,8 @@ pub(super) async fn records(state: &AppState, job_id: &str) -> Result<i32, sqlx:
 }
 
 /// Add to the job's replay counters; returns the new totals.
-pub(super) async fn add_counters(
-    state: &AppState,
+pub async fn add_counters(
+    state: &JobState,
     job_id: &str,
     bytes: i64,
     blocks_failed: i32,
@@ -329,14 +314,14 @@ pub(super) async fn add_counters(
         "SELECT replay_bytes, replay_blocks_failed FROM happyview_backfill_jobs WHERE id = ?",
         backend,
     );
-    crate::db::retry_on_busy(|| async {
-        crate::db::query(&update)
+    happyview_provider::db::retry_on_busy(|| async {
+        happyview_provider::db::query(&update)
             .bind(bytes)
             .bind(blocks_failed)
             .bind(job_id)
             .execute(&state.backfill_db)
             .await?;
-        crate::db::query_as::<(i64, i32)>(&read)
+        happyview_provider::db::query_as::<(i64, i32)>(&read)
             .bind(job_id)
             .fetch_one(&state.backfill_db)
             .await
@@ -345,8 +330,8 @@ pub(super) async fn add_counters(
 }
 
 /// The job's replay counters, read without writing.
-pub(super) async fn counters(state: &AppState, job_id: &str) -> Result<(i64, i32), sqlx::Error> {
-    crate::db::query_as::<(i64, i32)>(&adapt_sql(
+pub async fn counters(state: &JobState, job_id: &str) -> Result<(i64, i32), sqlx::Error> {
+    happyview_provider::db::query_as::<(i64, i32)>(&adapt_sql(
         "SELECT replay_bytes, replay_blocks_failed FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     ))
@@ -356,8 +341,8 @@ pub(super) async fn counters(state: &AppState, job_id: &str) -> Result<(i64, i32
 }
 
 /// `replay_after_seq`: where a gap replay starts; 0 for a whole-archive job.
-pub(super) async fn after_seq(state: &AppState, job_id: &str) -> Result<i64, sqlx::Error> {
-    let row: Option<(Option<i64>,)> = crate::db::query_as(&adapt_sql(
+pub async fn after_seq(state: &JobState, job_id: &str) -> Result<i64, sqlx::Error> {
+    let row: Option<(Option<i64>,)> = happyview_provider::db::query_as(&adapt_sql(
         "SELECT replay_after_seq FROM happyview_backfill_jobs WHERE id = ?",
         state.db_backend,
     ))
@@ -368,8 +353,8 @@ pub(super) async fn after_seq(state: &AppState, job_id: &str) -> Result<i64, sql
 }
 
 /// The DIDs an account job targets (its queue rows).
-pub(super) async fn job_dids(state: &AppState, job_id: &str) -> Result<Vec<String>, sqlx::Error> {
-    Ok(crate::db::query_as::<(String,)>(&adapt_sql(
+pub async fn job_dids(state: &JobState, job_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    Ok(happyview_provider::db::query_as::<(String,)>(&adapt_sql(
         "SELECT DISTINCT did FROM happyview_backfill_queue WHERE job_id = ? ORDER BY did",
         state.db_backend,
     ))
@@ -381,38 +366,8 @@ pub(super) async fn job_dids(state: &AppState, job_id: &str) -> Result<Vec<Strin
     .collect())
 }
 
-/// Up to `limit` DIDs, by `happyview_dids.id` after `after_id`, that hold
-/// network records in `collections`: whose account markers a network job
-/// replays.
-pub(super) async fn next_held_dids(
-    state: &AppState,
-    collections: &[String],
-    after_id: i64,
-    limit: i64,
-) -> Result<Vec<(i64, String)>, sqlx::Error> {
-    let placeholders = vec!["?"; collections.len()].join(", ");
-    let sql = adapt_sql(
-        &format!(
-            "SELECT d.id, d.did FROM happyview_dids d WHERE d.id > ? AND EXISTS ( \
-               SELECT 1 FROM happyview_records_v2 r \
-               WHERE r.did_id = d.id AND r.indexed_at IS NOT NULL AND r.collection_id IN ( \
-                 SELECT id FROM happyview_collections WHERE nsid IN ({placeholders}))) \
-             ORDER BY d.id LIMIT ?"
-        ),
-        state.db_backend,
-    );
-    let mut query = crate::db::query_as::<(i64, String)>(&sql).bind(after_id);
-    for collection in collections {
-        query = query.bind(collection.as_str());
-    }
-    query.bind(limit).fetch_all(&state.backfill_db).await
-}
-
-pub(super) async fn retries(
-    state: &AppState,
-    job_id: &str,
-) -> Result<Vec<(String, i32)>, sqlx::Error> {
-    crate::db::query_as::<(String, i32)>(&adapt_sql(
+pub async fn retries(state: &JobState, job_id: &str) -> Result<Vec<(String, i32)>, sqlx::Error> {
+    happyview_provider::db::query_as::<(String, i32)>(&adapt_sql(
         "SELECT segment, block_index FROM happyview_backfill_replay_retries \
          WHERE job_id = ? AND done = 0 ORDER BY segment, block_index",
         state.db_backend,
@@ -424,8 +379,8 @@ pub(super) async fn retries(
 
 /// Record the blocks a retry job refetches (`block_index` -1: a whole
 /// segment), before the job is spawned.
-pub(super) async fn insert_retries(
-    state: &AppState,
+pub async fn insert_retries(
+    state: &JobState,
     job_id: &str,
     blocks: &[(String, i32)],
 ) -> Result<(), sqlx::Error> {
@@ -434,8 +389,8 @@ pub(super) async fn insert_retries(
         state.db_backend,
     );
     for (segment, block) in blocks {
-        crate::db::retry_on_busy(|| {
-            crate::db::query(&sql)
+        happyview_provider::db::retry_on_busy(|| {
+            happyview_provider::db::query(&sql)
                 .bind(job_id)
                 .bind(segment.as_str())
                 .bind(*block)
@@ -446,8 +401,8 @@ pub(super) async fn insert_retries(
     Ok(())
 }
 
-pub(super) async fn has_retries(state: &AppState, job_id: &str) -> Result<bool, sqlx::Error> {
-    let n: i64 = crate::db::query_scalar(&adapt_sql(
+pub async fn has_retries(state: &JobState, job_id: &str) -> Result<bool, sqlx::Error> {
+    let n: i64 = happyview_provider::db::query_scalar(&adapt_sql(
         "SELECT COUNT(*) FROM happyview_backfill_replay_retries WHERE job_id = ?",
         state.db_backend,
     ))
@@ -457,14 +412,14 @@ pub(super) async fn has_retries(state: &AppState, job_id: &str) -> Result<bool, 
     Ok(n > 0)
 }
 
-pub(super) async fn retry_done(
-    state: &AppState,
+pub async fn retry_done(
+    state: &JobState,
     job_id: &str,
     segment: &str,
     block: i32,
 ) -> Result<(), sqlx::Error> {
-    crate::db::retry_on_busy(|| {
-        crate::db::query(&adapt_sql(
+    happyview_provider::db::retry_on_busy(|| {
+        happyview_provider::db::query(&adapt_sql(
             "UPDATE happyview_backfill_replay_retries SET done = 1 \
              WHERE job_id = ? AND segment = ? AND block_index = ?",
             state.db_backend,
@@ -522,96 +477,5 @@ mod tests {
                 .iter()
                 .all(|s| s.after_seq == 77 && s.cursor_seq == 77)
         );
-    }
-
-    #[tokio::test]
-    async fn sweeps_round_trip_on_both_backends() {
-        let mut states = vec![crate::test_support::test_state_with_pool(
-            crate::test_support::migrated_memory_pool().await,
-        )];
-        if let Some(state) = crate::test_support::test_state_from_env().await {
-            states.push(state);
-        }
-        for state in states {
-            let job = format!("sweeps-{}", uuid::Uuid::new_v4());
-            crate::db::query(&adapt_sql(
-                "INSERT INTO happyview_backfill_jobs (id, scope, status, stage, created_at) \
-                 VALUES (?, 'network', 'running', 'pending', '2026-10-12T00:00:00+00:00')",
-                state.db_backend,
-            ))
-            .bind(&job)
-            .execute(&state.db)
-            .await
-            .unwrap();
-            let mut sweeps = initial_sweeps(&names(2), Some(&["did:plc:x".to_string()]), 5);
-            insert(&state, &job, &sweeps).await.unwrap();
-            sweeps[0].cursor_seq = 40_000_000_000;
-            sweeps[0].tip_seq = Some(50_000_000_000);
-            sweeps[0].done = true;
-            save(&state, &job, &sweeps[0]).await.unwrap();
-            assert_eq!(load(&state, &job).await.unwrap(), sweeps);
-            assert_eq!(
-                add_counters(&state, &job, 1 << 40, 2).await.unwrap(),
-                (1 << 40, 2)
-            );
-            assert_eq!(
-                add_counters(&state, &job, 10, 1).await.unwrap(),
-                ((1 << 40) + 10, 3)
-            );
-            assert_eq!(
-                counters(&state, &job).await.unwrap(),
-                ((1 << 40) + 10, 3),
-                "a read changes nothing"
-            );
-            add_records(&state, &job, 4).await.unwrap();
-            add_records(&state, &job, 4).await.unwrap();
-            assert_eq!(records(&state, &job).await.unwrap(), 8);
-        }
-    }
-
-    #[tokio::test]
-    async fn an_unreadable_sweep_row_is_an_error_not_an_empty_list() {
-        let mut states = vec![crate::test_support::test_state_with_pool(
-            crate::test_support::migrated_memory_pool().await,
-        )];
-        if let Some(state) = crate::test_support::test_state_from_env().await {
-            states.push(state);
-        }
-        let cases = [
-            ("commits", "not json", None),
-            ("commits", "[]", None),
-            ("markers", "[]", Some("{oops")),
-            ("markers", "[]", None),
-            ("bogus", "[\"app.test.c\"]", None),
-        ];
-        for state in states {
-            for (kind, collections, dids) in cases {
-                let job = format!("corrupt-{}", uuid::Uuid::new_v4());
-                crate::db::query(&adapt_sql(
-                    "INSERT INTO happyview_backfill_jobs (id, scope, status, stage, created_at) \
-                     VALUES (?, 'network', 'running', 'pending', '2026-10-12T00:00:00+00:00')",
-                    state.db_backend,
-                ))
-                .bind(&job)
-                .execute(&state.db)
-                .await
-                .unwrap();
-                crate::db::query(&adapt_sql(
-                    "INSERT INTO happyview_backfill_replay_sweeps \
-                     (job_id, sweep, kind, collections, dids, after_seq, cursor_seq) \
-                     VALUES (?, 0, ?, ?, ?, 0, 0)",
-                    state.db_backend,
-                ))
-                .bind(&job)
-                .bind(kind)
-                .bind(collections)
-                .bind(dids)
-                .execute(&state.db)
-                .await
-                .unwrap();
-                let error = load(&state, &job).await.expect_err(kind).to_string();
-                assert!(error.contains("replay sweep 0"), "{error}");
-            }
-        }
     }
 }
