@@ -427,13 +427,16 @@ pub async fn backfill_status(
                 let (source, after, through, tip, bytes, failed) = replay
                     .remove(&id)
                     .unwrap_or_else(|| ("crawl".to_string(), None, None, None, 0, 0));
-                let replay = (source != "crawl").then_some(ReplayProgress {
-                    after_seq: after.unwrap_or(0),
-                    through_seq: through,
-                    tip_seq: tip,
-                    bytes,
-                    blocks_failed: failed,
-                });
+                // Only a replay (or an `auto` job yet to probe) has replay
+                // progress; a crawl and an executor's job have none.
+                let replay =
+                    matches!(source.as_str(), "replay" | "auto").then_some(ReplayProgress {
+                        after_seq: after.unwrap_or(0),
+                        through_seq: through,
+                        tip_seq: tip,
+                        bytes,
+                        blocks_failed: failed,
+                    });
                 BackfillJob {
                     id,
                     collection,
@@ -1004,6 +1007,14 @@ pub async fn retry_failed_backfill(
     let Some((collection, source, scope)) = row else {
         return Err(AdminError::NotFound("backfill job not found".into()));
     };
+
+    // An executor's job: its failures are its executor's to retry, never a
+    // crawl's.
+    if !crate::archive::is_builtin_source(&source) {
+        return Err(AdminError::BadRequest(format!(
+            "this job's failures are retried by its executor ({source}); start a new backfill"
+        )));
+    }
 
     if source == "replay" {
         if let Some(requested) = &body.kinds

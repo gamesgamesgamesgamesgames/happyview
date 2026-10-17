@@ -4,7 +4,9 @@
 pub mod admin;
 pub mod archive;
 pub mod backfill;
+pub mod compose;
 pub mod consumer;
 pub mod source;
 
-pub use source::JetstreamSource;
+pub use compose::{BackfillExecutor, JobHandle, JobTotals};
+pub use source::{JetstreamSource, JetstreamSourceBuilder};

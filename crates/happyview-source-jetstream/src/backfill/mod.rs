@@ -27,6 +27,7 @@ use happyview_provider::{Host, ProviderEvent, Severity};
 
 use crate::admin::AdminError;
 use crate::archive::{ArchiveConfig, SourceChoice};
+use crate::compose::{BackfillExecutor, Composition, JobHandle};
 use crate::consumer::config::Endpoint;
 
 pub use crawl::*;
@@ -59,6 +60,8 @@ pub struct JobState {
     pub backfill_events_tx: broadcast::Sender<BackfillEvent>,
     /// The jobs running in this process.
     pub running: RunningJobs,
+    /// What a composing provider streams live and backfills itself.
+    pub compose: Composition,
 }
 
 /// The addresses a crawl asks.
@@ -85,6 +88,7 @@ impl JobState {
             endpoint,
             backfill_events_tx: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
             running: RunningJobs::default(),
+            compose: Composition::default(),
             host,
         }
     }
@@ -95,6 +99,7 @@ impl JobState {
         Self {
             backfill_events_tx: self.backfill_events_tx.clone(),
             running: self.running.clone(),
+            compose: self.compose.clone(),
             ..Self::new(host, self.archive.clone(), self.endpoint.clone())
         }
     }
@@ -580,7 +585,7 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
 
     // Load job metadata
     let sql = adapt_sql(
-        "SELECT collection, did, stage, queue_version, discovery_complete, scope, source FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT collection, did, stage, queue_version, discovery_complete, scope, source, replay_after_seq FROM happyview_backfill_jobs WHERE id = ?",
         backend,
     );
     #[allow(clippy::type_complexity)]
@@ -592,6 +597,7 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
         i32,
         String,
         String,
+        Option<i64>,
     )> = happyview_provider::db::query_as(&sql)
         .bind(&job_id)
         .fetch_optional(&state.backfill_db)
@@ -599,7 +605,16 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
         .ok()
         .flatten();
 
-    let Some((collection, did, stage, queue_version, discovery_complete, scope, source)) = job
+    let Some((
+        collection,
+        did,
+        stage,
+        queue_version,
+        discovery_complete,
+        scope,
+        source,
+        replay_after_seq,
+    )) = job
     else {
         tracing::error!(job_id, "backfill job not found");
         return;
@@ -616,7 +631,15 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
         }
         vec![col.clone()]
     } else {
-        state.host.tracked_collections().borrow().clone()
+        let tracked = state.host.tracked_collections().borrow().clone();
+        // A collection with an executor is backfilled by that executor's
+        // jobs, and a gap in the live stream is only in what it streams.
+        let gap = replay_after_seq.is_some();
+        tracked
+            .into_iter()
+            .filter(|c| state.compose.executor(c).is_none())
+            .filter(|c| !gap || state.compose.streams(c))
+            .collect()
     };
 
     if collections.is_empty() {
@@ -628,6 +651,12 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
             Some("no backfill-eligible collections"),
         )
         .await;
+        return;
+    }
+
+    // Not one of the source's own: an executor's job.
+    if !crate::archive::is_builtin_source(&source) {
+        run_executor_job(&state, &job_id, collection.as_deref(), &source).await;
         return;
     }
 
@@ -1009,6 +1038,13 @@ pub async fn start_backfill_with(
     } else {
         SourceChoice::Crawl
     };
+    // A collection with an executor is backfilled by it.
+    if dids.is_empty()
+        && let Some(col) = collection.as_deref()
+        && let Some(executor) = state.compose.executor(col)
+    {
+        return start_executor_job(state, col, executor, actor_did).await;
+    }
     let job_id = create_backfill_job_with(state, collection.as_deref(), &dids, source).await?;
     let scope = if dids.is_empty() { "network" } else { "dids" };
 
@@ -1034,7 +1070,152 @@ pub async fn start_backfill_with(
         run_backfill_job(spawn_state, spawn_job_id).await;
     });
 
+    // A network backfill of every collection leaves the collections with an
+    // executor out (see `run_backfill_job_with`); each gets its executor's
+    // own job.
+    if collection.is_none() && dids.is_empty() && state.compose.executor_for.is_some() {
+        let tracked = state.host.tracked_collections().borrow().clone();
+        for col in tracked {
+            let Some(executor) = state.compose.executor(&col) else {
+                continue;
+            };
+            if let Err(e) = start_executor_job(state, &col, executor, actor_did).await {
+                tracing::warn!(collection = %col, error = %e, "could not start an executor backfill");
+            }
+        }
+    }
+
     Ok(job_id)
+}
+
+// ---------------------------------------------------------------------------
+// Executor jobs
+// ---------------------------------------------------------------------------
+
+/// Create and spawn a job of `executor` backfilling `collection`. Its
+/// `source` is the executor's name.
+pub async fn start_executor_job(
+    state: &JobState,
+    collection: &str,
+    executor: Arc<dyn BackfillExecutor>,
+    actor_did: &str,
+) -> Result<String, AdminError> {
+    let name = executor.name();
+    if crate::archive::is_builtin_source(name) || name.is_empty() {
+        return Err(AdminError::Internal(format!(
+            "a backfill executor cannot be named {name:?}"
+        )));
+    }
+    let job_id = Uuid::new_v4().to_string();
+    let now = now_rfc3339();
+    // Nothing to discover: `discovery_complete = 1`.
+    let sql = adapt_sql(
+        "INSERT INTO happyview_backfill_jobs \
+         (id, collection, did, scope, status, stage, total_repos, queue_version, discovery_complete, started_at, created_at, source) \
+         VALUES (?, ?, NULL, 'network', 'running', 'pending', 0, 2, 1, ?, ?, ?)",
+        state.db_backend,
+    );
+    happyview_provider::db::retry_on_busy(|| {
+        happyview_provider::db::query(&sql)
+            .bind(&job_id)
+            .bind(collection)
+            .bind(&now)
+            .bind(&now)
+            .bind(name)
+            .execute(&state.db)
+    })
+    .await
+    .map_err(|e| AdminError::Internal(format!("failed to create backfill job: {e}")))?;
+
+    state
+        .host
+        .log_event(ProviderEvent {
+            event_type: "backfill.started".to_string(),
+            severity: Severity::Info,
+            actor_did: Some(actor_did.to_string()),
+            subject: Some(collection.to_string()),
+            detail: serde_json::json!({
+                "job_id": job_id.clone(),
+                "scope": "network",
+                "account_count": 0,
+                "source": name,
+            }),
+        })
+        .await;
+
+    let spawn_state = state.clone();
+    let spawn_job_id = job_id.clone();
+    tokio::spawn(async move {
+        run_backfill_job(spawn_state, spawn_job_id).await;
+    });
+    Ok(job_id)
+}
+
+/// Run an executor's job: the executor `name` that backfills `collection`.
+/// One no longer configured fails the job; nothing else runs it.
+async fn run_executor_job(state: &JobState, job_id: &str, collection: Option<&str>, name: &str) {
+    let Some(collection) = collection else {
+        fail_job(
+            state,
+            job_id,
+            &format!("backfill executor '{name}' has no collection to backfill"),
+        )
+        .await;
+        return;
+    };
+    let Some(executor) = state
+        .compose
+        .executor(collection)
+        .filter(|executor| executor.name() == name)
+    else {
+        fail_job(
+            state,
+            job_id,
+            &format!(
+                "backfill executor '{name}' is not configured for {collection}; start a new backfill"
+            ),
+        )
+        .await;
+        return;
+    };
+
+    let handle = JobHandle::new(state.clone(), job_id, collection).await;
+    let result = executor.run(handle.clone(), collection).await;
+    handle.flush_errors().await;
+    match should_stop(state, job_id).await {
+        Some("cancelling") => {
+            tracing::info!(job_id, "backfill job cancelled");
+            finalise_cancel(state, job_id).await;
+        }
+        Some(_) => {
+            tracing::info!(job_id, "backfill job paused");
+            finalise_pause(state, job_id).await;
+        }
+        None => match result {
+            Ok(totals) => {
+                let records = i32::try_from(totals.records.max(0)).unwrap_or(i32::MAX);
+                complete_job(state, job_id, handle.processed(), records, None).await;
+                state
+                    .host
+                    .log_event(ProviderEvent {
+                        event_type: "backfill.completed".to_string(),
+                        severity: Severity::Info,
+                        actor_did: None,
+                        subject: Some(collection.to_string()),
+                        detail: serde_json::json!({
+                            "job_id": job_id,
+                            "source": name,
+                            "total_records": records,
+                        }),
+                    })
+                    .await;
+            }
+            Err(error) => {
+                tracing::error!(job_id, executor = name, error, "executor backfill failed");
+                fail_job(state, job_id, &error).await;
+            }
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------

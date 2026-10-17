@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use crate::admin::AdminError;
 use crate::archive::{ArchiveConfig, SourceChoice};
 use crate::backfill::{JobState, RunningJobs};
+use crate::compose::{BackfillExecutor, Composition};
 use crate::consumer::{self, config::Settings, workers::RetryPolicy};
 
 /// Tables counted into telemetry `totals`, as (payload key, table name).
@@ -40,6 +41,8 @@ pub struct JetstreamSource {
     settings: Option<Settings>,
     /// `None`: the replay settings, read when a host is given.
     archive: Option<ArchiveConfig>,
+    /// What a composing provider streams live and backfills itself.
+    compose: Composition,
     /// Shared by every job system this source builds, so `backfill_running`
     /// sees each job it runs.
     running: RunningJobs,
@@ -63,6 +66,7 @@ struct Bound {
 pub struct JetstreamSourceBuilder {
     settings: Option<Settings>,
     archive: Option<ArchiveConfig>,
+    compose: Composition,
 }
 
 impl JetstreamSourceBuilder {
@@ -75,6 +79,27 @@ impl JetstreamSourceBuilder {
     /// Replay the archive by `archive` instead of the environment's.
     pub fn archive(mut self, archive: ArchiveConfig) -> Self {
         self.archive = Some(archive);
+        self
+    }
+
+    /// Which tracked collections to stream live. Default: all. Asked again
+    /// whenever the tracked collections change. A gap in the live stream is
+    /// replayed for these collections only.
+    pub fn live_filter(mut self, f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.compose.live_filter = Some(Arc::new(f));
+        self
+    }
+
+    /// Who runs a backfill for a collection. `None` = crawl/replay as today.
+    /// A collection backfill for a collection with an executor runs as a job
+    /// of that executor, whatever source was asked for; a backfill of every
+    /// collection leaves those collections to their executors' own jobs.
+    /// Account backfills crawl, as before.
+    pub fn executor_for(
+        mut self,
+        f: impl Fn(&str) -> Option<Arc<dyn BackfillExecutor>> + Send + Sync + 'static,
+    ) -> Self {
+        self.compose.executor_for = Some(Arc::new(f));
         self
     }
 
@@ -94,6 +119,7 @@ impl JetstreamSourceBuilder {
             live,
             settings: self.settings,
             archive: self.archive,
+            compose: self.compose,
             running: RunningJobs::default(),
             bound: RwLock::new(None),
             tasks: Mutex::new(Vec::new()),
@@ -129,6 +155,7 @@ impl JetstreamSource {
             .unwrap_or_else(|| ArchiveConfig::from_env(&host.instance().user_agent));
         let mut jobs = JobState::new(host, archive, settings.endpoint.clone());
         jobs.running = self.running.clone();
+        jobs.compose = self.compose.clone();
         *self.bound.write().unwrap_or_else(|e| e.into_inner()) = Some(Bound { settings, jobs });
     }
 
@@ -164,8 +191,9 @@ impl JetstreamSource {
                 self.jobs().expect("attached above")
             }
         };
+        let compose = jobs.compose.clone();
         let gap_jobs = (jobs.archive.default_source != SourceChoice::Crawl).then_some(jobs);
-        consumer::spawn_replaying(host, settings, retry, gap_jobs)
+        consumer::spawn_replaying(host, settings, retry, gap_jobs, compose)
     }
 
     /// Stop what `start` spawned: the live consumer and the retention

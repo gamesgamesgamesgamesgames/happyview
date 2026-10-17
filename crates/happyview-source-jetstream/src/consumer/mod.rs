@@ -56,19 +56,21 @@ pub fn spawn_with(
     settings: Settings,
     retry: Option<RetryPolicy>,
 ) -> JoinHandle<()> {
-    spawn_replaying(host, settings, retry, None)
+    spawn_replaying(host, settings, retry, None, Default::default())
 }
 
 /// [`spawn_with`], replaying a refused cursor's gap from the archive as a
 /// job of `gap_jobs`. With `None` (as when backfill only crawls) a refused
-/// cursor resumes without the archive.
+/// cursor resumes without the archive. Streams the tracked collections
+/// `compose` streams live.
 pub(crate) fn spawn_replaying(
     host: Arc<dyn Host>,
     settings: Settings,
     retry: Option<RetryPolicy>,
     gap_jobs: Option<crate::backfill::JobState>,
+    compose: crate::compose::Composition,
 ) -> JoinHandle<()> {
-    let collections_rx = host.tracked_collections();
+    let collections_rx = compose.live_collections(host.tracked_collections());
     tokio::spawn(run(
         Consumer { host, gap_jobs },
         collections_rx,

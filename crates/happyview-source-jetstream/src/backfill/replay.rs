@@ -952,7 +952,8 @@ async fn decode(frame: Vec<u8>) -> Result<Vec<Row>, String> {
 /// network replay job for everything after `after_seq`, and return its id and
 /// the archive's sealed tip, where the live stream can resume at once.
 pub async fn start_gap_replay(jobs: &JobState, after_seq: i64) -> Result<(String, i64), String> {
-    let collections = jobs.host.tracked_collections().borrow().clone();
+    // The gap is in the live stream, which carries only these.
+    let collections = jobs.compose.live(&jobs.host.tracked_collections().borrow());
     if collections.is_empty() {
         return Err("there are no record collections to replay".into());
     }

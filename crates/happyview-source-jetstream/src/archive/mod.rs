@@ -61,6 +61,12 @@ pub fn parse_source(raw: &str) -> Option<SourceChoice> {
     }
 }
 
+/// Whether a job's `source` is one of the source's own backfills (`auto`,
+/// `replay` or `crawl`, as stored); anything else names an executor.
+pub fn is_builtin_source(source: &str) -> bool {
+    matches!(source, "auto" | "replay" | "crawl")
+}
+
 pub fn parse_concurrency(raw: Option<&str>) -> usize {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return DEFAULT_CONCURRENCY;
