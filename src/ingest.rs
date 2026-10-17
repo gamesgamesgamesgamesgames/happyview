@@ -215,6 +215,21 @@ pub(crate) async fn apply_batch_in(
             fill_failed(&mut out, total, outcome);
             return (out, Some(error));
         }
+        // A claimed collection's create or update changed the stored state
+        // when its delta applied.
+        if let SourceEvent::Record(ev) = &event
+            && ev.key.collection != LEXICON_SCHEMA_COLLECTION
+            && let Some(ext) = state.records.external_route(&ev.key.collection)
+        {
+            let (outcome, changed) = if is_tracked(state, &ev.key.collection).await {
+                apply_claimed(state, ext.as_ref(), ev, Hook::Run).await
+            } else {
+                (IngestOutcome::Skipped, false)
+            };
+            out.outcomes.push(outcome);
+            out.changed.push(changed);
+            continue;
+        }
         let applied = apply_in(state, event).await;
         out.outcomes.push(applied.outcome);
         out.changed.push(false);
@@ -530,7 +545,7 @@ async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestO
     }
 
     if let Some(ext) = state.records.external_route(&ev.key.collection) {
-        return apply_claimed(state, ext.as_ref(), ev, hook).await;
+        return apply_claimed(state, ext.as_ref(), ev, hook).await.0;
     }
 
     let reason = matches!(ev.origin, Origin::Backfill { .. }).then(|| "backfill".to_string());
@@ -663,12 +678,15 @@ async fn delete_hook(
 /// runs, but cannot keep a record the storage no longer has. An event that is
 /// not `stored` came from somewhere other than the claiming store's feed and
 /// is refused, so nothing for a claimed collection is written locally.
+///
+/// Also says whether the event changed what is stored: a create or update
+/// whose Proceed or Replace delta applied.
 async fn apply_claimed(
     state: &AppState,
     ext: &dyn RecordStorage,
     ev: &RecordEvent,
     hook: Hook,
-) -> IngestOutcome {
+) -> (IngestOutcome, bool) {
     let uri = ev.key.uri();
     if !ev.stored {
         tracing::warn!(
@@ -684,12 +702,12 @@ async fn apply_claimed(
             None,
         )
         .await;
-        return IngestOutcome::Invalid;
+        return (IngestOutcome::Invalid, false);
     }
     let (delta, outcome) = match ev.action {
         Action::Create | Action::Update => {
             let Some(body) = &ev.body else {
-                return IngestOutcome::Invalid;
+                return (IngestOutcome::Invalid, false);
             };
             match hook_decision(state, ev, body, hook).await {
                 Decision::Proceed => (Delta::Proceed, IngestOutcome::Matched),
@@ -755,34 +773,39 @@ async fn apply_claimed(
             }
             Ok(_) => {
                 tracing::debug!(uri = %uri, "a retried delta's record changed since; dropped");
-                return outcome;
+                return (outcome, false);
             }
             Err(e) => {
                 tracing::warn!(uri = %uri, "failed to read a retried record: {e}");
                 log_record(state, event_type, Severity::Error, ev, &uri, Some(&e)).await;
-                return if ext.unavailable(&e) {
-                    IngestOutcome::Unavailable
-                } else {
-                    failed_write_outcome(&e)
-                };
+                return (
+                    if ext.unavailable(&e) {
+                        IngestOutcome::Unavailable
+                    } else {
+                        failed_write_outcome(&e)
+                    },
+                    false,
+                );
             }
         }
     }
     match ext.apply_delta(&ev.key, delta, for_rev.as_deref()).await {
         Ok(()) => {
-            if outcome == IngestOutcome::Matched && ev.action != Action::Delete {
+            let stored = outcome == IngestOutcome::Matched && ev.action != Action::Delete;
+            if stored {
                 fetch_labels(state, std::slice::from_ref(&uri)).await;
             }
-            outcome
+            (outcome, stored)
         }
         Err(e) => {
             tracing::warn!(uri = %uri, "failed to apply a record's delta: {e}");
             log_record(state, event_type, Severity::Error, ev, &uri, Some(&e)).await;
-            if ext.unavailable(&e) {
+            let outcome = if ext.unavailable(&e) {
                 IngestOutcome::Unavailable
             } else {
                 failed_write_outcome(&e)
-            }
+            };
+            (outcome, false)
         }
     }
 }
