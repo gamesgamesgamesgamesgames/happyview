@@ -50,6 +50,9 @@ pub(crate) enum HookedBody {
 pub(crate) struct Applied {
     pub outcome: IngestOutcome,
     pub error: Option<String>,
+    /// Whether the event changed what is stored, where it can say: a claimed
+    /// collection's create or update whose delta applied.
+    pub changed: bool,
 }
 
 impl Applied {
@@ -57,6 +60,7 @@ impl Applied {
         Self {
             outcome,
             error: None,
+            changed: false,
         }
     }
 
@@ -70,6 +74,7 @@ impl Applied {
                 IngestOutcome::Errored
             },
             error: Some(e.to_string()),
+            changed: false,
         }
     }
 }
@@ -106,7 +111,13 @@ pub async fn apply_batch(state: &AppState, events: Vec<SourceEvent>) -> BatchOut
 /// [`apply`], with the error text behind a failed account or sync event.
 pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
     match event {
-        SourceEvent::Record(ev) => Applied::ok(apply_record(state, &ev, Hook::Run).await),
+        SourceEvent::Record(ev) => {
+            let (outcome, changed) = apply_record_changed(state, &ev, Hook::Run).await;
+            Applied {
+                changed,
+                ..Applied::ok(outcome)
+            }
+        }
         SourceEvent::Account {
             did,
             active,
@@ -215,24 +226,9 @@ pub(crate) async fn apply_batch_in(
             fill_failed(&mut out, total, outcome);
             return (out, Some(error));
         }
-        // A claimed collection's create or update changed the stored state
-        // when its delta applied.
-        if let SourceEvent::Record(ev) = &event
-            && ev.key.collection != LEXICON_SCHEMA_COLLECTION
-            && let Some(ext) = state.records.external_route(&ev.key.collection)
-        {
-            let (outcome, changed) = if is_tracked(state, &ev.key.collection).await {
-                apply_claimed(state, ext.as_ref(), ev, Hook::Run).await
-            } else {
-                (IngestOutcome::Skipped, false)
-            };
-            out.outcomes.push(outcome);
-            out.changed.push(changed);
-            continue;
-        }
         let applied = apply_in(state, event).await;
         out.outcomes.push(applied.outcome);
-        out.changed.push(false);
+        out.changed.push(applied.changed);
     }
     if let Err((outcome, error)) = write_run(state, &mut run, &mut out).await {
         fill_failed(&mut out, total, outcome);
@@ -520,12 +516,19 @@ async fn fetch_labels(state: &AppState, uris: &[String]) {
 /// One record event: upsert or delete the record, run its hook, or handle a
 /// lexicon schema event.
 async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOutcome {
-    let db = &state.db;
-    let uri = ev.key.uri();
+    apply_record_changed(state, ev, hook).await.0
+}
 
+/// [`apply_record`], and whether the event changed what is stored, where it
+/// can say (see [`Applied::changed`]).
+async fn apply_record_changed(
+    state: &AppState,
+    ev: &RecordEvent,
+    hook: Hook,
+) -> (IngestOutcome, bool) {
     // Handle lexicon schema events for tracked network lexicons.
     if ev.key.collection == LEXICON_SCHEMA_COLLECTION {
-        return lexicon_schema_event(
+        let outcome = lexicon_schema_event(
             state,
             &ev.key.did,
             &ev.key.rkey,
@@ -533,6 +536,7 @@ async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestO
             ev.body.as_ref(),
         )
         .await;
+        return (outcome, false);
     }
 
     // Skip records whose collection is not tracked by a registered record-type lexicon.
@@ -541,13 +545,20 @@ async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestO
             collection = %ev.key.collection,
             "skipping record for untracked collection"
         );
-        return IngestOutcome::Skipped;
+        return (IngestOutcome::Skipped, false);
     }
 
     if let Some(ext) = state.records.external_route(&ev.key.collection) {
-        return apply_claimed(state, ext.as_ref(), ev, hook).await.0;
+        return apply_claimed(state, ext.as_ref(), ev, hook).await;
     }
 
+    (apply_local(state, ev, hook).await, false)
+}
+
+/// A tracked record event of a collection kept in the instance database.
+async fn apply_local(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestOutcome {
+    let db = &state.db;
+    let uri = ev.key.uri();
     let reason = matches!(ev.origin, Origin::Backfill { .. }).then(|| "backfill".to_string());
     match ev.action {
         Action::Create | Action::Update => {

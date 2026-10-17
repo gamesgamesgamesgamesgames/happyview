@@ -3852,3 +3852,105 @@ async fn a_bookkeeping_write_that_fails_is_logged_not_dropped() {
     .expect("count events");
     assert_eq!(logged, 1);
 }
+
+// -----------------------------------------------------------------------
+// Running jobs, as `backfill_running` answers from them
+// -----------------------------------------------------------------------
+
+/// The relay answers `collection`'s first page only after `delay`, so a job
+/// discovering it stays running that long.
+async fn mount_slow_relay_page(mock: &MockServer, collection: &str, did: &str, delay: Duration) {
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.sync.listReposByCollection"))
+        .and(query_param("collection", collection))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"repos": [{"did": did}]}))
+                .set_delay(delay),
+        )
+        .mount(mock)
+        .await;
+}
+
+/// A state over `mock` with `POST` tracked, and its Jetstream source.
+async fn running_source(
+    mock: &MockServer,
+) -> (AppState, Arc<happyview_source_jetstream::JetstreamSource>) {
+    let mut state = pipeline_state(mock, &[POST]).await;
+    let source = crate::host::attach_jetstream(&mut state, Default::default());
+    (state, source)
+}
+
+async fn until_backfill_running(state: &AppState, collection: &str, running: bool) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while state.source.backfill_running(collection).await != running {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("backfill_running({collection}) never became {running}"));
+}
+
+#[tokio::test]
+async fn a_job_runs_for_backfill_running_while_its_run_goes_on() {
+    let mock = MockServer::start().await;
+    let (state, source) = running_source(&mock).await;
+    mount_slow_relay_page(&mock, POST, "did:plc:slowrun", Duration::from_millis(800)).await;
+    mount_plc(&mock).await;
+    mount_records(&mock, "did:plc:slowrun", POST, 1).await;
+    let jobs = source.jobs().expect("attached");
+
+    assert!(!state.source.backfill_running(POST).await);
+    let job_id = create_backfill_job(&jobs, Some(POST), &[])
+        .await
+        .expect("create job");
+    let run = tokio::spawn(run_backfill_job_with(
+        jobs.clone(),
+        job_id.clone(),
+        DEFAULT_DISCOVERY_WINDOW,
+    ));
+    until_backfill_running(&state, POST, true).await;
+    assert!(
+        !state.source.backfill_running(LIKE).await,
+        "the job covers its own collection only"
+    );
+    tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("the job should finish")
+        .expect("the job should not panic");
+    assert_eq!(job_row(&state, &job_id).await.status, "completed");
+    assert!(!state.source.backfill_running(POST).await);
+}
+
+#[tokio::test]
+async fn a_resumed_job_runs_for_backfill_running_from_the_resume() {
+    let mock = MockServer::start().await;
+    let (state, source) = running_source(&mock).await;
+    mount_slow_relay_page(
+        &mock,
+        POST,
+        "did:plc:slowresume",
+        Duration::from_millis(800),
+    )
+    .await;
+    mount_plc(&mock).await;
+    mount_records(&mock, "did:plc:slowresume", POST, 1).await;
+    seed_job(
+        &state,
+        "resume-running",
+        Some(POST),
+        "network",
+        "pending",
+        2,
+        false,
+    )
+    .await;
+    let jobs = source.jobs().expect("attached");
+
+    assert!(!state.source.backfill_running(POST).await);
+    resume_backfill_jobs(&jobs).await;
+    // Running from the resume itself, before its task has run at all.
+    assert!(state.source.backfill_running(POST).await);
+    until_backfill_running(&state, POST, false).await;
+    assert_eq!(job_row(&state, "resume-running").await.status, "completed");
+}

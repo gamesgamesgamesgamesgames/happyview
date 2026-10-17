@@ -2,6 +2,7 @@
 //! contract: the live consumer, the backfill job system, archive replay and
 //! their admin routes.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
@@ -46,6 +47,8 @@ pub struct JetstreamSource {
     bound: RwLock<Option<Bound>>,
     /// The consumer and the retention sweep `start` spawned.
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Set by the first `start`: a second one does nothing.
+    started: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -94,6 +97,7 @@ impl JetstreamSourceBuilder {
             running: RunningJobs::default(),
             bound: RwLock::new(None),
             tasks: Mutex::new(Vec::new()),
+            started: AtomicBool::new(false),
         }
     }
 }
@@ -132,6 +136,11 @@ impl JetstreamSource {
         self.bound.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The jobs this source runs, as `backfill_running` answers from them.
+    pub fn running(&self) -> RunningJobs {
+        self.running.clone()
+    }
+
     /// The backfill job system this source runs, once it has a host.
     pub fn jobs(&self) -> Option<JobState> {
         self.bound().map(|bound| bound.jobs)
@@ -160,7 +169,10 @@ impl JetstreamSource {
     }
 
     /// Stop what `start` spawned: the live consumer and the retention
-    /// sweep. Running backfill jobs are left to finish.
+    /// sweep. Running backfill jobs are left to finish. A started source is
+    /// usually held for the life of the process (its host's state holds it
+    /// back), so this is reached by an explicit call; dropping a source that
+    /// is no longer held calls it too.
     pub fn stop(&self) {
         for task in self
             .tasks
@@ -202,8 +214,12 @@ impl RecordSource for JetstreamSource {
         None
     }
 
+    /// Resume the jobs the last run left running, then spawn the consumer
+    /// and the retention sweep. Once: a second call does nothing.
     async fn start(self: Arc<Self>, host: Arc<dyn Host>) -> Result<(), ProviderError> {
-        if !self.live {
+        // Once only: a second start would resume, and so run twice, the
+        // jobs the first one is running.
+        if !self.live || self.started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         self.attach(host.clone());
@@ -218,7 +234,6 @@ impl RecordSource for JetstreamSource {
                 crate::backfill::run_backfill_retention_cleanup(&jobs).await;
             })
         };
-        self.stop();
         self.tasks
             .lock()
             .unwrap_or_else(|e| e.into_inner())

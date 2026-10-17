@@ -910,3 +910,64 @@ async fn a_claimed_retry_whose_hook_now_replaces_names_the_replaced_body() {
     );
     assert_eq!(open_dead_letters(&state).await, 0);
 }
+
+/// A claimed collection's events in a batch report `changed` where their
+/// delta applied: a create or update stored, not a refused or deleted one.
+#[tokio::test]
+async fn a_batch_reports_a_claimed_delta_that_applied_as_a_change() {
+    use happyview_provider::Host;
+
+    let storage = Arc::new(FakeStorage::claiming(&[CLAIMED]).await);
+    let state = instance(Some(storage.clone())).await;
+    let body = json!({"$type": CLAIMED, "text": "arrived"});
+    let host = happyview::host::AppHost::new(state.clone());
+    let batch = host
+        .ingest_batch(vec![
+            record_event(
+                CLAIMED,
+                "c1",
+                Action::Create,
+                Some(body.clone()),
+                Some(tid(1)),
+                true,
+            ),
+            record_event(
+                CLAIMED,
+                "c2",
+                Action::Update,
+                Some(body.clone()),
+                Some(tid(2)),
+                true,
+            ),
+            // Not from the claiming store's feed: refused, nothing applied.
+            record_event(
+                CLAIMED,
+                "c3",
+                Action::Create,
+                Some(body.clone()),
+                Some(tid(3)),
+                false,
+            ),
+            record_event(CLAIMED, "c1", Action::Delete, None, Some(tid(4)), true),
+        ])
+        .await;
+    assert_eq!(
+        batch.outcomes,
+        vec![
+            IngestOutcome::Matched,
+            IngestOutcome::Matched,
+            IngestOutcome::Invalid,
+            IngestOutcome::Matched,
+        ]
+    );
+    assert_eq!(batch.changed, vec![true, true, false, false]);
+    assert_eq!(
+        storage.deltas(),
+        vec![
+            (key(CLAIMED, "c1"), Delta::Proceed, Some(tid(1))),
+            (key(CLAIMED, "c2"), Delta::Proceed, Some(tid(2))),
+            (key(CLAIMED, "c1"), Delta::Proceed, Some(tid(4))),
+        ]
+    );
+    assert_eq!(local_rows(&state).await, 0);
+}

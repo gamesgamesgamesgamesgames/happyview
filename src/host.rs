@@ -165,15 +165,22 @@ pub fn attach_jetstream(state: &mut AppState, archive: ArchiveConfig) -> Arc<Jet
         .archive(archive)
         .build_detached();
     let mut held = state.clone();
-    held.source = Arc::new(WeakSource(Arc::downgrade(&source)));
+    held.source = Arc::new(WeakSource {
+        source: Arc::downgrade(&source),
+        running: source.running(),
+    });
     source.attach(AppHost::new(held));
     state.source = source.clone();
     source
 }
 
 /// A source's host's handle back to it. Once the source is gone it answers
-/// as a detached source would.
-struct WeakSource(Weak<JetstreamSource>);
+/// on the safe side: a job it was running still counts as running, and a
+/// collection may have been backfilled, so nothing starts one on a guess.
+struct WeakSource {
+    source: Weak<JetstreamSource>,
+    running: happyview_source_jetstream::backfill::RunningJobs,
+}
 
 #[async_trait]
 impl RecordSource for WeakSource {
@@ -189,21 +196,21 @@ impl RecordSource for WeakSource {
     }
 
     async fn start(self: Arc<Self>, host: Arc<dyn Host>) -> Result<(), ProviderError> {
-        match self.0.upgrade() {
+        match self.source.upgrade() {
             Some(source) => source.start(host).await,
             None => Ok(()),
         }
     }
 
     fn admin_routes(&self) -> axum::Router {
-        match self.0.upgrade() {
+        match self.source.upgrade() {
             Some(source) => source.admin_routes(),
             None => axum::Router::new(),
         }
     }
 
     async fn start_backfill(&self, req: BackfillRequest) -> Result<Option<String>, BackfillError> {
-        match self.0.upgrade() {
+        match self.source.upgrade() {
             Some(source) => source.start_backfill(req).await,
             None => Err(BackfillError::Internal(
                 "the jetstream source has no host yet".into(),
@@ -212,28 +219,25 @@ impl RecordSource for WeakSource {
     }
 
     async fn has_backfill(&self, collection: &str) -> bool {
-        match self.0.upgrade() {
+        match self.source.upgrade() {
             Some(source) => source.has_backfill(collection).await,
-            None => false,
+            None => true,
         }
     }
 
     async fn backfill_running(&self, collection: &str) -> bool {
-        match self.0.upgrade() {
-            Some(source) => source.backfill_running(collection).await,
-            None => false,
-        }
+        self.running.covers(collection)
     }
 
     async fn status(&self) -> serde_json::Value {
-        match self.0.upgrade() {
+        match self.source.upgrade() {
             Some(source) => source.status().await,
             None => serde_json::Value::Null,
         }
     }
 
     async fn metrics(&self) -> Vec<(String, i64)> {
-        match self.0.upgrade() {
+        match self.source.upgrade() {
             Some(source) => source.metrics().await,
             None => Vec::new(),
         }
