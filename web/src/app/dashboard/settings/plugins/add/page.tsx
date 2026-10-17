@@ -185,10 +185,12 @@ export default function AddPluginPage() {
                       </span>
                     </div>
                     <div className="flex shrink-0 flex-col items-end gap-1">
-                      {/* Everything this endpoint serves comes from the
-                          curated catalogue, so the badge is a fact about the
-                          source rather than a judgement about the plugin. */}
-                      <Badge variant="secondary">Official</Badge>
+                      {/* Anyone can publish any slug to the registry, so
+                          the badge follows the publisher the entry names and
+                          not the catalogue it arrived in. */}
+                      {entry.official ? (
+                        <Badge variant="secondary">Official</Badge>
+                      ) : null}
                       {installed.has(entry.id) ? (
                         <span className="text-xs text-muted-foreground">
                           Installed
