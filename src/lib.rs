@@ -51,6 +51,7 @@ pub mod service_entries;
 pub mod service_identity;
 pub mod setup;
 pub mod spaces;
+pub mod state;
 pub mod telemetry;
 pub mod telemetry_middleware;
 pub mod test_support;

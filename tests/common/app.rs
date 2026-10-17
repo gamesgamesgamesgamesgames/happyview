@@ -130,8 +130,9 @@ impl TestApp {
             .await
             .expect("failed to seed admin user");
 
-        let project = happyview::project::shared_empty();
-        let lexicons = LexiconCatalog::new(project.clone());
+        let mut state = happyview::state::state_with_pool_on(config, pool.clone(), backend);
+        let project = state.project.clone();
+        let lexicons = LexiconCatalog::new(project);
         lexicons
             .load_from_db(&pool)
             .await
@@ -139,7 +140,6 @@ impl TestApp {
 
         let initial_collections = lexicons.get_record_collections().await;
         let (collections_tx, _collections_rx) = watch::channel(initial_collections);
-        let (labeler_subscriptions_tx, _) = watch::channel(());
 
         let atrium_http =
             std::sync::Arc::new(happyview::http_retry::HappyViewHttpClient::default());
@@ -188,77 +188,32 @@ impl TestApp {
             })
             .await;
 
-        let state = AppState {
-            config,
-            http: reqwest::Client::new(),
-            db: pool.clone(),
-            db_backend: backend,
-            records: happyview::record_store::RecordStore::shared(pool.clone(), backend)
-                .await
-                .expect("load record dictionaries"),
-            archive: happyview::jetstream::archive::ArchiveConfig::default(),
-            domain_cache,
-            lexicons,
-            scripts: happyview::catalog::ScriptCatalog::new(pool.clone(), backend, project.clone()),
-            project,
-            collections_tx,
-            labeler_subscriptions_tx,
-            labeler_subscription_cache: std::sync::Arc::new(
-                happyview::labeler::SubscriptionCache::default(),
-            ),
-            rate_limiter: happyview::rate_limit::RateLimiter::new(
-                happyview::rate_limit::RateLimitDefaults {
-                    query_cost: 1,
-                    procedure_cost: 1,
-                    proxy_cost: 1,
-                },
-            ),
-            oauth: std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
-                std::sync::Arc::new(oauth),
-            )),
-            oauth_state_store: happyview::auth::oauth_store::DbStateStore::new(
+        state.records = happyview::record_store::RecordStore::shared(pool.clone(), backend)
+            .await
+            .expect("load record dictionaries");
+        state.domain_cache = domain_cache;
+        state.lexicons = lexicons;
+        state.collections_tx = collections_tx;
+        state.oauth = std::sync::Arc::new(happyview::auth::OAuthClientRegistry::new(
+            std::sync::Arc::new(oauth),
+        ));
+        state.linked_repos_client = std::sync::Arc::new(
+            happyview::linked_repos::client::build(
+                "https://plc.directory",
+                "http://127.0.0.1:0/oauth-client-metadata.json",
+                "http://127.0.0.1:0",
+                "http://127.0.0.1:0/auth/callback".into(),
+                true,
+                oauth_scopes,
+                happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
                 pool.clone(),
                 backend,
-            ),
-            linked_repos_client: std::sync::Arc::new(
-                happyview::linked_repos::client::build(
-                    "https://plc.directory",
-                    "http://127.0.0.1:0/oauth-client-metadata.json",
-                    "http://127.0.0.1:0",
-                    "http://127.0.0.1:0/auth/callback".into(),
-                    true,
-                    oauth_scopes,
-                    happyview::auth::oauth_store::DbStateStore::new(pool.clone(), backend),
-                    pool.clone(),
-                    backend,
-                    None,
-                )
-                .expect("Failed to create test linked-repo OAuth client"),
-            ),
-            linked_repos_client_kid: None,
-            cookie_key: axum_extra::extract::cookie::Key::derive_from(
-                b"test-secret-that-is-at-least-32-bytes-long",
-            ),
-            plugin_registry: std::sync::Arc::new(plugin_registry),
-            wasm_runtime: std::sync::Arc::new(
-                happyview::plugin::WasmRuntime::new().expect("wasm runtime"),
-            ),
-            attestation_signer: None,
-            official_registry: std::sync::Arc::new(tokio::sync::RwLock::new(
-                happyview::plugin::official_registry::OfficialRegistryState::default(),
-            )),
-            official_registry_config: registry_config,
-            proxy_config: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(
-                happyview::proxy_config::ProxyConfig::default(),
-            ))),
-            backfill_db: pool.clone(),
-            backfill_events_tx: tokio::sync::broadcast::channel(16).0,
-            verbose_event_logging: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            client_jwks: Vec::new(),
-            telemetry_counters: std::sync::Arc::new(happyview::telemetry::counters::Counters::new()),
-            script_limits: std::sync::Arc::new(happyview::lua::limits::ScriptLimits::default()),
-            test: None,
-        };
+                None,
+            )
+            .expect("Failed to create test linked-repo OAuth client"),
+        );
+        state.plugin_registry = std::sync::Arc::new(plugin_registry);
+        state.official_registry_config = registry_config;
 
         if let Some(key) = state.config.token_encryption_key.as_ref() {
             db::provision_space_signing_key(&state.db, state.db_backend, key).await;
