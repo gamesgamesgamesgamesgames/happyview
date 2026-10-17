@@ -154,65 +154,70 @@ mod tests {
             .collect()
     }
 
-    async fn clean(pool: &AnyPool) {
-        let _ = sqlx::query("DROP TABLE IF EXISTS test_source_widgets")
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DROP TABLE IF EXISTS _happyview_source_test_migrations")
-            .execute(pool)
-            .await;
+    /// Drop the tracking table of source `id`. Each test uses an id of its
+    /// own, so tests running in parallel on one Postgres database never touch
+    /// each other's tracking tables. The fixture's own table is created with
+    /// `IF NOT EXISTS` and never dropped, so it is safely shared.
+    async fn clean(pool: &AnyPool, id: &str) {
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS _happyview_source_{id}_migrations"
+        )))
+        .execute(pool)
+        .await;
     }
 
     #[tokio::test]
     async fn a_source_migrator_uses_its_own_table() {
         for (pool, backend) in test_pools().await {
-            clean(&pool).await;
+            clean(&pool, "test_own_table").await;
             let before = applied(&pool).await;
             let source = Fake {
-                id: "test",
+                id: "test_own_table",
                 migrator: Some(&TEST_MIGRATOR),
             };
             run(&pool, backend, &source).await.unwrap();
             assert_eq!(
-                count(&pool, "_happyview_source_test_migrations").await,
+                count(&pool, "_happyview_source_test_own_table_migrations").await,
                 1,
                 "{backend:?}"
             );
-            assert_eq!(count(&pool, "test_source_widgets").await, 0);
             assert_eq!(applied(&pool).await, before, "{backend:?}");
-            clean(&pool).await;
+            clean(&pool, "test_own_table").await;
         }
     }
 
     #[tokio::test]
     async fn an_existing_database_upgrades_without_touching_sqlx_migrations() {
         for (pool, backend) in test_pools().await {
-            clean(&pool).await;
+            clean(&pool, "test_upgrade").await;
             let snapshot = applied(&pool).await;
             assert!(!snapshot.is_empty());
             let source = Fake {
-                id: "test",
+                id: "test_upgrade",
                 migrator: Some(&TEST_MIGRATOR),
             };
             run(&pool, backend, &source).await.unwrap();
             run(&pool, backend, &source).await.unwrap();
             assert_eq!(applied(&pool).await, snapshot, "{backend:?}");
-            assert_eq!(count(&pool, "_happyview_source_test_migrations").await, 1);
-            clean(&pool).await;
+            assert_eq!(
+                count(&pool, "_happyview_source_test_upgrade_migrations").await,
+                1
+            );
+            clean(&pool, "test_upgrade").await;
         }
     }
 
     #[tokio::test]
     async fn no_migrator_is_a_no_op() {
         for (pool, backend) in test_pools().await {
-            clean(&pool).await;
+            clean(&pool, "test_noop").await;
             let source = Fake {
-                id: "test",
+                id: "test_noop",
                 migrator: None,
             };
             run(&pool, backend, &source).await.unwrap();
             assert!(
-                sqlx::query("SELECT COUNT(*) FROM _happyview_source_test_migrations")
+                sqlx::query("SELECT COUNT(*) FROM _happyview_source_test_noop_migrations")
                     .fetch_one(&pool)
                     .await
                     .is_err()

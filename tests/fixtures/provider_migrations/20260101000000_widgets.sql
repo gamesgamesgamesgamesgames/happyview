@@ -1,1 +1,1 @@
-CREATE TABLE test_source_widgets (id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS test_source_widgets (id INTEGER PRIMARY KEY);
