@@ -6,16 +6,12 @@ use crate::db::{DatabaseBackend, adapt_sql};
 use crate::record_store::RecordStore;
 use crate::telemetry::payload;
 
-/// Tables counted into `totals`, as (payload key, table name).
+/// Tables counted into `totals`, as (payload key, table name). The record
+/// source counts its own tables (`RecordSource::metrics`).
 const COUNTED_TABLES: &[(&str, &str)] = &[
     ("space_records", "happyview_space_records"),
     ("event_logs", "happyview_event_logs"),
     ("space_record_oplog", "happyview_space_record_oplog"),
-    ("backfill_repos", "happyview_backfill_repos"),
-    ("backfill_queue", "happyview_backfill_queue"),
-    ("backfill_completions", "happyview_backfill_completions"),
-    ("backfill_pds_stats", "happyview_backfill_pds_stats"),
-    ("backfill_cursors", "happyview_backfill_cursors"),
     ("jobs", "happyview_jobs"),
     ("lexicons", crate::catalog::lexicon_rows::TABLE),
     ("spaces", "happyview_spaces"),
@@ -28,7 +24,11 @@ const COUNTED_TABLES: &[(&str, &str)] = &[
 /// How many collections appear in `top_collection_shares`.
 const TOP_COLLECTIONS: usize = 10;
 
-async fn count_table(pool: &AnyPool, backend: DatabaseBackend, table: &'static str) -> Option<i64> {
+pub(crate) async fn count_table(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    table: &'static str,
+) -> Option<i64> {
     let sql = adapt_sql(&format!("SELECT COUNT(*) FROM {table}"), backend);
     match crate::db::query_as::<(i64,)>(&sql).fetch_one(pool).await {
         Ok((n,)) => Some(n),

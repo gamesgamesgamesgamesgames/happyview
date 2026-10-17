@@ -779,7 +779,8 @@ impl RecordStore {
     /// create cannot bring the record back. A delete that finds no row
     /// tombstones only when a create could still be on its way: the account
     /// holds network records in the collection, or a backfill still writing
-    /// covers it.
+    /// covers it (`backfill_running`, which the caller asks the record source
+    /// for).
     /// Otherwise it is a delete for a record this instance never held, and the
     /// network sends millions of those. A delete without a rev (a dead-letter
     /// retry) deletes the row whatever its rev and tombstones it at the rev it
@@ -793,6 +794,7 @@ impl RecordStore {
         collection: &str,
         rev: Option<&str>,
         now: &str,
+        backfill_running: bool,
     ) -> Result<(), sqlx::Error> {
         let backend = self.backend;
         let mut tx = crate::db::begin_write(pool, backend).await?;
@@ -815,7 +817,10 @@ impl RecordStore {
                 };
                 let survived = !deleted && found.is_some();
                 let tombstone = deleted
-                    || (!survived && self.create_may_follow(&mut tx, did, collection).await?);
+                    || (!survived
+                        && self
+                            .create_may_follow(&mut tx, did, collection, backfill_running)
+                            .await?);
                 if tombstone {
                     crate::tombstones::write_record_tombstone(&mut tx, backend, uri, rev, now)
                         .await?;
@@ -891,13 +896,13 @@ impl RecordStore {
     /// Whether a create for a record `did` holds no row for could still arrive
     /// out of order: the account holds network records in `collection` (live
     /// ingest or a past backfill reached it), or a backfill covering the
-    /// collection may still write: running, or pausing or cancelling (both stop
-    /// once in-flight pages are written).
+    /// collection may still write (`backfill_running`).
     async fn create_may_follow(
         &self,
         conn: &mut AnyConnection,
         did: &str,
         collection: &str,
+        backfill_running: bool,
     ) -> Result<bool, sqlx::Error> {
         let sql = adapt_sql(
             &format!(
@@ -913,20 +918,7 @@ impl RecordStore {
             .fetch_optional(&mut *conn)
             .await?
             .is_some();
-        if held {
-            return Ok(true);
-        }
-        let sql = adapt_sql(
-            "SELECT 1 FROM happyview_backfill_jobs \
-             WHERE status IN ('running', 'pausing', 'cancelling') \
-             AND (collection IS NULL OR collection = ?) LIMIT 1",
-            self.backend,
-        );
-        Ok(crate::db::query(&sql)
-            .bind(collection)
-            .fetch_optional(&mut *conn)
-            .await?
-            .is_some())
+        Ok(held || backfill_running)
     }
 
     /// The ids of up to `limit` of the network records `did` holds,
@@ -1974,14 +1966,14 @@ mod tests {
                 .expect("write");
             let now = crate::db::now_rfc3339();
             store
-                .delete_network(&pool, &rec.uri(), &did, NSID, Some(&tid(10)), &now)
+                .delete_network(&pool, &rec.uri(), &did, NSID, Some(&tid(10)), &now, false)
                 .await
                 .expect("older delete");
             assert!(row(&store, &rec.uri()).await.is_some(), "{backend:?}");
             assert_eq!(ref_count(&store, &rec.uri()).await, 1, "{backend:?}");
 
             store
-                .delete_network(&pool, &rec.uri(), &did, NSID, Some(&tid(30)), &now)
+                .delete_network(&pool, &rec.uri(), &did, NSID, Some(&tid(30)), &now, false)
                 .await
                 .expect("newer delete");
             assert!(row(&store, &rec.uri()).await.is_none(), "{backend:?}");

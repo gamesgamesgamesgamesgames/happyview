@@ -21,6 +21,7 @@ pub const PLATFORM_ACTOR: &str = "platform";
 /// (`require_domain_access`, `is_platform`). Deliberately tiny.
 const PLATFORM_PERMISSIONS: &[Permission] = &[Permission::StatsRead];
 
+#[derive(Clone)]
 pub struct UserAuth {
     pub did: String,
     pub user_id: String,
@@ -127,6 +128,12 @@ impl UserAuth {
     /// whether the platform principal is acceptable; see `UserAuth`'s extractor
     /// and `AllowPlatform`.
     async fn authenticate(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
+        // Already authenticated by `require_admin_caller` in front of a record
+        // source's routes. Authenticating again would refuse a DPoP proof as a
+        // replay of itself.
+        if let Some(Authenticated(auth)) = parts.extensions.get::<Authenticated>() {
+            return Ok(auth.clone());
+        }
         if let Some(auth) = Self::try_api_key_auth(parts, state).await? {
             return Ok(auth);
         }
@@ -258,6 +265,44 @@ impl FromRequestParts<AppState> for UserAuth {
         }
         Ok(auth)
     }
+}
+
+/// A request's authentication, kept for the handler behind
+/// `require_admin_caller`. Only that middleware inserts it.
+#[derive(Clone)]
+struct Authenticated(UserAuth);
+
+/// In front of a record source's admin routes: authenticate the request as
+/// `AllowPlatform` does, refuse it as the handler would when that fails, and
+/// hand the source an [`AdminCaller`](happyview_provider::AdminCaller). The
+/// routes' own extractors and permission checks still run, on the same
+/// authentication.
+pub(crate) async fn require_admin_caller(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let (mut parts, body) = request.into_parts();
+    let auth = match UserAuth::authenticate(&mut parts, &state).await {
+        Ok(auth) => auth,
+        Err(e) => return e.into_response(),
+    };
+    let permissions = if auth.is_super {
+        Permission::all()
+    } else {
+        auth.permissions.clone()
+    };
+    let mut permissions: Vec<String> = permissions.iter().map(|p| p.as_str().to_string()).collect();
+    permissions.sort();
+    parts.extensions.insert(happyview_provider::AdminCaller {
+        did: auth.did.clone(),
+        permissions,
+    });
+    parts.extensions.insert(Authenticated(auth));
+    next.run(axum::extract::Request::from_parts(parts, body))
+        .await
 }
 
 /// Explicit opt-in for routes the managed-hosting platform may call. Behaves

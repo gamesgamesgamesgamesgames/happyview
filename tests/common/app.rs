@@ -219,6 +219,9 @@ impl TestApp {
             db::provision_space_signing_key(&state.db, state.db_backend, key).await;
         }
 
+        // The source holds the state it works on: give it this one, as
+        // changed above.
+        state.source = happyview::builtin_source::BuiltinSource::attached(&state);
         let router = Self::build_router(&state);
 
         Self {
@@ -244,6 +247,7 @@ impl TestApp {
     }
 
     pub fn rebuild_router(&mut self) {
+        self.state.source = happyview::builtin_source::BuiltinSource::attached(&self.state);
         self.router = Self::build_router(&self.state);
     }
 

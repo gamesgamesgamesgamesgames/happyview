@@ -156,6 +156,7 @@ pub(super) async fn preview(
         &c,
         &state.telemetry_counters,
         &state.lexicons,
+        state.source.as_ref(),
     )
     .await
     .ok_or_else(|| AppError::Internal("failed to assemble telemetry preview".to_string()))?;

@@ -135,7 +135,8 @@ pub(super) async fn add(
         && tracked.revision == 1
         && auth.has(Permission::BackfillCreate)
     {
-        match crate::admin::backfill::start_automatic_backfill(&state, nsid.clone(), &auth.did)
+        match state
+            .start_automatic_backfill(nsid.clone(), &auth.did)
             .await
         {
             Ok(job_id) => job_id,

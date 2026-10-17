@@ -21,12 +21,43 @@ where
     }
 }
 
+/// A record source's metrics: `feature.<name>.ever` and
+/// `feature.<name>.active` (non-zero for true) go to `features`, anything
+/// else to `totals`.
+fn add_source_metrics(
+    totals: &mut crate::telemetry::payload::Counters,
+    features: &mut std::collections::BTreeMap<String, crate::telemetry::payload::FeatureUsage>,
+    metrics: Vec<(String, i64)>,
+) {
+    for (key, value) in metrics {
+        let feature = key.strip_prefix("feature.").and_then(|rest| {
+            rest.strip_suffix(".ever")
+                .map(|name| (name, true))
+                .or_else(|| rest.strip_suffix(".active").map(|name| (name, false)))
+        });
+        match feature {
+            Some((name, ever)) => {
+                let usage = features.entry(name.to_string()).or_default();
+                if ever {
+                    usage.ever = value != 0;
+                } else {
+                    usage.active = value != 0;
+                }
+            }
+            None => {
+                totals.insert(key, value);
+            }
+        }
+    }
+}
+
 pub async fn assemble(
     records: &crate::record_store::RecordStore,
     db_url: &str,
     consent: &Consent,
     counters: &Counters,
     lexicons: &crate::catalog::LexiconCatalog,
+    source: &dyn happyview_provider::RecordSource,
 ) -> Option<Snapshot> {
     let instance_id = consent.instance_id.clone()?;
     let (pool, backend) = (records.db(), records.backend());
@@ -122,6 +153,11 @@ pub async fn assemble(
             None => None,
         }
     };
+    let source_metrics_fut = async {
+        budgeted("source_metrics", source.metrics())
+            .await
+            .unwrap_or_default()
+    };
     let job_runtime_seconds_fut = async {
         budgeted(
             "job_runtime_seconds",
@@ -145,6 +181,7 @@ pub async fn assemble(
         postgres_db_bytes,
         job_runtime_seconds,
         lexicon_count,
+        source_metrics,
     ) = tokio::join!(
         totals_fut,
         features_fut,
@@ -159,9 +196,12 @@ pub async fn assemble(
         postgres_db_bytes_fut,
         job_runtime_seconds_fut,
         lexicon_count_fut,
+        source_metrics_fut,
     );
 
     let mut totals = totals;
+    let mut feature_usage = feature_usage;
+    add_source_metrics(&mut totals, &mut feature_usage, source_metrics);
     totals.extend(health_counters);
     if let Some(count) = restart_count {
         totals.insert("restarts".to_string(), count);
@@ -192,7 +232,6 @@ pub async fn assemble(
     let lexicon_count = lexicon_count
         .or_else(|| totals.get("lexicons").copied())
         .unwrap_or(0);
-    let mut feature_usage = feature_usage;
     if lexicon_count > 0 {
         feature_usage
             .entry("lexicons".to_string())
@@ -259,6 +298,7 @@ mod tests {
             &c,
             &Counters::new(),
             &LexiconCatalog::detached(),
+            &crate::builtin_source::BuiltinSource::detached(),
         )
         .await;
         assert!(out.is_none());
@@ -273,6 +313,7 @@ mod tests {
             &consent(TelemetryMode::Auto),
             &Counters::new(),
             &LexiconCatalog::detached(),
+            &crate::builtin_source::BuiltinSource::detached(),
         )
         .await
         .unwrap();
@@ -299,6 +340,7 @@ mod tests {
             &consent(TelemetryMode::Manual),
             &Counters::new(),
             &LexiconCatalog::detached(),
+            &crate::builtin_source::BuiltinSource::detached(),
         )
         .await
         .unwrap();
@@ -318,6 +360,7 @@ mod tests {
             &c,
             &Counters::new(),
             &LexiconCatalog::detached(),
+            &crate::builtin_source::BuiltinSource::detached(),
         )
         .await
         .unwrap();
@@ -336,6 +379,7 @@ mod tests {
             &c,
             &Counters::new(),
             &LexiconCatalog::detached(),
+            &crate::builtin_source::BuiltinSource::detached(),
         )
         .await
         .unwrap();
@@ -360,6 +404,7 @@ mod tests {
             &consent(TelemetryMode::Auto),
             &Counters::new(),
             &LexiconCatalog::detached(),
+            &crate::builtin_source::BuiltinSource::detached(),
         )
         .await;
 
@@ -381,6 +426,7 @@ mod tests {
             &consent(TelemetryMode::Auto),
             &Counters::new(),
             &LexiconCatalog::detached(),
+            &crate::builtin_source::BuiltinSource::detached(),
         )
         .await
         .unwrap();
@@ -408,6 +454,7 @@ mod tests {
             &consent(TelemetryMode::Auto),
             &Counters::new(),
             &LexiconCatalog::detached(),
+            &crate::builtin_source::BuiltinSource::detached(),
         )
         .await
         .unwrap();
@@ -453,11 +500,51 @@ mod tests {
             &consent(TelemetryMode::Auto),
             &Counters::new(),
             &catalog,
+            &crate::builtin_source::BuiltinSource::detached(),
         )
         .await
         .unwrap();
 
         assert_eq!(snap.lexicons.count, 1);
         assert!(snap.features["lexicons"].ever);
+    }
+
+    /// The backfill tables and the `backfill` feature come from the record
+    /// source, under the keys the payload has always had.
+    #[tokio::test]
+    async fn the_record_source_reports_its_tables_and_features() {
+        let state = crate::test_support::test_state_with_pool(pool_for_assembly().await);
+        crate::db::query(
+            "INSERT INTO happyview_backfill_jobs (id, collection, status, created_at) \
+             VALUES ('job', 'com.example.thing', 'completed', ?)",
+        )
+        .bind(crate::db::now_rfc3339())
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let snap = assemble(
+            &state.records,
+            "sqlite::memory:",
+            &consent(TelemetryMode::Auto),
+            &Counters::new(),
+            &LexiconCatalog::detached(),
+            state.source.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        for key in [
+            "backfill_repos",
+            "backfill_queue",
+            "backfill_completions",
+            "backfill_pds_stats",
+            "backfill_cursors",
+        ] {
+            assert_eq!(snap.totals.get(key), Some(&0), "{key}");
+        }
+        assert!(!snap.totals.keys().any(|k| k.starts_with("feature.")));
+        let backfill = snap.features["backfill"];
+        assert!(backfill.ever && backfill.active);
     }
 }

@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod auth;
 pub mod blobs;
+pub mod builtin_source;
 pub mod catalog;
 pub mod cid_verify;
 pub mod cli;
@@ -47,6 +48,7 @@ pub mod record_refs;
 pub mod record_store;
 pub mod repo;
 pub mod resolve;
+pub mod run;
 pub mod script;
 pub mod server;
 pub mod service_entries;
@@ -63,6 +65,8 @@ pub mod tombstones;
 pub mod verification_methods;
 pub mod version;
 pub mod xrpc;
+
+pub use run::{Providers, run};
 
 use auth::oauth_store::{DbSessionStore, DbStateStore};
 use catalog::LexiconCatalog;
@@ -102,6 +106,9 @@ pub struct AppState {
     pub db_backend: DatabaseBackend,
     /// The record tables' one reader and writer (see `record_store`).
     pub records: record_store::RecordStore,
+    /// Where records come from: live ingest, backfills and their admin
+    /// routes (`happyview::run`'s `Providers::source`).
+    pub source: Arc<dyn happyview_provider::RecordSource>,
     /// Replay backfill settings (`JETSTREAM_API_KEY`, `BACKFILL_SOURCE`, ...).
     pub archive: crate::jetstream::archive::ArchiveConfig,
     pub domain_cache: domain::DomainCache,
@@ -138,6 +145,33 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The one way to start a backfill nobody explicitly asked for (an
+    /// upload's or a project lexicon's `backfill = true`), so that
+    /// `HAPPYVIEW_DEV_BACKFILL` (`auto_backfill`) is honoured in one place.
+    /// `None` means it was not started.
+    pub async fn start_automatic_backfill(
+        &self,
+        collection: String,
+        actor: &str,
+    ) -> Result<Option<String>, happyview_provider::BackfillError> {
+        if !self.config.auto_backfill {
+            tracing::info!(
+                collection = collection.as_str(),
+                "automatic backfill is off; not backfilling"
+            );
+            return Ok(None);
+        }
+        self.source
+            .start_backfill(happyview_provider::BackfillRequest {
+                collection: Some(collection),
+                dids: Vec::new(),
+                source: None,
+                actor: actor.to_string(),
+                kind: happyview_provider::BackfillKind::Automatic,
+            })
+            .await
+    }
+
     /// A dispatcher over this instance's plugin registry. Cheap: every field
     /// is a handle. Built per use rather than stored so the registry, key,
     /// and pools stay the single source of truth.

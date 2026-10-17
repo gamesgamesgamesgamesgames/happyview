@@ -597,6 +597,7 @@ async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestO
             }
 
             let now = now_rfc3339();
+            let backfill_running = state.source.backfill_running(&ev.key.collection).await;
             let deleted = crate::db::with_change_reason(
                 reason,
                 crate::db::retry_on_busy(|| {
@@ -607,6 +608,7 @@ async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestO
                         &ev.key.collection,
                         ev.rev.as_deref(),
                         &now,
+                        backfill_running,
                     )
                 }),
             )

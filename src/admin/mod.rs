@@ -40,8 +40,19 @@ use axum::routing::{delete, get, patch, post, put};
 
 use crate::AppState;
 
-pub fn admin_routes(_state: AppState) -> Router<AppState> {
+pub fn admin_routes(state: AppState) -> Router<AppState> {
+    // The record source's routes, each behind the admin auth layer. Its
+    // router carries its own state, so it joins this one as a stateless one.
+    let source_routes = state
+        .source
+        .admin_routes()
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_admin_caller,
+        ))
+        .with_state(());
     Router::new()
+        .merge(source_routes)
         .route(
             "/lexicons",
             post(lexicons::upload_lexicon).get(lexicons::list_lexicons),
@@ -55,30 +66,6 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             get(lexicons::get_lexicon).delete(lexicons::delete_lexicon),
         )
         .route("/stats", get(stats::stats))
-        .route("/backfill", post(backfill::create_backfill))
-        .route("/backfill/status", get(backfill::backfill_status))
-        .route(
-            "/backfill/details",
-            delete(backfill::flush_all_backfill_details),
-        )
-        .route("/backfill/{id}/cancel", post(backfill::cancel_backfill))
-        .route("/backfill/{id}/pause", post(backfill::pause_backfill))
-        .route("/backfill/{id}/resume", post(backfill::resume_backfill))
-        .route("/backfill/{id}/events", get(backfill::backfill_events))
-        .route("/backfill/{id}/repos", get(backfill::backfill_repos))
-        .route(
-            "/backfill/{id}/pds-summary",
-            get(backfill::backfill_pds_summary),
-        )
-        .route("/backfill/{id}/errors", get(backfill::backfill_errors_list))
-        .route(
-            "/backfill/{id}/retry-failed",
-            post(backfill::retry_failed_backfill),
-        )
-        .route(
-            "/backfill/{id}/details",
-            delete(backfill::flush_backfill_details),
-        )
         .route(
             "/spaces/migration-status",
             get(spaces_migration::migration_status),
@@ -149,7 +136,6 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             post(database::schedule_vacuum).delete(database::cancel_vacuum),
         )
         .route("/storage/retrain", post(storage::retrain))
-        .route("/jetstream/status", get(jetstream::status))
         .route(
             "/network-lexicons",
             post(network_lexicons::add).get(network_lexicons::list),
@@ -306,4 +292,35 @@ pub fn admin_routes(_state: AppState) -> Router<AppState> {
             "/verification-methods/{fragment_id}",
             delete(verification_methods::delete),
         )
+}
+
+/// The in-tree record source's admin routes (`BuiltinSource::admin_routes`):
+/// backfill jobs and the live consumer's status.
+pub(crate) fn builtin_source_routes() -> Router<AppState> {
+    Router::new()
+        .route("/backfill", post(backfill::create_backfill))
+        .route("/backfill/status", get(backfill::backfill_status))
+        .route(
+            "/backfill/details",
+            delete(backfill::flush_all_backfill_details),
+        )
+        .route("/backfill/{id}/cancel", post(backfill::cancel_backfill))
+        .route("/backfill/{id}/pause", post(backfill::pause_backfill))
+        .route("/backfill/{id}/resume", post(backfill::resume_backfill))
+        .route("/backfill/{id}/events", get(backfill::backfill_events))
+        .route("/backfill/{id}/repos", get(backfill::backfill_repos))
+        .route(
+            "/backfill/{id}/pds-summary",
+            get(backfill::backfill_pds_summary),
+        )
+        .route("/backfill/{id}/errors", get(backfill::backfill_errors_list))
+        .route(
+            "/backfill/{id}/retry-failed",
+            post(backfill::retry_failed_backfill),
+        )
+        .route(
+            "/backfill/{id}/details",
+            delete(backfill::flush_backfill_details),
+        )
+        .route("/jetstream/status", get(jetstream::status))
 }

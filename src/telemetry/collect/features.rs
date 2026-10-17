@@ -19,12 +19,6 @@ const PROBES: &[Probe] = &[
         1,
     ),
     (
-        "backfill",
-        "SELECT COUNT(*) FROM happyview_backfill_jobs",
-        "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE created_at >= ?",
-        1,
-    ),
-    (
         "scripts",
         crate::catalog::script_rows::COUNT_ALL_SQL,
         crate::catalog::script_rows::COUNT_UPDATED_SINCE_SQL,
@@ -75,7 +69,12 @@ const PROBES: &[Probe] = &[
 ];
 
 /// Run a count, treating any failure as zero.
-async fn count(pool: &AnyPool, backend: DatabaseBackend, sql: &str, bind: Option<&str>) -> i64 {
+pub(crate) async fn count(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+    sql: &str,
+    bind: Option<&str>,
+) -> i64 {
     let adapted = adapt_sql(sql, backend);
     let q = crate::db::query_as::<(i64,)>(&adapted);
     let q = match bind {
@@ -91,7 +90,7 @@ async fn count(pool: &AnyPool, backend: DatabaseBackend, sql: &str, bind: Option
     }
 }
 
-fn window_start() -> String {
+pub(crate) fn window_start() -> String {
     let cutoff = chrono::Utc::now() - chrono::Duration::days(ACTIVE_WINDOW_DAYS);
     cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
 }
