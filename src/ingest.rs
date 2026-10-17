@@ -83,7 +83,7 @@ enum Hook {
 
 /// Apply one event.
 pub async fn apply(state: &AppState, event: SourceEvent) -> IngestOutcome {
-    apply_in(state, event, None).await.outcome
+    apply_in(state, event).await.outcome
 }
 
 /// Apply events in order. Runs of consecutive creates and updates are hooked
@@ -93,14 +93,8 @@ pub async fn apply_batch(state: &AppState, events: Vec<SourceEvent>) -> BatchOut
     apply_batch_in(state, events).await.0
 }
 
-/// [`apply`], with the error text behind a failure. `tracked` scopes a
-/// `#sync` purge; `None` means every tracked record collection. A replay job
-/// passes its own collections.
-pub(crate) async fn apply_in(
-    state: &AppState,
-    event: SourceEvent,
-    tracked: Option<&[String]>,
-) -> Applied {
+/// [`apply`], with the error text behind a failed account or sync event.
+pub(crate) async fn apply_in(state: &AppState, event: SourceEvent) -> Applied {
     match event {
         SourceEvent::Record(ev) => Applied::ok(apply_record(state, &ev, Hook::Run).await),
         SourceEvent::Account {
@@ -110,6 +104,7 @@ pub(crate) async fn apply_in(
             as_of_us,
             seq,
             time_us,
+            collections,
         } => {
             account_event(
                 state,
@@ -119,6 +114,7 @@ pub(crate) async fn apply_in(
                 as_of_us,
                 seq,
                 time_us,
+                collections.as_deref(),
             )
             .await
         }
@@ -128,9 +124,10 @@ pub(crate) async fn apply_in(
             as_of_us,
             seq: _,
             time_us: _,
+            collections,
         } => {
-            let tracked = match tracked {
-                Some(tracked) => tracked.to_vec(),
+            let tracked = match collections {
+                Some(collections) => collections,
                 None => state.collections_tx.borrow().clone(),
             };
             // A replayed sync acts as of its own rev, or its own time when
@@ -205,7 +202,7 @@ pub(crate) async fn apply_batch_in(
             fill_failed(&mut out, total, outcome);
             return (out, Some(error));
         }
-        let applied = apply_in(state, event, None).await;
+        let applied = apply_in(state, event).await;
         out.outcomes.push(applied.outcome);
         out.changed.push(false);
     }
@@ -518,6 +515,11 @@ async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestO
             };
             let rec_to_store = match hook_body_with(state, ev, rec, hook).await {
                 HookedBody::Store(v) => v,
+                // The delivery this retries failed open and stored the body
+                // as it arrived; the hook now says it should not be there.
+                HookedBody::Skip if ev.origin == Origin::Retry => {
+                    return remove_failed_open(state, ev, rec, &uri).await;
+                }
                 HookedBody::Skip | HookedBody::CidMismatch => return IngestOutcome::Skipped,
             };
 
@@ -612,6 +614,43 @@ async fn apply_record(state: &AppState, ev: &RecordEvent, hook: Hook) -> IngestO
                     failed_write_outcome(&e)
                 }
             }
+        }
+    }
+}
+
+/// A dead-letter retry whose hook now skips its create or update: remove the
+/// row its failed-open delivery stored, while that row still holds the
+/// dead letter's body (a newer write since is left alone). `Skipped`, or a
+/// failed delete's outcome.
+async fn remove_failed_open(
+    state: &AppState,
+    ev: &RecordEvent,
+    body: &Value,
+    uri: &str,
+) -> IngestOutcome {
+    let now = now_rfc3339();
+    let removed = crate::db::retry_on_busy(|| {
+        state.records.delete_network_if_body(
+            &state.db,
+            uri,
+            &ev.key.did,
+            &ev.key.collection,
+            body,
+            &now,
+        )
+    })
+    .await;
+    match removed {
+        Ok(removed) => {
+            if removed && state.verbose_event_logging.load(Ordering::Relaxed) {
+                log_record(state, "record.deleted", Severity::Info, ev, uri, None).await;
+            }
+            IngestOutcome::Skipped
+        }
+        Err(e) => {
+            tracing::warn!(uri = %uri, "failed to delete record: {e}");
+            log_record(state, "record.deleted", Severity::Error, ev, uri, Some(&e)).await;
+            failed_write_outcome(&e)
         }
     }
 }
@@ -738,6 +777,7 @@ async fn log(state: &AppState, event_type: &str, severity: Severity, did: &str, 
 /// itself and never lifts or lowers a newer tombstone, so applying it after
 /// the commits of the same range leaves what seq order would, and live
 /// writes made since survive. `None`: the live path.
+#[allow(clippy::too_many_arguments)]
 async fn account_event(
     state: &AppState,
     did: &str,
@@ -746,6 +786,7 @@ async fn account_event(
     as_of_us: Option<i64>,
     seq: Option<i64>,
     time_us: Option<i64>,
+    collections: Option<&[String]>,
 ) -> Applied {
     let before = as_of_us.map(tid);
     // The DID tombstone's rev: when the source saw the event.
@@ -764,6 +805,7 @@ async fn account_event(
                     "jetstream.account_deleted",
                     None,
                     before.as_deref(),
+                    collections,
                 ),
             )
             .await
@@ -779,6 +821,7 @@ async fn account_event(
                     "jetstream.account_takendown",
                     Some(status),
                     before.as_deref(),
+                    collections,
                 ),
             )
             .await
@@ -810,6 +853,7 @@ async fn account_event(
 /// The tombstone's transaction holds the DID's lock, and `purge_did_records`
 /// takes it again per batch, so that transaction commits before the purge
 /// starts.
+#[allow(clippy::too_many_arguments)]
 async fn account_purged(
     state: &AppState,
     did: &str,
@@ -818,6 +862,7 @@ async fn account_purged(
     event_type: &str,
     status: Option<&str>,
     before: Option<&str>,
+    collections: Option<&[String]>,
 ) -> Applied {
     let backend = state.db_backend;
     let deleted = status.is_none();
@@ -858,9 +903,15 @@ async fn account_purged(
     .await;
     let purged = match tombstoned {
         Ok(()) => match before {
-            None => crate::tombstones::purge_did_records(&state.records, did, None).await,
+            None => crate::tombstones::purge_did_records(&state.records, did, collections).await,
             Some(before) => {
-                crate::tombstones::purge_did_records_before(&state.records, did, None, before).await
+                crate::tombstones::purge_did_records_before(
+                    &state.records,
+                    did,
+                    collections,
+                    before,
+                )
+                .await
             }
         },
         Err(e) => Err(e),

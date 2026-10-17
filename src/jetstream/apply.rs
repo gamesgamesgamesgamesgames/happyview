@@ -109,11 +109,15 @@ pub async fn apply_replayed_marker(
 }
 
 /// The ingest event for an account, sync or identity event seen at `cursor`.
+/// `sync_scope` is the collections a `#sync` purges (the registered record
+/// collections live, a job's collections in replay). An account purge is not
+/// scoped: it removes everything held for the account, live or replayed.
 pub(crate) fn marker_event(
     did: String,
     cursor: CursorPoint,
     kind: EventKind,
     as_of_us: Option<i64>,
+    sync_scope: &[String],
 ) -> SourceEvent {
     let (seq, time_us) = (cursor.seq(), Some(cursor.time_us()));
     match kind {
@@ -124,6 +128,7 @@ pub(crate) fn marker_event(
             as_of_us,
             seq,
             time_us,
+            collections: None,
         },
         EventKind::Sync { rev } => SourceEvent::Sync {
             did,
@@ -131,6 +136,7 @@ pub(crate) fn marker_event(
             as_of_us,
             seq,
             time_us,
+            collections: Some(sync_scope.to_vec()),
         },
         EventKind::Identity { handle } => SourceEvent::Identity { did, handle },
         EventKind::Commit(_) => unreachable!("a commit is not a marker"),
@@ -145,8 +151,8 @@ async fn apply_marker(
     kind: EventKind,
     as_of_us: Option<i64>,
 ) -> ApplyOutcome {
-    let event = marker_event(did, cursor, kind, as_of_us);
-    worker_outcome(crate::ingest::apply_in(state, event, Some(tracked)).await)
+    let event = marker_event(did, cursor, kind, as_of_us, tracked);
+    worker_outcome(crate::ingest::apply_in(state, event).await)
 }
 
 /// What the worker makes of an account, sync or identity event's outcome:

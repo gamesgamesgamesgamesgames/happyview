@@ -149,9 +149,14 @@ impl ReplayFold {
                     self.flush().await?;
                 }
                 let as_of_us = Some(cursor.time_us());
-                let event = crate::jetstream::apply::marker_event(did, cursor, kind, as_of_us);
-                let applied =
-                    crate::ingest::apply_in(&self.state, event, Some(&self.tracked)).await;
+                let event = crate::jetstream::apply::marker_event(
+                    did,
+                    cursor,
+                    kind,
+                    as_of_us,
+                    &self.tracked,
+                );
+                let applied = crate::ingest::apply_in(&self.state, event).await;
                 match applied.outcome {
                     IngestOutcome::Unavailable
                     | IngestOutcome::Errored

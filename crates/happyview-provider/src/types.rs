@@ -91,6 +91,10 @@ pub enum SourceEvent {
         /// When the source saw the event. Orders a DID tombstone against
         /// commit revs; `None` means now.
         time_us: Option<i64>,
+        /// The collections a purge removes records from. `None`: every
+        /// record the instance holds for the account (a live purge).
+        /// `Some(list)`: only those, as a backfill job scoped to them does.
+        collections: Option<Vec<String>>,
     },
     Identity {
         did: String,
@@ -104,6 +108,10 @@ pub enum SourceEvent {
         seq: Option<i64>,
         /// As for `Account`.
         time_us: Option<i64>,
+        /// The collections the resync purges. `None`: every tracked record
+        /// collection (a live `#sync`). `Some(list)`: only those, as a
+        /// backfill job scoped to them does.
+        collections: Option<Vec<String>>,
     },
 }
 

@@ -756,6 +756,54 @@ impl RecordStore {
         tx.commit().await
     }
 
+    /// [`Self::delete_network`] without a rev, but only while the stored row
+    /// still holds `expected` as its body: a dead-letter retry whose hook now
+    /// skips the record removes what the failed-open delivery stored, and
+    /// leaves a row a newer write has replaced since. The check and the
+    /// delete run in one transaction under the record's locks. Returns
+    /// whether a row was removed.
+    pub async fn delete_network_if_body(
+        &self,
+        pool: &AnyPool,
+        uri: &str,
+        did: &str,
+        collection: &str,
+        expected: &Value,
+        now: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let backend = self.backend;
+        let Some((_, _, rkey)) = codec::parse_record_uri(uri) else {
+            return Ok(false);
+        };
+        let mut tx = crate::db::begin_write(pool, backend).await?;
+        crate::tombstones::lock_dids(&mut tx, backend, &[did]).await?;
+        crate::tombstones::lock_uris(&mut tx, backend, &[uri]).await?;
+        let sql = adapt_sql(&Self::get_sql(backend), backend);
+        let stored = crate::db::query_as::<StoredRow>(&sql)
+            .bind(did)
+            .bind(collection)
+            .bind(rkey)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(StoredRecord::from);
+        let holds_expected = stored
+            .and_then(|r| serde_json::from_str::<Value>(&r.record).ok())
+            .is_some_and(|body| &body == expected);
+        if !holds_expected {
+            return Ok(false);
+        }
+        let Some((id, stored_rev)) = self.find(&mut tx, did, collection, rkey).await? else {
+            return Ok(false);
+        };
+        self.delete_ids(&mut tx, &[id]).await?;
+        if let Some(stored_rev) = stored_rev {
+            crate::tombstones::write_record_tombstone(&mut tx, backend, uri, &stored_rev, now)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Whether a create for a record `did` holds no row for could still arrive
     /// out of order: the account holds network records in `collection` (live
     /// ingest or a past backfill reached it), or a backfill covering the

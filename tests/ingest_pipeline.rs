@@ -386,6 +386,7 @@ async fn the_change_reason_is_set_inside_purge_transactions() {
             as_of_us: None,
             seq: Some(1),
             time_us: Some(1_779_719_000_000_000),
+            collections: None,
         },
     )
     .await;
@@ -407,4 +408,137 @@ async fn the_change_reason_is_set_inside_purge_transactions() {
 
     assert_eq!(outcome, IngestOutcome::Matched);
     assert_eq!(reasons, vec![(Some("purge:deleted".to_string()),)]);
+}
+
+/// The id of the one open dead letter.
+async fn only_dead_letter(app: &TestApp) -> String {
+    let list = app.get_json("/admin/dead-letters").await;
+    assert_eq!(
+        list["dead_letters"].as_array().map(Vec::len),
+        Some(1),
+        "{list}"
+    );
+    list["dead_letters"][0]["id"]
+        .as_str()
+        .expect("dead letter listed")
+        .to_string()
+}
+
+async fn open_dead_letters(app: &TestApp) -> i64 {
+    let (n,): (i64,) = happyview::db::query_as(
+        "SELECT COUNT(*) FROM happyview_dead_letter_scripts WHERE resolved_at IS NULL",
+    )
+    .fetch_one(&app.state.db)
+    .await
+    .expect("count dead letters");
+    n
+}
+
+/// Review Focus 2: the delivery failed open and stored the body as it
+/// arrived; a retry whose hook now returns nil removes it.
+#[tokio::test]
+#[serial]
+async fn a_dead_letter_retry_whose_hook_now_skips_removes_the_record() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    let trigger = format!("record.create:{GAME}");
+    install_script(&app, &trigger, "error:runtime").await;
+    let body = json!({"$type": GAME, "name": "arrived"});
+    let _ = happyview::ingest::apply(
+        &app.state,
+        create("skip", body.clone(), Some(cid_of(&body)), Origin::Live),
+    )
+    .await;
+    assert_eq!(
+        stored(&app, "skip").await,
+        Some(body),
+        "fail-open stores it"
+    );
+
+    install_script(&app, &trigger, "value:none").await;
+    let id = only_dead_letter(&app).await;
+    let (status, response) = app
+        .post_json_status(&format!("/admin/dead-letters/{id}/retry"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{response}");
+
+    assert_eq!(stored(&app, "skip").await, None);
+    assert_eq!(open_dead_letters(&app).await, 0);
+}
+
+/// The removal only takes the row the failed delivery stored: a newer write
+/// since then survives the retry.
+#[tokio::test]
+#[serial]
+async fn a_skipping_retry_leaves_a_newer_write_alone() {
+    common::require_db!();
+    require_fixture!();
+    let app = app().await;
+    let trigger = format!("record.create:{GAME}");
+    install_script(&app, &trigger, "error:runtime").await;
+    let body = json!({"$type": GAME, "name": "arrived"});
+    let _ = happyview::ingest::apply(
+        &app.state,
+        create("newer", body.clone(), Some(cid_of(&body)), Origin::Live),
+    )
+    .await;
+
+    // A hook that passes records through, then a newer version of it.
+    install_script(&app, &trigger, "value:other").await;
+    let newer = json!({"$type": GAME, "name": "edited"});
+    assert_eq!(
+        happyview::ingest::apply(
+            &app.state,
+            create("newer", newer.clone(), Some(cid_of(&newer)), Origin::Live),
+        )
+        .await,
+        IngestOutcome::Matched
+    );
+
+    install_script(&app, &trigger, "value:none").await;
+    let id = only_dead_letter(&app).await;
+    let (status, response) = app
+        .post_json_status(&format!("/admin/dead-letters/{id}/retry"), json!({}))
+        .await;
+    assert_eq!(status, 200, "{response}");
+
+    assert_eq!(stored(&app, "newer").await, Some(newer));
+    assert_eq!(open_dead_letters(&app).await, 0);
+}
+
+/// `collections: Some(list)` scopes a `#sync` purge to that list; `None`
+/// purges every tracked collection.
+#[tokio::test]
+#[serial]
+async fn a_scoped_sync_purges_only_its_collections() {
+    common::require_db!();
+    let app = app().await;
+    let body = json!({"$type": GAME, "name": "held"});
+    assert_eq!(
+        happyview::ingest::apply(
+            &app.state,
+            create("scoped", body.clone(), None, Origin::Live)
+        )
+        .await,
+        IngestOutcome::Matched
+    );
+    let sync = |collections: Option<Vec<String>>| SourceEvent::Sync {
+        did: DID.to_string(),
+        rev: None,
+        as_of_us: None,
+        seq: None,
+        time_us: None,
+        collections,
+    };
+
+    let _ = happyview::ingest::apply(
+        &app.state,
+        sync(Some(vec!["com.example.other".to_string()])),
+    )
+    .await;
+    assert_eq!(stored(&app, "scoped").await, Some(body), "out of scope");
+
+    let _ = happyview::ingest::apply(&app.state, sync(Some(vec![GAME.to_string()]))).await;
+    assert_eq!(stored(&app, "scoped").await, None, "in scope");
 }
