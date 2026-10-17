@@ -47,7 +47,9 @@ test("the catalogue badges the official plugin only", async ({ page }) => {
   );
   await loginAsTestAdmin(page);
   await page.goto("/dashboard/settings/plugins");
-  await page.getByRole("link", { name: "Add plugin" }).click();
+  // Two of these lead to the catalogue while nothing is installed: the
+  // header action and the empty state's own call to action.
+  await page.getByRole("link", { name: "Add plugin" }).first().click();
   await expect(page).toHaveURL(/\/dashboard\/settings\/plugins\/add\/?$/);
 
   const official = page.getByRole("link", { name: /Lua/ });
