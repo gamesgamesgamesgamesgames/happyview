@@ -8,13 +8,11 @@
 //! dictionary (`compression`).
 
 pub mod apply;
-pub mod archive;
-pub mod compression;
-pub mod config;
+pub use happyview_source_jetstream::archive;
+pub use happyview_source_jetstream::consumer::{compression, config, event, watermark};
+
 pub mod cursor;
-pub mod event;
 pub mod status;
-pub mod watermark;
 pub mod workers;
 
 use std::collections::HashSet;

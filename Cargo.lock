@@ -1950,6 +1950,7 @@ dependencies = [
  "happyview-plugin-sdk",
  "happyview-provider",
  "happyview-scopes",
+ "happyview-source-jetstream",
  "hex",
  "hickory-resolver",
  "hkdf 0.13.0",
@@ -2091,6 +2092,24 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "happyview-source-jetstream"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "happyview-provider",
+ "reqwest",
+ "serde",
+ "serde_ipld_dagcbor",
+ "serde_json",
+ "serial_test",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
+ "zstd",
 ]
 
 [[package]]

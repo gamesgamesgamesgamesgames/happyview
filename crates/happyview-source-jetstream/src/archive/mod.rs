@@ -131,7 +131,7 @@ pub fn parse_api_key(raw: Option<&str>) -> Option<String> {
 #[derive(Clone, Debug)]
 pub struct ArchiveConfig {
     /// The client archive requests go through, built once: see
-    /// `http_retry::build_archive_client`.
+    /// `archive_client`.
     pub http: reqwest::Client,
     /// The archive's byte quota, learned from its responses and shared by
     /// every client built from this config: one key, one bucket.
@@ -163,7 +163,7 @@ pub struct ArchiveConfig {
 impl Default for ArchiveConfig {
     fn default() -> Self {
         Self {
-            http: archive_client(),
+            http: archive_client(DEFAULT_USER_AGENT),
             pacer: Arc::default(),
             api_key: None,
             concurrency: DEFAULT_CONCURRENCY,
@@ -178,11 +178,11 @@ impl Default for ArchiveConfig {
 }
 
 impl ArchiveConfig {
-    pub fn from_env() -> Self {
+    pub fn from_env(user_agent: &str) -> Self {
         let var = |name: &str| std::env::var(name).ok();
         let default_source = parse_default_source(var("BACKFILL_SOURCE").as_deref());
         Self {
-            http: archive_client(),
+            http: archive_client(user_agent),
             pacer: Arc::default(),
             api_key: parse_api_key(var("JETSTREAM_API_KEY").as_deref()),
             concurrency: parse_concurrency(var("BACKFILL_REPLAY_CONCURRENCY").as_deref()),
@@ -200,8 +200,28 @@ impl ArchiveConfig {
     }
 }
 
-fn archive_client() -> reqwest::Client {
-    crate::http_retry::build_archive_client(&crate::version::user_agent(), ARCHIVE_READ_TIMEOUT)
+/// The `User-Agent` of a config built without one, as in tests. The host
+/// passes its own to `from_env`.
+const DEFAULT_USER_AGENT: &str = concat!("HappyView-jetstream/", env!("CARGO_PKG_VERSION"));
+
+/// How long to wait for TCP + TLS before giving up on the archive host.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The client for the Jetstream archive: the shared client's connect timeout
+/// and user agent, but a `read` timeout long enough for the archive. Its
+/// network-wide plans can take 30 s before the first byte, past the shared
+/// client's read timeout. Redirects follow reqwest's default policy, which
+/// drops `Authorization` when a redirect leaves the host (a `getBlock` 307 to
+/// a CDN), so the archive key never travels further.
+fn archive_client(user_agent: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(ARCHIVE_READ_TIMEOUT)
+        .user_agent(user_agent)
+        .build()
+        // Only fails if the TLS backend can't initialise, in which case no
+        // outbound request would work anyway.
+        .expect("failed to build HTTP client")
 }
 
 #[cfg(test)]

@@ -283,7 +283,7 @@ mod tests {
     fn golden() -> Vec<u8> {
         std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/jetstream/corpus/golden_corpus_segment.jss"
+            "/../../tests/fixtures/jetstream/corpus/golden_corpus_segment.jss"
         ))
         .expect("golden segment")
     }
@@ -291,7 +291,7 @@ mod tests {
     fn golden_keys() -> Vec<(String, String)> {
         std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/jetstream/corpus/car_expected_records.tsv"
+            "/../../tests/fixtures/jetstream/corpus/car_expected_records.tsv"
         ))
         .unwrap()
         .lines()

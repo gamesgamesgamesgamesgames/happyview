@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::record_handler::LEXICON_SCHEMA_COLLECTION;
+use happyview_provider::LEXICON_SCHEMA_COLLECTION;
 
 /// Most collections either protocol takes in one subscription. Past it, v2
 /// refuses the subscription with `InvalidRequest`, so the filter is dropped
@@ -217,7 +217,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn from_env(jetstream_url: &str) -> Self {
-        use crate::config::vars::var;
+        use happyview_provider::vars::var;
         Self {
             endpoint: parse_endpoint(jetstream_url),
             protocol: parse_protocol(var("JETSTREAM_PROTOCOL").as_deref()),
@@ -416,7 +416,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn the_project_layer_reaches_the_jetstream_settings() {
-        use crate::config::vars::{LayerReset, set_project_layer};
+        use happyview_provider::vars::{LayerReset, set_project_layer};
         let _reset = LayerReset;
         unsafe {
             std::env::remove_var("JETSTREAM_PROTOCOL");

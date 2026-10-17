@@ -17,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::ArchiveConfig;
 use super::pacer::BytePacer;
-use crate::jetstream::config::Endpoint;
+use crate::consumer::config::Endpoint;
 
 pub const PLAN_PATH: &str = "/xrpc/network.bsky.jetstream.planSnapshot";
 pub const SEGMENT_PATH: &str = "/xrpc/network.bsky.jetstream.getSegment";
@@ -264,7 +264,7 @@ impl ArchiveClient {
                     }
                     // At least `retry_unit`, so `Retry-After: 0` can't spin.
                     let wait = Duration::from_secs(
-                        crate::http_retry::parse_retry_after(response.headers())
+                        happyview_provider::http::parse_retry_after(response.headers())
                             .min(MAX_THROTTLE_WAIT),
                     )
                     .max(self.retry_unit);
@@ -281,7 +281,7 @@ impl ArchiveClient {
                     if unavailable >= UNAVAILABLE_ATTEMPTS {
                         return Err(status_error(response).await);
                     }
-                    let wait = crate::http_retry::parse_retry_after(response.headers())
+                    let wait = happyview_provider::http::parse_retry_after(response.headers())
                         .min(MAX_THROTTLE_WAIT);
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                     continue;
@@ -652,7 +652,7 @@ fn content_range(response: &reqwest::Response) -> Option<(u64, u64, u64)> {
 
 async fn status_error(response: reqwest::Response) -> ArchiveError {
     let status = response.status().as_u16();
-    let body = crate::jetstream::compression::read_capped(response, 64 << 10)
+    let body = crate::consumer::compression::read_capped(response, 64 << 10)
         .await
         .unwrap_or_default();
     ArchiveError::Status {
@@ -671,7 +671,7 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     fn client(server: &MockServer, key: Option<&str>) -> ArchiveClient {
-        let endpoint = crate::jetstream::config::parse_endpoint(&server.uri());
+        let endpoint = crate::consumer::config::parse_endpoint(&server.uri());
         let config = ArchiveConfig {
             api_key: key.map(str::to_string),
             retry_unit: Duration::from_millis(5),
@@ -790,7 +790,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let endpoint = crate::jetstream::config::parse_endpoint(&format!("http://{addr}"));
+        let endpoint = crate::consumer::config::parse_endpoint(&format!("http://{addr}"));
         let config = ArchiveConfig {
             retry_unit: Duration::from_millis(1),
             ..ArchiveConfig::default()
@@ -866,7 +866,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let endpoint = crate::jetstream::config::parse_endpoint(&server.uri());
+        let endpoint = crate::consumer::config::parse_endpoint(&server.uri());
         let config = ArchiveConfig {
             retry_unit: Duration::from_millis(5),
             max_throttled_for: Duration::from_millis(50),
@@ -963,7 +963,7 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let endpoint = crate::jetstream::config::parse_endpoint(&server.uri());
+        let endpoint = crate::consumer::config::parse_endpoint(&server.uri());
         let config = ArchiveConfig::default();
         let client = ArchiveClient::new(&endpoint, &config);
         client.plan(&PlanRequest::default()).await.unwrap();
@@ -1473,7 +1473,7 @@ mod tests {
     }
 
     fn client_at(addr: std::net::SocketAddr) -> ArchiveClient {
-        let endpoint = crate::jetstream::config::parse_endpoint(&format!("http://{addr}"));
+        let endpoint = crate::consumer::config::parse_endpoint(&format!("http://{addr}"));
         let config = ArchiveConfig {
             retry_unit: Duration::from_millis(1),
             ..ArchiveConfig::default()
@@ -1594,15 +1594,15 @@ mod tests {
         // responder only fails the request, which nothing here would notice.
         let dictionary_auth = authorization_log();
         Mock::given(method("GET"))
-            .and(path(crate::jetstream::config::DICTIONARY_PATH))
+            .and(path(crate::consumer::config::DICTIONARY_PATH))
             .respond_with(recording(&dictionary_auth, ResponseTemplate::new(404)))
             .mount(&server)
             .await;
-        let endpoint = crate::jetstream::config::parse_endpoint(&server.uri());
+        let endpoint = crate::consumer::config::parse_endpoint(&server.uri());
         // A 404 makes this an error; only the request it sent matters.
-        let _ = crate::jetstream::compression::fetch_dictionary(
+        let _ = crate::consumer::compression::fetch_dictionary(
             &reqwest::Client::new(),
-            &crate::jetstream::config::dictionary_url(&endpoint),
+            &crate::consumer::config::dictionary_url(&endpoint),
         )
         .await;
         assert_eq!(

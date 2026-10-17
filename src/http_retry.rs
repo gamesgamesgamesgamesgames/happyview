@@ -46,16 +46,6 @@ pub fn shared_client() -> &'static reqwest::Client {
     SHARED_CLIENT.get_or_init(|| build_http_client(&crate::version::user_agent()))
 }
 
-/// The client for the Jetstream archive: the shared client's connect timeout
-/// and user agent, but a `read` timeout long enough for the archive. Its
-/// network-wide plans can take 30 s before the first byte, past the shared
-/// client's `READ_TIMEOUT`. Redirects follow reqwest's default policy, which
-/// drops `Authorization` when a redirect leaves the host (a `getBlock` 307 to
-/// a CDN), so the archive key never travels further.
-pub fn build_archive_client(user_agent: &str, read: Duration) -> reqwest::Client {
-    client_with_timeouts(CONNECT_TIMEOUT, read, user_agent)
-}
-
 /// The shared client's settings with redirects disabled, for callers that
 /// vet a host before sending and must not let a redirect carry the request
 /// past that check.

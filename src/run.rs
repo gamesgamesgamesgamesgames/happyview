@@ -1073,7 +1073,7 @@ async fn boot(
         http,
         records,
         source: providers.source,
-        archive: crate::jetstream::archive::ArchiveConfig::from_env(),
+        archive: crate::jetstream::archive::ArchiveConfig::from_env(&crate::version::user_agent()),
         db: db_pool,
         backfill_db: backfill_db_pool,
         db_backend,

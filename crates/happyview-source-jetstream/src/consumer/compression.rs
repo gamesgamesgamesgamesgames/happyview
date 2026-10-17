@@ -83,7 +83,7 @@ pub async fn fetch_dictionary(http: &reqwest::Client, url: &str) -> Result<Dicti
 
 /// `response`'s body, refused as soon as it is known to exceed `cap` bytes:
 /// up front from its `Content-Length`, or as its chunks arrive.
-pub(crate) async fn read_capped(
+pub async fn read_capped(
     mut response: reqwest::Response,
     cap: usize,
 ) -> Result<Vec<u8>, String> {
@@ -113,7 +113,7 @@ mod tests {
     fn fixture(name: &str) -> Vec<u8> {
         std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/jetstream")
+                .join("../../tests/fixtures/jetstream")
                 .join(name),
         )
         .expect("dictionary fixture")

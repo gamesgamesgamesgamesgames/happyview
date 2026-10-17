@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use serde::Deserialize;
 
 use super::segment::Row;
-use crate::jetstream::event::{Commit, CursorPoint, Event, EventKind};
+use crate::consumer::event::{Commit, CursorPoint, Event, EventKind};
 
 pub const KIND_CREATE: u8 = 1;
 pub const KIND_UPDATE: u8 = 2;
@@ -101,9 +101,9 @@ pub fn row_to_event(row: Row) -> Result<Option<Event>, String> {
             let (record, cid) = if row.kind == KIND_DELETE {
                 (None, None)
             } else {
-                let record = crate::cid_verify::dag_cbor_to_json(&row.payload)
+                let record = happyview_provider::cid::dag_cbor_to_json(&row.payload)
                     .map_err(|e| format!("record at seq {} does not decode: {e}", row.seq))?;
-                let cid = crate::cid_verify::dag_cbor_cid(&row.payload)
+                let cid = happyview_provider::cid::dag_cbor_cid(&row.payload)
                     .ok_or_else(|| format!("record at seq {} has no CID", row.seq))?;
                 (Some(record), Some(cid.to_string()))
             };
@@ -141,7 +141,7 @@ pub fn row_to_event(row: Row) -> Result<Option<Event>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jetstream::archive::segment::{decode_block, read_block_frame, read_index};
+    use crate::archive::segment::{decode_block, read_block_frame, read_index};
     use std::io::Cursor;
 
     fn row(seq: u64, kind: u8, collection: &str, did: &str, payload: Vec<u8>) -> Row {
@@ -167,7 +167,7 @@ mod tests {
     }
 
     fn cbor(value: serde_json::Value) -> Vec<u8> {
-        crate::cid_verify::record_to_dag_cbor(&value).unwrap()
+        happyview_provider::cid::record_to_dag_cbor(&value).unwrap()
     }
 
     fn filter(kinds: RowKinds, dids: Option<&[&str]>) -> RowFilter {
@@ -215,12 +215,12 @@ mod tests {
     fn golden_rows_become_creates_with_their_record_and_cid() {
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/jetstream/corpus/golden_corpus_segment.jss"
+            "/../../tests/fixtures/jetstream/corpus/golden_corpus_segment.jss"
         ))
         .unwrap();
         let cids: Vec<String> = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/jetstream/corpus/car_expected_records.tsv"
+            "/../../tests/fixtures/jetstream/corpus/car_expected_records.tsv"
         ))
         .unwrap()
         .lines()
@@ -251,8 +251,8 @@ mod tests {
             assert_eq!(commit.cid.as_deref(), Some(cid.as_str()));
             let record = commit.record.as_ref().expect("a record");
             assert_eq!(
-                crate::cid_verify::verify_record_cid(cid, record),
-                crate::cid_verify::CidCheck::Match
+                happyview_provider::cid::verify_record_cid(cid, record),
+                happyview_provider::cid::CidCheck::Match
             );
         }
     }

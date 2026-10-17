@@ -1,0 +1,24 @@
+[package]
+name = "happyview-source-jetstream"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "The Jetstream record source for HappyView"
+license = "MIT"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+happyview-provider = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "charset", "http2", "macos-system-configuration", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_ipld_dagcbor = "0.6"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+zstd = "0.13"
+
+[dev-dependencies]
+serial_test = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"
