@@ -887,3 +887,8 @@ mod tests {
         );
     }
 }
+
+/// The current UTC time as RFC 3339, as HappyView binds it.
+pub fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}

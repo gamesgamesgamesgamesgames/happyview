@@ -17,6 +17,7 @@ use rand::RngExt;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+pub use happyview_provider::db::now_rfc3339;
 use happyview_provider::db::{DatabaseBackend, adapt_sql};
 use happyview_provider::{Host, ProviderEvent, Severity};
 
@@ -112,11 +113,6 @@ pub trait Replay: Send + Sync + 'static {
         job_id: &str,
         blocks: &[(String, i32)],
     ) -> Result<(), sqlx::Error>;
-}
-
-/// The current UTC time, RFC 3339, as HappyView writes it.
-pub fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
 }
 
 // ---------------------------------------------------------------------------

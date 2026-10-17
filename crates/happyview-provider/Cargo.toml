@@ -13,6 +13,7 @@ testkit = []
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
+chrono = "0.4"
 cid = "0.11"
 ipld-core = { version = "0.4", features = ["serde"] }
 regex = "1.12.3"

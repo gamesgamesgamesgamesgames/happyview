@@ -24,20 +24,7 @@ const COUNTED_TABLES: &[(&str, &str)] = &[
 /// How many collections appear in `top_collection_shares`.
 const TOP_COLLECTIONS: usize = 10;
 
-pub(crate) async fn count_table(
-    pool: &AnyPool,
-    backend: DatabaseBackend,
-    table: &'static str,
-) -> Option<i64> {
-    let sql = adapt_sql(&format!("SELECT COUNT(*) FROM {table}"), backend);
-    match crate::db::query_as::<(i64,)>(&sql).fetch_one(pool).await {
-        Ok((n,)) => Some(n),
-        Err(e) => {
-            tracing::debug!(table, error = %e, "telemetry could not count table");
-            None
-        }
-    }
-}
+pub(crate) use happyview_provider::telemetry::count_table;
 
 pub async fn totals(records: &RecordStore) -> payload::Counters {
     let (pool, backend) = (records.db(), records.backend());

@@ -6,8 +6,8 @@ use sqlx::{Any, AnyPool};
 
 pub use happyview_provider::db::{
     BUSY_RETRY_ATTEMPTS, DatabaseBackend, MAX_FIELD_PATH_LEN, adapt_sql, is_invalid_data,
-    is_retryable_write_error, is_unavailable, is_valid_json_field_path, postgres_json_chain, query,
-    query_as, query_scalar, retry_on_busy, rev_compare,
+    is_retryable_write_error, is_unavailable, is_valid_json_field_path, now_rfc3339,
+    postgres_json_chain, query, query_as, query_scalar, retry_on_busy, rev_compare,
 };
 
 /// Escape the `LIKE` wildcard metacharacters (`%`, `_`) and the escape character
@@ -90,11 +90,6 @@ pub fn parse_dt(s: &str) -> DateTime<Utc> {
     // Fallback
     tracing::warn!("Failed to parse datetime string: {s}");
     DateTime::UNIX_EPOCH
-}
-
-/// Get current UTC time as RFC 3339 string for database binding.
-pub fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339()
 }
 
 /// Encode a pagination cursor from a timestamp and URI.

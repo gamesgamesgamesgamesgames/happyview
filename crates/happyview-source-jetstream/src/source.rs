@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use happyview_provider::{
     BackfillError, BackfillKind, BackfillRequest, Host, ProviderError, RecordSource,
     db::{DatabaseBackend, adapt_sql},
+    telemetry,
 };
 
 use crate::admin::AdminError;
@@ -23,9 +24,6 @@ const COUNTED_TABLES: &[(&str, &str)] = &[
     ("backfill_pds_stats", "happyview_backfill_pds_stats"),
     ("backfill_cursors", "happyview_backfill_cursors"),
 ];
-
-/// Days back a job still makes backfill an active feature in telemetry.
-const ACTIVE_WINDOW_DAYS: i64 = 7;
 
 pub struct JetstreamSource {
     settings: Settings,
@@ -199,8 +197,7 @@ impl RecordSource for JetstreamSource {
             .count_feature("SELECT COUNT(*) FROM happyview_backfill_jobs", None)
             .await
             >= 1;
-        let since = (chrono::Utc::now() - chrono::Duration::days(ACTIVE_WINDOW_DAYS))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        let since = telemetry::window_start();
         let active = ever
             && self
                 .count_feature(
@@ -217,36 +214,10 @@ impl RecordSource for JetstreamSource {
 
 impl JetstreamSource {
     async fn count_table(&self, table: &'static str) -> Option<i64> {
-        let sql = adapt_sql(
-            &format!("SELECT COUNT(*) FROM {table}"),
-            self.jobs.db_backend,
-        );
-        match happyview_provider::db::query_as::<(i64,)>(&sql)
-            .fetch_one(&self.jobs.db)
-            .await
-        {
-            Ok((n,)) => Some(n),
-            Err(e) => {
-                tracing::debug!(table, error = %e, "telemetry could not count table");
-                None
-            }
-        }
+        telemetry::count_table(&self.jobs.db, self.jobs.db_backend, table).await
     }
 
-    /// Run a count, treating any failure as zero.
     async fn count_feature(&self, sql: &str, bind: Option<&str>) -> i64 {
-        let adapted = adapt_sql(sql, self.jobs.db_backend);
-        let q = happyview_provider::db::query_as::<(i64,)>(&adapted);
-        let q = match bind {
-            Some(v) => q.bind(v),
-            None => q,
-        };
-        match q.fetch_one(&self.jobs.db).await {
-            Ok((n,)) => n,
-            Err(e) => {
-                tracing::warn!(error = %e, "telemetry feature probe failed, reporting unused");
-                0
-            }
-        }
+        telemetry::count(&self.jobs.db, self.jobs.db_backend, sql, bind).await
     }
 }

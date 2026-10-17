@@ -8,6 +8,7 @@ pub mod host;
 pub mod http;
 pub mod source;
 pub mod storage;
+pub mod telemetry;
 pub mod types;
 pub mod vars;
 

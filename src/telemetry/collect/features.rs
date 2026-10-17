@@ -4,10 +4,8 @@ use std::collections::BTreeMap;
 
 use sqlx::AnyPool;
 
-use crate::db::{DatabaseBackend, adapt_sql};
+use crate::db::DatabaseBackend;
 use crate::telemetry::payload::FeatureUsage;
-
-const ACTIVE_WINDOW_DAYS: i64 = 7;
 
 type Probe = (&'static str, &'static str, &'static str, i64);
 
@@ -68,32 +66,7 @@ const PROBES: &[Probe] = &[
     ),
 ];
 
-/// Run a count, treating any failure as zero.
-pub(crate) async fn count(
-    pool: &AnyPool,
-    backend: DatabaseBackend,
-    sql: &str,
-    bind: Option<&str>,
-) -> i64 {
-    let adapted = adapt_sql(sql, backend);
-    let q = crate::db::query_as::<(i64,)>(&adapted);
-    let q = match bind {
-        Some(v) => q.bind(v),
-        None => q,
-    };
-    match q.fetch_one(pool).await {
-        Ok((n,)) => n,
-        Err(e) => {
-            tracing::warn!(error = %e, "telemetry feature probe failed, reporting unused");
-            0
-        }
-    }
-}
-
-pub(crate) fn window_start() -> String {
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(ACTIVE_WINDOW_DAYS);
-    cutoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-}
+pub(crate) use happyview_provider::telemetry::{count, window_start};
 
 pub async fn usage(pool: &AnyPool, backend: DatabaseBackend) -> BTreeMap<String, FeatureUsage> {
     let since = window_start();
