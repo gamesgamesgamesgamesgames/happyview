@@ -61,10 +61,8 @@ pub fn var(name: &str) -> Option<String> {
 
 /// Clears the layer when dropped, so a test that installs one cannot leak
 /// it into the next. Tests holding one must be `#[serial]`.
-#[cfg(test)]
-pub(crate) struct LayerReset;
+pub struct LayerReset;
 
-#[cfg(test)]
 impl Drop for LayerReset {
     fn drop(&mut self) {
         set_project_layer(BTreeMap::new());

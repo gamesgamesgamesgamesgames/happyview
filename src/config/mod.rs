@@ -6,7 +6,7 @@ use crate::db::DatabaseBackend;
 
 pub mod declarations;
 pub mod project;
-pub mod vars;
+pub use happyview_provider::vars;
 
 pub use project::ConfigMode;
 use project::ProjectConfig;

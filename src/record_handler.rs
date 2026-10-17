@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::AppState;
 
 /// The static collection we always include for lexicon schema updates.
-pub const LEXICON_SCHEMA_COLLECTION: &str = "com.atproto.lexicon.schema";
+pub use happyview_provider::LEXICON_SCHEMA_COLLECTION;
 
 /// A generic record event that can originate from any source (Jetstream, backfill, etc.).
 pub struct RecordEvent {

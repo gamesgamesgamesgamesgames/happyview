@@ -348,7 +348,7 @@ mod tests {
     fn golden_payloads() -> Vec<Vec<u8>> {
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/jetstream/corpus/golden_corpus_segment.jss"
+            "/../../tests/fixtures/jetstream/corpus/golden_corpus_segment.jss"
         ))
         .expect("golden segment");
         let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
@@ -398,7 +398,7 @@ mod tests {
     fn golden_cids() -> Vec<String> {
         std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/jetstream/corpus/car_expected_records.tsv"
+            "/../../tests/fixtures/jetstream/corpus/car_expected_records.tsv"
         ))
         .expect("tsv")
         .lines()

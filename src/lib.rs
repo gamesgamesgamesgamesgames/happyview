@@ -3,7 +3,7 @@ pub mod auth;
 pub mod blobs;
 pub mod builtin_source;
 pub mod catalog;
-pub mod cid_verify;
+pub use happyview_provider::cid as cid_verify;
 pub mod cli;
 pub mod codemod;
 pub mod config;
