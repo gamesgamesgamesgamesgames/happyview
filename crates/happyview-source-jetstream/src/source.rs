@@ -82,8 +82,9 @@ impl JetstreamSourceBuilder {
         self
     }
 
-    /// Which tracked collections to stream live. Default: all. Asked again
-    /// whenever the tracked collections change. A gap in the live stream is
+    /// Which tracked collections to stream live. Default: all. It is asked
+    /// again only when the tracked collections change, so its answer for a
+    /// given tracked list should be stable. A gap in the live stream is
     /// replayed for these collections only.
     pub fn live_filter(mut self, f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
         self.compose.live_filter = Some(Arc::new(f));
@@ -94,7 +95,8 @@ impl JetstreamSourceBuilder {
     /// A collection backfill for a collection with an executor runs as a job
     /// of that executor, whatever source was asked for; a backfill of every
     /// collection leaves those collections to their executors' own jobs.
-    /// Account backfills crawl, as before.
+    /// Account backfills leave them out. A gap in the live stream is
+    /// replayed for every collection streamed, executor or not.
     pub fn executor_for(
         mut self,
         f: impl Fn(&str) -> Option<Arc<dyn BackfillExecutor>> + Send + Sync + 'static,
@@ -290,10 +292,10 @@ impl RecordSource for JetstreamSource {
             }
             BackfillKind::Manual => {
                 let source = match req.source.as_deref() {
-                    Some(raw) => crate::archive::parse_source(raw).ok_or_else(|| {
+                    Some(raw) => Some(crate::archive::parse_source(raw).ok_or_else(|| {
                         BackfillError::Invalid(format!("unknown backfill source: {raw}"))
-                    })?,
-                    None => jobs.archive.default_source,
+                    })?),
+                    None => None,
                 };
                 crate::backfill::start_backfill_with(
                     jobs,

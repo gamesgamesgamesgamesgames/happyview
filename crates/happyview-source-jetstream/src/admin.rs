@@ -67,7 +67,8 @@ pub async fn create_backfill(
     })
     .await?;
 
-    let job_id = start_backfill_with(&state, body.collection, dids, &admin.did, source).await?;
+    let requested = body.source.is_some().then_some(source);
+    let job_id = start_backfill_with(&state, body.collection, dids, &admin.did, requested).await?;
 
     Ok((
         StatusCode::CREATED,

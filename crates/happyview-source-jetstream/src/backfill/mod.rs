@@ -14,9 +14,11 @@ pub mod retry;
 pub mod types;
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures_util::FutureExt;
 use rand::RngExt;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -621,7 +623,10 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
     };
     let _running = state.running.enter(&job_id, collection.clone());
 
-    // Determine target collections
+    // Determine target collections. A collection with an executor belongs
+    // to the provider that composes this source: a crawl or replay of every
+    // collection, and any account backfill, leaves it to that executor.
+    let mut left_out: Vec<String> = Vec::new();
     let collections: Vec<String> = if let Some(ref col) = collection {
         let lexicon_exists: bool = state.host.tracked_collections().borrow().contains(col);
         if !lexicon_exists {
@@ -629,18 +634,36 @@ pub async fn run_backfill_job_with(state: JobState, job_id: String, window: i64)
             fail_job(&state, &job_id, &error).await;
             return;
         }
-        vec![col.clone()]
+        if scope == "dids" && state.compose.executor(col).is_some() {
+            left_out.push(col.clone());
+            Vec::new()
+        } else {
+            vec![col.clone()]
+        }
     } else {
         let tracked = state.host.tracked_collections().borrow().clone();
-        // A collection with an executor is backfilled by that executor's
-        // jobs, and a gap in the live stream is only in what it streams.
-        let gap = replay_after_seq.is_some();
-        tracked
-            .into_iter()
-            .filter(|c| state.compose.executor(c).is_none())
-            .filter(|c| !gap || state.compose.streams(c))
-            .collect()
+        if replay_after_seq.is_some() {
+            // A gap is in the live stream: replay what it streams, as
+            // `start_gap_replay` planned, executor or not.
+            tracked
+                .into_iter()
+                .filter(|c| state.compose.streams(c))
+                .collect()
+        } else {
+            let (owned, rest): (Vec<String>, Vec<String>) = tracked
+                .into_iter()
+                .partition(|c| state.compose.executor(c).is_some());
+            left_out = owned;
+            rest
+        }
     };
+    if !left_out.is_empty() {
+        tracing::info!(
+            job_id,
+            collections = ?left_out,
+            "leaving collections with a backfill executor out of this backfill"
+        );
+    }
 
     if collections.is_empty() {
         complete_job(
@@ -1013,24 +1036,18 @@ pub async fn start_backfill(
     dids: Vec<String>,
     actor_did: &str,
 ) -> Result<String, AdminError> {
-    start_backfill_with(
-        state,
-        collection,
-        dids,
-        actor_did,
-        state.archive.default_source,
-    )
-    .await
+    start_backfill_with(state, collection, dids, actor_did, None).await
 }
 
-/// `start_backfill` with an explicit source.
+/// `start_backfill` with the source asked for; `None`: `BACKFILL_SOURCE`.
 pub async fn start_backfill_with(
     state: &JobState,
     collection: Option<String>,
     dids: Vec<String>,
     actor_did: &str,
-    source: SourceChoice,
+    requested: Option<SourceChoice>,
 ) -> Result<String, AdminError> {
+    let source = requested.unwrap_or(state.archive.default_source);
     // Account backfills always crawl, whatever the default (see
     // `create_backfill`).
     let source = if dids.is_empty() {
@@ -1043,6 +1060,14 @@ pub async fn start_backfill_with(
         && let Some(col) = collection.as_deref()
         && let Some(executor) = state.compose.executor(col)
     {
+        if let Some(requested) = requested {
+            tracing::info!(
+                collection = col,
+                requested = requested.as_str(),
+                executor = executor.name(),
+                "this collection is backfilled by its executor, not by the source asked for"
+            );
+        }
         return start_executor_job(state, col, executor, actor_did).await;
     }
     let job_id = create_backfill_job_with(state, collection.as_deref(), &dids, source).await?;
@@ -1075,13 +1100,24 @@ pub async fn start_backfill_with(
     // own job.
     if collection.is_none() && dids.is_empty() && state.compose.executor_for.is_some() {
         let tracked = state.host.tracked_collections().borrow().clone();
+        let mut executor_jobs = Vec::new();
         for col in tracked {
             let Some(executor) = state.compose.executor(&col) else {
                 continue;
             };
-            if let Err(e) = start_executor_job(state, &col, executor, actor_did).await {
-                tracing::warn!(collection = %col, error = %e, "could not start an executor backfill");
+            match start_executor_job(state, &col, executor, actor_did).await {
+                Ok(id) => executor_jobs.push(id),
+                Err(e) => {
+                    tracing::warn!(collection = %col, error = %e, "could not start an executor backfill")
+                }
             }
+        }
+        if !executor_jobs.is_empty() {
+            tracing::info!(
+                job_id,
+                executor_jobs = ?executor_jobs,
+                "started executor backfills beside this backfill of every collection"
+            );
         }
     }
 
@@ -1180,20 +1216,41 @@ async fn run_executor_job(state: &JobState, job_id: &str, collection: Option<&st
     };
 
     let handle = JobHandle::new(state.clone(), job_id, collection).await;
-    let result = executor.run(handle.clone(), collection).await;
+    let run = AssertUnwindSafe(executor.run(handle.clone(), collection))
+        .catch_unwind()
+        .await;
     handle.flush_errors().await;
+    let Ok(result) = run else {
+        tracing::error!(job_id, executor = name, "backfill executor panicked");
+        fail_job(
+            state,
+            job_id,
+            &format!("backfill executor '{name}' panicked"),
+        )
+        .await;
+        return;
+    };
+    // `total_records` sums every run of the job.
+    let records = result
+        .as_ref()
+        .map(|totals| handle.records_with(totals.records))
+        .ok();
     match should_stop(state, job_id).await {
-        Some("cancelling") => {
-            tracing::info!(job_id, "backfill job cancelled");
-            finalise_cancel(state, job_id).await;
-        }
-        Some(_) => {
-            tracing::info!(job_id, "backfill job paused");
-            finalise_pause(state, job_id).await;
+        Some(stop) => {
+            if let Some(records) = records {
+                update_job_counter(state, job_id, "total_records", records).await;
+            }
+            if stop == "cancelling" {
+                tracing::info!(job_id, "backfill job cancelled");
+                finalise_cancel(state, job_id).await;
+            } else {
+                tracing::info!(job_id, "backfill job paused");
+                finalise_pause(state, job_id).await;
+            }
         }
         None => match result {
-            Ok(totals) => {
-                let records = i32::try_from(totals.records.max(0)).unwrap_or(i32::MAX);
+            Ok(_) => {
+                let records = records.unwrap_or_default();
                 complete_job(state, job_id, handle.processed(), records, None).await;
                 state
                     .host

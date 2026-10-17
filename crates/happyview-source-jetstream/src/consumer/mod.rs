@@ -523,6 +523,8 @@ async fn run(
     let pool = WorkerPool::spawn(
         settings.workers,
         WORKER_QUEUE_CAPACITY,
+        // A `#sync` purges the streamed (filtered) collections only: one
+        // outside them belongs to its executor or to the composing provider.
         apply::apply_fn(Arc::clone(&state.host), collections_rx.clone()),
         Arc::clone(&watermark),
         retry,

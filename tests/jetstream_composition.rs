@@ -482,7 +482,8 @@ async fn a_paused_executor_job_resumes_from_its_checkpoint() {
     );
     let row = job(&app, &id).await;
     assert_eq!(row.processed_repos, Some(2));
-    assert_eq!(row.total_records, Some(2));
+    // Both runs' records: 1 before the pause, 2 after.
+    assert_eq!(row.total_records, Some(3));
     assert_eq!(row.error, None);
 }
 
@@ -732,4 +733,213 @@ async fn a_gap_is_replayed_only_for_the_collections_streamed_live() {
         assert!(collections.contains(&json!(A)), "{plan}");
         assert!(!collections.contains(&json!(B)), "{plan}");
     }
+}
+
+/// Never expected to run.
+struct Unused {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl BackfillExecutor for Unused {
+    fn name(&self) -> &'static str {
+        "store-pass"
+    }
+
+    async fn run(&self, _job: JobHandle, _collection: &str) -> Result<JobTotals, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(JobTotals::default())
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_gap_replays_a_streamed_collection_that_has_an_executor() {
+    let Some((app, _tracked)) = app(&[A, B]).await else {
+        return;
+    };
+    let mock = MockJetstream::start().await;
+    mock.seal(
+        vec![
+            js::archive_create(1, DID, A, "a1", json!({"$type": A, "text": "a"})),
+            js::archive_create(2, DID, B, "b1", json!({"$type": B, "text": "b"})),
+            js::archive_create(3, DID, A, "a2", json!({"$type": A, "text": "a"})),
+        ],
+        3,
+    );
+    let executor = Arc::new(Unused {
+        calls: AtomicUsize::new(0),
+    });
+    let routed = executor.clone();
+    // `b` is streamed live and has an executor.
+    let source = JetstreamSource::builder()
+        .settings(settings(&mock))
+        .archive(ArchiveConfig {
+            download_dir: std::env::temp_dir().join(format!("hv-compose-{}", uuid::Uuid::new_v4())),
+            retry_unit: Duration::from_millis(5),
+            ..ArchiveConfig::default()
+        })
+        .executor_for(move |c| (c == B).then(|| routed.clone() as Arc<dyn BackfillExecutor>))
+        .build_detached();
+    attach(&app.state, &source);
+
+    let id = source
+        .start_backfill(BackfillRequest {
+            collection: None,
+            dids: Vec::new(),
+            source: None,
+            actor: "did:plc:testadmin".to_string(),
+            kind: BackfillKind::Gap { after_seq: 1 },
+        })
+        .await
+        .expect("start a gap replay")
+        .expect("a job id");
+    wait_until!(
+        "the gap job to finish",
+        job(&app, &id).await.status != "running"
+    );
+    assert_eq!(job(&app, &id).await.status, "completed");
+
+    let plans: Vec<Value> = mock
+        .plan_requests()
+        .into_iter()
+        .filter(|p| p.get("collections").is_some())
+        .collect();
+    assert!(!plans.is_empty());
+    for plan in &plans {
+        let collections = plan["collections"].as_array().unwrap();
+        assert!(collections.contains(&json!(A)), "{plan}");
+        assert!(collections.contains(&json!(B)), "{plan}");
+    }
+    // Seqs 2 (`b`) and 3 (`a`), both replayed.
+    assert_eq!(local_rows(&app).await, 2);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn an_account_backfill_leaves_executor_collections_out() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let Some((mut app, _tracked)) = app(&[A, B]).await else {
+        return;
+    };
+    let storage = Arc::new(FakeStorage::claiming(&[B]).await);
+    app.state.records = app.state.records.clone().with_external(storage.clone());
+    let executor = Arc::new(Unused {
+        calls: AtomicUsize::new(0),
+    });
+    let routed = executor.clone();
+    let claims = storage.clone();
+    let source = JetstreamSource::builder()
+        .executor_for(move |c| {
+            claims
+                .claims(c)
+                .then(|| routed.clone() as Arc<dyn BackfillExecutor>)
+        })
+        .build_detached();
+    attach(&app.state, &source);
+
+    let pds = app.mock_server.uri();
+    Mock::given(method("GET"))
+        .and(path(format!("/{DID}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(common::fixtures::did_document(DID, &pds)),
+        )
+        .mount(&app.mock_server)
+        .await;
+    let value = json!({"$type": A, "text": "crawled"});
+    let cid = happyview::cid_verify::compute_record_cid(&value)
+        .unwrap()
+        .to_string();
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.listRecords"))
+        .and(query_param("repo", DID))
+        .and(query_param("collection", A))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "records": [{"uri": format!("at://{DID}/{A}/one"), "cid": cid, "value": value}]
+        })))
+        .mount(&app.mock_server)
+        .await;
+    // The executor's collection is never fetched.
+    Mock::given(method("GET"))
+        .and(path("/xrpc/com.atproto.repo.listRecords"))
+        .and(query_param("collection", B))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&app.mock_server)
+        .await;
+
+    let id = source
+        .start_backfill(BackfillRequest {
+            collection: None,
+            dids: vec![DID.to_string()],
+            source: None,
+            actor: "did:plc:testadmin".to_string(),
+            kind: BackfillKind::Manual,
+        })
+        .await
+        .expect("start an account backfill")
+        .expect("a job id");
+    wait_until!(
+        "the job to finish",
+        job(&app, &id).await.status != "running"
+    );
+    let row = job(&app, &id).await;
+    assert_eq!(row.status, "completed", "{row:?}");
+    assert_eq!(row.source, "crawl");
+    assert_eq!(local_rows(&app).await, 1);
+
+    // Nothing reached the claiming storage, refused or otherwise.
+    assert!(storage.deltas().is_empty(), "{:?}", storage.deltas());
+    let refused: i64 = happyview::db::query_scalar(&adapt_sql(
+        "SELECT COUNT(*) FROM happyview_event_logs WHERE event_type = 'record.unstored_claimed'",
+        app.state.db_backend,
+    ))
+    .fetch_one(&app.state.db)
+    .await
+    .unwrap();
+    assert_eq!(refused, 0);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    let jobs: i64 = happyview::db::query_scalar("SELECT COUNT(*) FROM happyview_backfill_jobs")
+        .fetch_one(&app.state.db)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 1, "no executor job beside an account backfill");
+}
+
+struct Panicking;
+
+#[async_trait::async_trait]
+impl BackfillExecutor for Panicking {
+    fn name(&self) -> &'static str {
+        "store-pass"
+    }
+
+    async fn run(&self, _job: JobHandle, _collection: &str) -> Result<JobTotals, String> {
+        panic!("the executor fell over");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_panicking_executor_fails_its_job() {
+    let Some((app, _tracked)) = app(&[B]).await else {
+        return;
+    };
+    let source = JetstreamSource::builder()
+        .executor_for(|c| (c == B).then(|| Arc::new(Panicking) as Arc<dyn BackfillExecutor>))
+        .build_detached();
+    attach(&app.state, &source);
+
+    let id = start_backfill(&source, B).await;
+    wait_until!("the job to fail", job(&app, &id).await.status != "running");
+    let row = job(&app, &id).await;
+    assert_eq!(row.status, "failed");
+    assert_eq!(
+        row.error.as_deref(),
+        Some("backfill executor 'store-pass' panicked")
+    );
+    assert!(!source.backfill_running(B).await);
 }

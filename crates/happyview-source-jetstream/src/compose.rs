@@ -34,7 +34,9 @@ pub trait BackfillExecutor: Send + Sync + 'static {
 /// What an executor's run did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JobTotals {
-    /// Records the run wrote; the job's `total_records`.
+    /// Records this run wrote. The job's `total_records` is the sum over
+    /// all of its runs: a resumed job's count adds to what it wrote before
+    /// it was paused, as a replay's does.
     pub records: i64,
 }
 
@@ -46,18 +48,21 @@ pub struct JobHandle {
     collection: Arc<str>,
     /// The last `processed` reported, which completing the job keeps.
     processed: Arc<AtomicI64>,
+    /// `total_records` when this run started: what earlier runs wrote.
+    records_before: i64,
     errors: Arc<ErrorRecorder>,
 }
 
 impl JobHandle {
     pub(crate) async fn new(jobs: JobState, id: &str, collection: &str) -> Self {
-        let processed = processed_so_far(&jobs, id).await;
+        let (processed, records_before) = counters_so_far(&jobs, id).await;
         let errors = ErrorRecorder::new(&jobs, id).await;
         Self {
             jobs,
             id: id.into(),
             collection: collection.into(),
             processed: Arc::new(AtomicI64::new(processed)),
+            records_before,
             errors: Arc::new(errors),
         }
     }
@@ -98,8 +103,10 @@ impl JobHandle {
     }
 
     /// Note a failure in the job's error log (kind `other`, phase
-    /// `executor`), against `did` or, with `None`, the job as a whole. The
-    /// log keeps one row per DID: a later failure replaces its message.
+    /// `executor`), against `did`. The log keeps one row per DID: a later
+    /// failure replaces its message. `did: None` is a single job-level
+    /// slot, so a later job-level message replaces an earlier one. The
+    /// per-kind counts stay exact either way.
     pub async fn record_error(&self, did: Option<&str>, message: &str) {
         let failure = BackfillFailure {
             kind: BackfillErrorKind::Other,
@@ -163,6 +170,11 @@ impl JobHandle {
         clamp(self.processed.load(Ordering::Relaxed))
     }
 
+    /// The job's `total_records` once this run wrote `records`.
+    pub(crate) fn records_with(&self, records: i64) -> i32 {
+        clamp(self.records_before.saturating_add(records.max(0)))
+    }
+
     pub(crate) async fn flush_errors(&self) {
         self.errors.flush(&self.jobs, &self.id).await;
     }
@@ -176,20 +188,23 @@ fn clamp(n: i64) -> i32 {
     i32::try_from(n.max(0)).unwrap_or(i32::MAX)
 }
 
-async fn processed_so_far(jobs: &JobState, id: &str) -> i64 {
+/// A job's `processed_repos` and `total_records` so far.
+async fn counters_so_far(jobs: &JobState, id: &str) -> (i64, i64) {
     let sql = adapt_sql(
-        "SELECT processed_repos FROM happyview_backfill_jobs WHERE id = ?",
+        "SELECT processed_repos, total_records FROM happyview_backfill_jobs WHERE id = ?",
         jobs.db_backend,
     );
-    happyview_provider::db::query_as::<(Option<i32>,)>(&sql)
+    let row = happyview_provider::db::query_as::<(Option<i32>, Option<i32>)>(&sql)
         .bind(id)
         .fetch_optional(&jobs.backfill_db)
         .await
         .ok()
-        .flatten()
-        .and_then(|(n,)| n)
-        .map(i64::from)
-        .unwrap_or(0)
+        .flatten();
+    let (processed, records) = row.unwrap_or_default();
+    (
+        processed.map(i64::from).unwrap_or(0),
+        records.map(i64::from).unwrap_or(0),
+    )
 }
 
 /// Which tracked collections are streamed live.
