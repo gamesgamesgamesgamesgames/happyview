@@ -1,6 +1,9 @@
-//! The Jetstream record source: the v2 archive client and the live consumer.
+//! The Jetstream record source: the v2 archive client, the live consumer,
+//! the backfill job system and their admin routes.
 
+pub mod admin;
 pub mod archive;
+pub mod backfill;
 pub mod consumer;
 pub mod source;
 

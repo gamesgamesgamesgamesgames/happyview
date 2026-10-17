@@ -43,3 +43,48 @@ pub async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<
     }
     Ok(bytes)
 }
+
+/// Render an error together with its full `source()` chain.
+///
+/// `reqwest::Error`'s `Display` deliberately omits its source, so a transport
+/// failure formats as nothing more than `error sending request for url (…)` —
+/// leaving NXDOMAIN, TLS failure, connection refused and timeout completely
+/// indistinguishable in the logs. That is exactly the information needed to
+/// tell "this host is gone" from "we are misconfigured", so walk the chain and
+/// append each cause.
+pub fn describe_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        // Chains frequently restate the outer message; don't repeat it.
+        if !out.ends_with(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
+/// Host portion of an origin URL, for cooldown keying.
+pub fn host_of(url: &str) -> String {
+    url.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or(url)
+        .to_string()
+}
+
+/// The host a DID-document resolution will contact.
+///
+/// Used to key retry cooldowns. Every `did:plc` shares one host, so a rate
+/// limit learned from one applies to all of them.
+pub fn did_doc_host(plc_url: &str, did: &str) -> String {
+    if let Some(domain) = did.strip_prefix("did:web:") {
+        return domain.to_string();
+    }
+    host_of(plc_url)
+}

@@ -11,30 +11,21 @@ use futures_util::StreamExt;
 use super::replay_fold::ReplayFold;
 use super::replay_sweeps::{self as sweeps, Sweep, SweepKind};
 use crate::AppState;
-use crate::admin::backfill_errors::{BackfillErrorKind, BackfillFailure, ErrorRecorder};
 use crate::jetstream::archive::client::{
     ArchiveClient, ArchiveError, PlanEntry, PlanMode, PlanRequest, SegmentInfo,
 };
 use crate::jetstream::archive::rows::{self, RowFilter, RowKinds};
 use crate::jetstream::archive::segment::{self, Row};
+use happyview_source_jetstream::backfill::errors::{
+    BackfillErrorKind, BackfillFailure, ErrorRecorder,
+};
+use happyview_source_jetstream::backfill::{self as job_system, JobState, ReplayOutcome};
 
 const STALLED_PAGES: u32 = 5;
 /// Failed blocks in a row, across entries, after which the job stops rather
 /// than run on through an archive outage. Throttling alone doesn't get here:
 /// the client paces to the archive's byte quota and waits out its 429s.
 const MAX_CONSECUTIVE_FAILURES: u32 = 16;
-
-pub(super) enum ReplayOutcome {
-    Completed {
-        records: u64,
-        bytes: u64,
-    },
-    /// `auto`, and the Jetstream has no archive: the job is now a crawl.
-    FellBack,
-    /// Pausing or cancelling; the caller finalises.
-    Stopped,
-    Failed(String),
-}
 
 enum Halt {
     Stopped,
@@ -44,6 +35,7 @@ enum Halt {
 
 struct Run<'a> {
     state: &'a AppState,
+    jobs: &'a JobState,
     job_id: &'a str,
     client: ArchiveClient,
     fold: ReplayFold,
@@ -70,6 +62,7 @@ struct Run<'a> {
 
 pub(super) async fn run(
     state: &AppState,
+    jobs: &JobState,
     job_id: &str,
     collections: &[String],
     scope_dids: Option<Vec<String>>,
@@ -78,10 +71,11 @@ pub(super) async fn run(
     let endpoint = crate::jetstream::config::parse_endpoint(&state.config.jetstream_url);
     let mut run = Run {
         state,
+        jobs,
         job_id,
         client: ArchiveClient::new(&endpoint, &state.archive),
         fold: ReplayFold::new(state.clone(), job_id, collections.to_vec()),
-        errors: ErrorRecorder::new(state, job_id).await,
+        errors: ErrorRecorder::new(jobs, job_id).await,
         counted: 0,
         records_counted: 0,
         probing: source == "auto",
@@ -97,7 +91,7 @@ pub(super) async fn run(
     let counted = run.count_bytes(0).await;
     // Persist the error counts (`error_counts`) before the caller completes,
     // fails or pauses the job; `record` only writes the detail rows.
-    run.errors.flush(state, job_id).await;
+    run.errors.flush(jobs, job_id).await;
     remove_own_downloads(&run.download_dir, job_id).await;
     match (result, flushed) {
         (Ok(()), Ok(())) => {
@@ -224,7 +218,7 @@ impl Run<'_> {
             .await
             .map_err(db)?
         {
-            super::set_stage(self.state, self.job_id, "retrying_blocks").await;
+            job_system::set_stage(self.jobs, self.job_id, "retrying_blocks").await;
             return self.retry_blocks(collections, scope_dids).await;
         }
         let mut all = sweeps::load(self.state, self.job_id).await.map_err(db)?;
@@ -237,14 +231,14 @@ impl Run<'_> {
                 .await
                 .map_err(db)?;
         }
-        super::set_stage(self.state, self.job_id, "replaying").await;
+        job_system::set_stage(self.jobs, self.job_id, "replaying").await;
         for sweep in all
             .iter_mut()
             .filter(|s| s.kind == SweepKind::Commits && !s.done)
         {
             self.sweep(sweep).await?;
         }
-        super::set_stage(self.state, self.job_id, "replaying_accounts").await;
+        job_system::set_stage(self.jobs, self.job_id, "replaying_accounts").await;
         for sweep in all
             .iter_mut()
             .filter(|s| s.kind == SweepKind::Markers && !s.done)
@@ -291,7 +285,9 @@ impl Run<'_> {
     }
 
     async fn stop_requested(&self) -> bool {
-        super::should_stop(self.state, self.job_id).await.is_some()
+        job_system::should_stop(self.jobs, self.job_id)
+            .await
+            .is_some()
     }
 
     /// Add what the client downloaded and the fold wrote since the last call
@@ -421,9 +417,9 @@ impl Run<'_> {
         let (bytes, failed) = sweeps::counters(self.state, self.job_id)
             .await
             .unwrap_or((0, 0));
-        super::publish_event(
-            self.state,
-            crate::admin::types::BackfillEvent::ReplayProgress {
+        job_system::publish_event(
+            self.jobs,
+            job_system::types::BackfillEvent::ReplayProgress {
                 job_id: self.job_id.to_string(),
                 through_seq: sweep.cursor_seq,
                 tip_seq: sweep.tip_seq.unwrap_or(sweep.cursor_seq),
@@ -633,7 +629,7 @@ impl Run<'_> {
             };
             let stored = self
                 .errors
-                .record(self.state, self.job_id, segment, None, &phase, &failure, 1)
+                .record(self.jobs, self.job_id, segment, None, &phase, &failure, 1)
                 .await;
             if !stored {
                 return Err(Halt::Failed(format!(
@@ -698,7 +694,7 @@ impl Run<'_> {
         }
         // The DID lists already name only DIDs with records.
         self.held_only = None;
-        super::set_stage(self.state, self.job_id, "replaying_accounts").await;
+        job_system::set_stage(self.jobs, self.job_id, "replaying_accounts").await;
         for sweep in markers.iter_mut().filter(|s| !s.done) {
             self.sweep(sweep).await?;
         }
@@ -941,6 +937,7 @@ async fn decode(frame: Vec<u8>) -> Result<Vec<Row>, String> {
 /// the archive's sealed tip, where the live stream can resume at once.
 pub(crate) async fn start_gap_replay(
     state: &AppState,
+    jobs: &JobState,
     after_seq: i64,
 ) -> Result<(String, i64), String> {
     let collections = state.lexicons.get_record_collections().await;
@@ -996,14 +993,14 @@ pub(crate) async fn start_gap_replay(
         );
         return Ok((job_id, tip));
     }
-    let job_id = super::create_gap_replay_job(state, after_seq)
+    let job_id = job_system::create_gap_replay_job(jobs, after_seq)
         .await
         .map_err(|e| e.to_string())?;
-    super::log_event(
+    crate::event_log::log_event(
         &state.db,
-        super::EventLog {
+        crate::event_log::EventLog {
             event_type: "backfill.started".to_string(),
-            severity: super::Severity::Info,
+            severity: crate::event_log::Severity::Info,
             actor_did: None,
             subject: None,
             detail: serde_json::json!({
@@ -1018,9 +1015,9 @@ pub(crate) async fn start_gap_replay(
         state.db_backend,
     )
     .await;
-    let spawn_state = state.clone();
+    let spawn_jobs = jobs.clone();
     let spawn_id = job_id.clone();
-    tokio::spawn(async move { super::run_backfill_job(spawn_state, spawn_id).await });
+    tokio::spawn(async move { job_system::run_backfill_job(spawn_jobs, spawn_id).await });
     Ok((job_id, tip))
 }
 

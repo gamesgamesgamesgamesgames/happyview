@@ -1045,8 +1045,6 @@ async fn boot(
         std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(config)))
     };
 
-    let (backfill_events_tx, _) = tokio::sync::broadcast::channel(16384);
-
     let verbose_event_logging = {
         let enabled =
             crate::admin::settings::get_setting(&db_pool, "verbose_event_logging", db_backend)
@@ -1096,7 +1094,6 @@ async fn boot(
         official_registry,
         official_registry_config,
         proxy_config,
-        backfill_events_tx,
         verbose_event_logging,
         client_jwks,
         telemetry_counters,

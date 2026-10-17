@@ -1,13 +1,13 @@
-//! `BuiltinSource`: the Jetstream consumer (from `happyview_source_jetstream`)
-//! and the in-tree backfill behind the `RecordSource` contract (plan ruling
-//! C1: route HappyView through the contract first, move the code into its
-//! crate after).
+//! `BuiltinSource`: the Jetstream source (`happyview_source_jetstream`) with
+//! HappyView's archive replay plugged into it, behind the `RecordSource`
+//! contract (plan ruling C1: route HappyView through the contract first,
+//! move the code into its crate after).
 //!
-//! The backfill code it wraps still takes an `AppState`, so the source holds one,
-//! attached by whoever built the state: `run` before it calls `start`, and the
-//! test state builders. The state it holds reaches back to the source through
-//! a weak handle, so an instance and its source do not keep each other (and
-//! their pools) alive.
+//! Replay still takes an `AppState`, so the source is built from one,
+//! attached by whoever built the state: `run` before it calls `start`, and
+//! the test state builders. The state it holds reaches back to the source
+//! through a weak handle, so an instance and its source do not keep each
+//! other (and their pools) alive.
 
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -17,20 +17,12 @@ use futures_util::FutureExt;
 use happyview_provider::{
     BackfillError, BackfillKind, BackfillRequest, Host, ProviderError, RecordSource,
 };
+use happyview_source_jetstream::JetstreamSource;
+use happyview_source_jetstream::backfill::JobState;
 
 use crate::AppState;
-use crate::error::AppError;
 use crate::jetstream::GapReplay;
 use crate::jetstream::archive::SourceChoice;
-
-/// Tables counted into telemetry `totals`, as (payload key, table name).
-const COUNTED_TABLES: &[(&str, &str)] = &[
-    ("backfill_repos", "happyview_backfill_repos"),
-    ("backfill_queue", "happyview_backfill_queue"),
-    ("backfill_completions", "happyview_backfill_completions"),
-    ("backfill_pds_stats", "happyview_backfill_pds_stats"),
-    ("backfill_cursors", "happyview_backfill_cursors"),
-];
 
 /// Builtin sources `run` may need to attach a state to, found by address
 /// since `Providers` hands the source over as a trait object.
@@ -39,7 +31,14 @@ static ATTACHABLE: Mutex<Vec<Weak<BuiltinSource>>> = Mutex::new(Vec::new());
 pub struct BuiltinSource {
     /// `false` for a test state's source: `start` spawns nothing.
     live: bool,
-    state: RwLock<Option<AppState>>,
+    attached: RwLock<Option<Attached>>,
+}
+
+/// What attaching a state builds.
+#[derive(Clone)]
+struct Attached {
+    state: AppState,
+    source: Arc<JetstreamSource>,
 }
 
 impl BuiltinSource {
@@ -69,20 +68,37 @@ impl BuiltinSource {
     fn with_live(live: bool) -> Self {
         Self {
             live,
-            state: RwLock::new(None),
+            attached: RwLock::new(None),
         }
     }
 
-    /// Hold `state` (its own handle to this source made weak) for the
-    /// in-tree code this source calls.
+    /// Build the Jetstream source over `state` (its own handle to this
+    /// source made weak), with HappyView's archive replay.
     pub fn attach(self: &Arc<Self>, state: &AppState) {
         let mut held = state.clone();
         held.source = Arc::new(SourceRef(Arc::downgrade(self)));
-        *self.state.write().unwrap_or_else(|e| e.into_inner()) = Some(held);
+        let jobs = job_state(&held);
+        let source = JetstreamSource::new(
+            crate::jetstream::config::Settings::from_env(&held.config.jetstream_url),
+            gap_replay(&held, &jobs),
+            jobs,
+        );
+        *self.attached.write().unwrap_or_else(|e| e.into_inner()) = Some(Attached {
+            state: held,
+            source,
+        });
     }
 
-    fn state(&self) -> Option<AppState> {
-        self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
+    fn current(&self) -> Option<Attached> {
+        self.attached
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The Jetstream source this one runs, once a state is attached.
+    pub fn jetstream(&self) -> Option<Arc<JetstreamSource>> {
+        self.current().map(|attached| attached.source)
     }
 }
 
@@ -105,26 +121,33 @@ pub(crate) fn attach_if_builtin(source: &Arc<dyn RecordSource>, state: &AppState
     }
 }
 
-/// The consumer's gap replay for `state`: the in-tree archive replay, or
-/// `None` when backfill only crawls, which never asks the archive (P8).
-pub fn gap_replay(state: &AppState) -> Option<GapReplay> {
+/// A backfill job system over `state`, with HappyView's archive replay and
+/// a job event channel of its own.
+pub fn job_state(state: &AppState) -> JobState {
+    JobState::new(
+        crate::host::AppHost::new(state.clone()),
+        state.archive.default_source,
+        Arc::new(crate::admin::backfill::ArchiveReplay::new(state.clone())),
+    )
+}
+
+/// The consumer's gap replay for `state`: the in-tree archive replay, run as
+/// a job of `jobs`, or `None` when backfill only crawls, which never asks
+/// the archive (P8).
+pub fn gap_replay(state: &AppState, jobs: &JobState) -> Option<GapReplay> {
     if state.archive.default_source == SourceChoice::Crawl {
         return None;
     }
     let state = state.clone();
+    let jobs = jobs.clone();
     Some(Arc::new(move |after_seq| {
         let state = state.clone();
-        async move { crate::admin::backfill::replay::start_gap_replay(&state, after_seq).await }
-            .boxed()
+        let jobs = jobs.clone();
+        async move {
+            crate::admin::backfill::replay::start_gap_replay(&state, &jobs, after_seq).await
+        }
+        .boxed()
     }))
-}
-
-fn backfill_error(e: AppError) -> BackfillError {
-    match e {
-        AppError::BadRequest(_) => BackfillError::Invalid(e.to_string()),
-        AppError::Conflict(_) => BackfillError::Conflict(e.to_string()),
-        _ => BackfillError::Internal(e.to_string()),
-    }
 }
 
 fn detached_error() -> BackfillError {
@@ -149,135 +172,55 @@ impl RecordSource for BuiltinSource {
         if !self.live {
             return Ok(());
         }
-        let Some(state) = self.state() else {
+        let Some(Attached { state, source }) = self.current() else {
             return Err(ProviderError::Other(
                 "the builtin record source was started with no instance attached".into(),
             ));
         };
-        crate::jetstream::spawn_with_gap_replay(
-            host,
-            crate::jetstream::config::Settings::from_env(&state.config.jetstream_url),
-            None,
-            gap_replay(&state),
-        );
-
-        crate::admin::backfill::resume_backfill_jobs(&state).await;
+        // Spawns the consumer and the retention sweep, and resumes the jobs
+        // that were running.
+        source.start(host).await?;
 
         // After the resume, which re-spawns running jobs and would otherwise run
         // one started here twice.
         if state.config.project_root.is_some() {
             crate::project::boot::start_declared_backfills(&state).await;
         }
-
-        tokio::spawn(async move {
-            crate::admin::backfill::run_backfill_retention_cleanup(&state).await;
-        });
         Ok(())
     }
 
     fn admin_routes(&self) -> axum::Router {
-        match self.state() {
-            Some(state) => crate::admin::builtin_source_routes().with_state(state),
+        match self.jetstream() {
+            Some(source) => source.admin_routes(),
             None => axum::Router::new(),
         }
     }
 
     async fn start_backfill(&self, req: BackfillRequest) -> Result<Option<String>, BackfillError> {
-        let state = self.state().ok_or_else(detached_error)?;
+        let Attached { state, source } = self.current().ok_or_else(detached_error)?;
         match req.kind {
-            BackfillKind::Automatic => {
-                let collection = req.collection.ok_or_else(|| {
-                    BackfillError::Invalid("an automatic backfill needs a collection".into())
-                })?;
-                crate::admin::backfill::start_automatic_backfill(&state, collection, &req.actor)
-                    .await
-                    .map_err(backfill_error)
-            }
-            BackfillKind::Manual => {
-                let source = match req.source.as_deref() {
-                    Some(raw) => crate::jetstream::archive::parse_source(raw).ok_or_else(|| {
-                        BackfillError::Invalid(format!("unknown backfill source: {raw}"))
-                    })?,
-                    None => state.archive.default_source,
-                };
-                crate::admin::backfill::start_backfill_with(
-                    &state,
-                    req.collection,
-                    req.dids,
-                    &req.actor,
-                    source,
-                )
-                .await
-                .map(Some)
-                .map_err(backfill_error)
-            }
+            // Whatever `BACKFILL_SOURCE` says, as before.
             BackfillKind::Gap { after_seq } => {
-                crate::admin::backfill::replay::start_gap_replay(&state, after_seq)
+                crate::admin::backfill::replay::start_gap_replay(&state, source.jobs(), after_seq)
                     .await
                     .map(|(job_id, _tip)| Some(job_id))
                     .map_err(BackfillError::Internal)
             }
+            _ => source.start_backfill(req).await,
         }
     }
 
-    /// Whether `collection` has ever had a network backfill job. A job for
-    /// named accounts doesn't count: it fetched those accounts' records, not
-    /// the collection's. When it cannot tell, it says yes, so no caller starts
-    /// one on a guess.
     async fn has_backfill(&self, collection: &str) -> bool {
-        let Some(state) = self.state() else {
-            return false;
-        };
-        let sql = crate::db::adapt_sql(
-            "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE collection = ? AND scope = 'network'",
-            state.db_backend,
-        );
-        let seen: Result<(i64,), _> = crate::db::query_as(&sql)
-            .bind(collection)
-            .fetch_one(&state.db)
-            .await;
-        match seen {
-            Ok((0,)) => false,
-            Ok(_) => true,
-            Err(e) => {
-                tracing::warn!(
-                    collection = %collection,
-                    error = %e,
-                    "could not tell whether this collection was backfilled; not starting one"
-                );
-                true
-            }
+        match self.jetstream() {
+            Some(source) => source.has_backfill(collection).await,
+            None => false,
         }
     }
 
-    /// Whether a backfill covering `collection` may still write: running, or
-    /// pausing or cancelling (both stop once in-flight pages are written).
-    /// When it cannot tell, it says yes, so a delete still leaves its
-    /// tombstone.
     async fn backfill_running(&self, collection: &str) -> bool {
-        let Some(state) = self.state() else {
-            return false;
-        };
-        let sql = crate::db::adapt_sql(
-            "SELECT 1 FROM happyview_backfill_jobs \
-             WHERE status IN ('running', 'pausing', 'cancelling') \
-             AND (collection IS NULL OR collection = ?) LIMIT 1",
-            state.db_backend,
-        );
-        match crate::db::query(&sql)
-            .bind(collection)
-            .fetch_optional(&state.db)
-            .await
-        {
-            Ok(row) => row.is_some(),
-            Err(e) => {
-                tracing::warn!(
-                    collection = %collection,
-                    error = %e,
-                    "could not tell whether a backfill is running; assuming one is"
-                );
-                true
-            }
+        match self.jetstream() {
+            Some(source) => source.backfill_running(collection).await,
+            None => false,
         }
     }
 
@@ -285,42 +228,11 @@ impl RecordSource for BuiltinSource {
         serde_json::to_value(crate::jetstream::status::snapshot()).unwrap_or_default()
     }
 
-    /// The backfill tables' row counts (a table that cannot be counted is
-    /// left out), and `feature.backfill.ever` / `feature.backfill.active`
-    /// (any job, and any job in the last seven days).
     async fn metrics(&self) -> Vec<(String, i64)> {
-        let Some(state) = self.state() else {
-            return Vec::new();
-        };
-        let (pool, backend) = (&state.db, state.db_backend);
-        let mut out = Vec::new();
-        for (key, table) in COUNTED_TABLES {
-            if let Some(n) =
-                crate::telemetry::collect::database::count_table(pool, backend, table).await
-            {
-                out.push(((*key).to_string(), n));
-            }
+        match self.jetstream() {
+            Some(source) => source.metrics().await,
+            None => Vec::new(),
         }
-        let ever = crate::telemetry::collect::features::count(
-            pool,
-            backend,
-            "SELECT COUNT(*) FROM happyview_backfill_jobs",
-            None,
-        )
-        .await
-            >= 1;
-        let active = ever
-            && crate::telemetry::collect::features::count(
-                pool,
-                backend,
-                "SELECT COUNT(*) FROM happyview_backfill_jobs WHERE created_at >= ?",
-                Some(&crate::telemetry::collect::features::window_start()),
-            )
-            .await
-                >= 1;
-        out.push(("feature.backfill.ever".to_string(), i64::from(ever)));
-        out.push(("feature.backfill.active".to_string(), i64::from(active)));
-        out
     }
 }
 

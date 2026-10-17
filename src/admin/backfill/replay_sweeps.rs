@@ -282,7 +282,11 @@ pub(super) async fn add_records(state: &AppState, job_id: &str, n: i64) -> Resul
     let sql = adapt_sql(
         &format!(
             "UPDATE happyview_backfill_jobs SET {} WHERE id = ?",
-            super::saturating_counter("total_records", "?", state.db_backend)
+            happyview_source_jetstream::backfill::saturating_counter(
+                "total_records",
+                "?",
+                state.db_backend
+            )
         ),
         state.db_backend,
     );

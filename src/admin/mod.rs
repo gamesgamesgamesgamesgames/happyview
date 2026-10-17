@@ -2,15 +2,12 @@ pub(crate) mod api_clients;
 mod api_keys;
 pub(crate) mod auth;
 pub mod backfill;
-pub mod backfill_errors;
-pub mod backfill_retry;
 mod database;
 mod dead_letters;
 mod domains;
 mod events;
 mod feature_flags;
 mod identity;
-mod jetstream;
 mod jobs;
 mod labelers;
 mod lexicons;
@@ -292,35 +289,4 @@ pub fn admin_routes(state: AppState) -> Router<AppState> {
             "/verification-methods/{fragment_id}",
             delete(verification_methods::delete),
         )
-}
-
-/// The in-tree record source's admin routes (`BuiltinSource::admin_routes`):
-/// backfill jobs and the live consumer's status.
-pub(crate) fn builtin_source_routes() -> Router<AppState> {
-    Router::new()
-        .route("/backfill", post(backfill::create_backfill))
-        .route("/backfill/status", get(backfill::backfill_status))
-        .route(
-            "/backfill/details",
-            delete(backfill::flush_all_backfill_details),
-        )
-        .route("/backfill/{id}/cancel", post(backfill::cancel_backfill))
-        .route("/backfill/{id}/pause", post(backfill::pause_backfill))
-        .route("/backfill/{id}/resume", post(backfill::resume_backfill))
-        .route("/backfill/{id}/events", get(backfill::backfill_events))
-        .route("/backfill/{id}/repos", get(backfill::backfill_repos))
-        .route(
-            "/backfill/{id}/pds-summary",
-            get(backfill::backfill_pds_summary),
-        )
-        .route("/backfill/{id}/errors", get(backfill::backfill_errors_list))
-        .route(
-            "/backfill/{id}/retry-failed",
-            post(backfill::retry_failed_backfill),
-        )
-        .route(
-            "/backfill/{id}/details",
-            delete(backfill::flush_backfill_details),
-        )
-        .route("/jetstream/status", get(jetstream::status))
 }

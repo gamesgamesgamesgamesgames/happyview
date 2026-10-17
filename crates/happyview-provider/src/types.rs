@@ -196,9 +196,23 @@ pub struct InstanceInfo {
     pub user_agent: String,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct ResolveError(pub String);
+/// Why a lookup failed, classified as a backfill classifies a fetch, so a
+/// source can tell a failure worth retrying (after `retry_after`, when the
+/// host was told one) from a final one.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{}", .0.message)]
+pub struct ResolveError(pub crate::failure::BackfillFailure);
+
+impl ResolveError {
+    /// A failure with no more to it than `message`: never worth retrying.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(crate::failure::BackfillFailure {
+            kind: crate::failure::BackfillErrorKind::Other,
+            message: message.into(),
+            retry_after: None,
+        })
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {

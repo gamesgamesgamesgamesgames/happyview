@@ -889,7 +889,7 @@ pub(crate) async fn lexicon_schema_event(
                     {
                         let _ = state
                             .collections_tx
-                            .send(lexicons.get_record_collections().await);
+                            .send_replace(lexicons.get_record_collections().await);
                     }
                 }
                 Ok(None) => {}
@@ -904,7 +904,7 @@ pub(crate) async fn lexicon_schema_event(
                 tracing::info!(nsid, "removed network lexicon from network delete event");
                 let _ = state
                     .collections_tx
-                    .send(lexicons.get_record_collections().await);
+                    .send_replace(lexicons.get_record_collections().await);
             }
             Ok(false) => {}
             Err(e) => return failed(e),

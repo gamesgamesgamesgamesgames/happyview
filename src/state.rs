@@ -121,7 +121,6 @@ pub fn state_with_pool_on(
         proxy_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(
             crate::proxy_config::ProxyConfig::default(),
         ))),
-        backfill_events_tx: tokio::sync::broadcast::channel(16).0,
         verbose_event_logging: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         client_jwks: Vec::new(),
         telemetry_counters: Arc::new(crate::telemetry::counters::Counters::new()),

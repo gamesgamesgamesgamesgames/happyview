@@ -38,6 +38,13 @@ impl Host for AppHost {
         crate::ingest::apply_batch(&self.state, events).await
     }
 
+    async fn ingest_batch_with_error(
+        &self,
+        events: Vec<SourceEvent>,
+    ) -> (BatchOutcome, Option<String>) {
+        crate::ingest::apply_batch_in(&self.state, events).await
+    }
+
     fn tracked_collections(&self) -> watch::Receiver<Vec<String>> {
         self.state.collections_tx.subscribe()
     }
@@ -113,7 +120,19 @@ impl Host for AppHost {
     async fn resolve_pds(&self, did: &str) -> Result<String, ResolveError> {
         crate::profile::resolve_pds_endpoint_once(&self.state.http, &self.state.config.plc_url, did)
             .await
-            .map_err(|e| ResolveError(e.message))
+            .map_err(ResolveError)
+    }
+
+    /// `identity::resolve_identifier`: a DID is checked and returned, a
+    /// handle resolved. Its message is the one an admin request shows.
+    async fn resolve_handle(&self, handle: &str) -> Result<String, ResolveError> {
+        crate::identity::resolve_identifier(handle)
+            .await
+            .map(|resolved| resolved.did)
+            .map_err(|e| match e {
+                crate::error::AppError::BadRequest(message) => ResolveError::new(message),
+                other => ResolveError::new(other.to_string()),
+            })
     }
 
     fn counters(&self) -> Arc<IngestCounters> {

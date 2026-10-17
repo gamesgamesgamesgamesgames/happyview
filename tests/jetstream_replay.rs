@@ -914,7 +914,10 @@ async fn the_live_stream_never_sees_the_api_key() {
         AppHost::new(state.clone()),
         happyview::jetstream::config::Settings::from_env(&state.config.jetstream_url),
         None,
-        happyview::builtin_source::gap_replay(&state),
+        happyview::builtin_source::gap_replay(
+            &state,
+            &happyview::builtin_source::job_state(&state),
+        ),
     );
     wait_until!("a live connection", !mock.connections().is_empty());
     consumer.abort();
@@ -1717,7 +1720,10 @@ fn consume(
         AppHost::new(state.clone()),
         settings(mock),
         Some(fast_retries()),
-        happyview::builtin_source::gap_replay(&state),
+        happyview::builtin_source::gap_replay(
+            &state,
+            &happyview::builtin_source::job_state(&state),
+        ),
     );
     (handle, tx)
 }

@@ -54,26 +54,32 @@ impl UserAuth {
         if self.has(permission) {
             Ok(())
         } else {
-            log_event(
-                &self.db,
-                EventLog {
-                    event_type: "auth.permission_denied".to_string(),
-                    severity: Severity::Warn,
-                    actor_did: Some(self.did.clone()),
-                    subject: Some(permission.as_str().to_string()),
-                    detail: serde_json::json!({
-                        "user_id": self.user_id,
-                        "required_permission": permission.as_str(),
-                    }),
-                },
-                self.db_backend,
-            )
-            .await;
+            self.log_permission_denied(permission.as_str()).await;
 
             Err(AppError::InsufficientPermissions(
                 permission.as_str().to_string(),
             ))
         }
+    }
+
+    /// The `auth.permission_denied` event for a refusal for want of
+    /// `permission`.
+    pub(crate) async fn log_permission_denied(&self, permission: &str) {
+        log_event(
+            &self.db,
+            EventLog {
+                event_type: "auth.permission_denied".to_string(),
+                severity: Severity::Warn,
+                actor_did: Some(self.did.clone()),
+                subject: Some(permission.to_string()),
+                detail: serde_json::json!({
+                    "user_id": self.user_id,
+                    "required_permission": permission,
+                }),
+            },
+            self.db_backend,
+        )
+        .await;
     }
 
     async fn load_permissions(
@@ -128,12 +134,6 @@ impl UserAuth {
     /// whether the platform principal is acceptable; see `UserAuth`'s extractor
     /// and `AllowPlatform`.
     async fn authenticate(parts: &mut Parts, state: &AppState) -> Result<Self, AppError> {
-        // Already authenticated by `require_admin_caller` in front of a record
-        // source's routes. Authenticating again would refuse a DPoP proof as a
-        // replay of itself.
-        if let Some(Authenticated(auth)) = parts.extensions.get::<Authenticated>() {
-            return Ok(auth.clone());
-        }
         if let Some(auth) = Self::try_api_key_auth(parts, state).await? {
             return Ok(auth);
         }
@@ -267,16 +267,13 @@ impl FromRequestParts<AppState> for UserAuth {
     }
 }
 
-/// A request's authentication, kept for the handler behind
-/// `require_admin_caller`. Only that middleware inserts it.
-#[derive(Clone)]
-struct Authenticated(UserAuth);
-
 /// In front of a record source's admin routes: authenticate the request as
-/// `AllowPlatform` does, refuse it as the handler would when that fails, and
+/// `AllowPlatform` does, refuse it as a handler would when that fails, and
 /// hand the source an [`AdminCaller`](happyview_provider::AdminCaller). The
-/// routes' own extractors and permission checks still run, on the same
-/// authentication.
+/// source checks the caller's permissions itself (and refuses the platform
+/// principal through `AdminUser`); a refusal it marks with
+/// [`PermissionDenied`](happyview_provider::PermissionDenied) is logged here
+/// as `UserAuth::require` logs one.
 pub(crate) async fn require_admin_caller(
     axum::extract::State(state): axum::extract::State<AppState>,
     request: axum::extract::Request,
@@ -299,10 +296,21 @@ pub(crate) async fn require_admin_caller(
     parts.extensions.insert(happyview_provider::AdminCaller {
         did: auth.did.clone(),
         permissions,
+        platform: auth.is_platform,
     });
-    parts.extensions.insert(Authenticated(auth));
-    next.run(axum::extract::Request::from_parts(parts, body))
-        .await
+    let response = next
+        .run(axum::extract::Request::from_parts(parts, body))
+        .await;
+    // A source refused the caller for a permission: log it as `require`
+    // logs a refusal by HappyView's own routes.
+    if let Some(happyview_provider::PermissionDenied(permission)) =
+        response
+            .extensions()
+            .get::<happyview_provider::PermissionDenied>()
+    {
+        auth.log_permission_denied(permission).await;
+    }
+    response
 }
 
 /// Explicit opt-in for routes the managed-hosting platform may call. Behaves

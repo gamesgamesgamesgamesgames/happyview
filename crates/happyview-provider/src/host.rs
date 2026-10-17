@@ -35,6 +35,14 @@ pub trait Host: Send + Sync + 'static {
     }
     /// In order, in one write transaction where the storage allows.
     async fn ingest_batch(&self, events: Vec<SourceEvent>) -> BatchOutcome;
+    /// [`Host::ingest_batch`], with the error text of a write that failed and
+    /// stopped the batch, for a source that reports or retries it.
+    async fn ingest_batch_with_error(
+        &self,
+        events: Vec<SourceEvent>,
+    ) -> (BatchOutcome, Option<String>) {
+        (self.ingest_batch(events).await, None)
+    }
     fn tracked_collections(&self) -> watch::Receiver<Vec<String>>;
     async fn has_record_hook(&self, collection: &str, action: Action) -> bool;
     /// DIDs holding records in `collections`, after `after_did`, ascending.
@@ -50,6 +58,15 @@ pub trait Host: Send + Sync + 'static {
     async fn log_event(&self, event: ProviderEvent);
     fn http(&self) -> reqwest::Client;
     fn instance(&self) -> InstanceInfo;
+    /// One attempt at the PDS endpoint of `did`. Never retries: the error
+    /// says whether a retry could help.
     async fn resolve_pds(&self, did: &str) -> Result<String, ResolveError>;
+    /// The DID a handle names (a leading `@` allowed), or a DID itself,
+    /// checked and returned as it is.
+    async fn resolve_handle(&self, handle: &str) -> Result<String, ResolveError> {
+        Err(ResolveError::new(format!(
+            "could not resolve {handle}: this host does not resolve handles"
+        )))
+    }
     fn counters(&self) -> Arc<IngestCounters>;
 }
