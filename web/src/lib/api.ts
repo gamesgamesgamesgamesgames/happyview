@@ -1263,6 +1263,7 @@ export interface PluginPreview {
   version: string;
   description: string | null;
   icon_url: string | null;
+  banner_url: string | null;
   auth_type: string;
   required_secrets: SecretDefinition[];
   manifest_url: string;

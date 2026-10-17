@@ -927,6 +927,7 @@ fn catalogue_entry(
             })
             .collect(),
         sections: Default::default(),
+        banner_url: None,
     }
 }
 
